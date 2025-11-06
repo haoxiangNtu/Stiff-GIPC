@@ -72,7 +72,7 @@ bool GlobalLinearSystem::build_linear_system()
     }
 
     // allocate the memory for the linear system
-    m_triplet_A.resize(total_rhs_count / BlockSize, total_rhs_count / BlockSize, total_triplet_count);
+    m_triplet_A.reshape(total_rhs_count / BlockSize, total_rhs_count / BlockSize);
     m_b.resize(total_rhs_count);
     m_x.resize(total_rhs_count);
 
@@ -83,14 +83,22 @@ bool GlobalLinearSystem::build_linear_system()
     for(auto& subsystem : m_subsystems)
         subsystem->do_assemble(triplet_view, rhs_view);
 
-    convert();
+    int start_preconditioner_id = 0;
+    if(m_local_preconditioners.size() && m_local_preconditioners[0]->preconditioner_id == 0)
+    {
+        m_local_preconditioners[0]->assemble();
+        start_preconditioner_id++;
+    }
+    convert2();
 
     // assemble preconditioners
-    if(m_global_preconditioner)
-        m_global_preconditioner->do_assemble(m_bcoo_A);
+    //if(m_global_preconditioner)
+    //    m_global_preconditioner->do_assemble(m_bcoo_A);
 
-    for(auto& p : m_local_preconditioners)
-        p->assemble();
+    for(int i = start_preconditioner_id; i < m_local_preconditioners.size(); i++)
+    {
+        m_local_preconditioners[i]->assemble();
+    }
 
     return true;
 }
@@ -213,6 +221,28 @@ bool GlobalLinearSystem::accuracy_statisfied(muda::DenseVectorView<Float> r)
                                    s->dof_offset()(0), s->right_hand_side_dof()));
                        });
 }
+
+void GlobalLinearSystem::convert2()
+{
+
+    //if(reserved_triplet_count < m_triplet_A.triplet_count())
+    //{
+    //    reserved_triplet_count = m_triplet_A.triplet_count() * 1.5;
+    //    m_bcoo_A.reserve_triplets(reserved_triplet_count);
+    //    m_triplet_A.reserve_triplets(reserved_triplet_count);
+    //}
+
+    //m_converter.convert(m_triplet_A, m_bcoo_A);
+    //m_converter.ge2sym(m_bcoo_A);
+
+    m_converter.convert(*gipc_global_triplet,
+                        0,
+                        gipc_global_triplet->global_triplet_offset,
+                        gipc_global_triplet->global_triplet_offset);
+    m_converter.ge2sym(*gipc_global_triplet);
+}
+
+
 void GlobalLinearSystem::convert()
 {
     auto triplet2bcoo = [&]
@@ -230,6 +260,11 @@ void GlobalLinearSystem::convert()
             m_converter.convert(m_triplet_A, m_bcoo_A);
     };
 
+    //m_converter.convert(*gipc_global_triplet,
+    //                    0,
+    //                    gipc_global_triplet->global_triplet_offset,
+    //                    gipc_global_triplet->global_triplet_offset);
+    //m_converter.ge2sym(*gipc_global_triplet);
     auto bcoo2bsr = [&]
     {
         if(reserved_triplet_count < m_bcoo_A.triplet_count())
@@ -337,7 +372,14 @@ void GlobalLinearSystem::spmv(Float                         a,
         break;
         case SPMVAlgorithm::SymWarpReduceBCOO: {
             Timer timer{"warp_reduce_sym_spmv"};
-            m_spmv.warp_reduce_sym_spmv(a, m_bcoo_A, x, b, y);
+            m_spmv.warp_reduce_sym_spmv(a,
+                                        gipc_global_triplet->block_values(),
+                                        gipc_global_triplet->block_row_indices(),
+                                        gipc_global_triplet->block_col_indices(),
+                                        gipc_global_triplet->h_unique_key_number,
+                                        x,
+                                        b,
+                                        y);
         }
         break;
         default:

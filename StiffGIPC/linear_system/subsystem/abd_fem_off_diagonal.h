@@ -7,7 +7,6 @@ class GIPC;
 
 namespace gipc
 {
-class ContactSystem;
 class ABDSystem;
 class ABDFEMOffDiagonal : public OffDiagonalSubsystem
 {
@@ -15,7 +14,6 @@ class ABDFEMOffDiagonal : public OffDiagonalSubsystem
   public:
     ABDFEMOffDiagonal(GIPC&                gipc,
                       device_TetraData&    tetra_data,
-                      gipc::ContactSystem& contact_system,
                       ABDLinearSubsystem&  abd,
                       FEMLinearSubsystem&  fem);
 
@@ -26,7 +24,6 @@ class ABDFEMOffDiagonal : public OffDiagonalSubsystem
   private:
     GIPC&                m_gipc;
     device_TetraData&    m_tetra_data;
-    gipc::ContactSystem& m_contact_system;
     gipc::ABDSimData&    m_abd_sim_data;
 };
 }  // namespace gipc

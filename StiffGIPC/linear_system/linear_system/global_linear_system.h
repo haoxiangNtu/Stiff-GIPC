@@ -71,7 +71,7 @@ class GlobalLinearSystem
     gipc::SizeT solve_linear_system();
 
     Json as_json() const;
-
+    gipc::GIPCTripletMatrix<double, 3>* gipc_global_triplet = nullptr;
   private:
     GlobalLinearSystemOptions          m_options;
     std::vector<U<ILinearSubsystem>>   m_subsystems;
@@ -88,7 +88,7 @@ class GlobalLinearSystem
     muda::DeviceTripletMatrix<Float, 3> m_triplet_A;
     muda::DeviceBCOOMatrix<Float, 3>    m_bcoo_A;
     muda::DeviceBCOOMatrix<Float, 3>    fake_bcoo_A;
-
+    
     muda::DeviceBSRMatrix<Float, 3> m_bsr_A;
 
     std::vector<SizeT> m_triplet_offset_per_subsystem;
@@ -109,6 +109,7 @@ class GlobalLinearSystem
                               muda::CDenseVectorView<Float> r);
     bool accuracy_statisfied(muda::DenseVectorView<Float> r);
     void convert();
+    void convert2();
 
     void spmv(Float a, muda::CDenseVectorView<Float> x, Float b, muda::DenseVectorView<Float> y);
 

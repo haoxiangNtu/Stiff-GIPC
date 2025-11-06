@@ -91,20 +91,21 @@ Vector2i OffDiagonalSubsystem::dof_offset() const
 
 void OffDiagonalSubsystem::do_assemble(TripletMatrixView hessian, DenseVectorView)
 {
-    // redirect to the coupling version
-    int2 ij_offset{m_a->dof_offset()[0] / 3, m_b->dof_offset()[0] / 3};
-    int2 ij_count{m_a->right_hand_side_dof() / 3, m_b->right_hand_side_dof() / 3};
+    //return;
+    //// redirect to the coupling version
+    //int2 ij_offset{m_a->dof_offset()[0] / 3, m_b->dof_offset()[0] / 3};
+    //int2 ij_count{m_a->right_hand_side_dof() / 3, m_b->right_hand_side_dof() / 3};
 
-    int2 ji_offset = {ij_offset.y, ij_offset.x};
-    int2 ji_count  = {ij_count.y, ij_count.x};
+    //int2 ji_offset = {ij_offset.y, ij_offset.x};
+    //int2 ji_count  = {ij_count.y, ij_count.x};
 
-    auto upper_view =
-        hessian.subview(hessian_block_offset(), m_upper_hessian_count).submatrix(ij_offset, ij_count);
-    auto lower_view = hessian
-                          .subview(hessian_block_offset() + m_upper_hessian_count, m_lower_hessian_count)
-                          .submatrix(ji_offset, ji_count);
+    //auto upper_view =
+    //    hessian.subview(hessian_block_offset(), m_upper_hessian_count).submatrix(ij_offset, ij_count);
+    //auto lower_view = hessian
+    //                      .subview(hessian_block_offset() + m_upper_hessian_count, m_lower_hessian_count)
+    //                      .submatrix(ji_offset, ji_count);
 
-    assemble(upper_view, lower_view);
+    //assemble(upper_view, lower_view);
 }
 
 void OffDiagonalSubsystem::hessian_block_count(SizeT upper_hessian_count, SizeT lower_hessian_count)

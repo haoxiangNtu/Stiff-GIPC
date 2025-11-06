@@ -5,7 +5,7 @@
 // created by Kemeng Huang on 2022/12/01
 // Copyright (c) 2024 Kemeng Huang. All rights reserved.
 //
-
+#include "Eigen/Eigen"
 #pragma once
 #ifndef _EIGEN_DATA_H_
 #define _EIGEN_DATA_H_
@@ -114,7 +114,7 @@ struct Matrix3x3F
 
 struct MasMatrixSymT
 {
-    Matrix3x3F M[BANKSIZE * (BANKSIZE + 1) / 2];
+    Eigen::Matrix3d M[BANKSIZE * (BANKSIZE + 1) / 2];
 };
 
 struct Matrix3x3f
@@ -124,7 +124,7 @@ struct Matrix3x3f
 
 struct MasMatrixSymf
 {
-    Matrix3x3f M[BANKSIZE * (BANKSIZE + 1) / 2];
+    Eigen::Matrix3f M[BANKSIZE * (BANKSIZE + 1) / 2];
 };
 
 struct Matrix9x2d

@@ -4,25 +4,30 @@
 namespace gipc
 {
 MAS_Preconditioner::MAS_Preconditioner(FEMLinearSubsystem& subsystem,
-                                       BHessian&           mBH,
                                        MASPreconditioner&  mMAS,
                                        double*             mMasses,
                                        uint32_t*           mCpNum)
     : Base(subsystem)
-    , BH(mBH)
     , MAS_Prec(mMAS)
     , masses(mMasses)
     , cpNum(mCpNum)
 {
+    preconditioner_id = 1;
 }
 
 void MAS_Preconditioner::assemble()
 {
     double collision_num = *cpNum;
     gipc::Timer timer{"precomputing mas Preconditioner"};
-    //MAS_Prec.setPreconditioner(BH, masses, collision_num);
+    int         triplet_number  = 0;
+    uint32_t*   indices = calculate_subsystem_bcoo_indices(triplet_number);
     MAS_Prec.setPreconditioner_bcoo(system_bcoo_matrix(),
-                                    calculate_subsystem_bcoo_indices(), get_offset(), collision_num);
+                                    system_bcoo_rows(),
+                                    system_bcoo_cols(),
+                                    indices,
+                                    get_offset(),
+                                    triplet_number,
+                                    collision_num);
 }
 
 void MAS_Preconditioner::apply(muda::CDenseVectorView<Float> r,

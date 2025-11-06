@@ -3,9 +3,8 @@
 #include <muda/buffer/device_var.h>
 #include <muda/ext/linear_system.h>
 #include <abd_system/abd_system_parms.h>
-#include <contact_system/contact_info.h>
-#include <abd_system/utils/converter.h>
 #include <linear_system/utils/converter.h>
+#include "linear_system/linear_system/global_matrix.h"
 namespace gipc
 {
 class ABDSystem
@@ -30,19 +29,21 @@ class ABDSystem
     muda::DeviceVar<Float>    m_local_tolerance_max;
 
   public:  // public just for convenience
+    int*                                  fem_boundary_type;
     muda::DeviceBuffer<Vector12>          abd_gradient;  // just for legacy code
     muda::DeviceBuffer<Matrix12x12>       abd_body_hessian;
-    muda::LinearSystemContext             linear_system_context;
-    muda::DeviceTripletMatrix<double, 12> triplet_hessian;
-    muda::DeviceBCOOMatrix<double, 12>    bcoo_hessian;
-    muda::DeviceBSRMatrix<double, 12>     bsr_hessian;
+    //muda::LinearSystemContext             linear_system_context;
+    //muda::DeviceTripletMatrix<double, 12> triplet_hessian;
+    gipc::GIPCTripletMatrix<double, 3>*   global_triplet;
+    //muda::DeviceBCOOMatrix<double, 12>    bcoo_hessian;
+    //muda::DeviceBSRMatrix<double, 12>     bsr_hessian;
     muda::DeviceDenseMatrix<double>       dense_system_hessian;
     muda::DeviceCSRMatrix<double>         csr_system_hessian;
     muda::DeviceDenseVector<double>       system_gradient;
     muda::DeviceDenseVector<double>       temp_system_gradient;
     muda::DeviceDoubletVector<double, 12> doublet_system_gradient;
-    muda::DeviceTripletMatrix<double, 3>  triplet_vertex_hessian;
-    muda::DeviceBCOOMatrix<double, 3>     bcoo_vertex_hessian;
+    //muda::DeviceTripletMatrix<double, 3>  triplet_vertex_hessian;
+    //muda::DeviceBCOOMatrix<double, 3>     bcoo_vertex_hessian;
     muda::DeviceBuffer<Matrix12x12>       abd_system_diag_preconditioner;
 
     muda::DeviceBuffer<Vector3> body_mass_center;
@@ -52,7 +53,6 @@ class ABDSystem
     // Axis from [x0,x1,x2] to [x3,x4,x5]
     // Vector6 == Zero for non-motorized body
     muda::DeviceBuffer<Vector6> body_id_to_motor_rotation_axis;
-    abd_system::Converter       converter;
     gipc::Converter             converter3x3;
 
     size_t triplet_vertex_hessian_reserve_size = 0;
@@ -184,21 +184,23 @@ class ABDSystem
     /// <param name="sim_data"></param>
     /// <param name="vertex_barrier_gradient"></param>
     void setup_abd_system_gradient_hessian(ABDSimData& sim_data,
+                                           gipc::GIPCTripletMatrix<double, 3>& global_triplets,
                                            muda::CBufferView<double3> vertex_barrier_gradient);
     void setup_abd_system_gradient_hessian(ABDSimData& sim_data,
+                                           gipc::GIPCTripletMatrix<double, 3>& global_triplets,
                                            muda::CBufferView<Vector3> vertex_barrier_gradient);
     void setup_abd_system_gradient_hessian(ABDSimData& sim_data,
+                                           int*        fbtype,
                                            muda::CBufferView<double3> vertex_barrier_gradient,
-                                           muda::CBufferView<ContactHessian> abd_contact_hessian);
+                                           gipc::GIPCTripletMatrix<double, 3>& global_triplets);
 
-    void _cal_triplet_vertex_hessian(ABDSimData& sim_data,
-                                     muda::CBufferView<ContactHessian> abd_contact_hessian);
     void _cal_abd_body_gradient_and_hessian(ABDSimData& sim_data);
     void _cal_abd_system_barrier_gradient(ABDSimData& sim_data,
                                           muda::CBufferView<double3> vertex_barrier_gradient);
     void _cal_abd_system_barrier_gradient(ABDSimData& sim_data,
                                           muda::CBufferView<Vector3> vertex_barrier_gradient);
-    void _setup_abd_system_hessian(ABDSimData& sim_data);
+    void _setup_abd_system_hessian(ABDSimData& sim_data,
+                                   gipc::GIPCTripletMatrix<double, 3>& global_triplets);
     void _cal_abd_system_preconditioner(ABDSimData& sim_data);
 
     /********************************************************************************/

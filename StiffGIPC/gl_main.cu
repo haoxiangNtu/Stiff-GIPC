@@ -17,7 +17,7 @@
 #include "mlbvh.cuh"
 #include <stdio.h>
 #include "load_mesh.h"
-#include "cuda_tools.h"
+#include "cuda_tools/cuda_tools.h"
 #include <queue>
 //#include "timer.h"
 #include "femEnergy.cuh"
@@ -106,42 +106,45 @@ void           Init_CUDA()
     }
 }
 
-//typedef struct BITMAPFILEHEADER
-//{
-//    u_int16_t bfType;
-//    u_int32_t bfSize;
-//    u_int16_t bfReserved1;
-//    u_int16_t bfReserved2;
-//    u_int32_t bfOffBits;
-//}BITMAPFILEHEADER;
-//
-//typedef struct BITMAPINFOHEADER
-//{
-//    u_int32_t biSize;
-//    u_int32_t biWidth;
-//    u_int32_t biHeight;
-//    u_int16_t biPlanes;
-//    u_int16_t biBitCount;
-//    u_int32_t biCompression;
-//    u_int32_t biSizeImage;
-//    u_int32_t biXPelsPerMeter;
-//    u_int32_t biYPelsPerMeter;
-//    u_int32_t biClrUsed;
-//    u_int32_t biClrImportant;
-//}BITMAPINFODEADER;
+#pragma pack(push, 1)
+typedef struct
+{
+    uint16_t bfType;
+    uint32_t bfSize;
+    uint16_t bfReserved1;
+    uint16_t bfReserved2;
+    uint32_t bfOffBits;
+} mBITMAPFILEHEADER;
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+typedef struct
+{
+    uint32_t biSize;
+    int32_t  biWidth;
+    int32_t  biHeight;
+    uint16_t biPlanes;
+    uint16_t biBitCount;
+    uint32_t biCompression;
+    uint32_t biSizeImage;
+    int32_t  biXPelsPerMeter;
+    int32_t  biYPelsPerMeter;
+    uint32_t biClrUsed;
+    uint32_t biClrImportant;
+} mBITMAPINFOHEADER;
+#pragma pack(pop) 
 
 bool WriteBitmapFile(int width, int height, const std::string& file_name, unsigned char* bitmapData)
 {
-#ifdef WIN32
-    BITMAPFILEHEADER bitmapFileHeader;
-    memset(&bitmapFileHeader, 0, sizeof(BITMAPFILEHEADER));
-    bitmapFileHeader.bfSize = sizeof(BITMAPFILEHEADER);
+    mBITMAPFILEHEADER bitmapFileHeader;
+    memset(&bitmapFileHeader, 0, sizeof(mBITMAPFILEHEADER));
+    bitmapFileHeader.bfSize = sizeof(mBITMAPFILEHEADER);
     bitmapFileHeader.bfType = 0x4d42;  //BM
-    bitmapFileHeader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    bitmapFileHeader.bfOffBits = sizeof(mBITMAPFILEHEADER) + sizeof(mBITMAPINFOHEADER);
 
-    BITMAPINFOHEADER bitmapInfoHeader;
-    memset(&bitmapInfoHeader, 0, sizeof(BITMAPINFOHEADER));
-    bitmapInfoHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    mBITMAPINFOHEADER bitmapInfoHeader;
+    memset(&bitmapInfoHeader, 0, sizeof(mBITMAPINFOHEADER));
+    bitmapInfoHeader.biSize        = sizeof(mBITMAPINFOHEADER);
     bitmapInfoHeader.biWidth       = width;
     bitmapInfoHeader.biHeight      = height;
     bitmapInfoHeader.biPlanes      = 1;
@@ -167,29 +170,24 @@ bool WriteBitmapFile(int width, int height, const std::string& file_name, unsign
         return false;
     }
 
-    fwrite(&bitmapFileHeader, sizeof(BITMAPFILEHEADER), 1, filePtr);
+    fwrite(&bitmapFileHeader, sizeof(mBITMAPFILEHEADER), 1, filePtr);
 
-    fwrite(&bitmapInfoHeader, sizeof(BITMAPINFOHEADER), 1, filePtr);
+    fwrite(&bitmapInfoHeader, sizeof(mBITMAPINFOHEADER), 1, filePtr);
 
     fwrite(bitmapData, bitmapInfoHeader.biSizeImage, 1, filePtr);
 
     fclose(filePtr);
-#endif
     return true;
 }
 
 void SaveScreenShot(int width, int height, const std::string& file_name)
 {
-#ifdef WIN32
     int   data_len    = height * width * 3;  // bytes
     void* screen_data = malloc(data_len);
     memset(screen_data, 0, data_len);
     glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, screen_data);
-
     WriteBitmapFile(width, height, file_name + ".bmp", (unsigned char*)screen_data);
-
     free(screen_data);
-#endif
 }
 
 void saveSurfaceMesh(const string& path)
@@ -570,42 +568,6 @@ void initFEM(tetrahedra_obj& mesh)
     __GEIGEN__::__set_Mat_val(
         rotationX, 1, 0, 0, 0, cos(angleX), -sin(angleX), 0, sin(angleX), cos(angleX));
 
-    //for (int j = 0; j < mesh.vertexNum; j++) {
-    //    mesh.vertexes[j] = __GEIGEN__::__add(mesh.vertexes[j], make_double3(0.6, 0.6, 0.6));
-    //}
-
-    //for (int j = 0; j < mesh.vertexNum / 2; j++) {
-    //    __GEIGEN__::Matrix3x3d rotate = __GEIGEN__::__M_Mat_multiply(rotationX, __GEIGEN__::__M_Mat_multiply(rotationY, rotationZ));
-    //    mesh.vertexes[j] = __GEIGEN__::__add(__GEIGEN__::__M_v_multiply(rotate, __GEIGEN__::__add(mesh.vertexes[j], make_double3(0.0, -0.3, 0))), make_double3(0.0, 0.4, 0));
-    //    mesh.vertexes[j] = __GEIGEN__::__add(mesh.vertexes[j], make_double3(0.0, 0.3, 0));
-    //}
-    //for (int j = mesh.vertexNum / 2; j < mesh.vertexNum; j++) {
-    //    angleX = PI / 2, angleY = PI / 4, angleZ = PI / 2;
-    //    __GEIGEN__::__set_Mat_val(rotationY, cos(angleY), 0, -sin(angleY), 0, 1, 0, sin(angleY), 0, cos(angleY));
-    //    __GEIGEN__::__set_Mat_val(rotationX, 1, 0, 0, 0, cos(angleX), -sin(angleX), 0, sin(angleX), cos(angleX));
-    //    __GEIGEN__::__set_Mat_val(rotationZ, cos(angleZ), -sin(angleZ), 0, sin(angleZ), cos(angleZ), 0, 0, 0, 1);
-
-    //    __GEIGEN__::Matrix3x3d rotate = __GEIGEN__::__M_Mat_multiply(rotationX, __GEIGEN__::__M_Mat_multiply(rotationY, rotationZ));
-    //    //mesh.vertexes[j] = __GEIGEN__::__add(__GEIGEN__::__M_v_multiply(rotate, __GEIGEN__::__add(mesh.vertexes[j], make_double3(0.0, 0.3, 0))), make_double3(0.0, -0.4, 0));
-    //    __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-    //}
-
-    //for (int j = 0; j < mesh.vertexNum; j++) {
-    //    if((mesh.vertexes[j].x) > 0.75 - 1e-4 && (mesh.vertexes[j].z) > 0.75 - 1e-4 )
-    //    {
-    //        mesh.boundaryTypies[j] = 1;
-    //        __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-    //    }
-    //    if((mesh.vertexes[j].x) > 0.75 - 1e-4 && (mesh.vertexes[j].z) <  -0.75 + 1e-4)
-    //    {
-    //        mesh.boundaryTypies[j] = 1;
-    //        __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-    //    }
-    //    //if (((mesh.vertexes[j].x) < -0.75 + 1e-3)) {
-    //    //    mesh.boundaryTypies[j] = -1;
-    //    //    __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-    //    //}
-    //}
     double maxy = 0;
     for(int j = 0; j < mesh.vertexNum; j++)
     {
@@ -627,36 +589,11 @@ void initFEM(tetrahedra_obj& mesh)
                 mesh.boundaryTypies[j] = 1;
                 __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
             }
-            //if((mesh.vertexes[j].x) > 3 * 0.5 - 1e-4
-            //   && ((mesh.vertexes[j].z) < 3 * -0.5 + 1e-4))
-            //{
-            //    mesh.boundaryTypies[j] = 1;
-            //    // __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-            //}
-            //if(((mesh.vertexes[j].x) < 3 * -0.5 + 1e-4)
-            //   /*&& ((mesh.vertexes[j].z) < 3 * -0.5 + 1e-4)*/)
-            //{
-            //    mesh.boundaryTypies[j] = -1;
-            //    __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-            //}
-            //if(((mesh.vertexes[j].x) < 3 * -0.5 + 1e-4)
-            //   && (mesh.vertexes[j].z) > 3 * 0.5 - 1e-4)
-            //{
-            //    mesh.boundaryTypies[j] = 1;
-            //    // __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-            //}
+
         }
     }
 
     printf("maxy:   %f\n", maxy);
-
-    //   for (int j = 0; j < mesh.vertexNum; j++) {
-    //       double dis = pow(mesh.vertexes[j].y,2)+pow(mesh.vertexes[j].z,2);
-    //       if (dis<0.012*0.012&&mesh.vertexes[j].x>-0.25&&mesh.vertexes[j].x<-0.07) {
-    //           mesh.boundaryTypies[j] = 1;
-    //           __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-    //       }
-    //   }
 
     for(int i = 0; i < mesh.tetrahedraNum; i++)
     {
@@ -738,15 +675,15 @@ void DefaultSettings()
     ipc.strainRate        = 100;
     ipc.softMotionRate    = 1e0;
     ipc.bendStiff         = 3e-4;
-    ipc.Newton_solver_threshold = 1e-1;
-    ipc.pcg_threshold           = 1e-3;
+    ipc.Newton_solver_threshold = 1e-2;
+    ipc.pcg_threshold           = 1e-4;
     ipc.IPC_dt                  = 1e-2;
     ipc.relative_dhat           = 1e-3;
     ipc.bendStiff = ipc.bendYoungModulus * pow(ipc.clothThickness, 3)
                     / (24 * (1 - ipc.PoissonRate * ipc.PoissonRate));
     ipc.shearStiff = 0.03 * ipc.stretchStiff * ipc.strainRate;
 }
-int  meshids = 0;
+//int  meshids = 0;
 void LoadSettings()
 {
     bool successfulRead = false;
@@ -785,7 +722,7 @@ void LoadSettings()
         infile >> ignoreToken >> ipc.pcg_threshold;
         infile >> ignoreToken >> ipc.Newton_solver_threshold;
         infile >> ignoreToken >> ipc.relative_dhat;
-        infile >> ignoreToken >> meshids;
+        //infile >> ignoreToken >> meshids;
 
 
         ipc.lengthRateLame = ipc.YoungModulus / (2 * (1 + ipc.PoissonRate));
@@ -820,7 +757,7 @@ void set_case1() {
     double                    abd_height = -0.6;
     gipc::SimpleSceneImporter importer;
 
-
+    double Youngth_Modulus = 1e4;
     for(int k = 0; k < count_Y; ++k)
     {
         for(int i = 0; i < count; i++)
@@ -874,7 +811,7 @@ void set_case1() {
                                        3,
                                        gipc::BodyType::FEM,
                                        transform,
-                                       1e5,
+                                       Youngth_Modulus,
                                        assets_dir + "tetMesh/cube.msh",
                                        ipc.pcg_data.P_type);
             }
@@ -893,13 +830,13 @@ void set_case2()
     transform.block<3, 1>(0, 3) =
         -Eigen::Vector3d(position_offset.x, position_offset.y, position_offset.z);
 
-
+    double Youngth_Modulus = 1e4;
     string mesh0_path = assets_dir + "tetMesh/bunny2.msh";
     importer.load_geometry(tetMesh,
                            3,
                            gipc::BodyType::ABD,
                            transform,
-                           1e4,
+                           Youngth_Modulus,
                            mesh0_path,
                            ipc.pcg_data.P_type);
 
@@ -914,7 +851,7 @@ void set_case2()
                            3,
                            gipc::BodyType::FEM,
                            transform,
-                           1e5,
+                           Youngth_Modulus,
                            mesh1_path,
                            ipc.pcg_data.P_type);
 
@@ -976,7 +913,6 @@ void setMAS_partition() {
 void initScene()
 {
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
-    ipc.use_new_linear_system = true;
     ipc.pcg_data.P_type       = 1;
 
     int scene_no = 2;

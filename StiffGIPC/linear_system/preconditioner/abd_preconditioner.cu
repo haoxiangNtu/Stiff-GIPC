@@ -9,6 +9,7 @@ ABDPreconditioner::ABDPreconditioner(ABDLinearSubsystem& subsystem, ABDSystem& a
     , m_abd(abd)
     , m_sim_data(sim_data)
 {
+    preconditioner_id = 0;
 }
 
 void ABDPreconditioner::assemble()

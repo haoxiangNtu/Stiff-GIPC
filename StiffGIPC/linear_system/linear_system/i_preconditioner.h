@@ -20,16 +20,14 @@ class IPreconditioner
     friend class GlobalLinearSystem;
     friend class LocalPreconditioner;
     friend class GlobalPreconditioner;
-
     GlobalLinearSystem* m_system;
-
   public:
     IPreconditioner() = default;
 
     virtual ~IPreconditioner();
 
     virtual Json as_json() const;
-
+    
   protected:
     muda::LinearSystemContext& ctx() const;
 
@@ -51,10 +49,12 @@ class LocalPreconditioner : public IPreconditioner
     LocalPreconditioner(DiagonalSubsystem& subsystem);
 
     virtual ~LocalPreconditioner() = default;
-    muda::CBufferView<int>          calculate_subsystem_bcoo_indices() const;
+    uint32_t* calculate_subsystem_bcoo_indices(int& number) const;
     int                             get_offset() const;
-    muda::CBCOOMatrixView<Float, 3> system_bcoo_matrix() const;
-
+    Eigen::Matrix3d* system_bcoo_matrix() const;
+    int* system_bcoo_rows() const;
+    int* system_bcoo_cols() const;
+    int                             preconditioner_id;
   protected:
     virtual void assemble(){};
     virtual void apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z) = 0;

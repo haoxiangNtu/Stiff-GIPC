@@ -8,7 +8,7 @@
 
 #include "GIPC.cuh"
 #include <gipc/gipc.h>
-#include "cuda_tools.h"
+#include "cuda_tools/cuda_tools.h"
 #include "GIPC_PDerivative.cuh"
 #include "fem_parameters.h"
 #include "ACCD.cuh"
@@ -24,32 +24,38 @@
 #include <gipc/utils/timer.h>
 
 #include <tbb/parallel_for.h>
+
+#include <muda/cub/device/device_radix_sort.h>
 using namespace Eigen;
 #define RANK 2
 #define NEWF
 
 template <typename Scalar, int size>
-__device__ __host__ void makePDonCPU(Eigen::Matrix<Scalar, size, size>& symMtr)
+__device__ __host__ void makePDGeneral(Eigen::Matrix<Scalar, size, size>& symMtr)
 {
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<Scalar, size, size>> eigenSolver(symMtr);
-    if(eigenSolver.eigenvalues()[0] >= 0.0)
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<Scalar, size, size>> eigen_solver;
+
+    if constexpr(size <= 3)
+        eigen_solver.computeDirect(symMtr);
+    else
+        eigen_solver.compute(symMtr);
+    Eigen::Vector<Scalar, size> eigen_values  = eigen_solver.eigenvalues();
+    Eigen::Matrix<Scalar, size, size> eigen_vectors = eigen_solver.eigenvectors();
+
+
+    if(eigen_values[0] >= 0.0)
     {
         return;
     }
-    Eigen::DiagonalMatrix<Scalar, size> D(eigenSolver.eigenvalues());
-    int rows = ((size == Eigen::Dynamic) ? symMtr.rows() : size);
-    for(int i = 0; i < rows; i++)
+
+    for(int i = 0; i < size; ++i)
     {
-        if(D.diagonal()[i] < 0.0)
+        if(eigen_values(i) < 0)
         {
-            D.diagonal()[i] = 0.0;
-        }
-        else
-        {
-            break;
+            eigen_values(i) = 0;
         }
     }
-    symMtr = eigenSolver.eigenvectors() * D * eigenSolver.eigenvectors().transpose();
+    symMtr = eigen_vectors * eigen_values.asDiagonal() * eigen_vectors.transpose();
 }
 
 template <typename Scalar, int size>
@@ -72,6 +78,36 @@ __device__ __host__ void makePD(Eigen::Matrix<Scalar, size, size>& symMtr)
     }
     symMtr = eigenSolver.eigenvectors() * D * eigenSolver.eigenvectors().transpose();
 }
+
+template <int ROWS, int COLS>
+__device__ inline void write_triplet(Eigen::Matrix3d* triplet_value,
+                                     int*             row_ids,
+                                     int*             col_ids,
+                                     const unsigned int* index,
+                                     const double     input[ROWS][COLS],
+                                     const int&       offset)
+{
+    int rown = ROWS / 3;
+    int coln = COLS / 3;
+    for(int ii = 0; ii < rown; ii++)
+    {
+        for(int jj = 0; jj < coln; jj++)
+        {
+            int kk = ii * coln + jj;
+            row_ids[offset + kk] = index[ii];
+            col_ids[offset + kk] = index[jj];
+            for(int iii = 0; iii < 3; iii++)
+            {
+                for(int jjj = 0; jjj < 3; jjj++)
+                {
+                    triplet_value[offset+kk](iii, jjj) = input[ii * 3 + iii][jj * 3 + jjj];
+                }
+            }
+        }
+    }
+}
+
+
 
 __device__ __host__ inline uint32_t expand_bits(std::uint32_t v) noexcept
 {
@@ -132,6 +168,64 @@ __device__ __host__ inline uint32_t hash_code(
     }
     //std::uint32_t mchash = (((static_cast<std::uint32_t>(z) * 1024) + static_cast<std::uint32_t>(y)) * 1024) + static_cast<std::uint32_t>(x);//((xx << 2) + (yy << 1) + zz);
     //return mchash;
+}
+
+__global__ void _partition_collision_triplets(const uint64_t* sort_hash, int* abd_abd_offset, int* abd_fem_offset, int* fem_abd_offset, int* fem_fem_offset, int number) {
+    extern __shared__ int shared_hash[];
+    unsigned int          idx = threadIdx.x + (blockDim.x*blockIdx.x);
+    //if(idx == 0)
+    //{
+    //    *abd_abd_offset = -1;
+    //    *abd_fem_offset = -1;
+    //    *fem_abd_offset = -1;
+    //    *fem_fem_offset = -1;
+    //}
+    int self_hash;
+    if(idx < number)
+    {
+        self_hash                    = sort_hash[idx];
+        shared_hash[threadIdx.x + 1] = self_hash;
+        if(idx > 0 && threadIdx.x == 0)
+        {
+            shared_hash[0] = sort_hash[idx - 1];
+        }
+    }
+    __syncthreads();
+    if(idx < number)
+    {
+        int prior_hash = idx == 0 ? -1 : shared_hash[threadIdx.x];
+        if(self_hash != prior_hash)
+        {
+            if (self_hash == 3) {
+                *abd_abd_offset = idx;
+            }
+            else if (self_hash == 1) {
+                *abd_fem_offset = idx;
+            }
+            else if (self_hash == 2) {
+                *fem_abd_offset = idx;
+            }
+            else if (self_hash == 0) {
+                *fem_fem_offset = idx;
+            }
+        }
+    }
+}
+
+__global__ void _reorder_triplets(int*             row_ids_input,
+                                  int*             col_ids_input,
+                                  Eigen::Matrix3d* triplet_value_inpuit,
+                                  int*             row_ids,
+                                  int*             col_ids,
+                                  Eigen::Matrix3d* triplet_value,
+                                  const uint32_t*  sort_index,
+                                  int              number)
+{
+    uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx>=number) return;
+    row_ids[idx] = row_ids_input[sort_index[idx]];
+    col_ids[idx] = col_ids_input[sort_index[idx]];
+    triplet_value[idx] = triplet_value_inpuit[sort_index[idx]];
 }
 
 
@@ -1225,19 +1319,21 @@ __global__ void _calFrictionHessian_gd(const double3*  _vertexes,
                                        const double3*  _o_vertexes,
                                        const double3*  _normal,
                                        const uint32_t* _last_collisionPair_gd,
-                                       __GEIGEN__::Matrix3x3d* H3x3,
-                                       uint32_t*               D1Index,
+                                       Eigen::Matrix3d*        triplet_values,
+                                       int*                    row_ids,
+                                       int*                    col_ids,
                                        int                     number,
                                        double                  dt,
                                        double                  eps2,
                                        double*                 lastH,
+                                       int                     global_offset,
                                        double                  coef)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     double                 eps           = sqrt(eps2);
-    int                    gidx          = _last_collisionPair_gd[idx];
+    unsigned int           gidx          = _last_collisionPair_gd[idx];
     double                 multiplier_vI = coef * lastH[idx];
     __GEIGEN__::Matrix3x3d H_vI;
 
@@ -1295,19 +1391,18 @@ __global__ void _calFrictionHessian_gd(const double3*  _vertexes,
             H_vI, (multiplier_vI / eps), 0, 0, 0, 0, 0, 0, 0, (multiplier_vI / eps));
     }
 
-    H3x3[idx]    = H_vI;
-    D1Index[idx] = gidx;
+    //H3x3[idx]    = H_vI;
+    //D1Index[idx] = gidx;
+
+    write_triplet<3, 3>(triplet_values, row_ids, col_ids, &gidx, H_vI.m, global_offset + idx);
 }
 
 __global__ void _calFrictionHessian(const double3* _vertexes,
                                     const double3* _o_vertexes,
                                     const int4*    _last_collisionPair,
-                                    __GEIGEN__::Matrix12x12d* H12x12,
-                                    __GEIGEN__::Matrix9x9d*   H9x9,
-                                    __GEIGEN__::Matrix6x6d*   H6x6,
-                                    uint4*                    D4Index,
-                                    uint3*                    D3Index,
-                                    uint2*                    D2Index,
+                                    Eigen::Matrix3d*          triplet_values,
+                                    int*                      row_ids,
+                                    int*                      col_ids,
                                     uint32_t*                 _cpNum,
                                     int                       number,
                                     double                    dt,
@@ -1316,9 +1411,12 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                                     double                    eps2,
                                     double*                   lastH,
                                     double                    coef,
-                                    int                       offset4,
-                                    int                       offset3,
-                                    int                       offset2)
+                                    int                       cd_offset4,
+                                    int                       cd_offset3,
+                                    int                       cd_offset2,
+                                    int                       f_offset4,
+                                    int                       f_offset3,
+                                    int                       f_offset2)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1326,6 +1424,7 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
     int4    MMCVIDI = _last_collisionPair[idx];
     double  eps     = sqrt(eps2);
     double3 relDX3D;
+    int     global_offset = cd_offset4 * 16 + cd_offset3 * 9 + cd_offset2 * 4;
     if(MMCVIDI.x >= 0)
     {
         Friction::computeRelDX_EE(
@@ -1381,24 +1480,15 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
         }
 
         __GEIGEN__::Matrix2x2d projH;
-        __GEIGEN__::__set_Mat2x2_val_column(projH, make_double2(0, 0), make_double2(0, 0));
 
-        double  eigenValues[2];
-        int     eigenNum = 0;
-        double2 eigenVecs[2];
-        __GEIGEN__::__makePD2x2(
-            M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1], eigenValues, eigenNum, eigenVecs);
-        for(int i = 0; i < eigenNum; i++)
-        {
-            if(eigenValues[i] > 0)
-            {
-                __GEIGEN__::Matrix2x2d eigenMatrix =
-                    __GEIGEN__::__v2_vec2_toMat2x2(eigenVecs[i], eigenVecs[i]);
-                eigenMatrix =
-                    __GEIGEN__::__s_Mat2x2_multiply(eigenMatrix, eigenValues[i]);
-                projH = __GEIGEN__::__Mat2x2_add(projH, eigenMatrix);
-            }
-        }
+        Matrix2d F_mat2;
+        F_mat2 << M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1];
+        makePDGeneral<double, 2>(F_mat2);
+        projH.m[0][0] = F_mat2(0, 0);
+        projH.m[0][1] = F_mat2(0, 1);
+        projH.m[1][0] = F_mat2(1, 0);
+        projH.m[1][1] = F_mat2(1, 1);
+
 
         __GEIGEN__::Matrix12x2d TM2 = __GEIGEN__::__M12x2_M2x2_Multiply(T, projH);
 
@@ -1406,9 +1496,14 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
             __GEIGEN__::__s_M12x12_Multiply(__M12x2_M12x2T_Multiply(TM2, T),
                                             coef * lastH[idx]);
         int Hidx = atomicAdd(_cpNum + 4, 1);
-        Hidx += offset4;
-        H12x12[Hidx]  = HessianBlock;
-        D4Index[Hidx] = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+        int offset = global_offset + Hidx * 16;
+        Hidx += cd_offset4;
+        //H12x12[Hidx]  = HessianBlock;
+        uint4 global_index = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+        //D4Index[Hidx] = global_index;
+        
+        write_triplet<12, 12>(
+            triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
     }
     else
     {
@@ -1465,24 +1560,13 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                 }
             }
             __GEIGEN__::Matrix2x2d projH;
-            __GEIGEN__::__set_Mat2x2_val_column(projH, make_double2(0, 0), make_double2(0, 0));
-
-            double  eigenValues[2];
-            int     eigenNum = 0;
-            double2 eigenVecs[2];
-            __GEIGEN__::__makePD2x2(
-                M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1], eigenValues, eigenNum, eigenVecs);
-            for(int i = 0; i < eigenNum; i++)
-            {
-                if(eigenValues[i] > 0)
-                {
-                    __GEIGEN__::Matrix2x2d eigenMatrix =
-                        __GEIGEN__::__v2_vec2_toMat2x2(eigenVecs[i], eigenVecs[i]);
-                    eigenMatrix =
-                        __GEIGEN__::__s_Mat2x2_multiply(eigenMatrix, eigenValues[i]);
-                    projH = __GEIGEN__::__Mat2x2_add(projH, eigenMatrix);
-                }
-            }
+            Matrix2d               F_mat2;
+            F_mat2 << M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1];
+            makePDGeneral<double, 2>(F_mat2);
+            projH.m[0][0] = F_mat2(0, 0);
+            projH.m[0][1] = F_mat2(0, 1);
+            projH.m[1][0] = F_mat2(1, 0);
+            projH.m[1][1] = F_mat2(1, 1);
 
             __GEIGEN__::Matrix6x2d TM2 = __GEIGEN__::__M6x2_M2x2_Multiply(T, projH);
 
@@ -1491,9 +1575,14 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                                               coef * lastH[idx]);
 
             int Hidx = atomicAdd(_cpNum + 2, 1);
-            Hidx += offset2;
-            H6x6[Hidx]    = HessianBlock;
-            D2Index[Hidx] = make_uint2(MMCVIDI.x, MMCVIDI.y);
+            int offset = global_offset + f_offset4 * 16 + f_offset3 * 9 + Hidx * 4;
+            Hidx += cd_offset2;
+            //H6x6[Hidx]    = HessianBlock;
+            uint2        global_index = make_uint2(MMCVIDI.x, MMCVIDI.y);
+            //D2Index[Hidx]      = global_index;
+
+            
+            write_triplet<6, 6>(triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
         }
         else if(MMCVIDI.w < 0)
         {
@@ -1549,24 +1638,13 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                 }
             }
             __GEIGEN__::Matrix2x2d projH;
-            __GEIGEN__::__set_Mat2x2_val_column(projH, make_double2(0, 0), make_double2(0, 0));
-
-            double  eigenValues[2];
-            int     eigenNum = 0;
-            double2 eigenVecs[2];
-            __GEIGEN__::__makePD2x2(
-                M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1], eigenValues, eigenNum, eigenVecs);
-            for(int i = 0; i < eigenNum; i++)
-            {
-                if(eigenValues[i] > 0)
-                {
-                    __GEIGEN__::Matrix2x2d eigenMatrix =
-                        __GEIGEN__::__v2_vec2_toMat2x2(eigenVecs[i], eigenVecs[i]);
-                    eigenMatrix =
-                        __GEIGEN__::__s_Mat2x2_multiply(eigenMatrix, eigenValues[i]);
-                    projH = __GEIGEN__::__Mat2x2_add(projH, eigenMatrix);
-                }
-            }
+            Matrix2d               F_mat2;
+            F_mat2 << M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1];
+            makePDGeneral<double, 2>(F_mat2);
+            projH.m[0][0] = F_mat2(0, 0);
+            projH.m[0][1] = F_mat2(0, 1);
+            projH.m[1][0] = F_mat2(1, 0);
+            projH.m[1][1] = F_mat2(1, 1);
 
             __GEIGEN__::Matrix9x2d TM2 = __GEIGEN__::__M9x2_M2x2_Multiply(T, projH);
 
@@ -1574,9 +1652,15 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                 __GEIGEN__::__s_M9x9_Multiply(__M9x2_M9x2T_Multiply(TM2, T),
                                               coef * lastH[idx]);
             int Hidx = atomicAdd(_cpNum + 3, 1);
-            Hidx += offset3;
-            H9x9[Hidx]    = HessianBlock;
-            D3Index[Hidx] = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
+            int offset = global_offset + f_offset4 * 16 + Hidx * 9;
+            Hidx += cd_offset3;
+            //H9x9[Hidx]    = HessianBlock;
+            uint3 global_index = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
+            //D3Index[Hidx]      = global_index;
+
+            
+            write_triplet<9, 9>(
+                triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
         }
         else
         {
@@ -1635,24 +1719,13 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                 }
             }
             __GEIGEN__::Matrix2x2d projH;
-            __GEIGEN__::__set_Mat2x2_val_column(projH, make_double2(0, 0), make_double2(0, 0));
-
-            double  eigenValues[2];
-            int     eigenNum = 0;
-            double2 eigenVecs[2];
-            __GEIGEN__::__makePD2x2(
-                M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1], eigenValues, eigenNum, eigenVecs);
-            for(int i = 0; i < eigenNum; i++)
-            {
-                if(eigenValues[i] > 0)
-                {
-                    __GEIGEN__::Matrix2x2d eigenMatrix =
-                        __GEIGEN__::__v2_vec2_toMat2x2(eigenVecs[i], eigenVecs[i]);
-                    eigenMatrix =
-                        __GEIGEN__::__s_Mat2x2_multiply(eigenMatrix, eigenValues[i]);
-                    projH = __GEIGEN__::__Mat2x2_add(projH, eigenMatrix);
-                }
-            }
+            Matrix2d               F_mat2;
+            F_mat2 << M2.m[0][0], M2.m[0][1], M2.m[1][0], M2.m[1][1];
+            makePDGeneral<double, 2>(F_mat2);
+            projH.m[0][0] = F_mat2(0, 0);
+            projH.m[0][1] = F_mat2(0, 1);
+            projH.m[1][0] = F_mat2(1, 0);
+            projH.m[1][1] = F_mat2(1, 1);
 
             __GEIGEN__::Matrix12x2d TM2 = __GEIGEN__::__M12x2_M2x2_Multiply(T, projH);
 
@@ -1660,50 +1733,53 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                 __GEIGEN__::__s_M12x12_Multiply(__M12x2_M12x2T_Multiply(TM2, T),
                                                 coef * lastH[idx]);
             int Hidx = atomicAdd(_cpNum + 4, 1);
-            Hidx += offset4;
-            H12x12[Hidx]  = HessianBlock;
-            D4Index[Hidx] = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            int offset = global_offset + Hidx * 16;
+            Hidx += cd_offset4;
+            //H12x12[Hidx]  = HessianBlock;
+            uint4 global_index = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //D4Index[Hidx] = global_index;
+
+            
+            write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
         }
     }
 }
 
-
+template <typename T>
+__global__ inline void moveMemory_1(T* data, int output_start, int input_start, int length)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= length)
+        return;
+    data[output_start + idx] = data[input_start + idx];
+}
 
 __global__ void _calBarrierHessian(const double3*            _vertexes,
                                    const double3*            _rest_vertexes,
                                    const int4*               _collisionPair,
-                                   __GEIGEN__::Matrix12x12d* H12x12,
-                                   __GEIGEN__::Matrix9x9d*   H9x9,
-                                   __GEIGEN__::Matrix6x6d*   H6x6,
-                                   uint4*                    D4Index,
-                                   uint3*                    D3Index,
-                                   uint2*                    D2Index,
+                                   Eigen::Matrix3d*          triplet_values,
+                                   int*                      row_ids,
+                                   int*                      col_ids,
                                    uint32_t*                 _cpNum,
                                    int*                      matIndex,
                                    double                    dHat,
                                    double                    Kappa,
+                                   int                       offset4,
+                                   int                       offset3,
+                                   int                       offset2,
                                    int                       number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     int4 MMCVIDI = _collisionPair[idx];
-    //double dHat = 1e-6;
     double dHat_sqrt = sqrt(dHat);
 
-    //double Kappa = 1;
-    // int4 MMCVIDI = make_int4(-4,0,-1,-2);
-    // double3 _vertexes[4];
-    // _vertexes[0] = make_double3(0,0,0);
-    // _vertexes[1] = make_double3(2e-3,0,0);
-    // _vertexes[2] = make_double3(1e-3,0,sqrt(3)*1e-3);
-    // _vertexes[3] = make_double3(0e-3, 0.25*1e-3, sqrt(3)*0.0*1e-3);
-    double gassThreshold = 1e-4;
+    double gassThreshold = 1e-6;
     if(MMCVIDI.x >= 0)
     {
         if(MMCVIDI.w >= 0)
         {
-#ifdef NEWF
             double dis;
             _d_EE(_vertexes[MMCVIDI.x],
                   _vertexes[MMCVIDI.y],
@@ -1711,7 +1787,6 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
                   _vertexes[MMCVIDI.w],
                   dis);
             dis = sqrt(dis);
-            //double d_hat_sqrt = sqrt(dHat);
             __GEIGEN__::Matrix12x9d PFPxT;
             pFpx_ee2(_vertexes[MMCVIDI.x],
                      _vertexes[MMCVIDI.y],
@@ -1724,61 +1799,8 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
             q0.v[0] = q0.v[1] = q0.v[2] = q0.v[3] = q0.v[4] = q0.v[5] =
                 q0.v[6] = q0.v[7] = 0;
             q0.v[8]               = 1;
-            //q0 = __GEIGEN__::__s_vec9_multiply(q0, 1.0 / sqrt(I5));
-
             __GEIGEN__::Matrix9x9d H;
             __GEIGEN__::__init_Mat9x9(H, 0);
-#else
-            double3 v0 =
-                __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _vertexes[MMCVIDI.x]);
-            double3 v1 =
-                __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _vertexes[MMCVIDI.x]);
-            double3 v2 =
-                __GEIGEN__::__minus(_vertexes[MMCVIDI.w], _vertexes[MMCVIDI.x]);
-            __GEIGEN__::Matrix3x3d Ds;
-            __GEIGEN__::__set_Mat_val_column(Ds, v0, v1, v2);
-            double3 normal = __GEIGEN__::__normalized(__GEIGEN__::__v_vec_cross(
-                v0, __GEIGEN__::__minus(_vertexes[MMCVIDI.w], _vertexes[MMCVIDI.z])));
-            double  dis    = __GEIGEN__::__v_vec_dot(v1, normal);
-            //__GEIGEN__::Matrix12x9d PDmPx;
-            if(dis < 0)
-            {
-                //is_flip = true;
-                normal = make_double3(-normal.x, -normal.y, -normal.z);
-                dis    = -dis;
-                //pDmpx_ee_flip(_vertexes[MMCVIDI.x], _vertexes[MMCVIDI.y], _vertexes[MMCVIDI.z], _vertexes[MMCVIDI.w], dHat_sqrt, PDmPx);
-                //printf("------------ee_flip\n");
-            }
-            else
-            {
-                //pDmpx_ee(_vertexes[MMCVIDI.x], _vertexes[MMCVIDI.y], _vertexes[MMCVIDI.z], _vertexes[MMCVIDI.w], dHat_sqrt, PDmPx);
-            }
-
-            double3 pos2 =
-                __GEIGEN__::__add(_vertexes[MMCVIDI.z],
-                                  __GEIGEN__::__s_vec_multiply(normal, dHat_sqrt - dis));
-            double3 pos3 =
-                __GEIGEN__::__add(_vertexes[MMCVIDI.w],
-                                  __GEIGEN__::__s_vec_multiply(normal, dHat_sqrt - dis));
-
-            double3 u0 = v0;
-            double3 u1 = __GEIGEN__::__minus(pos2, _vertexes[MMCVIDI.x]);
-            double3 u2 = __GEIGEN__::__minus(pos3, _vertexes[MMCVIDI.x]);
-
-            __GEIGEN__::Matrix3x3d Dm, DmInv;
-            __GEIGEN__::__set_Mat_val_column(Dm, u0, u1, u2);
-
-            __GEIGEN__::__Inverse(Dm, DmInv);
-
-            __GEIGEN__::Matrix3x3d F;
-            __GEIGEN__::__M_Mat_multiply(Ds, DmInv, F);
-
-            double3 FxN = __GEIGEN__::__M_v_multiply(F, normal);
-            double  I5  = __GEIGEN__::__squaredNorm(FxN);
-
-
-            __GEIGEN__::Matrix9x12d PFPx = __computePFDsPX3D_double(DmInv);
-#endif
 
 #if (RANK == 1)
             double lambda0 =
@@ -1845,49 +1867,29 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
                 / I5;
 #endif
 
-#ifdef NEWF
             H = __GEIGEN__::__S_Mat9x9_multiply(__GEIGEN__::__v9_vec9_toMat9x9(q0, q0), lambda0);
 
             __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPxT, H), __GEIGEN__::__Transpose12x9(PFPxT));
 
             __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPxT, H, Hessian);
-#else
-            __GEIGEN__::Matrix3x3d Q0;
 
-            __GEIGEN__::Matrix3x3d fnn;
+            int Hidx = matIndex[idx]; 
 
-            __GEIGEN__::Matrix3x3d nn = __GEIGEN__::__v_vec_toMat(normal, normal);
+            uint4 global_index =
+                make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
 
-            __GEIGEN__::__M_Mat_multiply(F, nn, fnn);
-
-            __GEIGEN__::Vector9 q0 = __GEIGEN__::__Mat3x3_to_vec9_double(fnn);
-
-            q0 = __GEIGEN__::__s_vec9_multiply(q0, 1.0 / sqrt(I5));
-
-            __GEIGEN__::Matrix9x9d H;
-            __GEIGEN__::__init_Mat9x9(H, 0);
-
-            H = __GEIGEN__::__S_Mat9x9_multiply(__GEIGEN__::__v9_vec9_toMat9x9(q0, q0), lambda0);
-
-            __GEIGEN__::Matrix12x9d PFPxTransPos = __GEIGEN__::__Transpose9x12(PFPx);
-            __GEIGEN__::Matrix12x12d Hessian = __GEIGEN__::__M12x9_M9x12_Multiply(
-                __GEIGEN__::__M12x9_M9x9_Multiply(PFPxTransPos, H), PFPx);
-#endif
-            int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
-
-            H12x12[Hidx] = Hessian;
-            D4Index[Hidx] = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            int triplet_id_offset = Hidx * 16;
+            write_triplet<12, 12>(
+                triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
         }
         else
         {
-            //return;
             MMCVIDI.w = -MMCVIDI.w - 1;
-            //printf("pee condition  ***************************************\n: %d  %d  %d  %d\n***************************************\n", MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
             double3 v0 =
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _vertexes[MMCVIDI.x]);
             double3 v1 =
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.w], _vertexes[MMCVIDI.z]);
-            double c = __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(v0, v1)) /*/ __GEIGEN__::__norm(v0)*/;
+            double c  = __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(v0, v1));
             double I1 = c * c;
             if(I1 == 0)
                 return;
@@ -2063,54 +2065,26 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
                                   * (I2 - 1) * (3 * I2 + I2 * log(I2) - 3))
                                / (I2 * (eps_x * eps_x));
 #endif
-#ifndef MAKEPD
-            double  eigenValues[2];
-            int     eigenNum = 0;
-            double2 eigenVecs[2];
-            __GEIGEN__::__makePD2x2(
-                lambda10, lambdag1g, lambdag1g, lambda20, eigenValues, eigenNum, eigenVecs);
-            for(int i = 0; i < eigenNum; i++)
-            {
-                if(eigenValues[i] > 0)
-                {
-                    __GEIGEN__::Matrix3x3d eigenMatrix;
-                    __GEIGEN__::__set_Mat_val(eigenMatrix,
-                                              0,
-                                              0,
-                                              0,
-                                              0,
-                                              eigenVecs[i].x,
-                                              0,
-                                              0,
-                                              0,
-                                              eigenVecs[i].y);
 
-                    __GEIGEN__::Vector9 eigenMVec =
-                        __GEIGEN__::__Mat3x3_to_vec9_double(eigenMatrix);
-
-                    M9_temp = __GEIGEN__::__v9_vec9_toMat9x9(eigenMVec, eigenMVec);
-                    M9_temp = __GEIGEN__::__S_Mat9x9_multiply(M9_temp, eigenValues[i]);
-                    projectedH = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-                }
-            }
-#else
-            MatT2x2 F_{lambda10, lambdag1g, lambdag1g, lambda20};
-            make_pd(F_);
+            Eigen::Matrix2d FMat2;
+            FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
+            makePDGeneral<double, 2>(FMat2);
             __GEIGEN__::__init_Mat9x9(M9_temp, 0);
-            M9_temp.m[4][4] = F_(0, 0);
-            M9_temp.m[4][8] = F_(0, 1);
-            M9_temp.m[8][4] = F_(1, 0);
-            M9_temp.m[8][8] = F_(1, 1);
+            M9_temp.m[4][4] = FMat2(0, 0);
+            M9_temp.m[4][8] = FMat2(0, 1);
+            M9_temp.m[8][4] = FMat2(1, 0);
+            M9_temp.m[8][8] = FMat2(1, 1);
             projectedH      = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-#endif
 
-            //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
-            __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
+            __GEIGEN__::Matrix12x12d Hessian; 
             __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
-            int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
+            int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-            H12x12[Hidx] = Hessian;
-            D4Index[Hidx] = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            uint4 global_index =
+                make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            int triplet_id_offset = Hidx * 16;
+            write_triplet<12, 12>(
+                triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
         }
     }
     else
@@ -2301,55 +2275,29 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
                                       * (I2 - 1) * (3 * I2 + I2 * log(I2) - 3))
                                    / (I2 * (eps_x * eps_x));
 #endif
-#ifndef MAKEPD
-                double  eigenValues[2];
-                int     eigenNum = 0;
-                double2 eigenVecs[2];
-                __GEIGEN__::__makePD2x2(
-                    lambda10, lambdag1g, lambdag1g, lambda20, eigenValues, eigenNum, eigenVecs);
-                for(int i = 0; i < eigenNum; i++)
-                {
-                    if(eigenValues[i] > 0)
-                    {
-                        __GEIGEN__::Matrix3x3d eigenMatrix;
-                        __GEIGEN__::__set_Mat_val(eigenMatrix,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].x,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].y);
-
-                        __GEIGEN__::Vector9 eigenMVec =
-                            __GEIGEN__::__Mat3x3_to_vec9_double(eigenMatrix);
-
-                        M9_temp = __GEIGEN__::__v9_vec9_toMat9x9(eigenMVec, eigenMVec);
-                        M9_temp = __GEIGEN__::__S_Mat9x9_multiply(M9_temp, eigenValues[i]);
-                        projectedH = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-                    }
-                }
-#else
-                MatT2x2 F_{lambda10, lambdag1g, lambdag1g, lambda20};
-                make_pd(F_);
+                Eigen::Matrix2d FMat2;
+                FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
+                makePDGeneral<double, 2>(FMat2);
                 __GEIGEN__::__init_Mat9x9(M9_temp, 0);
-                M9_temp.m[4][4] = F_(0, 0);
-                M9_temp.m[4][8] = F_(0, 1);
-                M9_temp.m[8][4] = F_(1, 0);
-                M9_temp.m[8][8] = F_(1, 1);
+                M9_temp.m[4][4] = FMat2(0, 0);
+                M9_temp.m[4][8] = FMat2(0, 1);
+                M9_temp.m[8][4] = FMat2(1, 0);
+                M9_temp.m[8][8] = FMat2(1, 1);
                 projectedH      = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-#endif
 
                 //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
                 __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
                 __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
                 int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
-                H12x12[Hidx] = Hessian;
-                D4Index[Hidx] =
+                uint4 global_index =
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+                //D4Index[Hidx] = global_index;
+
+
+                int triplet_id_offset = Hidx * 16;
+                write_triplet<12, 12>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
             else
             {
@@ -2501,8 +2449,12 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
 #endif
                 int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
-                H6x6[Hidx]    = Hessian;
-                D2Index[Hidx] = make_uint2(v0I, MMCVIDI.y);
+                uint2 global_index = make_uint2(v0I, MMCVIDI.y);
+                //D2Index[Hidx]      = global_index;
+
+                int triplet_id_offset = Hidx * 4 + offset3 * 9 + offset4 * 16;
+                write_triplet<6, 6>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
         }
         else if(MMCVIDI.w < 0)
@@ -2692,54 +2644,29 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
                                       * (I2 - 1) * (3 * I2 + I2 * log(I2) - 3))
                                    / (I2 * (eps_x * eps_x));
 #endif
-#ifndef MAKEPD
-                double  eigenValues[2];
-                int     eigenNum = 0;
-                double2 eigenVecs[2];
-                __GEIGEN__::__makePD2x2(
-                    lambda10, lambdag1g, lambdag1g, lambda20, eigenValues, eigenNum, eigenVecs);
-                for(int i = 0; i < eigenNum; i++)
-                {
-                    if(eigenValues[i] > 0)
-                    {
-                        __GEIGEN__::Matrix3x3d eigenMatrix;
-                        __GEIGEN__::__set_Mat_val(eigenMatrix,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].x,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].y);
-
-                        __GEIGEN__::Vector9 eigenMVec =
-                            __GEIGEN__::__Mat3x3_to_vec9_double(eigenMatrix);
-
-                        M9_temp = __GEIGEN__::__v9_vec9_toMat9x9(eigenMVec, eigenMVec);
-                        M9_temp = __GEIGEN__::__S_Mat9x9_multiply(M9_temp, eigenValues[i]);
-                        projectedH = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-                    }
-                }
-#else
-                MatT2x2 F_{lambda10, lambdag1g, lambdag1g, lambda20};
-                make_pd(F_);
+                Eigen::Matrix2d FMat2;
+                FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
+                makePDGeneral<double, 2>(FMat2);
                 __GEIGEN__::__init_Mat9x9(M9_temp, 0);
-                M9_temp.m[4][4] = F_(0, 0);
-                M9_temp.m[4][8] = F_(0, 1);
-                M9_temp.m[8][4] = F_(1, 0);
-                M9_temp.m[8][8] = F_(1, 1);
+                M9_temp.m[4][4] = FMat2(0, 0);
+                M9_temp.m[4][8] = FMat2(0, 1);
+                M9_temp.m[8][4] = FMat2(1, 0);
+                M9_temp.m[8][8] = FMat2(1, 1);
                 projectedH      = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-#endif
                 //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
                 __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
                 __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
                 int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
-                H12x12[Hidx] = Hessian;
-                D4Index[Hidx] =
+                uint4 global_index =
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+
+                //D4Index[Hidx] = global_index;
+
+
+                int triplet_id_offset = Hidx * 16;
+                write_triplet<12, 12>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
             else
             {
@@ -2936,8 +2863,13 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
 #endif
                 int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
-                H9x9[Hidx]    = Hessian;
-                D3Index[Hidx] = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
+                uint3 global_index = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
+
+                //D3Index[Hidx] = global_index;
+
+                int triplet_id_offset = Hidx * 9 + offset4 * 16;
+                write_triplet<9, 9>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
         }
         else
@@ -3087,8 +3019,8 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
             //H.m[8][8] = lambda0;
             __GEIGEN__::Matrix9x9d H = __GEIGEN__::__S_Mat9x9_multiply(
                 __GEIGEN__::__v9_vec9_toMat9x9(q0, q0), lambda0);  //__GEIGEN__::__v9_vec9_toMat9x9(q0, q0, lambda0);
-            __GEIGEN__::Matrix12x12d H2;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPxT, H), __GEIGEN__::__Transpose12x9(PFPxT));
-            __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPxT, H, H2);
+            __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPxT, H), __GEIGEN__::__Transpose12x9(PFPxT));
+            __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPxT, H, Hessian);
 
 #else
 
@@ -3114,26 +3046,29 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
 
             int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
-            H12x12[Hidx]  = H2;
-            D4Index[Hidx] = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            uint4 global_index = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //D4Index[Hidx]         = global_index;
+            int triplet_id_offset = Hidx * 16;
+            write_triplet<12, 12>(
+                triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
         }
     }
 }
 
 __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                                               const double3*    _rest_vertexes,
-                                              const const int4* _collisionPair,
+                                              const int4* _collisionPair,
                                               double3*          _gradient,
-                                              __GEIGEN__::Matrix12x12d* H12x12,
-                                              __GEIGEN__::Matrix9x9d*   H9x9,
-                                              __GEIGEN__::Matrix6x6d*   H6x6,
-                                              uint4*                    D4Index,
-                                              uint3*                    D3Index,
-                                              uint2*                    D2Index,
+                                              Eigen::Matrix3d* triplet_values,
+                                              int*             row_ids,
+                                              int*             col_ids,
                                               uint32_t*                 _cpNum,
                                               int*   matIndex,
                                               double dHat,
                                               double Kappa,
+                                              int              offset4,
+                                              int              offset3,
+                                              int              offset2,
                                               int    number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3382,8 +3317,15 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
             }
             int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
-            H12x12[Hidx] = Hessian;
-            D4Index[Hidx] = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //H12x12[Hidx] = Hessian;
+            uint4 global_index =
+                make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //D4Index[Hidx] = global_index;
+
+            int triplet_id_offset = Hidx * 16;
+            write_triplet<12, 12>(
+                triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
+            
         }
         else
         {
@@ -3655,8 +3597,13 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
             __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
             int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-            H12x12[Hidx] = Hessian;
-            D4Index[Hidx] = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //H12x12[Hidx] = Hessian;
+            uint4 global_index =
+                make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //D4Index[Hidx] = global_index;
+
+            int triplet_id_offset = Hidx * 16;
+            write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
         }
     }
     else
@@ -3933,9 +3880,14 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                 __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
                 int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-                H12x12[Hidx] = Hessian;
-                D4Index[Hidx] =
+                //H12x12[Hidx] = Hessian;
+                uint4 global_index =
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+                //D4Index[Hidx] = global_index;
+                    
+
+                int triplet_id_offset = Hidx * 16;
+                write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
             else
             {
@@ -4174,8 +4126,12 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
 #endif
                 int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 2, 1);
 
-                H6x6[Hidx]    = Hessian;
-                D2Index[Hidx] = make_uint2(v0I, MMCVIDI.y);
+                //H6x6[Hidx]    = Hessian;
+                uint2 global_index = make_uint2(v0I, MMCVIDI.y);
+                //D2Index[Hidx]      = global_index;
+
+                int triplet_id_offset = Hidx * 4 + offset3 * 9 + offset4 * 16;
+                write_triplet<6, 6>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
         }
         else if(MMCVIDI.w < 0)
@@ -4451,9 +4407,16 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                 __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
                 int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-                H12x12[Hidx] = Hessian;
-                D4Index[Hidx] =
+                //H12x12[Hidx] = Hessian;
+
+                uint4 global_index =
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+
+                //D4Index[Hidx] = global_index;
+                    
+
+                int triplet_id_offset = Hidx * 16;
+                write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
             else
             {
@@ -4743,8 +4706,15 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
 #endif
                 int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 3, 1);
 
-                H9x9[Hidx]    = Hessian;
-                D3Index[Hidx] = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
+                //H9x9[Hidx]    = Hessian;
+                
+                uint3 global_index = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
+
+                //D3Index[Hidx] = global_index;
+
+                int triplet_id_offset = Hidx * 9 + offset4 * 16;
+                write_triplet<9, 9>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
         }
         else
@@ -4992,8 +4962,11 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
 
             int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-            H12x12[Hidx]  = Hessian;
-            D4Index[Hidx] = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //H12x12[Hidx]  = Hessian;
+            uint4 global_index = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+            //D4Index[Hidx]         = global_index;
+            int triplet_id_offset = Hidx * 16;
+            write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x),Hessian.m, triplet_id_offset);
         }
     }
 }
@@ -6422,11 +6395,14 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
                                                          const uint32_t* targetInd,
                                                          double3*  gradient,
                                                          uint32_t* _gpNum,
-                                                         __GEIGEN__::Matrix3x3d* H3x3,
-                                                         uint32_t* D1Index,
-                                                         double    motionRate,
-                                                         double    rate,
-                                                         int       number)
+                                                         Eigen::Matrix3d* triplet_values,
+                                                         int*   row_ids,
+                                                         int*   col_ids,
+                                                         double motionRate,
+                                                         double rate,
+                                                         int    global_offset,
+                                                         int global_hessian_fem_offset,
+                                                         int    number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -6453,8 +6429,10 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
     Hpg.m[2][1]   = 0;
     Hpg.m[2][2]   = rate * rate * d;
     int pidx      = atomicAdd(_gpNum, 1);
-    H3x3[pidx]    = Hpg;
-    D1Index[pidx] = vInd;
+    //H3x3[pidx]    = Hpg;
+    //D1Index[pidx] = vInd;
+    vInd+=global_hessian_fem_offset;
+    write_triplet<3, 3>(triplet_values, row_ids, col_ids, &vInd, Hpg.m, global_offset + idx);
     //_environment_collisionPair[atomicAdd(_gpNum, 1)] = surfVertIds[idx];
 }
 
@@ -6518,19 +6496,21 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  const uint32_t* _environment_collisionPair,
                                                  double3*  gradient,
                                                  uint32_t* _gpNum,
-                                                 __GEIGEN__::Matrix3x3d* H3x3,
-                                                 uint32_t* D1Index,
-                                                 double    dHat,
-                                                 double    Kappa,
-                                                 int       number)
+                                                 Eigen::Matrix3d* triplet_values,
+                                                 int*   row_ids,
+                                                 int*   col_ids,
+                                                 double dHat,
+                                                 double Kappa,
+                                                 int    global_offset,
+                                                 int    number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
-    double3 normal = *g_normal;
-    int     gidx   = _environment_collisionPair[idx];
-    double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
-    double  dist2 = dist * dist;
+    double3      normal = *g_normal;
+    unsigned int gidx   = _environment_collisionPair[idx];
+    double dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
+    double dist2 = dist * dist;
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -6549,14 +6529,16 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
     }
 
     double param = 4.0 * H_b * dist2 + 2.0 * g_b;
-    if(param > 0)
+    //if(param > 0)
     {
         __GEIGEN__::Matrix3x3d nn = __GEIGEN__::__v_vec_toMat(normal, normal);
         __GEIGEN__::Matrix3x3d Hpg = __GEIGEN__::__S_Mat_multiply(nn, Kappa * param);
 
         int pidx      = atomicAdd(_gpNum, 1);
-        H3x3[pidx]    = Hpg;
-        D1Index[pidx] = gidx;
+        //H3x3[pidx]    = Hpg;
+        //D1Index[pidx] = gidx;
+
+        write_triplet<3, 3>(triplet_values, row_ids, col_ids, &gidx, Hpg.m, global_offset + idx);
     }
     //_environment_collisionPair[atomicAdd(_gpNum, 1)] = surfVertIds[idx];
 }
@@ -6566,8 +6548,7 @@ __global__ void _computeGroundGradient(const double3* vertexes,
                                        const double3* g_normal,
                                        const uint32_t* _environment_collisionPair,
                                        double3*                gradient,
-                                       uint32_t*               _gpNum,
-                                       __GEIGEN__::Matrix3x3d* H3x3,
+                                       uint32_t*               _gpNum,                                      
                                        double                  dHat,
                                        double                  Kappa,
                                        int                     number)
@@ -8558,7 +8539,6 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_close_gpNum));
     CUDA_SAFE_CALL(cudaFree(_environment_collisionPair));
     CUDA_SAFE_CALL(cudaFree(_gpNum));
-    //CUDA_SAFE_CALL(cudaFree(_moveDir));
     CUDA_SAFE_CALL(cudaFree(_groundNormal));
     CUDA_SAFE_CALL(cudaFree(_groundOffset));
 
@@ -8570,7 +8550,6 @@ void GIPC::FREE_DEVICE_MEM()
 
     bvh_e.FREE_DEVICE_MEM();
     bvh_f.FREE_DEVICE_MEM();
-    BH.FREE_DEVICE_MEM();
 }
 
 void GIPC::MALLOC_DEVICE_MEM()
@@ -8649,10 +8628,42 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     meanMass     = m_meanMass;
     meanVolumn   = m_meanVolumn;
     dHat = relative_dhat * relative_dhat * bboxDiagSize2;  //__GEIGEN__::__squaredNorm(__GEIGEN__::__minus(maxConer, minConer));
-    fDhat = 1e-4 * bboxDiagSize2;
-    BH.MALLOC_DEVICE_MEM_O(
-        abd_fem_count_info.fem_tet_num, surf_vertexNum, surface_Num, edge_Num, triangleNum, tri_edge_num);
+    fDhat = 1e-6 * bboxDiagSize2;
 
+
+
+
+    int global_matrix_block3_size =
+        abd_fem_count_info.abd_body_num * 4 + abd_fem_count_info.fem_point_num;
+
+
+    uint32_t Minimum = 200000;
+    int minCollisionBuffer4 = std::max(2 * (surf_vertexNum + edge_Num), Minimum);
+    int minCollisionBuffer3 = std::max(2 * (surf_vertexNum + edge_Num), Minimum);
+    int minCollisionBuffer2 = std::max(2 * (surf_vertexNum + edge_Num), Minimum);
+    int minCollisionBuffer1 = 2 * surf_vertexNum;
+
+    long long unsigned total_internal_triplet_num =
+        ((abd_fem_count_info.fem_tet_num + tri_edge_num) * 16 + triangleNum * 9)
+        + abd_fem_count_info.abd_body_num * 16;
+    long long unsigned total_max_collision_triplet_num =
+        minCollisionBuffer4 * 16 + minCollisionBuffer3 * 9
+        + minCollisionBuffer2 * 4 + minCollisionBuffer1;
+    long long unsigned total_max_global_triplet_num =
+        total_internal_triplet_num * 2 + total_max_collision_triplet_num;
+
+    gipc_global_triplet.resize(global_matrix_block3_size,
+                                  global_matrix_block3_size,
+                                  total_max_global_triplet_num);
+
+    gipc_global_triplet.global_external_max_capcity =
+        total_internal_triplet_num + total_max_collision_triplet_num;
+    gipc_global_triplet.resize_collision_hash_size(
+        gipc_global_triplet.global_external_max_capcity);
+
+
+    m_global_linear_system->gipc_global_triplet = &(gipc_global_triplet);
+    m_abd_system->global_triplet                = &(gipc_global_triplet);
     init_abd_system();
 }
 
@@ -8724,20 +8735,30 @@ void GIPC::GroundCollisionDetect()
         _vertexes, _surfVerts, _groundOffset, _groundNormal, _environment_collisionPair, _gpNum, dHat, numbers);
 }
 
-void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient)
+void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int global_hessian_fem_offset)
 {
     int numbers = softNum;
     if(numbers < 1)
     {
-        CUDA_SAFE_CALL(cudaMemcpy(&BH.DNum, _gpNum, sizeof(int), cudaMemcpyDeviceToHost));
         return;
     }
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
     // offset
     _computeSoftConstraintGradientAndHessian<<<blockNum, threadNum>>>(
-        _vertexes, targetVert, targetInd, _gradient, _gpNum, BH.H3x3, BH.D1Index, softMotionRate, animation_fullRate, softNum);
-    CUDA_SAFE_CALL(cudaMemcpy(&BH.DNum, _gpNum, sizeof(int), cudaMemcpyDeviceToHost));
+        _vertexes,
+        targetVert,
+        targetInd,
+        _gradient,
+        _gpNum,
+        gipc_global_triplet.block_values(),
+        gipc_global_triplet.block_row_indices(),
+        gipc_global_triplet.block_col_indices(),
+        softMotionRate,
+        animation_fullRate,
+        gipc_global_triplet.global_triplet_offset,
+        global_hessian_fem_offset,
+        softNum);
 }
 
 void GIPC::getTotalForce(double3* _gradient0, double3* _gradient1)
@@ -8751,6 +8772,8 @@ void GIPC::getTotalForce(double3* _gradient0, double3* _gradient1)
     _getTotalForce<<<blockNum, threadNum>>>(_gradient0, _gradient1, numbers);
 }
 
+
+
 void GIPC::computeGroundGradientAndHessian(double3* _gradient)
 {
 #ifndef USE_FRICTION
@@ -8759,23 +8782,24 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
     int numbers = h_gpNum;
     if(numbers < 1)
     {
-        CUDA_SAFE_CALL(cudaMemcpy(&BH.DNum, _gpNum, sizeof(int), cudaMemcpyDeviceToHost));
         return;
     }
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
-    _computeGroundGradientAndHessian<<<blockNum, threadNum>>>(_vertexes,
-                                                              _groundOffset,
-                                                              _groundNormal,
-                                                              _environment_collisionPair,
-                                                              _gradient,
-                                                              _gpNum,
-                                                              BH.H3x3,
-                                                              BH.D1Index,
-                                                              dHat,
-                                                              Kappa,
-                                                              numbers);
-    CUDA_SAFE_CALL(cudaMemcpy(&BH.DNum, _gpNum, sizeof(int), cudaMemcpyDeviceToHost));
+    _computeGroundGradientAndHessian<<<blockNum, threadNum>>>(
+        _vertexes,
+        _groundOffset,
+        _groundNormal,
+        _environment_collisionPair,
+        _gradient,
+        _gpNum,
+        gipc_global_triplet.block_values(),
+        gipc_global_triplet.block_row_indices(),
+        gipc_global_triplet.block_col_indices(),
+        dHat,
+        Kappa,
+        gipc_global_triplet.global_triplet_offset,
+        numbers);
 }
 
 void GIPC::computeCloseGroundVal()
@@ -8864,8 +8888,7 @@ void GIPC::computeGroundGradient(double3* _gradient, double mKappa)
                                                     _groundNormal,
                                                     _environment_collisionPair,
                                                     _gradient,
-                                                    _gpNum,
-                                                    BH.H3x3,
+                                                    _gpNum,                                                
                                                     dHat,
                                                     mKappa,
                                                     numbers);
@@ -9123,22 +9146,23 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-
-    _calBarrierGradientAndHessian<<<blockNum, threadNum>>>(_vertexes,
-                                                           _rest_vertexes,
-                                                           _collisonPairs,
-                                                           _gradient,
-                                                           BH.H12x12,
-                                                           BH.H9x9,
-                                                           BH.H6x6,
-                                                           BH.D4Index,
-                                                           BH.D3Index,
-                                                           BH.D2Index,
-                                                           _cpNum,
-                                                           _MatIndex,
-                                                           dHat,
-                                                           mKappa,
-                                                           numbers);
+    _calBarrierGradientAndHessian<<<blockNum, threadNum>>>(
+        _vertexes,
+        _rest_vertexes,
+        _collisonPairs,
+        _gradient,
+        gipc_global_triplet.block_values(),
+        gipc_global_triplet.block_row_indices(),
+        gipc_global_triplet.block_col_indices(),
+        _cpNum,
+        _MatIndex,
+        dHat,
+        mKappa,
+        h_cpNum[4],
+        h_cpNum[3],
+        h_cpNum[2],
+        numbers);
+    
 }
 
 
@@ -9148,22 +9172,22 @@ void GIPC::calBarrierHessian()
     int numbers = h_cpNum[0];
     if(numbers < 1)
         return;
-    const unsigned int threadNum = 256;
+    const unsigned int threadNum = 32;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
 
     _calBarrierHessian<<<blockNum, threadNum>>>(_vertexes,
                                                 _rest_vertexes,
                                                 _collisonPairs,
-                                                BH.H12x12,
-                                                BH.H9x9,
-                                                BH.H6x6,
-                                                BH.D4Index,
-                                                BH.D3Index,
-                                                BH.D2Index,
+                                                gipc_global_triplet.block_values(),
+                                                gipc_global_triplet.block_row_indices(),
+                                                gipc_global_triplet.block_col_indices(),
                                                 _cpNum,
                                                 _MatIndex,
                                                 dHat,
                                                 Kappa,
+                                                h_cpNum[4],
+                                                h_cpNum[3],
+                                                h_cpNum[2],
                                                 numbers);
 
 }
@@ -9176,46 +9200,52 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
     if(numbers > 0)
     {
-        _calFrictionHessian<<<blockNum, threadNum>>>(_vertexes,
-                                                     TetMesh.o_vertexes,
-                                                     _collisonPairs_lastH,
-                                                     BH.H12x12,
-                                                     BH.H9x9,
-                                                     BH.H6x6,
-                                                     BH.D4Index,
-                                                     BH.D3Index,
-                                                     BH.D2Index,
-                                                     _cpNum,
-                                                     numbers,
-                                                     IPC_dt,
-                                                     distCoord,
-                                                     tanBasis,
-                                                     fDhat * IPC_dt * IPC_dt,
-                                                     lambda_lastH_scalar,
-                                                     frictionRate,
-                                                     h_cpNum[4],
-                                                     h_cpNum[3],
-                                                     h_cpNum[2]);
+        _calFrictionHessian<<<blockNum, threadNum>>>(
+            _vertexes,
+            TetMesh.o_vertexes,
+            _collisonPairs_lastH,
+            gipc_global_triplet.block_values(),
+            gipc_global_triplet.block_row_indices(),
+            gipc_global_triplet.block_col_indices(),
+            _cpNum,
+            numbers,
+            IPC_dt,
+            distCoord,
+            tanBasis,
+            fDhat * IPC_dt * IPC_dt,
+            lambda_lastH_scalar,
+            frictionRate,
+            h_cpNum[4],
+            h_cpNum[3],
+            h_cpNum[2],
+            h_cpNum_last[4],
+            h_cpNum_last[3],
+            h_cpNum_last[2]);
     }
 
     numbers = h_gpNum_last;
     CUDA_SAFE_CALL(cudaMemcpy(_gpNum, &h_gpNum_last, sizeof(uint32_t), cudaMemcpyHostToDevice));
     if(numbers < 1)
         return;
-    
-    blockNum = (numbers + threadNum - 1) / threadNum;
 
-    _calFrictionHessian_gd<<<blockNum, threadNum>>>(_vertexes,
-                                                    TetMesh.o_vertexes,
-                                                    _groundNormal,
-                                                    _collisonPairs_lastH_gd,
-                                                    BH.H3x3,
-                                                    BH.D1Index,
-                                                    numbers,
-                                                    IPC_dt,
-                                                    fDhat * IPC_dt * IPC_dt,
-                                                    lambda_lastH_scalar_gd,
-                                                    gd_frictionRate);
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    int global_offset = gipc_global_triplet.global_triplet_offset
+                        + h_cpNum_last[4] * 16 + h_cpNum_last[3] * 9
+                        + h_cpNum_last[2] * 4;
+    _calFrictionHessian_gd<<<blockNum, threadNum>>>(
+        _vertexes,
+        TetMesh.o_vertexes,
+        _groundNormal,
+        _collisonPairs_lastH_gd,
+        gipc_global_triplet.block_values(),
+        gipc_global_triplet.block_row_indices(),
+        gipc_global_triplet.block_col_indices(),
+        numbers,
+        IPC_dt,
+        fDhat * IPC_dt * IPC_dt,
+        lambda_lastH_scalar_gd,
+        global_offset,
+        gd_frictionRate);
 }
 
 void GIPC::computeSelfCloseVal()
@@ -9355,15 +9385,18 @@ void calKineticGradient(double3* _vertexes, double3* _xTilta, double3* _gradient
 void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d*   DmInverses,
                                     const double3*            vertexes,
                                     const uint4*              tetrahedras,
-                                    __GEIGEN__::Matrix12x12d* Hessians,
-                                    const uint32_t&           offset,
                                     const double*             volume,
                                     double3*                  gradient,
                                     int                       tetrahedraNum_FEM,
                                     int                       tetrahedraNum_ABD,
                                     const double*             lenRate,
                                     const double*             volRate,
-                                    double                    IPC_dt)
+                                    int                       global_offset,
+                                    Eigen::Matrix3d*          triplet_values,
+                                    int*                      row_ids,
+                                    int*                      col_ids,
+                                    double                    IPC_dt,
+                                    int global_hessian_fem_offset)
 {
     int numbers = tetrahedraNum_FEM;
     if(numbers < 1)
@@ -9374,28 +9407,35 @@ void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d*   DmInverses,
         DmInverses + tetrahedraNum_ABD,
         vertexes,
         tetrahedras + tetrahedraNum_ABD,
-        Hessians,
-        offset,
         volume + tetrahedraNum_ABD,
         gradient,
         numbers,
         lenRate + tetrahedraNum_ABD,
         volRate + tetrahedraNum_ABD,
-        IPC_dt);
+        //tet_ids,
+        global_offset,
+        triplet_values,
+        row_ids,
+        col_ids,
+        IPC_dt,
+        global_hessian_fem_offset);
 }
 
 void calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* triDmInverses,
                                              const double3*          vertexes,
                                              const uint3*            triangles,
-                                             __GEIGEN__::Matrix9x9d* Hessians,
-                                             const uint32_t&         offset,
                                              const double*           area,
                                              double3*                gradient,
-                                             int    triangleNum,
-                                             double stretchStiff,
-                                             double shearStiff,
-                                             double strainRate,
-                                             double IPC_dt)
+                                             int              triangleNum,
+                                             double           stretchStiff,
+                                             double           shearStiff,
+                                             double           strainRate,
+                                             int              global_offset,
+                                             Eigen::Matrix3d* triplet_values,
+                                             int*             row_ids,
+                                             int*             col_ids,
+                                             double           IPC_dt,
+                                             int global_hessian_fem_offset)
 {
     int numbers = triangleNum;
     if(numbers < 1)
@@ -9405,15 +9445,18 @@ void calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* triDmInvers
     _calculate_triangle_fem_gradient_hessian<<<blockNum, threadNum>>>(triDmInverses,
                                                                       vertexes,
                                                                       triangles,
-                                                                      Hessians,
-                                                                      offset,
                                                                       area,
                                                                       gradient,
                                                                       triangleNum,
                                                                       stretchStiff,
                                                                       shearStiff,
                                                                       IPC_dt,
-                                                                      strainRate);
+                                                                      global_offset,
+                                                                      triplet_values,
+                                                                      row_ids,
+                                                                      col_ids,
+                                                                      strainRate,
+                                                                      global_hessian_fem_offset);
 }
 
 
@@ -9463,24 +9506,37 @@ void calculate_bending_gradient_hessian(const double3* vertexes,
                                         const double3* rest_vertexes,
                                         const uint2*   edges,
                                         const uint2*   edges_adj_vertex,
-                                        __GEIGEN__::Matrix12x12d* Hessians,
-                                        uint4*                    Indices,
-                                        const uint32_t&           offset,
                                         double3*                  gradient,
                                         int                       edgeNum,
                                         double                    bendStiff,
-                                        double                    IPC_dt)
+                                        int                       global_offset,
+                                        Eigen::Matrix3d* triplet_values,
+                                        int*             row_ids,
+                                        int*             col_ids,
+                                        double           IPC_dt,
+                                        int global_hessian_fem_offset)
 {
     int numbers = edgeNum;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calculate_bending_gradient_hessian<<<blockNum, threadNum>>>(
-        vertexes, rest_vertexes, edges, edges_adj_vertex, Hessians, Indices, offset, gradient, edgeNum, bendStiff, IPC_dt);
+    _calculate_bending_gradient_hessian<<<blockNum, threadNum>>>(vertexes,
+                                                                 rest_vertexes,
+                                                                 edges,
+                                                                 edges_adj_vertex,
+                                                                 gradient,
+                                                                 edgeNum,
+                                                                 bendStiff,
+                                                                 global_offset,
+                                                                 triplet_values,
+                                                                 row_ids,
+                                                                 col_ids,
+                                                                 IPC_dt,
+                                                                 global_hessian_fem_offset);
 }
 
-void calculate_fem_gradient(__GEIGEN__::Matrix3x3d* DmInverses,
+    void calculate_fem_gradient(__GEIGEN__::Matrix3x3d* DmInverses,
                             const double3*          vertexes,
                             const uint4*            tetrahedras,
                             const double*           volume,
@@ -9905,95 +9961,168 @@ void GIPC::initKappa(device_TetraData& TetMesh)
     //printf("Kappa ====== %f\n", Kappa);
 }
 
-void CPU_MAKEPD(BHessian& BH, uint32_t hcpNUm[5])
+
+
+void GIPC::partitionContactHessian()
 {
-    //CUDA_SAFE_CALL(cudaMemcpy(BH.hH12x12, BH.H12x12, hcpNUm[4] * sizeof(__GEIGEN__::Matrix12x12d), cudaMemcpyDeviceToHost));
-    //CUDA_SAFE_CALL(cudaMemcpy(BH.hH9x9, BH.H9x9, hcpNUm[3] * sizeof(__GEIGEN__::Matrix9x9d), cudaMemcpyDeviceToHost));
-    //CUDA_SAFE_CALL(cudaMemcpy(BH.hH6x6, BH.H6x6, hcpNUm[2] * sizeof(__GEIGEN__::Matrix6x6d), cudaMemcpyDeviceToHost));
-    ////CUDA_SAFE_CALL(cudaMemcpy(BH.hH3x3, BH.H3x3, hcpNUm[1] * sizeof(__GEIGEN__::Matrix12x12d), cudaMemcpyDeviceToHost));
-    //std::vector<Matrix<double, 12, 12>> M12(hcpNUm[4]);
-    //std::vector<Matrix<double, 9, 9>> M9(hcpNUm[3]);
-    //std::vector<Matrix<double, 6, 6>> M6(hcpNUm[2]);
 
-    //tbb::parallel_for(0, (int)hcpNUm[4], 1, [&](int vI)
+    muda::DeviceRadixSort().SortPairs(gipc_global_triplet.block_hash_value(),
+                                      gipc_global_triplet.block_sort_hash_value(),
+                                      gipc_global_triplet.block_index(),
+                                      gipc_global_triplet.block_sort_index(),
+                                      gipc_global_triplet.global_collision_triplet_offset);
 
-    //                  {
-    //                      for (int i = 0;i < 12;i++) {
-    //                          for (int j = 0;j < 12;j++) {
-    //                              M12[vI](i, j) = BH.hH12x12[vI].m[i][j];
-    //                          }
-    //                      }
+    int threadNum = 256;
+    
+    LaunchCudaKernal_default(
+        gipc_global_triplet.global_collision_triplet_offset,
+                     threadNum,
+                     0,
+                     _reorder_triplets,
+                     gipc_global_triplet.block_row_indices(),
+                     gipc_global_triplet.block_col_indices(),
+                     gipc_global_triplet.block_values(),
+                     gipc_global_triplet.block_row_indices(
+                         gipc_global_triplet.global_collision_triplet_offset),
+                     gipc_global_triplet.block_col_indices(
+                         gipc_global_triplet.global_collision_triplet_offset),
+                     gipc_global_triplet.block_values(
+                         gipc_global_triplet.global_collision_triplet_offset),
+                     (const uint32_t*)gipc_global_triplet.block_sort_index(),
+                     gipc_global_triplet.global_collision_triplet_offset);
 
-    //                      makePDonCPU<double, 12>(M12[vI]);
-
-    //                      for (int i = 0;i < 12;i++) {
-    //                          for (int j = 0;j < 12;j++) {
-    //                              BH.hH12x12[vI].m[i][j] = M12[vI](i, j);
-    //                          }
-    //                      }
-    //                  }
-
-    //);
-
-    //tbb::parallel_for(0, (int)hcpNUm[3], 1, [&](int vI)
-
-    //                  {
-    //                      for (int i = 0;i < 9;i++) {
-    //                          for (int j = 0;j < 9;j++) {
-    //                              M9[vI](i, j) = BH.hH9x9[vI].m[i][j];
-    //                          }
-    //                      }
-    //                      makePDonCPU<double, 9>(M9[vI]);
-
-    //                      for (int i = 0;i < 9;i++) {
-    //                          for (int j = 0;j < 9;j++) {
-    //                              BH.hH9x9[vI].m[i][j] = M9[vI](i, j);
-    //                          }
-    //                      }
-
-    //                  }
-
-    //);
-
-    //tbb::parallel_for(0, (int)hcpNUm[2], 1, [&](int vI)
-
-    //                  {
-    //                      for (int i = 0;i < 6;i++) {
-    //                          for (int j = 0;j < 6;j++) {
-    //                              M6[vI](i, j) = BH.hH6x6[vI].m[i][j];
-    //                          }
-    //                      }
+    gipc_global_triplet.d_abd_abd_contact_start_id = -1;
+    gipc_global_triplet.d_abd_fem_contact_start_id = -1;
+    gipc_global_triplet.d_fem_abd_contact_start_id = -1;
+    gipc_global_triplet.d_fem_fem_contact_start_id = -1;
 
 
-    //                      makePDonCPU<double, 6>(M6[vI]);
+    size_t shareMem = (threadNum + 1) * sizeof(int);
+    LaunchCudaKernal(gipc_global_triplet.global_collision_triplet_offset,
+                     threadNum,
+                     shareMem,
+                     _partition_collision_triplets,
+                     (const uint64_t*)gipc_global_triplet.block_sort_hash_value(),
+                     gipc_global_triplet.d_abd_abd_contact_start_id.data(),
+                     gipc_global_triplet.d_abd_fem_contact_start_id.data(),
+                     gipc_global_triplet.d_fem_abd_contact_start_id.data(),
+                     gipc_global_triplet.d_fem_fem_contact_start_id.data(),
+                     //abd_fem_count_info.abd_point_num,
+                     gipc_global_triplet.global_collision_triplet_offset);
 
-    //                      for (int i = 0;i < 6;i++) {
-    //                          for (int j = 0;j < 6;j++) {
-    //                              BH.hH6x6[vI].m[i][j] = M6[vI](i, j);
-    //                          }
-    //                      }
 
-    //                  }
+    gipc_global_triplet.h_abd_abd_contact_start_id =
+        gipc_global_triplet.d_abd_abd_contact_start_id;
+    gipc_global_triplet.h_abd_fem_contact_start_id =
+        gipc_global_triplet.d_abd_fem_contact_start_id;
+    gipc_global_triplet.h_fem_abd_contact_start_id =
+        gipc_global_triplet.d_fem_abd_contact_start_id;
+    gipc_global_triplet.h_fem_fem_contact_start_id =
+        gipc_global_triplet.d_fem_fem_contact_start_id;
 
-    //);
+    if(gipc_global_triplet.h_fem_fem_contact_start_id >= 0)
+    {
+        if(gipc_global_triplet.h_abd_fem_contact_start_id > 0)
+        {
+            gipc_global_triplet.fem_fem_contact_num =
+                gipc_global_triplet.h_abd_fem_contact_start_id
+                - gipc_global_triplet.h_fem_fem_contact_start_id;
 
-    //CUDA_SAFE_CALL(cudaMemcpy(BH.H12x12, BH.hH12x12, hcpNUm[4] * sizeof(__GEIGEN__::Matrix12x12d), cudaMemcpyHostToDevice));
-    //CUDA_SAFE_CALL(cudaMemcpy(BH.H9x9, BH.hH9x9, hcpNUm[3] * sizeof(__GEIGEN__::Matrix9x9d), cudaMemcpyHostToDevice));
-    //CUDA_SAFE_CALL(cudaMemcpy(BH.H6x6, BH.hH6x6, hcpNUm[2] * sizeof(__GEIGEN__::Matrix6x6d), cudaMemcpyHostToDevice));
+            gipc_global_triplet.abd_fem_contact_num =
+                gipc_global_triplet.h_fem_abd_contact_start_id
+                - gipc_global_triplet.h_abd_fem_contact_start_id;
+
+            gipc_global_triplet.fem_abd_contact_num =
+                gipc_global_triplet.h_abd_abd_contact_start_id
+                - gipc_global_triplet.h_fem_abd_contact_start_id;
+            gipc_global_triplet.abd_abd_contact_num =
+                gipc_global_triplet.global_collision_triplet_offset
+                - gipc_global_triplet.h_abd_abd_contact_start_id;
+        }
+        else if(gipc_global_triplet.h_abd_abd_contact_start_id > 0)
+        {
+            gipc_global_triplet.fem_fem_contact_num =
+                gipc_global_triplet.h_abd_abd_contact_start_id
+                - gipc_global_triplet.h_fem_fem_contact_start_id;
+            gipc_global_triplet.abd_abd_contact_num =
+                gipc_global_triplet.global_collision_triplet_offset
+                - gipc_global_triplet.h_abd_abd_contact_start_id;
+
+            gipc_global_triplet.abd_fem_contact_num = 0;
+            gipc_global_triplet.fem_abd_contact_num = 0;
+        }
+        else
+        {
+            gipc_global_triplet.fem_fem_contact_num =
+                gipc_global_triplet.global_collision_triplet_offset;
+
+            gipc_global_triplet.abd_abd_contact_num = 0;
+
+            gipc_global_triplet.abd_fem_contact_num = 0;
+            gipc_global_triplet.fem_abd_contact_num = 0;
+        }
+    }
+    else if(gipc_global_triplet.h_abd_abd_contact_start_id >= 0)
+    {
+        gipc_global_triplet.abd_abd_contact_num =
+            gipc_global_triplet.global_collision_triplet_offset;
+
+        gipc_global_triplet.fem_fem_contact_num = 0;
+        gipc_global_triplet.abd_fem_contact_num = 0;
+        gipc_global_triplet.fem_abd_contact_num = 0;
+    }
+    else
+    {
+        gipc_global_triplet.abd_abd_contact_num = 0;
+        gipc_global_triplet.fem_fem_contact_num = 0;
+        gipc_global_triplet.abd_fem_contact_num = 0;
+        gipc_global_triplet.fem_abd_contact_num = 0;
+    }
+
+    gipc_global_triplet.h_fem_fem_contact_start_id = 0;
+    gipc_global_triplet.h_abd_fem_contact_start_id =
+        gipc_global_triplet.h_fem_fem_contact_start_id
+        + gipc_global_triplet.fem_fem_contact_num;
+    gipc_global_triplet.h_fem_abd_contact_start_id =
+        gipc_global_triplet.h_abd_fem_contact_start_id
+        + gipc_global_triplet.abd_fem_contact_num;
+    gipc_global_triplet.h_abd_abd_contact_start_id =
+        gipc_global_triplet.h_fem_abd_contact_start_id
+        + gipc_global_triplet.fem_abd_contact_num;
+
+
+    int number = gipc_global_triplet.global_collision_triplet_offset;
+
+    CUDA_SAFE_CALL(cudaMemcpy(
+        gipc_global_triplet.block_row_indices(),
+        gipc_global_triplet.block_row_indices() + gipc_global_triplet.global_collision_triplet_offset,
+        gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+        cudaMemcpyDeviceToDevice));
+
+    CUDA_SAFE_CALL(cudaMemcpy(
+        gipc_global_triplet.block_col_indices(),
+        gipc_global_triplet.block_col_indices() + gipc_global_triplet.global_collision_triplet_offset,
+        gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+        cudaMemcpyDeviceToDevice));
+
+    CUDA_SAFE_CALL(cudaMemcpy(
+        gipc_global_triplet.block_values(),
+        gipc_global_triplet.block_values() + gipc_global_triplet.global_collision_triplet_offset,
+        gipc_global_triplet.global_collision_triplet_offset * sizeof(Eigen::Matrix3d),
+        cudaMemcpyDeviceToDevice));
 }
-
 
 float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 {
     gipc::Timer timer{"cal_gradient_hessian"};
 
     CUDA_SAFE_CALL(cudaMemset(TetMesh.fb, 0, vertexNum * sizeof(double3)));
-    //CUDA_SAFE_CALL(cudaMemset(TetMesh.shape_grads, 0, vertexNum * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemset(TetMesh.shape_grads, 0, vertexNum * sizeof(double3)));
 
-    muda::BufferView<double3>{TetMesh.shape_grads, vertexNum}.fill(double3{0, 0, 0});
+    //muda::BufferView<double3>{TetMesh.shape_grads, vertexNum}.fill(double3{0, 0, 0});
 
 
-    auto shape_grads = use_new_linear_system ? TetMesh.shape_grads : TetMesh.fb;
+    auto shape_grads   = TetMesh.shape_grads;
     auto contact_grads = TetMesh.fb;
     {
         gipc::Timer timer{"cal_kinetic_gradient"};
@@ -10001,127 +10130,163 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             TetMesh.vertexes, TetMesh.xTilta, shape_grads, TetMesh.masses, vertexNum);
     }
 
+    gipc_global_triplet.global_triplet_offset = 0;
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
         CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
-        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
         //calBarrierHessian();
         //calBarrierGradient(contact_grads, Kappa);
-        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
         calBarrierGradientAndHessian(contact_grads, Kappa);
+        gipc_global_triplet.global_triplet_offset +=
+            h_cpNum[4] * 16 + h_cpNum[3] * 9 + h_cpNum[2] * 4;
     }
 
     float time00 = 0;
-    //    cudaEvent_t start, end0;
-    //    cudaEventCreate(&start);
-    //    cudaEventCreate(&end0);
-    //    cudaEventRecord(start);
-    //
-    //    calBarrierHessian();
-    //
-    //    CPU_MAKEPD(BH, h_cpNum);
-    //
-    //    cudaEventRecord(end0);
-    //
-    //    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    //
-    //    cudaEventElapsedTime(&time00, start, end0);
-    //    (cudaEventDestroy(start));
-    //    (cudaEventDestroy(end0));
 
-    //calBarrierGradient(TetMesh.fb, Kappa);
 #ifdef USE_FRICTION
     {
+
         gipc::Timer timer{"cal_friction_gradient_hessian"};
         calFrictionGradient(contact_grads, TetMesh);
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
         calFrictionHessian(TetMesh);
+        gipc_global_triplet.global_triplet_offset +=
+            h_cpNum_last[4] * 16 + h_cpNum_last[3] * 9 + h_cpNum_last[2] * 4 + h_gpNum_last;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     }
 #endif
+
+    computeGroundGradientAndHessian(contact_grads);
+    gipc_global_triplet.global_triplet_offset += h_gpNum;
+    gipc_global_triplet.global_collision_triplet_offset =
+        gipc_global_triplet.global_triplet_offset;
+
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    gipc_global_triplet.update_hash_value(abd_fem_count_info.abd_point_num);
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    partitionContactHessian();
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+
+    {
+        gipc::Timer timer{"setup_abd_system_gradient_hessian"};
+
+        m_abd_system->setup_abd_system_gradient_hessian(
+            *m_abd_sim_data,
+            TetMesh.BoundaryType,
+            muda::BufferView<double3>{TetMesh.fb, vertexNum}.subview(
+                abd_fem_count_info.abd_point_offset, abd_fem_count_info.abd_point_num),
+            gipc_global_triplet);
+    }
+
+    int fem_global_hessian_index_offset =
+        -abd_fem_count_info.abd_point_num + abd_fem_count_info.abd_body_num * 4;
+    {
+        muda::ParallelFor(256)
+            .kernel_name(__FUNCTION__)
+            .apply(gipc_global_triplet.fem_fem_contact_num,
+                   [cfem_rows = gipc_global_triplet.block_row_indices(
+                        gipc_global_triplet.h_fem_fem_contact_start_id),
+                    cfem_cols = gipc_global_triplet.block_col_indices(
+                        gipc_global_triplet.h_fem_fem_contact_start_id),
+                    fem_global_hessian_index_offset] __device__(int i) mutable
+                   {
+                       cfem_rows[i] = cfem_rows[i] + fem_global_hessian_index_offset;
+                       cfem_cols[i] = cfem_cols[i] + fem_global_hessian_index_offset;
+                   });
+    }
+
     {
         gipc::Timer timer{"cal_fem_gradient_hessian"};
 
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
         calculate_fem_gradient_hessian(TetMesh.DmInverses,
                                        TetMesh.vertexes,
-                                       TetMesh.tetrahedras,
-                                       BH.H12x12,
-                                       h_cpNum[4] + h_cpNum_last[4],
+                                       TetMesh.tetrahedras,                                       
                                        TetMesh.volum,
                                        shape_grads,
                                        abd_fem_count_info.fem_tet_num,
                                        abd_fem_count_info.abd_tet_num,
                                        TetMesh.lengthRate,
                                        TetMesh.volumeRate,
-                                       IPC_dt);
+                                       gipc_global_triplet.global_triplet_offset,
+                                       gipc_global_triplet.block_values(),
+                                       gipc_global_triplet.block_row_indices(),
+                                       gipc_global_triplet.block_col_indices(),
+                                       IPC_dt,
+                                       fem_global_hessian_index_offset);
+        gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_tet_num * 16;
+
+
+        calculate_bending_gradient_hessian(
+            TetMesh.vertexes,
+            TetMesh.rest_vertexes,
+            TetMesh.tri_edges,
+            TetMesh.tri_edge_adj_vertex,
+            shape_grads,
+            tri_edge_num,
+            bendStiff,
+            gipc_global_triplet.global_triplet_offset,
+            gipc_global_triplet.block_values(),
+            gipc_global_triplet.block_row_indices(),
+            gipc_global_triplet.block_col_indices(),
+            IPC_dt,
+            fem_global_hessian_index_offset);
+        gipc_global_triplet.global_triplet_offset += tri_edge_num * 16;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        CUDA_SAFE_CALL(cudaMemcpy(BH.D4Index + h_cpNum[4] + h_cpNum_last[4],
-                                  TetMesh.tetrahedras + abd_fem_count_info.abd_tet_num,
-                                  abd_fem_count_info.fem_tet_num * sizeof(uint4),
-                                  cudaMemcpyDeviceToDevice));
 
-        calculate_bending_gradient_hessian(TetMesh.vertexes,
-                                           TetMesh.rest_vertexes,
-                                           TetMesh.tri_edges,
-                                           TetMesh.tri_edge_adj_vertex,
-                                           BH.H12x12,
-                                           BH.D4Index,
-                                           h_cpNum[4] + h_cpNum_last[4]
-                                               + abd_fem_count_info.fem_tet_num,
-                                           shape_grads,
-                                           tri_edge_num,
-                                           bendStiff,
-                                           IPC_dt);
-        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        calculate_triangle_fem_gradient_hessian(
+            TetMesh.triDmInverses,
+            TetMesh.vertexes,
+            TetMesh.triangles,
+            TetMesh.area,
+            shape_grads,
+            triangleNum,
+            stretchStiff,
+            shearStiff,
+            strainRate,
+            gipc_global_triplet.global_triplet_offset,
+            gipc_global_triplet.block_values(),
+            gipc_global_triplet.block_row_indices(),
+            gipc_global_triplet.block_col_indices(),
+            IPC_dt,
+            fem_global_hessian_index_offset);
 
-        calculate_triangle_fem_gradient_hessian(TetMesh.triDmInverses,
-                                                TetMesh.vertexes,
-                                                TetMesh.triangles,
-                                                BH.H9x9,
-                                                h_cpNum[3] + h_cpNum_last[3],
-                                                TetMesh.area,
-                                                shape_grads,
-                                                triangleNum,
-                                                stretchStiff,
-                                                shearStiff,
-                                                strainRate,
-                                                IPC_dt);
-        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        CUDA_SAFE_CALL(cudaMemcpy(BH.D3Index + h_cpNum[3] + h_cpNum_last[3],
-                                  TetMesh.triangles,
-                                  triangleNum * sizeof(uint3),
-                                  cudaMemcpyDeviceToDevice));
+        gipc_global_triplet.global_triplet_offset += triangleNum * 9;
+
+
+
+        computeSoftConstraintGradientAndHessian(shape_grads, fem_global_hessian_index_offset);
+        gipc_global_triplet.global_triplet_offset += softNum;
+
+        //int massNum = 
+                muda::ParallelFor()
+            .file_line(__FILE__, __LINE__)
+            .apply(abd_fem_count_info.fem_point_num,
+                   [mass      = TetMesh.masses,
+                    cfem_rows = gipc_global_triplet.block_row_indices(
+                        gipc_global_triplet.global_triplet_offset),
+                    cfem_cols = gipc_global_triplet.block_col_indices(
+                        gipc_global_triplet.global_triplet_offset),
+                    triplet_fem = gipc_global_triplet.block_values(
+                        gipc_global_triplet.global_triplet_offset),
+                    fem_global_hessian_index_offset,
+                    fem_pint_start = abd_fem_count_info.abd_point_num,
+                    abd_num = abd_fem_count_info.abd_body_num] __device__(int i) mutable
+                   {
+                       triplet_fem[i] =
+                           mass[i + fem_pint_start] * gipc::Matrix3x3::Identity();
+                       cfem_rows[i] = i + abd_num * 4;
+                       cfem_cols[i] = i + abd_num * 4;
+                   });
+        gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_point_num;
+
+        //cudaMemcpy(TetMesh.totalForce, contact_grads, vertexNum * sizeof(double3), cudaMemcpyDeviceToDevice);
+        //getTotalForce(shape_grads, TetMesh.totalForce);
     }
 
-    {
-        gipc::Timer timer{"cal_ground_gradient_hessian"};
-
-        computeGroundGradientAndHessian(contact_grads);
-        computeSoftConstraintGradientAndHessian(shape_grads);
-    }
-
-    //cudaMemcpy(TetMesh.totalForce, contact_grads, vertexNum * sizeof(double3), cudaMemcpyDeviceToDevice);
-    //getTotalForce(shape_grads, TetMesh.totalForce);
-
-    {
-        gipc::Timer timer{"partition contact info"};
-
-        // assemble and partition the contact info for FEM and ABD
-        m_contact_system->solve();
-    }
-
-    {
-        gipc::Timer timer{"setup_abd_system_gradient_hessian"};
-        // setup abd system gradient and hessian
-        m_abd_system->setup_abd_system_gradient_hessian(
-            *m_abd_sim_data,
-            muda::BufferView<double3>{TetMesh.fb, vertexNum}.subview(
-                abd_fem_count_info.abd_point_offset, abd_fem_count_info.abd_point_num),
-            m_contact_system->abd_contact_hessians());
-    }
     return time00;
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
@@ -10295,39 +10460,39 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
 {
     double Energy      = 0.0;
     auto   fem_kinetic = Energy_Add_Reduction_Algorithm(0, TetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += fem_kinetic;
 
     auto abd_kinetic = m_abd_system->cal_abd_kinetic_energy(*m_abd_sim_data);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += abd_kinetic;
 
     auto abd_shape = m_abd_system->cal_abd_shape_energy(*m_abd_sim_data);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += abd_shape;
 
     auto fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(1, TetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += fem;
 
     auto tri_fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(8, TetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += tri_fem;
 
     auto bend = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(10, TetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += bend;
 
     auto constraint = Energy_Add_Reduction_Algorithm(9, TetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += constraint;
 
     auto barrier = Energy_Add_Reduction_Algorithm(2, TetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += barrier;
 
     auto ground = Kappa * Energy_Add_Reduction_Algorithm(4, TetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += ground;
 
     //std::cout << "fem_kinetic: " << fem_kinetic << std::endl;
@@ -10356,30 +10521,10 @@ int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int pre
 {
     gipc::Timer timer{"solve_linear_system"};
     auto        iter = 0;
-    if(use_new_linear_system)
-    {
-        iter = m_global_linear_system->solve_linear_system();
-    }
-    else
-    {
-        if(!preconditioner_type)
-        {
-            iter = PCG_Process(
-                &TetMesh, &pcg_data, BH, _moveDir, vertexNum, tetrahedraNum, IPC_dt, meanVolumn, pcg_threshold);
-        }
-        else if(preconditioner_type == 1)
-        {
-            iter = MASPCG_Process(
-                &TetMesh, &pcg_data, BH, _moveDir, vertexNum, tetrahedraNum, IPC_dt, meanVolumn, cpNum, pcg_threshold);
-            if(/*iter == 10000 || */ iter == 0)
-            {
-                printf("MASPCG fail, turn to PCG--------------------!!!!!!!!!!!!!!!!!!!!!\n");
-                iter = PCG_Process(
-                    &TetMesh, &pcg_data, BH, _moveDir, vertexNum, tetrahedraNum, IPC_dt, meanVolumn, pcg_threshold);
-                printf("PCG finish:  %d\n", iter);
-            }
-        }
-    }
+
+    iter = m_global_linear_system->solve_linear_system();
+
+
     auto& json = gipc::Statistics::instance().at_current_frame();
     json["newton"].back()["pcg"]["iterations"] = iter;
     return iter;
@@ -10506,7 +10651,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         c1m += armijoParam * Energy_Add_Reduction_Algorithm(3, TetMesh);
     }
 
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     CUDA_SAFE_CALL(cudaMemcpy(TetMesh.temp_double3Mem,
                               TetMesh.vertexes,
@@ -10683,7 +10828,6 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     int iterCap = 10000, k = 0;
 
     CUDA_SAFE_CALL(cudaMemset(_moveDir, 0, vertexNum * sizeof(double3)));
-    //BH.MALLOC_DEVICE_MEM_O(tetrahedraNum, h_cpNum + 1, h_gpNum);
     double totalTimeStep = 0;
     for(; k < iterCap; ++k)
     {
@@ -10700,10 +10844,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         cudaEventCreate(&end3);
         cudaEventCreate(&end4);
 
-
-        BH.updateDNum(triangleNum, abd_fem_count_info.fem_tet_num, h_cpNum + 1, h_cpNum_last + 1, tri_edge_num);
-
-        //printf("collision num  %d\n", h_cpNum[0]);
+        printf("\n\n\ncollision num  %d\n\n\n", h_cpNum[0]+h_gpNum);
 
         cudaEventRecord(start);
         timemakePd += computeGradientAndHessian(TetMesh);
@@ -10779,8 +10920,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         postLineSearch(TetMesh, alpha);
         //computeGradientAndHessian(TetMesh);
         cudaEventRecord(end4);
-        //BH.FREE_DEVICE_MEM();
-        //if (h_cpNum[0] > 0) return;
+
         CUDA_SAFE_CALL(cudaDeviceSynchronize());
         float time00, time11, time22, time33, time44;
         cudaEventElapsedTime(&time00, start, end0);
@@ -10795,12 +10935,12 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         time3 += time33;
         time4 += time44;
         ////*cflTime = ptime;
-        /*printf("time0 = %f,  time1 = %f,  time2 = %f,  time3 = %f,  time4 = %f\n",
+        printf("time0 = %f,  time1 = %f,  time2 = %f,  time3 = %f,  time4 = %f\n",
                time00,
                time11,
                time22,
                time33,
-               time44);*/
+               time44);
         (cudaEventDestroy(start));
         (cudaEventDestroy(end0));
         (cudaEventDestroy(end1));
@@ -10809,13 +10949,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         (cudaEventDestroy(end4));
         totalTimeStep += alpha;
     }
-    iterV.push_back(k);
-    std::ofstream outiter("iterCount.txt");
-    for(int ii = 0; ii < iterV.size(); ii++)
-    {
-        outiter << iterV[ii] << std::endl;
-    }
-    outiter.close();
+    //iterV.push_back(k);
+    //std::ofstream outiter("iterCount.txt");
+    //for(int ii = 0; ii < iterV.size(); ii++)
+    //{
+    //    outiter << iterV[ii] << std::endl;
+    //}
+    //outiter.close();
     printf("\n\n      Kappa: %f                               iteration k:  %d\n", Kappa, k);
     return k;
 }
@@ -10983,7 +11123,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         suggestKappa(Kappa);
     }
     initKappa(TetMesh);
-
+    //Kappa = 1e4;
 #ifdef USE_FRICTION
     CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, h_cpNum[0] * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, h_cpNum[0] * sizeof(double2)));

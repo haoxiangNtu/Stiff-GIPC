@@ -11,9 +11,20 @@
 #include <gipc/utils/parallel_algorithm/fast_segmental_reduce.h>
 #include <muda/cub/device/device_reduce.h>
 #include <muda/cub/device/device_partition.h>
-
+#include <fstream>
+#include <vector>
 namespace gipc
 {
+
+    template <typename T>
+__global__ inline void moveMemory_2(T* data, int output_start, int input_start, int length)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= length)
+        return;
+    data[output_start + idx] = data[input_start + idx];
+}
+
 void print_matrix(const muda::DeviceTripletMatrix<Float, 3>& mat)
 {
     auto row_indices = mat.block_row_indices();
@@ -40,6 +51,26 @@ void print_matrix(const muda::DeviceTripletMatrix<Float, 3>& mat)
 
 constexpr bool UseRadixSort   = true;
 constexpr bool UseReduceByKey = false;
+
+void Converter::convert(gipc::GIPCTripletMatrix<double, 3>& global_triplets,
+                        const int&                          start,
+                        const int&                          length,
+                        const int&                          out_start_id)
+{
+    gipc::Timer timer("convert3x3");
+
+    _radix_sort_indices_and_blocks(global_triplets, start, length, out_start_id);
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+
+    _make_unique_indices(global_triplets, start, length, out_start_id);
+
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+
+    _make_unique_block_warp_reduction(global_triplets, start, length, out_start_id);
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+}
 
 void Converter::convert(const muda::DeviceTripletMatrix<T, N>& from,
                         muda::DeviceBCOOMatrix<T, N>&          to)
@@ -211,6 +242,86 @@ void Converter::_radix_sort_indices_and_blocks(const muda::DeviceTripletMatrix<T
     }
 }
 
+void Converter::_radix_sort_indices_and_blocks(gipc::GIPCTripletMatrix<double, 3>& global_triplets,
+                                               const int& start,
+                                               const int& length,
+                                               const int& out_start_id)
+{
+    using namespace muda;
+
+    auto src_row_indices = global_triplets.block_row_indices(start);
+    auto src_col_indices = global_triplets.block_col_indices(start);
+    auto src_blocks      = global_triplets.block_values(start);
+    //auto triplet_pair_id = global_triplets.triplet_pair_id.data();
+    auto index_input   = global_triplets.block_index();
+    auto ij_hash_input = global_triplets.block_hash_value();
+    //global_triplets.resize_collision_hash_size(global_triplets.abd_abd_contact_num);
+
+
+    // hash ij
+    ParallelFor(256)
+        .file_line(__FILE__, __LINE__)
+        .apply(length,
+               [row_indices = src_row_indices,
+                col_indices = src_col_indices,
+                ij_hash_input,
+                index_input] __device__(int i) mutable
+               {
+                   ij_hash_input[i] =
+                       (uint64_t{row_indices[i]} << 32) + uint64_t{col_indices[i]};
+                   index_input[i] = i;
+               });
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    DeviceRadixSort().SortPairs(ij_hash_input,
+                                global_triplets.block_sort_hash_value(),
+                                index_input,
+                                global_triplets.block_sort_index(),
+                                length);
+
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        //ParallelFor(256)
+        //.file_line(__FILE__, __LINE__)
+        //.apply(length,
+        //       [sort_hash = global_triplets.block_sort_hash_value(),
+        //        triplet_pair_id] __device__(int i) mutable
+        //       {
+        //           triplet_pair_id[i].x = sort_hash[i] >> 32;
+        //           triplet_pair_id[i].y = sort_hash[i] & 0xffffffff;
+        //       });
+
+
+    auto dst_val = global_triplets.block_values() + out_start_id;
+    ParallelFor(256)
+        .kernel_name("set col row indices")
+        .apply(length,
+               [sort_index = global_triplets.block_sort_index(),
+                //sort_hash  = global_triplets.block_sort_hash_value(),
+                src_blocks,
+                //src_row_indices,
+                //src_col_indices,
+                dst_val] __device__(int i) mutable
+               {
+                   dst_val[i] = src_blocks[sort_index[i]];
+                   //src_row_indices[i] = sort_hash[i] >> 32;
+                   //src_col_indices[i] = sort_hash[i] & 0xffffffff;
+               });
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        //{
+        //    Timer timer("set block values");
+        //    ParallelFor(256)
+        //        .kernel_name(__FUNCTION__)
+        //        .apply(length,
+        //               [src_blocks = global_triplets.block_values(start),
+        //                sort_index = global_triplets.block_sort_index(),
+        //                dst_blocks = global_triplets.block_values(out_start_id)] __device__(int i) mutable
+        //               { dst_blocks[i] = src_blocks[sort_index[i]]; });
+        //}
+    //CUDA_SAFE_CALL(cudaMemcpy(src_blocks, dst_val, length * sizeof(Eigen::Matrix3d), cudaMemcpyDeviceToDevice));
+
+    //LaunchCudaKernal_default(
+    //    length, 256, 0, moveMemory_2, global_triplets.block_values(), start, out_start_id, length);
+}
+
 void Converter::_radix_sort_indices_and_blocks(muda::DeviceBCOOMatrix<T, N>& to)
 {
     using namespace muda;
@@ -301,36 +412,130 @@ void Converter::_make_unique_indices(const muda::DeviceTripletMatrix<T, N>& from
     loose_resize(unique_ij_pairs, ij_pairs.size());
     loose_resize(unique_counts, ij_pairs.size());
 
-
-    DeviceRunLengthEncode().Encode(ij_pairs.data(),
-                                   unique_ij_pairs.data(),
+    //std::vector<uint64_t> hash;
+    //ij_hash.copy_to(hash);
+    DeviceRunLengthEncode().Encode(ij_hash.data(),
+                                   ij_hash_input.data(),
                                    unique_counts.data(),
                                    count.data(),
-                                   ij_pairs.size());
+                                   ij_hash.size());
 
-    int h_count = count;
+    int               h_count = count;
+    //std::vector<uint64_t> skey2;
+    //ij_hash.copy_to(skey2);
 
-    unique_ij_pairs.resize(h_count);
-    unique_counts.resize(h_count);
+    //std::ofstream out("old.txt");
+    //for(int i = 0; i < ij_hash.size(); i++)
+    //{
+    //    int a = skey2[i] >> 32;
+    //    int b = skey2[i] & 0xffffffff;
+    //    out << a << "     " << b << std::endl;
+    //}
+    //out.close();
 
-    offsets.resize(unique_counts.size() + 1);  // +1 for the last offset_end
 
-    DeviceScan().ExclusiveSum(
-        unique_counts.data(), offsets.data(), unique_counts.size());
+    
+
+    //unique_ij_pairs.resize(h_count);
+    //unique_counts.resize(h_count);
+
+    //offsets.resize(unique_counts.size() + 1);  // +1 for the last offset_end
+
+    //DeviceScan().ExclusiveSum(
+    //    unique_counts.data(), offsets.data(), unique_counts.size());
 
 
     muda::ParallelFor(256)
         .kernel_name(__FUNCTION__)
-        .apply(unique_counts.size(),
+        .apply(h_count,
                [unique_ij_pairs = unique_ij_pairs.viewer().name("unique_ij_pairs"),
                 row_indices = row_indices.viewer().name("row_indices"),
+                uhash = ij_hash_input.data(),
                 col_indices = col_indices.viewer().name("col_indices")] __device__(int i) mutable
                {
-                   row_indices(i) = unique_ij_pairs(i).x;
-                   col_indices(i) = unique_ij_pairs(i).y;
+                   row_indices(i) = uhash[i]>>32;
+                   col_indices(i) = uhash[i]&0xffffffff;
                });
 
     to.resize_triplets(h_count);
+}
+
+
+void Converter::_make_unique_indices(gipc::GIPCTripletMatrix<double, 3>& global_triplets,
+                                     const int& start,
+                                     const int& length,
+                                     const int& out_start_id)
+{
+    auto row_indices = global_triplets.block_row_indices(start);
+    auto col_indices = global_triplets.block_col_indices(start);
+
+    auto unique_key = global_triplets.block_hash_value();
+    auto sort_key   = global_triplets.block_sort_hash_value();
+    //global_triplets.d_unique_key_number = 0;
+    //auto triplet_pair_id = global_triplets.triplet_pair_id.data();
+    //muda::DeviceRunLengthEncode().Encode(triplet_pair_id,
+    //                                     global_triplets.unique_triplet_pair_id.data(),
+    //                                     global_triplets.block_temp_buffer(),
+    //                                     global_triplets.d_unique_key_number.data(),
+    //                                     length);
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        muda::DeviceRunLengthEncode().Encode(sort_key,
+                                         unique_key,
+                                         global_triplets.block_temp_buffer(),
+                                         global_triplets.d_unique_key_number.data(),
+                                         length);
+    //muda::DeviceRunLengthEncode().Encode(ij_pairs.data(),
+    //                               unique_ij_pairs.data(),
+    //                               unique_counts.data(),
+    //                               count.data(),
+    //                               ij_pairs.size());
+
+        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    global_triplets.h_unique_key_number = global_triplets.d_unique_key_number;
+
+    //std::vector<uint64_t> skey2;
+    //global_triplets.m_block_sort_hash_value.copy_to_host(skey2);
+
+    //std::ofstream out("my.txt");
+    //for(int i = 0; i < length; i++)
+    //{
+    //    int a = skey2[i] >> 32;
+    //    int b = skey2[i] & 0xffffffff;
+    //    out << a << "     " << b << std::endl;
+    //}
+    //out.close();
+
+    muda::ParallelFor(256)
+        .kernel_name(__FUNCTION__)
+        .apply(global_triplets.h_unique_key_number,
+
+               [row_indices, col_indices, unique_key] __device__(int i) mutable
+               {
+                   //row_indices[i] = unique_pair[i].x;  //unique_key[i] >> 32;
+                   //col_indices[i] = unique_pair[i].y;  //unique_key[i] & 0xffffffff;
+
+                   row_indices[i] = unique_key[i] >> 32;
+                   col_indices[i] = unique_key[i] & 0xffffffff;
+               });
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    //LaunchCudaKernal_default(global_triplets.h_unique_key_number,
+    //                         256,
+    //                         0,
+    //                         moveMemory_2,
+    //                         global_triplets.block_row_indices(),
+    //                         start,
+    //                         out_start_id,
+    //                         length);
+
+    //LaunchCudaKernal_default(global_triplets.h_unique_key_number,
+    //                         256,
+    //                         0,
+    //                         moveMemory_2,
+    //                         global_triplets.block_col_indices(),
+    //                         start,
+    //                         out_start_id,
+    //                         length);
 }
 
 void Converter::_make_unique_indices_and_blocks(const muda::DeviceTripletMatrix<T, N>& from,
@@ -524,19 +729,37 @@ void Converter::_make_unique_block_warp_reduction(const muda::DeviceTripletMatri
     loose_resize(sorted_partition_output, ij_pairs.size());
 
 
-    BufferLaunch().fill<int>(sorted_partition_input, 0);
+    //BufferLaunch().fill<int>(sorted_partition_input, 0);
 
+    //ParallelFor()
+    //    .file_line(__FILE__, __LINE__)
+    //    .apply(unique_counts.size(),
+    //           [sorted_partition = sorted_partition_input.viewer().name("sorted_partition"),
+    //            unique_counts = unique_counts.viewer().name("unique_counts"),
+    //            offsets = offsets.viewer().name("offsets")] __device__(int i) mutable
+    //           {
+    //               auto offset = offsets(i);
+    //               auto count  = unique_counts(i);
+
+    //               sorted_partition(offset + count - 1) = 1;
+    //           });
+    int number = ij_hash.size();
     ParallelFor()
         .file_line(__FILE__, __LINE__)
-        .apply(unique_counts.size(),
+        .apply(number,
                [sorted_partition = sorted_partition_input.viewer().name("sorted_partition"),
-                unique_counts = unique_counts.viewer().name("unique_counts"),
-                offsets = offsets.viewer().name("offsets")] __device__(int i) mutable
+                ij_hash = ij_hash.viewer(),
+                number] __device__(int i) mutable
                {
-                   auto offset = offsets(i);
-                   auto count  = unique_counts(i);
+                   if(i == number - 1)
+                   {
+                       sorted_partition(i) = 0;
+                   }
+                   else
+                   {
 
-                   sorted_partition(offset + count - 1) = 1;
+                       sorted_partition(i) = ij_hash(i) != ij_hash(i + 1);
+                   }
                });
 
     // scatter
@@ -570,6 +793,64 @@ void Converter::_make_unique_block_warp_reduction(const muda::DeviceTripletMatri
 
     //temp_blocks.resize(blocks.size());
     //blocks.copy_to(temp_blocks.data());
+}
+
+
+void Converter::_make_unique_block_warp_reduction(gipc::GIPCTripletMatrix<double, 3>& global_triplets,
+                                                  const int& start, const int& length, const int& out_start_id)
+{
+    using namespace muda;
+
+    auto sorted_partition_input = global_triplets.block_temp_buffer();
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    ParallelFor()
+        .file_line(__FILE__, __LINE__)
+        .apply(length - 1,
+               [sorted_partition_input,
+                ij_hash = global_triplets.block_sort_hash_value()] __device__(int i) mutable
+               {
+                   sorted_partition_input[i] = ij_hash[i] != ij_hash[i + 1] ? 1 : 0;
+               });
+    auto sorted_partition_output = global_triplets.block_index();
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // scatter
+    DeviceScan().ExclusiveSum(sorted_partition_input,
+                              sorted_partition_output, length);
+
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    cudaMemset(global_triplets.block_values(start),
+               0,
+               global_triplets.h_unique_key_number * sizeof(Eigen::Matrix3d));
+
+
+
+    //ParallelFor()
+    //    .file_line(__FILE__, __LINE__)
+    //    .apply(global_triplets.h_unique_key_number,
+    //           [triplet = global_triplets.block_values(start)] __device__(int i) mutable
+    //           { triplet[i] = Eigen::Matrix3d::Zero();
+    //           });
+
+
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    FastSegmentalReduce()
+        .kernel_name(__FUNCTION__)
+        .reduce(length, sorted_partition_output,
+                global_triplets.block_values(out_start_id),
+                global_triplets.block_values(start));
+
+    //CUDA_SAFE_CALL(cudaMemcpy(global_triplets.block_values(start),
+    //                          global_triplets.block_values(out_start_id),
+    //                          global_triplets.h_unique_key_number * sizeof(Eigen::Matrix3d),
+    //                          cudaMemcpyDeviceToDevice));
+    //LaunchCudaKernal_default(global_triplets.h_unique_key_number,
+    //                         256,
+    //                         0,
+    //                         moveMemory_2,
+    //                         global_triplets.block_values(),
+    //                         start,
+    //                         out_start_id,
+    //                         length);
 }
 
 void Converter::_make_unique_blocks_naive(const muda::DeviceTripletMatrix<T, N>& from,
@@ -753,6 +1034,72 @@ void Converter::ge2sym(muda::DeviceBCOOMatrix<T, N>& to)
     int h_total_count = count;
 
     to.resize_triplets(h_total_count);
+
+    //print_matrix(to);
+}
+
+void Converter::ge2sym(gipc::GIPCTripletMatrix<double, 3>& global_triplets)
+{
+    using namespace muda;
+
+    auto counts  = global_triplets.block_index();
+    auto offsets = global_triplets.block_sort_index();
+    auto block_temp = global_triplets.block_values(global_triplets.h_unique_key_number);
+    auto blocks      = global_triplets.block_values();
+    auto ij_hash     = global_triplets.block_hash_value();
+    auto row_indices = global_triplets.block_row_indices();
+    auto col_indices = global_triplets.block_col_indices();
+
+    ParallelFor(256)
+        .file_line(__FILE__, __LINE__)
+        .apply(global_triplets.h_unique_key_number,
+               [row_indices, col_indices, ij_hash, blocks, block_temp, counts] __device__(int i) mutable
+               {
+                   counts[i] = row_indices[i] <= col_indices[i] ? 1 : 0;
+                   ij_hash[i] =
+                       (uint64_t{row_indices[i]} << 32) + uint64_t{col_indices[i]};
+                   block_temp[i] = blocks[i];
+               });
+
+    // exclusive sum
+    DeviceScan().ExclusiveSum(counts, offsets, global_triplets.h_unique_key_number);
+
+    // set the values
+    auto dst_blocks = global_triplets.block_values();
+
+    ParallelFor(256)
+        .file_line(__FILE__, __LINE__)
+        .apply(global_triplets.h_unique_key_number,
+               [dst_blocks,
+                block_temp,
+                ij_hash,
+                row_indices,
+                col_indices,
+                counts,
+                offsets,
+                total_count = global_triplets.d_unique_key_number.data(),
+                number = global_triplets.h_unique_key_number] __device__(int i) mutable
+               {
+                   auto count  = counts[i];
+                   auto offset = offsets[i];
+
+                   if(count != 0)
+                   {
+                       dst_blocks[offset]  = block_temp[i];
+                       auto ij             = ij_hash[i];
+                       row_indices[offset] = ij >> 32;
+                       col_indices[offset] = ij & 0xffffffff;
+                   }
+
+                   if(i == number - 1)
+                   {
+                       *total_count = offsets[i] + counts[i];
+                   }
+               });
+
+    global_triplets.h_unique_key_number = global_triplets.d_unique_key_number;
+
+    //global_triplets.resize_triplets(global_triplets.h_unique_key_number);
 
     //print_matrix(to);
 }

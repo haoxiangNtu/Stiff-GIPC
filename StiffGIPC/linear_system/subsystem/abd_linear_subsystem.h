@@ -4,7 +4,6 @@
 class GIPC;
 namespace gipc
 {
-class ContactSystem;
 class ABDSystem;
 class ABDSimData;
 
@@ -14,7 +13,6 @@ class ABDLinearSubsystem : public gipc::DiagonalSubsystem
     // Inherited via LinearSubsystem
   public:
     ABDLinearSubsystem(GIPC&          gipc,
-                       ContactSystem& contact_system,
                        ABDSystem&     abd_system,
                        ABDSimData&    abd_sim_data);
 
@@ -27,7 +25,6 @@ class ABDLinearSubsystem : public gipc::DiagonalSubsystem
 
   private:
     GIPC&          m_gipc;
-    ContactSystem& m_contact_system;
     ABDSystem&     m_abd_system;
     ABDSimData&    m_abd_sim_data;
 

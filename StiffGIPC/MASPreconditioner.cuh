@@ -9,37 +9,7 @@
 #include "device_fem_data.cuh"
 #include "eigen_data.h"
 #include <muda/ext/linear_system/bcoo_matrix_view.h>
-class BHessian
-{
-  public:
-    uint32_t*                 D1Index;  //pIndex, DpeIndex, DptIndex;
-    uint3*                    D3Index;
-    uint4*                    D4Index;
-    uint2*                    D2Index;
-    __GEIGEN__::Matrix12x12d* H12x12;
-    __GEIGEN__::Matrix3x3d*   H3x3;
-    __GEIGEN__::Matrix6x6d*   H6x6;
-    __GEIGEN__::Matrix9x9d*   H9x9;
-
-    uint32_t DNum[4];
-
-  public:
-    BHessian() {}
-    ~BHessian() {};
-    void updateDNum(const int&      tri_Num,
-                    const int&      tet_number,
-                    const uint32_t* cpNums,
-                    const uint32_t* last_cpNums,
-                    const int&      tri_edge_number);
-    void MALLOC_DEVICE_MEM_O(const int& tet_number,
-                             const int& surfvert_number,
-                             const int& surface_number,
-                             const int& edge_number,
-                             const int& triangle_num,
-                             const int& tri_Edge_number);
-    void FREE_DEVICE_MEM();
-    //void init(const int& edgeNum, const int& faceNum, const int& vertNum);
-};
+#include "linear_system/linear_system/global_matrix.h"
 
 class MASPreconditioner
 {
@@ -69,7 +39,7 @@ class MASPreconditioner
     __GEIGEN__::MasMatrixT*    d_MatMas;
     __GEIGEN__::MasMatrixSymT* d_inverseMatMas;
     __GEIGEN__::MasMatrixSymf* d_precondMatMas;
-    Precision_T3*              d_multiLevelR;
+    Eigen::Vector3f*              d_multiLevelR;
     Precision_T3*              d_multiLevelZ;
 
   public:
@@ -108,19 +78,25 @@ class MASPreconditioner
                                   int           level,
                                   int cpNum);  // called in ReorderRealtime
 
-    void setPreconditioner(const BHessian& BH, const double* masses, int cpNum);  // init the preconditioner for PCG
-    void setPreconditioner_bcoo(muda::CBCOOMatrixView<double, 3> hessian,
-                                muda::CBufferView<int>           indices,
-                                int                              offset,
-                                int                              cpNum);
-    void PrepareHessian(const BHessian& BH, const double* masses);  // called in setPreconditioner
-    void PrepareHessian_bcoo(muda::CBCOOMatrixView<double, 3> hessian,
-                             int                              offset,
-                             muda::CBufferView<int>           indices);
+    void setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
+                                int*             row_ids,
+                                int*             col_ids,
+                                uint32_t*        indices,
+                                int              offset,
+                                int              triplet_num,
+                                int              cpNum);
+    void PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
+                             int*             row_ids,
+                             int*             col_ids,
+                             uint32_t*        indices,
+                             int              offset,
+                             int              triplet_number);
 
     void preconditioning(const double3* R, double3* Z);
     void BuildMultiLevelR(const double3* R);  // called in preconditioning
     void SchwarzLocalXSym();                  // called in preconditioning
+    void SchwarzLocalXSym_block3();                  // called in preconditioning
+    void SchwarzLocalXSym_sym();           // called in preconditioning
     void CollectFinalZ(double3* Z);           // called in preconditioning
 
     void FreeMAS();

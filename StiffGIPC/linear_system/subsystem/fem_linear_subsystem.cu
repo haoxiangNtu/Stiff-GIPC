@@ -2,59 +2,17 @@
 #include <muda/ext/eigen.h>
 #include <muda/cub/device/device_reduce.h>
 #include <gipc/utils/host_log.h>
-#include <contact_system/contact_system.h>
+
 namespace gipc
 {
 FEMLinearSubsystem::FEMLinearSubsystem(GIPC&                gipc,
-                                       device_TetraData&    tetra_data,
-                                       gipc::ContactSystem& contact_system)
+                                       device_TetraData&    tetra_data)
     : m_gipc(gipc)
     , m_tetra_data(tetra_data)
-    , m_contact_system(contact_system)
 {
     //muda::Debug::debug_sync_all(true);
 }
 
-muda::BufferView<__GEIGEN__::Matrix12x12d> FEMLinearSubsystem::H12x12() const
-{
-    auto tet_offset = 0;  //m_gipc.abd_fem_count_info.fem_tet_offset;
-    //auto tet_count   = m_gipc.abd_fem_count_info.fem_tet_num;
-    //auto bend_count  = m_gipc.tri_edge_num;
-    auto total_count = m_gipc.BH.DNum[3];
-    auto offset      = m_gipc.h_cpNum[4] + m_gipc.h_cpNum_last[4] + tet_offset;
-    return muda::BufferView<__GEIGEN__::Matrix12x12d>{m_gipc.BH.H12x12, total_count}
-        .subview(offset);
-}
-
-muda::BufferView<uint4> FEMLinearSubsystem::H12x12_index() const
-{
-    auto tet_offset = 0;
-    //m_gipc.abd_fem_count_info.fem_tet_offset;
-    //auto tet_count   = m_gipc.abd_fem_count_info.fem_tet_num;
-    //auto bend_count  = m_gipc.tri_edge_num;
-    auto total_count = m_gipc.BH.DNum[3];
-    auto offset      = m_gipc.h_cpNum[4] + m_gipc.h_cpNum_last[4] + tet_offset;
-    return muda::BufferView<uint4>{m_gipc.BH.D4Index, total_count}.subview(offset);
-}
-
-muda::BufferView<__GEIGEN__::Matrix9x9d> FEMLinearSubsystem::H9x9() const
-{
-    auto tri_offset  = m_gipc.h_cpNum[3] + m_gipc.h_cpNum_last[3];
-    auto tri_count   = m_gipc.triangleNum;
-    auto total_count = m_gipc.BH.DNum[2];
-    MUDA_ASSERT(tri_offset + tri_count == total_count, "");
-    return muda::BufferView<__GEIGEN__::Matrix9x9d>{m_gipc.BH.H9x9, total_count}.subview(
-        tri_offset, tri_count);
-}
-
-muda::BufferView<uint3> FEMLinearSubsystem::H9x9_index() const
-{
-    auto tri_offset  = m_gipc.h_cpNum[3] + m_gipc.h_cpNum_last[3];
-    auto tri_count   = m_gipc.triangleNum;
-    auto total_count = m_gipc.BH.DNum[2];
-    MUDA_ASSERT(tri_offset + tri_count == total_count, "");
-    return muda::BufferView<uint3>{m_gipc.BH.D3Index, total_count}.subview(tri_offset, tri_count);
-}
 
 muda::CBufferView<int> FEMLinearSubsystem::boundary_type() const
 {
@@ -95,19 +53,9 @@ muda::BufferView<double> FEMLinearSubsystem::mass() const
 
 void FEMLinearSubsystem::report_subsystem_info()
 {
-    size_t hessian_block_count = 0;
-
-    hessian_block_count += mass().size();
-    hessian_block_count += m_contact_system.fem_contact_hessians().size();
-    hessian_block_count += H9x9().size() * 9;
-    hessian_block_count += H12x12().size() * 16;
-
-
-    //std::cout << "FEMLinearSubsystem::report_subsystem_info" << std::endl;
-    //std::cout << "mass size: " << mass().size() << std::endl;
-    //std::cout << "contact hessian size: "
-    //          << m_contact_system.fem_contact_hessians().size() << std::endl;
-    //std::cout << "shape H12x12 size: " << shape_H12x12().size() << std::endl;
+    size_t hessian_block_count = m_gipc.gipc_global_triplet.global_triplet_offset
+                                 - m_gipc.gipc_global_triplet.global_collision_triplet_offset
+        + m_gipc.gipc_global_triplet.fem_fem_contact_num;
 
     this->hessian_block_count(hessian_block_count);
     this->right_hand_side_dof(dx().size() * 3);
@@ -157,10 +105,6 @@ namespace details
                                            index(j),
                                            matrix.template block<3, 3>(i * 3, j * 3));
                 }
-
-                //viewer(offset++).write(index(i),
-                //                       index(j),
-                //                       matrix.template block<3, 3>(i * 3, j * 3));
             }
         }
     }
@@ -172,127 +116,12 @@ void FEMLinearSubsystem::assemble(TripletMatrixView hessian, DenseVectorView gra
 {
     using namespace muda;
 
-    auto mass               = this->mass();
-
     if(m_gipc.abd_fem_count_info.fem_point_num < 1)
         return;
 
-    auto contact_hessian    = m_contact_system.fem_contact_hessians();
-    auto shape_H9x9         = this->H9x9();
-    auto shape_H9x9_index   = this->H9x9_index();
-    auto shape_H12x12       = this->H12x12();
-    auto shape_H12x12_index = this->H12x12_index();
     auto barrier_gradient   = this->barrier_gradient();
     auto shape_gradient     = this->shape_gradient();
-    auto fem_point_offset   = m_gipc.abd_fem_count_info.fem_point_offset;
-
-    auto move_dir = this->dx();
-
-    auto offset = 0;
-    auto count  = 0;
-
-    {  // lumped mass hessian
-        offset += count;
-        count = mass.size();
-
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(mass.size(),
-                   [mass = mass.viewer().name("mass"),
-                    hessian = hessian.subview(offset, count).viewer().name("hessian")] __device__(int i) mutable
-                   {
-                       // mass
-                       hessian(i).write(i, i, mass(i) * gipc::Matrix3x3::Identity());
-                   });
-    }
-
- {  // contact hessian
-        offset += count;
-        count = contact_hessian.size();
-
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(m_contact_system.fem_contact_hessians().size(),
-                   [btype = boundary_type().cviewer().name("boundary_type"),
-                    hessian = hessian.subview(offset, count).viewer().name("hessian"),
-                    contact_hessian =
-                        m_contact_system.fem_contact_hessians().viewer().name("contact_hessian"),
-                    fem_point_offset] __device__(int I) mutable
-                   {
-                       auto& H = contact_hessian(I);
-                       // because point id is global, we need to subtract the offset of fem points
-                       Vector2i ij = H.point_id - Vector2i::Ones() * fem_point_offset;
-
-                       if(btype(ij(0)) != 0 || btype(ij(1)) != 0)
-                       {
-                           hessian(I).write(ij(0), ij(1), Matrix3x3::Zero());
-                       }
-                       else
-                       {
-                           hessian(I).write(ij(0), ij(1), H.hessian);
-                       }
-                   });
-    }
-
-
-    {  //shape 9x9 hessian
-        offset += count;
-        count = shape_H9x9.size() * 9;
-
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(shape_H9x9.size(),
-                   [H9x9       = shape_H9x9.viewer().name("H9x9"),
-                    H9x9_index = shape_H9x9_index.viewer().name("index"),
-                    hessian = hessian.subview(offset, count).viewer().name("hessian"),
-                    btype = boundary_type().cviewer().name("boundary_type"),
-                    fem_point_offset] __device__(int I) mutable
-                   {
-                       gipc::Matrix9x9 H;
-                       auto&           srcH = H9x9(I);
-                       for(int j = 0; j < 9; ++j)
-                       {
-                           for(int k = 0; k < 9; ++k)
-                           {
-                               H(j, k) = srcH.m[j][k];
-                           }
-                       }
-                       //H          = gipc::Matrix9x9::Zero();
-                       auto index = eigen::as_eigen(H9x9_index(I));
-                       index.array() -= fem_point_offset;
-                       details::fill_hessian_block(I, btype, hessian, index, H);
-                   });
-    }
-
-    {  // shape 12x12 hessian
-
-        offset += count;
-        count = shape_H12x12.size() * 16;
-
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(shape_H12x12.size(),
-                   [H12x12       = shape_H12x12.viewer().name("H12x12"),
-                    H12x12_index = shape_H12x12_index.viewer().name("index"),
-                    hessian = hessian.subview(offset, count).viewer().name("hessian"),
-                    btype = boundary_type().cviewer().name("boundary_type"),
-                    fem_point_offset] __device__(int I) mutable
-                   {
-                       gipc::Matrix12x12 H;
-                       auto&             srcH = H12x12(I);
-                       for(int j = 0; j < 12; ++j)
-                       {
-                           for(int k = 0; k < 12; ++k)
-                           {
-                               H(j, k) = srcH.m[j][k];
-                           }
-                       }
-                       //H          = gipc::Matrix12x12::Zero();
-                       auto index = eigen::as_eigen(H12x12_index(I));
-                       index.array() -= fem_point_offset;
-                       details::fill_hessian_block(I, btype, hessian, index, H);
-                   });
-    }
+    //auto fem_point_offset   = m_gipc.abd_fem_count_info.fem_point_offset;
 
 
     {  // gradient = contact_gradient + shape_gradient
@@ -314,15 +143,38 @@ void FEMLinearSubsystem::assemble(TripletMatrixView hessian, DenseVectorView gra
                                eigen::as_eigen(b(i)) + eigen::as_eigen(s(i));
                        }
 
-                       //gradient.segment<3>(i * 3).as_eigen() =
-                       //    eigen::as_eigen(b(i)) + eigen::as_eigen(s(i));
                    });
     }
+    //return;
+    /*auto offset     = 0;
+    auto count      = m_gipc.gipc_global_triplet.fem_fem_contact_num;
+    int abd_offset = m_gipc.abd_fem_count_info.abd_body_num * 4;
+    
+    ParallelFor()
+        .file_line(__FILE__, __LINE__)
+        .apply(count,
+               [triplet_b = m_gipc.gipc_global_triplet.block_values(m_gipc.gipc_global_triplet.h_fem_fem_contact_start_id),
+                rows = m_gipc.gipc_global_triplet.block_row_indices(m_gipc.gipc_global_triplet.h_fem_fem_contact_start_id),
+                cols = m_gipc.gipc_global_triplet.block_col_indices(m_gipc.gipc_global_triplet.h_fem_fem_contact_start_id),
+                abd_offset,
+                hessian = hessian.subview(offset, count).viewer().name("hessian")] __device__(int i) mutable
+               {
+                   hessian(i).write(rows[i] - abd_offset, cols[i] - abd_offset, triplet_b[i]);
+               });
 
-
-    //Eigen::VectorX<double> grad(gradient.size());
-    //gradient.buffer_view().copy_to(grad.data());
-    //std::cout << "gradient: " << grad.transpose() << std::endl;
+    offset += m_gipc.gipc_global_triplet.fem_fem_contact_num;
+    count = m_gipc.gipc_global_triplet.global_triplet_offset - m_gipc.gipc_global_triplet.global_collision_triplet_offset;
+    ParallelFor()
+        .file_line(__FILE__, __LINE__)
+        .apply(count,
+               [triplet_b = m_gipc.gipc_global_triplet.block_values(m_gipc.gipc_global_triplet.global_collision_triplet_offset),
+                rows = m_gipc.gipc_global_triplet.block_row_indices(m_gipc.gipc_global_triplet.global_collision_triplet_offset),
+                cols = m_gipc.gipc_global_triplet.block_col_indices(m_gipc.gipc_global_triplet.global_collision_triplet_offset),
+                abd_offset,
+                hessian = hessian.subview(offset, count).viewer().name("hessian")] __device__(int i) mutable
+               {
+                   hessian(i).write(rows[i] - abd_offset, cols[i] - abd_offset, triplet_b[i]);
+               });*/
 }
 
 void FEMLinearSubsystem::retrieve_solution(CDenseVectorView dx)

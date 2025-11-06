@@ -288,6 +288,10 @@ __device__ __host__ void __SolverForCubicEquation(const double& a,
 
 __device__ __host__ Vector9 __Mat3x3_to_vec9_double(const Matrix3x3d& F);
 
+__device__ __host__ Eigen::Vector<double, 9> __Mat3x3_to_vec9_Eigen_double(const Matrix3x3d& F);
+
+__device__ __host__ Eigen::Vector<double, 9> __Mat3x3_to_vec9_Eigen_double(const Eigen::Matrix3d& F);
+
 __device__ __host__ void __normalized_vec9_double(Vector9& v9);
 
 __device__ __host__ void __normalized_vec6_double(Vector6& v6);
@@ -313,6 +317,11 @@ __device__ __host__ void __makePD2x2(const double& a00,
 __device__ __host__ void __M12x9_S9x9_MT9x12_Multiply(const Matrix12x9d& A,
                                                       const Matrix9x9d&  B,
                                                       Matrix12x12d& output);
+
+__device__ __host__ void __M12x9_S9x9_MT9x12_Multiply_Eigen(
+    const Eigen::Matrix<double, 9, 12>& A,
+    const Eigen::Matrix<double, 9, 9>&  B,
+    Eigen::Matrix<double, 12, 12>&      output);
 
 __device__ __host__ void __M9x4_S4x4_MT4x9_Multiply(const Matrix9x4d& A,
                                                     const Matrix4x4d& B,

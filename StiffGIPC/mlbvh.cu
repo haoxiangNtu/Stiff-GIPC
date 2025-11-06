@@ -8,7 +8,7 @@
 
 #include "mlbvh.cuh"
 #include <cmath>
-#include "cuda_tools.h"
+#include "cuda_tools/cuda_tools.h"
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
 #include <thrust/device_ptr.h>
@@ -705,7 +705,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
     int    dtype  = _dType_EE(v0, v1, v2, v3);
     int    add_e  = -1;
     double d      = 100.0;
-    bool   smooth = true;
+    bool   smooth = false;
     switch(dtype)
     {
         case 0: {

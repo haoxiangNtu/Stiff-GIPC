@@ -7,7 +7,7 @@
 //
 
 #include "device_fem_data.cuh"
-#include "cuda_tools.h"
+#include "cuda_tools/cuda_tools.h"
 
 
 void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
@@ -71,11 +71,11 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
                               triangle_num * sizeof(__GEIGEN__::Matrix2x2d)));
 
 
-    CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2F,
-                              triangle_num * sizeof(Eigen::Matrix<double, 3, 2>)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2U, triangle_num * sizeof(Eigen::Matrix3d)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2V, triangle_num * sizeof(Eigen::Matrix2d)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2S, triangle_num * sizeof(Eigen::Vector2d)));
+    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2F,
+    //                          triangle_num * sizeof(Eigen::Matrix<double, 3, 2>)));
+    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2U, triangle_num * sizeof(Eigen::Matrix3d)));
+    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2V, triangle_num * sizeof(Eigen::Matrix2d)));
+    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2S, triangle_num * sizeof(Eigen::Vector2d)));
 
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&area, triangle_num * sizeof(double)));

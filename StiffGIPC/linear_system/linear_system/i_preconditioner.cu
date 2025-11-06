@@ -29,47 +29,59 @@ int LocalPreconditioner::get_offset() const
     return m_subsystem->m_dof_offset / 3;
 }
 
-muda::CBufferView<int> LocalPreconditioner::calculate_subsystem_bcoo_indices() const
+uint32_t* LocalPreconditioner::calculate_subsystem_bcoo_indices(int& number) const
 {
-    auto  offset = m_subsystem->m_dof_offset / 3;
-    auto  end    = offset + m_subsystem->m_right_hand_side_dof / 3;
-    auto& bcoo   = m_system->m_bcoo_A;
+    auto offset = m_subsystem->m_dof_offset / 3;
+    auto end    = offset + m_subsystem->m_right_hand_side_dof / 3;
 
-    loose_resize(m_indices_input, bcoo.triplet_count());
-    loose_resize(m_indices_output, bcoo.triplet_count());
-    loose_resize(m_flags, bcoo.triplet_count());
-
+    auto index_input  = m_system->gipc_global_triplet->block_index();
+    auto index_output = m_system->gipc_global_triplet->block_sort_index();
+    auto flags        = m_system->gipc_global_triplet->block_temp_buffer();
     muda::ParallelFor()
         .kernel_name(__FUNCTION__)
-        .apply(bcoo.triplet_count(),
-               [bcoo          = bcoo.cviewer().name("bcoo"),
-                offset        = offset,
-                end           = end,
-                indices_input = m_indices_input.viewer().name("indices_input"),
-                flags = m_flags.viewer().name("flags")] __device__(int I) mutable
+        .apply(m_system->gipc_global_triplet->h_unique_key_number,
+               [rows   = m_system->gipc_global_triplet->block_row_indices(),
+                cols   = m_system->gipc_global_triplet->block_col_indices(),
+                offset = offset,
+                end    = end,
+                indices_input = index_input,
+                flags] __device__(int I) mutable
                {
-                   auto&& [i, j, H] = bcoo(I);
+                   //auto&& [i, j, H] = bcoo(I);
+                   auto i = rows[I];
+                   auto j = cols[I];
                    auto in_range = [&](int m) { return m >= offset && m < end; };
                    bool valid       = in_range(i) && in_range(j);
-                   indices_input(I) = valid ? I : -I;  // -I for invalid
-                   flags(I)         = valid ? 1 : 0;
+                   indices_input[I] = I;  // -I for invalid
+                   flags[I]         = valid ? 1 : 0;
                });
 
-    muda::DeviceSelect().Flagged(m_indices_input.data(),
-                                 m_flags.data(),
-                                 m_indices_output.data(),
-                                 m_count.data(),
-                                 m_indices_input.size());
+    muda::DeviceSelect().Flagged(
+        index_input,
+        flags,
+        index_output,
+        m_system->gipc_global_triplet->d_unique_key_number.data(),
+        m_system->gipc_global_triplet->h_unique_key_number);
 
-    int h_count = m_count;
+    int h_count = m_system->gipc_global_triplet->d_unique_key_number;
 
-    m_indices_output.resize(h_count);
-    return m_indices_output;
+    number = h_count;
+    return index_output;
 }
 
-muda::CBCOOMatrixView<Float, 3> LocalPreconditioner::system_bcoo_matrix() const
+Eigen::Matrix3d* LocalPreconditioner::system_bcoo_matrix() const
 {
-    return m_system->m_bcoo_A;
+    return m_system->gipc_global_triplet->block_values();
+}
+
+int* LocalPreconditioner::system_bcoo_rows() const
+{
+    return m_system->gipc_global_triplet->block_row_indices();
+}
+
+int* LocalPreconditioner::system_bcoo_cols() const
+{
+    return m_system->gipc_global_triplet->block_col_indices();
 }
 
 void LocalPreconditioner::do_apply(muda::CDenseVectorView<Float> r,

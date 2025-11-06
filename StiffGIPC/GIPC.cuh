@@ -20,7 +20,6 @@ namespace gipc
 class ABDSimData;
 class ABDSystem;
 class GlobalLinearSystem;
-class ContactSystem;
 }  // namespace gipc
 
 class GIPC
@@ -103,7 +102,7 @@ class GIPC
     uint32_t surface_Num    = 0;
     uint32_t tetrahedraNum  = 0;
 
-    BHessian BH;
+    gipc::GIPCTripletMatrix<double, 3> gipc_global_triplet;
     AABB     SceneSize;
     int      MAX_COLLITION_PAIRS_NUM     = 0;
     int      MAX_CCD_COLLITION_PAIRS_NUM = 0;
@@ -137,7 +136,6 @@ class GIPC
     double pcg_threshold           = 0.0;
 
     gipc::ABDFEMCountInfo abd_fem_count_info{};
-    bool                  use_new_linear_system = true;
 
   public:
     GIPC();
@@ -174,8 +172,12 @@ class GIPC
     int calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int preconditioner_type = 0);
     float computeGradientAndHessian(device_TetraData& TetMesh);
     void  computeGroundGradientAndHessian(double3* _gradient);
+
+    void partitionContactHessian();
+
     void  computeGroundGradient(double3* _gradient, double mKap);
-    void  computeSoftConstraintGradientAndHessian(double3* _gradient);
+    void computeSoftConstraintGradientAndHessian(double3* _gradient,
+                                                 int global_hessian_fem_offset);
 
     void getTotalForce(double3* _gradient, double3* _gradient2);
 
@@ -227,20 +229,13 @@ class GIPC
     void sortMesh(device_TetraData& TetMesh, int updateVertNum);
     void buildFrictionSets();
 
-
-    bool Inverse_Physics(device_TetraData& TetMesh);
-    void computeInverseHessian(device_TetraData& TetMesh);
-    void computeGroundHessian(double3* _gradient);
-    void computeInverseGradient(device_TetraData& TetMesh);
-    void computeFldm(double3* _deltaPos, double3* fldm);
     void create_LinearSystem(device_TetraData& tet);
 
-  private:
+  public:
     void                                      init_abd_system();
     std::unique_ptr<gipc::ABDSimData>         m_abd_sim_data;
     std::unique_ptr<gipc::ABDSystem>          m_abd_system;
     std::unique_ptr<gipc::GlobalLinearSystem> m_global_linear_system;
-    std::unique_ptr<gipc::ContactSystem>      m_contact_system;
 };
 
 #endif

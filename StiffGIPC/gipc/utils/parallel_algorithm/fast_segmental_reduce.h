@@ -47,6 +47,12 @@ class FastSegmentalReduce : public LaunchBase<FastSegmentalReduce<BlockSize, War
                 CBufferView<Eigen::Matrix<T, M, N>> in,
                 BufferView<Eigen::Matrix<T, M, N>>  out,
                 ReduceOp                            op = ReduceOp{});
+    template <typename T, int M, int N, typename ReduceOp = cuda::std::plus<T>>
+    void reduce(int length,
+        uint32_t*               dst,
+                Eigen::Matrix<T, M, N>* in,
+                Eigen::Matrix<T, M, N>*  out,
+                ReduceOp                            op = ReduceOp{});
 
     template <typename T, typename ReduceOp = cuda::std::plus<T>>
     void reduce(CBufferView<int> dst, CBufferView<T> in, BufferView<T> out, ReduceOp op = ReduceOp{});

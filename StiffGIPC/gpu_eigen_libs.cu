@@ -1679,6 +1679,34 @@ __device__ __host__ Vector9 __Mat3x3_to_vec9_double(const Matrix3x3d& F)
     return result;
 }
 
+__device__ __host__ Eigen::Vector<double, 9> __Mat3x3_to_vec9_Eigen_double(const Matrix3x3d& F)
+{
+
+    Eigen::Vector<double, 9> result;
+    for(int i = 0; i < 3; i++)
+    {
+        for(int j = 0; j < 3; j++)
+        {
+            result[i * 3 + j] = F.m[j][i];
+        }
+    }
+    return result;
+}
+
+__device__ __host__ Eigen::Vector<double, 9> __Mat3x3_to_vec9_Eigen_double(const Eigen::Matrix3d& F)
+{
+
+    Eigen::Vector<double, 9> result;
+    for(int i = 0; i < 3; i++)
+    {
+        for(int j = 0; j < 3; j++)
+        {
+            result[i * 3 + j] = F(j, i);
+        }
+    }
+    return result;
+}
+
 __device__ __host__ void __normalized_vec9_double(Vector9& v9)
 {
 
@@ -1901,6 +1929,38 @@ __device__ __host__ void __M12x9_S9x9_MT9x12_Multiply(const Matrix12x9d& A,
                 temp += A.m[j][k] * tempM.v[k];
             }
             output.m[i][j] = temp;
+        }
+    }
+    //return output;
+}
+
+__device__ __host__ void __M12x9_S9x9_MT9x12_Multiply_Eigen(
+    const Eigen::Matrix<double, 9, 12>& A,
+    const Eigen::Matrix<double, 9, 9>&  B,
+    Eigen::Matrix<double, 12, 12>&      output)
+{
+    //Matrix12x12d output;
+    double tempM[9];
+    for(int i = 0; i < 12; i++)
+    {
+        for(int j = 0; j < 9; j++)
+        {
+            double temp = 0;
+            for(int k = 0; k < 9; k++)
+            {
+                temp += A(k, i) * B(j, k);
+            }
+            tempM[j] = temp;
+        }
+
+        for(int j = 0; j < 12; j++)
+        {
+            double temp = 0;
+            for(int k = 0; k < 9; k++)
+            {
+                temp += A(k, j) * tempM[k];
+            }
+            output(i, j) = temp;
         }
     }
     //return output;

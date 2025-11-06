@@ -16,5 +16,6 @@ class ABDPreconditioner : public LocalPreconditioner
     ABDPreconditioner(ABDLinearSubsystem& subsystem, ABDSystem& abd, ABDSimData& sim_data);
     virtual void assemble() override;
     virtual void apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z) override;
+    //const int preconditioner_id = 0;
 };
 }  // namespace gipc
