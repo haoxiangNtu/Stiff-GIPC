@@ -462,9 +462,9 @@ void Converter::_make_unique_indices(const muda::DeviceTripletMatrix<T, N>& from
 
 
 void Converter::_make_unique_indices(GIPCTripletMatrix& global_triplets,
-                                     const int& start,
-                                     const int& length,
-                                     const int& out_start_id)
+                                     const int&         start,
+                                     const int&         length,
+                                     const int&         out_start_id)
 {
     auto row_indices = global_triplets.block_row_indices(start);
     auto col_indices = global_triplets.block_col_indices(start);
@@ -479,7 +479,7 @@ void Converter::_make_unique_indices(GIPCTripletMatrix& global_triplets,
     //                                     global_triplets.d_unique_key_number.data(),
     //                                     length);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        muda::DeviceRunLengthEncode().Encode(sort_key,
+    muda::DeviceRunLengthEncode().Encode(sort_key,
                                          unique_key,
                                          global_triplets.block_temp_buffer(),
                                          global_triplets.d_unique_key_number.data(),
@@ -490,9 +490,12 @@ void Converter::_make_unique_indices(GIPCTripletMatrix& global_triplets,
     //                               count.data(),
     //                               ij_pairs.size());
 
-        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    global_triplets.h_unique_key_number = global_triplets.d_unique_key_number;
-
+    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    //global_triplets.h_unique_key_number = global_triplets.d_unique_key_number;
+    CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
+                              global_triplets.d_unique_key_number.data(),
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost));
     //std::vector<uint64_t> skey2;
     //global_triplets.m_block_sort_hash_value.copy_to_host(skey2);
 
@@ -1097,8 +1100,11 @@ void Converter::ge2sym(GIPCTripletMatrix& global_triplets)
                    }
                });
 
-    global_triplets.h_unique_key_number = global_triplets.d_unique_key_number;
 
+    CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
+                              global_triplets.d_unique_key_number.data(),
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost));
     //global_triplets.resize_triplets(global_triplets.h_unique_key_number);
 
     //print_matrix(to);

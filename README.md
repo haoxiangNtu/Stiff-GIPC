@@ -77,7 +77,7 @@ Support platforms: Windows, Linux
 We use CMake to build the project.
 
 ```bash
-sudo apt install libglew-dev freeglut3-dev libeigen3-dev metis
+sudo apt install libglew-dev freeglut3-dev libeigen3-dev metis nlohmann-json3-dev
 ```
 
 
@@ -85,7 +85,7 @@ sudo apt install libglew-dev freeglut3-dev libeigen3-dev metis
 We use [vcpkg](https://github.com/microsoft/vcpkg) to manage the libraries we need and use CMake to build the project. The simplest way to let CMake detect vcpkg is to set the system environment variable `CMAKE_TOOLCHAIN_FILE` to `(YOUR_VCPKG_PARENT_FOLDER)/vcpkg/scripts/buildsystems/vcpkg.cmake`
 
 ```shell
-vcpkg install eigen3 freeglut glew tbb freeglut metis
+vcpkg install eigen3 freeglut glew tbb freeglut metis nlohmann-json
 ```
 
 

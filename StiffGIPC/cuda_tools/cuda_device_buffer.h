@@ -77,7 +77,7 @@ class CudaDeviceVar
     CudaDeviceVar& operator=(CudaDeviceVar<T>&& other);
 
     CudaDeviceVar& operator=(const T& val);  // copy from host
-    operator T() const;                      // copy to host
+    //operator T() const;                      // copy to host
     T*       data() noexcept { return m_data; }
     const T* data() const noexcept { return m_data; }
     void clear() { m_data = nullptr; }

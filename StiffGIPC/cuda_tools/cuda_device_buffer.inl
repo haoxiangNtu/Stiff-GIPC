@@ -252,13 +252,13 @@ CudaDeviceVar<T>& CudaDeviceVar<T>::operator=(const T& val)
     return *this;
 }
 
-template <typename T>
-CudaDeviceVar<T>::operator T() const
-{
-    T value;
-    CUDA_SAFE_CALL(cudaMemcpy(&value, m_data, sizeof(T), cudaMemcpyDeviceToHost));
-    return value;
-}
+//template <typename T>
+//CudaDeviceVar<T>::operator T() const
+//{
+//    T value;
+//    CUDA_SAFE_CALL(cudaMemcpy(&value, m_data, sizeof(T), cudaMemcpyDeviceToHost));
+//    return value;
+//}
 template <typename T>
 CudaDeviceVar<T>::~CudaDeviceVar()
 {
