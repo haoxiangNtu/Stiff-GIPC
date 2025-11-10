@@ -8686,15 +8686,15 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
         abd_fem_count_info.abd_body_num * 4 + abd_fem_count_info.fem_point_num;
 
 
-    uint32_t Minimum = 200000;
+    uint32_t Minimum = 100000;
     int minCollisionBuffer4 = std::max(2 * (surf_vertexNum + edge_Num), Minimum);
     int minCollisionBuffer3 = std::max(2 * (surf_vertexNum + edge_Num), Minimum);
     int minCollisionBuffer2 = std::max(2 * (surf_vertexNum + edge_Num), Minimum);
     int minCollisionBuffer1 = 2 * surf_vertexNum;
 
     long long unsigned total_internal_triplet_num =
-        ((abd_fem_count_info.fem_tet_num + tri_edge_num) * 16 + triangleNum * 9)
-        + abd_fem_count_info.abd_body_num * 16;
+        ((abd_fem_count_info.fem_tet_num + tri_edge_num) * 10 + triangleNum * 6)
+        + abd_fem_count_info.abd_body_num * 10;
     long long unsigned total_max_collision_triplet_num =
         minCollisionBuffer4 * 16 + minCollisionBuffer3 * 9
         + minCollisionBuffer2 * 4 + minCollisionBuffer1;
