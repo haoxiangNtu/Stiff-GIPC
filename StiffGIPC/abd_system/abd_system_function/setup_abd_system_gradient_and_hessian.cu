@@ -11,30 +11,24 @@
 namespace gipc
 {
 //template <int ROWS, int COLS>
-__device__ inline void write_triplet_cv(Eigen::Matrix3d*    triplet_value,
-                                        int*                row_ids,
-                                        int*                col_ids,
-                                        unsigned int*     node_index,
+__device__ inline void write_triplet_cv(Eigen::Matrix3d* triplet_value,
+                                        int*             row_ids,
+                                        int*             col_ids,
+                                        unsigned int*    node_index,
                                         const Eigen::Matrix<double, 12, 12>& input,
                                         const int& offset)
 {
     int rown = 4;
     int coln = 4;
+    int kk    = 0;
     for(int ii = 0; ii < rown; ii++)
     {
-        for(int jj = 0; jj < coln; jj++)
+        for(int jj = ii; jj < coln; jj++)
         {
-            int kk               = ii * coln + jj;
-            row_ids[offset + kk] = node_index[ii];
-            col_ids[offset + kk] = node_index[jj];
-            for(int iii = 0; iii < 3; iii++)
-            {
-                for(int jjj = 0; jjj < 3; jjj++)
-                {
-                    triplet_value[offset + kk](iii, jjj) =
-                        input(ii * 3 + iii, jj * 3 + jjj);
-                }
-            }
+            row_ids[offset + kk]       = node_index[ii];
+            col_ids[offset + kk]       = node_index[jj];
+            triplet_value[offset + kk] = input.block<3, 3>(ii * 3, jj * 3);
+            kk++;
         }
     }
 }
@@ -46,8 +40,8 @@ template <int ROWS, int COLS>
 __device__ inline void write_triplet_cv2(Eigen::Matrix3d* triplet_value,
                                          int*             row_ids,
                                          int*             col_ids,
-                                         unsigned int*     node_index_rows,
-                                         unsigned int*     node_index_cols,
+                                         unsigned int*    node_index_rows,
+                                         unsigned int*    node_index_cols,
                                          const Eigen::Matrix<double, ROWS, COLS>& input,
                                          const int& offset)
 {
@@ -57,16 +51,22 @@ __device__ inline void write_triplet_cv2(Eigen::Matrix3d* triplet_value,
     {
         for(int jj = 0; jj < coln; jj++)
         {
-            int kk               = ii * coln + jj;
-            row_ids[offset + kk] = node_index_rows[ii];
-            col_ids[offset + kk] = node_index_cols[jj];
-            for(int iii = 0; iii < 3; iii++)
+            int kk  = ii * coln + jj;
+            int row = node_index_rows[ii];
+            int col = node_index_cols[jj];
+
+
+            if(row <= col)
             {
-                for(int jjj = 0; jjj < 3; jjj++)
-                {
-                    triplet_value[offset + kk](iii, jjj) =
-                        input(ii * 3 + iii, jj * 3 + jjj);
-                }
+                row_ids[offset + kk]       = row;
+                col_ids[offset + kk]       = col;
+                triplet_value[offset + kk] = input.block<3, 3>(ii * 3, jj * 3);
+            }
+            else
+            {
+                row_ids[offset + kk]       = col;
+                col_ids[offset + kk]       = row;
+                triplet_value[offset + kk].setZero();
             }
         }
     }
@@ -102,9 +102,9 @@ __global__ void write_barrier_hessian(//muda::TripletMatrixViewer<double, 12> tr
     auto H = triplet[vI + start_input];
     auto i = rows[vI + start_input];
     auto j = cols[vI + start_input];
-    //auto&& [i, j, H] = vertex_hessian(vI);
     auto body_id_i = body_id[i];
     auto body_id_j = body_id[j];
+
 
     int          offset       = vI * 16 + start_output;
     unsigned int index_row[4] = {
@@ -116,29 +116,13 @@ __global__ void write_barrier_hessian(//muda::TripletMatrixViewer<double, 12> tr
     if(is_fixed[body_id_i] == BodyBoundaryType::Fixed
        || is_fixed[body_id_j] == BodyBoundaryType::Fixed)
     {
-        //tripletViewer(vI).write(body_id_i, body_id_j, Matrix12x12::Zero());
-
         Matrix12x12 zero12 = Matrix12x12::Zero();
-        write_triplet_cv2<12, 12>(triplet,
-                                  rows,
-                                  cols,
-                                  index_row,
-                                  index_col,
-                                  zero12,
-                                  offset);
+        write_triplet_cv2<12, 12>(triplet, rows, cols, index_row, index_col, zero12, offset);
     }
     else
     {
         auto ABD_H = ABDJacobi::JT_H_J(abd_J[i].T(), H, abd_J[j]);
-        //tripletViewer(vI).write(body_id_i, body_id_j, ABD_H);
-
-        write_triplet_cv2<12, 12>(triplet,
-                                  rows,
-                                  cols,
-                                  index_row,
-                                  index_col,
-                                  ABD_H,
-                                  offset);
+        write_triplet_cv2<12, 12>(triplet, rows, cols, index_row, index_col, ABD_H, offset);
     }
 
 }
@@ -151,7 +135,7 @@ __global__ void write_abd_body_hessian(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
-    int          offset   = idx * 16;
+    int          offset   = idx * 10;
     unsigned int index[4] = {idx * 4, idx * 4 + 1, idx * 4 + 2, idx * 4 + 3};
     write_triplet_cv(triplet, row, col, index, matrix_input[idx], offset);
 }
@@ -465,8 +449,9 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
     global_triplets.abd_abd_contact_num = bcooNum;
     int new_triplet_offset =
-        global_triplets.fem_fem_contact_num + global_triplets.abd_fem_contact_num * 8
-        + (global_triplets.abd_abd_contact_num + abd_body_count) * 16;
+        global_triplets.fem_fem_contact_num + global_triplets.abd_fem_contact_num * 4
+        + global_triplets.fem_abd_contact_num * 4
+        + (global_triplets.abd_abd_contact_num * 16 + abd_body_count * 10);
 
     int h_abd_fem_contact_start_id = global_triplets.fem_fem_contact_num;
     int h_fem_abd_contact_start_id =
@@ -508,7 +493,7 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
         auto body_id      = unique_point_id_to_body_id.viewer().data();
         int  start_input  = global_triplets.h_abd_abd_contact_start_id;
         int  start_output = new_triplet_offset + h_abd_abd_contact_start_id
-                           + write_offset + 16 * body_hessian_size;
+                           + write_offset + 10 * body_hessian_size;
 
         LaunchCudaKernal_default(bcooNum,
                                  threadNum,
@@ -555,8 +540,8 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
                                 + global_triplets.h_abd_fem_contact_start_id,
                  h_abd_fem_contact_start_id,
 
-                 fem_abd_contact = global_triplets.block_values()
-                                   + global_triplets.h_fem_abd_contact_start_id,
+                 /*fem_abd_contact = global_triplets.block_values()
+                                   + global_triplets.h_fem_abd_contact_start_id,*/
 
                  fem_abd_rows = global_triplets.block_row_indices()
                                 + global_triplets.h_fem_abd_contact_start_id,
@@ -564,7 +549,7 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
                                 + global_triplets.h_fem_abd_contact_start_id,
                  h_fem_abd_contact_start_id,
                  is_fixed = body_id_is_fixed.cviewer().name("is_fixed"),
-                 new_triplet_offset,
+                 //new_triplet_offset,
                  abd_body_count,
                  fem_point_offset] __device__(int I) mutable
                 {
@@ -597,7 +582,7 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
                             {
                                 H.setZero();
                             }
-                            for(int i = 0; i < 4; ++i, ++offset)
+                            for(int i = 0; i < 4; ++i)
                             {
                                 triplet_out[h_abd_fem_contact_start_id + I * 4 + i] =
                                     H.block<3, 3>(i * 3, 0);
@@ -610,47 +595,28 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
                         }
                     }
                     // 2. process lower : FEM-ABD
+                    if(true)
                     {
-                        auto fem_abd_H3x3 = fem_abd_contact[I];
-                        auto i_fem        = fem_abd_rows[I];  // global point id
-                        auto j_abd        = fem_abd_cols[I];  // global point id
+                        //auto fem_abd_H3x3 = fem_abd_contact[I];
+                        auto i_fem = fem_abd_rows[I];  // global point id
+                        auto j_abd = fem_abd_cols[I];  // global point id
 
-                        //if(btype(i_fem) == 0)
+
+                        auto local_fem_point_id = i_fem - fem_point_offset;
+
+                        auto body_id = point_to_body(j_abd);  // global body id
+
+                        for(int i = 0; i < 4; ++i)
                         {
+                            triplet_out[h_fem_abd_contact_start_id + I * 4 + i].setZero();
 
-                            auto local_fem_point_id = i_fem - fem_point_offset;
-
-                            auto body_id = point_to_body(j_abd);  // global body id
-
-                            auto local_abd_body_id = body_id;  // - abd_body_offset;
-                            auto local_abd_point_id = j_abd;  // - abd_point_offset;
-                            //tex: $\mathbf{J}_{3\times 12}$
-                            gipc::ABDJacobi  J = Js(local_abd_point_id);
-                            gipc::Matrix3x12 H = fem_abd_H3x3 * J.to_mat();
-                            //tex:
-                            //$$
-                            // \mathbf{H} = \begin{bmatrix}
-                            //  \mathbf{H}_{1} & \mathbf{H}_{2} & \mathbf{H}_{3} & \mathbf{H}_{4}
-                            //\end{bmatrix}
-                            //$$
-                            auto offset = 4 * I;
-                            if(btype(local_fem_point_id) != 0
-                               || is_fixed(body_id) == BodyBoundaryType::Fixed)
-                            {
-                                H.setZero();
-                            }
-                            for(int i = 0; i < 4; ++i, ++offset)
-                            {
-                                triplet_out[h_fem_abd_contact_start_id + I * 4 + i] =
-                                    H.block<3, 3>(0, i * 3);
-
-                                row_out[h_fem_abd_contact_start_id + I * 4 + i] =
-                                    abd_body_count * 4 + local_fem_point_id;
+                            row_out[h_fem_abd_contact_start_id + I * 4 + i] =
+                                body_id * 4 + i;
 
 
-                                col_out[h_fem_abd_contact_start_id + I * 4 + i] =
-                                    body_id * 4 + i;
-                            }
+                            col_out[h_fem_abd_contact_start_id + I * 4 + i] =
+
+                                abd_body_count * 4 + local_fem_point_id;
                         }
                     }
                 });
@@ -666,42 +632,12 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
     global_triplets.fem_abd_contact_num = global_triplets.fem_abd_contact_num * 4;
 
     global_triplets.abd_abd_contact_num =
-        16 * global_triplets.abd_abd_contact_num + abd_body_count * 16;
+        16 * global_triplets.abd_abd_contact_num + abd_body_count * 10;
 
 
     global_triplets.global_collision_triplet_offset = new_triplet_offset;
     global_triplets.global_triplet_offset = global_triplets.global_collision_triplet_offset;
 
-    /*number = new_triplet_offset - global_triplets.fem_fem_contact_num;
-    int inStart = new_triplet_offset + global_triplets.fem_fem_contact_num + write_offset;
-    int outStart = global_triplets.fem_fem_contact_num;
-    LaunchCudaKernal_default(number,
-                             threadNum,
-                             0,
-                             moveMemory_0,
-                             global_triplets.block_values(),
-                             (int)global_triplets.fem_fem_contact_num,
-                             inStart,
-                             number);
-
-    LaunchCudaKernal_default(number,
-                             threadNum,
-                             0,
-                             moveMemory_0,
-                             global_triplets.block_col_indices(),
-                             (int)global_triplets.fem_fem_contact_num,
-                             inStart,
-                             number);
-
-    LaunchCudaKernal_default(number,
-                             threadNum,
-                             0,
-                             moveMemory_0,
-                             global_triplets.block_row_indices(),
-                             (int)global_triplets.fem_fem_contact_num,
-                             inStart,
-                             number);*/
-    //cudaStreamSynchronize();
 
     CUDA_SAFE_CALL(cudaMemcpy(
         global_triplets.block_values() + global_triplets.fem_fem_contact_num,
@@ -739,16 +675,21 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
         ParallelFor(256)
             .kernel_name(__FUNCTION__)
             .apply(global_triplet->abd_abd_contact_num,
-                   [P = abd_system_diag_preconditioner.viewer().name("P"),
-                    triplet, rows, cols] __device__(int i) mutable
+                   [P = abd_system_diag_preconditioner.viewer().name("P"), triplet, rows, cols] __device__(
+                       int i) mutable
                    {
-                       auto row             = rows[i];
-                       auto H               = triplet[i];
-                       auto col             = cols[i];
+                       auto row = rows[i];
+                       auto H   = triplet[i];
+                       auto col = cols[i];
                        //auto&& [row, col, H] = bcoo(i);
                        if(row / 4 == col / 4)
                        {
-                           P(row / 4).block<3, 3>((row % 4)*3, (col % 4)*3) = H;
+                           P(row / 4).block<3, 3>((row % 4) * 3, (col % 4) * 3) = H;
+                           if(row != col)
+                           {
+                               P(row / 4).block<3, 3>((col % 4) * 3, (row % 4) * 3) =
+                                   H.transpose();
+                           }
                        }
                    });
         int count = sim_data.abd_fem_count_info().abd_body_num;

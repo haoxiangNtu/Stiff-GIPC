@@ -80,33 +80,63 @@ __device__ __host__ void makePD(Eigen::Matrix<Scalar, size, size>& symMtr)
 }
 
 template <int ROWS, int COLS>
-__device__ inline void write_triplet(Eigen::Matrix3d* triplet_value,
-                                     int*             row_ids,
-                                     int*             col_ids,
+__device__ inline void write_triplet(Eigen::Matrix3d*    triplet_value,
+                                     int*                row_ids,
+                                     int*                col_ids,
                                      const unsigned int* index,
-                                     const double     input[ROWS][COLS],
-                                     const int&       offset)
+                                     const double        input[ROWS][COLS],
+                                     const int&          offset)
 {
     int rown = ROWS / 3;
     int coln = COLS / 3;
     for(int ii = 0; ii < rown; ii++)
     {
-        for(int jj = 0; jj < coln; jj++)
+#ifdef SymGH
+        int start = ii;
+#else
+        int start = 0;
+#endif
+        for(int jj = start; jj < coln; jj++)
         {
-            int kk = ii * coln + jj;
-            row_ids[offset + kk] = index[ii];
-            col_ids[offset + kk] = index[jj];
-            for(int iii = 0; iii < 3; iii++)
+
+#ifdef SymGH
+            int kk = ii * rown + jj - ii * (ii + 1) / 2;
+#else
+            int kk = ii * rown + jj;  // - ii * (ii + 1) / 2;
+#endif
+            int row = index[ii];
+            int col = index[jj];
+#ifdef SymGH
+            if(row > col)
             {
-                for(int jjj = 0; jjj < 3; jjj++)
+                row_ids[offset + kk] = col;
+                col_ids[offset + kk] = row;
+                for(int iii = 0; iii < 3; iii++)
                 {
-                    triplet_value[offset+kk](iii, jjj) = input[ii * 3 + iii][jj * 3 + jjj];
+                    for(int jjj = 0; jjj < 3; jjj++)
+                    {
+                        triplet_value[offset + kk](iii, jjj) =
+                            input[jj * 3 + iii][ii * 3 + jjj];
+                    }
+                }
+            }
+            else
+#endif
+            {
+                row_ids[offset + kk] = row;
+                col_ids[offset + kk] = col;
+                for(int iii = 0; iii < 3; iii++)
+                {
+                    for(int jjj = 0; jjj < 3; jjj++)
+                    {
+                        triplet_value[offset + kk](iii, jjj) =
+                            input[ii * 3 + iii][jj * 3 + jjj];
+                    }
                 }
             }
         }
     }
 }
-
 
 
 __device__ __host__ inline uint32_t expand_bits(std::uint32_t v) noexcept
@@ -1397,26 +1427,26 @@ __global__ void _calFrictionHessian_gd(const double3*  _vertexes,
     write_triplet<3, 3>(triplet_values, row_ids, col_ids, &gidx, H_vI.m, global_offset + idx);
 }
 
-__global__ void _calFrictionHessian(const double3* _vertexes,
-                                    const double3* _o_vertexes,
-                                    const int4*    _last_collisionPair,
-                                    Eigen::Matrix3d*          triplet_values,
-                                    int*                      row_ids,
-                                    int*                      col_ids,
-                                    uint32_t*                 _cpNum,
-                                    int                       number,
-                                    double                    dt,
-                                    double2*                  distCoord,
-                                    __GEIGEN__::Matrix3x2d*   tanBasis,
-                                    double                    eps2,
-                                    double*                   lastH,
-                                    double                    coef,
-                                    int                       cd_offset4,
-                                    int                       cd_offset3,
-                                    int                       cd_offset2,
-                                    int                       f_offset4,
-                                    int                       f_offset3,
-                                    int                       f_offset2)
+__global__ void _calFrictionHessian(const double3*          _vertexes,
+                                    const double3*          _o_vertexes,
+                                    const int4*             _last_collisionPair,
+                                    Eigen::Matrix3d*        triplet_values,
+                                    int*                    row_ids,
+                                    int*                    col_ids,
+                                    uint32_t*               _cpNum,
+                                    int                     number,
+                                    double                  dt,
+                                    double2*                distCoord,
+                                    __GEIGEN__::Matrix3x2d* tanBasis,
+                                    double                  eps2,
+                                    double*                 lastH,
+                                    double                  coef,
+                                    int                     cd_offset4,
+                                    int                     cd_offset3,
+                                    int                     cd_offset2,
+                                    int                     f_offset4,
+                                    int                     f_offset3,
+                                    int                     f_offset2)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1424,7 +1454,7 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
     int4    MMCVIDI = _last_collisionPair[idx];
     double  eps     = sqrt(eps2);
     double3 relDX3D;
-    int     global_offset = cd_offset4 * 16 + cd_offset3 * 9 + cd_offset2 * 4;
+    int global_offset = cd_offset4 * M12_Off + cd_offset3 * M9_Off + cd_offset2 * M6_Off;
     if(MMCVIDI.x >= 0)
     {
         Friction::computeRelDX_EE(
@@ -1495,13 +1525,13 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
         __GEIGEN__::Matrix12x12d HessianBlock =
             __GEIGEN__::__s_M12x12_Multiply(__M12x2_M12x2T_Multiply(TM2, T),
                                             coef * lastH[idx]);
-        int Hidx = atomicAdd(_cpNum + 4, 1);
-        int offset = global_offset + Hidx * 16;
-        Hidx += cd_offset4;
+        int Hidx   = atomicAdd(_cpNum + 4, 1);
+        int offset = global_offset + Hidx * M12_Off;
+        //Hidx += cd_offset4;
         //H12x12[Hidx]  = HessianBlock;
         uint4 global_index = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
         //D4Index[Hidx] = global_index;
-        
+
         write_triplet<12, 12>(
             triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
     }
@@ -1574,15 +1604,21 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
                 __GEIGEN__::__s_M6x6_Multiply(__M6x2_M6x2T_Multiply(TM2, T),
                                               coef * lastH[idx]);
 
-            int Hidx = atomicAdd(_cpNum + 2, 1);
-            int offset = global_offset + f_offset4 * 16 + f_offset3 * 9 + Hidx * 4;
-            Hidx += cd_offset2;
+            int Hidx   = atomicAdd(_cpNum + 2, 1);
+            int offset = global_offset + f_offset4 * M12_Off
+                         + f_offset3 * M9_Off + Hidx * M6_Off;
+            //Hidx += cd_offset2;
             //H6x6[Hidx]    = HessianBlock;
-            uint2        global_index = make_uint2(MMCVIDI.x, MMCVIDI.y);
+            uint2 global_index = make_uint2(MMCVIDI.x, MMCVIDI.y);
             //D2Index[Hidx]      = global_index;
 
-            
-            write_triplet<6, 6>(triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
+
+            write_triplet<6, 6>(triplet_values,
+                                row_ids,
+                                col_ids,
+                                &(global_index.x),
+                                HessianBlock.m,
+                                offset);
         }
         else if(MMCVIDI.w < 0)
         {
@@ -1651,16 +1687,20 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
             __GEIGEN__::Matrix9x9d HessianBlock =
                 __GEIGEN__::__s_M9x9_Multiply(__M9x2_M9x2T_Multiply(TM2, T),
                                               coef * lastH[idx]);
-            int Hidx = atomicAdd(_cpNum + 3, 1);
-            int offset = global_offset + f_offset4 * 16 + Hidx * 9;
-            Hidx += cd_offset3;
+            int Hidx   = atomicAdd(_cpNum + 3, 1);
+            int offset = global_offset + f_offset4 * M12_Off + Hidx * M9_Off;
+            //Hidx += cd_offset3;
             //H9x9[Hidx]    = HessianBlock;
             uint3 global_index = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
             //D3Index[Hidx]      = global_index;
 
-            
-            write_triplet<9, 9>(
-                triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
+
+            write_triplet<9, 9>(triplet_values,
+                                row_ids,
+                                col_ids,
+                                &(global_index.x),
+                                HessianBlock.m,
+                                offset);
         }
         else
         {
@@ -1732,15 +1772,20 @@ __global__ void _calFrictionHessian(const double3* _vertexes,
             __GEIGEN__::Matrix12x12d HessianBlock =
                 __GEIGEN__::__s_M12x12_Multiply(__M12x2_M12x2T_Multiply(TM2, T),
                                                 coef * lastH[idx]);
-            int Hidx = atomicAdd(_cpNum + 4, 1);
-            int offset = global_offset + Hidx * 16;
-            Hidx += cd_offset4;
+            int Hidx   = atomicAdd(_cpNum + 4, 1);
+            int offset = global_offset + Hidx * M12_Off;
+            //Hidx += cd_offset4;
             //H12x12[Hidx]  = HessianBlock;
             uint4 global_index = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
             //D4Index[Hidx] = global_index;
 
-            
-            write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), HessianBlock.m, offset);
+
+            write_triplet<12, 12>(triplet_values,
+                                  row_ids,
+                                  col_ids,
+                                  &(global_index.x),
+                                  HessianBlock.m,
+                                  offset);
         }
     }
 }
@@ -3055,21 +3100,21 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
     }
 }
 
-__global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
-                                              const double3*    _rest_vertexes,
-                                              const int4* _collisionPair,
-                                              double3*          _gradient,
+__global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
+                                              const double3*   _rest_vertexes,
+                                              const int4*      _collisionPair,
+                                              double3*         _gradient,
                                               Eigen::Matrix3d* triplet_values,
                                               int*             row_ids,
                                               int*             col_ids,
-                                              uint32_t*                 _cpNum,
-                                              int*   matIndex,
-                                              double dHat,
-                                              double Kappa,
+                                              uint32_t*        _cpNum,
+                                              int*             matIndex,
+                                              double           dHat,
+                                              double           Kappa,
                                               int              offset4,
                                               int              offset3,
                                               int              offset2,
-                                              int    number)
+                                              int              number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -3322,10 +3367,9 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                 make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
             //D4Index[Hidx] = global_index;
 
-            int triplet_id_offset = Hidx * 16;
+            int triplet_id_offset = Hidx * M12_Off;
             write_triplet<12, 12>(
                 triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
-            
         }
         else
         {
@@ -3602,8 +3646,9 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                 make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
             //D4Index[Hidx] = global_index;
 
-            int triplet_id_offset = Hidx * 16;
-            write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
+            int triplet_id_offset = Hidx * M12_Off;
+            write_triplet<12, 12>(
+                triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
         }
     }
     else
@@ -3884,10 +3929,11 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                 uint4 global_index =
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
                 //D4Index[Hidx] = global_index;
-                    
 
-                int triplet_id_offset = Hidx * 16;
-                write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
+
+                int triplet_id_offset = Hidx * M12_Off;
+                write_triplet<12, 12>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
             else
             {
@@ -4130,8 +4176,9 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                 uint2 global_index = make_uint2(v0I, MMCVIDI.y);
                 //D2Index[Hidx]      = global_index;
 
-                int triplet_id_offset = Hidx * 4 + offset3 * 9 + offset4 * 16;
-                write_triplet<6, 6>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
+                int triplet_id_offset = Hidx * M6_Off + offset3 * M9_Off + offset4 * M12_Off;
+                write_triplet<6, 6>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
         }
         else if(MMCVIDI.w < 0)
@@ -4413,10 +4460,11 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
 
                 //D4Index[Hidx] = global_index;
-                    
 
-                int triplet_id_offset = Hidx * 16;
-                write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
+
+                int triplet_id_offset = Hidx * M12_Off;
+                write_triplet<12, 12>(
+                    triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
             else
             {
@@ -4707,12 +4755,12 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
                 int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 3, 1);
 
                 //H9x9[Hidx]    = Hessian;
-                
+
                 uint3 global_index = make_uint3(v0I, MMCVIDI.y, MMCVIDI.z);
 
                 //D3Index[Hidx] = global_index;
 
-                int triplet_id_offset = Hidx * 9 + offset4 * 16;
+                int triplet_id_offset = Hidx * M9_Off + offset4 * M12_Off;
                 write_triplet<9, 9>(
                     triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
             }
@@ -4965,8 +5013,9 @@ __global__ void _calBarrierGradientAndHessian(const double3*    _vertexes,
             //H12x12[Hidx]  = Hessian;
             uint4 global_index = make_uint4(v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
             //D4Index[Hidx]         = global_index;
-            int triplet_id_offset = Hidx * 16;
-            write_triplet<12, 12>(triplet_values, row_ids, col_ids, &(global_index.x),Hessian.m, triplet_id_offset);
+            int triplet_id_offset = Hidx * M12_Off;
+            write_triplet<12, 12>(
+                triplet_values, row_ids, col_ids, &(global_index.x), Hessian.m, triplet_id_offset);
         }
     }
 }
@@ -9231,9 +9280,8 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
         return;
 
     blockNum = (numbers + threadNum - 1) / threadNum;
-    int global_offset = gipc_global_triplet.global_triplet_offset
-                        + h_cpNum_last[4] * 16 + h_cpNum_last[3] * 9
-                        + h_cpNum_last[2] * 4;
+    int global_offset = gipc_global_triplet.global_triplet_offset + h_cpNum_last[4] * M12_Off
+                        + h_cpNum_last[3] * M9_Off + h_cpNum_last[2] * M6_Off;
     _calFrictionHessian_gd<<<blockNum, threadNum>>>(
         _vertexes,
         TetMesh.o_vertexes,
@@ -10051,14 +10099,24 @@ void GIPC::partitionContactHessian()
             gipc_global_triplet.fem_fem_contact_num =
                 gipc_global_triplet.h_abd_fem_contact_start_id
                 - gipc_global_triplet.h_fem_fem_contact_start_id;
+            if(gipc_global_triplet.h_fem_abd_contact_start_id > 0)
+            {
+                gipc_global_triplet.abd_fem_contact_num =
+                    gipc_global_triplet.h_fem_abd_contact_start_id
+                    - gipc_global_triplet.h_abd_fem_contact_start_id;
 
-            gipc_global_triplet.abd_fem_contact_num =
-                gipc_global_triplet.h_fem_abd_contact_start_id
-                - gipc_global_triplet.h_abd_fem_contact_start_id;
+                gipc_global_triplet.fem_abd_contact_num =
+                    gipc_global_triplet.h_abd_abd_contact_start_id
+                    - gipc_global_triplet.h_fem_abd_contact_start_id;
+            }
+            else
+            {
+                gipc_global_triplet.abd_fem_contact_num =
+                    gipc_global_triplet.h_abd_abd_contact_start_id
+                    - gipc_global_triplet.h_abd_fem_contact_start_id;
 
-            gipc_global_triplet.fem_abd_contact_num =
-                gipc_global_triplet.h_abd_abd_contact_start_id
-                - gipc_global_triplet.h_fem_abd_contact_start_id;
+                gipc_global_triplet.fem_abd_contact_num = 0;
+            }
             gipc_global_triplet.abd_abd_contact_num =
                 gipc_global_triplet.global_collision_triplet_offset
                 - gipc_global_triplet.h_abd_abd_contact_start_id;
@@ -10161,7 +10219,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
         calBarrierGradientAndHessian(contact_grads, Kappa);
         gipc_global_triplet.global_triplet_offset +=
-            h_cpNum[4] * 16 + h_cpNum[3] * 9 + h_cpNum[2] * 4;
+            h_cpNum[4] * M12_Off + h_cpNum[3] * M9_Off + h_cpNum[2] * M6_Off;
     }
 
     float time00 = 0;
@@ -10174,7 +10232,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
         calFrictionHessian(TetMesh);
         gipc_global_triplet.global_triplet_offset +=
-            h_cpNum_last[4] * 16 + h_cpNum_last[3] * 9 + h_cpNum_last[2] * 4 + h_gpNum_last;
+            h_cpNum_last[4] * M12_Off + h_cpNum_last[3] * M9_Off
+            + h_cpNum_last[2] * M6_Off + h_gpNum_last;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     }
 #endif
@@ -10212,10 +10271,22 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                         gipc_global_triplet.h_fem_fem_contact_start_id),
                     cfem_cols = gipc_global_triplet.block_col_indices(
                         gipc_global_triplet.h_fem_fem_contact_start_id),
+                    cfem_vals = gipc_global_triplet.block_values(
+                        gipc_global_triplet.h_fem_fem_contact_start_id),
                     fem_global_hessian_index_offset] __device__(int i) mutable
                    {
-                       cfem_rows[i] = cfem_rows[i] + fem_global_hessian_index_offset;
-                       cfem_cols[i] = cfem_cols[i] + fem_global_hessian_index_offset;
+                       int row = cfem_rows[i];
+                       int col = cfem_cols[i];
+                       if(row <= col)
+                       {
+                           cfem_rows[i] = row + fem_global_hessian_index_offset;
+                           cfem_cols[i] = col + fem_global_hessian_index_offset;
+                       }
+                       else {
+                           cfem_rows[i] = col + fem_global_hessian_index_offset;
+                           cfem_cols[i] = row + fem_global_hessian_index_offset;
+                           cfem_vals[i].setZero();
+                       }
                    });
     }
 
@@ -10238,7 +10309,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                        gipc_global_triplet.block_col_indices(),
                                        IPC_dt,
                                        fem_global_hessian_index_offset);
-        gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_tet_num * 16;
+        gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_tet_num * 10;
 
 
         calculate_bending_gradient_hessian(
@@ -10255,7 +10326,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             gipc_global_triplet.block_col_indices(),
             IPC_dt,
             fem_global_hessian_index_offset);
-        gipc_global_triplet.global_triplet_offset += tri_edge_num * 16;
+        gipc_global_triplet.global_triplet_offset += tri_edge_num * 10;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
         calculate_triangle_fem_gradient_hessian(
@@ -10275,7 +10346,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             IPC_dt,
             fem_global_hessian_index_offset);
 
-        gipc_global_triplet.global_triplet_offset += triangleNum * 9;
+        gipc_global_triplet.global_triplet_offset += triangleNum * 6;
 
 
 

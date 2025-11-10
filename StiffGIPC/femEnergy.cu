@@ -21,21 +21,42 @@ __device__ inline void write_triplet_fem(Eigen::Matrix3d* triplet_value,
 {
     int rown = ROWS / 3;
     int coln = COLS / 3;
+    int kk   = 0;
     for(int ii = 0; ii < rown; ii++)
     {
-        for(int jj = 0; jj < coln; jj++)
+        for(int jj = ii; jj < coln; jj++)
         {
-            int kk               = ii * coln + jj;
-            row_ids[offset + kk] = node_index[ii];
-            col_ids[offset + kk] = node_index[jj];
-            for(int iii = 0; iii < 3; iii++)
+            int row              = node_index[ii];
+            int col              = node_index[jj];
+
+            if(row <= col)
             {
-                for(int jjj = 0; jjj < 3; jjj++)
+                row_ids[offset + kk] = row;
+                col_ids[offset + kk] = col;
+                for(int iii = 0; iii < 3; iii++)
                 {
-                    triplet_value[offset + kk](iii, jjj) =
-                        input[ii * 3 + iii][jj * 3 + jjj];
+                    for(int jjj = 0; jjj < 3; jjj++)
+                    {
+                        triplet_value[offset + kk](iii, jjj) =
+                            input[ii * 3 + iii][jj * 3 + jjj];
+                    }
                 }
             }
+            else
+            {
+                row_ids[offset + kk] = col;
+                col_ids[offset + kk] = row;
+                for(int iii = 0; iii < 3; iii++)
+                {
+                    for(int jjj = 0; jjj < 3; jjj++)
+                    {
+                        triplet_value[offset + kk](iii, jjj) =
+                            input[jj * 3 + iii][ii * 3 + jjj];
+                    }
+                }
+            }
+            kk++;
+            
         }
     }
 }
@@ -1808,16 +1829,29 @@ __global__ void _calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInvers
     //write_triplet_fem<12, 12>(
     //    triplet_values, row_ids, col_ids, fem_index, H.m, global_offset + 16 * idx);
 
-    int triplet_offset = global_offset + 16 * idx;
+    int triplet_offset = global_offset + 10 * idx;
+    int kk             = 0;
     for(int ii = 0; ii < 4; ii++)
     {
-        for(int jj = 0; jj < 4; jj++)
+        for(int jj = ii; jj < 4; jj++)
         {
-            int kk               = ii * 4 + jj;
-            row_ids[triplet_offset + kk] = fem_index[ii];
-            col_ids[triplet_offset + kk] = fem_index[jj];
-
-            triplet_values[triplet_offset + kk] = H.block<3, 3>(ii * 3, jj * 3);
+            int row                      = fem_index[ii];
+            int col                      = fem_index[jj];
+            if(row <= col)
+            {
+                row_ids[triplet_offset + kk] = row;
+                col_ids[triplet_offset + kk] = col;
+                triplet_values[triplet_offset + kk] = H.block<3, 3>(ii * 3, jj * 3);
+                //kk++;
+            }
+            else
+            {
+                row_ids[triplet_offset + kk] = col;
+                col_ids[triplet_offset + kk] = row;
+                triplet_values[triplet_offset + kk] =
+                    H.block<3, 3>(ii * 3, jj * 3).transpose();
+            }
+            kk++;
         }
     }
 }
@@ -2177,7 +2211,7 @@ __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d*
                                          triangles[idx].z + global_hessian_fem_offset};
 
     write_triplet_fem<9, 9>(
-        triplet_values, row_ids, col_ids, global_fem_offset, H.m, global_offset + idx * 9);
+        triplet_values, row_ids, col_ids, global_fem_offset, H.m, global_offset + idx * 6);
 }
 
 __global__ void _calculate_triangle_fem_gradient(__GEIGEN__::Matrix2x2d* trimInverses,
@@ -2336,17 +2370,19 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
     if(adj.y == -1)
     {
         int default_index[4] = {0, 1, 2, 3};
-        int gtrioff = global_offset + idx * 16;
+        int gtrioff          = global_offset + idx * 10;
+        int kk               = 0;
         for(int ii = 0; ii < 4; ii++)
         {
-            for(int jj = 0; jj < 4; jj++)
+            for(int jj = ii; jj < 4; jj++)
             {
-                int kk                       = ii * 4 + jj;
-                row_ids[gtrioff + kk]        = default_index[ii];
-                col_ids[gtrioff + kk]        = default_index[jj];
-                triplet_values[gtrioff + kk] = Matrix3d::Zero();
+                row_ids[gtrioff + kk]        = 0;
+                col_ids[gtrioff + kk]        = 0;
+                triplet_values[gtrioff + kk].setZero();
+                kk++;
             }
         }
+
         return;
     }
     auto x0 = vertexes[edge.x];
@@ -2396,13 +2432,13 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
 
 
     {
-        atomicAdd(&(gradient[edge.x].x), grad_transpose(0,0));
-        atomicAdd(&(gradient[edge.x].y), grad_transpose(0,1));
-        atomicAdd(&(gradient[edge.x].z), grad_transpose(0,2));
+        atomicAdd(&(gradient[edge.x].x), grad_transpose(0, 0));
+        atomicAdd(&(gradient[edge.x].y), grad_transpose(0, 1));
+        atomicAdd(&(gradient[edge.x].z), grad_transpose(0, 2));
 
-        atomicAdd(&(gradient[edge.y].x), grad_transpose(0,3));
-        atomicAdd(&(gradient[edge.y].y), grad_transpose(0,4));
-        atomicAdd(&(gradient[edge.y].z), grad_transpose(0,5));
+        atomicAdd(&(gradient[edge.y].x), grad_transpose(0, 3));
+        atomicAdd(&(gradient[edge.y].y), grad_transpose(0, 4));
+        atomicAdd(&(gradient[edge.y].z), grad_transpose(0, 5));
 
         atomicAdd(&(gradient[adj.x].x), grad_transpose(0, 6));
         atomicAdd(&(gradient[adj.x].y), grad_transpose(0, 7));
@@ -2412,33 +2448,37 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
         atomicAdd(&(gradient[adj.y].y), grad_transpose(0, 10));
         atomicAdd(&(gradient[adj.y].z), grad_transpose(0, 11));
     }
-    /*__GEIGEN__::Matrix12x12d d_H;
-    for(int i = 0; i < 12; i++)
-    {
-        for(int j = 0; j < 12; j++)
-        {
-            d_H.m[i][j] = IPC_dt * IPC_dt * length * H(i, j) * bendStiff;
-        }
-    }*/
+
     H = IPC_dt * IPC_dt * length * bendStiff * H;
     //Hessians[idx + offset] = d_H;
-    uint4 global_index     = make_uint4(edge.x, edge.y, adj.x, adj.y);
+    uint4 global_index = make_uint4(edge.x, edge.y, adj.x, adj.y);
     //Indices[idx + offset]  = global_index;
     unsigned int fem_global_index[4] = {edge.x + global_hessian_fem_offset,
-                                     edge.y + global_hessian_fem_offset,
-                                     adj.x + global_hessian_fem_offset,
-                                     adj.y + global_hessian_fem_offset};
-    //write_triplet_fem<12, 12>(
-    //    triplet_values, row_ids, col_ids, fem_global_index, d_H.m, global_offset + idx * 16);
-    int gtrioff = global_offset + idx * 16;
+                                        edge.y + global_hessian_fem_offset,
+                                        adj.x + global_hessian_fem_offset,
+                                        adj.y + global_hessian_fem_offset};
+
+    int gtrioff = global_offset + idx * 10;
+    int kk      = 0;
     for(int ii = 0; ii < 4; ii++)
     {
-        for(int jj = 0; jj < 4; jj++)
+        for(int jj = ii; jj < 4; jj++)
         {
-            int kk               = ii * 4 + jj;
-            row_ids[gtrioff + kk]       = fem_global_index[ii];
-            col_ids[gtrioff + kk]       = fem_global_index[jj];
-            triplet_values[gtrioff + kk] = H.block<3, 3>(ii * 3, jj * 3);
+            int row = fem_global_index[ii];
+            int col = fem_global_index[jj];
+            if(row <= col)
+            {
+                row_ids[gtrioff + kk]        = row;
+                col_ids[gtrioff + kk]        = col;
+                triplet_values[gtrioff + kk] = H.block<3, 3>(ii * 3, jj * 3);
+            }
+            else
+            {
+                row_ids[gtrioff + kk] = col;
+                col_ids[gtrioff + kk] = row;
+                triplet_values[gtrioff + kk] = H.block<3, 3>(ii * 3, jj * 3).transpose();
+            }
+            kk++;
         }
     }
 }

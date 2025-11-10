@@ -1,12 +1,19 @@
 #pragma once
 
-//namespace muda::details
-//{
-//template <typename T, int N>
-//class MatrixFormatConverter;
-//}
 #include"cuda_tools/cuda_device_buffer.h"
 #include"Eigen/Eigen"
+
+//#define SymGH
+#ifdef SymGH
+#define M12_Off 10
+#define M9_Off 6
+#define M6_Off 3
+#else
+#define M12_Off 16
+#define M9_Off 9
+#define M6_Off 4
+#endif
+
 
 class GIPCTripletMatrix
 {

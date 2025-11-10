@@ -89,7 +89,7 @@ bool GlobalLinearSystem::build_linear_system()
         m_local_preconditioners[0]->assemble();
         start_preconditioner_id++;
     }
-    convert2();
+    convert_new();
 
     // assemble preconditioners
     if(m_global_preconditioner)
@@ -222,24 +222,15 @@ bool GlobalLinearSystem::accuracy_statisfied(muda::DenseVectorView<Float> r)
                        });
 }
 
-void GlobalLinearSystem::convert2()
+void GlobalLinearSystem::convert_new()
 {
-
-    //if(reserved_triplet_count < m_triplet_A.triplet_count())
-    //{
-    //    reserved_triplet_count = m_triplet_A.triplet_count() * 1.5;
-    //    m_bcoo_A.reserve_triplets(reserved_triplet_count);
-    //    m_triplet_A.reserve_triplets(reserved_triplet_count);
-    //}
-
-    //m_converter.convert(m_triplet_A, m_bcoo_A);
-    //m_converter.ge2sym(m_bcoo_A);
-
     m_converter.convert(*gipc_global_triplet,
                         0,
                         gipc_global_triplet->global_triplet_offset,
                         gipc_global_triplet->global_triplet_offset);
-    m_converter.ge2sym(*gipc_global_triplet);
+//#ifndef SymGH
+//    m_converter.ge2sym(*gipc_global_triplet);
+//#endif
 }
 
 

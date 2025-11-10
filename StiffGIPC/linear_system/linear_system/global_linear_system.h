@@ -109,7 +109,7 @@ class GlobalLinearSystem
                               muda::CDenseVectorView<Float> r);
     bool accuracy_statisfied(muda::DenseVectorView<Float> r);
     void convert();
-    void convert2();
+    void convert_new();
 
     void spmv(Float a, muda::CDenseVectorView<Float> x, Float b, muda::DenseVectorView<Float> y);
 
