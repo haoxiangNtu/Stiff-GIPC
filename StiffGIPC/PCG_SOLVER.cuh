@@ -10,26 +10,13 @@
 #ifndef _PCG_SOLVER_CUH_
 #define _PCG_SOLVER_CUH_
 #include <cuda_runtime.h>
-#include "device_fem_data.cuh"
-#include <cstdint>
 #include "MASPreconditioner.cuh"
 
 class PCG_Data
 {
   public:
     double*                 squeue;
-    double3*                b;
-    __GEIGEN__::Matrix3x3d* P;
-    double3*                r;
-    double3*                c;
-    double3*                q;
-    double3*                s;
-    double3*                z;
     double3*                dx;
-    double3*                tempDx;
-
-    double3*          filterTempVec3;
-    double3*          preconditionTempVec3;
     MASPreconditioner MP;
 
     int P_type = 1;

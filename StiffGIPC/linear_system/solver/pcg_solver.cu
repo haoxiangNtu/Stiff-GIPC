@@ -1,6 +1,154 @@
 #include <linear_system/solver/pcg_solver.h>
 #include <gipc/utils/timer.h>
 #include <gipc/statistics.h>
+#include <cuda_tools/cuda_tools.h>
+
+
+
+__global__ void PCG_vdv_Reduction(double* squeue, const double* a, const double* b, int numbers)
+{
+    int idof = blockIdx.x * blockDim.x;
+    int idx  = threadIdx.x + idof;
+
+    extern __shared__ double tep[];
+
+    if(idx >= numbers)
+        return;
+
+    double temp = a[idx] * b[idx];
+
+    int    warpTid = threadIdx.x % 32;
+    int    warpId  = (threadIdx.x >> 5);
+    //double nextTp;
+    int    warpNum;
+    if(blockIdx.x == gridDim.x - 1)
+    {
+        warpNum = ((numbers - idof + 31) >> 5);
+    }
+    else
+    {
+        warpNum = ((blockDim.x) >> 5);
+    }
+    for(int i = 1; i < 32; i = (i << 1))
+    {
+        temp += __shfl_down_sync(0xffffffff, temp, i);
+    }
+    if(warpTid == 0)
+    {
+        tep[warpId] = temp;
+    }
+    __syncthreads();
+    if(threadIdx.x >= warpNum)
+        return;
+    if(warpNum > 1)
+    {
+        temp = tep[threadIdx.x];
+        for(int i = 1; i < warpNum; i = (i << 1))
+        {
+            temp += __shfl_down_sync(0xffffffff, temp, i);
+        }
+    }
+    if(threadIdx.x == 0)
+    {
+        squeue[blockIdx.x] = temp;
+    }
+}
+
+
+
+__global__ void add_reduction(double* mem, int numbers)
+{
+    int idof = blockIdx.x * blockDim.x;
+    int idx  = threadIdx.x + idof;
+    extern __shared__ double tep[];
+    if(idx >= numbers)
+        return;
+    double temp = mem[idx];
+    int    warpTid = threadIdx.x % 32;
+    int    warpId  = (threadIdx.x >> 5);
+    int    warpNum;
+    if(blockIdx.x == gridDim.x - 1)
+    {
+        warpNum = ((numbers - idof + 31) >> 5);
+    }
+    else
+    {
+        warpNum = ((blockDim.x) >> 5);
+    }
+    for(int i = 1; i < 32; i = (i << 1))
+    {
+        temp += __shfl_down_sync(0xffffffff, temp, i);
+    }
+    if(warpTid == 0)
+    {
+        tep[warpId] = temp;
+    }
+    __syncthreads();
+    if(threadIdx.x >= warpNum)
+        return;
+    if(warpNum > 1)
+    {
+        temp = tep[threadIdx.x];
+        for(int i = 1; i < warpNum; i = (i << 1))
+        {
+            temp += __shfl_down_sync(0xffffffff, temp, i);
+        }
+    }
+    if(threadIdx.x == 0)
+    {
+        mem[blockIdx.x] = temp;
+    }
+}
+
+
+
+__global__ void update_vector_dx_r(
+    double* dx, double* r, const double* c, const double* q, double alpha, int numbers)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= numbers)
+        return;
+    dx[idx] = dx[idx] + alpha * c[idx];
+    r[idx]  = r[idx] - alpha * q[idx];
+}
+
+__global__ void update_vector_c(
+    double* c, const double* s, double beta, int numbers)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= numbers)
+        return;
+    c[idx] = s[idx] + beta * c[idx];
+}
+
+
+double My_PCG_General_v_v_Reduction_Algorithm(double* temp, double* A, double* B, int vertexNum)
+{
+
+    int numbers = vertexNum;
+    if(numbers < 1)
+        return 0;
+    const unsigned int threadNum = 256;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+
+    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+    PCG_vdv_Reduction<<<blockNum, threadNum, sharedMsize>>>(temp, A, B, numbers);
+
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+
+    while(numbers > 1)
+    {
+        add_reduction<<<blockNum, threadNum, sharedMsize>>>(temp, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    double result;
+    cudaMemcpy(&result, temp, sizeof(double), cudaMemcpyDeviceToHost);
+    return result;
+}
+
 namespace gipc
 {
 PCGSolver::PCGSolver(const PCGSolverConfig& cfg)
@@ -16,6 +164,7 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
     z.resize(b.size());
     p.resize(b.size());
     r.resize(b.size());
+    //temp.resize(b.size());
     Ap.resize(b.size());
     auto iter = pcg(x, b, m_config.max_iter_ratio * b.size());
 
@@ -27,271 +176,98 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
 {
     SizeT k = 0;
 
-    auto dot = [this](muda::CDenseVectorView<Float> a,
-                      muda::CDenseVectorView<Float> b,
-                      muda::VarView<Float>          res)
-    {
-        ctx().dot(a, b, res);
-        //blas.dot(a, b, res);
-    };
-
-    auto axpby = [this](Float                         alpha,
-                        muda::CDenseVectorView<Float> x,
-                        Float                         beta,
-                        muda::DenseVectorView<Float>  y)
-    {
-        ctx().axpby(alpha, x, beta, y);
-        //blas.axpby(alpha, x, beta, y);
-    };
-
-    // r = b - A * x
-    {
-        // r = b;
-        r.buffer_view().copy_from(b.buffer_view());
-        // r = - A * x + r
-        //spmv(-1.0, x.as_const(), 1.0, r.view());
-    }
+    r.buffer_view().copy_from(b.buffer_view());
 
     Float alpha, beta, rz, rz0;
 
     {
-        Timer timer{"preconditioner"};
-        // z = P * r (apply preconditioner)
+        //Timer timer{"preconditioner"};
         apply_preconditioner(z, r);
     }
 
-
-    // p = z
-    p = z;
-
-    // init rz
-    // rz = r^T * z
     {
-        Timer timer{"dot"};
-        dot(r.cview(), z.cview(), dot_res);
-
-        // rz = dot(r.cview(), z.cview());
+        //Timer timer{"dot"};
+        rz = My_PCG_General_v_v_Reduction_Algorithm(p.buffer_view().data(),
+                                                    r.buffer_view().data(),
+                                                    z.buffer_view().data(),
+                                                    z.size());
     }
 
-    {
-        Timer timer{"dot_res_copy_time"};
-        dot_res.view().copy_to(host_pinned_dot_res);
-        rz = *host_pinned_dot_res;
-    }
-
-
-    rz0 = std::abs(rz);
-
-    // check convergence
-    if(/*accuracy_statisfied(r) &&*/ std::abs(rz) <= m_config.global_tol_rate * rz0)
-        return k;
+    p   = z;
+    rz0 = rz;
 
     for(k = 1; k < max_iter; ++k)
     {
         {
-            Timer timer{"spmv"};
+            //Timer timer{"spmv"};
             // Ap = A * p
             spmv(p.cview(), Ap.view());
         }
 
         {
-            Timer timer{"dot"};
-            // alpha = rz / (p^T * Ap)
+            //Timer timer{"dot"};
 
-            // alpha = rz / dot(p.cview(), Ap.cview());
-            dot(p.cview(), Ap.cview(), dot_res);
+            *host_pinned_dot_res =
+                My_PCG_General_v_v_Reduction_Algorithm(z.buffer_view().data(),
+                                                       p.buffer_view().data(),
+                                                       Ap.buffer_view().data(),
+                                                       z.size());
         }
 
         {
-            Timer timer{"dot_res_copy_time"};
-            // alpha = rz / dot_res;
-
-            dot_res.view().copy_to(host_pinned_dot_res);
+            //Timer timer{"dot_res_copy_time"};
             alpha = rz / *host_pinned_dot_res;
         }
 
         {
-            Timer timer{"axpby"};
-
-            // x = x + alpha * p
-            axpby(alpha, p.cview(), 1.0, x);
-
-            // r = r - alpha * Ap
-            axpby(-alpha, Ap.cview(), 1.0, r.view());
+            //Timer timer{"axpby"};
+            LaunchCudaKernal_default(z.size(),
+                                     256,
+                                     0,
+                                     update_vector_dx_r,
+                                     x.buffer_view().data(),
+                                     r.buffer_view().data(),
+                                     (const double*)p.buffer_view().data(),
+                                     (const double*)Ap.buffer_view().data(),
+                                     alpha,
+                                     (int)z.size());
         }
 
-        // check convergence
-        if(/*accuracy_statisfied(r) &&*/ std::abs(rz) <= m_config.global_tol_rate * rz0)
+        if(std::abs(rz) <= m_config.global_tol_rate * rz0)
             break;
 
         {
-            Timer timer{"preconditioner"};
-            // z = P * r (apply preconditioner)
+            //Timer timer{"preconditioner"};
             apply_preconditioner(z, r);
         }
 
         Float rz_new = 0;
         {
-            Timer timer{"dot"};
-            // rz_new = r^T * z
-            // rz_new = dot(r.cview(), z.cview());
-
-            dot(r.cview(), z.cview(), dot_res);
+            //Timer timer{"dot"};
+            rz_new = My_PCG_General_v_v_Reduction_Algorithm(Ap.buffer_view().data(),
+                                                            r.buffer_view().data(),
+                                                            z.buffer_view().data(),
+                                                            z.size());
         }
 
-        {
-            Timer timer{"dot_res_copy_time"};
-            dot_res.view().copy_to(host_pinned_dot_res);
-            rz_new = *host_pinned_dot_res;
-        }
-
-        // beta = rz_new / rz
         beta = rz_new / rz;
 
         {
-            Timer timer{"axpby"};
-            // p = z + beta * p
-            axpby(1.0, z.cview(), beta, p.view());
+            //Timer timer{"axpby"};
+            LaunchCudaKernal_default(z.size(),
+                                     256,
+                                     0,
+                                     update_vector_c,
+                                     p.buffer_view().data(),
+                                     (const double*)z.buffer_view().data(),
+                                     beta,
+                                     (int)z.size());
         }
 
-        // update rz
         rz = rz_new;
     }
 
     return k;
 }
 
-SizeT PCGSolver::pcg_0(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter)
-{
-    SizeT k = 0;
-
-    auto dot = [this](muda::CDenseVectorView<Float> a,
-                      muda::CDenseVectorView<Float> b,
-                      muda::VarView<Float>          res)
-    {
-        //ctx().dot(a, b, res);
-        blas.dot(a, b, res);
-    };
-
-    auto axpby = [this](Float                         alpha,
-                        muda::CDenseVectorView<Float> x,
-                        Float                         beta,
-                        muda::DenseVectorView<Float>  y)
-    {
-        ctx().axpby(alpha, x, beta, y);
-        //blas.axpby(alpha, x, beta, y);
-    };
-
-    // r = b - A * x
-    {
-        // r = b;
-        r.buffer_view().copy_from(b.buffer_view());
-        // r = - A * x + r
-        //spmv(-1.0, x.as_const(), 1.0, r.view());
-    }
-
-    Float alpha, beta, rz, rz0;
-
-    {
-        Timer timer{"preconditioner"};
-        // z = P * r (apply preconditioner)
-        apply_preconditioner(z, r);
-    }
-
-
-    // p = z
-    p = z;
-
-    // init rz
-    // rz = r^T * z
-    {
-        Timer timer{"dot"};
-        dot(r.cview(), z.cview(), dot_res);
-
-        // rz = dot(r.cview(), z.cview());
-    }
-
-    {
-        Timer timer{"dot_res_copy_time"};
-        rz = dot_res;
-    }
-
-
-    rz0 = std::abs(rz);
-
-    // check convergence
-    if(/*accuracy_statisfied(r) &&*/ std::abs(rz) <= m_config.global_tol_rate * rz0)
-        return k;
-
-    for(k = 1; k < max_iter; ++k)
-    {
-        {
-            Timer timer{"spmv"};
-            // Ap = A * p
-            spmv(p.cview(), Ap.view());
-        }
-
-        {
-            Timer timer{"dot"};
-            // alpha = rz / (p^T * Ap)
-
-            // alpha = rz / dot(p.cview(), Ap.cview());
-            dot(p.cview(), Ap.cview(), dot_res);
-        }
-
-        {
-            Timer timer{"dot_res_copy_time"};
-            // alpha = rz / dot_res;
-            alpha = rz / dot_res;
-        }
-
-        {
-            Timer timer{"axpby"};
-
-            // x = x + alpha * p
-            axpby(alpha, p.cview(), 1.0, x);
-
-            // r = r - alpha * Ap
-            axpby(-alpha, Ap.cview(), 1.0, r.view());
-        }
-
-        // check convergence
-        if(/*accuracy_statisfied(r) &&*/ std::abs(rz) <= m_config.global_tol_rate * rz0)
-            break;
-
-        {
-            Timer timer{"preconditioner"};
-            // z = P * r (apply preconditioner)
-            apply_preconditioner(z, r);
-        }
-
-        Float rz_new = 0;
-        {
-            Timer timer{"dot"};
-            // rz_new = r^T * z
-            // rz_new = dot(r.cview(), z.cview());
-
-            dot(r.cview(), z.cview(), dot_res);
-        }
-
-        {
-            Timer timer{"dot_res_copy_time"};
-            rz_new = dot_res;
-        }
-
-        // beta = rz_new / rz
-        beta = rz_new / rz;
-
-        {
-            Timer timer{"axpby"};
-            // p = z + beta * p
-            axpby(1.0, z.cview(), beta, p.view());
-        }
-
-        // update rz
-        rz = rz_new;
-    }
-
-    return k;
-}
 }  // namespace gipc

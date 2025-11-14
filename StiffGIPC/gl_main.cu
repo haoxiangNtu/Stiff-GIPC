@@ -1149,19 +1149,13 @@ void initScene()
 
     printf("restSNKE: %f\n", ipc.RestNHEnergy);
     ipc.buildCP();
-    ipc.pcg_data.b        = d_tetMesh.fb;
+
     ipc._moveDir          = ipc.pcg_data.dx;
     ipc.animation_subRate = 1.0 / motion_rate;
     //ipc.animation_fullRate = ipc.animation_subRate;
     ipc.computeXTilta(d_tetMesh, 1);
     ///////////////////////////////////////////////////////////////////////////////////
 
-    //if (ipc.isIntersected(d_tetMesh)) {
-    //    printf("init intersection\n");
-    //}
-
-    //ipc.m_global_linear_system->create<gipc::MAS_Preconditioner>(
-    //    ipc.m_global_linear_system->m_subsystems[1], ipc.BH, ipc.pcg_data.MP, d_tetMesh, ipc.h_cpNum);
     ipc.create_LinearSystem(d_tetMesh);
 
     bvs.resize(2 * ipc.edge_Num - 1);
