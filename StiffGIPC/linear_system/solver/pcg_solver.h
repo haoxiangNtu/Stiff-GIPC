@@ -33,8 +33,6 @@ class PCGSolver : public IterativeSolver
     DeviceDenseVector p;   // search direction
     DeviceDenseVector Ap;  // A*p
     PCGSolverConfig   m_config;
-    //muda::DeviceVar<Float> dot_res;
-    Float* host_pinned_dot_res;
 
   protected:
     SizeT solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b) override;

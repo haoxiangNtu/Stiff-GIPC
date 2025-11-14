@@ -154,7 +154,6 @@ namespace gipc
 PCGSolver::PCGSolver(const PCGSolverConfig& cfg)
     : m_config(cfg)
 {
-    checkCudaErrors(cudaMallocHost(&host_pinned_dot_res, sizeof(Float)));
 }
 SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b)
 {
@@ -207,16 +206,13 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         {
             //Timer timer{"dot"};
 
-            *host_pinned_dot_res =
+            Float dot_res =
                 My_PCG_General_v_v_Reduction_Algorithm(z.buffer_view().data(),
                                                        p.buffer_view().data(),
                                                        Ap.buffer_view().data(),
                                                        z.size());
-        }
 
-        {
-            //Timer timer{"dot_res_copy_time"};
-            alpha = rz / *host_pinned_dot_res;
+            alpha = rz / dot_res;
         }
 
         {

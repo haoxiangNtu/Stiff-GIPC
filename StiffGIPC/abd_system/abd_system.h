@@ -32,18 +32,12 @@ class ABDSystem
     int*                                  fem_boundary_type;
     muda::DeviceBuffer<Vector12>          abd_gradient;  // just for legacy code
     muda::DeviceBuffer<Matrix12x12>       abd_body_hessian;
-    //muda::LinearSystemContext             linear_system_context;
-    //muda::DeviceTripletMatrix<double, 12> triplet_hessian;
     GIPCTripletMatrix*   global_triplet;
-    //muda::DeviceBCOOMatrix<double, 12>    bcoo_hessian;
-    //muda::DeviceBSRMatrix<double, 12>     bsr_hessian;
     muda::DeviceDenseMatrix<double>       dense_system_hessian;
     muda::DeviceCSRMatrix<double>         csr_system_hessian;
     muda::DeviceDenseVector<double>       system_gradient;
     muda::DeviceDenseVector<double>       temp_system_gradient;
     muda::DeviceDoubletVector<double, 12> doublet_system_gradient;
-    //muda::DeviceTripletMatrix<double, 3>  triplet_vertex_hessian;
-    //muda::DeviceBCOOMatrix<double, 3>     bcoo_vertex_hessian;
     muda::DeviceBuffer<Matrix12x12>       abd_system_diag_preconditioner;
 
     muda::DeviceBuffer<Vector3> body_mass_center;
