@@ -651,18 +651,6 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
                        auto H = P(i);
                        P(i)   = inverse(H);
                    });
-
-
-        //ParallelFor(256)
-        //    .kernel_name(__FUNCTION__)
-        //    .apply(bcoo_hessian.triplet_count(),
-        //           [P = abd_system_diag_preconditioner.viewer().name("P"),
-        //            bcoo = bcoo_hessian.cviewer().name("abd_hessian")] __device__(int i) mutable
-        //           {
-        //               auto&& [row, col, H] = bcoo(i);
-        //               if(row == col)
-        //                   P(row) = inverse(H);
-        //           });
     }
 }
 }  // namespace gipc

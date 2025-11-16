@@ -2113,13 +2113,11 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
 
             Eigen::Matrix2d FMat2;
             FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
-            makePDGeneral<double, 2>(FMat2);
-            __GEIGEN__::__init_Mat9x9(M9_temp, 0);
-            M9_temp.m[4][4] = FMat2(0, 0);
-            M9_temp.m[4][8] = FMat2(0, 1);
-            M9_temp.m[8][4] = FMat2(1, 0);
-            M9_temp.m[8][8] = FMat2(1, 1);
-            projectedH      = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
+            makePDGeneral<double, 2>(FMat2);          
+            projectedH.m[4][4] += FMat2(0, 0);
+            projectedH.m[4][8] += FMat2(0, 1);
+            projectedH.m[8][4] += FMat2(1, 0);
+            projectedH.m[8][8] += FMat2(1, 1);
 
             __GEIGEN__::Matrix12x12d Hessian; 
             __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
@@ -2323,12 +2321,10 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
                 Eigen::Matrix2d FMat2;
                 FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
                 makePDGeneral<double, 2>(FMat2);
-                __GEIGEN__::__init_Mat9x9(M9_temp, 0);
-                M9_temp.m[4][4] = FMat2(0, 0);
-                M9_temp.m[4][8] = FMat2(0, 1);
-                M9_temp.m[8][4] = FMat2(1, 0);
-                M9_temp.m[8][8] = FMat2(1, 1);
-                projectedH      = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
+                projectedH.m[4][4] += FMat2(0, 0);
+                projectedH.m[4][8] += FMat2(0, 1);
+                projectedH.m[8][4] += FMat2(1, 0);
+                projectedH.m[8][8] += FMat2(1, 1);
 
                 //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
                 __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
@@ -2692,12 +2688,10 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
                 Eigen::Matrix2d FMat2;
                 FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
                 makePDGeneral<double, 2>(FMat2);
-                __GEIGEN__::__init_Mat9x9(M9_temp, 0);
-                M9_temp.m[4][4] = FMat2(0, 0);
-                M9_temp.m[4][8] = FMat2(0, 1);
-                M9_temp.m[8][4] = FMat2(1, 0);
-                M9_temp.m[8][8] = FMat2(1, 1);
-                projectedH      = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
+                projectedH.m[4][4] += FMat2(0, 0);
+                projectedH.m[4][8] += FMat2(0, 1);
+                projectedH.m[8][4] += FMat2(1, 0);
+                projectedH.m[8][8] += FMat2(1, 1);
                 //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
                 __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
                 __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
@@ -3362,10 +3356,8 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
             }
             int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
-            //H12x12[Hidx] = Hessian;
             uint4 global_index =
                 make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
-            //D4Index[Hidx] = global_index;
 
             int triplet_id_offset = Hidx * M12_Off;
             write_triplet<12, 12>(
@@ -3605,46 +3597,21 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                   * (I2 - 1) * (3 * I2 + I2 * log(I2) - 3))
                                / (I2 * (eps_x * eps_x));
 #endif
-            double  eigenValues[2];
-            int     eigenNum = 0;
-            double2 eigenVecs[2];
-            __GEIGEN__::__makePD2x2(
-                lambda10, lambdag1g, lambdag1g, lambda20, eigenValues, eigenNum, eigenVecs);
-
-            for(int i = 0; i < eigenNum; i++)
-            {
-                if(eigenValues[i] > 0)
-                {
-                    __GEIGEN__::Matrix3x3d eigenMatrix;
-                    __GEIGEN__::__set_Mat_val(eigenMatrix,
-                                              0,
-                                              0,
-                                              0,
-                                              0,
-                                              eigenVecs[i].x,
-                                              0,
-                                              0,
-                                              0,
-                                              eigenVecs[i].y);
-
-                    __GEIGEN__::Vector9 eigenMVec =
-                        __GEIGEN__::__Mat3x3_to_vec9_double(eigenMatrix);
-
-                    M9_temp = __GEIGEN__::__v9_vec9_toMat9x9(eigenMVec, eigenMVec);
-                    M9_temp = __GEIGEN__::__S_Mat9x9_multiply(M9_temp, eigenValues[i]);
-                    projectedH = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-                }
-            }
+            Eigen::Matrix2d FMat2;
+            FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
+            makePDGeneral<double, 2>(FMat2);
+            projectedH.m[4][4] += FMat2(0, 0);
+            projectedH.m[4][8] += FMat2(0, 1);
+            projectedH.m[8][4] += FMat2(1, 0);
+            projectedH.m[8][8] += FMat2(1, 1);
 
             //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
             __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
             __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
             int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-            //H12x12[Hidx] = Hessian;
             uint4 global_index =
                 make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
-            //D4Index[Hidx] = global_index;
 
             int triplet_id_offset = Hidx * M12_Off;
             write_triplet<12, 12>(
@@ -3889,47 +3856,21 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                       * (I2 - 1) * (3 * I2 + I2 * log(I2) - 3))
                                    / (I2 * (eps_x * eps_x));
 #endif
-                double  eigenValues[2];
-                int     eigenNum = 0;
-                double2 eigenVecs[2];
-                __GEIGEN__::__makePD2x2(
-                    lambda10, lambdag1g, lambdag1g, lambda20, eigenValues, eigenNum, eigenVecs);
-
-                for(int i = 0; i < eigenNum; i++)
-                {
-                    if(eigenValues[i] > 0)
-                    {
-                        __GEIGEN__::Matrix3x3d eigenMatrix;
-                        __GEIGEN__::__set_Mat_val(eigenMatrix,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].x,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].y);
-
-                        __GEIGEN__::Vector9 eigenMVec =
-                            __GEIGEN__::__Mat3x3_to_vec9_double(eigenMatrix);
-
-                        M9_temp = __GEIGEN__::__v9_vec9_toMat9x9(eigenMVec, eigenMVec);
-                        M9_temp = __GEIGEN__::__S_Mat9x9_multiply(M9_temp, eigenValues[i]);
-                        projectedH = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-                    }
-                }
+                Eigen::Matrix2d FMat2;
+                FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
+                makePDGeneral<double, 2>(FMat2);
+                projectedH.m[4][4] += FMat2(0, 0);
+                projectedH.m[4][8] += FMat2(0, 1);
+                projectedH.m[8][4] += FMat2(1, 0);
+                projectedH.m[8][8] += FMat2(1, 1);
 
                 //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
                 __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
                 __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
                 int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-                //H12x12[Hidx] = Hessian;
                 uint4 global_index =
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
-                //D4Index[Hidx] = global_index;
-
 
                 int triplet_id_offset = Hidx * M12_Off;
                 write_triplet<12, 12>(
@@ -4418,49 +4359,21 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                       * (I2 - 1) * (3 * I2 + I2 * log(I2) - 3))
                                    / (I2 * (eps_x * eps_x));
 #endif
-                double  eigenValues[2];
-                int     eigenNum = 0;
-                double2 eigenVecs[2];
-                __GEIGEN__::__makePD2x2(
-                    lambda10, lambdag1g, lambdag1g, lambda20, eigenValues, eigenNum, eigenVecs);
-
-                for(int i = 0; i < eigenNum; i++)
-                {
-                    if(eigenValues[i] > 0)
-                    {
-                        __GEIGEN__::Matrix3x3d eigenMatrix;
-                        __GEIGEN__::__set_Mat_val(eigenMatrix,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].x,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  eigenVecs[i].y);
-
-                        __GEIGEN__::Vector9 eigenMVec =
-                            __GEIGEN__::__Mat3x3_to_vec9_double(eigenMatrix);
-
-                        M9_temp = __GEIGEN__::__v9_vec9_toMat9x9(eigenMVec, eigenMVec);
-                        M9_temp = __GEIGEN__::__S_Mat9x9_multiply(M9_temp, eigenValues[i]);
-                        projectedH = __GEIGEN__::__Mat9x9_add(projectedH, M9_temp);
-                    }
-                }
+                Eigen::Matrix2d FMat2;
+                FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
+                makePDGeneral<double, 2>(FMat2);
+                projectedH.m[4][4] += FMat2(0, 0);
+                projectedH.m[4][8] += FMat2(0, 1);
+                projectedH.m[8][4] += FMat2(1, 0);
+                projectedH.m[8][8] += FMat2(1, 1);
 
                 //__GEIGEN__::Matrix9x12d PFPxTransPos = __GEIGEN__::__Transpose12x9(PFPx);
                 __GEIGEN__::Matrix12x12d Hessian;  // = __GEIGEN__::__M12x9_M9x12_Multiply(__GEIGEN__::__M12x9_M9x9_Multiply(PFPx, projectedH), PFPxTransPos);
                 __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
                 int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
-                //H12x12[Hidx] = Hessian;
-
                 uint4 global_index =
                     make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
-
-                //D4Index[Hidx] = global_index;
-
 
                 int triplet_id_offset = Hidx * M12_Off;
                 write_triplet<12, 12>(
@@ -10783,9 +10696,9 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     double LFStepSize      = alpha;
 
     std::cout.precision(18);
-    constexpr int report_line_search_threshold = 8;
+    constexpr int report_line_search_threshold = 7;
 
-    while((testingE > lastEnergyVal + c1m * alpha) && alpha > 1e-3 * LFStepSize)
+    while((testingE > lastEnergyVal + c1m * alpha) && numOfLineSearch <= report_line_search_threshold)
     {
         //std::cout << "[" << numOfLineSearch << "]   testE:    " << testingE
         //          << "      lastEnergyVal:        " << lastEnergyVal << std::endl;
