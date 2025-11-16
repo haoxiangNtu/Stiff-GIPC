@@ -21,9 +21,7 @@ class GlobalLinearSystem
     friend class LocalPreconditioner;
 
   public:
-    GlobalLinearSystem()
-    {
-    }
+    GlobalLinearSystem() {}
 
     ~GlobalLinearSystem();
 
@@ -64,19 +62,20 @@ class GlobalLinearSystem
      */
     gipc::SizeT solve_linear_system();
 
-    Json as_json() const;
+    Json               as_json() const;
     GIPCTripletMatrix* gipc_global_triplet = nullptr;
+
   private:
-    std::vector<U<ILinearSubsystem>>   m_subsystems;
-    std::vector<DiagonalSubsystem*>    m_inner_subsystems;
+    std::vector<U<ILinearSubsystem>> m_subsystems;
+    std::vector<DiagonalSubsystem*>  m_inner_subsystems;
 
     std::vector<U<LocalPreconditioner>> m_local_preconditioners;
     U<GlobalPreconditioner>             m_global_preconditioner;
     U<IterativeSolver>                  m_solver;
 
-    muda::LinearSystemContext           m_context;
-    muda::DeviceDenseVector<Float>      m_x;
-    muda::DeviceDenseVector<Float>      m_b;
+    muda::LinearSystemContext      m_context;
+    muda::DeviceDenseVector<Float> m_x;
+    muda::DeviceDenseVector<Float> m_b;
 
     std::vector<SizeT> m_rhs_count_per_subsystem;
     std::vector<SizeT> m_rhs_offset_per_subsystem;

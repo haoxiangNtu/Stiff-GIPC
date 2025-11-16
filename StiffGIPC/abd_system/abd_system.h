@@ -201,17 +201,12 @@ class ABDSystem
 
     // when doing line search, we need to copy q to q_temp
     void copy_q_to_q_temp(ABDSimData& sim_data);
-    void copy_q_to_q_temp(ABDSimData& sim_data, muda::BufferView<double3> vertices_temp);
 
     // move forward to test the energy
     void step_forward(ABDSimData&                sim_data,
                       muda::BufferView<double3>  vertices,
-                      muda::CBufferView<double3> temp_vertices,
                       double                     alpha);
-    void step_forward(ABDSimData&                sim_data,
-                      muda::BufferView<Vector3>  vertices,
-                      muda::CBufferView<Vector3> temp_vertices,
-                      double                     alpha);
+
     // when doing line search, we need calculate abd energy from q
     Float cal_abd_kinetic_energy(ABDSimData& sim_data);
     Float cal_abd_shape_energy(ABDSimData& sim_data);

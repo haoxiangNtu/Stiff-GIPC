@@ -96,7 +96,7 @@ vector<string> files;
 vector<int>    file_vert_offsets;
 vector<int>    file_tet_offsets;
 
-void           Init_CUDA()
+void Init_CUDA()
 {
     cudaError_t cudaStatus = cudaSetDevice(0);
     if(cudaStatus != cudaSuccess)
@@ -132,7 +132,7 @@ typedef struct
     uint32_t biClrUsed;
     uint32_t biClrImportant;
 } mBITMAPINFOHEADER;
-#pragma pack(pop) 
+#pragma pack(pop)
 
 bool WriteBitmapFile(int width, int height, const std::string& file_name, unsigned char* bitmapData)
 {
@@ -589,7 +589,6 @@ void initFEM(tetrahedra_obj& mesh)
                 mesh.boundaryTypies[j] = 1;
                 __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
             }
-
         }
     }
 
@@ -692,9 +691,7 @@ void LoadSettings()
     std::ifstream infile;
 
 
-    string DEFAULT_CONFIG_FILE =
-        std::string{gipc::assets_dir()} + "scene/parameterSetting.txt";
-
+    string DEFAULT_CONFIG_FILE = std::string{gipc::assets_dir()} + "scene/parameterSetting.txt";
 
 
     infile.open(DEFAULT_CONFIG_FILE, std::ifstream::in);
@@ -749,7 +746,8 @@ void LoadSettings()
     }
 }
 
-void set_case1() {
+void set_case1()
+{
     double                    dist       = 0.2;
     int                       count      = 4;
     int                       count_Y    = 4;
@@ -831,7 +829,7 @@ void set_case2()
         -Eigen::Vector3d(position_offset.x, position_offset.y, position_offset.z);
 
     double Youngth_Modulus = 1e4;
-    string mesh0_path = assets_dir + "tetMesh/bunny2.msh";
+    string mesh0_path      = assets_dir + "tetMesh/bunny2.msh";
     importer.load_geometry(tetMesh,
                            3,
                            gipc::BodyType::ABD,
@@ -862,7 +860,7 @@ void set_case2()
     transform.block<3, 1>(0, 3) =
         -Eigen::Vector3d(position_offset.x, position_offset.y, position_offset.z);
     string mesh2_path = assets_dir + "triMesh/cloth_high.obj";
-    
+
     importer.load_geometry(tetMesh,
                            2,
                            gipc::BodyType::FEM,
@@ -882,7 +880,8 @@ void set_case3()
 }
 
 
-void setMAS_partition() {
+void setMAS_partition()
+{
     tetMesh.partId_map_real.resize(tetMesh.part_offset * BANKSIZE, -1);
     tetMesh.real_map_partId.resize(tetMesh.partId.size());
     int index = 0;
@@ -913,9 +912,9 @@ void setMAS_partition() {
 void initScene()
 {
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
-    ipc.pcg_data.P_type       = 1;
+    ipc.pcg_data.P_type = 1;
 
-    int scene_no = 2;
+    int scene_no = 1;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -983,10 +982,7 @@ void initScene()
                               tetMesh.DM_inverse.data(),
                               tetMesh.tetrahedraNum * sizeof(__GEIGEN__::Matrix3x3d),
                               cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.Constraints,
-                              tetMesh.constraints.data(),
-                              tetMesh.vertexNum * sizeof(__GEIGEN__::Matrix3x3d),
-                              cudaMemcpyHostToDevice));
+
     CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.BoundaryType,
                               tetMesh.boundaryTypies.data(),
                               tetMesh.vertexNum * sizeof(int),

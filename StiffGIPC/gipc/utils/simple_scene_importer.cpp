@@ -62,7 +62,7 @@ void SimpleSceneImporter::load_geometry(tetrahedra_obj&  tetras,
 
         if(bodyType == gipc::BodyType::ABD)
         {
-            tetras.load_tetrahedraMesh(meth_path, transform, 1e8, bodyType, body_boundary_type);
+            tetras.load_tetrahedraMesh(meth_path, transform, YoungthM, bodyType, body_boundary_type);
         }
         else if(bodyType == gipc::BodyType::FEM)
         {
@@ -129,7 +129,7 @@ void SimpleSceneImporter::import_scene(tetrahedra_obj& tetras)
         auto boundary_type = is_fixed ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
         //tetras.load_tetrahedraMesh(mesh_file, transform, 1e8, body_type, boundary_type);
 
-        load_geometry(tetras, 3, body_type, transform, 1e8, mesh_file, 1, boundary_type);
+        load_geometry(tetras, 3, body_type, transform, 1e7, mesh_file, 1, boundary_type);
     }
 }
 

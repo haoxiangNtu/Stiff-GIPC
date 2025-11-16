@@ -14,15 +14,14 @@ void IterativeSolver::spmv(Float                         a,
 }
 
 void IterativeSolver::apply_preconditioner(muda::DenseVectorView<Float> z,
-                                               muda::CDenseVectorView<Float> r) const
+                                           muda::CDenseVectorView<Float> r) const
 {
     m_system->apply_preconditioner(z, r);
 }
-
 
 
 muda::LinearSystemContext& IterativeSolver::ctx() const
 {
     return m_system->m_context;
 }
-}  // namespace uipc
+}  // namespace gipc

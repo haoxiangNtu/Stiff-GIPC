@@ -2,8 +2,7 @@
 
 namespace gipc
 {
-FEMLinearSubsystem::FEMLinearSubsystem(GIPC&                gipc,
-                                       device_TetraData&    tetra_data)
+FEMLinearSubsystem::FEMLinearSubsystem(GIPC& gipc, device_TetraData& tetra_data)
     : m_gipc(gipc)
     , m_tetra_data(tetra_data)
 {

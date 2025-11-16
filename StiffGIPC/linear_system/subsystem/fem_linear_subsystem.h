@@ -11,7 +11,7 @@ class FEMLinearSubsystem : public DiagonalSubsystem
   public:
     FEMLinearSubsystem(GIPC& gipc, device_TetraData& tetra_data);
 
-    muda::CBufferView<int>                     boundary_type() const;
+    muda::CBufferView<int> boundary_type() const;
 
     muda::BufferView<double3> barrier_gradient() const;
     muda::BufferView<double3> shape_gradient() const;
@@ -25,8 +25,8 @@ class FEMLinearSubsystem : public DiagonalSubsystem
     void         set_local_tolerance(Float tol);
 
   private:
-    GIPC&                m_gipc;
-    device_TetraData&    m_tetra_data;
+    GIPC&             m_gipc;
+    device_TetraData& m_tetra_data;
 
     muda::DeviceBuffer<gipc::Float> m_local_squared_norm;
     muda::DeviceVar<gipc::Float>    m_max_squared_norm;

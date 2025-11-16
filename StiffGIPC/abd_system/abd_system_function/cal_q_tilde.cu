@@ -36,24 +36,24 @@ void ABDSystem::cal_q_tilde(ABDSimData& sim_data)
                    }
                });
 
-    m_local_tolerance.resize(abd.body_id_to_q_tilde.size());
+    //m_local_tolerance.resize(abd.body_id_to_q_tilde.size());
 
-    ParallelFor()
-        .file_line(__FILE__, __LINE__)
-        .apply(abd_body_count,
-               [local_tolerance = m_local_tolerance.viewer().name("local_tolerance"),
-                q_tildes = abd.body_id_to_q_tilde.cviewer().name("q_tilde"),
-                qs = abd.body_id_to_q.cviewer().name("q")] __device__(int i) mutable
-               {
-                   auto& q_tilde      = q_tildes(i);
-                   auto& q            = qs(i);
-                   local_tolerance(i) = (q_tilde - q).norm();
-               });
+    //ParallelFor()
+    //    .file_line(__FILE__, __LINE__)
+    //    .apply(abd_body_count,
+    //           [local_tolerance = m_local_tolerance.viewer().name("local_tolerance"),
+    //            q_tildes = abd.body_id_to_q_tilde.cviewer().name("q_tilde"),
+    //            qs = abd.body_id_to_q.cviewer().name("q")] __device__(int i) mutable
+    //           {
+    //               auto& q_tilde      = q_tildes(i);
+    //               auto& q            = qs(i);
+    //               local_tolerance(i) = (q_tilde - q).norm();
+    //           });
 
-    muda::DeviceReduce().Max(m_local_tolerance.data(),
-                             m_local_tolerance_max.data(),
-                             m_local_tolerance.size());
+    //muda::DeviceReduce().Max(m_local_tolerance.data(),
+    //                         m_local_tolerance_max.data(),
+    //                         m_local_tolerance.size());
 
-    m_suggest_max_tolerance = m_local_tolerance_max;
+    //m_suggest_max_tolerance = m_local_tolerance_max;
 }
 }  // namespace gipc

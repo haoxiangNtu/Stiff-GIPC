@@ -39,27 +39,12 @@ class device_TetraData
 
     double* lengthRate = nullptr;
     double* volumeRate = nullptr;
-    //double* tempV;
     double*   masses           = nullptr;
     double*   tempDouble       = nullptr;
-    uint64_t* MChash           = nullptr;
-    uint32_t* sortIndex        = nullptr;
-    uint32_t* sortMapVertIndex = nullptr;
-    //uint32_t* sortTetIndex;
+
     __GEIGEN__::Matrix3x3d* DmInverses       = nullptr;
     __GEIGEN__::Matrix2x2d* triDmInverses    = nullptr;
-    __GEIGEN__::Matrix3x3d* Constraints      = nullptr;
     int*                    BoundaryType     = nullptr;
-    int*                    tempBoundaryType = nullptr;
-
-
-    Eigen::Matrix<double, 3, 2>* svd3x2F;
-    Eigen::Matrix3d*             svd3x2U;
-    Eigen::Matrix2d*             svd3x2V;
-    Eigen::Vector2d*             svd3x2S;
-
-    //__GEIGEN__::Matrix3x3d* tempDmInverses;
-    __GEIGEN__::Matrix3x3d* tempMat3x3 = nullptr;
 
     double3*          shape_grads              = nullptr;
     BodyBoundaryType* body_id_to_boundary_type = nullptr;

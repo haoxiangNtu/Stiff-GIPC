@@ -43,40 +43,17 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
     CUDA_SAFE_CALL(cudaMalloc((void**)&volumeRate, tetradedra_num * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&tempDouble, maxNumbers * sizeof(double)));
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&tempM, vertex_num * sizeof(double)));
 
-    CUDA_SAFE_CALL(cudaMalloc((void**)&MChash, maxNumbers * sizeof(uint64_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&sortIndex, maxNumbers * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&BoundaryType, vertex_num * sizeof(int)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&tempBoundaryType, vertex_num * sizeof(int)));
 
     CUDA_SAFE_CALL(cudaMemset(BoundaryType, 0, vertex_num * sizeof(int)));
-
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&sortVertIndex, vertex_num * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&sortMapVertIndex, vertex_num * sizeof(uint32_t)));
-
     CUDA_SAFE_CALL(cudaMalloc((void**)&DmInverses,
                               tetradedra_num * sizeof(__GEIGEN__::Matrix3x3d)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&Constraints,
-                              vertex_num * sizeof(__GEIGEN__::Matrix3x3d)));
-
-    CUDA_SAFE_CALL(cudaMalloc((void**)&tempMat3x3,
-                              maxNumbers * sizeof(__GEIGEN__::Matrix3x3d)));
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&tempConstraints, vertex_num * sizeof(__GEIGEN__::Matrix3x3d)));
-
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&targetIndex, softNum * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&targetVert, softNum * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&triDmInverses,
                               triangle_num * sizeof(__GEIGEN__::Matrix2x2d)));
-
-
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2F,
-    //                          triangle_num * sizeof(Eigen::Matrix<double, 3, 2>)));
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2U, triangle_num * sizeof(Eigen::Matrix3d)));
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2V, triangle_num * sizeof(Eigen::Matrix2d)));
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&svd3x2S, triangle_num * sizeof(Eigen::Vector2d)));
-
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&area, triangle_num * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&triangles, triangle_num * sizeof(uint4)));
@@ -94,8 +71,6 @@ device_TetraData::~device_TetraData()
 
 void device_TetraData::FREE_DEVICE_MEM()
 {
-    CUDA_SAFE_CALL(cudaFree(sortIndex));
-    CUDA_SAFE_CALL(cudaFree(sortMapVertIndex));
     CUDA_SAFE_CALL(cudaFree(vertexes));
     CUDA_SAFE_CALL(cudaFree(o_vertexes));
     CUDA_SAFE_CALL(cudaFree(temp_double3Mem));
@@ -111,12 +86,8 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(lengthRate));
     CUDA_SAFE_CALL(cudaFree(volumeRate));
     CUDA_SAFE_CALL(cudaFree(DmInverses));
-    CUDA_SAFE_CALL(cudaFree(Constraints));
-    CUDA_SAFE_CALL(cudaFree(tempMat3x3));
-    CUDA_SAFE_CALL(cudaFree(MChash));
     CUDA_SAFE_CALL(cudaFree(tempDouble));
     CUDA_SAFE_CALL(cudaFree(BoundaryType));
-    CUDA_SAFE_CALL(cudaFree(tempBoundaryType));
 
     CUDA_SAFE_CALL(cudaFree(totalForce));
     CUDA_SAFE_CALL(cudaFree(targetIndex));
@@ -132,8 +103,4 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(point_id_to_body_id));
     CUDA_SAFE_CALL(cudaFree(tet_id_to_body_id));
 
-    CUDA_SAFE_CALL(cudaFree(svd3x2F));
-    CUDA_SAFE_CALL(cudaFree(svd3x2U));
-    CUDA_SAFE_CALL(cudaFree(svd3x2V));
-    CUDA_SAFE_CALL(cudaFree(svd3x2S));
 }

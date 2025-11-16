@@ -5,9 +5,7 @@
 
 namespace gipc
 {
-ABDLinearSubsystem::ABDLinearSubsystem(GIPC&          gipc,
-                                       ABDSystem&     abd_system,
-                                       ABDSimData&    abd_sim_data)
+ABDLinearSubsystem::ABDLinearSubsystem(GIPC& gipc, ABDSystem& abd_system, ABDSimData& abd_sim_data)
     : m_gipc(gipc)
     , m_abd_system(abd_system)
     , m_abd_sim_data(abd_sim_data)
@@ -49,9 +47,7 @@ void ABDLinearSubsystem::retrieve_solution(CDenseVectorView dx)
                [dx        = dx.cviewer().name("dx"),
                 dq        = dq.viewer().name("dq"),
                 local_tol = m_local_tol] __device__(int i) mutable
-               {
-                   dq(i) = dx.segment<12>(i * 12).as_eigen();
-               });
+               { dq(i) = dx.segment<12>(i * 12).as_eigen(); });
 
     m_abd_system.cal_dx_from_dq(
         sim_data,

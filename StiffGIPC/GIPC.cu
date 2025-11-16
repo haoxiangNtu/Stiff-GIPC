@@ -39,7 +39,7 @@ __device__ __host__ void makePDGeneral(Eigen::Matrix<Scalar, size, size>& symMtr
         eigen_solver.computeDirect(symMtr);
     else
         eigen_solver.compute(symMtr);
-    Eigen::Vector<Scalar, size> eigen_values  = eigen_solver.eigenvalues();
+    Eigen::Vector<Scalar, size> eigen_values = eigen_solver.eigenvalues();
     Eigen::Matrix<Scalar, size, size> eigen_vectors = eigen_solver.eigenvectors();
 
 
@@ -200,9 +200,15 @@ __device__ __host__ inline uint32_t hash_code(
     //return mchash;
 }
 
-__global__ void _partition_collision_triplets(const uint64_t* sort_hash, int* abd_abd_offset, int* abd_fem_offset, int* fem_abd_offset, int* fem_fem_offset, int number) {
+__global__ void _partition_collision_triplets(const uint64_t* sort_hash,
+                                              int*            abd_abd_offset,
+                                              int*            abd_fem_offset,
+                                              int*            fem_abd_offset,
+                                              int*            fem_fem_offset,
+                                              int             number)
+{
     extern __shared__ int shared_hash[];
-    unsigned int          idx = threadIdx.x + (blockDim.x*blockIdx.x);
+    unsigned int          idx = threadIdx.x + (blockDim.x * blockIdx.x);
     //if(idx == 0)
     //{
     //    *abd_abd_offset = -1;
@@ -226,16 +232,20 @@ __global__ void _partition_collision_triplets(const uint64_t* sort_hash, int* ab
         int prior_hash = idx == 0 ? -1 : shared_hash[threadIdx.x];
         if(self_hash != prior_hash)
         {
-            if (self_hash == 3) {
+            if(self_hash == 3)
+            {
                 *abd_abd_offset = idx;
             }
-            else if (self_hash == 1) {
+            else if(self_hash == 1)
+            {
                 *abd_fem_offset = idx;
             }
-            else if (self_hash == 2) {
+            else if(self_hash == 2)
+            {
                 *fem_abd_offset = idx;
             }
-            else if (self_hash == 0) {
+            else if(self_hash == 0)
+            {
                 *fem_fem_offset = idx;
             }
         }
@@ -252,9 +262,10 @@ __global__ void _reorder_triplets(int*             row_ids_input,
                                   int              number)
 {
     uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if(idx>=number) return;
-    row_ids[idx] = row_ids_input[sort_index[idx]];
-    col_ids[idx] = col_ids_input[sort_index[idx]];
+    if(idx >= number)
+        return;
+    row_ids[idx]       = row_ids_input[sort_index[idx]];
+    col_ids[idx]       = col_ids_input[sort_index[idx]];
     triplet_value[idx] = triplet_value_inpuit[sort_index[idx]];
 }
 
@@ -1345,19 +1356,19 @@ __device__ double __cal_Friction_energy(const double3*         _vertexes,
     }
 }
 
-__global__ void _calFrictionHessian_gd(const double3*  _vertexes,
-                                       const double3*  _o_vertexes,
-                                       const double3*  _normal,
-                                       const uint32_t* _last_collisionPair_gd,
-                                       Eigen::Matrix3d*        triplet_values,
-                                       int*                    row_ids,
-                                       int*                    col_ids,
-                                       int                     number,
-                                       double                  dt,
-                                       double                  eps2,
-                                       double*                 lastH,
-                                       int                     global_offset,
-                                       double                  coef)
+__global__ void _calFrictionHessian_gd(const double3*   _vertexes,
+                                       const double3*   _o_vertexes,
+                                       const double3*   _normal,
+                                       const uint32_t*  _last_collisionPair_gd,
+                                       Eigen::Matrix3d* triplet_values,
+                                       int*             row_ids,
+                                       int*             col_ids,
+                                       int              number,
+                                       double           dt,
+                                       double           eps2,
+                                       double*          lastH,
+                                       int              global_offset,
+                                       double           coef)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1799,25 +1810,25 @@ __global__ inline void moveMemory_1(T* data, int output_start, int input_start, 
     data[output_start + idx] = data[input_start + idx];
 }
 
-__global__ void _calBarrierHessian(const double3*            _vertexes,
-                                   const double3*            _rest_vertexes,
-                                   const int4*               _collisionPair,
-                                   Eigen::Matrix3d*          triplet_values,
-                                   int*                      row_ids,
-                                   int*                      col_ids,
-                                   uint32_t*                 _cpNum,
-                                   int*                      matIndex,
-                                   double                    dHat,
-                                   double                    Kappa,
-                                   int                       offset4,
-                                   int                       offset3,
-                                   int                       offset2,
-                                   int                       number)
+__global__ void _calBarrierHessian(const double3*   _vertexes,
+                                   const double3*   _rest_vertexes,
+                                   const int4*      _collisionPair,
+                                   Eigen::Matrix3d* triplet_values,
+                                   int*             row_ids,
+                                   int*             col_ids,
+                                   uint32_t*        _cpNum,
+                                   int*             matIndex,
+                                   double           dHat,
+                                   double           Kappa,
+                                   int              offset4,
+                                   int              offset3,
+                                   int              offset2,
+                                   int              number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
-    int4 MMCVIDI = _collisionPair[idx];
+    int4   MMCVIDI   = _collisionPair[idx];
     double dHat_sqrt = sqrt(dHat);
 
     double gassThreshold = 1e-6;
@@ -1918,7 +1929,7 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
 
             __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPxT, H, Hessian);
 
-            int Hidx = matIndex[idx]; 
+            int Hidx = matIndex[idx];
 
             uint4 global_index =
                 make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
@@ -2113,13 +2124,13 @@ __global__ void _calBarrierHessian(const double3*            _vertexes,
 
             Eigen::Matrix2d FMat2;
             FMat2 << lambda10, lambdag1g, lambdag1g, lambda20;
-            makePDGeneral<double, 2>(FMat2);          
+            makePDGeneral<double, 2>(FMat2);
             projectedH.m[4][4] += FMat2(0, 0);
             projectedH.m[4][8] += FMat2(0, 1);
             projectedH.m[8][4] += FMat2(1, 0);
             projectedH.m[8][8] += FMat2(1, 1);
 
-            __GEIGEN__::Matrix12x12d Hessian; 
+            __GEIGEN__::Matrix12x12d Hessian;
             __GEIGEN__::__M12x9_S9x9_MT9x12_Multiply(PFPx, projectedH, Hessian);
             int Hidx = matIndex[idx];  //int Hidx = atomicAdd(_cpNum + 4, 1);
 
@@ -5260,7 +5271,6 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
 }
 
 
-
 __global__ void _calBarrierGradient(const double3*    _vertexes,
                                     const double3*    _rest_vertexes,
                                     const const int4* _collisionPair,
@@ -6364,7 +6374,7 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
                                                          double rate,
                                                          int    global_offset,
                                                          int global_hessian_fem_offset,
-                                                         int    number)
+                                                         int number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -6381,19 +6391,19 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
         atomicAdd(&(gradient[vInd].z), d * rate * rate * (z - c));
     }
     __GEIGEN__::Matrix3x3d Hpg;
-    Hpg.m[0][0]   = rate * rate * d;
-    Hpg.m[0][1]   = 0;
-    Hpg.m[0][2]   = 0;
-    Hpg.m[1][0]   = 0;
-    Hpg.m[1][1]   = rate * rate * d;
-    Hpg.m[1][2]   = 0;
-    Hpg.m[2][0]   = 0;
-    Hpg.m[2][1]   = 0;
-    Hpg.m[2][2]   = rate * rate * d;
-    int pidx      = atomicAdd(_gpNum, 1);
+    Hpg.m[0][0] = rate * rate * d;
+    Hpg.m[0][1] = 0;
+    Hpg.m[0][2] = 0;
+    Hpg.m[1][0] = 0;
+    Hpg.m[1][1] = rate * rate * d;
+    Hpg.m[1][2] = 0;
+    Hpg.m[2][0] = 0;
+    Hpg.m[2][1] = 0;
+    Hpg.m[2][2] = rate * rate * d;
+    int pidx    = atomicAdd(_gpNum, 1);
     //H3x3[pidx]    = Hpg;
     //D1Index[pidx] = vInd;
-    vInd+=global_hessian_fem_offset;
+    vInd += global_hessian_fem_offset;
     write_triplet<3, 3>(triplet_values, row_ids, col_ids, &vInd, Hpg.m, global_offset + idx);
     //_environment_collisionPair[atomicAdd(_gpNum, 1)] = surfVertIds[idx];
 }
@@ -6496,7 +6506,7 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
         __GEIGEN__::Matrix3x3d nn = __GEIGEN__::__v_vec_toMat(normal, normal);
         __GEIGEN__::Matrix3x3d Hpg = __GEIGEN__::__S_Mat_multiply(nn, Kappa * param);
 
-        int pidx      = atomicAdd(_gpNum, 1);
+        int pidx = atomicAdd(_gpNum, 1);
         //H3x3[pidx]    = Hpg;
         //D1Index[pidx] = gidx;
 
@@ -6509,11 +6519,11 @@ __global__ void _computeGroundGradient(const double3* vertexes,
                                        const double*  g_offset,
                                        const double3* g_normal,
                                        const uint32_t* _environment_collisionPair,
-                                       double3*                gradient,
-                                       uint32_t*               _gpNum,                                      
-                                       double                  dHat,
-                                       double                  Kappa,
-                                       int                     number)
+                                       double3*  gradient,
+                                       uint32_t* _gpNum,
+                                       double    dHat,
+                                       double    Kappa,
+                                       int       number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -7376,63 +7386,6 @@ __global__ void _getKineticEnergy_Reduction_3D(
     }
 }
 
-
-__global__ void _getStrain_LimitEnergy_Reduction(double*          squeue,
-                                                 double*          areas,
-                                                 Eigen::Vector2d* sigma,
-                                                 int              triangleNum)
-{
-    int idof = blockIdx.x * blockDim.x;
-    int idx  = threadIdx.x + idof;
-
-    extern __shared__ double tep[];
-    int                      numbers = triangleNum;
-    if(idx >= numbers)
-        return;
-
-    double temp = __cal_strainL_energy(sigma[idx], areas[idx]);
-    //double temp = 0;
-    //printf("%f    %f\n\n\n", lenRate, volRate);
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(threadIdx.x >= warpNum)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = tep[threadIdx.x];
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
-}
 
 
 __global__ void _getBendingEnergy_Reduction(double*        squeue,
@@ -8593,8 +8546,6 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     fDhat = 1e-4 * bboxDiagSize2;
 
 
-
-
     int global_matrix_block3_size =
         abd_fem_count_info.abd_body_num * 4 + abd_fem_count_info.fem_point_num;
 
@@ -8617,13 +8568,12 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     gipc_global_triplet.init_var();
 
     gipc_global_triplet.resize(global_matrix_block3_size,
-                                  global_matrix_block3_size,
-                                  total_max_global_triplet_num);
+                               global_matrix_block3_size,
+                               total_max_global_triplet_num);
 
     gipc_global_triplet.global_external_max_capcity =
         total_internal_triplet_num + total_max_collision_triplet_num;
-    gipc_global_triplet.resize_collision_hash_size(
-        gipc_global_triplet.global_external_max_capcity);
+    gipc_global_triplet.resize_collision_hash_size(gipc_global_triplet.global_external_max_capcity);
 
 
     m_global_linear_system->gipc_global_triplet = &(gipc_global_triplet);
@@ -8735,7 +8685,6 @@ void GIPC::getTotalForce(double3* _gradient0, double3* _gradient1)
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
     _getTotalForce<<<blockNum, threadNum>>>(_gradient0, _gradient1, numbers);
 }
-
 
 
 void GIPC::computeGroundGradientAndHessian(double3* _gradient)
@@ -8852,7 +8801,7 @@ void GIPC::computeGroundGradient(double3* _gradient, double mKappa)
                                                     _groundNormal,
                                                     _environment_collisionPair,
                                                     _gradient,
-                                                    _gpNum,                                                
+                                                    _gpNum,
                                                     dHat,
                                                     mKappa,
                                                     numbers);
@@ -9126,7 +9075,6 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
         h_cpNum[3],
         h_cpNum[2],
         numbers);
-    
 }
 
 
@@ -9153,7 +9101,6 @@ void GIPC::calBarrierHessian()
                                                 h_cpNum[3],
                                                 h_cpNum[2],
                                                 numbers);
-
 }
 
 void GIPC::calFrictionHessian(device_TetraData& TetMesh)
@@ -9345,20 +9292,20 @@ void calKineticGradient(double3* _vertexes, double3* _xTilta, double3* _gradient
 }
 
 
-void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d*   DmInverses,
-                                    const double3*            vertexes,
-                                    const uint4*              tetrahedras,
-                                    const double*             volume,
-                                    double3*                  gradient,
-                                    int                       tetrahedraNum_FEM,
-                                    int                       tetrahedraNum_ABD,
-                                    const double*             lenRate,
-                                    const double*             volRate,
-                                    int                       global_offset,
-                                    Eigen::Matrix3d*          triplet_values,
-                                    int*                      row_ids,
-                                    int*                      col_ids,
-                                    double                    IPC_dt,
+void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInverses,
+                                    const double3*          vertexes,
+                                    const uint4*            tetrahedras,
+                                    const double*           volume,
+                                    double3*                gradient,
+                                    int                     tetrahedraNum_FEM,
+                                    int                     tetrahedraNum_ABD,
+                                    const double*           lenRate,
+                                    const double*           volRate,
+                                    int                     global_offset,
+                                    Eigen::Matrix3d*        triplet_values,
+                                    int*                    row_ids,
+                                    int*                    col_ids,
+                                    double                  IPC_dt,
                                     int global_hessian_fem_offset)
 {
     int numbers = tetrahedraNum_FEM;
@@ -9385,10 +9332,10 @@ void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d*   DmInverses,
 }
 
 void calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* triDmInverses,
-                                             const double3*          vertexes,
-                                             const uint3*            triangles,
-                                             const double*           area,
-                                             double3*                gradient,
+                                             const double3*   vertexes,
+                                             const uint3*     triangles,
+                                             const double*    area,
+                                             double3*         gradient,
                                              int              triangleNum,
                                              double           stretchStiff,
                                              double           shearStiff,
@@ -9465,14 +9412,14 @@ void calculate_triangle_fem_deformationF(__GEIGEN__::Matrix2x2d* triDmInverses,
                                                                   F3x2);
 }
 
-void calculate_bending_gradient_hessian(const double3* vertexes,
-                                        const double3* rest_vertexes,
-                                        const uint2*   edges,
-                                        const uint2*   edges_adj_vertex,
-                                        double3*                  gradient,
-                                        int                       edgeNum,
-                                        double                    bendStiff,
-                                        int                       global_offset,
+void calculate_bending_gradient_hessian(const double3*   vertexes,
+                                        const double3*   rest_vertexes,
+                                        const uint2*     edges,
+                                        const uint2*     edges_adj_vertex,
+                                        double3*         gradient,
+                                        int              edgeNum,
+                                        double           bendStiff,
+                                        int              global_offset,
                                         Eigen::Matrix3d* triplet_values,
                                         int*             row_ids,
                                         int*             col_ids,
@@ -9499,14 +9446,14 @@ void calculate_bending_gradient_hessian(const double3* vertexes,
                                                                  global_hessian_fem_offset);
 }
 
-    void calculate_fem_gradient(__GEIGEN__::Matrix3x3d* DmInverses,
+void calculate_fem_gradient(__GEIGEN__::Matrix3x3d* DmInverses,
                             const double3*          vertexes,
                             const uint4*            tetrahedras,
                             const double*           volume,
                             double3*                gradient,
                             int                     tetrahedraNum,
-                            double*                  lenRate,
-                            double*                  volRate,
+                            double*                 lenRate,
+                            double*                 volRate,
                             double                  dt)
 {
     int numbers = tetrahedraNum;
@@ -9617,16 +9564,13 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
                     move_boundary,
                     fem_vertexes.size());
     }
-    if(move_boundary || abd_fem_count_info.abd_point_num <= 0)
+    if(abd_fem_count_info.abd_point_num <= 0)
         return;
 
     auto abd_vertexes = muda::BufferView<double3>{TetMesh.vertexes, vertexNum}.subview(
         abd_fem_count_info.abd_point_offset, abd_fem_count_info.abd_point_num);
-    auto abd_vertexes_temp =
-        muda::BufferView<double3>{TetMesh.temp_double3Mem, vertexNum}.subview(
-            abd_fem_count_info.abd_point_offset, abd_fem_count_info.abd_point_num);
 
-    m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, abd_vertexes_temp, alpha);
+    m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, alpha);
 }
 
 void updateSurfaces(uint32_t* sortIndex, uint3* _faces, const int& offset_num, const int& numbers)
@@ -9792,46 +9736,8 @@ void sortGeometry(device_TetraData& TetMesh,
                   const int&        tetradedra_num,
                   const int&        triangle_num)
 {
-    calcVertMChash(TetMesh.MChash, TetMesh.vertexes, _MaxBv, vertex_num);
-    thrust::sequence(thrust::device_ptr<uint32_t>(TetMesh.sortIndex),
-                     thrust::device_ptr<uint32_t>(TetMesh.sortIndex) + vertex_num);
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(TetMesh.MChash),
-                        thrust::device_ptr<uint64_t>(TetMesh.MChash) + vertex_num,
-                        thrust::device_ptr<uint32_t>(TetMesh.sortIndex));
-    updateVertexes(TetMesh.o_vertexes,
-                   TetMesh.vertexes,
-                   TetMesh.tempDouble,
-                   TetMesh.masses,
-                   TetMesh.tempMat3x3,
-                   TetMesh.tempBoundaryType,
-                   TetMesh.Constraints,
-                   TetMesh.BoundaryType,
-                   TetMesh.sortIndex,
-                   TetMesh.sortMapVertIndex,
-                   vertex_num);
-    CUDA_SAFE_CALL(cudaMemcpy(TetMesh.vertexes,
-                              TetMesh.o_vertexes,
-                              vertex_num * sizeof(double3),
-                              cudaMemcpyDeviceToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(
-        TetMesh.masses, TetMesh.tempDouble, vertex_num * sizeof(double), cudaMemcpyDeviceToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(TetMesh.Constraints,
-                              TetMesh.tempMat3x3,
-                              vertex_num * sizeof(__GEIGEN__::Matrix3x3d),
-                              cudaMemcpyDeviceToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(TetMesh.BoundaryType,
-                              TetMesh.tempBoundaryType,
-                              vertex_num * sizeof(int),
-                              cudaMemcpyDeviceToDevice));
 
-    updateTopology(TetMesh.tetrahedras, TetMesh.triangles, TetMesh.sortMapVertIndex, tetradedra_num, triangle_num);
-    //calcTetMChash(TetMesh.MChash, TetMesh.vertexes, TetMesh.tetrahedras, _MaxBv, TetMesh.sortMapVertIndex, tetradedra_num);
-    //thrust::sequence(thrust::device_ptr<uint32_t>(TetMesh.sortIndex), thrust::device_ptr<uint32_t>(TetMesh.sortIndex) + tetradedra_num);
-    //thrust::sort_by_key(thrust::device_ptr<uint64_t>(TetMesh.MChash), thrust::device_ptr<uint64_t>(TetMesh.MChash) + tetradedra_num, thrust::device_ptr<uint32_t>(TetMesh.sortIndex));
-    //updateTetrahedras(TetMesh.tempTetrahedras, TetMesh.tetrahedras, TetMesh.tempDouble, TetMesh.volum, TetMesh.tempMat3x3, TetMesh.DmInverses, TetMesh.sortIndex, TetMesh.sortMapVertIndex, tetradedra_num);
-    //CUDA_SAFE_CALL(cudaMemcpy(TetMesh.tetrahedras, TetMesh.tempTetrahedras, tetradedra_num * sizeof(uint4), cudaMemcpyDeviceToDevice));
-    //CUDA_SAFE_CALL(cudaMemcpy(TetMesh.volum, TetMesh.tempDouble, tetradedra_num * sizeof(double), cudaMemcpyDeviceToDevice));
-    //CUDA_SAFE_CALL(cudaMemcpy(TetMesh.DmInverses, TetMesh.tempMat3x3, tetradedra_num * sizeof(__GEIGEN__::Matrix3x3d), cudaMemcpyDeviceToDevice));
+
 }
 
 ////////////////////////TO DO LATER/////////////////////////////////////////
@@ -9923,7 +9829,6 @@ void GIPC::initKappa(device_TetraData& TetMesh)
 
     //printf("Kappa ====== %f\n", Kappa);
 }
-
 
 
 void GIPC::partitionContactHessian()
@@ -10195,7 +10100,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                            cfem_rows[i] = row + fem_global_hessian_index_offset;
                            cfem_cols[i] = col + fem_global_hessian_index_offset;
                        }
-                       else {
+                       else
+                       {
                            cfem_rows[i] = col + fem_global_hessian_index_offset;
                            cfem_cols[i] = row + fem_global_hessian_index_offset;
                            cfem_vals[i].setZero();
@@ -10209,7 +10115,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
         calculate_fem_gradient_hessian(TetMesh.DmInverses,
                                        TetMesh.vertexes,
-                                       TetMesh.tetrahedras,                                       
+                                       TetMesh.tetrahedras,
                                        TetMesh.volum,
                                        shape_grads,
                                        abd_fem_count_info.fem_tet_num,
@@ -10225,49 +10131,46 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_tet_num * 10;
 
 
-        calculate_bending_gradient_hessian(
-            TetMesh.vertexes,
-            TetMesh.rest_vertexes,
-            TetMesh.tri_edges,
-            TetMesh.tri_edge_adj_vertex,
-            shape_grads,
-            tri_edge_num,
-            bendStiff,
-            gipc_global_triplet.global_triplet_offset,
-            gipc_global_triplet.block_values(),
-            gipc_global_triplet.block_row_indices(),
-            gipc_global_triplet.block_col_indices(),
-            IPC_dt,
-            fem_global_hessian_index_offset);
+        calculate_bending_gradient_hessian(TetMesh.vertexes,
+                                           TetMesh.rest_vertexes,
+                                           TetMesh.tri_edges,
+                                           TetMesh.tri_edge_adj_vertex,
+                                           shape_grads,
+                                           tri_edge_num,
+                                           bendStiff,
+                                           gipc_global_triplet.global_triplet_offset,
+                                           gipc_global_triplet.block_values(),
+                                           gipc_global_triplet.block_row_indices(),
+                                           gipc_global_triplet.block_col_indices(),
+                                           IPC_dt,
+                                           fem_global_hessian_index_offset);
         gipc_global_triplet.global_triplet_offset += tri_edge_num * 10;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-        calculate_triangle_fem_gradient_hessian(
-            TetMesh.triDmInverses,
-            TetMesh.vertexes,
-            TetMesh.triangles,
-            TetMesh.area,
-            shape_grads,
-            triangleNum,
-            stretchStiff,
-            shearStiff,
-            strainRate,
-            gipc_global_triplet.global_triplet_offset,
-            gipc_global_triplet.block_values(),
-            gipc_global_triplet.block_row_indices(),
-            gipc_global_triplet.block_col_indices(),
-            IPC_dt,
-            fem_global_hessian_index_offset);
+        calculate_triangle_fem_gradient_hessian(TetMesh.triDmInverses,
+                                                TetMesh.vertexes,
+                                                TetMesh.triangles,
+                                                TetMesh.area,
+                                                shape_grads,
+                                                triangleNum,
+                                                stretchStiff,
+                                                shearStiff,
+                                                strainRate,
+                                                gipc_global_triplet.global_triplet_offset,
+                                                gipc_global_triplet.block_values(),
+                                                gipc_global_triplet.block_row_indices(),
+                                                gipc_global_triplet.block_col_indices(),
+                                                IPC_dt,
+                                                fem_global_hessian_index_offset);
 
         gipc_global_triplet.global_triplet_offset += triangleNum * 6;
-
 
 
         computeSoftConstraintGradientAndHessian(shape_grads, fem_global_hessian_index_offset);
         gipc_global_triplet.global_triplet_offset += softNum;
 
-        //int massNum = 
-                muda::ParallelFor()
+        //int massNum =
+        muda::ParallelFor()
             .file_line(__FILE__, __LINE__)
             .apply(abd_fem_count_info.fem_point_num,
                    [mass      = TetMesh.masses,
@@ -10440,9 +10343,6 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
                 numbers,
                 bendStiff);
             break;
-        case 11:
-            _getStrain_LimitEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.area, TetMesh.svd3x2S, numbers);
     }
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     numbers  = blockNum;
@@ -10645,7 +10545,7 @@ bool is_strain_limit_violated(Eigen::Vector2d* Sigma, int triangleNum)
 bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha)
 {
     muda::wait_device();
-    bool stopped = false;
+    bool   stopped       = false;
     double lastEnergyVal = computeEnergy(TetMesh);
 
     double c1m         = 0.0;
@@ -10665,7 +10565,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     double alpha_SL = alpha;
 
-        step_forward(TetMesh, alpha, false);
+    step_forward(TetMesh, alpha, false);
 
     bool rehash = true;
 
@@ -10696,7 +10596,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     double LFStepSize      = alpha;
 
     std::cout.precision(18);
-    constexpr int report_line_search_threshold = 7;
+    constexpr int report_line_search_threshold = 8;
 
     while((testingE > lastEnergyVal + c1m * alpha) && numOfLineSearch <= report_line_search_threshold)
     {
@@ -10863,8 +10763,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         alpha =
             std::min(alpha, ground_largestFeasibleStepSize(slackness_a, pcg_data.squeue));
         //alpha = std::min(alpha, InjectiveStepSize(0.2, 1e-6, pcg_data.squeue, TetMesh.tetrahedras));
-        alpha             = std::min(alpha,
-                        self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_cpNum[0]));
+        alpha = std::min(
+            alpha, self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_cpNum[0]));
         double temp_alpha = alpha;
         double alpha_CFL  = alpha;
 
@@ -10886,8 +10786,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 buildFullCP(temp_alpha);*/
                 alpha =
                     std::min(temp_alpha,
-                            self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_ccd_cpNum)
-                                * ccd_size);
+                             self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_ccd_cpNum)
+                                 * ccd_size);
                 alpha = std::max(alpha, alpha_CFL);
             }
         }
@@ -10976,15 +10876,6 @@ void GIPC::updateBoundaryMoveDir(device_TetraData& TetMesh, double alpha, int fi
         TetMesh.vertexes, TetMesh.BoundaryType, _moveDir, IPC_dt, FEM::PI, alpha, numbers, fid);
 }
 
-void GIPC::updateBoundary2(device_TetraData& TetMesh)
-{
-    int numbers = vertexNum;
-    if(numbers <= 0)
-        return;
-    const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
-    _updateBoundary2<<<blockNum, threadNum>>>(TetMesh.BoundaryType, TetMesh.Constraints, numbers);
-}
 
 void GIPC::computeXTilta(device_TetraData& TetMesh, const double& rate)
 {
@@ -10999,36 +10890,6 @@ void GIPC::computeXTilta(device_TetraData& TetMesh, const double& rate)
     m_abd_system->cal_q_tilde(*m_abd_sim_data);
 }
 
-void GIPC::sortMesh(device_TetraData& TetMesh, int updateVertNum)
-{
-    sortGeometry(TetMesh, calcuMaxSceneSize(), updateVertNum, tetrahedraNum, triangleNum);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    updateSurfaces(TetMesh.sortMapVertIndex, _faces, updateVertNum, surface_Num);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    updateSurfaceEdges(TetMesh.sortMapVertIndex, _edges, updateVertNum, edge_Num);
-
-    updateTriEdges_adjVerts(TetMesh.sortMapVertIndex,
-                            TetMesh.tri_edges,
-                            TetMesh.tri_edge_adj_vertex,
-                            updateVertNum,
-                            tri_edge_num);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    updateSurfaceVerts(TetMesh.sortMapVertIndex, _surfVerts, updateVertNum, surf_vertexNum);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    if(pcg_data.P_type == 1)
-    {
-        updateNeighborInfo(pcg_data.MP.d_neighborList,
-                           pcg_data.MP.d_neighborListInit,
-                           pcg_data.MP.d_neighborNum,
-                           pcg_data.MP.d_neighborNumInit,
-                           pcg_data.MP.d_neighborStart,
-                           pcg_data.MP.d_neighborStartTemp,
-                           TetMesh.sortIndex,
-                           TetMesh.sortMapVertIndex,
-                           updateVertNum,
-                           pcg_data.MP.neighborListSize);
-    }
-}
 
 int    totalNT          = 0;
 double totalTime        = 0;
@@ -11060,7 +10921,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         {
             double slackness_m = 0.8;
             alpha              = std::min(alpha,
-                            self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_ccd_cpNum));
+                             self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_ccd_cpNum));
         }
         //updateBoundary(TetMesh, alpha);
 

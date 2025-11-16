@@ -582,6 +582,7 @@ bool tetrahedra_obj::load_tetrahedraMesh(const std::string&     filename,
             if(body_type == gipc::BodyType::ABD)
             {
                 abd_tetOffset += elementNumber;
+                youngth_module = 1e7;
             }
 
             set_body_tet_num(body_type, elementNumber);
