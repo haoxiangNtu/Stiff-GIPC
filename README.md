@@ -77,7 +77,7 @@ Support platforms: Windows, Linux
 We use CMake to build the project.
 
 ```bash
-sudo apt install libglew-dev freeglut3-dev libeigen3-dev metis nlohmann-json3-dev
+sudo apt install libglew-dev freeglut3-dev libeigen3-dev nlohmann-json3-dev
 ```
 
 
@@ -85,7 +85,7 @@ sudo apt install libglew-dev freeglut3-dev libeigen3-dev metis nlohmann-json3-de
 We use [vcpkg](https://github.com/microsoft/vcpkg) to manage the libraries we need and use CMake to build the project. The simplest way to let CMake detect vcpkg is to set the system environment variable `CMAKE_TOOLCHAIN_FILE` to `(YOUR_VCPKG_PARENT_FOLDER)/vcpkg/scripts/buildsystems/vcpkg.cmake`
 
 ```shell
-vcpkg install eigen3 freeglut glew tbb freeglut metis nlohmann-json
+vcpkg install eigen3 freeglut glew tbb freeglut nlohmann-json
 ```
 
 
@@ -96,3 +96,6 @@ This work utilizes the following external software library, which have been incl
 Copyrights are retained by the original authors.
 
 muda https://github.com/KemengHuang/muda, a fork of https://github.com/MuGdxy/muda
+metis https://github.com/KemengHuang/METIS, a fork of https://github.com/KarypisLab/METIS
+GKlib https://github.com/KemengHuang/GKlib, a fork of https://github.com/KarypisLab/GKlib
+

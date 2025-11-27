@@ -64,7 +64,7 @@ if(CUDAToolkit_VERSION_MAJOR GREATER_EQUAL 13)
 endif()
 
 target_link_libraries(gipc PRIVATE cusparse cublas cusolver cudart_static)
-target_link_libraries(gipc PRIVATE mesh_process CUDA::cudart)
+target_link_libraries(gipc PRIVATE metis_partition CUDA::cudart)
 target_link_libraries(gipc PRIVATE GLUT::GLUT GLEW::GLEW OpenGL::GLU Eigen3::Eigen TBB::tbb)
 target_link_libraries(gipc PRIVATE nlohmann_json::nlohmann_json)
 
