@@ -568,32 +568,6 @@ void initFEM(tetrahedra_obj& mesh)
     __GEIGEN__::__set_Mat_val(
         rotationX, 1, 0, 0, 0, cos(angleX), -sin(angleX), 0, sin(angleX), cos(angleX));
 
-    double maxy = 0;
-    for(int j = 0; j < mesh.vertexNum; j++)
-    {
-
-        if(mesh.vertexes[j].y > maxy)
-        {
-            maxy = mesh.vertexes[j].y;
-        }
-
-        //  if((mesh.vertexes[j].y < global_offset + 1))
-        {
-            if((mesh.vertexes[j].x) > 0.75 - 1e-4 && (mesh.vertexes[j].y) > 1.75 - 1e-4)
-            {
-                mesh.boundaryTypies[j] = 1;
-                __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-            }
-            if((mesh.vertexes[j].x) < -0.75 + 1e-4 && (mesh.vertexes[j].y) > 1.75 - 1e-4)
-            {
-                mesh.boundaryTypies[j] = 1;
-                __GEIGEN__::__init_Mat3x3(mesh.constraints[j], 0);
-            }
-        }
-    }
-
-    printf("maxy:   %f\n", maxy);
-
     for(int i = 0; i < mesh.tetrahedraNum; i++)
     {
         __GEIGEN__::Matrix3x3d DM;
@@ -879,6 +853,46 @@ void set_case3()
     importer.import_scene(tetMesh);
 }
 
+void set_case4()
+{
+    ipc.pcg_data.P_type = 1;
+
+    gipc::SimpleSceneImporter importer;
+    double                    scale           = 0.6;
+    double3                   position_offset = make_double3(0, 1.0, 0);
+
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+    Transform t     = Transform::Identity();
+    t.translate(Eigen::Vector3d{0, 1.0, 0});
+    t.scale(scale);
+    t.rotate(Eigen::AngleAxisd(3.1415926 / 2, Eigen::Vector3d::UnitX()));
+    Eigen::Matrix4d transform = t.matrix();
+
+    string mesh_path = assets_dir + "triMesh/cloth_high.obj";
+    importer.load_geometry(tetMesh,
+                           2,
+                           gipc::BodyType::FEM,
+                           transform,
+                           1e4,
+                           mesh_path,
+                           ipc.pcg_data.P_type);
+
+    int          fixed_vertex_num = 0;
+    const double eps              = 1e-4;
+    double       max_y            = tetMesh.maxTConer.y;
+    double       min_x            = tetMesh.minTConer.x;
+    double       max_x            = tetMesh.maxTConer.x;
+    for(int i = 0; i < tetMesh.vertexNum; i++)
+    {
+        if(tetMesh.vertexes[i].y > max_y - eps
+           && (tetMesh.vertexes[i].x < min_x + eps || tetMesh.vertexes[i].x > max_x - eps))
+        {
+            tetMesh.boundaryTypies[i] = 1;
+            fixed_vertex_num++;
+        }
+    }
+    std::cout << "fixed vertex num: " << fixed_vertex_num << std::endl;
+}
 
 void setMAS_partition()
 {
@@ -914,7 +928,7 @@ void initScene()
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
     ipc.pcg_data.P_type = 1;
 
-    int scene_no = 2;
+    int scene_no = 3;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -928,6 +942,8 @@ void initScene()
             break;
         case 2:  //wrecking ball case
             set_case3();
+        case 3:  //fixed cloth
+            set_case4();
             break;
     }
 
