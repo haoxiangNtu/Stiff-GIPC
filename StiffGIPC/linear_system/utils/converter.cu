@@ -26,12 +26,13 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
                         const int&                          out_start_id)
 {
     gipc::Timer timer("convert3x3");
-
+    if(length < 1)
+        return;
     _radix_sort_indices_and_blocks(global_triplets, start, length, out_start_id);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
 
-    _make_unique_indices(global_triplets, start, length, out_start_id);
+    //_make_unique_indices(global_triplets, start, length, out_start_id);
 
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -142,17 +143,54 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
     auto sorted_partition_output = global_triplets.block_index();
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     // scatter
-    DeviceScan().ExclusiveSum(sorted_partition_input,
-                              sorted_partition_output, length);
+    DeviceScan().ExclusiveSum(sorted_partition_input, sorted_partition_output, length);
 
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    cudaMemset(global_triplets.block_values(start),
-               0,
-               global_triplets.h_unique_key_number * sizeof(Eigen::Matrix3d));
+    auto row_indices = global_triplets.block_row_indices(start);
+    auto col_indices = global_triplets.block_col_indices(start);
+
+
+    muda::ParallelFor(256)
+        .kernel_name(__FUNCTION__)
+        .apply(length,
+               [row_indices,
+                col_indices,
+                ij_hash = global_triplets.block_sort_hash_value(),
+                sorted_partition_output] __device__(int i) mutable
+               {
+                   int index = sorted_partition_output[i];
+                   if(i == 0)
+                   {
+
+                       auto key           = ij_hash[i];
+                       row_indices[index] = key >> 32;
+                       col_indices[index] = key & 0xffffffff;
+                   }
+                   else
+                   {
+                       if(index != sorted_partition_output[i - 1])
+                       {
+                           auto key           = ij_hash[i];
+                           row_indices[index] = key >> 32;
+                           col_indices[index] = key & 0xffffffff;
+                       }
+                   }
+               });
+
+
+    CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
+                              sorted_partition_output + length - 1,
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost));
+    global_triplets.h_unique_key_number += 1;
+
+    CUDA_SAFE_CALL(cudaMemset(global_triplets.block_values(start),
+                              0,
+                              global_triplets.h_unique_key_number * sizeof(Eigen::Matrix3d)));
 
     FastSegmentalReduce()
         .kernel_name(__FUNCTION__)
-        .reduce(length, sorted_partition_output,
+        .reduce(length,
+                sorted_partition_output,
                 global_triplets.block_values(out_start_id),
                 global_triplets.block_values(start));
 }

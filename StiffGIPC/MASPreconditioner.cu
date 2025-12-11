@@ -1910,6 +1910,21 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                                         }
                                     }
                                 }
+                                else
+                                {
+                                    int bvRid = vertRid % BANKSIZE;
+                                    int bvCid = vertCid % BANKSIZE;
+                                    int index = BANKSIZE * bvCid
+                                                - bvCid * (bvCid + 1) / 2 + bvRid;
+                                    for(int i = 0; i < 3; i++)
+                                    {
+                                        for(int j = 0; j < 3; j++)
+                                        {
+                                            atomicAdd(&(_invMatrix[cPid].M[index](i, j)),
+                                                      H(j, i));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
