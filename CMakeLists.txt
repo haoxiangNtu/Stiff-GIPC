@@ -48,7 +48,7 @@ target_sources(gipc PRIVATE ${GIPC_SOURCE} ${GIPC_HANDER})
 target_compile_definitions(gipc PRIVATE GIPC_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Assets/")
 target_compile_definitions(gipc PRIVATE GIPC_OUTPUT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Output/")
 
-target_compile_definitions(gipc PRIVATE USE_SNK1 ADAPTIVE_KAPPA USE_FRICTION)
+target_compile_definitions(gipc PRIVATE USE_SNK1 ADAPTIVE_KAPPA USE_FRICTION USE_QUADRATIC_BENDING)
 
 
 find_package(CUDAToolkit REQUIRED)

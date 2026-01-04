@@ -2484,6 +2484,315 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
 }
 
 
+
+#ifdef USE_QUADRATIC_BENDING
+
+// Host function: Precompute Q matrices for quadratic bending
+// This function is called once during initialization
+void PrepareQuadBendingQ(const double3*   rest_vertexes,
+                         const uint2*     tri_edges,
+                         const uint2*     tri_edge_adj_vertex,
+                         int              edge_num,
+                         Eigen::Matrix4d* Q_output  // Output: host memory
+)
+{
+    // Completely copied from CPU-IPC PrepQuadBending logic
+    int error_count    = 0;
+    int boundary_count = 0;
+
+    for(int i = 0; i < edge_num; i++)
+    {
+        const uint2& edge = tri_edges[i];
+        const uint2& adj  = tri_edge_adj_vertex[i];
+
+        // Skip boundary edges (adj.y == -1)
+        if(adj.y == (unsigned int)(-1))
+        {
+            Q_output[i].setZero();
+            boundary_count++;
+            continue;
+        }
+
+        // Get 4 vertices in rest configuration
+        // Vertex ordering MUST match CPU-IPC: [edge[0], edge[1], trig1_outer, trig2_outer]
+        Eigen::Vector3d v0(rest_vertexes[edge.x].x,
+                           rest_vertexes[edge.x].y,
+                           rest_vertexes[edge.x].z);  // edge vertex 0
+        Eigen::Vector3d v1(rest_vertexes[edge.y].x,
+                           rest_vertexes[edge.y].y,
+                           rest_vertexes[edge.y].z);  // edge vertex 1
+        Eigen::Vector3d v2(rest_vertexes[adj.x].x,
+                           rest_vertexes[adj.x].y,
+                           rest_vertexes[adj.x].z);  // trig1 outer
+        Eigen::Vector3d v3(rest_vertexes[adj.y].x,
+                           rest_vertexes[adj.y].y,
+                           rest_vertexes[adj.y].z);  // trig2 outer
+
+        // Compute edges (EXACTLY copied from CPU-IPC)
+        // v0=edge[0], v1=edge[1], v2=trig1_outer, v3=trig2_outer
+        Eigen::Vector3d e0 = v1 - v0;  // edge vector (v1 - v0)
+        Eigen::Vector3d e1 = v2 - v0;  // from edge[0] to trig1_outer
+        Eigen::Vector3d e2 = v3 - v0;  // from edge[0] to trig2_outer
+        Eigen::Vector3d e3 = v2 - v1;  // from edge[1] to trig1_outer
+        Eigen::Vector3d e4 = v3 - v1;  // from edge[1] to trig2_outer
+
+        // Compute triangle areas with safety check
+        Eigen::Vector3d cross01 = e0.cross(e1);
+        Eigen::Vector3d cross02 = e0.cross(e2);
+        double          norm01  = cross01.norm();
+        double          norm02  = cross02.norm();
+
+        if(norm01 < 1e-12 || norm02 < 1e-12)
+        {
+            // Degenerate triangle
+            Q_output[i].setZero();
+            error_count++;
+            continue;
+        }
+
+        double a0 = 0.5 * norm01;  // triangle 1 area
+        double a1 = 0.5 * norm02;  // triangle 2 area
+
+        // Cotangent function with safety check
+        auto cot = [](const Eigen::Vector3d& e0, const Eigen::Vector3d& e1) -> double
+        {
+            double cross_norm = e0.cross(e1).norm();
+            if(cross_norm < 1e-12)
+                return 0.0;
+            return e0.dot(e1) / cross_norm;
+        };
+
+        // Compute cotangent values (copied from CPU-IPC)
+        double c01 = cot(e0, e1);
+        double c02 = cot(e0, e2);
+        double c03 = cot(-e0, e3);
+        double c04 = cot(-e0, e4);
+
+        // Build K vector (copied from CPU-IPC formula)
+        Eigen::Vector4d K;
+        K << c03 + c04, c01 + c02, -c01 - c03, -c02 - c04;
+
+        // Compute Q matrix: Q = 3 / (a0 + a1) * K * K^T
+        double area_sum = a0 + a1;
+        if(area_sum < 1e-12)
+        {
+            Q_output[i].setZero();
+            error_count++;
+            continue;
+        }
+
+        Q_output[i] = 3.0 / area_sum * K * K.transpose();
+
+        // Verify no NaN or Inf
+        bool has_invalid = false;
+        for(int r = 0; r < 4; r++)
+        {
+            for(int c = 0; c < 4; c++)
+            {
+                if(std::isnan(Q_output[i](r, c)) || std::isinf(Q_output[i](r, c)))
+                {
+                    has_invalid = true;
+                    break;
+                }
+            }
+            if(has_invalid)
+                break;
+        }
+
+        if(has_invalid)
+        {
+            Q_output[i].setZero();
+            error_count++;
+        }
+    }
+
+    if(error_count > 0)
+    {
+        printf("PrepareQuadBendingQ: %d edges with errors (set to zero)\n", error_count);
+    }
+    printf("PrepareQuadBendingQ: %d boundary, %d errors, %d valid (total %d)\n",
+           boundary_count,
+           error_count,
+           edge_num - boundary_count - error_count,
+           edge_num);
+}
+
+// Calculate quadratic bending gradient and Hessian
+// Gradient: ∇E_i = k * dt² * Σ_j Q_ij * x_j  (simple matrix-vector product)
+// Hessian: H_ij = k * dt² * Q_ij * I_3x3  (constant matrix, much simpler than LibShell!)
+__global__ void _calculate_quad_bending_gradient_hessian(const double3* vertexes,
+                                                         const double3* rest_vertexes,
+                                                         const uint2* edges,
+                                                         const uint2* edges_adj_vertex,
+                                                         const Eigen::Matrix4d* quad_bending_Q,
+                                                         double3* gradient,
+                                                         int      edgeNum,
+                                                         double   bendStiff,
+                                                         int      global_offset,
+                                                         Eigen::Matrix3d* triplet_values,
+                                                         int*   row_ids,
+                                                         int*   col_ids,
+                                                         double IPC_dt,
+                                                         int global_hessian_fem_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= edgeNum)
+        return;
+
+    uint2 edge = edges[idx];
+    uint2 adj  = edges_adj_vertex[idx];
+
+    // Boundary edge: set zeros to triplet
+    if(adj.y == (unsigned int)(-1))
+    {
+        int gtrioff = global_offset + idx * 10;
+        for(int kk = 0; kk < 10; kk++)
+        {
+            row_ids[gtrioff + kk] = 0;
+            col_ids[gtrioff + kk] = 0;
+            triplet_values[gtrioff + kk].setZero();
+        }
+        return;
+    }
+
+    const Eigen::Matrix4d& Q = quad_bending_Q[idx];
+
+    // Collect current positions (MUST match CPU-IPC: [edge[0], edge[1], trig1_outer, trig2_outer])
+    auto x0 = vertexes[edge.x];  // edge[0]
+    auto x1 = vertexes[edge.y];  // edge[1]
+    auto x2 = vertexes[adj.x];   // trig1_outer
+    auto x3 = vertexes[adj.y];   // trig2_outer
+
+    Eigen::Vector3d x_eigen[4];
+    x_eigen[0] = Eigen::Vector3d(x0.x, x0.y, x0.z);
+    x_eigen[1] = Eigen::Vector3d(x1.x, x1.y, x1.z);
+    x_eigen[2] = Eigen::Vector3d(x2.x, x2.y, x2.z);
+    x_eigen[3] = Eigen::Vector3d(x3.x, x3.y, x3.z);
+
+    // Compute gradient: g_i = Q_ij * x_j
+    Eigen::Matrix<double, 12, 1> grad;
+    for(int i = 0; i < 4; i++)
+    {
+        Eigen::Vector3d g_i = Eigen::Vector3d::Zero();
+        for(int j = 0; j < 4; j++)
+        {
+            g_i += Q(i, j) * x_eigen[j];
+        }
+        grad.block<3, 1>(i * 3, 0) = g_i;
+    }
+
+    auto rest_x0 = rest_vertexes[edge.x];
+    auto rest_x1 = rest_vertexes[edge.y];
+
+    double length = __GEIGEN__::__norm(__GEIGEN__::__minus(rest_x0, rest_x1));
+
+    // Scale by stiffness and time step
+    double coef = length * bendStiff * IPC_dt * IPC_dt;
+    grad *= coef;
+
+    // Accumulate gradient using atomic operations
+    // Order matches Q matrix: [edge[0], edge[1], trig1_outer, trig2_outer]
+    unsigned int vertex_indices[4] = {edge.x, edge.y, adj.x, adj.y};
+    for(int i = 0; i < 4; i++)
+    {
+        atomicAdd(&(gradient[vertex_indices[i]].x), grad(i * 3 + 0));
+        atomicAdd(&(gradient[vertex_indices[i]].y), grad(i * 3 + 1));
+        atomicAdd(&(gradient[vertex_indices[i]].z), grad(i * 3 + 2));
+    }
+
+    // Compute Hessian: H_ij = Q_ij * I_3x3
+    // The Hessian is constant (doesn't depend on current position)!
+    // This is the key advantage of quadratic bending over angle-based bending.
+    Eigen::Matrix<double, 12, 12> H;
+    for(int i = 0; i < 4; i++)
+    {
+        for(int j = 0; j < 4; j++)
+        {
+            // H_ij = Q_ij * I_3x3
+            H.block<3, 3>(i * 3, j * 3) = Q(i, j) * Eigen::Matrix3d::Identity();
+        }
+    }
+
+    // Scale by stiffness and time step
+    H *= coef;
+
+    // Make positive definite (optional, Q should already be PSD)
+    // Temporarily disable this to debug
+    // makePDSNK<double, 12>(H);
+
+    // Write upper triangular blocks to triplet format
+    unsigned int fem_global_index[4] = {vertex_indices[0] + global_hessian_fem_offset,
+                                        vertex_indices[1] + global_hessian_fem_offset,
+                                        vertex_indices[2] + global_hessian_fem_offset,
+                                        vertex_indices[3] + global_hessian_fem_offset};
+
+    int gtrioff = global_offset + idx * 10;
+    int kk      = 0;
+    for(int ii = 0; ii < 4; ii++)
+    {
+        for(int jj = ii; jj < 4; jj++)
+        {
+            int row = fem_global_index[ii];
+            int col = fem_global_index[jj];
+
+            if(row <= col)
+            {
+                row_ids[gtrioff + kk]        = row;
+                col_ids[gtrioff + kk]        = col;
+                triplet_values[gtrioff + kk] = H.block<3, 3>(ii * 3, jj * 3);
+            }
+            else
+            {
+                row_ids[gtrioff + kk] = col;
+                col_ids[gtrioff + kk] = row;
+                triplet_values[gtrioff + kk] = H.block<3, 3>(jj * 3, ii * 3).transpose();
+            }
+            kk++;
+        }
+    }
+}
+
+
+__device__ double __cal_quad_bending_energy(const double3* vertexes,
+                                            const double3* rest_vertexes,
+                                            const uint2&   edge,
+                                            const uint2&   adj,
+                                            const Eigen::Matrix4d& Q,
+                                            double                 bendStiff)
+{
+    if(adj.y == (unsigned int)(-1))
+        return 0;
+
+    // Get 4 vertices (MUST match CPU-IPC order)
+    // [edge[0], edge[1], trig1_outer, trig2_outer]
+    double3 x[4];
+    x[0] = vertexes[edge.x];  // edge vertex 0
+    x[1] = vertexes[edge.y];  // edge vertex 1
+    x[2] = vertexes[adj.x];   // trig1 outer
+    x[3] = vertexes[adj.y];   // trig2 outer
+
+    auto rest_x0 = rest_vertexes[edge.x];
+    auto rest_x1 = rest_vertexes[edge.y];
+
+    double length = __GEIGEN__::__norm(__GEIGEN__::__minus(rest_x0, rest_x1));
+
+    // E = 0.5 * k * Σ_ij Q_ij * x_i · x_j
+    double energy = 0.0;
+    for(int i = 0; i < 4; ++i)
+    {
+        for(int j = 0; j < 4; ++j)
+        {
+            double Qij = Q(i, j);
+            energy += Qij * (x[i].x * x[j].x + x[i].y * x[j].y + x[i].z * x[j].z);
+        }
+    }
+
+    return 0.5 * bendStiff * length * energy;
+}
+
+#endif
+
+
 __device__ double __cal_strainL_energy(Eigen::Vector2d& sigma, double area)
 {
     double slimit   = 1.1;

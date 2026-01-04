@@ -1148,6 +1148,82 @@ void initScene()
                               ipc.vertexNum * sizeof(double3),
                               cudaMemcpyDeviceToDevice));
 
+
+
+
+    #ifdef USE_QUADRATIC_BENDING
+    // Precompute Q matrices for quadratic bending
+    if(tetMesh.tri_edges.size() > 0)
+    {
+        printf("Precomputing Q matrices for quadratic bending (%zu edges)...\n",
+               tetMesh.tri_edges.size());
+
+        // Allocate host memory for Q matrices
+        std::vector<Eigen::Matrix4d> Q_host(tetMesh.tri_edges.size());
+
+        // Download rest positions, edges, and adjacency from device
+        std::vector<double3> rest_verts_host(ipc.vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(rest_verts_host.data(),
+                                  d_tetMesh.rest_vertexes,
+                                  ipc.vertexNum * sizeof(double3),
+                                  cudaMemcpyDeviceToHost));
+
+        // Call precomputation function (defined in femEnergy.cu)
+        PrepareQuadBendingQ(rest_verts_host.data(),
+                            tetMesh.tri_edges.data(),
+                            tetMesh.tri_edges_adj_points.data(),  // CPU端叫tri_edges_adj_points
+                            tetMesh.tri_edges.size(),
+                            Q_host.data());
+
+        // Upload Q matrices to device
+        CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.quad_bending_Q,
+                                  Q_host.data(),
+                                  tetMesh.tri_edges.size() * sizeof(Eigen::Matrix4d),
+                                  cudaMemcpyHostToDevice));
+
+        printf("Quadratic bending Q matrices uploaded successfully.\n");
+
+        // Optional: Print first Q matrix for verification
+        if(tetMesh.tri_edges.size() > 0)
+        {
+            printf("First Q matrix:\n");
+            for(int i = 0; i < 4; i++)
+            {
+                printf("  [%10.6f %10.6f %10.6f %10.6f]\n",
+                       Q_host[0](i, 0),
+                       Q_host[0](i, 1),
+                       Q_host[0](i, 2),
+                       Q_host[0](i, 3));
+            }
+
+            // Check for NaN or Inf
+            int nan_count = 0;
+            int inf_count = 0;
+            for(size_t i = 0; i < Q_host.size(); i++)
+            {
+                for(int r = 0; r < 4; r++)
+                {
+                    for(int c = 0; c < 4; c++)
+                    {
+                        if(std::isnan(Q_host[i](r, c)))
+                            nan_count++;
+                        if(std::isinf(Q_host[i](r, c)))
+                            inf_count++;
+                    }
+                }
+            }
+            if(nan_count > 0 || inf_count > 0)
+            {
+                printf("WARNING: Q matrices contain %d NaN values and %d Inf values!\n",
+                       nan_count,
+                       inf_count);
+            }
+        }
+    }
+#endif
+
+
+
     ipc.buildBVH();
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer);
 

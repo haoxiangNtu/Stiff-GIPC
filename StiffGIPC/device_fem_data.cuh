@@ -32,6 +32,10 @@ class device_TetraData
     uint2* tri_edges           = nullptr;
     uint2* tri_edge_adj_vertex = nullptr;
 
+#ifdef USE_QUADRATIC_BENDING
+    Eigen::Matrix4d* quad_bending_Q = nullptr;  // Precomputed Q matrices for quadratic bending
+#endif
+
     uint32_t* targetIndex     = nullptr;
     uint4*    tempTetrahedras = nullptr;
     double*   volum           = nullptr;

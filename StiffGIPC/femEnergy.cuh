@@ -124,6 +124,38 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
                                                     int global_hessian_fem_offset);
 
 
+#ifdef USE_QUADRATIC_BENDING
+// Host function: Precompute Q matrices for quadratic bending
+void PrepareQuadBendingQ(const double3*   rest_vertexes,
+                         const uint2*     tri_edges,
+                         const uint2*     tri_edge_adj_vertex,
+                         int              edge_num,
+                         Eigen::Matrix4d* Q_output);
+
+// Device function: Calculate quadratic bending energy
+__device__ double __cal_quad_bending_energy(const double3* vertexes,
+                                            const double3* rest_vertexes,
+                                            const uint2&   edge,
+                                            const uint2&   adj,
+                                            const Eigen::Matrix4d& Q,
+                                            double                 bendStiff);
+
+__global__ void _calculate_quad_bending_gradient_hessian(const double3* vertexes,
+                                                         const double3* rest_vertexes,
+                                                         const uint2* edges,
+                                                         const uint2* edges_adj_vertex,
+                                                         const Eigen::Matrix4d* quad_bending_Q,
+                                                         double3* gradient,
+                                                         int      edgeNum,
+                                                         double   bendStiff,
+                                                         int      global_offset,
+                                                         Eigen::Matrix3d* triplet_values,
+                                                         int*   row_ids,
+                                                         int*   col_ids,
+                                                         double IPC_dt,
+                                                         int global_hessian_fem_offset);
+#endif
+
 __global__ void _calculate_triangle_fem_strain_limiting_gradient_hessian(
     __GEIGEN__::Matrix2x2d* trimInverses,
     const double3*          vertexes,

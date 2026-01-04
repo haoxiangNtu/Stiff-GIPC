@@ -3,7 +3,7 @@
 #include <numeric>
 #include <map>
 #include <set>
-
+#include <iomanip>
 namespace gipc
 {
 void TetMesh::load(const std::string& filename)
@@ -124,8 +124,9 @@ $EndMeshFormat)";
     ofs << vertices().size() << std::endl;
     for(int i = 0; i < vertices().size(); i++)
     {
-        ofs << i + 1 << " " << m_vertices[i].x() << " " << m_vertices[i].y()
-            << " " << m_vertices[i].z() << std::endl;
+        ofs << i + 1 << " " << std::scientific << std::setprecision(12)
+            << m_vertices[i].x() << " " << m_vertices[i].y() << " "
+            << m_vertices[i].z() << std::endl;
     }
 
     ofs << "$Elements" << std::endl;
@@ -143,8 +144,9 @@ void TriMesh::export_mesh(const std::string& filename)
     std::ofstream ofs(filename);
     for(int i = 0; i < vertices().size(); i++)
     {
-        ofs << "v" << " " << m_vertices[i].x() << " " << m_vertices[i].y()
-            << " " << m_vertices[i].z() << std::endl;
+        ofs << "v" << " " << std::scientific << std::setprecision(12)
+            << m_vertices[i].x() << " " << m_vertices[i].y() << " "
+            << m_vertices[i].z() << std::endl;
     }
 
     for(int i = 0; i < m_triangle.size(); i++)
