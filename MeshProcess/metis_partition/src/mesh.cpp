@@ -310,9 +310,10 @@ void TetMesh::_load(const std::string& filename)
                 vector<std::string> nodePos;
                 std::string         spacer = " ";
                 _split(line, nodePos, spacer);
-                x = atof(nodePos[1].c_str());
-                y = atof(nodePos[2].c_str());
-                z = atof(nodePos[3].c_str());
+                int size = nodePos.size();
+                x        = atof(nodePos[size - 3].c_str());
+                y        = atof(nodePos[size - 2].c_str());
+                z        = atof(nodePos[size - 1].c_str());
                 Vector3d vertex{x, y, z};
 
                 double mass         = 0;
@@ -334,10 +335,11 @@ void TetMesh::_load(const std::string& filename)
                 vector<std::string> elementIndexex;
                 std::string         spacer = " ";
                 _split(line, elementIndexex, spacer);
-                index0 = atoi(elementIndexex[3].c_str()) - 1;
-                index1 = atoi(elementIndexex[4].c_str()) - 1;
-                index2 = atoi(elementIndexex[5].c_str()) - 1;
-                index3 = atoi(elementIndexex[6].c_str()) - 1;
+                int size = elementIndexex.size();
+                index0   = atoi(elementIndexex[size - 4].c_str()) - 1;
+                index1   = atoi(elementIndexex[size - 3].c_str()) - 1;
+                index2   = atoi(elementIndexex[size - 2].c_str()) - 1;
+                index3   = atoi(elementIndexex[size - 1].c_str()) - 1;
 
                 Vector4i tet;
                 tet.x() = index0 + vertexOffset;

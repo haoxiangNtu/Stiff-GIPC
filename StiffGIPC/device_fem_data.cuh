@@ -44,6 +44,7 @@ class device_TetraData
     double* lengthRate = nullptr;
     double* volumeRate = nullptr;
     double*   masses           = nullptr;
+    int*    apply_gravity = nullptr;
     double*   tempDouble       = nullptr;
 
     __GEIGEN__::Matrix3x3d* DmInverses       = nullptr;
@@ -54,6 +55,15 @@ class device_TetraData
     BodyBoundaryType* body_id_to_boundary_type = nullptr;
     int*              point_id_to_body_id      = nullptr;
     int*              tet_id_to_body_id        = nullptr;
+
+    int                   m_soft_num   = 0;
+    int                   m_vertex_num = 0;
+    std::vector<uint32_t> host_target_indices;
+    std::vector<double3>  host_target_vertices;
+    std::function<double3(double3 vertex, int step_id, double ipc_dt)> update_soft_constraint_functor =
+        nullptr;
+    void update_soft_constraint_target_position(int step_id, double ipc_dt);
+
 
   public:
     device_TetraData() {}

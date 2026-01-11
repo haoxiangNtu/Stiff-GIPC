@@ -17,6 +17,7 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
                                          const int& tri_edgeNum,
                                          const int& bodyNum)
 {
+    m_vertex_num   = vertex_num;
     int maxNumbers = vertex_num > tetradedra_num ? vertex_num : tetradedra_num;
     CUDA_SAFE_CALL(cudaMalloc((void**)&vertexes, vertex_num * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&o_vertexes, vertex_num * sizeof(double3)));
@@ -45,6 +46,7 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
     CUDA_SAFE_CALL(cudaMalloc((void**)&lengthRate, tetradedra_num * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&volumeRate, tetradedra_num * sizeof(double)));
 
+    CUDA_SAFE_CALL(cudaMalloc((void**)&apply_gravity, vertex_num * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&tempDouble, maxNumbers * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&BoundaryType, vertex_num * sizeof(int)));
@@ -53,6 +55,7 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
     CUDA_SAFE_CALL(cudaMalloc((void**)&DmInverses,
                               tetradedra_num * sizeof(__GEIGEN__::Matrix3x3d)));
 
+    m_soft_num = softNum;
     CUDA_SAFE_CALL(cudaMalloc((void**)&targetIndex, softNum * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&targetVert, softNum * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&triDmInverses,
@@ -61,7 +64,7 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
     CUDA_SAFE_CALL(cudaMalloc((void**)&area, triangle_num * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&triangles, triangle_num * sizeof(uint4)));
 
-
+    
     CUDA_SAFE_CALL(cudaMalloc((void**)&body_id_to_boundary_type, bodyNum * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&point_id_to_body_id, vertex_num * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&tet_id_to_body_id, tetradedra_num * sizeof(int)));
@@ -81,6 +84,7 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(rest_vertexes));
     CUDA_SAFE_CALL(cudaFree(xTilta));
     CUDA_SAFE_CALL(cudaFree(fb));
+    CUDA_SAFE_CALL(cudaFree(apply_gravity));
     CUDA_SAFE_CALL(cudaFree(shape_grads));
     CUDA_SAFE_CALL(cudaFree(tetrahedras));
     CUDA_SAFE_CALL(cudaFree(tempTetrahedras));
@@ -110,4 +114,28 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(point_id_to_body_id));
     CUDA_SAFE_CALL(cudaFree(tet_id_to_body_id));
 
+}
+
+void device_TetraData::update_soft_constraint_target_position(int step_id, double ipc_dt)
+{
+    if(m_soft_num < 1)
+        return;
+
+    std::vector<double3> host_vertexes(m_vertex_num);
+    CUDA_SAFE_CALL(cudaMemcpy(
+        host_vertexes.data(), vertexes, m_vertex_num * sizeof(double3), cudaMemcpyDeviceToHost));
+
+    for(int i = 0; i < m_soft_num; i++)
+    {
+        if(update_soft_constraint_functor == nullptr)
+            host_target_vertices[i] = host_vertexes[host_target_indices[i]];
+        else
+            host_target_vertices[i] = update_soft_constraint_functor(
+                host_vertexes[host_target_indices[i]], step_id, ipc_dt);
+    }
+
+    CUDA_SAFE_CALL(cudaMemcpy(targetVert,
+                              host_target_vertices.data(),
+                              m_soft_num * sizeof(double3),
+                              cudaMemcpyHostToDevice));
 }

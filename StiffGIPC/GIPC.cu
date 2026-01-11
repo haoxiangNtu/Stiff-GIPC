@@ -8076,6 +8076,7 @@ __global__ void _computeXTilta(int*     _btype,
                                double3* _velocities,
                                double3* _o_vertexes,
                                double3* _xTilta,
+                               int*     _apply_gravity,
                                double   ipc_dt,
                                double   rate,
                                int      numbers)
@@ -8085,7 +8086,7 @@ __global__ void _computeXTilta(int*     _btype,
         return;
 
     double3 gravityDtSq = make_double3(0, 0, 0);  //__GEIGEN__::__s_vec_multiply(make_double3(0, -9.8, 0), ipc_dt * ipc_dt);//Vector3d(0, gravity, 0) * IPC_dt * IPC_dt;
-    if(_btype[idx] == 0)
+    if(_btype[idx] == 0 && _apply_gravity[idx])
     {
         gravityDtSq =
             __GEIGEN__::__s_vec_multiply(make_double3(0, -9.8, 0), ipc_dt * ipc_dt);
@@ -11040,8 +11041,14 @@ void GIPC::computeXTilta(device_TetraData& TetMesh, const double& rate)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
-    _computeXTilta<<<blockNum, threadNum>>>(
-        TetMesh.BoundaryType, TetMesh.velocities, TetMesh.o_vertexes, TetMesh.xTilta, IPC_dt, rate, numbers);
+    _computeXTilta<<<blockNum, threadNum>>>(TetMesh.BoundaryType,
+                                            TetMesh.velocities,
+                                            TetMesh.o_vertexes,
+                                            TetMesh.xTilta,
+                                            TetMesh.apply_gravity,
+                                            IPC_dt,
+                                            rate,
+                                            numbers);
 
     m_abd_system->cal_q_tilde(*m_abd_sim_data);
 }
@@ -11114,6 +11121,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         printf("boundary alpha: %f\n  finished a step\n", alpha);
     }
 
+    TetMesh.update_soft_constraint_target_position(total_Frames + 1, IPC_dt);
     //suggestKappa(Kappa);
     upperBoundKappa(Kappa);
     if(Kappa < 1e-16)

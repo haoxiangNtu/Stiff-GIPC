@@ -558,15 +558,31 @@ void initFEM(tetrahedra_obj& mesh)
 
     double massSum   = 0;
     double volumeSum = 0;
-    float  angleX = FEM::PI / 4, angleY = -FEM::PI / 4, angleZ = FEM::PI / 2;
-    __GEIGEN__::Matrix3x3d rotation, rotationZ, rotationY, rotationX, eigenTest;
-    __GEIGEN__::__set_Mat_val(rotation, 1, 0, 0, 0, 1, 0, 0, 0, 1);
-    __GEIGEN__::__set_Mat_val(
-        rotationZ, cos(angleZ), -sin(angleZ), 0, sin(angleZ), cos(angleZ), 0, 0, 0, 1);
-    __GEIGEN__::__set_Mat_val(
-        rotationY, cos(angleY), 0, -sin(angleY), 0, 1, 0, sin(angleY), 0, cos(angleY));
-    __GEIGEN__::__set_Mat_val(
-        rotationX, 1, 0, 0, 0, cos(angleX), -sin(angleX), 0, sin(angleX), cos(angleX));
+    //float  angleX = FEM::PI / 4, angleY = -FEM::PI / 4, angleZ = FEM::PI / 2;
+    //__GEIGEN__::Matrix3x3d rotation, rotationZ, rotationY, rotationX, eigenTest;
+    //__GEIGEN__::__set_Mat_val(rotation, 1, 0, 0, 0, 1, 0, 0, 0, 1);
+    //__GEIGEN__::__set_Mat_val(
+    //    rotationZ, cos(angleZ), -sin(angleZ), 0, sin(angleZ), cos(angleZ), 0, 0, 0, 1);
+    //__GEIGEN__::__set_Mat_val(
+    //    rotationY, cos(angleY), 0, -sin(angleY), 0, 1, 0, sin(angleY), 0, cos(angleY));
+    //__GEIGEN__::__set_Mat_val(
+    //    rotationX, 1, 0, 0, 0, cos(angleX), -sin(angleX), 0, sin(angleX), cos(angleX));
+
+
+    ipc.lengthRateLame = ipc.YoungModulus / (2 * (1 + ipc.PoissonRate));
+    ipc.volumeRateLame = ipc.YoungModulus * ipc.PoissonRate
+                         / ((1 + ipc.PoissonRate) * (1 - 2 * ipc.PoissonRate));
+    ipc.lengthRate   = 4 * ipc.lengthRateLame / 3;
+    ipc.volumeRate   = ipc.volumeRateLame + 5 * ipc.lengthRateLame / 6;
+    ipc.stretchStiff = ipc.clothYoungModulus / (2 * (1 + ipc.PoissonRate));
+
+    ipc.bendStiff = ipc.bendYoungModulus * pow(ipc.clothThickness, 3)
+                    / (24 * (1 - ipc.PoissonRate * ipc.PoissonRate));
+
+    ipc.shearStiff = 0.03 * ipc.stretchStiff * ipc.strainRate;
+
+    printf("ipc.shearStiff: %f\n", ipc.shearStiff);
+
 
     for(int i = 0; i < mesh.tetrahedraNum; i++)
     {
@@ -632,18 +648,18 @@ void DefaultSettings()
     // global settings
     ipc.density        = 1e3;
     ipc.PoissonRate    = 0.49;
-    ipc.lengthRateLame = ipc.YoungModulus / (2 * (1 + ipc.PoissonRate));
-    ipc.volumeRateLame = ipc.YoungModulus * ipc.PoissonRate
-                         / ((1 + ipc.PoissonRate) * (1 - 2 * ipc.PoissonRate));
-    ipc.lengthRate        = 4 * ipc.lengthRateLame / 3;
-    ipc.volumeRate        = ipc.volumeRateLame + 5 * ipc.lengthRateLame / 6;
+    //ipc.lengthRateLame = ipc.YoungModulus / (2 * (1 + ipc.PoissonRate));
+    //ipc.volumeRateLame = ipc.YoungModulus * ipc.PoissonRate
+    //                     / ((1 + ipc.PoissonRate) * (1 - 2 * ipc.PoissonRate));
+    //ipc.lengthRate        = 4 * ipc.lengthRateLame / 3;
+    //ipc.volumeRate        = ipc.volumeRateLame + 5 * ipc.lengthRateLame / 6;
     ipc.frictionRate      = 0.4;
     ipc.gd_frictionRate   = 0.4;
     ipc.clothThickness    = 1e-3;
     ipc.clothYoungModulus = 1e6;
     ipc.bendYoungModulus  = 1e5;
-    ipc.stretchStiff      = ipc.clothYoungModulus / (2 * (1 + ipc.PoissonRate));
-    ipc.shearStiff        = ipc.stretchStiff * 0.3;
+    //ipc.stretchStiff      = ipc.clothYoungModulus / (2 * (1 + ipc.PoissonRate));
+    //ipc.shearStiff        = ipc.stretchStiff * 0.3;
     ipc.clothDensity      = 2e2;
     ipc.strainRate        = 100;
     ipc.softMotionRate    = 1e0;
@@ -652,9 +668,9 @@ void DefaultSettings()
     ipc.pcg_threshold           = 1e-4;
     ipc.IPC_dt                  = 1e-2;
     ipc.relative_dhat           = 1e-3;
-    ipc.bendStiff = ipc.bendYoungModulus * pow(ipc.clothThickness, 3)
-                    / (24 * (1 - ipc.PoissonRate * ipc.PoissonRate));
-    ipc.shearStiff = 0.03 * ipc.stretchStiff * ipc.strainRate;
+    //ipc.bendStiff = ipc.bendYoungModulus * pow(ipc.clothThickness, 3)
+    //                / (24 * (1 - ipc.PoissonRate * ipc.PoissonRate));
+    //ipc.shearStiff = 0.03 * ipc.stretchStiff * ipc.strainRate;
 }
 //int  meshids = 0;
 void LoadSettings()
@@ -696,19 +712,7 @@ void LoadSettings()
         //infile >> ignoreToken >> meshids;
 
 
-        ipc.lengthRateLame = ipc.YoungModulus / (2 * (1 + ipc.PoissonRate));
-        ipc.volumeRateLame = ipc.YoungModulus * ipc.PoissonRate
-                             / ((1 + ipc.PoissonRate) * (1 - 2 * ipc.PoissonRate));
-        ipc.lengthRate   = 4 * ipc.lengthRateLame / 3;
-        ipc.volumeRate   = ipc.volumeRateLame + 5 * ipc.lengthRateLame / 6;
-        ipc.stretchStiff = ipc.clothYoungModulus / (2 * (1 + ipc.PoissonRate));
 
-        ipc.bendStiff = ipc.bendYoungModulus * pow(ipc.clothThickness, 3)
-                        / (24 * (1 - ipc.PoissonRate * ipc.PoissonRate));
-
-        ipc.shearStiff = 0.03 * ipc.stretchStiff * ipc.strainRate;
-
-        printf("ipc.shearStiff: %f\n", ipc.shearStiff);
         //ipc.shearStiff =
         infile.close();
     }
@@ -894,6 +898,166 @@ void set_case4()
     std::cout << "fixed vertex num: " << fixed_vertex_num << std::endl;
 }
 
+void set_case5()
+{
+    ipc.pcg_data.P_type = 1;
+
+    gipc::SimpleSceneImporter importer;
+    double                    scale = 1.0;
+    Eigen::Vector3d           position_offset{0, 0, 0};
+
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+    Transform t     = Transform::Identity();
+    t.translate(position_offset);
+    t.scale(scale);
+    Eigen::Matrix4d transform = t.matrix();
+
+    string mesh_path       = assets_dir + "tetMesh/high_mat.msh";
+    double Youngth_Modulus = 1e4;
+    ipc.PoissonRate        = 0.48;
+    importer.load_geometry(tetMesh,
+                           3,
+                           gipc::BodyType::FEM,
+                           transform,
+                           Youngth_Modulus,
+                           mesh_path,
+                           ipc.pcg_data.P_type);
+
+    // no gravity
+    for(int i = 0; i < tetMesh.vertexes.size(); i++)
+    {
+        tetMesh.apply_gravity[i] = 0;
+    }
+
+    const double eps = 1e-4;
+    for(int i = 0; i < tetMesh.vertexNum; i++)
+    {
+        if(tetMesh.vertexes[i].x < -0.5 + eps || tetMesh.vertexes[i].x > 0.5 - eps)
+        {
+            tetMesh.targetIndex.push_back(i);
+            tetMesh.targetPos.push_back(tetMesh.vertexes[i]);
+        }
+    }
+    tetMesh.softNum = tetMesh.targetIndex.size();
+    std::cout << "soft constraint num: " << tetMesh.softNum << std::endl;
+    ipc.softMotionRate = 1;
+
+    const double angular_vel = 3.14159265358979323846/5;
+    d_tetMesh.update_soft_constraint_functor =
+        [angular_vel](double3 vertex, int step_id, double ipc_dt) -> double3
+    {
+        double3 rotated_vertex = vertex;
+        if(vertex.x < 0)
+        {
+            // rotate along x axis clockwise
+            rotated_vertex = {vertex.x,
+                              vertex.y * std::cos(angular_vel * ipc_dt)
+                                  - vertex.z * std::sin(angular_vel * ipc_dt),
+                              vertex.y * std::sin(angular_vel * ipc_dt)
+                                  + vertex.z * std::cos(angular_vel * ipc_dt)};
+        }
+        if(vertex.x > 0)
+        {
+            // rotate along x axis counterclockwise
+            rotated_vertex = {vertex.x,
+                              vertex.y * std::cos(-angular_vel * ipc_dt)
+                                  - vertex.z * std::sin(-angular_vel * ipc_dt),
+                              vertex.y * std::sin(-angular_vel * ipc_dt)
+                                  + vertex.z * std::cos(-angular_vel * ipc_dt)};
+        }
+        return rotated_vertex;
+    };
+}
+
+void set_case6()
+{
+
+    ipc.pcg_data.P_type = 1;
+    double scale      = 0.3;
+    double dist       = scale / 2;
+    int    count      = 8;
+    int    count_Y    = 15;
+    double fem_height = global_offset + 1 - 0.8;
+    double abd_height = fem_height - dist;
+
+
+    for(int k = 0; k < count_Y; ++k)
+    {
+        for(int i = 0; i < count; i++)
+        {
+            for(int j = 0; j < count; j++)
+            {
+
+                gipc::Vector2 ij{i, j};
+                gipc::Vector2 pos =
+                    ij * dist - gipc::Vector2::Ones() * dist * (count - 1) / 2.0;
+
+
+                double3 position_offset =
+                    double3{-pos.x(), -abd_height - 2 * dist * k, -pos.y()};
+                Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+                transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * scale;
+                transform.block<3, 1>(0, 3) = -Eigen::Vector3d(
+                    position_offset.x, position_offset.y, position_offset.z);
+                tetMesh.load_tetrahedraMesh(assets_dir + "tetMesh/cube.msh",
+                                            transform,
+                                            1e6,
+                                            gipc::BodyType::ABD);
+            }
+        }
+    }
+
+    for(int k = 0; k < count_Y; ++k)
+    {
+        for(int i = 0; i < count; i++)
+        {
+            for(int j = 0; j < count; j++)
+            {
+                gipc::Vector2 ij{i, j};
+                gipc::Vector2 pos =
+                    ij * dist - gipc::Vector2::Ones() * dist * (count - 1) / 2.0;
+
+                double3 position_offset =
+                    double3{-pos.x(), -fem_height - 2 * dist * k, -pos.y()};
+                Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+                transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * scale;
+                transform.block<3, 1>(0, 3) = -Eigen::Vector3d(
+                    position_offset.x, position_offset.y, position_offset.z);
+                tetMesh.load_tetrahedraMesh(assets_dir + "tetMesh/cube.msh",
+                                            transform,
+                                            5e4,
+                                            gipc::BodyType::ABD);
+            }
+        }
+    }
+    
+    gipc::SimpleSceneImporter importer;
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+    Transform t     = Transform::Identity();
+    t.scale(1.5);
+    t.translate(Eigen::Vector3d(0, 0.35, 0));
+    string mesh_path = assets_dir + "triMesh/cloth_high.obj";
+    importer.load_geometry(tetMesh,
+                           2,
+                           gipc::BodyType::FEM,
+                           t.matrix(),
+                           1e4,
+                           mesh_path,
+                           ipc.pcg_data.P_type);
+
+    const double eps = 1e-4;
+    for(int i = 0; i < tetMesh.vertexNum; i++)
+    {
+        if(tetMesh.vertexes[i].x < -1.5 + eps || tetMesh.vertexes[i].x > 1.5 - eps)
+        {
+            tetMesh.boundaryTypies[i] = 1;
+        }
+    }
+
+    ipc.relative_dhat = 1e-3;
+    ipc.strainRate    = 1e6;
+}
+
 void setMAS_partition()
 {
     tetMesh.partId_map_real.resize(tetMesh.part_offset * BANKSIZE, -1);
@@ -928,7 +1092,7 @@ void initScene()
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
     ipc.pcg_data.P_type = 1;
 
-    int scene_no = 2;
+    int scene_no = 4;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -945,6 +1109,12 @@ void initScene()
             break;
         case 3:  //fixed cloth
             set_case4();
+            break;
+        case 4:  //twisting mat
+            set_case5();
+            break;
+        case 5:  //box pipe large scale and cloth
+            set_case6();
             break;
     }
 
@@ -966,6 +1136,11 @@ void initScene()
     CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.masses,
                               tetMesh.masses.data(),
                               tetMesh.vertexNum * sizeof(double),
+                              cudaMemcpyHostToDevice));
+
+    CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.apply_gravity,
+                              tetMesh.apply_gravity.data(),
+                              tetMesh.vertexNum * sizeof(int),
                               cudaMemcpyHostToDevice));
 
     CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.lengthRate,
@@ -1018,6 +1193,10 @@ void initScene()
                               tetMesh.targetPos.data(),
                               tetMesh.softNum * sizeof(double3),
                               cudaMemcpyHostToDevice));
+
+    d_tetMesh.host_target_indices  = tetMesh.targetIndex;
+    d_tetMesh.host_target_vertices = tetMesh.targetPos;
+
     CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.triDmInverses,
                               tetMesh.tri_DM_inverse.data(),
                               tetMesh.triangleNum * sizeof(__GEIGEN__::Matrix2x2d),
@@ -1149,9 +1328,7 @@ void initScene()
                               cudaMemcpyDeviceToDevice));
 
 
-
-
-    #ifdef USE_QUADRATIC_BENDING
+#ifdef USE_QUADRATIC_BENDING
     // Precompute Q matrices for quadratic bending
     if(tetMesh.tri_edges.size() > 0)
     {
@@ -1221,7 +1398,6 @@ void initScene()
         }
     }
 #endif
-
 
 
     ipc.buildBVH();

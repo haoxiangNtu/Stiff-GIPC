@@ -168,7 +168,7 @@ bool tetrahedra_obj::load_triMesh(const std::string&     filename,
                 masses.push_back(0);
                 __GEIGEN__::__set_Mat_val(constraint, 1, 0, 0, 0, 1, 0, 0, 0, 1);
             }
-
+            apply_gravity.push_back(1);  // apply gravity by default
             constraints.push_back(constraint);
             int boundaryType = mboundaryType;
 
@@ -547,6 +547,7 @@ bool tetrahedra_obj::load_tetrahedraMesh(const std::string&     filename,
                 //isNBC.push_back(false);
                 //d_velocities.push_back(d_velocity);
                 masses.push_back(mass);
+                apply_gravity.push_back(1);
                 //isDelete.push_back(false);
                 //d_positions.push_back(d_pos);
                 //externalForce.push_back(Vector3d(0, 0, 0));

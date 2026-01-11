@@ -47,7 +47,7 @@ class tetrahedra_obj
     vector<double> volum;
     vector<double> area;
     vector<double> masses;
-
+    vector<int>                    apply_gravity;
     double                         meanMass  = 0.0f;
     double                         meanVolum = 0.0f;
     vector<double3>                vertexes;
