@@ -51,7 +51,7 @@ target_compile_definitions(gipc PRIVATE GIPC_OUTPUT_DIR="${CMAKE_CURRENT_SOURCE_
 target_compile_definitions(gipc PRIVATE 
 USE_SNK1 
 ADAPTIVE_KAPPA 
-#USE_FRICTION 
+USE_FRICTION 
 USE_QUADRATIC_BENDING
 )
 
