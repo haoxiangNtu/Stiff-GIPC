@@ -57,6 +57,8 @@ class lbvh
     AABB      scene;
     int*      _btype;
     int*      _bodyId;
+    int*      _collision_skip_matrix = nullptr;  // NxN exclusion matrix (null if none)
+    int       _collision_body_count = 0;        // N dimension of exclusion matrix
 
   public:
     lbvh() {}
@@ -85,7 +87,9 @@ class lbvh_f : public lbvh
                 uint32_t*  _mcpNum,
                 int*       _mMatIndex,
                 const int& faceNum,
-                const int& vertNum);
+                const int& vertNum,
+                int*       collision_skip_matrix = nullptr,
+                int        collision_body_count  = 0);
     double Construct();
     AABB*  getSceneSize();
     double ConstructFullCCD(const double3* moveDir, const double& alpha);
@@ -111,7 +115,9 @@ class lbvh_e : public lbvh
                 uint32_t*  _mcpNum,
                 int*       _mMatIndex,
                 const int& edgeNum,
-                const int& vertNum);
+                const int& vertNum,
+                int*       collision_skip_matrix = nullptr,
+                int        collision_body_count  = 0);
     double Construct();
     double ConstructFullCCD(const double3* moveDir, const double& alpha);
     void   SelfCollitionDetect(double dHat);

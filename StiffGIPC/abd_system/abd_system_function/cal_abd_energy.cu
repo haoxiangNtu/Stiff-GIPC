@@ -1,6 +1,7 @@
 #include <abd_system/abd_system.h>
 #include <muda/cub/device/device_reduce.h>
 #include <abd_system/abd_energy.h>
+#include <abd_system/abd_joint_constraint.h>
 namespace gipc
 {
 Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
@@ -162,4 +163,38 @@ Float ABDSystem::cal_abd_shape_energy(ABDSimData& sim_data)
 
     return m_shape_energy;
 }
+
+Float ABDSystem::cal_abd_joint_energy(ABDSimData& sim_data)
+{
+    using namespace muda;
+    auto& abd       = sim_data.device;
+    auto  num_joints = m_num_joints;
+
+    if(!num_joints)
+        return 0;
+
+    auto kdt2 = parms.joint_stiffness * parms.dt * parms.dt;
+
+    m_joint_energy_per_joint.resize(num_joints);
+
+    ParallelFor()
+        .kernel_name(__FUNCTION__)
+        .apply(num_joints,
+               [energies   = m_joint_energy_per_joint.viewer().name("joint_energies"),
+                joints     = m_joint_data.cviewer().name("joint_data"),
+                qs         = abd.body_id_to_q.cviewer().name("qs"),
+                kdt2] __device__(int j) mutable
+               {
+                   auto& joint     = joints(j);
+                   auto& q_parent  = qs(joint.parent_body_id);
+                   auto& q_child   = qs(joint.child_body_id);
+                   energies(j) = joint_constraint_energy(joint, q_parent, q_child, kdt2);
+               });
+
+    muda::DeviceReduce().Sum(
+        m_joint_energy_per_joint.data(), m_joint_energy.data(), num_joints);
+
+    return m_joint_energy;
+}
+
 }  // namespace gipc

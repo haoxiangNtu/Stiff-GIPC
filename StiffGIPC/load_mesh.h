@@ -20,6 +20,7 @@
 #include <gipc/body_type.h>
 #include <Eigen/Core>
 #include <body_boundary_type.h>
+#include <joint_constraint_host_info.h>
 
 using namespace std;
 
@@ -117,6 +118,14 @@ class tetrahedra_obj
     std::vector<BodyBoundaryType> body_id_to_is_fixed;
     std::vector<int>              point_id_to_body_id;
     std::vector<int>              tet_id_to_body_id;
+
+    // Collision exclusion pairs: pairs of body IDs that should NOT collide.
+    // Typically populated from URDF joint adjacency (parent-child link pairs).
+    std::vector<std::pair<int, int>> collision_exclusion_pairs;
+
+    // Joint constraints between ABD bodies (populated by URDF importer).
+    // World-space anchor positions are stored; material coords computed on GPU after init.
+    std::vector<JointConstraintHostInfo> joint_constraints;
 
     // Per-body motor parameters (indexed by body_id, size = abd_body_num)
     // motor_axis: the rotation axis in the body's local frame (normalized)

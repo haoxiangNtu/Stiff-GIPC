@@ -1,8 +1,11 @@
 #include <abd_system/abd_system.h>
 #include <muda/launch.h>
 #include <muda/ext/eigen/evd.h>
+#include <muda/ext/eigen/atomic.h>
+#include <muda/ext/eigen/inverse.h>
 #include <gipc/utils/cuda_vec_to_eigen.h>
 #include <abd_system/abd_energy.h>
+#include <abd_system/abd_joint_constraint.h>
 #include <gipc/utils/math.h>
 #include <gipc/utils/timer.h>
 #include "cuda_tools/cuda_tools.h"
@@ -146,6 +149,7 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
                                                   muda::CBufferView<double3> vertex_barrier_gradient)
 {
     _cal_abd_body_gradient_and_hessian(sim_data);
+    _cal_abd_joint_gradient_and_hessian(sim_data);
     _cal_abd_system_barrier_gradient(sim_data, vertex_barrier_gradient);
     _setup_abd_system_hessian(sim_data, global_triplets);
 }
@@ -155,6 +159,7 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
                                                   muda::CBufferView<Vector3> vertex_barrier_gradient)
 {
     _cal_abd_body_gradient_and_hessian(sim_data);
+    _cal_abd_joint_gradient_and_hessian(sim_data);
     _cal_abd_system_barrier_gradient(sim_data, vertex_barrier_gradient);
     _setup_abd_system_hessian(sim_data, global_triplets);
 }
@@ -455,9 +460,10 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
     auto body_hessian_size          = abd_body_count;
 
     global_triplets.abd_abd_contact_num = bcooNum;
+    int joint_triplet_blocks = m_num_joints * 16;  // 16 block-3x3 per joint cross-body
     int new_triplet_offset =
         global_triplets.fem_fem_contact_num + global_triplets.abd_fem_contact_num * 4
-        + (global_triplets.abd_abd_contact_num * 16 + abd_body_count * 10);
+        + (global_triplets.abd_abd_contact_num * 16 + abd_body_count * 10 + joint_triplet_blocks);
 
     int h_abd_fem_contact_start_id = global_triplets.fem_fem_contact_num;
     int h_abd_abd_contact_start_id =
@@ -589,7 +595,50 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
     global_triplets.h_abd_abd_contact_start_id = h_abd_abd_contact_start_id;
     global_triplets.abd_abd_contact_num =
-        16 * global_triplets.abd_abd_contact_num + abd_body_count * 10;
+        16 * global_triplets.abd_abd_contact_num + abd_body_count * 10 + joint_triplet_blocks;
+
+    // Write joint cross-body Hessian triplets
+    if(m_num_joints > 0)
+    {
+        int joint_output_start = new_triplet_offset + h_abd_abd_contact_start_id
+                                 + write_offset + 10 * body_hessian_size;
+        if(bcooNum > 0)
+            joint_output_start += 16 * bcooNum;
+
+        ParallelFor(256)
+            .kernel_name("write_joint_cross_hessian")
+            .apply(m_num_joints,
+                   [joints        = m_joint_data.cviewer().name("joint_data"),
+                    cross_hessian = m_joint_cross_hessian.cviewer().name("joint_cross_hessian"),
+                    triplet_out   = global_triplets.block_values(),
+                    row_out       = global_triplets.block_row_indices(),
+                    col_out       = global_triplets.block_col_indices(),
+                    joint_output_start] __device__(int j) mutable
+                   {
+                       auto& joint = joints(j);
+                       int   pid   = joint.parent_body_id;
+                       int   cid   = joint.child_body_id;
+
+                       auto H_pc = cross_hessian(j);
+
+                       unsigned int index_row[4] = {
+                           (unsigned int)(pid * 4),
+                           (unsigned int)(pid * 4 + 1),
+                           (unsigned int)(pid * 4 + 2),
+                           (unsigned int)(pid * 4 + 3)};
+
+                       unsigned int index_col[4] = {
+                           (unsigned int)(cid * 4),
+                           (unsigned int)(cid * 4 + 1),
+                           (unsigned int)(cid * 4 + 2),
+                           (unsigned int)(cid * 4 + 3)};
+
+                       int offset = joint_output_start + j * 16;
+                       write_triplet_cv2<12, 12>(
+                           triplet_out, row_out, col_out,
+                           index_row, index_col, H_pc, offset);
+                   });
+    }
 
 
     global_triplets.global_collision_triplet_offset = new_triplet_offset;
@@ -615,6 +664,181 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
         (new_triplet_offset - global_triplets.fem_fem_contact_num) * sizeof(int),
         cudaMemcpyDeviceToDevice));
 }
+
+// ============================================================================
+// Joint Constraint Gradient & Hessian
+// ============================================================================
+
+void ABDSystem::_cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data)
+{
+    if(m_num_joints == 0)
+        return;
+
+    gipc::Timer timer("_cal_abd_joint_gradient_and_hessian");
+    using namespace muda;
+
+    auto& abd = sim_data.device;
+    auto  kdt2 = parms.joint_stiffness * parms.dt * parms.dt;
+    auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
+
+    m_joint_cross_hessian.resize(m_num_joints);
+
+    ParallelFor(256)
+        .kernel_name(__FUNCTION__)
+        .apply(m_num_joints,
+               [joints          = m_joint_data.cviewer().name("joint_data"),
+                qs              = abd.body_id_to_q.cviewer().name("qs"),
+                affine_gradient = abd_gradient.viewer().name("abd_gradient"),
+                system_gradient = system_gradient.viewer().name("system_gradient"),
+                body_hessian    = abd_body_hessian.viewer().name("abd_body_hessian"),
+                cross_hessian   = m_joint_cross_hessian.viewer().name("joint_cross_hessian"),
+                is_fixed        = body_id_is_fixed.cviewer().name("is_fixed"),
+                kdt2] __device__(int j) mutable
+               {
+                   auto& joint = joints(j);
+                   int   pid   = joint.parent_body_id;
+                   int   cid   = joint.child_body_id;
+
+                   auto& q_parent = qs(pid);
+                   auto& q_child  = qs(cid);
+
+                   bool parent_fixed = (is_fixed(pid) == BodyBoundaryType::Fixed);
+                   bool child_fixed  = (is_fixed(cid) == BodyBoundaryType::Fixed);
+
+                   // Compute gradient
+                   Vector12 grad_parent, grad_child;
+                   joint_constraint_gradient(joint, q_parent, q_child, kdt2,
+                                             grad_parent, grad_child);
+
+                   // Compute Hessian blocks
+                   Matrix12x12 H_pp, H_cc, H_pc;
+                   joint_constraint_hessian(joint, kdt2, H_pp, H_cc, H_pc);
+
+                   // Add gradient to parent body (skip if fixed)
+                   if(!parent_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(pid), grad_parent);
+                       system_gradient.segment<12>(pid * 12).atomic_add(grad_parent);
+                       // Add self-body Hessian
+                       eigen::atomic_add(body_hessian(pid), H_pp);
+                   }
+
+                   // Add gradient to child body (skip if fixed)
+                   if(!child_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(cid), grad_child);
+                       system_gradient.segment<12>(cid * 12).atomic_add(grad_child);
+                       // Add self-body Hessian
+                       eigen::atomic_add(body_hessian(cid), H_cc);
+                   }
+
+                   // Store cross-body Hessian for triplet writing
+                   // If either body is fixed, zero out the cross term
+                   if(parent_fixed || child_fixed)
+                       cross_hessian(j) = Matrix12x12::Zero();
+                   else
+                       cross_hessian(j) = H_pc;
+               });
+}
+
+
+// ============================================================================
+// Joint Constraint Initialization
+// ============================================================================
+
+void ABDSystem::init_joint_constraints(
+    ABDSimData& sim_data,
+    const std::vector<JointConstraintHostInfo>& host_joints)
+{
+    m_num_joints = static_cast<int>(host_joints.size());
+    if(m_num_joints == 0)
+        return;
+
+    auto& abd = sim_data.device;
+
+    // Build host-side GPU data: world-space positions for now
+    std::vector<JointConstraintGPUData> host_gpu_data(m_num_joints);
+    std::vector<Eigen::Vector3d> world_positions;  // all anchor positions flattened
+
+    for(int j = 0; j < m_num_joints; j++)
+    {
+        auto& hj     = host_joints[j];
+        auto& gj     = host_gpu_data[j];
+        gj.parent_body_id = hj.parent_body_id;
+        gj.child_body_id  = hj.child_body_id;
+        gj.num_points     = hj.num_points;
+
+        // Initialize with world positions (will be converted to material coords below)
+        for(int k = 0; k < kMaxJointConstraintPoints; k++)
+        {
+            if(k < hj.num_points)
+            {
+                gj.parent_xbar[k] = Vector3(hj.world_anchor[k].x(),
+                                              hj.world_anchor[k].y(),
+                                              hj.world_anchor[k].z());
+                gj.child_xbar[k]  = gj.parent_xbar[k];  // same world position
+            }
+            else
+            {
+                gj.parent_xbar[k] = Vector3::Zero();
+                gj.child_xbar[k]  = Vector3::Zero();
+            }
+        }
+    }
+
+    // Upload to GPU
+    m_joint_data.resize(m_num_joints);
+    m_joint_data.view().copy_from(host_gpu_data.data());
+
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    // Convert world-space positions to material coordinates using initial q:
+    // x_bar = world_pos - q.segment<3>(0)  (since initial A = I)
+    using namespace muda;
+    ParallelFor(256)
+        .kernel_name("convert_joint_world_to_material")
+        .apply(m_num_joints,
+               [joints = m_joint_data.viewer().name("joint_data"),
+                qs     = abd.body_id_to_q.cviewer().name("qs")] __device__(int j) mutable
+               {
+                   auto& joint = joints(j);
+                   int   pid   = joint.parent_body_id;
+                   int   cid   = joint.child_body_id;
+
+                   // Get initial body centers from q
+                   Vector3 p_parent = qs(pid).segment<3>(0);
+                   Vector3 p_child  = qs(cid).segment<3>(0);
+
+                   // Get initial rotation matrices from q (should be close to identity at init)
+                   // A = [a1 a2 a3]^T, need A^{-1} to get material coords
+                   // But at initialization, A = I, so x_bar = world_pos - p
+                   // For robustness, use actual A:
+                   Matrix3x3 A_parent;
+                   A_parent.row(0) = qs(pid).segment<3>(3).transpose();
+                   A_parent.row(1) = qs(pid).segment<3>(6).transpose();
+                   A_parent.row(2) = qs(pid).segment<3>(9).transpose();
+
+                   Matrix3x3 A_child;
+                   A_child.row(0) = qs(cid).segment<3>(3).transpose();
+                   A_child.row(1) = qs(cid).segment<3>(6).transpose();
+                   A_child.row(2) = qs(cid).segment<3>(9).transpose();
+
+                   Matrix3x3 A_parent_inv = eigen::inverse(A_parent);
+                   Matrix3x3 A_child_inv  = eigen::inverse(A_child);
+
+                   for(int k = 0; k < joint.num_points; k++)
+                   {
+                       Vector3 world_pos = joint.parent_xbar[k];  // stored as world pos initially
+                       joint.parent_xbar[k] = A_parent_inv * (world_pos - p_parent);
+                       joint.child_xbar[k]  = A_child_inv * (world_pos - p_child);
+                   }
+               });
+
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    std::cout << "[ABDSystem] Initialized " << m_num_joints << " joint constraints." << std::endl;
+}
+
 
 void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
 {

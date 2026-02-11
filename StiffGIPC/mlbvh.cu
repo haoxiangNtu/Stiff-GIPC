@@ -41,6 +41,19 @@ __device__ __host__ inline bool overlap(const AABB& lhs, const AABB& rhs, const 
     return true;
 }
 
+// Check if collision between bodyA and bodyB should be skipped
+// according to the collision exclusion matrix.
+__device__ inline bool _is_collision_excluded(int bodyA, int bodyB,
+                                              const int* _collision_skip_matrix,
+                                              int _collision_body_count)
+{
+    if(_collision_skip_matrix == nullptr || _collision_body_count <= 0)
+        return false;
+    if(bodyA < 0 || bodyB < 0 || bodyA >= _collision_body_count || bodyB >= _collision_body_count)
+        return false;
+    return _collision_skip_matrix[bodyA * _collision_body_count + bodyB] != 0;
+}
+
 __device__ __host__ inline double3 centroid(const AABB& box) noexcept
 {
     double3 c;
@@ -1315,7 +1328,9 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                               uint32_t*       _cpNum,
                               int*            MatIndex,
                               double          dHat,
-                              int             number)
+                              int             number,
+                              const int*      _collision_skip_matrix,
+                              int             _collision_body_count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1345,7 +1360,9 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                   && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
+                                             _collision_skip_matrix, _collision_body_count))
                 {
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
@@ -1376,7 +1393,9 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                   && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
+                                             _collision_skip_matrix, _collision_body_count))
                 {
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
@@ -1417,7 +1436,9 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                   int4*           _ccd_collisionPair,
                                   uint32_t*       _cpNum,
                                   double          dHat,
-                                  int             number)
+                                  int             number,
+                                  const int*      _collision_skip_matrix,
+                                  int             _collision_body_count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1452,7 +1473,9 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                   && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
+                                             _collision_skip_matrix, _collision_body_count))
                 {
 
                     if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
@@ -1480,7 +1503,9 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                   && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
+                                             _collision_skip_matrix, _collision_body_count))
                 {
                     if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
                          && _btype[_faces[obj_idx].y] >= 2
@@ -1518,7 +1543,9 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                               uint32_t*      _cpNum,
                               int*           MatIndex,
                               double         dHat,
-                              int            number)
+                              int            number,
+                              const int*     _collision_skip_matrix,
+                              int            _collision_body_count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1549,8 +1576,10 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
+                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
                        || (_bodyID[_edges[self_eid].x] == -1))
+                       && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
+                                                 _collision_skip_matrix, _collision_body_count))
                     {
 
 
@@ -1593,8 +1622,10 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
+                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
                        || (_bodyID[_edges[self_eid].x] == -1))
+                       && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
+                                                 _collision_skip_matrix, _collision_body_count))
                     {
                         if(!(_edges[self_eid].x == _edges[obj_idx].x
                              || _edges[self_eid].x == _edges[obj_idx].y
@@ -1642,7 +1673,9 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                                   int4*          _ccd_collisionPair,
                                   uint32_t*      _cpNum,
                                   double         dHat,
-                                  int            number)
+                                  int            number,
+                                  const int*     _collision_skip_matrix,
+                                  int            _collision_body_count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1675,8 +1708,10 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
+                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
                        || (_bodyID[_edges[self_eid].x] == -1))
+                       && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
+                                                 _collision_skip_matrix, _collision_body_count))
                     {
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
@@ -1708,8 +1743,10 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
+                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
                        || (_bodyID[_edges[self_eid].x] == -1))
+                       && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
+                                                 _collision_skip_matrix, _collision_body_count))
                     {
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
@@ -1876,7 +1913,9 @@ void selfQuery_ee(const int*     _bodyID,
                   uint32_t*      _cpNum,
                   int*           MatIndex,
                   double         dHat,
-                  int            number)
+                  int            number,
+                  const int*     _collision_skip_matrix,
+                  int            _collision_body_count)
 {
     int numbers = number;
     if(numbers < 1)
@@ -1896,7 +1935,9 @@ void selfQuery_ee(const int*     _bodyID,
                                            _cpNum,
                                            MatIndex,
                                            dHat,
-                                           numbers);
+                                           numbers,
+                                           _collision_skip_matrix,
+                                           _collision_body_count);
 }
 
 void fullCCDselfQuery_ee(const int*     _bodyID,
@@ -1910,7 +1951,9 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
                          int4*          _ccd_collisonPairs,
                          uint32_t*      _cpNum,
                          double         dHat,
-                         int            number)
+                         int            number,
+                         const int*     _collision_skip_matrix,
+                         int            _collision_body_count)
 {
     int numbers = number;
     if(numbers < 1)
@@ -1919,7 +1962,8 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
     _selfQuery_ee_ccd<<<blockNum, threadNum>>>(
-        _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers);
+        _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
+        _collision_skip_matrix, _collision_body_count);
 }
 
 void selfQuery_vf(const int*      _bodyID,
@@ -1934,7 +1978,9 @@ void selfQuery_vf(const int*      _bodyID,
                   uint32_t*       _cpNum,
                   int*            MatIndex,
                   double          dHat,
-                  int             number)
+                  int             number,
+                  const int*      _collision_skip_matrix,
+                  int             _collision_body_count)
 {
     int numbers = number;
     if(numbers < 1)
@@ -1954,7 +2000,9 @@ void selfQuery_vf(const int*      _bodyID,
                                            _cpNum,
                                            MatIndex,
                                            dHat,
-                                           numbers);
+                                           numbers,
+                                           _collision_skip_matrix,
+                                           _collision_body_count);
 }
 
 void fullCCDselfQuery_vf(const int*      _bodyID,
@@ -1969,7 +2017,9 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
                          int4*           _ccd_collisonPairs,
                          uint32_t*       _cpNum,
                          double          dHat,
-                         int             number)
+                         int             number,
+                         const int*      _collision_skip_matrix,
+                         int             _collision_body_count)
 {
     int numbers = number;
     if(numbers < 1)
@@ -1978,7 +2028,8 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
     _selfQuery_vf_ccd<<<blockNum, threadNum>>>(
-        _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers);
+        _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
+        _collision_skip_matrix, _collision_body_count);
 }
 
 void lbvh::FREE_DEVICE_MEM()
@@ -2019,7 +2070,9 @@ void lbvh_f::init(int*       _mbodyID,
                   uint32_t*  _mcpNum,
                   int*       _mMatIndex,
                   const int& faceNum,
-                  const int& vertNum)
+                  const int& vertNum,
+                  int*       collision_skip_matrix,
+                  int        collision_body_count)
 {
     _bodyId            = _mbodyID;
     _faces             = _mFaces;
@@ -2032,6 +2085,8 @@ void lbvh_f::init(int*       _mbodyID,
     face_number        = faceNum;
     vert_number        = vertNum;
     _btype             = _mbtype;
+    _collision_skip_matrix = collision_skip_matrix;
+    _collision_body_count  = collision_body_count;
     MALLOC_DEVICE_MEM(face_number);
 }
 
@@ -2045,7 +2100,9 @@ void lbvh_e::init(int*       _mbodyID,
                   uint32_t*  _mcpNum,
                   int*       _mMatIndex,
                   const int& edgeNum,
-                  const int& vertNum)
+                  const int& vertNum,
+                  int*       collision_skip_matrix,
+                  int        collision_body_count)
 {
     _bodyId            = _mbodyID;
     _rest_vertexes     = _mRest_vertexes;
@@ -2058,6 +2115,8 @@ void lbvh_e::init(int*       _mbodyID,
     edge_number        = edgeNum;
     vert_number        = vertNum;
     _btype             = _mbtype;
+    _collision_skip_matrix = collision_skip_matrix;
+    _collision_body_count  = collision_body_count;
     MALLOC_DEVICE_MEM(edge_number);
 }
 
@@ -2192,7 +2251,9 @@ void lbvh_f::SelfCollitionDetect(double dHat)
                  _cpNum,
                  _MatIndex,
                  dHat,
-                 vert_number);
+                 vert_number,
+                 _collision_skip_matrix,
+                 _collision_body_count);
 }
 
 void lbvh_e::SelfCollitionDetect(double dHat)
@@ -2210,21 +2271,25 @@ void lbvh_e::SelfCollitionDetect(double dHat)
                  _cpNum,
                  _MatIndex,
                  dHat,
-                 edge_number);
+                 edge_number,
+                 _collision_skip_matrix,
+                 _collision_body_count);
 }
 
 void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha)
 {
 
     fullCCDselfQuery_vf(
-        _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number);
+        _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
+        _collision_skip_matrix, _collision_body_count);
 }
 
 void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha)
 {
 
     fullCCDselfQuery_ee(
-        _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, edge_number);
+        _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, edge_number,
+        _collision_skip_matrix, _collision_body_count);
 }
 
 

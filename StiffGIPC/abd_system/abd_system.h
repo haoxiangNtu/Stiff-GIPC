@@ -1,5 +1,7 @@
 #pragma once
 #include <abd_system/abd_sim_data.h>
+#include <abd_system/abd_joint_constraint.h>
+#include <joint_constraint_host_info.h>
 #include <muda/buffer/device_var.h>
 #include <muda/ext/linear_system.h>
 #include <abd_system/abd_system_parms.h>
@@ -51,6 +53,13 @@ class ABDSystem
 
     size_t triplet_vertex_hessian_reserve_size = 0;
     size_t abd_system_hessian_reserve_size     = 0;
+
+    // ---- Joint Constraint Data ----
+    int                                       m_num_joints = 0;
+    muda::DeviceBuffer<JointConstraintGPUData> m_joint_data;       // [num_joints]
+    muda::DeviceBuffer<Matrix12x12>            m_joint_cross_hessian; // [num_joints] H_pc
+    muda::DeviceVar<Float>                     m_joint_energy;
+    muda::DeviceBuffer<Float>                  m_joint_energy_per_joint; // [num_joints]
 
   public:
     ABDSystemParms parms;
@@ -210,5 +219,12 @@ class ABDSystem
     // when doing line search, we need calculate abd energy from q
     Float cal_abd_kinetic_energy(ABDSimData& sim_data);
     Float cal_abd_shape_energy(ABDSimData& sim_data);
+    Float cal_abd_joint_energy(ABDSimData& sim_data);
+
+    // Joint constraint setup: upload from host data, compute material coords
+    void init_joint_constraints(ABDSimData& sim_data,
+                                const std::vector<JointConstraintHostInfo>& host_joints);
+
+    void _cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data);
 };
 }  // namespace gipc
