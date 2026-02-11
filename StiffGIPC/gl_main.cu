@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <gipc/statistics.h>
 #include <gipc/utils/simple_scene_importer.h>
+#include <gipc/utils/urdf_scene_importer.h>
 #include <Eigen/Geometry>
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
@@ -1058,6 +1059,144 @@ void set_case6()
     ipc.strainRate    = 1e6;
 }
 
+// ==========================================================================
+// Case 7: URDF import test
+// Loads a simple test robot URDF with 3 cube links as ABD bodies.
+// ==========================================================================
+void set_case7_urdf_test()
+{
+    gipc::UrdfSceneImporter urdf_importer;
+
+    // Path to the test URDF
+    std::string urdf_path = assets_dir + "sim_data/urdf/test_robot/test_robot.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    // Global transform: scale and position the robot
+    Eigen::Matrix4d global_transform = Eigen::Matrix4d::Identity();
+    global_transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 0.4;  // scale
+    global_transform(1, 3) = 1.0;  // lift up
+    urdf_importer.set_global_transform(global_transform);
+
+    // Set root link as Fixed
+    urdf_importer.set_root_fixed(true);
+
+    // Enable revolute joints as Motor type
+    urdf_importer.set_revolute_as_motor(true);
+    urdf_importer.set_default_motor_speed(3.14);    // 0.5 rev/s
+    urdf_importer.set_default_motor_strength(10.0);
+
+    // Map each URDF link to a .msh tetrahedral mesh
+    // All three links use the same cube.msh with different Young's moduli
+    std::string cube_msh = assets_dir + "tetMesh/cube.msh";
+    urdf_importer.set_mesh_override("base_link", {cube_msh, 1e7});
+    urdf_importer.set_mesh_override("link1", {cube_msh, 1e6});
+    urdf_importer.set_mesh_override("link2", {cube_msh, 1e6});
+
+    // Import the scene - all links become ABD bodies
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case7] URDF import failed!" << std::endl;
+        std::abort();
+    }
+
+    // Print loaded info
+    std::cout << "[set_case7] URDF test scene loaded successfully." << std::endl;
+    std::cout << "[set_case7] Links loaded:" << std::endl;
+    for(auto& [name, info] : urdf_importer.link_infos())
+    {
+        if(info.body_id >= 0)
+        {
+            std::cout << "  - " << name << " (body_id=" << info.body_id << ")" << std::endl;
+        }
+    }
+    std::cout << "[set_case7] Joints:" << std::endl;
+    for(auto& [name, info] : urdf_importer.joint_infos())
+    {
+        std::cout << "  - " << name << ": " << info.parent_link_name
+                  << " -> " << info.child_link_name
+                  << " (type=" << static_cast<int>(info.type)
+                  << ", global_axis=[" << info.global_axis.x()
+                  << "," << info.global_axis.y()
+                  << "," << info.global_axis.z() << "])"
+                  << std::endl;
+    }
+}
+
+// ==========================================================================
+// Case 8: XArm6 URDF test
+// Loads the xarm6 robot URDF. Uses cube.msh as placeholder for all links.
+// Demonstrates: fixed joint (world->base), revolute joints (joint1-6).
+// ==========================================================================
+void set_case8_xarm6_test()
+{
+    gipc::UrdfSceneImporter urdf_importer;
+
+    // Path to xarm6 URDF
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm6_robot.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    // Global transform: scale down and lift up
+    Eigen::Matrix4d global_transform = Eigen::Matrix4d::Identity();
+    global_transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 0.3;  // scale
+    global_transform(1, 3) = 1.5;  // lift up
+    urdf_importer.set_global_transform(global_transform);
+
+    // Root link (link_base, after world->link_base fixed joint) should be fixed
+    urdf_importer.set_root_fixed(true);
+    // Default non-root non-revolute links are Free
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+
+    // Enable revolute joints as Motor type
+    urdf_importer.set_revolute_as_motor(true);
+    urdf_importer.set_default_motor_speed(1.57);    // ~0.25 rev/s
+    urdf_importer.set_default_motor_strength(10.0);
+
+    // Default Young's modulus for all links loaded from .obj collision meshes
+    urdf_importer.set_default_young_modulus(1e7);
+
+    // No mesh overrides needed — the importer will auto-detect .obj collision
+    // meshes from the URDF and load them via the fan-tet approach.
+    // To override a specific link with a tet mesh instead:
+    //   urdf_importer.set_mesh_override("link_base", {"path/to/base.msh", 1e8});
+
+    // Import the scene
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case8] XArm6 URDF import failed!" << std::endl;
+        std::abort();
+    }
+
+    // Print summary
+    std::cout << "[set_case8] XArm6 loaded successfully." << std::endl;
+    std::cout << "[set_case8] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case8] Links:" << std::endl;
+    for(auto& [name, info] : urdf_importer.link_infos())
+    {
+        if(info.body_id >= 0)
+        {
+            auto& mi = tetMesh.body_motor_infos[info.body_id];
+            auto  bt = tetMesh.body_id_to_is_fixed[info.body_id];
+            std::cout << "  - " << name << " (body=" << info.body_id
+                      << ", boundary=" << static_cast<int>(bt)
+                      << ", motor_axis=[" << mi.axis_x << "," << mi.axis_y << "," << mi.axis_z << "]"
+                      << ", speed=" << mi.speed << ")" << std::endl;
+        }
+    }
+    std::cout << "[set_case8] Joints:" << std::endl;
+    for(auto& [name, info] : urdf_importer.joint_infos())
+    {
+        std::cout << "  - " << name << ": " << info.parent_link_name
+                  << " -> " << info.child_link_name
+                  << " (type=" << static_cast<int>(info.type)
+                  << ", global_axis=[" << info.global_axis.x()
+                  << "," << info.global_axis.y()
+                  << "," << info.global_axis.z() << "])"
+                  << std::endl;
+    }
+}
+
 void setMAS_partition()
 {
     tetMesh.partId_map_real.resize(tetMesh.part_offset * BANKSIZE, -1);
@@ -1092,7 +1231,7 @@ void initScene()
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
     ipc.pcg_data.P_type = 1;
 
-    int scene_no = 4;
+    int scene_no = 7;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1115,6 +1254,12 @@ void initScene()
             break;
         case 5:  //box pipe large scale and cloth
             set_case6();
+            break;
+        case 6:  //URDF import test
+            set_case7_urdf_test();
+            break;
+        case 7:  //XArm6 URDF test
+            set_case8_xarm6_test();
             break;
     }
 
@@ -1233,6 +1378,26 @@ void initScene()
                               tetMesh.tet_id_to_body_id.data(),
                               tetMesh.tet_id_to_body_id.size() * sizeof(int),
                               cudaMemcpyHostToDevice));
+
+    // Upload per-body motor parameters
+    if(!tetMesh.body_motor_infos.empty())
+    {
+        int bodyNum = static_cast<int>(tetMesh.body_motor_infos.size());
+        std::vector<double> motor_params(bodyNum * 5, 0.0);
+        for(int i = 0; i < bodyNum; i++)
+        {
+            auto& mi             = tetMesh.body_motor_infos[i];
+            motor_params[i * 5 + 0] = mi.axis_x;
+            motor_params[i * 5 + 1] = mi.axis_y;
+            motor_params[i * 5 + 2] = mi.axis_z;
+            motor_params[i * 5 + 3] = mi.speed;
+            motor_params[i * 5 + 4] = mi.strength;
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.body_motor_params,
+                                  motor_params.data(),
+                                  bodyNum * 5 * sizeof(double),
+                                  cudaMemcpyHostToDevice));
+    }
 
 
     printf("stretchStiff:  %f,  shearStiff:   %f\n", ipc.stretchStiff, ipc.shearStiff);

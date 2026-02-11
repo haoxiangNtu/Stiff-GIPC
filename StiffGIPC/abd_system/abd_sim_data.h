@@ -162,6 +162,10 @@ class ABDSimData
     muda::CBufferView<TetLocalInfo>     tet_info() const;
     muda::CBufferView<I32>              tet_id_to_body_id() const;
     muda::CBufferView<BodyBoundaryType> body_id_to_boundary_type() const;
+    
+    // Per-body motor params: raw double* with 5 doubles per body
+    // [axis_x, axis_y, axis_z, speed, strength]
+    const double* body_motor_params() const;
 
   private:
     muda::DeviceBuffer<I32>          m_point_id_to_unique_point_id;
