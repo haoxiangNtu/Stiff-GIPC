@@ -1133,7 +1133,8 @@ void set_case8_xarm6_test()
     gipc::UrdfSceneImporter urdf_importer;
 
     // Path to xarm6 URDF
-    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm6_robot.urdf";
+    //std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm6_robot.urdf";
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm7_with_gripper.urdf";
     urdf_importer.set_urdf_path(urdf_path);
 
     // Global transform: scale down and lift up
@@ -1197,6 +1198,70 @@ void set_case8_xarm6_test()
     }
 }
 
+// ==========================================================================
+// Case 9: XArm7 with Gripper URDF test
+// Loads the xarm7_with_gripper.urdf (7-DOF arm + parallel gripper).
+// Demonstrates: .stl collision mesh loading, empty link pass-through.
+// ==========================================================================
+void set_case9_xarm7_gripper_test()
+{
+    gipc::UrdfSceneImporter urdf_importer;
+
+    // Path to xarm7 with gripper URDF
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm7_with_gripper.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    // Global transform: scale down and lift up
+    Eigen::Matrix4d global_transform = Eigen::Matrix4d::Identity();
+    global_transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 0.3;  // scale
+    global_transform(1, 3) = 1.5;  // lift up
+    urdf_importer.set_global_transform(global_transform);
+
+    // Root link (link_base) should be fixed in world
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+
+    // No motor for now — just test joint constraints under gravity
+    urdf_importer.set_revolute_as_motor(false);
+
+    // Default Young's modulus for all links
+    urdf_importer.set_default_young_modulus(1e7);
+
+    // Import the scene
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case9] XArm7+Gripper URDF import failed!" << std::endl;
+        std::abort();
+    }
+
+    // Print summary
+    std::cout << "[set_case9] XArm7+Gripper loaded successfully." << std::endl;
+    std::cout << "[set_case9] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case9] Links:" << std::endl;
+    for(auto& [name, info] : urdf_importer.link_infos())
+    {
+        if(info.body_id >= 0)
+        {
+            auto  bt = tetMesh.body_id_to_is_fixed[info.body_id];
+            std::cout << "  - " << name << " (body=" << info.body_id
+                      << ", boundary=" << static_cast<int>(bt) << ")" << std::endl;
+        }
+        else
+        {
+            std::cout << "  - " << name << " (no geometry, skipped)" << std::endl;
+        }
+    }
+    std::cout << "[set_case9] Joints:" << std::endl;
+    for(auto& [name, info] : urdf_importer.joint_infos())
+    {
+        std::cout << "  - " << name << ": " << info.parent_link_name
+                  << " -> " << info.child_link_name
+                  << " (type=" << static_cast<int>(info.type) << ")" << std::endl;
+    }
+    std::cout << "[set_case9] Joint constraints: " << tetMesh.joint_constraints.size() << std::endl;
+}
+
 void setMAS_partition()
 {
     tetMesh.partId_map_real.resize(tetMesh.part_offset * BANKSIZE, -1);
@@ -1231,7 +1296,7 @@ void initScene()
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
     ipc.pcg_data.P_type = 1;
 
-    int scene_no = 7;
+    int scene_no = 8;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1260,6 +1325,9 @@ void initScene()
             break;
         case 7:  //XArm6 URDF test
             set_case8_xarm6_test();
+            break;
+        case 8:  //XArm7 + Gripper URDF test
+            set_case9_xarm7_gripper_test();
             break;
     }
 

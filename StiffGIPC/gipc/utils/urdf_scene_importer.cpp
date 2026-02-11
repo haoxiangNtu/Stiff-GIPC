@@ -128,7 +128,7 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
             std::string ext = coll_path.extension().string();
             // lowercase the extension
             for(auto& c : ext) c = static_cast<char>(std::tolower(c));
-            if(ext == ".obj" && fs::exists(coll_path))
+            if((ext == ".obj" || ext == ".stl") && fs::exists(coll_path))
             {
                 has_obj_collision  = true;
                 obj_collision_path = link_info.collision_mesh_filename;
@@ -138,7 +138,7 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
         if(!has_override && !has_obj_collision)
         {
             std::cout << "[UrdfSceneImporter] Skipping link '" << link_name
-                      << "' (no mesh override and no loadable .obj collision mesh)" << std::endl;
+                      << "' (no mesh override and no loadable .obj/.stl collision mesh)" << std::endl;
             continue;
         }
 
@@ -289,13 +289,90 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
     // ---- Generate joint constraints ----
     // For each joint, create constraint points at the joint location in world space.
     // The ABD solver will convert these to material coordinates after init.
+
+    // Helper: resolve a link to its nearest ancestor/descendant with a body_id.
+    // For empty links (no geometry, body_id == -1) like "link_eef", we walk up
+    // the parent chain to find the nearest link that actually has geometry.
+    auto resolve_body_id = [&](const std::string& link_name) -> int
+    {
+        // First check if this link itself has a body_id
+        auto it = m_link_infos.find(link_name);
+        if(it != m_link_infos.end() && it->second.body_id >= 0)
+            return it->second.body_id;
+
+        // Walk up the parent chain via joints
+        std::string current = link_name;
+        for(int depth = 0; depth < 20; depth++)  // safety limit
+        {
+            // Find the joint whose child is 'current'
+            bool found = false;
+            for(auto& [jn, ji] : m_joint_infos)
+            {
+                if(ji.child_link_name == current)
+                {
+                    auto pit = m_link_infos.find(ji.parent_link_name);
+                    if(pit != m_link_infos.end() && pit->second.body_id >= 0)
+                        return pit->second.body_id;
+                    current = ji.parent_link_name;
+                    found = true;
+                    break;
+                }
+            }
+            if(!found) break;
+        }
+        return -1;  // not found
+    };
+
+    auto resolve_body_id_child = [&](const std::string& link_name) -> int
+    {
+        // First check if this link itself has a body_id
+        auto it = m_link_infos.find(link_name);
+        if(it != m_link_infos.end() && it->second.body_id >= 0)
+            return it->second.body_id;
+
+        // Walk down the child chain via joints
+        std::string current = link_name;
+        for(int depth = 0; depth < 20; depth++)
+        {
+            bool found = false;
+            for(auto& [jn, ji] : m_joint_infos)
+            {
+                if(ji.parent_link_name == current)
+                {
+                    auto cit = m_link_infos.find(ji.child_link_name);
+                    if(cit != m_link_infos.end() && cit->second.body_id >= 0)
+                        return cit->second.body_id;
+                    current = ji.child_link_name;
+                    found = true;
+                    break;
+                }
+            }
+            if(!found) break;
+        }
+        return -1;
+    };
+
     for(auto& [jname, jinfo] : m_joint_infos)
     {
         auto parent_it = m_link_infos.find(jinfo.parent_link_name);
         auto child_it  = m_link_infos.find(jinfo.child_link_name);
         if(parent_it == m_link_infos.end() || child_it == m_link_infos.end())
             continue;
-        if(parent_it->second.body_id < 0 || child_it->second.body_id < 0)
+
+        // Resolve body IDs — walk through empty links if needed
+        int parent_body = resolve_body_id(jinfo.parent_link_name);
+        int child_body  = resolve_body_id_child(jinfo.child_link_name);
+
+        if(parent_body < 0 || child_body < 0)
+        {
+            std::cout << "[UrdfSceneImporter] Skipping joint '" << jname
+                      << "' (unresolved body: parent=" << parent_body
+                      << " child=" << child_body << ")" << std::endl;
+            continue;
+        }
+
+        // Skip if both resolve to the same body (e.g. chain of empty links)
+        if(parent_body == child_body)
             continue;
 
         // Joint world position = parent_global * joint_local_trans
@@ -303,8 +380,8 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
         Eigen::Vector3d joint_pos   = joint_world.block<3, 1>(0, 3);
 
         JointConstraintHostInfo jc;
-        jc.parent_body_id = parent_it->second.body_id;
-        jc.child_body_id  = child_it->second.body_id;
+        jc.parent_body_id = parent_body;
+        jc.child_body_id  = child_body;
 
         if(jinfo.type == UrdfJointInfo::Type::Fixed)
         {

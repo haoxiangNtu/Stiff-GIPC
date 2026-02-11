@@ -18,7 +18,7 @@
 #include "gpu_eigen_libs.cuh"
 #include "cstring"
 #include "Eigen/Eigen"
-#include <gipc/utils/obj_mesh_loader.h>
+#include <gipc/utils/stl_mesh_loader.h>
 using namespace std;
 
 class Triangle
@@ -800,7 +800,7 @@ bool tetrahedra_obj::load_surfaceMesh_ABD(const std::string&     obj_filename,
                                           BodyBoundaryType       boundary_type)
 {
     gipc::ObjMeshData obj_data;
-    if(!gipc::load_obj_mesh(obj_filename, obj_data))
+    if(!gipc::load_surface_mesh(obj_filename, obj_data))
     {
         std::cerr << "[load_surfaceMesh_ABD] Failed to load: " << obj_filename << std::endl;
         return false;
@@ -909,6 +909,16 @@ bool tetrahedra_obj::load_surfaceMesh_ABD(const std::string&     obj_filename,
     // using the convex_components data that was built by the obj loader.
     // Global face → component assignment
     std::vector<int> global_face_to_component(obj_data.faces.size(), 0);
+
+    // If no convex components were found (e.g. STL files, or OBJ without 'o'/'g' groups),
+    // treat the entire mesh as a single component.
+    if(obj_data.convex_components.empty())
+    {
+        gipc::ObjConvexComponent single_comp;
+        single_comp.vertices = obj_data.vertices;
+        single_comp.faces    = obj_data.faces;
+        obj_data.convex_components.push_back(std::move(single_comp));
+    }
 
     if(obj_data.convex_components.size() > 1)
     {
