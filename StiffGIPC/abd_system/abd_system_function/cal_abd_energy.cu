@@ -21,7 +21,8 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
                 q_prev   = abd.body_id_to_q_prev.viewer().name("q_prev"),
                 q_tildes = abd.body_id_to_q_tilde.viewer().name("q_tildes"),
                 Ms       = abd.body_id_to_abd_mass.viewer().name("Ms"),
-                boundary_type  = boundry_type.cviewer().name("btype"),
+                boundary_type    = boundry_type.cviewer().name("btype"),
+                body_motor_data  = sim_data.body_motor_params(),
                 dt             = parms.dt,
                 motor_speed    = parms.motor_speed,
                 motor_strength = parms.motor_strength] __device__(int i) mutable
@@ -51,6 +52,26 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
                                K           = 0.5 * dq.dot(M * dq);
                            }
 
+                           // Read per-body motor params: [axis_x, axis_y, axis_z, speed, strength]
+                           Vector3 rot_axis = Vector3::UnitX();
+                           double  body_speed    = motor_speed;
+                           double  body_strength = motor_strength;
+                           if(body_motor_data)
+                           {
+                               double ax = body_motor_data[i * 5 + 0];
+                               double ay = body_motor_data[i * 5 + 1];
+                               double az = body_motor_data[i * 5 + 2];
+                               double sp = body_motor_data[i * 5 + 3];
+                               double st = body_motor_data[i * 5 + 4];
+                               double len = sqrt(ax * ax + ay * ay + az * az);
+                               if(len > 1e-10)
+                                   rot_axis = Vector3{ax, ay, az} / len;
+                               if(sp > 0.0)
+                                   body_speed = sp;
+                               if(st > 0.0)
+                                   body_strength = st;
+                           }
+
                            Vector3 bar_x0 = Vector3::Zero();
                            Vector3 bar_x1 = Vector3::UnitX();
                            Vector3 bar_x2 = Vector3::UnitY();
@@ -69,16 +90,16 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
 
                            Matrix12x12 inv_J = eigen::inverse(J);
 
-                           auto theta_per_sec = motor_speed;
-                           auto theta         = theta_per_sec * dt;
-                           // rotate x2 and x3 around (x0, x1) by theta
-                           auto R = Eigen::AngleAxisd(theta, Vector3::UnitX());
+                           auto theta = body_speed * dt;
+                           // rotate around per-body axis
+                           auto R = Eigen::AngleAxisd(theta, rot_axis);
 
+                           Vector3 x1_P = R * bar_x1;
                            Vector3 x2_P = R * bar_x2;
                            Vector3 x3_P = R * bar_x3;
 
                            auto mat0_delta = ABDJacobi{Vector3::Zero()}.to_mat();
-                           auto mat1_delta = ABDJacobi{Vector3::Zero()}.to_mat();
+                           auto mat1_delta = ABDJacobi{x1_P - bar_x1}.to_mat();
                            auto mat2_delta = ABDJacobi{x2_P - bar_x2}.to_mat();
                            auto mat3_delta = ABDJacobi{x3_P - bar_x3}.to_mat();
 
@@ -90,15 +111,15 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
 
                            //Vector12 q_p = inv_J * J_delta * q_prev(i) + q_prev(i);
                            Vector12 q_p = inv_J * J_delta * q_tilde + q_tilde;
+                           q_p.segment<3>(3).normalize();
                            q_p.segment<3>(6).normalize();
                            q_p.segment<3>(9).normalize();
                            Vector12 dq      = q - q_p;
                            dq.segment<3>(0) = Vector3::Zero();
-                           dq.segment<3>(3) = Vector3::Zero();
 
                            Matrix12x12 PowMass = Matrix12x12::Zero();
-                           PowMass.block<6, 6>(6, 6) = //1000 * Matrix6x6::Identity();
-                           motor_strength * Ms(i).to_mat().block<6, 6>(6, 6);
+                           PowMass.block<9, 9>(3, 3) =
+                           body_strength * Ms(i).to_mat().block<9, 9>(3, 3);
 
                            K += 0.5 * dq.dot(PowMass * dq);
                        }

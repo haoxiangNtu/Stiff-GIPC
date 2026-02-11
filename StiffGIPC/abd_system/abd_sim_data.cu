@@ -63,6 +63,11 @@ muda::CBufferView<BodyBoundaryType> ABDSimData::body_id_to_boundary_type() const
         .subview(offset, num);
 }
 
+const double* ABDSimData::body_motor_params() const
+{
+    return m_tet.body_motor_params;
+}
+
 void ABDSimData::upload()
 {
     std::vector<TetLocalInfo> tet_info(m_gipc.tetrahedraNum);

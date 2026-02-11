@@ -118,6 +118,18 @@ class tetrahedra_obj
     std::vector<int>              point_id_to_body_id;
     std::vector<int>              tet_id_to_body_id;
 
+    // Per-body motor parameters (indexed by body_id, size = abd_body_num)
+    // motor_axis: the rotation axis in the body's local frame (normalized)
+    // motor_speed: angular velocity in rad/s (0 means use global default)
+    // motor_strength: penalty strength (0 means use global default)
+    struct BodyMotorInfo
+    {
+        double axis_x = 1.0, axis_y = 0.0, axis_z = 0.0;  // default UnitX
+        double speed    = 0.0;  // 0 = use global default
+        double strength = 0.0;  // 0 = use global default
+    };
+    std::vector<BodyMotorInfo> body_motor_infos;
+
     tetrahedra_obj();
     int getVertNeighbors();
     //void InitMesh(int type, double scale);
@@ -145,6 +157,15 @@ class tetrahedra_obj
 
     bool load_triMesh(const std::string& filename, double scale, double3 transform, int boundaryType);
     bool load_triMesh(const std::string& filename, const Eigen::Matrix4d& transform, int boundaryType);
+
+    /// Load a surface mesh (.obj) as an ABD body.
+    /// Uses the "fan-tet" approach: creates virtual tetrahedra from each triangle
+    /// to the mesh centroid, enabling the existing ABD pipeline to work unchanged.
+    /// Works correctly for convex meshes (e.g., VHACD collision geometry).
+    bool load_surfaceMesh_ABD(const std::string&     obj_filename,
+                              const Eigen::Matrix4d& transform,
+                              double                 youngth_module   = 1e7,
+                              BodyBoundaryType       boundary_type    = BodyBoundaryType::Free);
 
 
     bool load_animation(const std::string& filename, double scale, double3 transform);

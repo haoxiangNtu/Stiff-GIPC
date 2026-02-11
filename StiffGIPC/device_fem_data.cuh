@@ -56,6 +56,11 @@ class device_TetraData
     int*              point_id_to_body_id      = nullptr;
     int*              tet_id_to_body_id        = nullptr;
 
+    // Per-body motor parameters: [axis_x, axis_y, axis_z, speed, strength, 0]
+    // Packed as double6 (reusing __GEIGEN__::Matrix3x3d storage is tricky, so use raw double*)
+    // Layout: body_id * 5 + [0..4] = {axis_x, axis_y, axis_z, speed, strength}
+    double* body_motor_params = nullptr;
+
     int                   m_soft_num   = 0;
     int                   m_vertex_num = 0;
     std::vector<uint32_t> host_target_indices;
