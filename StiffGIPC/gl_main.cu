@@ -1147,10 +1147,10 @@ void set_case8_xarm6_test()
     // Default non-root non-revolute links are Free
     urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
 
-    // Enable revolute joints as Motor type
-    urdf_importer.set_revolute_as_motor(true);
-    urdf_importer.set_default_motor_speed(1.57);    // ~0.25 rev/s
-    urdf_importer.set_default_motor_strength(10.0);
+    // Disable motor for now — just test joint constraints under gravity
+    urdf_importer.set_revolute_as_motor(false);
+    //urdf_importer.set_default_motor_speed(1.57);    // ~0.25 rev/s
+    //urdf_importer.set_default_motor_strength(10.0);
 
     // Default Young's modulus for all links loaded from .obj collision meshes
     urdf_importer.set_default_young_modulus(1e7);
@@ -1399,6 +1399,27 @@ void initScene()
                                   cudaMemcpyHostToDevice));
     }
 
+    // Build and upload collision exclusion matrix from host pairs
+    if(!tetMesh.collision_exclusion_pairs.empty() && d_tetMesh.collision_body_num > 0)
+    {
+        int N = d_tetMesh.collision_body_num;
+        std::vector<int> host_matrix(N * N, 0);
+        for(auto& [a, b] : tetMesh.collision_exclusion_pairs)
+        {
+            if(a >= 0 && a < N && b >= 0 && b < N)
+            {
+                host_matrix[a * N + b] = 1;
+                host_matrix[b * N + a] = 1;  // symmetric
+            }
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.collision_skip_matrix,
+                                  host_matrix.data(),
+                                  N * N * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        printf("[CollisionExclusion] Uploaded %dx%d exclusion matrix (%d pairs)\n",
+               N, N, (int)tetMesh.collision_exclusion_pairs.size());
+    }
+
 
     printf("stretchStiff:  %f,  shearStiff:   %f\n", ipc.stretchStiff, ipc.shearStiff);
 
@@ -1424,6 +1445,7 @@ void initScene()
     ipc.targetInd          = d_tetMesh.targetIndex;
     ipc.softNum            = tetMesh.softNum;
     ipc.abd_fem_count_info = tetMesh.abd_fem_count_info;
+    ipc.num_joint_constraints = static_cast<int>(tetMesh.joint_constraints.size());
 
     std::cout << "ABD FEM count info: \n"
               << ipc.abd_fem_count_info << std::endl;
@@ -1449,7 +1471,8 @@ void initScene()
                               tetMesh.surfVerts.data(),
                               ipc.surf_vertexNum * sizeof(uint32_t),
                               cudaMemcpyHostToDevice));
-    ipc.initBVH(d_tetMesh.BoundaryType, d_tetMesh.point_id_to_body_id);
+    ipc.initBVH(d_tetMesh.BoundaryType, d_tetMesh.point_id_to_body_id,
+                d_tetMesh.collision_skip_matrix, d_tetMesh.collision_body_num);
 
     if(ipc.pcg_data.P_type && true)
     {
@@ -1567,6 +1590,12 @@ void initScene()
 
     ipc.buildBVH();
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer);
+
+    // Initialize joint constraints after ABD system is ready
+    if(!tetMesh.joint_constraints.empty())
+    {
+        ipc.init_joint_constraints_from_mesh(tetMesh);
+    }
 
     printf("bboxDiagSize2: %f\n", ipc.bboxDiagSize2);
     printf("maxConer: %f  %f   %f           minCorner: %f  %f   %f\n",

@@ -1,4 +1,5 @@
 {
   "motor_speed": -0.02,
-  "motor_strength" :  200
+  "motor_strength" :  200,
+  "joint_stiffness" : 1e8
 }

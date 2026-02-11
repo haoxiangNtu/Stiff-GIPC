@@ -71,6 +71,14 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
     // Per-body motor params: 5 doubles per body [axis_x, axis_y, axis_z, speed, strength]
     CUDA_SAFE_CALL(cudaMalloc((void**)&body_motor_params, bodyNum * 5 * sizeof(double)));
     CUDA_SAFE_CALL(cudaMemset(body_motor_params, 0, bodyNum * 5 * sizeof(double)));
+
+    // Collision exclusion matrix: NxN flat array (default = all zeros = no exclusions)
+    collision_body_num = bodyNum;
+    if(bodyNum > 0)
+    {
+        CUDA_SAFE_CALL(cudaMalloc((void**)&collision_skip_matrix, bodyNum * bodyNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(collision_skip_matrix, 0, bodyNum * bodyNum * sizeof(int)));
+    }
 }
 
 device_TetraData::~device_TetraData()
@@ -117,6 +125,7 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(point_id_to_body_id));
     CUDA_SAFE_CALL(cudaFree(tet_id_to_body_id));
     CUDA_SAFE_CALL(cudaFree(body_motor_params));
+    CUDA_SAFE_CALL(cudaFree(collision_skip_matrix));
 
 }
 

@@ -2,6 +2,7 @@
 #include <gipc/gipc.h>
 #include <gipc/utils/timer.h>
 #include <gipc/utils/json.h>
+#include <load_mesh.h>
 #include <fstream>
 
 void GIPC::build_gipc_system(device_TetraData& tet)
@@ -25,6 +26,8 @@ void GIPC::build_gipc_system(device_TetraData& tet)
 
     m_abd_system->parms.motor_speed = json["motor_speed"].get<double>();
     m_abd_system->parms.motor_strength = json["motor_strength"].get<double>();
+    if(json.contains("joint_stiffness"))
+        m_abd_system->parms.joint_stiffness = json["joint_stiffness"].get<double>();
 
     std::cout << "- create Global Linear System ..." << std::endl;
 
@@ -37,6 +40,16 @@ void GIPC::init_abd_system()
 {
     m_abd_sim_data->upload();
     m_abd_system->init_system(*m_abd_sim_data);
+}
+
+void GIPC::init_joint_constraints_from_mesh(tetrahedra_obj& tetMesh)
+{
+    if(tetMesh.joint_constraints.empty())
+    {
+        std::cout << "[GIPC] No joint constraints to initialize." << std::endl;
+        return;
+    }
+    m_abd_system->init_joint_constraints(*m_abd_sim_data, tetMesh.joint_constraints);
 }
 
 void GIPC::create_LinearSystem(device_TetraData& tet)

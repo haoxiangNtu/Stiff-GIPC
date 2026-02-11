@@ -136,6 +136,7 @@ class GIPC
     double pcg_threshold           = 0.0;
 
     gipc::ABDFEMCountInfo abd_fem_count_info{};
+    int                   num_joint_constraints = 0;  // set from tetMesh
 
   public:
     GIPC();
@@ -149,7 +150,7 @@ class GIPC
     void tempFree_closeConstraint();
 
     void FREE_DEVICE_MEM();
-    void initBVH(int* _btype, int* _bodyId);
+    void initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix = nullptr, int _collision_body_count = 0);
     void init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer);
 
     void buildCP();
@@ -233,6 +234,8 @@ class GIPC
 
   public:
     void                                      init_abd_system();
+    // Note: defined in gipc.cu which has load_mesh.h included
+    void                                      init_joint_constraints_from_mesh(class tetrahedra_obj& tetMesh);
     std::unique_ptr<gipc::ABDSimData>         m_abd_sim_data;
     std::unique_ptr<gipc::ABDSystem>          m_abd_system;
     std::unique_ptr<gipc::GlobalLinearSystem> m_global_linear_system;

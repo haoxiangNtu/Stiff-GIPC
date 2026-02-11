@@ -61,6 +61,12 @@ class device_TetraData
     // Layout: body_id * 5 + [0..4] = {axis_x, axis_y, axis_z, speed, strength}
     double* body_motor_params = nullptr;
 
+    // Collision exclusion matrix: flat NxN int array (N = collision_body_num).
+    // collision_skip_matrix[i * collision_body_num + j] = 1 means skip collision between body i and j.
+    // Symmetric: matrix[i*N+j] == matrix[j*N+i].
+    int*    collision_skip_matrix = nullptr;
+    int     collision_body_num    = 0;
+
     int                   m_soft_num   = 0;
     int                   m_vertex_num = 0;
     std::vector<uint32_t> host_target_indices;

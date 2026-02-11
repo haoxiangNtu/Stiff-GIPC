@@ -12,5 +12,6 @@ class ABDSystemParms
     Float    kappa        = 1e8;
     Float    motor_speed  = 31.4;  // rad/s
     Float    motor_strength = 10; // how strong the motor is, related to the body mass
+    Float    joint_stiffness = 1e8; // penalty stiffness for joint constraints
 };
 }  // namespace gipc

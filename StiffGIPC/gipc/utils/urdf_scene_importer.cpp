@@ -266,8 +266,90 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
         loaded_count++;
     }
 
+    // ---- Disable ALL self-collision among robot links ----
+    // Like rbs-uipc: robot_elem vs robot_elem = no collision.
+    // Collect all body IDs that belong to this robot, then exclude all pairs.
+    std::vector<int> robot_body_ids;
+    for(auto& [link_name, link_info] : m_link_infos)
+    {
+        if(link_info.body_id >= 0)
+            robot_body_ids.push_back(link_info.body_id);
+    }
+    for(size_t i = 0; i < robot_body_ids.size(); i++)
+    {
+        for(size_t j = i + 1; j < robot_body_ids.size(); j++)
+        {
+            tetras.collision_exclusion_pairs.emplace_back(robot_body_ids[i], robot_body_ids[j]);
+        }
+    }
+    std::cout << "[UrdfSceneImporter] Robot self-collision disabled for "
+              << robot_body_ids.size() << " bodies ("
+              << tetras.collision_exclusion_pairs.size() << " exclusion pairs)" << std::endl;
+
+    // ---- Generate joint constraints ----
+    // For each joint, create constraint points at the joint location in world space.
+    // The ABD solver will convert these to material coordinates after init.
+    for(auto& [jname, jinfo] : m_joint_infos)
+    {
+        auto parent_it = m_link_infos.find(jinfo.parent_link_name);
+        auto child_it  = m_link_infos.find(jinfo.child_link_name);
+        if(parent_it == m_link_infos.end() || child_it == m_link_infos.end())
+            continue;
+        if(parent_it->second.body_id < 0 || child_it->second.body_id < 0)
+            continue;
+
+        // Joint world position = parent_global * joint_local_trans
+        Eigen::Matrix4d joint_world = parent_it->second.global_transform * jinfo.local_trans;
+        Eigen::Vector3d joint_pos   = joint_world.block<3, 1>(0, 3);
+
+        JointConstraintHostInfo jc;
+        jc.parent_body_id = parent_it->second.body_id;
+        jc.child_body_id  = child_it->second.body_id;
+
+        if(jinfo.type == UrdfJointInfo::Type::Fixed)
+        {
+            // Fixed joint: 4 non-coplanar constraint points (tetrahedron around joint)
+            jc.type       = JointConstraintHostInfo::Type::Fixed;
+            jc.num_points = 4;
+            double spread = 0.05;  // 5cm spread for constraint points
+            jc.world_anchor[0] = joint_pos;
+            jc.world_anchor[1] = joint_pos + Eigen::Vector3d(spread, 0, 0);
+            jc.world_anchor[2] = joint_pos + Eigen::Vector3d(0, spread, 0);
+            jc.world_anchor[3] = joint_pos + Eigen::Vector3d(0, 0, spread);
+        }
+        else if(jinfo.type == UrdfJointInfo::Type::Revolute
+                || jinfo.type == UrdfJointInfo::Type::Continuous)
+        {
+            // Revolute joint: 2 constraint points on the rotation axis
+            // These constrain the axis position but allow rotation around it
+            jc.type       = JointConstraintHostInfo::Type::Revolute;
+            jc.num_points = 2;
+            double spread = 0.05;  // 5cm offset along axis from joint center
+            Eigen::Vector3d world_axis = jinfo.global_axis.normalized();
+            jc.world_anchor[0] = joint_pos + spread * world_axis;
+            jc.world_anchor[1] = joint_pos - spread * world_axis;
+        }
+        else
+        {
+            // Unsupported joint type, skip
+            continue;
+        }
+
+        tetras.joint_constraints.push_back(jc);
+
+        std::cout << "[UrdfSceneImporter] Joint constraint '" << jname
+                  << "' (" << (jc.type == JointConstraintHostInfo::Type::Fixed ? "Fixed" : "Revolute")
+                  << "): body " << jc.parent_body_id << " <-> " << jc.child_body_id
+                  << " at (" << joint_pos.x() << ", " << joint_pos.y() << ", "
+                  << joint_pos.z() << ")" << std::endl;
+    }
+
+    std::cout << "[UrdfSceneImporter] Generated " << tetras.joint_constraints.size()
+              << " joint constraints." << std::endl;
+
     std::cout << "[UrdfSceneImporter] Successfully loaded " << loaded_count
-              << " ABD bodies from URDF." << std::endl;
+              << " ABD bodies from URDF (" << tetras.collision_exclusion_pairs.size()
+              << " collision exclusion pairs)." << std::endl;
 
     return loaded_count > 0;
 }

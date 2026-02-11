@@ -8245,7 +8245,21 @@ __global__ void _updateSurfVerts(uint32_t* sortIndex, uint32_t* _sVerts, int _of
     }
 }
 
-__global__ void _edgeTriIntersectionQuery(const int*     _btype,
+// Check if collision between bodyA and bodyB should be skipped
+// according to the collision exclusion matrix.
+__device__ inline bool _is_collision_excluded_gipc(int bodyA, int bodyB,
+                                                   const int* _collision_skip_matrix,
+                                                   int _collision_body_count)
+{
+    if(_collision_skip_matrix == nullptr || _collision_body_count <= 0)
+        return false;
+    if(bodyA < 0 || bodyB < 0 || bodyA >= _collision_body_count || bodyB >= _collision_body_count)
+        return false;
+    return _collision_skip_matrix[bodyA * _collision_body_count + bodyB] != 0;
+}
+
+__global__ void _edgeTriIntersectionQuery(const int*     _bodyId,
+                                          const int*     _btype,
                                           const double3* _vertexes,
                                           const uint2*   _edges,
                                           const uint3*   _faces,
@@ -8253,7 +8267,9 @@ __global__ void _edgeTriIntersectionQuery(const int*     _btype,
                                           const Node*    _edge_nodes,
                                           int*           _isIntesect,
                                           double         dHat,
-                                          int            number)
+                                          int            number,
+                                          const int*     _collision_skip_matrix,
+                                          int            _collision_body_count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -8297,7 +8313,19 @@ __global__ void _edgeTriIntersectionQuery(const int*     _btype,
                      || face.y == _edges[obj_idx].x || face.y == _edges[obj_idx].y
                      || face.z == _edges[obj_idx].x || face.z == _edges[obj_idx].y))
                 {
-                    if(!(_btype[face.x] >= 2 && _btype[face.y] >= 2
+                    // Skip if face and edge belong to the same ABD body
+                    if((_bodyId[face.x] == _bodyId[_edges[obj_idx].x])
+                       && (_bodyId[face.x] != -1))
+                    {
+                        // same body, skip
+                    }
+                    // Skip if bodies are in the collision exclusion list
+                    else if(_is_collision_excluded_gipc(_bodyId[face.x], _bodyId[_edges[obj_idx].x],
+                                                       _collision_skip_matrix, _collision_body_count))
+                    {
+                        // excluded body pair, skip
+                    }
+                    else if(!(_btype[face.x] >= 2 && _btype[face.y] >= 2
                          && _btype[face.z] >= 2 && _btype[_edges[obj_idx].x] >= 2
                          && _btype[_edges[obj_idx].y] >= 2))
                         if(segTriIntersect(_vertexes[_edges[obj_idx].x],
@@ -8332,7 +8360,19 @@ __global__ void _edgeTriIntersectionQuery(const int*     _btype,
                      || face.y == _edges[obj_idx].x || face.y == _edges[obj_idx].y
                      || face.z == _edges[obj_idx].x || face.z == _edges[obj_idx].y))
                 {
-                    if(!(_btype[face.x] >= 2 && _btype[face.y] >= 2
+                    // Skip if face and edge belong to the same ABD body
+                    if((_bodyId[face.x] == _bodyId[_edges[obj_idx].x])
+                       && (_bodyId[face.x] != -1))
+                    {
+                        // same body, skip
+                    }
+                    // Skip if bodies are in the collision exclusion list
+                    else if(_is_collision_excluded_gipc(_bodyId[face.x], _bodyId[_edges[obj_idx].x],
+                                                       _collision_skip_matrix, _collision_body_count))
+                    {
+                        // excluded body pair, skip
+                    }
+                    else if(!(_btype[face.x] >= 2 && _btype[face.y] >= 2
                          && _btype[face.z] >= 2 && _btype[_edges[obj_idx].x] >= 2
                          && _btype[_edges[obj_idx].y] >= 2))
                         if(segTriIntersect(_vertexes[_edges[obj_idx].x],
@@ -8565,7 +8605,7 @@ void GIPC::MALLOC_DEVICE_MEM()
 }
 
 
-void GIPC::initBVH(int* _btype, int* _bodyId)
+void GIPC::initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix, int _collision_body_count)
 {
 
     bvh_e.init(_bodyId,
@@ -8578,7 +8618,9 @@ void GIPC::initBVH(int* _btype, int* _bodyId)
                _cpNum,
                _MatIndex,
                edge_Num,
-               surf_vertexNum);
+               surf_vertexNum,
+               _collision_skip_matrix,
+               _collision_body_count);
     bvh_f.init(_bodyId,
                _btype,
                _vertexes,
@@ -8589,7 +8631,9 @@ void GIPC::initBVH(int* _btype, int* _bodyId)
                _cpNum,
                _MatIndex,
                surface_Num,
-               surf_vertexNum);
+               surf_vertexNum,
+               _collision_skip_matrix,
+               _collision_body_count);
 }
 
 void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer)
@@ -8617,7 +8661,8 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
     long long unsigned total_internal_triplet_num =
         ((abd_fem_count_info.fem_tet_num + tri_edge_num) * 10 + triangleNum * 6)
-        + abd_fem_count_info.abd_body_num * 10;
+        + abd_fem_count_info.abd_body_num * 10
+        + num_joint_constraints * 16;  // 16 block-3x3 per joint cross-body hessian
     long long unsigned total_max_collision_triplet_num =
         minCollisionBuffer4 * 16 + minCollisionBuffer3 * 9
         + minCollisionBuffer2 * 4 + minCollisionBuffer1;
@@ -10534,6 +10579,9 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += abd_shape;
 
+    auto abd_joint = m_abd_system->cal_abd_joint_energy(*m_abd_sim_data);
+    Energy += abd_joint;
+
     auto fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(1, TetMesh);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += fem;
@@ -10594,14 +10642,17 @@ int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int pre
 }
 
 
-bool edgeTriIntersectionQuery(const int*     _btype,
+bool edgeTriIntersectionQuery(const int*     _bodyId,
+                              const int*     _btype,
                               const double3* _vertexes,
                               const uint2*   _edges,
                               const uint3*   _faces,
                               const AABB*    _edge_bvs,
                               const Node*    _edge_nodes,
                               double         dHat,
-                              int            number)
+                              int            number,
+                              const int*     _collision_skip_matrix,
+                              int            _collision_body_count)
 {
     int numbers = number;
     if(numbers <= 0)
@@ -10613,7 +10664,8 @@ bool edgeTriIntersectionQuery(const int*     _btype,
     CUDA_SAFE_CALL(cudaMemset(_isIntersect, 0, sizeof(int)));
 
     _edgeTriIntersectionQuery<<<blockNum, threadNum>>>(
-        _btype, _vertexes, _edges, _faces, _edge_bvs, _edge_nodes, _isIntersect, dHat, numbers);
+        _bodyId, _btype, _vertexes, _edges, _faces, _edge_bvs, _edge_nodes, _isIntersect, dHat, numbers,
+        _collision_skip_matrix, _collision_body_count);
 
     int h_isITST;
     cudaMemcpy(&h_isITST, _isIntersect, sizeof(int), cudaMemcpyDeviceToHost);
@@ -10627,14 +10679,17 @@ bool edgeTriIntersectionQuery(const int*     _btype,
 
 bool GIPC::checkEdgeTriIntersectionIfAny(device_TetraData& TetMesh)
 {
-    return edgeTriIntersectionQuery(bvh_e._btype,
+    return edgeTriIntersectionQuery(bvh_e._bodyId,
+                                    bvh_e._btype,
                                     TetMesh.vertexes,
                                     bvh_e._edges,
                                     bvh_f._faces,
                                     bvh_e._bvs,
                                     bvh_e._nodes,
                                     dHat,
-                                    bvh_f.face_number);
+                                    bvh_f.face_number,
+                                    bvh_e._collision_skip_matrix,
+                                    bvh_e._collision_body_count);
 }
 
 bool GIPC::checkGroundIntersection()
