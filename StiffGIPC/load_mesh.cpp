@@ -790,9 +790,10 @@ bool tetrahedra_obj::load_tetrahedraMesh(const std::string&     filename,
 
 
 // =============================================================================
-// Load a surface mesh (.obj) as an ABD body using the "fan-tet" approach.
-// For each convex component: centroid + triangle → virtual tetrahedron.
-// This feeds directly into the existing ABD tet pipeline.
+// Load a surface mesh (.obj) as an ABD body using native surface integrals.
+// Vertices are added for collision; triangle topology is stored in
+// surface_mesh_bodies for ABDSystem to compute mass/volume/gravity via
+// Divergence theorem — no fan-tets or centroid vertices.
 // =============================================================================
 bool tetrahedra_obj::load_surfaceMesh_ABD(const std::string&     obj_filename,
                                           const Eigen::Matrix4d& transform,
@@ -808,13 +809,21 @@ bool tetrahedra_obj::load_surfaceMesh_ABD(const std::string&     obj_filename,
 
     begin_load_body(obj_filename, gipc::BodyType::ABD, boundary_type);
 
-    // ---------- Phase 1: Add all original vertices (transformed) ----------
-    int orig_vert_count = static_cast<int>(obj_data.vertices.size());
+    int vert_count = static_cast<int>(obj_data.vertices.size());
     double xmin = 1e32, ymin = 1e32, zmin = 1e32;
     double xmax = -1e32, ymax = -1e32, zmax = -1e32;
 
-    for(auto& v : obj_data.vertices)
+    // Store transformed vertices for ABDSystem surface integral computation
+    SurfaceMeshBodyInfo smb;
+    smb.body_id            = abd_fem_count_info.abd_body_num - 1;
+    smb.vert_global_offset = vertexOffset;
+    smb.vertices.resize(vert_count);
+    smb.triangles.resize(obj_data.faces.size());
+
+    // Phase 1: Add surface vertices to global arrays (for collision + J setup)
+    for(int i = 0; i < vert_count; i++)
     {
+        auto& v = obj_data.vertices[i];
         Eigen::Vector4d V = transform * Eigen::Vector4d(v.x(), v.y(), v.z(), 1.0);
         double3 vertex = make_double3(V(0), V(1), V(2));
 
@@ -828,6 +837,8 @@ bool tetrahedra_obj::load_surfaceMesh_ABD(const std::string&     obj_filename,
         __GEIGEN__::__set_Mat_val(constraint, 1, 0, 0, 0, 1, 0, 0, 0, 1);
         constraints.push_back(constraint);
 
+        smb.vertices[i] = Eigen::Vector3d(V(0), V(1), V(2));
+
         if(xmin > vertex.x) xmin = vertex.x;
         if(ymin > vertex.y) ymin = vertex.y;
         if(zmin > vertex.z) zmin = vertex.z;
@@ -836,174 +847,25 @@ bool tetrahedra_obj::load_surfaceMesh_ABD(const std::string&     obj_filename,
         if(zmax < vertex.z) zmax = vertex.z;
     }
 
-    // ---------- Phase 2: For each convex component, add centroid + fan tets ----------
-    int total_centroids     = 0;
-    int total_fan_tets      = 0;
-
-    for(auto& comp : obj_data.convex_components)
-    {
-        if(comp.faces.empty())
-            continue;
-
-        // Compute centroid of this convex component
-        Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
-        for(auto& cv : comp.vertices)
-            centroid += cv;
-        centroid /= static_cast<double>(comp.vertices.size());
-
-        // Transform centroid
-        Eigen::Vector4d C = transform * Eigen::Vector4d(centroid.x(), centroid.y(), centroid.z(), 1.0);
-        double3 centroid_vertex = make_double3(C(0), C(1), C(2));
-
-        // Add centroid as an extra vertex
-        int centroid_global_idx = vertexNum + orig_vert_count + total_centroids;
-        vertexes.push_back(centroid_vertex);
-        velocities.push_back(make_double3(0, 0, 0));
-        masses.push_back(0);
-        boundaryTypies.push_back(0);
-        apply_gravity.push_back(1);
-
-        __GEIGEN__::Matrix3x3d constraint;
-        __GEIGEN__::__set_Mat_val(constraint, 1, 0, 0, 0, 1, 0, 0, 0, 1);
-        constraints.push_back(constraint);
-
-        total_centroids++;
-
-        // Create fan-tets: centroid + each triangle face
-        // comp.faces use LOCAL indices within the component, but we stored vertices
-        // globally. The global vertex for local_idx i in component is found via the
-        // original obj_data global indices. We need to map comp local → obj global → array global.
-        // But since we stored ALL obj vertices first, obj global idx maps to
-        // (vertexOffset + obj_global_idx).
-
-        // The component faces use LOCAL indices. We need global-in-obj indices.
-        // Rebuild the local→global mapping for this component.
-        // Actually, the component's faces use local indices into comp.vertices.
-        // comp.vertices[local_idx] == obj_data.vertices[some_global_idx].
-        // We need to find that global_idx. Let's use position matching.
-        // Better: rebuild from the ObjConvexComponent data.
-
-        // Simpler approach: use the global faces from obj_data directly, 
-        // but we only have comp's local faces. Let me use global data instead.
-    }
-
-    // ---------- Alternative: Simpler approach using global data directly ----------
-    // For each face in the global mesh, we need to know which component's centroid to use.
-    // Build a face→component mapping.
-
-    // Actually, let's restart the centroid approach more cleanly.
-    // Remove the centroids we just added and redo it.
-    // Pop the centroid vertices we just added
-    for(int i = 0; i < total_centroids; i++)
-    {
-        vertexes.pop_back();
-        velocities.pop_back();
-        masses.pop_back();
-        boundaryTypies.pop_back();
-        apply_gravity.pop_back();
-        constraints.pop_back();
-    }
-    total_centroids = 0;
-
-    // Rebuild: for each component, map its local face indices to global-in-obj indices
-    // using the convex_components data that was built by the obj loader.
-    // Global face → component assignment
-    std::vector<int> global_face_to_component(obj_data.faces.size(), 0);
-
-    // If no convex components were found (e.g. STL files, or OBJ without 'o'/'g' groups),
-    // treat the entire mesh as a single component.
-    if(obj_data.convex_components.empty())
-    {
-        gipc::ObjConvexComponent single_comp;
-        single_comp.vertices = obj_data.vertices;
-        single_comp.faces    = obj_data.faces;
-        obj_data.convex_components.push_back(std::move(single_comp));
-    }
-
-    if(obj_data.convex_components.size() > 1)
-    {
-        // Rebuild from components: accumulate face count per component
-        int face_offset = 0;
-        for(int ci = 0; ci < static_cast<int>(obj_data.convex_components.size()); ci++)
-        {
-            int n_faces = static_cast<int>(obj_data.convex_components[ci].faces.size());
-            for(int fi = 0; fi < n_faces; fi++)
-            {
-                if(face_offset + fi < static_cast<int>(global_face_to_component.size()))
-                    global_face_to_component[face_offset + fi] = ci;
-            }
-            face_offset += n_faces;
-        }
-    }
-
-    // Compute per-component centroids (in original obj space, before transform)
-    std::vector<Eigen::Vector3d> comp_centroids;
-    for(auto& comp : obj_data.convex_components)
-    {
-        Eigen::Vector3d c = Eigen::Vector3d::Zero();
-        for(auto& cv : comp.vertices)
-            c += cv;
-        if(!comp.vertices.empty())
-            c /= static_cast<double>(comp.vertices.size());
-        comp_centroids.push_back(c);
-    }
-
-    // Add centroid vertices (transformed)
-    std::vector<int> centroid_global_indices;
-    int extra_vert_start = vertexNum + orig_vert_count;  // where centroid verts start in the global array
-    for(int ci = 0; ci < static_cast<int>(comp_centroids.size()); ci++)
-    {
-        Eigen::Vector4d C = transform * Eigen::Vector4d(
-            comp_centroids[ci].x(), comp_centroids[ci].y(), comp_centroids[ci].z(), 1.0);
-        double3 cv = make_double3(C(0), C(1), C(2));
-
-        vertexes.push_back(cv);
-        velocities.push_back(make_double3(0, 0, 0));
-        masses.push_back(0);
-        boundaryTypies.push_back(0);
-        apply_gravity.push_back(1);
-
-        __GEIGEN__::Matrix3x3d constraint;
-        __GEIGEN__::__set_Mat_val(constraint, 1, 0, 0, 0, 1, 0, 0, 0, 1);
-        constraints.push_back(constraint);
-
-        centroid_global_indices.push_back(extra_vert_start + ci);
-        total_centroids++;
-    }
-
-    int total_point_num = orig_vert_count + total_centroids;
-    vertexNum += total_point_num;
-    set_body_point_num(gipc::BodyType::ABD, total_point_num);
-    abd_vertexOffset += total_point_num;
-
-    // ---------- Phase 3: Create fan tets ----------
-    int n_fan_tets = static_cast<int>(obj_data.faces.size());
-
-    abd_tetOffset += n_fan_tets;
-
-    set_body_tet_num(gipc::BodyType::ABD, n_fan_tets);
-
-    for(int fi = 0; fi < n_fan_tets; fi++)
+    // Phase 2: Store triangle topology (no fan-tets, no centroid vertices)
+    for(int fi = 0; fi < static_cast<int>(obj_data.faces.size()); fi++)
     {
         auto& face = obj_data.faces[fi];
-        int comp_idx = global_face_to_component[fi];
-        int centroid_idx = centroid_global_indices[comp_idx];
-
-        // Fan tet: (centroid, face[0], face[1], face[2])
-        // face indices are 0-based in the obj → global array index = vertexOffset + face[j]
-        uint4 tet;
-        tet.x = centroid_idx;
-        tet.y = face[0] + vertexOffset;
-        tet.z = face[1] + vertexOffset;
-        tet.w = face[2] + vertexOffset;
-
-        tetrahedras.push_back(tet);
-        tetra_fiberDir.push_back(make_double3(0, 0, 0));
-        vert_youngth_modules.push_back(youngth_module);
+        smb.triangles[fi] = Eigen::Vector3i(face[0], face[1], face[2]);
     }
-    tetrahedraNum += n_fan_tets;
 
-    // ---------- Phase 4: Update AABB ----------
+    int saved_body_id = smb.body_id;
+    surface_mesh_bodies.push_back(std::move(smb));
+
+    // Register points with ABD pipeline (no tets for this body)
+    vertexNum += vert_count;
+    set_body_point_num(gipc::BodyType::ABD, vert_count);
+    abd_vertexOffset += vert_count;
+
+    // Zero tets for this surface-mesh body
+    set_body_tet_num(gipc::BodyType::ABD, 0);
+
+    // Update AABB
     minTConer = make_double3(xmin, ymin, zmin);
     maxTConer = make_double3(xmax, ymax, zmax);
 
@@ -1024,9 +886,9 @@ bool tetrahedra_obj::load_surfaceMesh_ABD(const std::string&     obj_filename,
     D3x3Num   = 0;
 
     std::cout << "[load_surfaceMesh_ABD] Loaded '" << obj_filename
-              << "': " << orig_vert_count << " verts + " << total_centroids
-              << " centroids = " << total_point_num << " points, "
-              << n_fan_tets << " fan-tets" << std::endl;
+              << "' (native surface): " << vert_count << " verts, "
+              << obj_data.faces.size() << " triangles (body_id="
+              << saved_body_id << ")" << std::endl;
 
     return true;
 }
@@ -1390,6 +1252,19 @@ void tetrahedra_obj::getSurface()
     for(const auto& tri : triangles)
     {
         surface.push_back(make_uint3(tri.x, tri.y, tri.z));
+    }
+
+    // Add surface mesh body triangles (ABD bodies loaded from .obj without tets)
+    for(const auto& smb : surface_mesh_bodies)
+    {
+        int off = smb.vert_global_offset;
+        for(const auto& tri : smb.triangles)
+        {
+            surface.push_back(make_uint3(
+                static_cast<uint32_t>(tri[0] + off),
+                static_cast<uint32_t>(tri[1] + off),
+                static_cast<uint32_t>(tri[2] + off)));
+        }
     }
 
     vector<bool> flag(vertexNum, false);

@@ -10,6 +10,7 @@
 #include "GL/freeglut.h"
 #include <fstream>
 #include <iostream>
+#include <chrono>
 #include <cuda_runtime.h>
 #include <map>
 // #include "GIPC.cuh"
@@ -34,11 +35,18 @@
 #include <thrust/sequence.h>
 #include <thrust/device_ptr.h>
 #include <GIPC.cuh>
+#include "abd_system/abd_system.h"
+
+// ImGui for interactive UI (joint control sliders)
+#include "imgui.h"
+#include "imgui_impl_glut.h"
+#include "imgui_impl_opengl2.h"
 
 auto             assets_dir = std::string{gipc::assets_dir()};
 std::string      metis_dir  = assets_dir + "sorted_mesh/";
 double           collision_detection_buff_scale = 1;
 double           motion_rate                    = 1;
+bool             g_skip_rendering               = false;
 mesh_obj         obj;
 lbvh_f           bvh_f;
 lbvh_e           bvh_e;
@@ -48,6 +56,9 @@ tetrahedra_obj   tetMesh;
 vector<Node>     nodes;
 vector<AABB>     bvs;
 vector<string>   obj_pathes;
+
+// Whether interactive joint control UI is enabled (set by case 12)
+bool g_joint_control_enabled = false;
 int              initPath = 0;
 using namespace std;
 int   step      = 0;
@@ -66,7 +77,7 @@ float yRotLength    = 0.0f;
 float window_width  = 1000;
 float window_height = 1000;
 int   s_dimention   = 3;
-bool  saveSurface   = false;
+bool  saveSurface   = true;
 bool  change        = false;
 bool  screenshot    = false;
 
@@ -194,12 +205,7 @@ void SaveScreenShot(int width, int height, const std::string& file_name)
 void saveSurfaceMesh(const string& path)
 {
     std::stringstream ss;
-    ss << path;
-    ss.fill('0');
-    ss.width(5);
-    ss << (surfNumId++) / 1;  // / 10;
-    //if (surfNumId % 10 != 0) return;
-    ss << ".obj";
+    ss << path << "scene_surface" << (surfNumId++) << ".obj";
     std::string file_path = ss.str();
     ofstream    outSurf(file_path);
 
@@ -400,15 +406,6 @@ void draw_mesh3D()
 
     for(int j = 0; j < tetMesh.surfEdges.size(); j++)
     {
-        //if ((tetMesh.surfEdges[j].x == 870 && tetMesh.surfEdges[j].y == 965) || (tetMesh.surfEdges[j].x == 965 && tetMesh.surfEdges[j].y == 870)) {
-        //    glColor3f(0.9f, 0.1f, 0.1f);
-        //    glLineWidth(3.4f);
-        //}
-        //else if ((tetMesh.surfEdges[j].x == 870 && tetMesh.surfEdges[j].y == 905) || (tetMesh.surfEdges[j].x == 905 && tetMesh.surfEdges[j].y == 870)) {
-        //    glColor3f(0.9f, 0.9f, 0.1f);
-        //    glLineWidth(3.4f);
-        //}
-
         glVertex3f((tetMesh.vertexes[tetMesh.surfEdges[j].x].x),
                    (tetMesh.vertexes[tetMesh.surfEdges[j].x].y),
                    (tetMesh.vertexes[tetMesh.surfEdges[j].x].z));
@@ -420,6 +417,27 @@ void draw_mesh3D()
         glLineWidth(0.1f);
     }
     glEnd();
+
+    // -- Visualize stitch springs as bright green lines --
+    if (!d_tetMesh.stitch_paired_vertex.empty() && tetMesh.softNum > 0) {
+        glDisable(GL_DEPTH_TEST);  // draw on top
+        glLineWidth(3.0f);
+        glBegin(GL_LINES);
+        for (int i = 0; i < tetMesh.softNum; ++i) {
+            int fem_idx = tetMesh.targetIndex[i];
+            int abd_idx = d_tetMesh.stitch_paired_vertex[i];
+            if (abd_idx < 0) continue;
+            glColor3f(0.0f, 1.0f, 0.0f);  // bright green
+            glVertex3f(tetMesh.vertexes[fem_idx].x,
+                       tetMesh.vertexes[fem_idx].y,
+                       tetMesh.vertexes[fem_idx].z);
+            glVertex3f(tetMesh.vertexes[abd_idx].x,
+                       tetMesh.vertexes[abd_idx].y,
+                       tetMesh.vertexes[abd_idx].z);
+        }
+        glEnd();
+        glEnable(GL_DEPTH_TEST);
+    }
 
     //glColor3f(0.99f, 0.1f, 0.1f);
     ////glDisable(GL_DEPTH_TEST);
@@ -513,25 +531,98 @@ void draw_Scene3D()
     glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glTranslatef(xTrans, yTrans, zTrans);
-    glRotatef(xRot, 1.0f, 0.0f, 0.0f);
-    glRotatef(yRot, 0.0f, 1.0f, 0.0f);
-
-    //draw_box3D(-2, -1, -2, 4, 4, 4, 1);
-    if(drawSurface)
+    if(!g_skip_rendering)
     {
-        draw_mesh3D();
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glTranslatef(xTrans, yTrans, zTrans);
+        glRotatef(xRot, 1.0f, 0.0f, 0.0f);
+        glRotatef(yRot, 0.0f, 1.0f, 0.0f);
+
+        //draw_box3D(-2, -1, -2, 4, 4, 4, 1);
+        if(drawSurface)
+        {
+            draw_mesh3D();
+        }
+        if(drawbvh)
+        {
+            draw_bvh();
+        }
+
+        glPopMatrix();
     }
-    if(drawbvh)
+
+    // ---- ImGui Rendering ----
+    ImGui_ImplOpenGL2_NewFrame();
+    ImGui_ImplGLUT_NewFrame();
+    ImGui::NewFrame();
+
+    if(g_joint_control_enabled
+       && (!tetMesh.joint_angle_controls.empty() || !tetMesh.prismatic_drive_controls.empty()))
     {
-        draw_bvh();
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_FirstUseEver);
+        if(ImGui::Begin("Joint State Control"))
+        {
+            if(!tetMesh.joint_angle_controls.empty())
+            {
+                ImGui::Text("Revolute Joints");
+                ImGui::Separator();
+                for(auto& ctrl : tetMesh.joint_angle_controls)
+                {
+                    float angle_deg = static_cast<float>(ctrl.target_angle * 180.0 / 3.14159265358979);
+                    float lo_deg    = static_cast<float>(ctrl.lower_limit * 180.0 / 3.14159265358979);
+                    float hi_deg    = static_cast<float>(ctrl.upper_limit * 180.0 / 3.14159265358979);
+                    if(ImGui::SliderFloat(ctrl.joint_name.c_str(), &angle_deg, lo_deg, hi_deg, "%.1f"))
+                    {
+                        ctrl.target_angle = static_cast<double>(angle_deg) * 3.14159265358979 / 180.0;
+                    }
+                }
+            }
+
+            if(!tetMesh.prismatic_drive_controls.empty())
+            {
+                ImGui::Spacing();
+                ImGui::Text("Prismatic Joints");
+                ImGui::Separator();
+                for(auto& pctrl : tetMesh.prismatic_drive_controls)
+                {
+                    float dist_mm = static_cast<float>(pctrl.target_distance * 1000.0);
+                    float lo_mm   = static_cast<float>(pctrl.lower_limit * 1000.0);
+                    float hi_mm   = static_cast<float>(pctrl.upper_limit * 1000.0);
+                    if(ImGui::SliderFloat(pctrl.joint_name.c_str(), &dist_mm, lo_mm, hi_mm, "%.1f mm"))
+                    {
+                        pctrl.target_distance = static_cast<double>(dist_mm) / 1000.0;
+                    }
+                }
+            }
+
+            if(ImGui::Button("Reset All"))
+            {
+                for(auto& ctrl : tetMesh.joint_angle_controls)
+                    ctrl.target_angle = 0.0;
+                for(auto& pctrl : tetMesh.prismatic_drive_controls)
+                    pctrl.target_distance = 0.0;
+            }
+        }
+        ImGui::End();
     }
 
-    glPopMatrix();
+    // Info overlay
+    {
+        ImGui::SetNextWindowPos(ImVec2(10, static_cast<float>(window_height) - 60.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.35f);
+        if(ImGui::Begin("##info", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+            | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
+        {
+            ImGui::Text("Step: %d  |  %s", step, stop ? "PAUSED (Space to run)" : "RUNNING");
+        }
+        ImGui::End();
+    }
 
+    ImGui::Render();
+    ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
     glutSwapBuffers();
     //glFlush();
@@ -1148,7 +1239,7 @@ void set_case8_xarm6_test()
     // Default non-root non-revolute links are Free
     urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
 
-    // Disable motor for now — just test joint constraints under gravity
+    // Disable motor for now -- just test joint constraints under gravity
     urdf_importer.set_revolute_as_motor(false);
     //urdf_importer.set_default_motor_speed(1.57);    // ~0.25 rev/s
     //urdf_importer.set_default_motor_strength(10.0);
@@ -1156,7 +1247,7 @@ void set_case8_xarm6_test()
     // Default Young's modulus for all links loaded from .obj collision meshes
     urdf_importer.set_default_young_modulus(1e7);
 
-    // No mesh overrides needed — the importer will auto-detect .obj collision
+    // No mesh overrides needed -- the importer will auto-detect .obj collision
     // meshes from the URDF and load them via the fan-tet approach.
     // To override a specific link with a tet mesh instead:
     //   urdf_importer.set_mesh_override("link_base", {"path/to/base.msh", 1e8});
@@ -1221,7 +1312,7 @@ void set_case9_xarm7_gripper_test()
     urdf_importer.set_root_fixed(true);
     urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
 
-    // No motor for now — just test joint constraints under gravity
+    // No motor for now -- just test joint constraints under gravity
     urdf_importer.set_revolute_as_motor(false);
 
     // Default Young's modulus for all links
@@ -1262,6 +1353,1040 @@ void set_case9_xarm7_gripper_test()
     std::cout << "[set_case9] Joint constraints: " << tetMesh.joint_constraints.size() << std::endl;
 }
 
+// ==========================================================================
+// Helper: load OBJ vertex positions (ignoring per-vertex colors if present)
+// Optionally applies a 4x4 transform to each vertex.
+// ==========================================================================
+static std::vector<double3> load_obj_positions(const std::string&     obj_path,
+                                               const Eigen::Matrix4d& transform = Eigen::Matrix4d::Identity())
+{
+    std::vector<double3> positions;
+    std::ifstream        ifs(obj_path);
+    if(!ifs.is_open())
+    {
+        std::cerr << "[load_obj_positions] Failed to open: " << obj_path << std::endl;
+        return positions;
+    }
+    std::string line;
+    while(std::getline(ifs, line))
+    {
+        if(line.size() >= 2 && line[0] == 'v' && line[1] == ' ')
+        {
+            double          x, y, z;
+            std::istringstream ss(line.substr(2));
+            ss >> x >> y >> z;  // ignore any extra color components
+            Eigen::Vector4d p = transform * Eigen::Vector4d(x, y, z, 1.0);
+            positions.push_back(make_double3(p(0), p(1), p(2)));
+        }
+    }
+    std::cout << "[load_obj_positions] Loaded " << positions.size()
+              << " vertices from " << obj_path << std::endl;
+    return positions;
+}
+
+// ==========================================================================
+// Helper: minimum distance from a point to any vertex in a point cloud
+// ==========================================================================
+static double min_dist_to_points(double3                      pt,
+                                 const std::vector<double3>& verts)
+{
+    double best = 1e20;
+    for(const auto& v : verts)
+    {
+        double dx = pt.x - v.x;
+        double dy = pt.y - v.y;
+        double dz = pt.z - v.z;
+        double d  = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if(d < best)
+            best = d;
+    }
+    return best;
+}
+
+// ==========================================================================
+// apply_per_tet_youngth_modulus  (GIPC equivalent of UIPC's "apply_to")
+//
+// Classify each tetrahedron in [tet_offset, tet_offset + tet_count) by
+// centroid proximity to two reference point clouds ("hard" vs "soft"),
+// then assign the corresponding Young's modulus.
+// ==========================================================================
+static void apply_per_tet_youngth_modulus(
+    tetrahedra_obj&              mesh,
+    int                          tet_offset,
+    int                          tet_count,
+    const std::vector<double3>&  hard_ref_verts,
+    const std::vector<double3>&  soft_ref_verts,
+    double                       hard_youngs,
+    double                       soft_youngs)
+{
+    int hard_count = 0, soft_count = 0;
+    for(int t = 0; t < tet_count; ++t)
+    {
+        int   gi  = tet_offset + t;
+        auto& tet = mesh.tetrahedras[gi];
+
+        // Compute tet centroid
+        double3 centroid;
+        centroid.x = (mesh.vertexes[tet.x].x + mesh.vertexes[tet.y].x
+                      + mesh.vertexes[tet.z].x + mesh.vertexes[tet.w].x)
+                     * 0.25;
+        centroid.y = (mesh.vertexes[tet.x].y + mesh.vertexes[tet.y].y
+                      + mesh.vertexes[tet.z].y + mesh.vertexes[tet.w].y)
+                     * 0.25;
+        centroid.z = (mesh.vertexes[tet.x].z + mesh.vertexes[tet.y].z
+                      + mesh.vertexes[tet.z].z + mesh.vertexes[tet.w].z)
+                     * 0.25;
+
+        double d_hard = min_dist_to_points(centroid, hard_ref_verts);
+        double d_soft = min_dist_to_points(centroid, soft_ref_verts);
+
+        if(d_hard <= d_soft)
+        {
+            mesh.vert_youngth_modules[gi] = hard_youngs;
+            ++hard_count;
+        }
+        else
+        {
+            mesh.vert_youngth_modules[gi] = soft_youngs;
+            ++soft_count;
+        }
+    }
+    std::cout << "[apply_per_tet_youngth_modulus] "
+              << hard_count << " hard tets, "
+              << soft_count << " soft tets" << std::endl;
+}
+
+// ==========================================================================
+// Case 10: UIPC-style Soft Gripper Demo
+//
+// Replicates the UIPC hello_vbd soft gripper scene in GIPC.
+// Two fingers (ABD rigid base + FEM heterogeneous-stiffness combined mesh)
+// grip a cup (ABD). Per-tet Young's modulus is assigned based on proximity
+// to part2 (hard) and part3 (soft) reference surfaces.
+// ==========================================================================
+void set_case10_uipc_demo()
+{
+    // ==========================================================
+    // UIPC-style soft gripper demo (ABD rigid base + FEM soft body):
+    //   ABD cube (top, Animated boundary -- driven upward by soft
+    //             translation penalty, analogous to UIPC SoftTransformConstraint)
+    //   FEM cube (bottom, soft E=1e5, connected to ABD via stitch springs)
+    //
+    // ABD must be loaded before FEM.
+    // ==========================================================
+
+    ipc.pcg_data.P_type = 0;  // bypass metis_sort
+
+    std::string tetmesh_dir = assets_dir + "tetMesh/";
+    gipc::SimpleSceneImporter importer;
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+
+    std::string cube_msh = tetmesh_dir + "cube.msh";
+    // cube.msh actual vertex bounds:
+    //   x: [-0.2, 0.2], y: [0.1, 0.5], z: [-0.2, 0.2]
+    //   top face (y=0.5): verts 1-4, bottom face (y=0.1): verts 5-8
+    double mesh_y_min = 0.1;  // bottom face y in original mesh
+    double mesh_y_max = 0.5;  // top face y in original mesh
+
+    double scale       = 0.3;   // scaling factor
+    double gap         = 0.3;   // visible gap between cubes (applied after stitch)
+    double soft_E      = 1e5;   // FEM cube: soft
+    double lift_speed  = 0.1;   // m/s -- ABD upward velocity
+    double anim_strength = 1e6; // Animated penalty stiffness
+
+    // ----------------------------------------------------------
+    // 1) Load ABD cube (top, rigid)
+    //    Position so bottom face (y_min) lands at y=0.
+    //    After transform: y_bottom = scale*mesh_y_min + ty = 0 → ty = -scale*mesh_y_min
+    // ----------------------------------------------------------
+    int abdA_vert_start = tetMesh.vertexNum;
+    int abdA_body_id = -1;
+    {
+        Transform t = Transform::Identity();
+        t.translate(Eigen::Vector3d{0, -scale * mesh_y_min, 0});
+        t.scale(scale);
+        abdA_body_id = static_cast<int>(tetMesh.body_id_to_is_fixed.size());
+        importer.load_geometry(tetMesh, 3, gipc::BodyType::ABD, t.matrix(),
+                               1e8 /* YoungthM (unused for ABD) */, cube_msh,
+                               ipc.pcg_data.P_type, BodyBoundaryType::Animated);
+    }
+    int abdA_vert_end = tetMesh.vertexNum;
+    std::cout << "[case10] ABD cube (Animated) loaded, body_id=" << abdA_body_id
+              << ", verts [" << abdA_vert_start << ", " << abdA_vert_end << ")"
+              << std::endl;
+
+    // Set Animated motor params: [vx, vy, vz, strength, 0]
+    if(abdA_body_id >= 0 && abdA_body_id < static_cast<int>(tetMesh.body_motor_infos.size()))
+    {
+        auto& mi = tetMesh.body_motor_infos[abdA_body_id];
+        mi.axis_x   = 0.0;          // vx
+        mi.axis_y   = lift_speed;    // vy
+        mi.axis_z   = 0.0;          // vz
+        mi.speed    = anim_strength; // stored in params[3] → anim_strength
+        mi.strength = 0.0;          // params[4] unused for Animated
+    }
+
+    // ----------------------------------------------------------
+    // 2) Load FEM cube (bottom, soft)
+    //    Position so top face (y_max) lands at y=0.
+    //    After transform: y_top = scale*mesh_y_max + ty = 0 → ty = -scale*mesh_y_max
+    // ----------------------------------------------------------
+    int femB_vert_start = tetMesh.vertexNum;
+    {
+        Transform t = Transform::Identity();
+        t.translate(Eigen::Vector3d{0, -scale * mesh_y_max, 0});
+        t.scale(scale);
+        importer.load_geometry(tetMesh, 3, gipc::BodyType::FEM, t.matrix(),
+                               soft_E, cube_msh, ipc.pcg_data.P_type);
+    }
+    int femB_vert_end = tetMesh.vertexNum;
+    std::cout << "[case10] FEM cube (soft) loaded, verts ["
+              << femB_vert_start << ", " << femB_vert_end << ")" << std::endl;
+
+    // Enable gravity on FEM cube only (ABD has its own gravity via q_tilde)
+    for(int i = 0; i < tetMesh.vertexNum; i++)
+        tetMesh.apply_gravity[i] = 0;
+
+    // Debug: print all vertex positions
+    std::cout << "[case10] ABD vertices:" << std::endl;
+    for(int v = abdA_vert_start; v < abdA_vert_end; ++v)
+    {
+        auto& p = tetMesh.vertexes[v];
+        std::cout << "  v" << v << ": (" << p.x << ", " << p.y << ", " << p.z << ")" << std::endl;
+    }
+    std::cout << "[case10] FEM vertices:" << std::endl;
+    for(int v = femB_vert_start; v < femB_vert_end; ++v)
+    {
+        auto& p = tetMesh.vertexes[v];
+        std::cout << "  v" << v << ": (" << p.x << ", " << p.y << ", " << p.z << ")" << std::endl;
+    }
+
+    // ----------------------------------------------------------
+    // 3) Find stitch pairs (mutual NN on the facing surfaces)
+    //    Match by x/z distance only (ignoring y gap between cubes)
+    //    ABD bottom face ↔ FEM top face
+    // ----------------------------------------------------------
+    std::vector<std::pair<int, int>> stitch_pairs;  // (femB_idx, abdA_idx)
+    {
+        double threshold = scale * 0.15;  // x/z matching threshold
+        int A_count = abdA_vert_end - abdA_vert_start;
+        int B_count = femB_vert_end - femB_vert_start;
+
+        for(int b = 0; b < B_count; ++b)
+        {
+            auto& pb = tetMesh.vertexes[femB_vert_start + b];
+            double best_d = 1e20;
+            int    best_a = -1;
+            for(int a = 0; a < A_count; ++a)
+            {
+                auto& pa = tetMesh.vertexes[abdA_vert_start + a];
+                double dx = pb.x - pa.x, dz = pb.z - pa.z;
+                double d  = std::sqrt(dx * dx + dz * dz);  // x/z only
+                if(d < best_d) { best_d = d; best_a = a; }
+            }
+            if(best_d < threshold && best_a >= 0)
+            {
+                // Reverse check: ensure mutual nearest neighbor
+                auto& pa = tetMesh.vertexes[abdA_vert_start + best_a];
+                double rev_best = 1e20;
+                int    rev_b    = -1;
+                for(int b2 = 0; b2 < B_count; ++b2)
+                {
+                    auto& pb2 = tetMesh.vertexes[femB_vert_start + b2];
+                    double dx = pa.x - pb2.x, dz = pa.z - pb2.z;
+                    double d  = std::sqrt(dx * dx + dz * dz);  // x/z only
+                    if(d < rev_best) { rev_best = d; rev_b = b2; }
+                }
+                if(rev_b == b)
+                {
+                    stitch_pairs.emplace_back(femB_vert_start + b,
+                                              abdA_vert_start + best_a);
+                    break;
+                    std::cout << "[case10] Stitch: FEM v" << (femB_vert_start + b)
+                              << " <-> ABD v" << (abdA_vert_start + best_a)
+                              << "  dist=" << best_d << std::endl;
+                }
+            }
+        }
+    }
+    std::cout << "[case10] Total stitch pairs: " << stitch_pairs.size() << std::endl;
+
+    // ----------------------------------------------------------
+    // 4) Shift ABD cube upward by 'gap' (after stitch pair finding)
+    // ----------------------------------------------------------
+    if(gap > 0)
+    {
+        for(int v = abdA_vert_start; v < abdA_vert_end; ++v)
+            tetMesh.vertexes[v].y += gap;
+        std::cout << "[case10] ABD cube shifted up by " << gap << std::endl;
+    }
+
+    // ----------------------------------------------------------
+    // 5) Build soft constraints (stitch springs only)
+    //    Each stitch spring: FEM vertex tracks ABD vertex + rest offset
+    //    The soft constraint target updates each step via
+    //    update_soft_constraint_target_position using stitch_paired_vertex.
+    // ----------------------------------------------------------
+    std::vector<int>     stitch_paired_vertex_map;
+    std::vector<double3> stitch_rest_offsets;
+    std::vector<int>     stitch_abd_body_ids;
+
+    for(auto& [fem_idx, abd_idx] : stitch_pairs)
+    {
+        auto& fp = tetMesh.vertexes[fem_idx];
+        auto& ap = tetMesh.vertexes[abd_idx];  // already shifted up by gap
+        double3 rest_off = make_double3(fp.x - ap.x, fp.y - ap.y, fp.z - ap.z);
+
+        tetMesh.targetIndex.push_back(fem_idx);
+        tetMesh.targetPos.push_back(fp);  // initial target = current pos (zero force)
+        stitch_paired_vertex_map.push_back(abd_idx);
+        stitch_rest_offsets.push_back(rest_off);
+        stitch_abd_body_ids.push_back(abdA_body_id);
+
+        std::cout << "[case10] Rest offset: (" << rest_off.x << ", "
+                  << rest_off.y << ", " << rest_off.z << ")" << std::endl;
+    }
+
+    tetMesh.softNum = tetMesh.targetIndex.size();
+    d_tetMesh.stitch_paired_vertex = stitch_paired_vertex_map;
+    d_tetMesh.stitch_rest_offset   = stitch_rest_offsets;
+    d_tetMesh.stitch_abd_body_id   = stitch_abd_body_ids;
+
+    std::cout << "[case10] Soft constraints (stitch): " << tetMesh.softNum << std::endl;
+
+    // Stitch spring stiffness
+    ipc.softMotionRate = 1e6;
+
+    // Simulation parameters
+    ipc.relative_dhat = 1e-3;
+    ipc.PoissonRate   = 0.45;
+
+    std::cout << "[case10] ABD(Animated) + FEM stitch demo setup complete."
+              << std::endl;
+}
+
+// ==========================================================================
+// Case 11: Full Soft Gripper Scene
+// ==========================================================================
+void set_case11_gripper()
+{
+    ipc.pcg_data.P_type = 0;  // bypass metis_sort
+
+    std::string sim_tetmesh = assets_dir + "sim_data/tetmesh/";
+    gipc::SimpleSceneImporter importer;
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+
+    // --- Mesh paths ---------------------------------------------
+    std::string part1_msh     = sim_tetmesh + "softgriper_part1.msh";
+    std::string combined_msh  = sim_tetmesh + "softgriper_part2_blobal.msh";
+    std::string cup_msh       = sim_tetmesh + "softgriper_cup.msh";
+    std::string part2_obj     = sim_tetmesh + "softgriper_part2.obj";
+    std::string part3_obj     = sim_tetmesh + "softgriper_part3.obj";
+
+    // --- Scene parameters ---------------------------------------
+    double finger_dist    = 0.3;
+    double finger_y       = -0.95;   // base center height (ground at y=-1)
+    double finger_z_off   = -0.05;
+    double part1_y_off    = -0.093;
+    double combined_y_off = -0.0933;
+    double combined_scale = 0.97;
+
+    double separation_dist = 0.02; // gap between ABD base and FEM body (meters)
+    bool   enable_stitch    = true;  // stitch springs between ABD base and FEM body
+    bool   enable_animation  = true;  // ABD animated movement
+
+    double hard_E = 1e7;
+    double soft_E = 1e6;
+    double base_E = 1e8;
+    double cup_E  = 1e8;
+
+    double anim_speed    = 1.0;
+    double anim_strength = 1e5;
+    int    switch_frame  = 27;  // frame 0-49: grip inward, frame 50+: lift upward
+
+    // --- Helper lambdas -----------------------------------------
+    auto compute_bbox_center = [&](int v_start, int v_end) -> Eigen::Vector3d {
+        Eigen::Vector3d mn(1e20, 1e20, 1e20), mx(-1e20, -1e20, -1e20);
+        for (int v = v_start; v < v_end; ++v) {
+            auto& p = tetMesh.vertexes[v];
+            mn.x() = std::min(mn.x(), p.x); mn.y() = std::min(mn.y(), p.y); mn.z() = std::min(mn.z(), p.z);
+            mx.x() = std::max(mx.x(), p.x); mx.y() = std::max(mx.y(), p.y); mx.z() = std::max(mx.z(), p.z);
+        }
+        return (mn + mx) * 0.5;
+    };
+    auto rotate_verts_around = [&](int v_start, int v_end, const Eigen::Matrix3d& R, const Eigen::Vector3d& center) {
+        for (int v = v_start; v < v_end; ++v) {
+            auto& p = tetMesh.vertexes[v];
+            Eigen::Vector3d pos(p.x, p.y, p.z);
+            pos = R * (pos - center) + center;
+            p = make_double3(pos.x(), pos.y(), pos.z());
+        }
+    };
+    auto translate_verts = [&](int v_start, int v_end, const Eigen::Vector3d& t) {
+        for (int v = v_start; v < v_end; ++v) {
+            tetMesh.vertexes[v].x += t.x();
+            tetMesh.vertexes[v].y += t.y();
+            tetMesh.vertexes[v].z += t.z();
+        }
+    };
+
+    // =============================================================
+    // PHASE A: Load all ABD bodies first (GIPC requirement)
+    // =============================================================
+
+    // 1. Cup (ABD, Free)
+    int cup_vert_start = tetMesh.vertexNum;
+    int cup_body_id    = static_cast<int>(tetMesh.body_id_to_is_fixed.size());
+    {
+        Transform t = Transform::Identity();
+        importer.load_geometry(tetMesh, 3, gipc::BodyType::ABD, t.matrix(),
+                               cup_E, cup_msh, ipc.pcg_data.P_type, BodyBoundaryType::Free);
+    }
+    int cup_vert_end = tetMesh.vertexNum;
+    {
+        Eigen::Vector3d mn(1e20, 1e20, 1e20), mx(-1e20, -1e20, -1e20);
+        for (int v = cup_vert_start; v < cup_vert_end; ++v) {
+            auto& p = tetMesh.vertexes[v];
+            mn.x() = std::min(mn.x(), p.x); mn.y() = std::min(mn.y(), p.y); mn.z() = std::min(mn.z(), p.z);
+            mx.x() = std::max(mx.x(), p.x); mx.y() = std::max(mx.y(), p.y); mx.z() = std::max(mx.z(), p.z);
+        }
+        Eigen::Vector3d shift(-(mn.x() + mx.x()) * 0.5, -mn.y() - 0.995, -(mn.z() + mx.z()) * 0.5);
+        translate_verts(cup_vert_start, cup_vert_end, shift);
+    }
+    std::cout << "[case11] Cup: body=" << cup_body_id << ", verts [" << cup_vert_start << "," << cup_vert_end << ")" << std::endl;
+
+    // 2. Finger 0 base (ABD)
+    BodyBoundaryType base_btype = enable_animation ? BodyBoundaryType::Animated : BodyBoundaryType::Free;
+    int f0_base_vs = tetMesh.vertexNum;
+    int f0_base_id = static_cast<int>(tetMesh.body_id_to_is_fixed.size());
+    {
+        Transform t = Transform::Identity();
+        t.translate(Eigen::Vector3d{0, part1_y_off, 0});
+        importer.load_geometry(tetMesh, 3, gipc::BodyType::ABD, t.matrix(),
+                               base_E, part1_msh, ipc.pcg_data.P_type, base_btype);
+    }
+    int f0_base_ve = tetMesh.vertexNum;
+
+    // 3. Finger 1 base (ABD)
+    int f1_base_vs = tetMesh.vertexNum;
+    int f1_base_id = static_cast<int>(tetMesh.body_id_to_is_fixed.size());
+    {
+        Transform t = Transform::Identity();
+        t.translate(Eigen::Vector3d{0, part1_y_off, 0});
+        importer.load_geometry(tetMesh, 3, gipc::BodyType::ABD, t.matrix(),
+                               base_E, part1_msh, ipc.pcg_data.P_type, base_btype);
+    }
+    int f1_base_ve = tetMesh.vertexNum;
+
+    std::cout << "[case11] F0 base: body=" << f0_base_id << ", F1 base: body=" << f1_base_id << std::endl;
+
+    // =============================================================
+    // PHASE B: Load FEM bodies
+    // =============================================================
+
+    // 4. Finger 0 FEM
+    int f0_fem_vs = tetMesh.vertexNum;
+    int f0_fem_ts = tetMesh.tetrahedraNum;
+    {
+        Transform t = Transform::Identity();
+        t.translate(Eigen::Vector3d{0, combined_y_off, 0});
+        t.scale(combined_scale);
+        importer.load_geometry(tetMesh, 3, gipc::BodyType::FEM, t.matrix(),
+                               hard_E, combined_msh, ipc.pcg_data.P_type);
+    }
+    int f0_fem_ve = tetMesh.vertexNum;
+    int f0_fem_te = tetMesh.tetrahedraNum;
+
+    // 5. Finger 1 FEM
+    int f1_fem_vs = tetMesh.vertexNum;
+    int f1_fem_ts = tetMesh.tetrahedraNum;
+    {
+        Transform t = Transform::Identity();
+        t.translate(Eigen::Vector3d{0, combined_y_off, 0});
+        t.scale(combined_scale);
+        importer.load_geometry(tetMesh, 3, gipc::BodyType::FEM, t.matrix(),
+                               hard_E, combined_msh, ipc.pcg_data.P_type);
+    }
+    int f1_fem_ve = tetMesh.vertexNum;
+    int f1_fem_te = tetMesh.tetrahedraNum;
+
+    std::cout << "[case11] F0 FEM: verts[" << f0_fem_vs << "," << f0_fem_ve
+              << ") tets[" << f0_fem_ts << "," << f0_fem_te << ")" << std::endl;
+    std::cout << "[case11] F1 FEM: verts[" << f1_fem_vs << "," << f1_fem_ve
+              << ") tets[" << f1_fem_ts << "," << f1_fem_te << ")" << std::endl;
+
+    // =============================================================
+    // PHASE C: Per-tet heterogeneous Young's modulus
+    // (BEFORE rotation -- ref verts & mesh share the same local frame)
+    // =============================================================
+    {
+        Eigen::Matrix4d ref_t = Eigen::Matrix4d::Identity();
+        ref_t.block<3, 3>(0, 0) *= combined_scale;
+        ref_t(1, 3) = combined_y_off;
+
+        auto hard_ref = load_obj_positions(part2_obj, ref_t);
+        auto soft_ref = load_obj_positions(part3_obj, ref_t);
+
+        std::cout << "[case11] Ref verts: hard=" << hard_ref.size() << " soft=" << soft_ref.size() << std::endl;
+
+        apply_per_tet_youngth_modulus(tetMesh, f0_fem_ts, f0_fem_te - f0_fem_ts,
+                                     hard_ref, soft_ref, hard_E, soft_E);
+        apply_per_tet_youngth_modulus(tetMesh, f1_fem_ts, f1_fem_te - f1_fem_ts,
+                                     hard_ref, soft_ref, hard_E, soft_E);
+    }
+
+    // =============================================================
+    // PHASE D: Stitch springs (before rotation -- find pairs in local frame)
+    // =============================================================
+    struct StitchInfo { std::vector<std::pair<int, int>> pairs; };
+
+    auto find_stitch_pairs = [&](int abd_vs, int abd_ve, int fem_vs, int fem_ve, double thresh) -> StitchInfo {
+        StitchInfo si;
+        for (int b = fem_vs; b < fem_ve; ++b) {
+            auto& pb = tetMesh.vertexes[b];
+            double best_d = 1e20; int best_a = -1;
+            for (int a = abd_vs; a < abd_ve; ++a) {
+                auto& pa = tetMesh.vertexes[a];
+                double dx = pb.x - pa.x, dy = pb.y - pa.y, dz = pb.z - pa.z;
+                double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (d < best_d) { best_d = d; best_a = a; }
+            }
+            if (best_d < thresh && best_a >= 0) {
+                // Reverse check: is b the closest FEM vert to best_a?
+                auto& pa = tetMesh.vertexes[best_a];
+                double rev_best = 1e20; int rev_b = -1;
+                for (int b2 = fem_vs; b2 < fem_ve; ++b2) {
+                    auto& pb2 = tetMesh.vertexes[b2];
+                    double dx = pa.x - pb2.x, dy = pa.y - pb2.y, dz = pa.z - pb2.z;
+                    double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (d < rev_best) { rev_best = d; rev_b = b2; }
+                }
+                if(rev_b == b)
+                {
+                    si.pairs.emplace_back(b, best_a);
+                    //break;
+                }
+            }
+        }
+        return si;
+    };
+
+    double stitch_thresh = 0.005;
+    auto f0_stitch = find_stitch_pairs(f0_base_vs, f0_base_ve, f0_fem_vs, f0_fem_ve, stitch_thresh);
+    auto f1_stitch = find_stitch_pairs(f1_base_vs, f1_base_ve, f1_fem_vs, f1_fem_ve, stitch_thresh);
+    std::cout << "[case11] Stitch pairs: F0=" << f0_stitch.pairs.size()
+              << " F1=" << f1_stitch.pairs.size() << std::endl;
+    // Print each pair's vertex indices and positions for debugging
+    auto print_pairs = [&](const char* name, const StitchInfo& si) {
+        for (size_t i = 0; i < si.pairs.size(); ++i) {
+            auto [fem_idx, abd_idx] = si.pairs[i];
+            auto& fp = tetMesh.vertexes[fem_idx];
+            auto& ap = tetMesh.vertexes[abd_idx];
+            double dx = fp.x - ap.x, dy = fp.y - ap.y, dz = fp.z - ap.z;
+            double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            std::cout << "  " << name << " pair[" << i << "]: FEM v" << fem_idx
+                      << " (" << fp.x << "," << fp.y << "," << fp.z << ") <-> ABD v"
+                      << abd_idx << " (" << ap.x << "," << ap.y << "," << ap.z
+                      << ")  dist=" << dist << std::endl;
+        }
+    };
+    print_pairs("F0", f0_stitch);
+    print_pairs("F1", f1_stitch);
+
+    // =============================================================
+    // PHASE D.5: Separate FEM from ABD base to avoid intersection
+    // In local frame the finger is vertical (Y-up), base is at top,
+    // FEM hangs below. Translate FEM further down by separation_dist.
+    // =============================================================
+    translate_verts(f0_fem_vs, f0_fem_ve, Eigen::Vector3d(0, -separation_dist, 0));
+    translate_verts(f1_fem_vs, f1_fem_ve, Eigen::Vector3d(0, -separation_dist, 0));
+    std::cout << "[case11] Separated FEM from ABD base by " << separation_dist << "m" << std::endl;
+
+    // =============================================================
+    // PHASE E: Rotations & Translations
+    // =============================================================
+    Eigen::Matrix3d rot_x_neg90;
+    {
+        double a = -3.14159265358979323846 * 0.5;
+        rot_x_neg90 << 1, 0, 0,
+                        0, std::cos(a), -std::sin(a),
+                        0, std::sin(a),  std::cos(a);
+    }
+    Eigen::Matrix3d rot_z_180;
+    rot_z_180 << -1, 0, 0,  0, -1, 0,  0, 0, 1;
+
+    // Finger 0 (Right): -90 X, translate to (-finger_dist, finger_y, finger_z_off)
+    {
+        // Rotate around combined bbox center
+        Eigen::Vector3d center = compute_bbox_center(f0_base_vs, f0_fem_ve);
+        rotate_verts_around(f0_base_vs, f0_base_ve, rot_x_neg90, center);
+        rotate_verts_around(f0_fem_vs,  f0_fem_ve,  rot_x_neg90, center);
+        // Align by ABD base center (not combined center) so both fingers match
+        Eigen::Vector3d base_center = compute_bbox_center(f0_base_vs, f0_base_ve);
+        Eigen::Vector3d shift = Eigen::Vector3d(-finger_dist, finger_y, finger_z_off) - base_center;
+        translate_verts(f0_base_vs, f0_base_ve, shift);
+        translate_verts(f0_fem_vs,  f0_fem_ve,  shift);
+    }
+
+    // Finger 1 (Left): 180Z * -90X, translate to (+finger_dist, finger_y, finger_z_off)
+    {
+        Eigen::Matrix3d R1 = rot_z_180 * rot_x_neg90;
+        Eigen::Vector3d center = compute_bbox_center(f1_base_vs, f1_fem_ve);
+        rotate_verts_around(f1_base_vs, f1_base_ve, R1, center);
+        rotate_verts_around(f1_fem_vs,  f1_fem_ve,  R1, center);
+        // Align by ABD base center
+        Eigen::Vector3d base_center = compute_bbox_center(f1_base_vs, f1_base_ve);
+        Eigen::Vector3d shift = Eigen::Vector3d(finger_dist, finger_y, finger_z_off) - base_center;
+        translate_verts(f1_base_vs, f1_base_ve, shift);
+        translate_verts(f1_fem_vs,  f1_fem_ve,  shift);
+    }
+
+    // Print bounding boxes for all objects to verify no ground intersection
+    auto print_bbox = [&](const char* name, int vs, int ve) {
+        Eigen::Vector3d mn(1e20,1e20,1e20), mx(-1e20,-1e20,-1e20);
+        for (int v = vs; v < ve; ++v) {
+            auto& p = tetMesh.vertexes[v];
+            mn.x()=std::min(mn.x(),p.x); mn.y()=std::min(mn.y(),p.y); mn.z()=std::min(mn.z(),p.z);
+            mx.x()=std::max(mx.x(),p.x); mx.y()=std::max(mx.y(),p.y); mx.z()=std::max(mx.z(),p.z);
+        }
+        std::cout << "[case11] " << name << " bbox: ("
+                  << mn.x() << "," << mn.y() << "," << mn.z() << ") -> ("
+                  << mx.x() << "," << mx.y() << "," << mx.z() << ")" << std::endl;
+    };
+    print_bbox("Cup",      cup_vert_start, cup_vert_end);
+    print_bbox("F0 base",  f0_base_vs, f0_base_ve);
+    print_bbox("F0 FEM",   f0_fem_vs,  f0_fem_ve);
+    print_bbox("F1 base",  f1_base_vs, f1_base_ve);
+    print_bbox("F1 FEM",   f1_fem_vs,  f1_fem_ve);
+
+    // =============================================================
+    // PHASE F: Build soft constraints (stitch springs)
+    // =============================================================
+    if (enable_stitch) {
+        std::vector<int>     stitch_paired_vertex_map;
+        std::vector<double3> stitch_rest_offsets;
+        std::vector<int>     stitch_abd_body_ids;
+
+        auto add_stitch = [&](const StitchInfo& si, int abd_body_id) {
+            for (auto& [fem_idx, abd_idx] : si.pairs) {
+                auto& fp = tetMesh.vertexes[fem_idx];
+                auto& ap = tetMesh.vertexes[abd_idx];
+                double3 rest_off = make_double3(fp.x - ap.x, fp.y - ap.y, fp.z - ap.z);
+                tetMesh.targetIndex.push_back(fem_idx);
+                tetMesh.targetPos.push_back(fp);
+                stitch_paired_vertex_map.push_back(abd_idx);
+                stitch_rest_offsets.push_back(rest_off);
+                stitch_abd_body_ids.push_back(abd_body_id);
+            }
+        };
+        add_stitch(f0_stitch, f0_base_id);
+        add_stitch(f1_stitch, f1_base_id);
+
+        tetMesh.softNum = static_cast<int>(tetMesh.targetIndex.size());
+        d_tetMesh.stitch_paired_vertex = stitch_paired_vertex_map;
+        d_tetMesh.stitch_rest_offset   = stitch_rest_offsets;
+        d_tetMesh.stitch_abd_body_id   = stitch_abd_body_ids;
+        // UIPC effective stiffness = kappa * dt^2 = 1e8 * 0.01^2 = 1e4
+        // GIPC effective stiffness = softMotionRate * rate^2 = softMotionRate * 1.0
+        // So set softMotionRate = 1e4 to match UIPC
+        ipc.softMotionRate = 1e4;
+
+        std::cout << "[case11] Total stitch soft constraints: " << tetMesh.softNum << std::endl;
+    } else {
+        tetMesh.softNum = 0;
+        std::cout << "[case11] Stitch springs DISABLED for speed test" << std::endl;
+    }
+
+    // =============================================================
+    // PHASE G: Animation (Animated ABD motor params + per-frame callback)
+    //
+    // Motor params now store ABSOLUTE target position [tx, ty, tz, strength, 0].
+    // The pre_step_functor accumulates displacement from the initial centroid
+    // each step, computing: target = initial_pos + sum(velocity * dt).
+    // =============================================================
+    d_tetMesh.m_body_count = static_cast<int>(tetMesh.body_id_to_is_fixed.size());
+
+    if (enable_animation) {
+        // Compute initial centroid of each ABD base (average of vertices)
+        auto compute_centroid = [&](int vs, int ve) -> Eigen::Vector3d {
+            Eigen::Vector3d c = Eigen::Vector3d::Zero();
+            for (int v = vs; v < ve; ++v) {
+                auto& p = tetMesh.vertexes[v];
+                c += Eigen::Vector3d(p.x, p.y, p.z);
+            }
+            return c / (ve - vs);
+        };
+        Eigen::Vector3d f0_init_pos = compute_centroid(f0_base_vs, f0_base_ve);
+        Eigen::Vector3d f1_init_pos = compute_centroid(f1_base_vs, f1_base_ve);
+        std::cout << "[case11] F0 base initial centroid: ("
+                  << f0_init_pos.x() << "," << f0_init_pos.y() << "," << f0_init_pos.z() << ")" << std::endl;
+        std::cout << "[case11] F1 base initial centroid: ("
+                  << f1_init_pos.x() << "," << f1_init_pos.y() << "," << f1_init_pos.z() << ")" << std::endl;
+
+        // Initial motor params: target = initial position (no displacement yet)
+        auto& mi0 = tetMesh.body_motor_infos[f0_base_id];
+        mi0.axis_x = f0_init_pos.x(); mi0.axis_y = f0_init_pos.y(); mi0.axis_z = f0_init_pos.z();
+        mi0.speed = anim_strength; mi0.strength = 0;
+
+        auto& mi1 = tetMesh.body_motor_infos[f1_base_id];
+        mi1.axis_x = f1_init_pos.x(); mi1.axis_y = f1_init_pos.y(); mi1.axis_z = f1_init_pos.z();
+        mi1.speed = anim_strength; mi1.strength = 0;
+
+        // Per-frame callback: accumulate displacement, compute absolute target
+        d_tetMesh.pre_step_functor =
+            [f0_id = f0_base_id, f1_id = f1_base_id,
+             f0_pos0 = f0_init_pos, f1_pos0 = f1_init_pos,
+             switch_frame, anim_speed, anim_strength, body_count = d_tetMesh.m_body_count,
+             f0_disp = Eigen::Vector3d(0,0,0), f1_disp = Eigen::Vector3d(0,0,0)]
+            (int step_id, double ipc_dt, double* body_motor_params_gpu, int bc) mutable
+        {
+            // Compute velocity for this step
+            Eigen::Vector3d f0_vel, f1_vel;
+            if (step_id < switch_frame) {
+                // Grip phase: move inward (F0 +x, F1 -x)
+                f0_vel = Eigen::Vector3d( anim_speed, 0, 0);
+                f1_vel = Eigen::Vector3d(-anim_speed, 0, 0);
+            } else {
+                // Lift phase: move up (both +y), stop horizontal
+                f0_vel = Eigen::Vector3d(0, anim_speed, 0);
+                f1_vel = Eigen::Vector3d(0, anim_speed, 0);
+            }
+
+            // Accumulate displacement
+            f0_disp += f0_vel * ipc_dt;
+            f1_disp += f1_vel * ipc_dt;
+
+            // Absolute target = initial position + accumulated displacement
+            Eigen::Vector3d f0_target = f0_pos0 + f0_disp;
+            Eigen::Vector3d f1_target = f1_pos0 + f1_disp;
+
+            // Upload
+            std::vector<double> params(body_count * 5, 0.0);
+            params[f0_id * 5 + 0] = f0_target.x();
+            params[f0_id * 5 + 1] = f0_target.y();
+            params[f0_id * 5 + 2] = f0_target.z();
+            params[f0_id * 5 + 3] = anim_strength;
+            params[f1_id * 5 + 0] = f1_target.x();
+            params[f1_id * 5 + 1] = f1_target.y();
+            params[f1_id * 5 + 2] = f1_target.z();
+            params[f1_id * 5 + 3] = anim_strength;
+            CUDA_SAFE_CALL(cudaMemcpy(body_motor_params_gpu, params.data(),
+                                      body_count * 5 * sizeof(double), cudaMemcpyHostToDevice));
+            if (step_id <= 3 || step_id == switch_frame || step_id == switch_frame + 1)
+                printf("[anim] step=%d  F0 target=(%.4f,%.4f,%.4f)  F1 target=(%.4f,%.4f,%.4f)\n",
+                       step_id, f0_target.x(), f0_target.y(), f0_target.z(),
+                       f1_target.x(), f1_target.y(), f1_target.z());
+        };
+        std::cout << "[case11] Animation ENABLED (absolute target mode)" << std::endl;
+    } else {
+        std::cout << "[case11] Animation DISABLED for speed test" << std::endl;
+    }
+
+    // =============================================================
+    // PHASE H: Final simulation parameters
+    // =============================================================
+    for (int i = 0; i < tetMesh.vertexNum; i++)
+        tetMesh.apply_gravity[i] = 1;
+    // Note: With absolute target mode, gravity on ABD bases is fine --
+    // the constraint pulls toward the absolute target regardless of gravity.
+
+    ipc.relative_dhat = 1e-3;
+    ipc.PoissonRate   = 0.45;
+    // Match UIPC default friction coefficient (0.5)
+    ipc.frictionRate    = 0.5;
+    ipc.gd_frictionRate = 0.5;
+
+    // =============================================================
+    // PHASE I: Collision exclusion (DISABLED for debugging)
+    //  Assign FEM body IDs so intersection printf shows which FEM body,
+    //  but do NOT add collision exclusion pairs.
+    //  Body layout:
+    //    0 = Cup, 1 = F0 base, 2 = F1 base, 3 = F0 FEM, 4 = F1 FEM
+    // =============================================================
+    {
+        int abd_body_count = static_cast<int>(tetMesh.abd_fem_count_info.abd_body_num);
+        int f0_fem_body_id = abd_body_count;     // 3
+        int f1_fem_body_id = abd_body_count + 1; // 4
+
+        // Assign body IDs so intersection printf is useful
+        for (int v = f0_fem_vs; v < f0_fem_ve; ++v)
+            tetMesh.point_id_to_body_id[v] = f0_fem_body_id;
+        for (int v = f1_fem_vs; v < f1_fem_ve; ++v)
+            tetMesh.point_id_to_body_id[v] = f1_fem_body_id;
+
+        std::cout << "[case11] FEM body IDs assigned: F0 FEM=" << f0_fem_body_id
+                  << " (verts " << f0_fem_vs << "-" << f0_fem_ve << ")"
+                  << " F1 FEM=" << f1_fem_body_id
+                  << " (verts " << f1_fem_vs << "-" << f1_fem_ve << ")" << std::endl;
+        std::cout << "[case11] Collision exclusion: NONE (debug mode)" << std::endl;
+    }
+
+    std::cout << "[case11] Soft gripper scene setup complete. Bodies=" << d_tetMesh.m_body_count
+              << " Verts=" << tetMesh.vertexNum << " Tets=" << tetMesh.tetrahedraNum << std::endl;
+}
+
+// ==========================================================================
+// Case 12: Multi-Cube Revolute Chain Test (N cubes + UI angle sliders)
+//
+// A chain of N ABD cubes connected by revolute joints.
+// - cube 0: Fixed (base)
+// - cubes 1..N-1: Free, each connected to previous cube by a revolute joint
+// Each joint has its own UI slider for angle control.
+// Alternating joint axes (Z, X, Z, X, ...) to test 3D articulation.
+// ==========================================================================
+void set_case12_two_cube_revolute_test()
+{
+    ipc.pcg_data.P_type = 0;
+
+    gipc::SimpleSceneImporter importer;
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+
+    std::string cube_msh = assets_dir + "tetMesh/cube.msh";
+    double      scale    = 0.25;
+
+    // cube.msh local bounds: x,z: [-0.2, 0.2], y: [0.1, 0.5]
+    // cube height = 0.4 * scale, we place cubes touching along Y.
+    double cube_height = 0.4 * scale;  // 0.1 in world (scale=0.25)
+
+    constexpr int NUM_CUBES = 5;
+    std::vector<int> body_ids(NUM_CUBES);
+
+    // Create cube chain along +Y axis.
+    // cube 0: base at y = [-0.1, 0] (fixed)
+    // cube i: stacked on top, y_bottom = cube_height * i
+    for(int i = 0; i < NUM_CUBES; i++)
+    {
+        body_ids[i] = static_cast<int>(tetMesh.body_id_to_is_fixed.size());
+
+        Transform t = Transform::Identity();
+        double y_offset = cube_height * i - 0.5 * scale;
+        t.translate(Eigen::Vector3d{0.0, y_offset, 0.0});
+        t.scale(scale);
+        importer.load_geometry(tetMesh,
+                               3,
+                               gipc::BodyType::ABD,
+                               t.matrix(),
+                               1e8,
+                               cube_msh,
+                               ipc.pcg_data.P_type,
+                               (i == 0) ? BodyBoundaryType::Fixed
+                                        : BodyBoundaryType::Free);
+    }
+
+    // Create revolute joints between consecutive cubes.
+    // Joint i connects cube i (parent) to cube i+1 (child).
+    // Joint anchor = top face of cube i = bottom face of cube i+1.
+    for(int i = 0; i < NUM_CUBES - 1; i++)
+    {
+        double joint_y = cube_height * (i + 1) - 0.5 * scale + 0.1 * scale;
+
+        // Alternate axes: even joints rotate around Z, odd around X
+        Eigen::Vector3d axis_dir = (i % 2 == 0) ? Eigen::Vector3d::UnitZ()
+                                                 : Eigen::Vector3d::UnitX();
+        Eigen::Vector3d n_dir    = (i % 2 == 0) ? Eigen::Vector3d::UnitX()
+                                                 : Eigen::Vector3d::UnitY();
+
+        JointConstraintHostInfo jc;
+        jc.parent_body_id = body_ids[i];
+        jc.child_body_id  = body_ids[i + 1];
+        jc.type           = JointConstraintHostInfo::Type::Revolute;
+        jc.num_points     = 2;
+        jc.world_anchor[0] = Eigen::Vector3d(0, joint_y, 0) - 0.5 * axis_dir;
+        jc.world_anchor[1] = Eigen::Vector3d(0, joint_y, 0) + 0.5 * axis_dir;
+        jc.point_weight[0] = 1.0;
+        jc.point_weight[1] = 1.0;
+
+        JointAngleControlInfo ctrl;
+        ctrl.constraint_index = static_cast<int>(tetMesh.joint_constraints.size());
+        ctrl.axis_dir         = axis_dir;
+        ctrl.n_dir            = n_dir;
+        ctrl.target_angle     = 0.0;
+        ctrl.lower_limit      = -JointAngleControlInfo::kSafeAngleLimit;
+        ctrl.upper_limit      =  JointAngleControlInfo::kSafeAngleLimit;
+        ctrl.strength_ratio   = 1.0;
+        ctrl.joint_name       = "joint_" + std::to_string(i) + "_"
+                                + ((i % 2 == 0) ? "Z" : "X");
+
+        tetMesh.joint_constraints.push_back(jc);
+        tetMesh.joint_angle_controls.push_back(ctrl);
+
+        tetMesh.collision_exclusion_pairs.push_back({body_ids[i], body_ids[i + 1]});
+    }
+
+    // Disable collision between ALL link pairs in the chain.
+    // Adjacent pairs are already added above; add all non-adjacent pairs here.
+    for(int i = 0; i < NUM_CUBES; i++)
+        for(int j = i + 2; j < NUM_CUBES; j++)
+            tetMesh.collision_exclusion_pairs.push_back({body_ids[i], body_ids[j]});
+
+    ipc.m_abd_system->parms.joint_strength_ratio            = 100.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio = 100.0;
+
+    g_joint_control_enabled = true;
+
+    std::cout << "[set_case12] Multi-cube revolute chain loaded (" << NUM_CUBES << " cubes)." << std::endl;
+    for(int i = 0; i < NUM_CUBES; i++)
+        std::cout << "  cube " << i << ": body_id=" << body_ids[i]
+                  << (i == 0 ? " (fixed)" : " (free)") << std::endl;
+    std::cout << "[set_case12] Joint constraints: "
+              << tetMesh.joint_constraints.size() << std::endl;
+    std::cout << "[set_case12] Joint angle controls: "
+              << tetMesh.joint_angle_controls.size() << std::endl;
+}
+
+// ==========================================================================
+// Case 13: XArm7 with Gripper - Interactive Joint Control via ImGui sliders.
+// Same model as case 9, but with UI for controlling each revolute joint angle.
+// ==========================================================================
+void set_case13_xarm7_interactive()
+{
+    gipc::UrdfSceneImporter urdf_importer;
+
+    //std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm7_with_gripper.urdf";
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm6_robot_white.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    Eigen::Matrix4d global_transform = Eigen::Matrix4d::Identity();
+    global_transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 0.3;
+    global_transform(1, 3) = 0.0;  // place near origin so default camera can see it
+    urdf_importer.set_global_transform(global_transform);
+
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case13] XArm7 Interactive import failed!" << std::endl;
+        std::abort();
+    }
+
+    // Keep gravity enabled (rbs-uipc style default).
+    // Do NOT override per-vertex apply_gravity or ABD parms.gravity here.
+
+    // Mass-based joint stiffness matching rbs-uipc formulation:
+    // kappa = strength_ratio * (m_parent + m_child), NO dt² factor.
+    ipc.m_abd_system->parms.joint_strength_ratio            = 100.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio = 100.0;
+
+    // Enable joint control UI
+    g_joint_control_enabled = true;
+
+    std::cout << "[set_case13] XArm7 Interactive loaded." << std::endl;
+    std::cout << "[set_case13] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case13] Joint angle controls: " << tetMesh.joint_angle_controls.size() << std::endl;
+    for(auto& ctrl : tetMesh.joint_angle_controls)
+    {
+        std::cout << "  - " << ctrl.joint_name
+                  << " [" << (ctrl.lower_limit * 180.0 / 3.14159265) << ", "
+                  << (ctrl.upper_limit * 180.0 / 3.14159265) << "] deg" << std::endl;
+    }
+}
+
+// ==========================================================================
+// Case 14: XArm7 + Gripper - Interactive Joint Control via ImGui sliders.
+// Uses xarm7_with_gripper.urdf (7-DOF arm + gripper fingers).
+// ==========================================================================
+void set_case14_xarm7_gripper_interactive()
+{
+    gipc::UrdfSceneImporter urdf_importer;
+
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm7_with_gripper.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    Eigen::Matrix4d global_transform = Eigen::Matrix4d::Identity();
+    global_transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 0.3;
+    global_transform(1, 3) = 0.0;
+    urdf_importer.set_global_transform(global_transform);
+
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case14] XArm7+Gripper Interactive import failed!" << std::endl;
+        std::abort();
+    }
+
+    ipc.m_abd_system->parms.joint_strength_ratio            = 100.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio = 100.0;
+
+    ipc.m_skip_all_collision = true;
+    g_skip_rendering = true;
+    std::cout << "[set_case14] DEBUG: collision pipeline completely disabled, rendering skipped" << std::endl;
+
+    g_joint_control_enabled = true;
+
+    std::cout << "[set_case14] XArm7+Gripper Interactive loaded." << std::endl;
+    std::cout << "[set_case14] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case14] Joint angle controls: " << tetMesh.joint_angle_controls.size() << std::endl;
+    for(auto& ctrl : tetMesh.joint_angle_controls)
+    {
+        std::cout << "  - " << ctrl.joint_name
+                  << " [" << (ctrl.lower_limit * 180.0 / 3.14159265) << ", "
+                  << (ctrl.upper_limit * 180.0 / 3.14159265) << "] deg" << std::endl;
+    }
+}
+
+// ==========================================================================
+// Case 15: Ridgeback Dual Panda (nomobile) - Interactive Joint Control.
+// Uses ridgeback_dual_panda2_nomobile.urdf (dual 7-DOF arms + grippers).
+// ==========================================================================
+void set_case15_ridgeback_dual_panda()
+{
+    gipc::UrdfSceneImporter urdf_importer;
+
+    std::string urdf_path =
+        "D:/Preserntation/SimulationDemo/OtherDemo/ridgeback_dual_panda_soft/"
+        "franka/ridgeback_dual_panda2_nomobile.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    Eigen::Matrix4d global_transform = Eigen::Matrix4d::Identity();
+    global_transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 0.3;
+    global_transform(1, 3) = 0.0;
+    urdf_importer.set_global_transform(global_transform);
+
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case15] Ridgeback Dual Panda import failed!" << std::endl;
+        std::abort();
+    }
+
+    ipc.m_abd_system->parms.joint_strength_ratio              = 100.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio   = 100.0;
+    ipc.m_abd_system->parms.prismatic_strength_ratio          = 100.0;
+    ipc.m_abd_system->parms.prismatic_driving_strength_ratio  = 100.0;
+
+    g_joint_control_enabled = true;
+
+    std::cout << "[set_case15] Ridgeback Dual Panda (nomobile) loaded." << std::endl;
+    std::cout << "[set_case15] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case15] Revolute angle controls: " << tetMesh.joint_angle_controls.size() << std::endl;
+    for(auto& ctrl : tetMesh.joint_angle_controls)
+    {
+        std::cout << "  - " << ctrl.joint_name
+                  << " [" << (ctrl.lower_limit * 180.0 / 3.14159265) << ", "
+                  << (ctrl.upper_limit * 180.0 / 3.14159265) << "] deg" << std::endl;
+    }
+    std::cout << "[set_case15] Prismatic drive controls: " << tetMesh.prismatic_drive_controls.size() << std::endl;
+    for(auto& ctrl : tetMesh.prismatic_drive_controls)
+    {
+        std::cout << "  - " << ctrl.joint_name
+                  << " [" << ctrl.lower_limit << ", " << ctrl.upper_limit << "] m" << std::endl;
+    }
+}
+
 void setMAS_partition()
 {
     tetMesh.partId_map_real.resize(tetMesh.part_offset * BANKSIZE, -1);
@@ -1296,7 +2421,8 @@ void initScene()
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
     ipc.pcg_data.P_type = 1;
 
-    int scene_no = 8;
+    int scene_no            = 13;
+    g_joint_control_enabled = false;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1321,13 +2447,31 @@ void initScene()
             set_case6();
             break;
         case 6:  //URDF import test
-            set_case7_urdf_test();
+            set_case7_urdf_test(); 
             break;
         case 7:  //XArm6 URDF test
             set_case8_xarm6_test();
             break;
         case 8:  //XArm7 + Gripper URDF test
             set_case9_xarm7_gripper_test();
+            break;
+        case 9:  //UIPC-style soft gripper demo
+            set_case10_uipc_demo();
+            break;
+        case 10: //Full soft gripper scene
+            set_case11_gripper();
+            break;
+        case 11: //Case12: two ABD cubes revolute test with UI slider
+            set_case12_two_cube_revolute_test();
+            break;
+        case 12: //Case13: XArm6 interactive joint control
+            set_case13_xarm7_interactive();
+            break;
+        case 13: //Case14: XArm7 + Gripper interactive joint control
+            set_case14_xarm7_gripper_interactive();
+            break;
+        case 14: //Case15: Ridgeback Dual Panda (nomobile)
+            set_case15_ridgeback_dual_panda();
             break;
     }
 
@@ -1512,6 +2656,29 @@ void initScene()
     ipc.targetVert         = d_tetMesh.targetVert;
     ipc.targetInd          = d_tetMesh.targetIndex;
     ipc.softNum            = tetMesh.softNum;
+
+    // Upload stitch spring data to GPU and set bilateral coupling pointers
+    if(tetMesh.softNum > 0 && !d_tetMesh.stitch_paired_vertex.empty())
+    {
+        CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.d_stitch_paired_vertex,
+                                  d_tetMesh.stitch_paired_vertex.data(),
+                                  tetMesh.softNum * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.d_stitch_rest_offset,
+                                  d_tetMesh.stitch_rest_offset.data(),
+                                  tetMesh.softNum * sizeof(double3),
+                                  cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.d_stitch_abd_body_id,
+                                  d_tetMesh.stitch_abd_body_id.data(),
+                                  tetMesh.softNum * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        ipc.m_d_stitch_paired_vertex = d_tetMesh.d_stitch_paired_vertex;
+        ipc.m_d_stitch_rest_offset   = d_tetMesh.d_stitch_rest_offset;
+        ipc.m_d_stitch_abd_body_id   = d_tetMesh.d_stitch_abd_body_id;
+        std::cout << "[stitch] Uploaded " << tetMesh.softNum
+                  << " bilateral stitch springs to GPU" << std::endl;
+    }
+
     ipc.abd_fem_count_info = tetMesh.abd_fem_count_info;
     ipc.num_joint_constraints = static_cast<int>(tetMesh.joint_constraints.size());
 
@@ -1657,10 +2824,11 @@ void initScene()
 
 
     ipc.buildBVH();
+    ipc.setup_surface_mesh_bodies(tetMesh);
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer);
 
-    // Initialize joint constraints after ABD system is ready
-    if(!tetMesh.joint_constraints.empty())
+    // Initialize joint constraints (revolute + fixed + prismatic) after ABD system is ready
+    if(!tetMesh.joint_constraints.empty() || !tetMesh.prismatic_constraints.empty())
     {
         ipc.init_joint_constraints_from_mesh(tetMesh);
     }
@@ -1762,8 +2930,20 @@ void display(void)
     if(stop)
         return;
 
+    auto frame_start = std::chrono::high_resolution_clock::now();
 
+    // Update joint angle targets from UI sliders before solving
+    if(g_joint_control_enabled)
+    {
+        ipc.update_joint_angle_targets_from_mesh(tetMesh);
+    }
+
+    auto solver_start = std::chrono::high_resolution_clock::now();
     ipc.IPC_Solver(d_tetMesh);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto solver_end = std::chrono::high_resolution_clock::now();
+
+    double solver_ms = std::chrono::duration<double, std::milli>(solver_end - solver_start).count();
 
     if(ipc.animation && true)
     {
@@ -1777,15 +2957,26 @@ void display(void)
                                   cudaMemcpyHostToDevice));
     }
 
+    if(!ipc.m_skip_all_collision && ipc.edge_Num > 0)
+    {
+        CUDA_SAFE_CALL(cudaMemcpy(
+            &bvs[0], ipc.bvh_e._bvs, (2 * ipc.edge_Num - 1) * sizeof(AABB), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(
+            &nodes[0], ipc.bvh_e._nodes, (2 * ipc.edge_Num - 1) * sizeof(Node), cudaMemcpyDeviceToHost));
+    }
 
-    CUDA_SAFE_CALL(cudaMemcpy(
-        &bvs[0], ipc.bvh_e._bvs, (2 * ipc.edge_Num - 1) * sizeof(AABB), cudaMemcpyDeviceToHost));
-    CUDA_SAFE_CALL(cudaMemcpy(
-        &nodes[0], ipc.bvh_e._nodes, (2 * ipc.edge_Num - 1) * sizeof(Node), cudaMemcpyDeviceToHost));
-    CUDA_SAFE_CALL(cudaMemcpy(tetMesh.vertexes.data(),
-                              ipc._vertexes,
-                              ipc.vertexNum * sizeof(double3),
-                              cudaMemcpyDeviceToHost));
+    if(!g_skip_rendering)
+    {
+        CUDA_SAFE_CALL(cudaMemcpy(tetMesh.vertexes.data(),
+                                  ipc._vertexes,
+                                  ipc.vertexNum * sizeof(double3),
+                                  cudaMemcpyDeviceToHost));
+    }
+
+    // Auto-save surface OBJ each frame
+    if (saveSurface) {
+        saveSurfaceMesh(output_path);
+    }
 
 
     if(screenshot)
@@ -1799,7 +2990,11 @@ void display(void)
         SaveScreenShot(window_width, window_height, file_path);
     }
     step++;
-    printf("step:  %d\n", step);
+
+    auto frame_end = std::chrono::high_resolution_clock::now();
+    double frame_ms = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
+    printf("step: %d | solver: %.1f ms | frame_total: %.1f ms (%.1f FPS)\n",
+           step, solver_ms, frame_ms, 1000.0 / frame_ms);
 
     //if(step >= 160)
     //{
@@ -1835,7 +3030,7 @@ void init(void)
         glViewport(0, 0, window_width, window_height);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        gluPerspective(45.0, (float)window_width / window_height, 10.1f, 500.0);
+        gluPerspective(45.0, (float)window_width / window_height, 0.1f, 500.0);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
         glTranslatef(0.0f, 0.0f, -3.0f);
@@ -1845,7 +3040,17 @@ void init(void)
         glGenBuffers(1, &PN_vbo_);
         glGenVertexArrays(1, &VAO);
     }
-    //glEnable(GL_DEPTH_TEST);
+
+    // Initialize ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGLUT_Init();
+    ImGui_ImplOpenGL2_Init();
+    // Resize callback for ImGui
+    ImGui_ImplGLUT_ReshapeFunc(static_cast<int>(window_width), static_cast<int>(window_height));
 }
 
 
@@ -1856,8 +3061,7 @@ void idle_func()
 
 void reshape_func(GLint width, GLint height)
 {
-    //window_width = width;
-    //window_height = height;
+    ImGui_ImplGLUT_ReshapeFunc(width, height);
 
     glViewport(0, 0, width, height);
     if(!isSetShader)
@@ -1871,11 +3075,19 @@ void reshape_func(GLint width, GLint height)
         glLoadIdentity();
         glTranslatef(0.0f, 0.0f, -3.0f);
     }
-    //glTranslatef(0.5f, 0.5f, -4.0f);
 }
 
 void keyboard_func(unsigned char key, int x, int y)
 {
+    // Forward to ImGui
+    ImGui_ImplGLUT_KeyboardFunc(key, x, y);
+    ImGuiIO& io = ImGui::GetIO();
+    if(io.WantCaptureKeyboard)
+    {
+        glutPostRedisplay();
+        return;
+    }
+
     if(key == 'w')
     {
         zTrans += .3f;
@@ -1935,11 +3147,20 @@ void keyboard_func(unsigned char key, int x, int y)
 
 void special_keyboard_func(int key, int x, int y)
 {
+    ImGui_ImplGLUT_SpecialFunc(key, x, y);
     glutPostRedisplay();
 }
 
 void mouse_func(int button, int state, int x, int y)
 {
+    ImGui_ImplGLUT_MouseFunc(button, state, x, y);
+    ImGuiIO& io = ImGui::GetIO();
+    if(io.WantCaptureMouse)
+    {
+        glutPostRedisplay();
+        return;
+    }
+
     if(state == GLUT_DOWN)
     {
         buttonState = 1;
@@ -1957,6 +3178,14 @@ void mouse_func(int button, int state, int x, int y)
 
 void motion_func(int x, int y)
 {
+    ImGui_ImplGLUT_MotionFunc(x, y);
+    ImGuiIO& io = ImGui::GetIO();
+    if(io.WantCaptureMouse)
+    {
+        glutPostRedisplay();
+        return;
+    }
+
     float dx, dy;
     dx = (float)(x - ox);
     dy = (float)(y - oy);
@@ -1976,6 +3205,8 @@ void motion_func(int x, int y)
 
 void SpecialKey(GLint key, GLint x, GLint y)
 {
+    ImGui_ImplGLUT_SpecialFunc(key, x, y);
+
     if(key == GLUT_KEY_DOWN)
     {
         change = true;
@@ -2030,6 +3261,7 @@ int main(int argc, char** argv)
     glutSpecialFunc(&SpecialKey);
     glutMouseFunc(mouse_func);
     glutMotionFunc(motion_func);
+    glutPassiveMotionFunc(ImGui_ImplGLUT_MotionFunc);
     glutIdleFunc(idle_func);
 
 

@@ -13,6 +13,8 @@
 #include <gipc/tet_local_info.h>
 #include <muda/ext/eigen.h>
 #include <gipc/utils/host_log.h>
+#include <abd_system/abd_trimesh_utils.h>
+#include <abd_system/abd_jacobi_matrix.h>
 
 namespace gipc
 {
@@ -63,6 +65,10 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
                              parms.mass_density,
                              abd_point_id_to_unique_point_id);
 
+    // For surface-mesh bodies (0 tets), inject per-vertex mass from surface integrals
+    if(!m_surface_mesh_bodies.empty())
+        _fix_surface_mesh_vertex_masses(abd.unique_point_id_to_mass);
+
     auto abd_body_count         = data.abd_fem_count_info().abd_body_num;
     auto abd_unique_point_count = data.abd_fem_count_info().abd_point_num;
 
@@ -73,6 +79,10 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
                                 abd.unique_point_id_to_mass,
                                 abd_unique_point_position,
                                 abd_unique_point_id_to_body_id);
+
+    // Override mass centers for surface-mesh bodies with true center-of-mass
+    if(!m_surface_mesh_bodies.empty())
+        _fix_surface_mesh_mass_centers();
 
     if(init)
     {
@@ -87,16 +97,6 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
     }
     else  // rebuild
     {
-        //_spawn_abd_state(abd.body_id_to_body_id_old,
-        //                 abd.body_id_to_is_fixed,
-        //                 abd.body_id_to_q,
-        //                 abd.body_id_to_q_temp,
-        //                 abd.body_id_to_q_tilde,
-        //                 abd.body_id_to_q_prev,
-        //                 abd.body_id_to_q_v,
-        //                 abd.body_id_to_dq);
-
-        //exp3_14
         MUDA_ERROR_WITH_LOCATION("In this version, we do not support the rebuild of ABDSystem!");
     }
 
@@ -136,6 +136,10 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
                        abd_body_count,
                        abd.body_id_to_abd_mass_inv,
                        abd.body_id_to_abd_gravity);
+
+    // Override body-level mass/volume/gravity for surface-mesh bodies
+    if(!m_surface_mesh_bodies.empty())
+        _apply_surface_mesh_body_overrides(data);
 }
 
 void ABDSystem::_setup_unique_point_mass(size_t unique_point_count,
@@ -694,4 +698,110 @@ void ABDSystem::_setup_abd_gravity(muda::CBufferView<Vector12> tet_abd_gravity_f
                        return gravity_acc;
                    });
 }
+// ---------------------------------------------------------------------------
+// Surface mesh body overrides
+// ---------------------------------------------------------------------------
+
+void ABDSystem::_fix_surface_mesh_vertex_masses(muda::DeviceBuffer<Float>& unique_point_mass)
+{
+    for(auto& smb : m_surface_mesh_bodies)
+    {
+        double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles);
+        double total_mass = std::abs(volume) * parms.mass_density;
+        double mass_per_vertex = total_mass / static_cast<double>(smb.point_count);
+
+        std::vector<Float> h_masses(smb.point_count, static_cast<Float>(mass_per_vertex));
+        cudaMemcpy(unique_point_mass.data() + smb.point_start,
+                   h_masses.data(),
+                   smb.point_count * sizeof(Float),
+                   cudaMemcpyHostToDevice);
+
+        std::cout << "[SurfaceMesh] body " << smb.body_id
+                  << ": volume=" << volume
+                  << ", mass=" << total_mass
+                  << ", verts=" << smb.point_count << std::endl;
+    }
+}
+
+void ABDSystem::_fix_surface_mesh_mass_centers()
+{
+    for(auto& smb : m_surface_mesh_bodies)
+    {
+        double m = 0.0;
+        Eigen::Vector3d m_x = Eigen::Vector3d::Zero();
+        Eigen::Matrix3d m_xx = Eigen::Matrix3d::Zero();
+        gipc::compute_trimesh_dyadic_mass(smb.vertices, smb.triangles,
+                                          parms.mass_density, m, m_x, m_xx);
+
+        Eigen::Vector3d center = m_x / m;
+        Vector3 h_center = center;
+        cudaMemcpy(body_mass_center.data() + smb.body_id,
+                   &h_center,
+                   sizeof(Vector3),
+                   cudaMemcpyHostToDevice);
+    }
+}
+
+void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
+{
+    auto& abd = data.device;
+
+    for(auto& smb : m_surface_mesh_bodies)
+    {
+        double out_m = 0.0;
+        Eigen::Vector3d out_m_x = Eigen::Vector3d::Zero();
+        Eigen::Matrix3d out_m_xx = Eigen::Matrix3d::Zero();
+        gipc::compute_trimesh_dyadic_mass(smb.vertices, smb.triangles,
+                                          parms.mass_density,
+                                          out_m, out_m_x, out_m_xx);
+
+        Eigen::Vector3d center = out_m_x / out_m;
+
+        // Centered second moment: m_xx_bar = m_xx - (1/m) * m_x * m_x^T
+        Eigen::Matrix3d m_xx_centered = out_m_xx - (1.0 / out_m) * out_m_x * out_m_x.transpose();
+
+        // Build ABDJacobiDyadicMass in body-centered frame
+        ABDJacobiDyadicMass dyadic = ABDJacobiDyadicMass::from_dyadic_mass(
+            out_m, Vector3::Zero(), m_xx_centered);
+
+        // Upload body dyadic mass
+        cudaMemcpy(abd.body_id_to_abd_mass.data() + smb.body_id,
+                   &dyadic,
+                   sizeof(ABDJacobiDyadicMass),
+                   cudaMemcpyHostToDevice);
+
+        // Compute and upload inverse mass matrix
+        Matrix12x12 M_mat = dyadic.to_mat();
+        Matrix12x12 M_inv = M_mat.inverse();
+        cudaMemcpy(abd.body_id_to_abd_mass_inv.data() + smb.body_id,
+                   &M_inv,
+                   sizeof(Matrix12x12),
+                   cudaMemcpyHostToDevice);
+
+        // Upload volume
+        double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles);
+        Float h_vol = static_cast<Float>(std::abs(volume));
+        cudaMemcpy(abd.body_id_to_volume.data() + smb.body_id,
+                   &h_vol,
+                   sizeof(Float),
+                   cudaMemcpyHostToDevice);
+
+        // Gravity: in body-centered frame, first moment is zero so
+        // f_gravity = [m*g; 0; 0; 0] and gravity_acc = M^-1 * f_gravity
+        Vector12 gravity_force = Vector12::Zero();
+        gravity_force.segment<3>(0) = out_m * parms.gravity;
+        Vector12 gravity_acc = M_inv * gravity_force;
+        cudaMemcpy(abd.body_id_to_abd_gravity.data() + smb.body_id,
+                   &gravity_acc,
+                   sizeof(Vector12),
+                   cudaMemcpyHostToDevice);
+
+        std::cout << "[SurfaceMesh] body " << smb.body_id
+                  << " override: mass=" << out_m
+                  << ", vol=" << std::abs(volume)
+                  << ", center=(" << center.x() << "," << center.y() << "," << center.z() << ")"
+                  << std::endl;
+    }
+}
+
 }  // namespace gipc
