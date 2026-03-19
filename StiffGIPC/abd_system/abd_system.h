@@ -1,14 +1,28 @@
 #pragma once
 #include <abd_system/abd_sim_data.h>
 #include <abd_system/abd_joint_constraint.h>
+#include <abd_system/abd_driving_joint.h>
 #include <joint_constraint_host_info.h>
+#include <joint_angle_control.h>
 #include <muda/buffer/device_var.h>
 #include <muda/ext/linear_system.h>
 #include <abd_system/abd_system_parms.h>
 #include <linear_system/utils/converter.h>
 #include "linear_system/linear_system/global_matrix.h"
+#include <Eigen/Dense>
 namespace gipc
 {
+
+/// Host-side surface mesh data for ABD bodies loaded from triangle meshes.
+/// Used by ABDSystem to compute mass/volume/gravity via surface integrals.
+struct ABDSurfaceMeshBody
+{
+    std::vector<Eigen::Vector3d> vertices;
+    std::vector<Eigen::Vector3i> triangles;
+    int body_id     = -1;
+    int point_start = -1;  // first unique_point_id belonging to this body
+    int point_count = 0;   // number of unique points in this body
+};
 class ABDSystem
 {
   private:
@@ -60,6 +74,42 @@ class ABDSystem
     muda::DeviceBuffer<Matrix12x12>            m_joint_cross_hessian; // [num_joints] H_pc
     muda::DeviceVar<Float>                     m_joint_energy;
     muda::DeviceBuffer<Float>                  m_joint_energy_per_joint; // [num_joints]
+
+    // ---- Revolute Driving Joint Data ----
+    int                                         m_num_revolute_driving = 0;
+    muda::DeviceBuffer<RevoluteDrivingGPUData>   m_revolute_driving_data;
+    muda::DeviceBuffer<Matrix12x12>              m_revolute_driving_cross_hessian;
+    muda::DeviceVar<Float>                       m_revolute_driving_energy;
+    muda::DeviceBuffer<Float>                    m_revolute_driving_energy_per;
+
+    // ---- Prismatic Joint Constraint Data ----
+    int                                         m_num_prismatic = 0;
+    muda::DeviceBuffer<PrismaticJointGPUData>    m_prismatic_data;
+    muda::DeviceBuffer<Matrix12x12>              m_prismatic_cross_hessian;
+    muda::DeviceVar<Float>                       m_prismatic_energy;
+    muda::DeviceBuffer<Float>                    m_prismatic_energy_per;
+
+    // ---- Prismatic Driving Joint Data ----
+    int                                         m_num_prismatic_driving = 0;
+    muda::DeviceBuffer<PrismaticDrivingGPUData>  m_prismatic_driving_data;
+    muda::DeviceBuffer<Matrix12x12>              m_prismatic_driving_cross_hessian;
+    muda::DeviceVar<Float>                       m_prismatic_driving_energy;
+    muda::DeviceBuffer<Float>                    m_prismatic_driving_energy_per;
+
+    // ---- Surface Mesh Bodies (for native surface integral path) ----
+    std::vector<ABDSurfaceMeshBody> m_surface_mesh_bodies;
+
+    // ---- Bilateral Stitch Constraint Data ----
+    // Set from GIPC before each call to setup_abd_system_gradient_hessian.
+    // These are GPU pointers owned by device_TetraData (not managed here).
+    int        m_stitch_count              = 0;
+    int*       m_d_stitch_paired_vertex    = nullptr;  // ABD unique point id per spring
+    double3*   m_d_stitch_rest_offset      = nullptr;  // rest offset per spring
+    int*       m_d_stitch_abd_body_id      = nullptr;  // ABD body id per spring
+    uint32_t*  m_d_stitch_fem_vertex_id    = nullptr;  // FEM vertex (= targetInd)
+    double3*   m_d_all_vertexes            = nullptr;  // all vertex positions
+    double     m_stitch_motion_rate        = 0.0;
+    double     m_stitch_rate               = 0.0;      // animation_fullRate
 
   public:
     ABDSystemParms parms;
@@ -159,6 +209,11 @@ class ABDSystem
                             muda::CBufferView<Matrix12x12> abd_dyadic_mass_inv,
                             muda::DeviceBuffer<Vector12>&  abd_gravity);
 
+    // Surface mesh body overrides (host → device uploads)
+    void _fix_surface_mesh_vertex_masses(muda::DeviceBuffer<Float>& unique_point_mass);
+    void _fix_surface_mesh_mass_centers();
+    void _apply_surface_mesh_body_overrides(ABDSimData& data);
+
     /*******************************************************************************
     *                                 involution
     ********************************************************************************/
@@ -220,11 +275,42 @@ class ABDSystem
     Float cal_abd_kinetic_energy(ABDSimData& sim_data);
     Float cal_abd_shape_energy(ABDSimData& sim_data);
     Float cal_abd_joint_energy(ABDSimData& sim_data);
+    Float cal_abd_revolute_driving_energy(ABDSimData& sim_data);
+    Float cal_abd_prismatic_energy(ABDSimData& sim_data);
+    Float cal_abd_prismatic_driving_energy(ABDSimData& sim_data);
 
     // Joint constraint setup: upload from host data, compute material coords
     void init_joint_constraints(ABDSimData& sim_data,
                                 const std::vector<JointConstraintHostInfo>& host_joints);
 
+    /// Initialize revolute driving joints (sin-based angle control).
+    void init_revolute_driving(ABDSimData& sim_data,
+                               const std::vector<JointAngleControlInfo>& controls,
+                               const std::vector<JointConstraintHostInfo>& host_joints);
+
+    /// Update target angles for revolute driving joints (called per frame from UI).
+    /// Uses incremental-angle approach: reads q_prev to compute the actual angle,
+    /// then sets target = θ_prev + clamp(θ_goal - θ_prev, -step, step).
+    void update_revolute_driving_targets(ABDSimData& sim_data,
+                                         const std::vector<JointAngleControlInfo>& controls);
+
     void _cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data);
+    void _cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_data);
+
+    // Prismatic joint constraint: init, energy, gradient/hessian
+    void init_prismatic_constraints(ABDSimData& sim_data,
+                                    const std::vector<PrismaticJointHostInfo>& host_prismatic);
+
+    void init_prismatic_driving(ABDSimData& sim_data,
+                                const std::vector<PrismaticDrivingControlInfo>& controls,
+                                const std::vector<PrismaticJointHostInfo>& host_prismatic);
+
+    void update_prismatic_driving_targets(ABDSimData& sim_data,
+                                          const std::vector<PrismaticDrivingControlInfo>& controls);
+
+    void _cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data);
+    void _cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_data);
+
+    void _cal_abd_stitch_gradient_and_hessian(ABDSimData& sim_data);
 };
 }  // namespace gipc

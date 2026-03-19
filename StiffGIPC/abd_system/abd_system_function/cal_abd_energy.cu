@@ -46,6 +46,37 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
                            K           = 0.5 * dq.dot(M * dq);
                        }
 
+                       if(boundary_type(i) == BodyBoundaryType::Animated)
+                       {
+                           // Kinetic energy
+                           Vector12 dq_kin = q - q_tilde;
+                           K = 0.5 * dq_kin.dot(M * dq_kin);
+
+                           // Animated penalty energy (absolute target)
+                           // body_motor_params = [target_x, target_y, target_z, strength, 0]
+                           // Constrain translation toward target, affine A toward identity.
+                           Vector3 aim_pos = q_tilde.segment<3>(0);
+                           double  anim_strength = 1e6;
+                           if(body_motor_data)
+                           {
+                               aim_pos(0) = body_motor_data[i * 5 + 0];
+                               aim_pos(1) = body_motor_data[i * 5 + 1];
+                               aim_pos(2) = body_motor_data[i * 5 + 2];
+                               double st = body_motor_data[i * 5 + 3];
+                               if(st > 0.0) anim_strength = st;
+                           }
+                           // q_aim: target position + identity affine matrix
+                           Vector12 q_aim;
+                           q_aim.segment<3>(0) = aim_pos;
+                           q_aim(3) = 1.0; q_aim(4) = 0.0; q_aim(5) = 0.0;
+                           q_aim(6) = 0.0; q_aim(7) = 1.0; q_aim(8) = 0.0;
+                           q_aim(9) = 0.0; q_aim(10) = 0.0; q_aim(11) = 1.0;
+                           Vector12 dq_anim = q - q_aim;
+                           // Penalize all 12 DOFs: translation + affine
+                           Matrix12x12 PowMass = anim_strength * Matrix12x12::Identity();
+                           K += 0.5 * dq_anim.dot(PowMass * dq_anim);
+                       }
+
                        if(boundary_type(i) == BodyBoundaryType::Motor)
                        {
                            {
@@ -173,22 +204,22 @@ Float ABDSystem::cal_abd_joint_energy(ABDSimData& sim_data)
     if(!num_joints)
         return 0;
 
-    auto kdt2 = parms.joint_stiffness * parms.dt * parms.dt;
+    auto kappa_fallback = parms.joint_strength_ratio;  // fallback; per-joint kappa takes priority
 
     m_joint_energy_per_joint.resize(num_joints);
 
     ParallelFor()
         .kernel_name(__FUNCTION__)
         .apply(num_joints,
-               [energies   = m_joint_energy_per_joint.viewer().name("joint_energies"),
-                joints     = m_joint_data.cviewer().name("joint_data"),
-                qs         = abd.body_id_to_q.cviewer().name("qs"),
-                kdt2] __device__(int j) mutable
+               [energies       = m_joint_energy_per_joint.viewer().name("joint_energies"),
+                joints         = m_joint_data.cviewer().name("joint_data"),
+                qs             = abd.body_id_to_q.cviewer().name("qs"),
+                kappa_fallback] __device__(int j) mutable
                {
                    auto& joint     = joints(j);
                    auto& q_parent  = qs(joint.parent_body_id);
                    auto& q_child   = qs(joint.child_body_id);
-                   energies(j) = joint_constraint_energy(joint, q_parent, q_child, kdt2);
+                   energies(j) = joint_constraint_energy(joint, q_parent, q_child, kappa_fallback);
                });
 
     muda::DeviceReduce().Sum(

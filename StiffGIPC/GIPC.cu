@@ -6374,14 +6374,30 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
                                                          double rate,
                                                          int    global_offset,
                                                          int global_hessian_fem_offset,
+                                                         const int*     stitch_paired_vertex,
+                                                         const double3* stitch_rest_offset,
                                                          int number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     uint32_t vInd = targetInd[idx];
-    double   x = vertexes[vInd].x, y = vertexes[vInd].y, z = vertexes[vInd].z,
-           a = targetVert[idx].x, b = targetVert[idx].y, c = targetVert[idx].z;
+    double   x = vertexes[vInd].x, y = vertexes[vInd].y, z = vertexes[vInd].z;
+    double   a, b, c;
+    // For bilateral stitch springs, compute target dynamically from current ABD vertex
+    if(stitch_paired_vertex && stitch_paired_vertex[idx] >= 0)
+    {
+        int abd_idx = stitch_paired_vertex[idx];
+        a = vertexes[abd_idx].x + stitch_rest_offset[idx].x;
+        b = vertexes[abd_idx].y + stitch_rest_offset[idx].y;
+        c = vertexes[abd_idx].z + stitch_rest_offset[idx].z;
+    }
+    else
+    {
+        a = targetVert[idx].x;
+        b = targetVert[idx].y;
+        c = targetVert[idx].z;
+    }
     //double dis = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(vertexes[vInd], targetVert[idx]));
     //printf("%f\n", dis);
     double d = motionRate;
@@ -6414,14 +6430,29 @@ __global__ void _computeSoftConstraintGradient(const double3*  vertexes,
                                                double3*        gradient,
                                                double          motionRate,
                                                double          rate,
+                                               const int*      stitch_paired_vertex,
+                                               const double3*  stitch_rest_offset,
                                                int             number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     uint32_t vInd = targetInd[idx];
-    double   x = vertexes[vInd].x, y = vertexes[vInd].y, z = vertexes[vInd].z,
-           a = targetVert[idx].x, b = targetVert[idx].y, c = targetVert[idx].z;
+    double   x = vertexes[vInd].x, y = vertexes[vInd].y, z = vertexes[vInd].z;
+    double   a, b, c;
+    if(stitch_paired_vertex && stitch_paired_vertex[idx] >= 0)
+    {
+        int abd_idx = stitch_paired_vertex[idx];
+        a = vertexes[abd_idx].x + stitch_rest_offset[idx].x;
+        b = vertexes[abd_idx].y + stitch_rest_offset[idx].y;
+        c = vertexes[abd_idx].z + stitch_rest_offset[idx].z;
+    }
+    else
+    {
+        a = targetVert[idx].x;
+        b = targetVert[idx].y;
+        c = targetVert[idx].z;
+    }
     //double dis = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(vertexes[vInd], targetVert[idx]));
     //printf("%f\n", dis);
     double d = motionRate;
@@ -7589,6 +7620,8 @@ __global__ void _computeSoftConstraintEnergy_Reduction(double*        squeue,
                                                        const uint32_t* targetInd,
                                                        double motionRate,
                                                        double rate,
+                                                       const int*     stitch_paired_vertex,
+                                                       const double3* stitch_rest_offset,
                                                        int    number)
 {
     int idof = blockIdx.x * blockDim.x;
@@ -7599,8 +7632,21 @@ __global__ void _computeSoftConstraintEnergy_Reduction(double*        squeue,
     if(idx >= number)
         return;
     uint32_t vInd = targetInd[idx];
+    double3 target;
+    if(stitch_paired_vertex && stitch_paired_vertex[idx] >= 0)
+    {
+        int abd_idx = stitch_paired_vertex[idx];
+        target = make_double3(
+            vertexes[abd_idx].x + stitch_rest_offset[idx].x,
+            vertexes[abd_idx].y + stitch_rest_offset[idx].y,
+            vertexes[abd_idx].z + stitch_rest_offset[idx].z);
+    }
+    else
+    {
+        target = targetVert[idx];
+    }
     double   dis  = __GEIGEN__::__squaredNorm(__GEIGEN__::__s_vec_multiply(
-        __GEIGEN__::__minus(vertexes[vInd], targetVert[idx]), rate));
+        __GEIGEN__::__minus(vertexes[vInd], target), rate));
     double   d    = motionRate;
     double   temp = d * dis * 0.5;
 
@@ -8334,14 +8380,10 @@ __global__ void _edgeTriIntersectionQuery(const int*     _bodyId,
                                            _vertexes[face.y],
                                            _vertexes[face.z]))
                         {
-                            //atomicAdd(_isIntesect, -1);
                             *_isIntesect = -1;
-                            //printf("tri: %d %d %d,  edge: %d  %d\n",
-                            //       face.x,
-                            //       face.y,
-                            //       face.z,
-                            //       _edges[obj_idx].x,
-                            //       _edges[obj_idx].y);
+                            printf("[INTERSECT-L] tri(%d,%d,%d) body=%d  edge(%d,%d) body=%d\n",
+                                   face.x, face.y, face.z, _bodyId[face.x],
+                                   _edges[obj_idx].x, _edges[obj_idx].y, _bodyId[_edges[obj_idx].x]);
                             return;
                         }
                 }
@@ -8381,14 +8423,10 @@ __global__ void _edgeTriIntersectionQuery(const int*     _bodyId,
                                            _vertexes[face.y],
                                            _vertexes[face.z]))
                         {
-                            //atomicAdd(_isIntesect, -1);
                             *_isIntesect = -1;
-                            //printf("tri: %d %d %d,  edge: %d  %d\n",
-                            //       face.x,
-                            //       face.y,
-                            //       face.z,
-                            //       _edges[obj_idx].x,
-                            //       _edges[obj_idx].y);
+                            printf("[INTERSECT-R] tri(%d,%d,%d) body=%d  edge(%d,%d) body=%d\n",
+                                   face.x, face.y, face.z, _bodyId[face.x],
+                                   _edges[obj_idx].x, _edges[obj_idx].y, _bodyId[_edges[obj_idx].x]);
                             return;
                         }
                 }
@@ -8661,8 +8699,13 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
     long long unsigned total_internal_triplet_num =
         ((abd_fem_count_info.fem_tet_num + tri_edge_num) * 10 + triangleNum * 6)
+        + softNum
         + abd_fem_count_info.abd_body_num * 10
-        + num_joint_constraints * 16;  // 16 block-3x3 per joint cross-body hessian
+        + num_joint_constraints * 16
+        + static_cast<long long>(m_abd_system->m_num_revolute_driving) * 16
+        + static_cast<long long>(m_abd_system->m_num_prismatic) * 16
+        + static_cast<long long>(m_abd_system->m_num_prismatic_driving) * 16
+        + static_cast<long long>(softNum) * 4;
     long long unsigned total_max_collision_triplet_num =
         minCollisionBuffer4 * 16 + minCollisionBuffer3 * 9
         + minCollisionBuffer2 * 4 + minCollisionBuffer1;
@@ -8777,6 +8820,8 @@ void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int globa
         animation_fullRate,
         gipc_global_triplet.global_triplet_offset,
         global_hessian_fem_offset,
+        m_d_stitch_paired_vertex,
+        m_d_stitch_rest_offset,
         softNum);
 }
 
@@ -8921,11 +8966,14 @@ void GIPC::computeSoftConstraintGradient(double3* _gradient)
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
     // offset
     _computeSoftConstraintGradient<<<blockNum, threadNum>>>(
-        _vertexes, targetVert, targetInd, _gradient, softMotionRate, animation_fullRate, softNum);
+        _vertexes, targetVert, targetInd, _gradient, softMotionRate, animation_fullRate,
+        m_d_stitch_paired_vertex, m_d_stitch_rest_offset, softNum);
 }
 
 double GIPC::self_largestFeasibleStepSize(double slackness, double* mqueue, int numbers)
 {
+    if(m_skip_all_collision)
+        return 1.0;
     //slackness = 0.9;
     //int numbers = h_cpNum[0];
     if(numbers < 1)
@@ -9032,6 +9080,8 @@ double reduction2Kappa(int type, const double3* A, const double3* B, double* _qu
 
 double GIPC::ground_largestFeasibleStepSize(double slackness, double* mqueue)
 {
+    if(m_skip_all_collision)
+        return 1.0;
 
     int numbers = surf_vertexNum;
     if(numbers < 1)
@@ -9111,6 +9161,12 @@ double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueu
 
 void GIPC::buildCP()
 {
+    if(m_skip_all_collision)
+    {
+        memset(h_cpNum, 0, sizeof(h_cpNum));
+        h_gpNum = 0;
+        return;
+    }
 
     CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_gpNum, 0, sizeof(uint32_t)));
@@ -9131,6 +9187,12 @@ void GIPC::buildCP()
 
 void GIPC::buildFullCP(const double& alpha)
 {
+    if(m_skip_all_collision)
+    {
+        h_ccd_cpNum = 0;
+        return;
+    }
+
     CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, sizeof(uint32_t)));
 
     bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
@@ -9141,6 +9203,8 @@ void GIPC::buildFullCP(const double& alpha)
 
 void GIPC::buildBVH()
 {
+    if(m_skip_all_collision)
+        return;
     bvh_f.Construct();
     bvh_e.Construct();
 }
@@ -9152,6 +9216,8 @@ AABB* GIPC::calcuMaxSceneSize()
 
 void GIPC::buildBVH_FULLCCD(const double& alpha)
 {
+    if(m_skip_all_collision)
+        return;
     bvh_f.ConstructFullCCD(_moveDir, alpha);
     bvh_e.ConstructFullCCD(_moveDir, alpha);
 }
@@ -10216,6 +10282,16 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     {
         gipc::Timer timer{"setup_abd_system_gradient_hessian"};
 
+        // Set stitch spring parameters for ABD-side bilateral coupling
+        m_abd_system->m_stitch_count              = softNum;
+        m_abd_system->m_d_stitch_paired_vertex    = m_d_stitch_paired_vertex;
+        m_abd_system->m_d_stitch_rest_offset      = m_d_stitch_rest_offset;
+        m_abd_system->m_d_stitch_abd_body_id      = m_d_stitch_abd_body_id;
+        m_abd_system->m_d_stitch_fem_vertex_id    = targetInd;
+        m_abd_system->m_d_all_vertexes            = _vertexes;
+        m_abd_system->m_stitch_motion_rate        = softMotionRate;
+        m_abd_system->m_stitch_rate               = animation_fullRate;
+
         m_abd_system->setup_abd_system_gradient_hessian(
             *m_abd_sim_data,
             TetMesh.BoundaryType,
@@ -10522,7 +10598,8 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
             break;
         case 9:
             _computeSoftConstraintEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.targetVert, TetMesh.targetIndex, softMotionRate, animation_fullRate, numbers);
+                queue, TetMesh.vertexes, TetMesh.targetVert, TetMesh.targetIndex, softMotionRate, animation_fullRate,
+                TetMesh.d_stitch_paired_vertex, TetMesh.d_stitch_rest_offset, numbers);
             break;
         case 10:
 #ifdef USE_QUADRATIC_BENDING
@@ -10581,6 +10658,15 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
 
     auto abd_joint = m_abd_system->cal_abd_joint_energy(*m_abd_sim_data);
     Energy += abd_joint;
+
+    auto abd_revolute_driving = m_abd_system->cal_abd_revolute_driving_energy(*m_abd_sim_data);
+    Energy += abd_revolute_driving;
+
+    auto abd_prismatic = m_abd_system->cal_abd_prismatic_energy(*m_abd_sim_data);
+    Energy += abd_prismatic;
+
+    auto abd_prismatic_driving = m_abd_system->cal_abd_prismatic_driving_energy(*m_abd_sim_data);
+    Energy += abd_prismatic_driving;
 
     auto fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(1, TetMesh);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -10718,6 +10804,9 @@ bool GIPC::checkGroundIntersection()
 
 bool GIPC::isIntersected(device_TetraData& TetMesh)
 {
+    if(m_skip_all_collision)
+        return false;
+
     if(checkGroundIntersection())
     {
         return true;

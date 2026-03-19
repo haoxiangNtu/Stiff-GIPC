@@ -73,6 +73,27 @@ class device_TetraData
     std::vector<double3>  host_target_vertices;
     std::function<double3(double3 vertex, int step_id, double ipc_dt)> update_soft_constraint_functor =
         nullptr;
+
+    // Stitch spring support: for soft constraint i, if stitch_paired_vertex[i] >= 0,
+    // the target position is: position_of(stitch_paired_vertex[i]) + stitch_rest_offset[i]
+    // This gives a spring with rest length = |stitch_rest_offset[i]|.
+    // Bilateral coupling: gradient+Hessian on both FEM and ABD sides + cross-Hessian.
+    std::vector<int>     stitch_paired_vertex;  // size = m_soft_num, -1 = use functor
+    std::vector<double3> stitch_rest_offset;    // size = m_soft_num, rest offset from ABD to FEM
+    std::vector<int>     stitch_abd_body_id;    // size = m_soft_num, ABD body id
+
+    // GPU copies of stitch data (allocated in Malloc_DEVICE_MEM if softNum > 0)
+    int*     d_stitch_paired_vertex = nullptr;  // GPU: ABD unique point id per spring (-1 if functor)
+    double3* d_stitch_rest_offset   = nullptr;  // GPU: rest offset per spring
+    int*     d_stitch_abd_body_id   = nullptr;  // GPU: ABD body id per spring
+
+    // Per-frame callback to update body_motor_params on the GPU.
+    // Called at the beginning of each timestep with (step_id, ipc_dt, body_motor_params_gpu, body_count).
+    // The functor should cudaMemcpy the updated params to the GPU pointer.
+    std::function<void(int step_id, double ipc_dt, double* body_motor_params_gpu, int body_count)>
+        pre_step_functor = nullptr;
+    int m_body_count = 0;  // total body count for pre_step_functor
+
     void update_soft_constraint_target_position(int step_id, double ipc_dt);
 
 

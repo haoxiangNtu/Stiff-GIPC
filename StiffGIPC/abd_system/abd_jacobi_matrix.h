@@ -188,6 +188,16 @@ class ABDJacobiDyadicMass
 
     static MUDA_GENERIC auto zero() { return ABDJacobiDyadicMass{}; }
 
+    static MUDA_GENERIC ABDJacobiDyadicMass from_dyadic_mass(
+        double sum_m, const Vector3& sum_m_x_bar, const Matrix3x3& sum_m_x_bar_x_bar)
+    {
+        ABDJacobiDyadicMass ret;
+        ret.m_mass                    = sum_m;
+        ret.m_mass_times_x_bar        = sum_m_x_bar;
+        ret.m_mass_times_dyadic_x_bar = sum_m_x_bar_x_bar;
+        return ret;
+    }
+
     static MUDA_DEVICE ABDJacobiDyadicMass atomic_add(ABDJacobiDyadicMass& dst,
                                                       const ABDJacobiDyadicMass& src);
 

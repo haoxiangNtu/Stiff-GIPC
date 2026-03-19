@@ -6,6 +6,7 @@
 #include <gipc/utils/cuda_vec_to_eigen.h>
 #include <abd_system/abd_energy.h>
 #include <abd_system/abd_joint_constraint.h>
+#include <abd_system/abd_driving_joint.h>
 #include <gipc/utils/math.h>
 #include <gipc/utils/timer.h>
 #include "cuda_tools/cuda_tools.h"
@@ -13,6 +14,10 @@
 #include <vector>
 namespace gipc
 {
+
+struct DrivingCtrlPacked  { Float target_angle;    Float strength_ratio; };
+struct PrisCtrlPacked     { Float target_distance; Float strength_ratio; };
+
 //template <int ROWS, int COLS>
 __device__ inline void write_triplet_cv(Eigen::Matrix3d* triplet_value,
                                         int*             row_ids,
@@ -150,6 +155,10 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
 {
     _cal_abd_body_gradient_and_hessian(sim_data);
     _cal_abd_joint_gradient_and_hessian(sim_data);
+    _cal_abd_revolute_driving_gradient_and_hessian(sim_data);
+    _cal_abd_prismatic_gradient_and_hessian(sim_data);
+    _cal_abd_prismatic_driving_gradient_and_hessian(sim_data);
+    _cal_abd_stitch_gradient_and_hessian(sim_data);
     _cal_abd_system_barrier_gradient(sim_data, vertex_barrier_gradient);
     _setup_abd_system_hessian(sim_data, global_triplets);
 }
@@ -160,6 +169,10 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
 {
     _cal_abd_body_gradient_and_hessian(sim_data);
     _cal_abd_joint_gradient_and_hessian(sim_data);
+    _cal_abd_revolute_driving_gradient_and_hessian(sim_data);
+    _cal_abd_prismatic_gradient_and_hessian(sim_data);
+    _cal_abd_prismatic_driving_gradient_and_hessian(sim_data);
+    _cal_abd_stitch_gradient_and_hessian(sim_data);
     _cal_abd_system_barrier_gradient(sim_data, vertex_barrier_gradient);
     _setup_abd_system_hessian(sim_data, global_triplets);
 }
@@ -273,6 +286,38 @@ void ABDSystem::_cal_abd_body_gradient_and_hessian(ABDSimData& sim_data)
                        gradients(i)                                   = G;
                        system_gradient.segment<12>(i * 12).as_eigen() = G;
                        body_hessian(i)                                = H;
+
+                       if(boundary_type(i) == BodyBoundaryType::Animated)
+                       {
+                           // Soft drive with ABSOLUTE target:
+                           // body_motor_params = [target_x, target_y, target_z, strength, 0]
+                           // Constrain translation toward target, affine A toward identity.
+                           Vector3 aim_pos = q_tilde.segment<3>(0);  // fallback to q_tilde
+                           double  anim_strength = 1e6;
+                           if(body_motor_data)
+                           {
+                               aim_pos(0) = body_motor_data[i * 5 + 0];
+                               aim_pos(1) = body_motor_data[i * 5 + 1];
+                               aim_pos(2) = body_motor_data[i * 5 + 2];
+                               double st = body_motor_data[i * 5 + 3];
+                               if(st > 0.0) anim_strength = st;
+                           }
+
+                           // q_aim: target position + identity affine matrix
+                           Vector12 q_aim;
+                           q_aim.segment<3>(0) = aim_pos;
+                           q_aim(3) = 1.0; q_aim(4) = 0.0; q_aim(5) = 0.0;
+                           q_aim(6) = 0.0; q_aim(7) = 1.0; q_aim(8) = 0.0;
+                           q_aim(9) = 0.0; q_aim(10) = 0.0; q_aim(11) = 1.0;
+
+                           Vector12 dq = q - q_aim;
+                           // Penalize all 12 DOFs: translation + affine
+                           Matrix12x12 PowMass = anim_strength * Matrix12x12::Identity();
+
+                           system_gradient.segment<12>(i * 12).as_eigen() += PowMass * dq;
+                           gradients(i) += PowMass * dq;
+                           body_hessian(i) += PowMass;
+                       }
 
                        if(boundary_type(i) == BodyBoundaryType::Motor)
                        {
@@ -460,10 +505,17 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
     auto body_hessian_size          = abd_body_count;
 
     global_triplets.abd_abd_contact_num = bcooNum;
-    int joint_triplet_blocks = m_num_joints * 16;  // 16 block-3x3 per joint cross-body
+    int joint_triplet_blocks = m_num_joints * 16;
+    int revolute_driving_triplet_blocks = m_num_revolute_driving * 16;
+    int prismatic_triplet_blocks = m_num_prismatic * 16;
+    int prismatic_driving_triplet_blocks = m_num_prismatic_driving * 16;
+    int stitch_triplet_blocks = m_stitch_count * 4;
     int new_triplet_offset =
         global_triplets.fem_fem_contact_num + global_triplets.abd_fem_contact_num * 4
-        + (global_triplets.abd_abd_contact_num * 16 + abd_body_count * 10 + joint_triplet_blocks);
+        + (global_triplets.abd_abd_contact_num * 16 + abd_body_count * 10
+           + joint_triplet_blocks + revolute_driving_triplet_blocks
+           + prismatic_triplet_blocks + prismatic_driving_triplet_blocks
+           + stitch_triplet_blocks);
 
     int h_abd_fem_contact_start_id = global_triplets.fem_fem_contact_num;
     int h_abd_abd_contact_start_id =
@@ -595,7 +647,10 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
     global_triplets.h_abd_abd_contact_start_id = h_abd_abd_contact_start_id;
     global_triplets.abd_abd_contact_num =
-        16 * global_triplets.abd_abd_contact_num + abd_body_count * 10 + joint_triplet_blocks;
+        16 * global_triplets.abd_abd_contact_num + abd_body_count * 10
+        + joint_triplet_blocks + revolute_driving_triplet_blocks
+        + prismatic_triplet_blocks + prismatic_driving_triplet_blocks
+        + stitch_triplet_blocks;
 
     // Write joint cross-body Hessian triplets
     if(m_num_joints > 0)
@@ -640,6 +695,226 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
                    });
     }
 
+    // Write revolute driving cross-body Hessian triplets
+    if(m_num_revolute_driving > 0)
+    {
+        int drv_output_start = new_triplet_offset + h_abd_abd_contact_start_id
+                               + write_offset + 10 * body_hessian_size;
+        if(bcooNum > 0)
+            drv_output_start += 16 * bcooNum;
+        drv_output_start += joint_triplet_blocks;  // after joint cross-hessians
+
+        ParallelFor(256)
+            .kernel_name("write_revolute_driving_cross_hessian")
+            .apply(m_num_revolute_driving,
+                   [drvs          = m_revolute_driving_data.cviewer().name("drv_data"),
+                    cross_hessian = m_revolute_driving_cross_hessian.cviewer().name("drv_cross_hessian"),
+                    triplet_out   = global_triplets.block_values(),
+                    row_out       = global_triplets.block_row_indices(),
+                    col_out       = global_triplets.block_col_indices(),
+                    drv_output_start] __device__(int j) mutable
+                   {
+                       auto& drv = drvs(j);
+                       int   pid = drv.parent_body_id;
+                       int   cid = drv.child_body_id;
+
+                       auto H_pc = cross_hessian(j);
+
+                       unsigned int index_row[4] = {
+                           (unsigned int)(pid * 4),
+                           (unsigned int)(pid * 4 + 1),
+                           (unsigned int)(pid * 4 + 2),
+                           (unsigned int)(pid * 4 + 3)};
+
+                       unsigned int index_col[4] = {
+                           (unsigned int)(cid * 4),
+                           (unsigned int)(cid * 4 + 1),
+                           (unsigned int)(cid * 4 + 2),
+                           (unsigned int)(cid * 4 + 3)};
+
+                       int offset = drv_output_start + j * 16;
+                       write_triplet_cv2<12, 12>(
+                           triplet_out, row_out, col_out,
+                           index_row, index_col, H_pc, offset);
+                   });
+    }
+
+    // Write prismatic constraint cross-body Hessian triplets
+    if(m_num_prismatic > 0)
+    {
+        int pris_output_start = new_triplet_offset + h_abd_abd_contact_start_id
+                                + write_offset + 10 * body_hessian_size;
+        if(bcooNum > 0)
+            pris_output_start += 16 * bcooNum;
+        pris_output_start += joint_triplet_blocks;
+        pris_output_start += revolute_driving_triplet_blocks;
+
+        ParallelFor(256)
+            .kernel_name("write_prismatic_cross_hessian")
+            .apply(m_num_prismatic,
+                   [prisms        = m_prismatic_data.cviewer().name("prism_data"),
+                    cross_hessian = m_prismatic_cross_hessian.cviewer().name("pris_cross_hessian"),
+                    triplet_out   = global_triplets.block_values(),
+                    row_out       = global_triplets.block_row_indices(),
+                    col_out       = global_triplets.block_col_indices(),
+                    pris_output_start] __device__(int j) mutable
+                   {
+                       auto& pj  = prisms(j);
+                       int   pid = pj.parent_body_id;
+                       int   cid = pj.child_body_id;
+
+                       auto H_pc = cross_hessian(j);
+
+                       unsigned int index_row[4] = {
+                           (unsigned int)(pid * 4),
+                           (unsigned int)(pid * 4 + 1),
+                           (unsigned int)(pid * 4 + 2),
+                           (unsigned int)(pid * 4 + 3)};
+
+                       unsigned int index_col[4] = {
+                           (unsigned int)(cid * 4),
+                           (unsigned int)(cid * 4 + 1),
+                           (unsigned int)(cid * 4 + 2),
+                           (unsigned int)(cid * 4 + 3)};
+
+                       int offset = pris_output_start + j * 16;
+                       write_triplet_cv2<12, 12>(
+                           triplet_out, row_out, col_out,
+                           index_row, index_col, H_pc, offset);
+                   });
+    }
+
+    // Write prismatic driving cross-body Hessian triplets
+    if(m_num_prismatic_driving > 0)
+    {
+        int pris_drv_output_start = new_triplet_offset + h_abd_abd_contact_start_id
+                                    + write_offset + 10 * body_hessian_size;
+        if(bcooNum > 0)
+            pris_drv_output_start += 16 * bcooNum;
+        pris_drv_output_start += joint_triplet_blocks;
+        pris_drv_output_start += revolute_driving_triplet_blocks;
+        pris_drv_output_start += prismatic_triplet_blocks;
+
+        ParallelFor(256)
+            .kernel_name("write_prismatic_driving_cross_hessian")
+            .apply(m_num_prismatic_driving,
+                   [drvs          = m_prismatic_driving_data.cviewer().name("pris_drv_data"),
+                    cross_hessian = m_prismatic_driving_cross_hessian.cviewer().name("pris_drv_cross_hessian"),
+                    triplet_out   = global_triplets.block_values(),
+                    row_out       = global_triplets.block_row_indices(),
+                    col_out       = global_triplets.block_col_indices(),
+                    pris_drv_output_start] __device__(int j) mutable
+                   {
+                       auto& drv = drvs(j);
+                       int   pid = drv.parent_body_id;
+                       int   cid = drv.child_body_id;
+
+                       auto H_pc = cross_hessian(j);
+
+                       unsigned int index_row[4] = {
+                           (unsigned int)(pid * 4),
+                           (unsigned int)(pid * 4 + 1),
+                           (unsigned int)(pid * 4 + 2),
+                           (unsigned int)(pid * 4 + 3)};
+
+                       unsigned int index_col[4] = {
+                           (unsigned int)(cid * 4),
+                           (unsigned int)(cid * 4 + 1),
+                           (unsigned int)(cid * 4 + 2),
+                           (unsigned int)(cid * 4 + 3)};
+
+                       int offset = pris_drv_output_start + j * 16;
+                       write_triplet_cv2<12, 12>(
+                           triplet_out, row_out, col_out,
+                           index_row, index_col, H_pc, offset);
+                   });
+    }
+
+    // Write bilateral stitch spring ABD-FEM cross-Hessian triplets
+    if(m_stitch_count > 0 && m_d_stitch_paired_vertex)
+    {
+        auto fem_point_offset = sim_data.abd_fem_count_info().abd_point_num;
+        auto abd_pt_offset    = sim_data.abd_fem_count_info().abd_point_offset;
+        int stitch_output_start = new_triplet_offset + h_abd_abd_contact_start_id
+                                  + write_offset + 10 * body_hessian_size;
+        if(bcooNum > 0)
+            stitch_output_start += 16 * bcooNum;
+        stitch_output_start += joint_triplet_blocks;
+        stitch_output_start += revolute_driving_triplet_blocks;
+        stitch_output_start += prismatic_triplet_blocks;
+        stitch_output_start += prismatic_driving_triplet_blocks;
+
+        ParallelFor(256)
+            .kernel_name("write_stitch_cross_hessian")
+            .apply(m_stitch_count,
+                   [stitch_paired_vertex = m_d_stitch_paired_vertex,
+                    stitch_abd_body_id   = m_d_stitch_abd_body_id,
+                    stitch_fem_vertex_id = m_d_stitch_fem_vertex_id,
+                    Js                   = sim_data.device.unique_point_id_to_J.cviewer().name("Js"),
+                    is_fixed  = body_id_is_fixed.cviewer().name("is_fixed"),
+                    triplet_out = global_triplets.block_values(),
+                    row_out     = global_triplets.block_row_indices(),
+                    col_out     = global_triplets.block_col_indices(),
+                    abd_body_count,
+                    fem_point_offset,
+                    abd_pt_offset,
+                    motionRate     = m_stitch_motion_rate,
+                    rate           = m_stitch_rate,
+                    stitch_output_start] __device__(int i) mutable
+                   {
+                       int abd_point_id = stitch_paired_vertex[i];
+                       if(abd_point_id < 0)
+                       {
+                           // Not a stitch spring — zero out the 4 reserved blocks
+                           int offset = stitch_output_start + i * 4;
+                           for(int b = 0; b < 4; ++b)
+                           {
+                               triplet_out[offset + b].setZero();
+                               row_out[offset + b] = 0;
+                               col_out[offset + b] = 0;
+                           }
+                           return;
+                       }
+
+                       int body_id = stitch_abd_body_id[i];
+                       double k = motionRate * rate * rate;
+
+                       // J^T: 12x3 matrix
+                       int local_abd_point_id = abd_point_id - static_cast<int>(abd_pt_offset);
+                       gipc::ABDJacobi J = Js(local_abd_point_id);
+                       gipc::Matrix3x12 Jmat = J.to_mat();
+
+                       // Cross-Hessian = -k * J^T (12x3)
+                       // Written as 4 blocks of 3x3: H_block[b] = -k * Jmat^T rows [3b..3b+2]
+                       uint32_t fem_vid = stitch_fem_vertex_id[i];
+                       int local_fem_id = static_cast<int>(fem_vid) - static_cast<int>(fem_point_offset);
+                       int col_idx = abd_body_count * 4 + local_fem_id;
+
+                       bool is_zero = (is_fixed(body_id) == BodyBoundaryType::Fixed);
+
+                       int offset = stitch_output_start + i * 4;
+                       for(int b = 0; b < 4; ++b)
+                       {
+                           if(is_zero)
+                           {
+                               triplet_out[offset + b].setZero();
+                           }
+                           else
+                           {
+                               // Block (b, 0) of J^T: rows [3b..3b+2], cols [0..2]
+                               // J^T = Jmat^T, so J^T[3b+r][c] = Jmat[c][3b+r]
+                               Eigen::Matrix3d block;
+                               for(int r = 0; r < 3; ++r)
+                                   for(int c = 0; c < 3; ++c)
+                                       block(r, c) = -k * Jmat(c, b * 3 + r);
+                               triplet_out[offset + b] = block;
+                           }
+                           row_out[offset + b] = body_id * 4 + b;
+                           col_out[offset + b] = col_idx;
+                       }
+                   });
+    }
+
 
     global_triplets.global_collision_triplet_offset = new_triplet_offset;
     global_triplets.global_triplet_offset = global_triplets.global_collision_triplet_offset;
@@ -678,7 +953,7 @@ void ABDSystem::_cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data)
     using namespace muda;
 
     auto& abd = sim_data.device;
-    auto  kdt2 = parms.joint_stiffness * parms.dt * parms.dt;
+    auto  kappa_fallback = parms.joint_strength_ratio;  // fallback (per-joint kappa takes priority)
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
 
     m_joint_cross_hessian.resize(m_num_joints);
@@ -693,7 +968,7 @@ void ABDSystem::_cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data)
                 body_hessian    = abd_body_hessian.viewer().name("abd_body_hessian"),
                 cross_hessian   = m_joint_cross_hessian.viewer().name("joint_cross_hessian"),
                 is_fixed        = body_id_is_fixed.cviewer().name("is_fixed"),
-                kdt2] __device__(int j) mutable
+                kappa_fallback] __device__(int j) mutable
                {
                    auto& joint = joints(j);
                    int   pid   = joint.parent_body_id;
@@ -705,14 +980,12 @@ void ABDSystem::_cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data)
                    bool parent_fixed = (is_fixed(pid) == BodyBoundaryType::Fixed);
                    bool child_fixed  = (is_fixed(cid) == BodyBoundaryType::Fixed);
 
-                   // Compute gradient
                    Vector12 grad_parent, grad_child;
-                   joint_constraint_gradient(joint, q_parent, q_child, kdt2,
+                   joint_constraint_gradient(joint, q_parent, q_child, kappa_fallback,
                                              grad_parent, grad_child);
 
-                   // Compute Hessian blocks
                    Matrix12x12 H_pp, H_cc, H_pc;
-                   joint_constraint_hessian(joint, kdt2, H_pp, H_cc, H_pc);
+                   joint_constraint_hessian(joint, kappa_fallback, H_pp, H_cc, H_pc);
 
                    // Add gradient to parent body (skip if fixed)
                    if(!parent_fixed)
@@ -758,7 +1031,6 @@ void ABDSystem::init_joint_constraints(
 
     // Build host-side GPU data: world-space positions for now
     std::vector<JointConstraintGPUData> host_gpu_data(m_num_joints);
-    std::vector<Eigen::Vector3d> world_positions;  // all anchor positions flattened
 
     for(int j = 0; j < m_num_joints; j++)
     {
@@ -767,8 +1039,8 @@ void ABDSystem::init_joint_constraints(
         gj.parent_body_id = hj.parent_body_id;
         gj.child_body_id  = hj.child_body_id;
         gj.num_points     = hj.num_points;
+        gj.kappa      = 0.0;
 
-        // Initialize with world positions (will be converted to material coords below)
         for(int k = 0; k < kMaxJointConstraintPoints; k++)
         {
             if(k < hj.num_points)
@@ -776,43 +1048,62 @@ void ABDSystem::init_joint_constraints(
                 gj.parent_xbar[k] = Vector3(hj.world_anchor[k].x(),
                                               hj.world_anchor[k].y(),
                                               hj.world_anchor[k].z());
-                gj.child_xbar[k]  = gj.parent_xbar[k];  // same world position
+                gj.child_xbar[k]  = gj.parent_xbar[k];
+                gj.point_weight[k] = static_cast<Float>(hj.point_weight[k]);
             }
             else
             {
                 gj.parent_xbar[k] = Vector3::Zero();
                 gj.child_xbar[k]  = Vector3::Zero();
+                gj.point_weight[k] = 0.0;
             }
+        }
+
+        gj.has_direction_constraint = hj.has_direction_constraint ? 1 : 0;
+        if(hj.has_direction_constraint)
+        {
+            // Store world-space directions temporarily; converted to material below
+            gj.parent_n_bar = Vector3(hj.world_normal.x(), hj.world_normal.y(), hj.world_normal.z());
+            gj.child_n_bar  = gj.parent_n_bar;
+            gj.parent_b_bar = Vector3(hj.world_bitangent.x(), hj.world_bitangent.y(), hj.world_bitangent.z());
+            gj.child_b_bar  = gj.parent_b_bar;
+        }
+        else
+        {
+            gj.parent_n_bar = gj.child_n_bar = Vector3::Zero();
+            gj.parent_b_bar = gj.child_b_bar = Vector3::Zero();
         }
     }
 
-    // Upload to GPU
     m_joint_data.resize(m_num_joints);
     m_joint_data.view().copy_from(host_gpu_data.data());
-
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-    // Convert world-space positions to material coordinates using initial q:
-    // x_bar = world_pos - q.segment<3>(0)  (since initial A = I)
+    // Convert world-space positions to material coordinates and compute
+    // mass-based stiffness: kappa = strength_ratio * (m_parent + m_child).
+    // Matches rbs-uipc: joint energies have NO dt² factor — they act as stiff
+    // penalty terms relative to kinetic energy in the IP formulation.
     using namespace muda;
+    Float sr  = parms.joint_strength_ratio;
+
     ParallelFor(256)
         .kernel_name("convert_joint_world_to_material")
         .apply(m_num_joints,
-               [joints = m_joint_data.viewer().name("joint_data"),
-                qs     = abd.body_id_to_q.cviewer().name("qs")] __device__(int j) mutable
+               [joints    = m_joint_data.viewer().name("joint_data"),
+                qs        = abd.body_id_to_q.cviewer().name("qs"),
+                masses    = body_mass.cviewer().name("body_mass"),
+                sr] __device__(int j) mutable
                {
                    auto& joint = joints(j);
                    int   pid   = joint.parent_body_id;
                    int   cid   = joint.child_body_id;
 
-                   // Get initial body centers from q
+                   Float mass_sum = masses(pid) + masses(cid);
+                   joint.kappa = sr * mass_sum;
+
                    Vector3 p_parent = qs(pid).segment<3>(0);
                    Vector3 p_child  = qs(cid).segment<3>(0);
 
-                   // Get initial rotation matrices from q (should be close to identity at init)
-                   // A = [a1 a2 a3]^T, need A^{-1} to get material coords
-                   // But at initialization, A = I, so x_bar = world_pos - p
-                   // For robustness, use actual A:
                    Matrix3x3 A_parent;
                    A_parent.row(0) = qs(pid).segment<3>(3).transpose();
                    A_parent.row(1) = qs(pid).segment<3>(6).transpose();
@@ -828,15 +1119,770 @@ void ABDSystem::init_joint_constraints(
 
                    for(int k = 0; k < joint.num_points; k++)
                    {
-                       Vector3 world_pos = joint.parent_xbar[k];  // stored as world pos initially
+                       Vector3 world_pos = joint.parent_xbar[k];
                        joint.parent_xbar[k] = A_parent_inv * (world_pos - p_parent);
                        joint.child_xbar[k]  = A_child_inv * (world_pos - p_child);
+                   }
+
+                   if(joint.has_direction_constraint)
+                   {
+                       // Direction vectors: d_bar = A_inv * d_world (rotation only)
+                       joint.parent_n_bar = A_parent_inv * joint.parent_n_bar;
+                       joint.child_n_bar  = A_child_inv  * joint.child_n_bar;
+                       joint.parent_b_bar = A_parent_inv * joint.parent_b_bar;
+                       joint.child_b_bar  = A_child_inv  * joint.child_b_bar;
                    }
                });
 
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-    std::cout << "[ABDSystem] Initialized " << m_num_joints << " joint constraints." << std::endl;
+    // Log computed stiffness for the first joint
+    if(m_num_joints > 0)
+    {
+        std::vector<JointConstraintGPUData> dbg(1);
+        m_joint_data.view().subview(0, 1).copy_to(dbg.data());
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        std::cout << "[ABDSystem] Initialized " << m_num_joints << " joint constraints "
+                  << "(strength_ratio=" << sr
+                  << ", kappa[0]=" << dbg[0].kappa << ")." << std::endl;
+    }
+}
+
+
+// ============================================================================
+// Revolute Driving Joint Initialization
+// ============================================================================
+
+void ABDSystem::init_revolute_driving(
+    ABDSimData& sim_data,
+    const std::vector<JointAngleControlInfo>& controls,
+    const std::vector<JointConstraintHostInfo>& host_joints)
+{
+    m_num_revolute_driving = static_cast<int>(controls.size());
+    if(m_num_revolute_driving == 0)
+        return;
+
+    auto& abd = sim_data.device;
+
+    std::vector<RevoluteDrivingGPUData> host_data(m_num_revolute_driving);
+
+    for(int i = 0; i < m_num_revolute_driving; i++)
+    {
+        auto& ctrl = controls[i];
+        auto& drv  = host_data[i];
+
+        int ji = ctrl.constraint_index;
+        if(ji < 0 || ji >= static_cast<int>(host_joints.size()))
+            continue;
+
+        auto& hj = host_joints[ji];
+        drv.parent_body_id = hj.parent_body_id;
+        drv.child_body_id  = hj.child_body_id;
+
+        Eigen::Vector3d axis = ctrl.axis_dir.normalized();
+        Eigen::Vector3d n    = ctrl.n_dir.normalized();
+        Eigen::Vector3d m    = axis.cross(n).normalized();
+
+        drv.p_bar  = Vector3(n.x(), n.y(), n.z());
+        drv.pN_bar = Vector3(m.x(), m.y(), m.z());
+        drv.q_bar  = Vector3(n.x(), n.y(), n.z());
+        drv.qN_bar = Vector3(m.x(), m.y(), m.z());
+
+        drv.stiffness    = 0.0;  // computed on GPU using body masses
+        drv.target_angle = static_cast<Float>(ctrl.target_angle);
+    }
+
+    m_revolute_driving_data.resize(m_num_revolute_driving);
+    m_revolute_driving_data.view().copy_from(host_data.data());
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    // Compute mass-based stiffness and convert directions to material space on GPU.
+    // K = strength_ratio * ctrl.strength_ratio * (m_parent + m_child)
+    // Matches rbs-uipc: kappa = strength_ratio * (m_i + m_j), NO dt² factor.
+    // Joint energies are intentionally NOT scaled by dt² so they act as very
+    // stiff penalty terms relative to kinetic energy in the IP formulation.
+    using namespace muda;
+    Float sr  = parms.revolute_driving_strength_ratio;
+
+    // Upload per-joint strength ratios to a temp buffer
+    std::vector<Float> host_ctrl_sr(m_num_revolute_driving, 1.0);
+    for(int i = 0; i < m_num_revolute_driving && i < static_cast<int>(controls.size()); i++)
+        host_ctrl_sr[i] = static_cast<Float>(controls[i].strength_ratio);
+
+    muda::DeviceBuffer<Float> d_ctrl_sr(m_num_revolute_driving);
+    d_ctrl_sr.view().copy_from(host_ctrl_sr.data());
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    ParallelFor(256)
+        .kernel_name("init_driving_stiffness_and_material_dirs")
+        .apply(m_num_revolute_driving,
+               [drvs     = m_revolute_driving_data.viewer().name("revolute_driving"),
+                qs       = abd.body_id_to_q.cviewer().name("qs"),
+                masses   = body_mass.cviewer().name("body_mass"),
+                ctrl_sr  = d_ctrl_sr.cviewer().name("ctrl_sr"),
+                sr] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   int pid = drv.parent_body_id;
+                   int cid = drv.child_body_id;
+
+                   Float mass_sum = masses(pid) + masses(cid);
+                   drv.stiffness = sr * ctrl_sr(i) * mass_sum;
+
+                   Matrix3x3 A_parent;
+                   A_parent.row(0) = qs(pid).segment<3>(3).transpose();
+                   A_parent.row(1) = qs(pid).segment<3>(6).transpose();
+                   A_parent.row(2) = qs(pid).segment<3>(9).transpose();
+
+                   Matrix3x3 A_child;
+                   A_child.row(0) = qs(cid).segment<3>(3).transpose();
+                   A_child.row(1) = qs(cid).segment<3>(6).transpose();
+                   A_child.row(2) = qs(cid).segment<3>(9).transpose();
+
+                   Matrix3x3 A_parent_inv = eigen::inverse(A_parent);
+                   Matrix3x3 A_child_inv  = eigen::inverse(A_child);
+
+                   drv.p_bar  = (A_parent_inv * drv.p_bar).normalized();
+                   drv.pN_bar = (A_parent_inv * drv.pN_bar).normalized();
+                   drv.q_bar  = (A_child_inv  * drv.q_bar).normalized();
+                   drv.qN_bar = (A_child_inv  * drv.qN_bar).normalized();
+               });
+
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    if(m_num_revolute_driving > 0)
+    {
+        std::vector<RevoluteDrivingGPUData> dbg(1);
+        m_revolute_driving_data.view().subview(0, 1).copy_to(dbg.data());
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        std::cout << "[ABDSystem] Initialized " << m_num_revolute_driving
+                  << " revolute driving joints (strength_ratio=" << sr
+                  << ", K[0]=" << dbg[0].stiffness << ")." << std::endl;
+    }
+}
+
+
+// ============================================================================
+// Update Revolute Driving Targets (per frame from UI)
+// ============================================================================
+
+void ABDSystem::update_revolute_driving_targets(
+    ABDSimData& sim_data,
+    const std::vector<JointAngleControlInfo>& controls)
+{
+    if(controls.empty() || m_num_revolute_driving == 0)
+        return;
+
+    using namespace muda;
+    auto& abd = sim_data.device;
+    int n = m_num_revolute_driving;
+
+    std::vector<DrivingCtrlPacked> host_ctrl(n);
+    for(int i = 0; i < n && i < static_cast<int>(controls.size()); i++)
+    {
+        host_ctrl[i].target_angle   = static_cast<Float>(controls[i].target_angle);
+        host_ctrl[i].strength_ratio = static_cast<Float>(controls[i].strength_ratio);
+    }
+
+    muda::DeviceBuffer<DrivingCtrlPacked> d_ctrl(n);
+    d_ctrl.view().copy_from(host_ctrl.data());
+
+    constexpr Float kMaxStepPerFrame = 0.1;
+    Float sr = parms.revolute_driving_strength_ratio;
+
+    ParallelFor(256)
+        .kernel_name("update_revolute_driving_targets_gpu")
+        .apply(n,
+               [drvs    = m_revolute_driving_data.viewer().name("revolute_driving"),
+                q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
+                masses  = body_mass.cviewer().name("body_mass"),
+                ctrls   = d_ctrl.cviewer().name("ctrls"),
+                sr, kMaxStepPerFrame] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   int pid = drv.parent_body_id;
+                   int cid = drv.child_body_id;
+
+                   const auto& q1 = q_prev(pid);
+                   const auto& q2 = q_prev(cid);
+
+                   Matrix3x3 A1, A2;
+                   A1.row(0) = q1.segment<3>(3).transpose();
+                   A1.row(1) = q1.segment<3>(6).transpose();
+                   A1.row(2) = q1.segment<3>(9).transpose();
+                   A2.row(0) = q2.segment<3>(3).transpose();
+                   A2.row(1) = q2.segment<3>(6).transpose();
+                   A2.row(2) = q2.segment<3>(9).transpose();
+
+                   Vector3 p  = A1 * drv.p_bar;
+                   Vector3 pN = A1 * drv.pN_bar;
+                   Vector3 q  = A2 * drv.q_bar;
+                   Vector3 qN = A2 * drv.qN_bar;
+
+                   Float cos_prev = Float(0.5) * (p.dot(q) + pN.dot(qN));
+                   Float sin_prev = Float(0.5) * (q.dot(pN) - qN.dot(p));
+                   Float theta_prev = atan2(sin_prev, cos_prev);
+
+                   Float desired_goal = ctrls(i).target_angle;
+                   Float diff = desired_goal - theta_prev;
+                   diff = (diff >  kMaxStepPerFrame) ?  kMaxStepPerFrame :
+                          (diff < -kMaxStepPerFrame) ? -kMaxStepPerFrame : diff;
+
+                   drv.target_angle = theta_prev + diff;
+
+                   Float mass_sum = masses(pid) + masses(cid);
+                   drv.stiffness = sr * ctrls(i).strength_ratio * mass_sum;
+               });
+}
+
+
+// ============================================================================
+// Revolute Driving Energy
+// ============================================================================
+
+Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data)
+{
+    using namespace muda;
+    if(m_num_revolute_driving == 0)
+        return 0;
+
+    auto& abd = sim_data.device;
+    m_revolute_driving_energy_per.resize(m_num_revolute_driving);
+
+    ParallelFor()
+        .kernel_name("cal_revolute_driving_energy")
+        .apply(m_num_revolute_driving,
+               [energies = m_revolute_driving_energy_per.viewer().name("energies"),
+                drvs     = m_revolute_driving_data.cviewer().name("drvs"),
+                qs       = abd.body_id_to_q.cviewer().name("qs")] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   energies(i) = revolute_driving_energy(drv, qs(drv.parent_body_id),
+                                                              qs(drv.child_body_id));
+               });
+
+    muda::DeviceReduce().Sum(
+        m_revolute_driving_energy_per.data(), m_revolute_driving_energy.data(),
+        m_num_revolute_driving);
+
+    return m_revolute_driving_energy;
+}
+
+
+// ============================================================================
+// Revolute Driving Gradient & Hessian
+// ============================================================================
+
+void ABDSystem::_cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_data)
+{
+    if(m_num_revolute_driving == 0)
+        return;
+
+    using namespace muda;
+    auto& abd = sim_data.device;
+    auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
+
+    m_revolute_driving_cross_hessian.resize(m_num_revolute_driving);
+
+    ParallelFor(256)
+        .kernel_name("cal_revolute_driving_grad_hess")
+        .apply(m_num_revolute_driving,
+               [drvs            = m_revolute_driving_data.cviewer().name("drvs"),
+                qs               = abd.body_id_to_q.cviewer().name("qs"),
+                affine_gradient  = abd_gradient.viewer().name("abd_gradient"),
+                sys_gradient     = system_gradient.viewer().name("system_gradient"),
+                body_hessian     = abd_body_hessian.viewer().name("abd_body_hessian"),
+                cross_hessian    = m_revolute_driving_cross_hessian.viewer().name("drv_cross_hessian"),
+                is_fixed         = body_id_is_fixed.cviewer().name("is_fixed")] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   int pid = drv.parent_body_id;
+                   int cid = drv.child_body_id;
+
+                   auto& q1 = qs(pid);
+                   auto& q2 = qs(cid);
+
+                   bool p_fixed = (is_fixed(pid) == BodyBoundaryType::Fixed);
+                   bool c_fixed = (is_fixed(cid) == BodyBoundaryType::Fixed);
+
+                   Vector12 grad1, grad2;
+                   revolute_driving_gradient(drv, q1, q2, grad1, grad2);
+
+                   Matrix12x12 H_11, H_22, H_12;
+                   revolute_driving_hessian(drv, q1, q2, H_11, H_22, H_12);
+
+                   if(!p_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(pid), grad1);
+                       sys_gradient.segment<12>(pid * 12).atomic_add(grad1);
+                       eigen::atomic_add(body_hessian(pid), H_11);
+                   }
+
+                   if(!c_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(cid), grad2);
+                       sys_gradient.segment<12>(cid * 12).atomic_add(grad2);
+                       eigen::atomic_add(body_hessian(cid), H_22);
+                   }
+
+                   if(p_fixed || c_fixed)
+                       cross_hessian(i) = Matrix12x12::Zero();
+                   else
+                       cross_hessian(i) = H_12;
+               });
+}
+
+
+// ============================================================================
+// Prismatic Joint Constraint Initialization
+// ============================================================================
+
+void ABDSystem::init_prismatic_constraints(
+    ABDSimData& sim_data,
+    const std::vector<PrismaticJointHostInfo>& host_prismatic)
+{
+    m_num_prismatic = static_cast<int>(host_prismatic.size());
+    if(m_num_prismatic == 0)
+        return;
+
+    auto& abd = sim_data.device;
+
+    std::vector<PrismaticJointGPUData> host_gpu(m_num_prismatic);
+
+    for(int i = 0; i < m_num_prismatic; i++)
+    {
+        auto& hp = host_prismatic[i];
+        auto& gp = host_gpu[i];
+
+        gp.parent_body_id = hp.parent_body_id;
+        gp.child_body_id  = hp.child_body_id;
+
+        gp.Cp_bar = Vector3(hp.world_center.x(), hp.world_center.y(), hp.world_center.z());
+        gp.Cq_bar = gp.Cp_bar;
+
+        Eigen::Vector3d t = hp.world_axis.normalized();
+        Eigen::Vector3d n = hp.world_normal.normalized();
+        Eigen::Vector3d b = hp.world_bitangent.normalized();
+
+        gp.tp_bar = Vector3(t.x(), t.y(), t.z());
+        gp.tq_bar = gp.tp_bar;
+        gp.np_bar = Vector3(n.x(), n.y(), n.z());
+        gp.nq_bar = gp.np_bar;
+        gp.bp_bar = Vector3(b.x(), b.y(), b.z());
+        gp.bq_bar = gp.bp_bar;
+    }
+
+    m_prismatic_data.resize(m_num_prismatic);
+    m_prismatic_data.view().copy_from(host_gpu.data());
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    Float sr = parms.prismatic_strength_ratio;
+
+    using namespace muda;
+    ParallelFor(256)
+        .kernel_name("init_prismatic_constraints_material")
+        .apply(m_num_prismatic,
+               [prisms = m_prismatic_data.viewer().name("prismatic_data"),
+                qs     = abd.body_id_to_q.cviewer().name("qs"),
+                masses = body_mass.cviewer().name("body_mass"),
+                sr] __device__(int i) mutable
+               {
+                   auto& pj = prisms(i);
+                   int pid = pj.parent_body_id;
+                   int cid = pj.child_body_id;
+
+                   Matrix3x3 Ap, Ac;
+                   Ap.row(0) = qs(pid).segment<3>(3).transpose();
+                   Ap.row(1) = qs(pid).segment<3>(6).transpose();
+                   Ap.row(2) = qs(pid).segment<3>(9).transpose();
+                   Ac.row(0) = qs(cid).segment<3>(3).transpose();
+                   Ac.row(1) = qs(cid).segment<3>(6).transpose();
+                   Ac.row(2) = qs(cid).segment<3>(9).transpose();
+
+                   Matrix3x3 Ap_inv = eigen::inverse(Ap);
+                   Matrix3x3 Ac_inv = eigen::inverse(Ac);
+
+                   Vector3 pp = qs(pid).segment<3>(0);
+                   Vector3 pc = qs(cid).segment<3>(0);
+
+                   pj.Cp_bar = Ap_inv * (pj.Cp_bar - pp);
+                   pj.Cq_bar = Ac_inv * (pj.Cq_bar - pc);
+
+                   pj.tp_bar = (Ap_inv * pj.tp_bar).normalized();
+                   pj.tq_bar = (Ac_inv * pj.tq_bar).normalized();
+                   pj.np_bar = (Ap_inv * pj.np_bar).normalized();
+                   pj.nq_bar = (Ac_inv * pj.nq_bar).normalized();
+                   pj.bp_bar = (Ap_inv * pj.bp_bar).normalized();
+                   pj.bq_bar = (Ac_inv * pj.bq_bar).normalized();
+               });
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    std::cout << "[ABDSystem] Initialized " << m_num_prismatic
+              << " prismatic joint constraints (strength_ratio=" << sr << ")." << std::endl;
+}
+
+
+// ============================================================================
+// Prismatic Joint Constraint Energy
+// ============================================================================
+
+Float ABDSystem::cal_abd_prismatic_energy(ABDSimData& sim_data)
+{
+    using namespace muda;
+    if(m_num_prismatic == 0)
+        return 0;
+
+    auto& abd = sim_data.device;
+    Float kappa = parms.prismatic_strength_ratio;
+    m_prismatic_energy_per.resize(m_num_prismatic);
+
+    ParallelFor()
+        .kernel_name("cal_prismatic_energy")
+        .apply(m_num_prismatic,
+               [energies = m_prismatic_energy_per.viewer().name("energies"),
+                prisms   = m_prismatic_data.cviewer().name("prisms"),
+                qs       = abd.body_id_to_q.cviewer().name("qs"),
+                masses   = body_mass.cviewer().name("body_mass"),
+                kappa] __device__(int i) mutable
+               {
+                   auto& pj = prisms(i);
+                   Float K = kappa * (masses(pj.parent_body_id) + masses(pj.child_body_id));
+                   energies(i) = prismatic_constraint_energy(pj, qs(pj.parent_body_id),
+                                                                  qs(pj.child_body_id), K);
+               });
+
+    muda::DeviceReduce().Sum(
+        m_prismatic_energy_per.data(), m_prismatic_energy.data(), m_num_prismatic);
+
+    return m_prismatic_energy;
+}
+
+
+// ============================================================================
+// Prismatic Joint Constraint Gradient & Hessian
+// ============================================================================
+
+void ABDSystem::_cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data)
+{
+    if(m_num_prismatic == 0)
+        return;
+
+    using namespace muda;
+    auto& abd = sim_data.device;
+    auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
+    Float kappa = parms.prismatic_strength_ratio;
+
+    m_prismatic_cross_hessian.resize(m_num_prismatic);
+
+    ParallelFor(256)
+        .kernel_name("cal_prismatic_grad_hess")
+        .apply(m_num_prismatic,
+               [prisms          = m_prismatic_data.cviewer().name("prisms"),
+                qs              = abd.body_id_to_q.cviewer().name("qs"),
+                affine_gradient = abd_gradient.viewer().name("abd_gradient"),
+                sys_gradient    = system_gradient.viewer().name("system_gradient"),
+                body_hessian    = abd_body_hessian.viewer().name("abd_body_hessian"),
+                cross_hessian   = m_prismatic_cross_hessian.viewer().name("pris_cross_hessian"),
+                is_fixed        = body_id_is_fixed.cviewer().name("is_fixed"),
+                masses          = body_mass.cviewer().name("body_mass"),
+                kappa] __device__(int i) mutable
+               {
+                   auto& pj = prisms(i);
+                   int pid = pj.parent_body_id;
+                   int cid = pj.child_body_id;
+
+                   Float K = kappa * (masses(pid) + masses(cid));
+
+                   auto& q1 = qs(pid);
+                   auto& q2 = qs(cid);
+
+                   bool p_fixed = (is_fixed(pid) == BodyBoundaryType::Fixed);
+                   bool c_fixed = (is_fixed(cid) == BodyBoundaryType::Fixed);
+
+                   Vector12 grad1, grad2;
+                   Matrix12x12 H_pp, H_qq, H_pq;
+                   prismatic_constraint_gradient_hessian(pj, q1, q2, K,
+                                                         grad1, grad2, H_pp, H_qq, H_pq);
+
+                   if(!p_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(pid), grad1);
+                       sys_gradient.segment<12>(pid * 12).atomic_add(grad1);
+                       eigen::atomic_add(body_hessian(pid), H_pp);
+                   }
+
+                   if(!c_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(cid), grad2);
+                       sys_gradient.segment<12>(cid * 12).atomic_add(grad2);
+                       eigen::atomic_add(body_hessian(cid), H_qq);
+                   }
+
+                   if(p_fixed || c_fixed)
+                       cross_hessian(i) = Matrix12x12::Zero();
+                   else
+                       cross_hessian(i) = H_pq;
+               });
+}
+
+
+// ============================================================================
+// Prismatic Driving Joint Initialization
+// ============================================================================
+
+void ABDSystem::init_prismatic_driving(
+    ABDSimData& sim_data,
+    const std::vector<PrismaticDrivingControlInfo>& controls,
+    const std::vector<PrismaticJointHostInfo>& host_prismatic)
+{
+    m_num_prismatic_driving = static_cast<int>(controls.size());
+    if(m_num_prismatic_driving == 0)
+        return;
+
+    auto& abd = sim_data.device;
+
+    std::vector<PrismaticDrivingGPUData> host_data(m_num_prismatic_driving);
+
+    for(int i = 0; i < m_num_prismatic_driving; i++)
+    {
+        auto& ctrl = controls[i];
+        auto& drv  = host_data[i];
+
+        int pi = ctrl.prismatic_constraint_index;
+        if(pi < 0 || pi >= static_cast<int>(host_prismatic.size()))
+            continue;
+
+        auto& hp = host_prismatic[pi];
+        drv.parent_body_id = hp.parent_body_id;
+        drv.child_body_id  = hp.child_body_id;
+
+        Eigen::Vector3d c = hp.world_center;
+        Eigen::Vector3d t = hp.world_axis.normalized();
+
+        drv.Cp_bar = Vector3(c.x(), c.y(), c.z());
+        drv.Cq_bar = drv.Cp_bar;
+        drv.tq_bar = Vector3(t.x(), t.y(), t.z());
+
+        drv.stiffness       = 0.0;
+        drv.target_distance = static_cast<Float>(ctrl.target_distance);
+    }
+
+    m_prismatic_driving_data.resize(m_num_prismatic_driving);
+    m_prismatic_driving_data.view().copy_from(host_data.data());
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    Float sr = parms.prismatic_driving_strength_ratio;
+
+    std::vector<Float> host_ctrl_sr(m_num_prismatic_driving, 1.0);
+    for(int i = 0; i < m_num_prismatic_driving && i < static_cast<int>(controls.size()); i++)
+        host_ctrl_sr[i] = static_cast<Float>(controls[i].strength_ratio);
+
+    muda::DeviceBuffer<Float> d_ctrl_sr(m_num_prismatic_driving);
+    d_ctrl_sr.view().copy_from(host_ctrl_sr.data());
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    using namespace muda;
+    ParallelFor(256)
+        .kernel_name("init_prismatic_driving_material")
+        .apply(m_num_prismatic_driving,
+               [drvs     = m_prismatic_driving_data.viewer().name("prismatic_driving"),
+                qs       = abd.body_id_to_q.cviewer().name("qs"),
+                masses   = body_mass.cviewer().name("body_mass"),
+                ctrl_sr  = d_ctrl_sr.cviewer().name("ctrl_sr"),
+                sr] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   int pid = drv.parent_body_id;
+                   int cid = drv.child_body_id;
+
+                   Float mass_sum = masses(pid) + masses(cid);
+                   drv.stiffness = sr * ctrl_sr(i) * mass_sum;
+
+                   Matrix3x3 Ap, Ac;
+                   Ap.row(0) = qs(pid).segment<3>(3).transpose();
+                   Ap.row(1) = qs(pid).segment<3>(6).transpose();
+                   Ap.row(2) = qs(pid).segment<3>(9).transpose();
+                   Ac.row(0) = qs(cid).segment<3>(3).transpose();
+                   Ac.row(1) = qs(cid).segment<3>(6).transpose();
+                   Ac.row(2) = qs(cid).segment<3>(9).transpose();
+
+                   Matrix3x3 Ap_inv = eigen::inverse(Ap);
+                   Matrix3x3 Ac_inv = eigen::inverse(Ac);
+
+                   Vector3 pp = qs(pid).segment<3>(0);
+                   Vector3 pc = qs(cid).segment<3>(0);
+
+                   drv.Cp_bar = Ap_inv * (drv.Cp_bar - pp);
+                   drv.Cq_bar = Ac_inv * (drv.Cq_bar - pc);
+                   drv.tq_bar = (Ac_inv * drv.tq_bar).normalized();
+               });
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    std::cout << "[ABDSystem] Initialized " << m_num_prismatic_driving
+              << " prismatic driving joints (strength_ratio=" << sr << ")." << std::endl;
+}
+
+
+// ============================================================================
+// Update Prismatic Driving Targets (per frame from UI)
+// ============================================================================
+
+void ABDSystem::update_prismatic_driving_targets(
+    ABDSimData& sim_data,
+    const std::vector<PrismaticDrivingControlInfo>& controls)
+{
+    if(controls.empty() || m_num_prismatic_driving == 0)
+        return;
+
+    using namespace muda;
+    auto& abd = sim_data.device;
+    int n = m_num_prismatic_driving;
+
+    std::vector<PrisCtrlPacked> host_ctrl(n);
+    for(int i = 0; i < n && i < static_cast<int>(controls.size()); i++)
+    {
+        host_ctrl[i].target_distance = static_cast<Float>(controls[i].target_distance);
+        host_ctrl[i].strength_ratio  = static_cast<Float>(controls[i].strength_ratio);
+    }
+
+    muda::DeviceBuffer<PrisCtrlPacked> d_ctrl(n);
+    d_ctrl.view().copy_from(host_ctrl.data());
+
+    constexpr Float kMaxStepPerFrame = 0.002;
+    Float sr = parms.prismatic_driving_strength_ratio;
+
+    ParallelFor(256)
+        .kernel_name("update_prismatic_driving_targets_gpu")
+        .apply(n,
+               [drvs    = m_prismatic_driving_data.viewer().name("prismatic_driving"),
+                q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
+                masses  = body_mass.cviewer().name("body_mass"),
+                ctrls   = d_ctrl.cviewer().name("ctrls"),
+                sr, kMaxStepPerFrame] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   int pid = drv.parent_body_id;
+                   int cid = drv.child_body_id;
+
+                   const auto& q1 = q_prev(pid);
+                   const auto& q2 = q_prev(cid);
+
+                   Vector3 Cp = ABDJacobi(drv.Cp_bar) * q1;
+                   Vector3 Cq = ABDJacobi(drv.Cq_bar) * q2;
+                   Matrix3x3 Aq;
+                   Aq.row(0) = q2.segment<3>(3).transpose();
+                   Aq.row(1) = q2.segment<3>(6).transpose();
+                   Aq.row(2) = q2.segment<3>(9).transpose();
+                   Vector3 tq = Aq * drv.tq_bar;
+
+                   Float d_prev = (Cp - Cq).dot(tq);
+
+                   Float desired_goal = ctrls(i).target_distance;
+                   Float diff = desired_goal - d_prev;
+                   diff = (diff >  kMaxStepPerFrame) ?  kMaxStepPerFrame :
+                          (diff < -kMaxStepPerFrame) ? -kMaxStepPerFrame : diff;
+
+                   drv.target_distance = d_prev + diff;
+
+                   Float mass_sum = masses(pid) + masses(cid);
+                   drv.stiffness = sr * ctrls(i).strength_ratio * mass_sum;
+               });
+}
+
+
+// ============================================================================
+// Prismatic Driving Energy
+// ============================================================================
+
+Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data)
+{
+    using namespace muda;
+    if(m_num_prismatic_driving == 0)
+        return 0;
+
+    auto& abd = sim_data.device;
+    m_prismatic_driving_energy_per.resize(m_num_prismatic_driving);
+
+    ParallelFor()
+        .kernel_name("cal_prismatic_driving_energy")
+        .apply(m_num_prismatic_driving,
+               [energies = m_prismatic_driving_energy_per.viewer().name("energies"),
+                drvs     = m_prismatic_driving_data.cviewer().name("drvs"),
+                qs       = abd.body_id_to_q.cviewer().name("qs")] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   energies(i) = prismatic_driving_energy(drv, qs(drv.parent_body_id),
+                                                               qs(drv.child_body_id));
+               });
+
+    muda::DeviceReduce().Sum(
+        m_prismatic_driving_energy_per.data(), m_prismatic_driving_energy.data(),
+        m_num_prismatic_driving);
+
+    return m_prismatic_driving_energy;
+}
+
+
+// ============================================================================
+// Prismatic Driving Gradient & Hessian
+// ============================================================================
+
+void ABDSystem::_cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_data)
+{
+    if(m_num_prismatic_driving == 0)
+        return;
+
+    using namespace muda;
+    auto& abd = sim_data.device;
+    auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
+
+    m_prismatic_driving_cross_hessian.resize(m_num_prismatic_driving);
+
+    ParallelFor(256)
+        .kernel_name("cal_prismatic_driving_grad_hess")
+        .apply(m_num_prismatic_driving,
+               [drvs            = m_prismatic_driving_data.cviewer().name("drvs"),
+                qs              = abd.body_id_to_q.cviewer().name("qs"),
+                affine_gradient = abd_gradient.viewer().name("abd_gradient"),
+                sys_gradient    = system_gradient.viewer().name("system_gradient"),
+                body_hessian    = abd_body_hessian.viewer().name("abd_body_hessian"),
+                cross_hessian   = m_prismatic_driving_cross_hessian.viewer().name("pris_drv_cross_hessian"),
+                is_fixed        = body_id_is_fixed.cviewer().name("is_fixed")] __device__(int i) mutable
+               {
+                   auto& drv = drvs(i);
+                   int pid = drv.parent_body_id;
+                   int cid = drv.child_body_id;
+
+                   auto& q1 = qs(pid);
+                   auto& q2 = qs(cid);
+
+                   bool p_fixed = (is_fixed(pid) == BodyBoundaryType::Fixed);
+                   bool c_fixed = (is_fixed(cid) == BodyBoundaryType::Fixed);
+
+                   Vector12 grad1, grad2;
+                   Matrix12x12 H_pp, H_qq, H_pq;
+                   prismatic_driving_gradient_hessian(drv, q1, q2,
+                                                      grad1, grad2, H_pp, H_qq, H_pq);
+
+                   if(!p_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(pid), grad1);
+                       sys_gradient.segment<12>(pid * 12).atomic_add(grad1);
+                       eigen::atomic_add(body_hessian(pid), H_pp);
+                   }
+
+                   if(!c_fixed)
+                   {
+                       eigen::atomic_add(affine_gradient(cid), grad2);
+                       sys_gradient.segment<12>(cid * 12).atomic_add(grad2);
+                       eigen::atomic_add(body_hessian(cid), H_qq);
+                   }
+
+                   if(p_fixed || c_fixed)
+                       cross_hessian(i) = Matrix12x12::Zero();
+                   else
+                       cross_hessian(i) = H_pq;
+               });
 }
 
 
@@ -884,4 +1930,86 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
                    });
     }
 }
+
+// ============================================================================
+// Bilateral stitch spring: ABD-side gradient and Hessian
+//
+// Energy: E = 0.5 * k * |x_fem - J*q - r|^2
+// where x_fem = vertex position of FEM point, J*q = ABD vertex position,
+// r = rest offset, k = motionRate * rate^2.
+//
+// ABD gradient: dE/dq = -k * J^T * d   where d = x_fem - J*q - r
+// ABD Hessian:  d2E/dq2 = k * J^T * J  (12x12, positive semi-definite)
+// ============================================================================
+void ABDSystem::_cal_abd_stitch_gradient_and_hessian(ABDSimData& sim_data)
+{
+    using namespace muda;
+    if(m_stitch_count <= 0 || !m_d_stitch_paired_vertex)
+        return;
+
+    auto& abd = sim_data.device;
+    auto  abd_body_count = sim_data.abd_fem_count_info().abd_body_num;
+    auto  abd_point_offset = sim_data.abd_fem_count_info().abd_point_offset;
+    auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
+
+    ParallelFor(256)
+        .kernel_name("abd_stitch_gradient_hessian")
+        .apply(m_stitch_count,
+               [stitch_paired_vertex = m_d_stitch_paired_vertex,
+                stitch_rest_offset   = m_d_stitch_rest_offset,
+                stitch_abd_body_id   = m_d_stitch_abd_body_id,
+                stitch_fem_vertex_id = m_d_stitch_fem_vertex_id,
+                all_vertexes         = m_d_all_vertexes,
+                Js             = abd.unique_point_id_to_J.cviewer().name("Js"),
+                qs             = abd.body_id_to_q.cviewer().name("q"),
+                abd_gradient   = abd_gradient.viewer().name("abd_gradient"),
+                sys_gradient   = system_gradient.viewer().name("system_gradient"),
+                body_hessian   = abd_body_hessian.viewer().name("body_hessian"),
+                is_fixed       = body_id_is_fixed.cviewer().name("is_fixed"),
+                motionRate     = m_stitch_motion_rate,
+                rate           = m_stitch_rate,
+                abd_point_offset] __device__(int i) mutable
+               {
+                   int abd_point_id = stitch_paired_vertex[i];
+                   if(abd_point_id < 0)
+                       return;  // not a stitch spring
+
+                   int body_id = stitch_abd_body_id[i];
+                   if(is_fixed(body_id) == BodyBoundaryType::Fixed)
+                       return;
+
+                   double k = motionRate * rate * rate;
+
+                   // Get current positions
+                   uint32_t fem_vid = stitch_fem_vertex_id[i];
+                   Vector3 x_fem{all_vertexes[fem_vid].x,
+                                 all_vertexes[fem_vid].y,
+                                 all_vertexes[fem_vid].z};
+
+                   // Compute ABD position: x_abd = J * q
+                   int local_abd_point_id = abd_point_id - static_cast<int>(abd_point_offset);
+                   gipc::ABDJacobi J = Js(local_abd_point_id);
+                   const auto& q = qs(body_id);
+                   Vector3 x_abd = J.point_x(q);
+
+                   // Rest offset
+                   Vector3 r{stitch_rest_offset[i].x,
+                             stitch_rest_offset[i].y,
+                             stitch_rest_offset[i].z};
+
+                   // d = x_fem - x_abd - r
+                   Vector3 d = x_fem - x_abd - r;
+
+                   // ABD gradient: -k * J^T * d
+                   Vector12 G = -(k) * (J.T() * d);
+                   eigen::atomic_add(abd_gradient(body_id), G);
+                   sys_gradient.segment<12>(body_id * 12).atomic_add(G);
+
+                   // ABD Hessian: k * J^T * J (12x12)
+                   Matrix3x3 kI = k * Matrix3x3::Identity();
+                   Matrix12x12 H = gipc::ABDJacobi::JT_H_J(J.T(), kI, J);
+                   eigen::atomic_add(body_hessian(body_id), H);
+               });
+}
+
 }  // namespace gipc

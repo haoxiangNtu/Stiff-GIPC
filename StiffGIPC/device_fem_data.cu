@@ -79,6 +79,14 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
         CUDA_SAFE_CALL(cudaMalloc((void**)&collision_skip_matrix, bodyNum * bodyNum * sizeof(int)));
         CUDA_SAFE_CALL(cudaMemset(collision_skip_matrix, 0, bodyNum * bodyNum * sizeof(int)));
     }
+
+    // Stitch spring GPU arrays (bilateral coupling)
+    if(softNum > 0)
+    {
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_stitch_paired_vertex, softNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_stitch_rest_offset, softNum * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_stitch_abd_body_id, softNum * sizeof(int)));
+    }
 }
 
 device_TetraData::~device_TetraData()
@@ -127,10 +135,20 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(body_motor_params));
     CUDA_SAFE_CALL(cudaFree(collision_skip_matrix));
 
+    // Stitch spring GPU arrays
+    CUDA_SAFE_CALL(cudaFree(d_stitch_paired_vertex));
+    CUDA_SAFE_CALL(cudaFree(d_stitch_rest_offset));
+    CUDA_SAFE_CALL(cudaFree(d_stitch_abd_body_id));
 }
 
 void device_TetraData::update_soft_constraint_target_position(int step_id, double ipc_dt)
 {
+    // Call pre-step functor to update body_motor_params if set
+    if(pre_step_functor && m_body_count > 0)
+    {
+        pre_step_functor(step_id, ipc_dt, body_motor_params, m_body_count);
+    }
+
     if(m_soft_num < 1)
         return;
 
@@ -140,11 +158,26 @@ void device_TetraData::update_soft_constraint_target_position(int step_id, doubl
 
     for(int i = 0; i < m_soft_num; i++)
     {
-        if(update_soft_constraint_functor == nullptr)
-            host_target_vertices[i] = host_vertexes[host_target_indices[i]];
-        else
+        // Bilateral stitch spring: target is computed dynamically in GPU kernel
+        // from current ABD vertex position + rest_offset.  No pre-computed target needed.
+        if(!stitch_paired_vertex.empty() && stitch_paired_vertex[i] >= 0)
+        {
+            // Still update targetVert as fallback (not used by bilateral kernel,
+            // but keeps the array valid for debugging / energy printout).
+            auto abd_pos = host_vertexes[stitch_paired_vertex[i]];
+            auto off     = stitch_rest_offset[i];
+            host_target_vertices[i] = make_double3(
+                abd_pos.x + off.x, abd_pos.y + off.y, abd_pos.z + off.z);
+        }
+        else if(update_soft_constraint_functor != nullptr)
+        {
             host_target_vertices[i] = update_soft_constraint_functor(
                 host_vertexes[host_target_indices[i]], step_id, ipc_dt);
+        }
+        else
+        {
+            host_target_vertices[i] = host_vertexes[host_target_indices[i]];
+        }
     }
 
     CUDA_SAFE_CALL(cudaMemcpy(targetVert,

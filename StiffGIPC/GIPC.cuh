@@ -38,6 +38,11 @@ class GIPC
     uint32_t  softNum     = 0;
     uint32_t  triangleNum = 0;
 
+    // Bilateral stitch spring GPU pointers (point into device_TetraData's d_stitch_* arrays)
+    int*     m_d_stitch_paired_vertex = nullptr;
+    double3* m_d_stitch_rest_offset   = nullptr;
+    int*     m_d_stitch_abd_body_id   = nullptr;
+
 
     double3* _moveDir = nullptr;
     lbvh_f   bvh_f;
@@ -138,6 +143,8 @@ class GIPC
     gipc::ABDFEMCountInfo abd_fem_count_info{};
     int                   num_joint_constraints = 0;  // set from tetMesh
 
+    bool m_skip_all_collision = false;
+
   public:
     GIPC();
     ~GIPC();
@@ -234,8 +241,13 @@ class GIPC
 
   public:
     void                                      init_abd_system();
+    /// Set up surface mesh body data in ABDSystem before init_abd_system().
+    void                                      setup_surface_mesh_bodies(class tetrahedra_obj& tetMesh);
     // Note: defined in gipc.cu which has load_mesh.h included
     void                                      init_joint_constraints_from_mesh(class tetrahedra_obj& tetMesh);
+    /// Update revolute driving joint target angles from tetMesh.joint_angle_controls.
+    /// Call each frame before IPC_Solver when using interactive joint control.
+    void                                      update_joint_angle_targets_from_mesh(class tetrahedra_obj& tetMesh);
     std::unique_ptr<gipc::ABDSimData>         m_abd_sim_data;
     std::unique_ptr<gipc::ABDSystem>          m_abd_system;
     std::unique_ptr<gipc::GlobalLinearSystem> m_global_linear_system;

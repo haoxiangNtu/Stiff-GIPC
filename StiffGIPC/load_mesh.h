@@ -21,6 +21,7 @@
 #include <Eigen/Core>
 #include <body_boundary_type.h>
 #include <joint_constraint_host_info.h>
+#include <joint_angle_control.h>
 
 using namespace std;
 
@@ -127,6 +128,17 @@ class tetrahedra_obj
     // World-space anchor positions are stored; material coords computed on GPU after init.
     std::vector<JointConstraintHostInfo> joint_constraints;
 
+    // Per-revolute-joint angle control info (populated by URDF importer).
+    // Stores axis/perpendicular directions needed to update the "angle control"
+    // constraint point at runtime based on UI slider target angles.
+    std::vector<JointAngleControlInfo> joint_angle_controls;
+
+    // Prismatic joint constraints between ABD bodies (populated by URDF importer).
+    std::vector<PrismaticJointHostInfo> prismatic_constraints;
+
+    // Per-prismatic-joint driving control info (populated by URDF importer).
+    std::vector<PrismaticDrivingControlInfo> prismatic_drive_controls;
+
     // Per-body motor parameters (indexed by body_id, size = abd_body_num)
     // motor_axis: the rotation axis in the body's local frame (normalized)
     // motor_speed: angular velocity in rad/s (0 means use global default)
@@ -167,14 +179,26 @@ class tetrahedra_obj
     bool load_triMesh(const std::string& filename, double scale, double3 transform, int boundaryType);
     bool load_triMesh(const std::string& filename, const Eigen::Matrix4d& transform, int boundaryType);
 
-    /// Load a surface mesh (.obj) as an ABD body.
-    /// Uses the "fan-tet" approach: creates virtual tetrahedra from each triangle
-    /// to the mesh centroid, enabling the existing ABD pipeline to work unchanged.
-    /// Works correctly for convex meshes (e.g., VHACD collision geometry).
+    /// Load a surface mesh (.obj) as an ABD body using native surface integrals.
+    /// Mass, volume, and gravity are computed directly from the closed triangle
+    /// mesh via Divergence theorem — no tetrahedralization or fan-tet hack.
+    /// The surface vertices are still added for collision detection.
     bool load_surfaceMesh_ABD(const std::string&     obj_filename,
                               const Eigen::Matrix4d& transform,
                               double                 youngth_module   = 1e7,
                               BodyBoundaryType       boundary_type    = BodyBoundaryType::Free);
+
+    /// Per-body surface mesh data for bodies loaded from triangle meshes.
+    /// Used by ABDSystem to compute mass/volume/gravity via surface integrals
+    /// instead of the tet-based path.
+    struct SurfaceMeshBodyInfo
+    {
+        std::vector<Eigen::Vector3d> vertices;
+        std::vector<Eigen::Vector3i> triangles;
+        int body_id          = -1;
+        int vert_global_offset = 0;  // global index of this body's first vertex
+    };
+    std::vector<SurfaceMeshBodyInfo> surface_mesh_bodies;
 
 
     bool load_animation(const std::string& filename, double scale, double3 transform);

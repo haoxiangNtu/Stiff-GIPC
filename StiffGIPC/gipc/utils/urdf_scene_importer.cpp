@@ -3,6 +3,7 @@
 #include <urdf_parser/urdf_parser.h>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <Eigen/Geometry>
 
 namespace gipc
@@ -84,21 +85,28 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
     // Load each link that has a mesh override as an ABD body
     // Ordering: process in BFS order from root to maintain a predictable body order
     std::vector<std::string> ordered_links;
+    // Track which links are world-fixed (chain of fixed joints back to root)
+    std::set<std::string> world_fixed_links;
     {
         std::vector<std::string> queue;
         queue.push_back(m_root_link_name);
+        if(m_root_fixed)
+            world_fixed_links.insert(m_root_link_name);
         while(!queue.empty())
         {
             std::string current = queue.front();
             queue.erase(queue.begin());
             ordered_links.push_back(current);
 
+            bool current_is_world_fixed = world_fixed_links.count(current) > 0;
             auto it = m_link_children_joints.find(current);
             if(it != m_link_children_joints.end())
             {
                 for(auto& joint_name : it->second)
                 {
                     auto& joint = m_joint_infos[joint_name];
+                    if(current_is_world_fixed && joint.type == UrdfJointInfo::Type::Fixed)
+                        world_fixed_links.insert(joint.child_link_name);
                     queue.push_back(joint.child_link_name);
                 }
             }
@@ -164,24 +172,21 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
             }
         }
 
-        if(link_name == m_root_link_name && m_root_fixed)
+        if(world_fixed_links.count(link_name) > 0)
         {
+            // Only freeze if there's an unbroken chain of fixed joints to the root
             boundary_type = BodyBoundaryType::Fixed;
         }
         else if(parent_joint)
         {
-            if(parent_joint->type == UrdfJointInfo::Type::Fixed)
-            {
-                // Fixed joint: child link is rigidly attached, freeze it
-                boundary_type = BodyBoundaryType::Fixed;
-            }
-            else if(m_revolute_as_motor
+            if(m_revolute_as_motor
                     && (parent_joint->type == UrdfJointInfo::Type::Revolute
                         || parent_joint->type == UrdfJointInfo::Type::Continuous))
             {
-                // Revolute/Continuous joint: child link is motor-driven
                 boundary_type = BodyBoundaryType::Motor;
             }
+            // Fixed joints NOT in the world-fixed chain stay Free and rely
+            // on the 4-point fixed constraint to follow their parent.
         }
 
         // Compute the full transform: link_global_transform * collision_origin * scale
@@ -352,6 +357,11 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
         return -1;
     };
 
+    // Compute model scale factor from the global transform (e.g., 0.3 for a 0.3x model).
+    double model_scale = m_global_transform.block<3, 3>(0, 0).col(0).norm();
+    if(model_scale < 1e-10) model_scale = 1.0;
+    std::cout << "[UrdfSceneImporter] Model scale = " << model_scale << std::endl;
+
     for(auto& [jname, jinfo] : m_joint_infos)
     {
         auto parent_it = m_link_infos.find(jinfo.parent_link_name);
@@ -385,26 +395,104 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
 
         if(jinfo.type == UrdfJointInfo::Type::Fixed)
         {
-            // Fixed joint: 4 non-coplanar constraint points (tetrahedron around joint)
+            // Fixed joint (rbs-uipc Method 2):
+            //   1 position point (joint center) + 2 direction vectors (normal, bitangent)
+            //   E = 0.5*K*||Cp-Cq||^2 + 0.5*K*||np-nq||^2 + 0.5*K*||bp-bq||^2
             jc.type       = JointConstraintHostInfo::Type::Fixed;
-            jc.num_points = 4;
-            double spread = 0.05;  // 5cm spread for constraint points
+            jc.num_points = 1;
             jc.world_anchor[0] = joint_pos;
-            jc.world_anchor[1] = joint_pos + Eigen::Vector3d(spread, 0, 0);
-            jc.world_anchor[2] = joint_pos + Eigen::Vector3d(0, spread, 0);
-            jc.world_anchor[3] = joint_pos + Eigen::Vector3d(0, 0, spread);
+
+            // Build an orthonormal frame at the joint from the joint's rotation
+            Eigen::Matrix3d R = joint_world.block<3, 3>(0, 0);
+            // Normalize columns in case of scaling
+            Eigen::Vector3d col0 = R.col(0).normalized();
+            Eigen::Vector3d col1 = R.col(1).normalized();
+            Eigen::Vector3d col2 = R.col(2).normalized();
+            // Use the joint frame's Y and Z axes as normal and bitangent
+            jc.has_direction_constraint = true;
+            jc.world_normal    = col1;
+            jc.world_bitangent = col2;
         }
         else if(jinfo.type == UrdfJointInfo::Type::Revolute
                 || jinfo.type == UrdfJointInfo::Type::Continuous)
         {
-            // Revolute joint: 2 constraint points on the rotation axis
-            // These constrain the axis position but allow rotation around it
+            // Revolute joint (rbs-uipc style):
+            //   2 constraint points on the axis for both position lock AND axis
+            //   alignment via pure positional constraints.
+            //   Spread = 0.5 (half of unit-normalized axis, matching rbs-uipc).
+            //   With mass-based stiffness this gives good conditioning regardless
+            //   of model scale.
             jc.type       = JointConstraintHostInfo::Type::Revolute;
             jc.num_points = 2;
-            double spread = 0.05;  // 5cm offset along axis from joint center
             Eigen::Vector3d world_axis = jinfo.global_axis.normalized();
-            jc.world_anchor[0] = joint_pos + spread * world_axis;
-            jc.world_anchor[1] = joint_pos - spread * world_axis;
+            Eigen::Vector3d half_axis  = world_axis * 0.5;
+            jc.world_anchor[0] = joint_pos + half_axis;
+            jc.world_anchor[1] = joint_pos - half_axis;
+            jc.point_weight[0] = 1.0;
+            jc.point_weight[1] = 1.0;
+
+            // Compute a stable perpendicular direction to the axis
+            Eigen::Vector3d n_perp;
+            if(std::abs(world_axis.x()) < 0.9)
+                n_perp = world_axis.cross(Eigen::Vector3d::UnitX()).normalized();
+            else
+                n_perp = world_axis.cross(Eigen::Vector3d::UnitY()).normalized();
+
+            // Populate JointAngleControlInfo for the revolute driving energy.
+            // axis_dir and n_dir are used by init_revolute_driving() to create
+            // the RevoluteDrivingGPUData direction vectors.
+            JointAngleControlInfo ctrl;
+            ctrl.constraint_index   = static_cast<int>(tetras.joint_constraints.size());
+            ctrl.axis_dir           = world_axis;
+            ctrl.n_dir              = n_perp;
+            ctrl.target_angle       = 0.0;
+            ctrl.lower_limit        = std::max(jinfo.lower_limit, -JointAngleControlInfo::kSafeAngleLimit);
+            ctrl.upper_limit        = std::min(jinfo.upper_limit,  JointAngleControlInfo::kSafeAngleLimit);
+            ctrl.joint_name         = jname;
+            tetras.joint_angle_controls.push_back(ctrl);
+        }
+        else if(jinfo.type == UrdfJointInfo::Type::Prismatic)
+        {
+            // Prismatic joint: constrain to translate along axis only.
+            // Uses separate PrismaticJointHostInfo and PrismaticDrivingControlInfo.
+            Eigen::Vector3d world_axis = jinfo.global_axis.normalized();
+
+            Eigen::Vector3d n_perp;
+            if(std::abs(world_axis.x()) < 0.9)
+                n_perp = world_axis.cross(Eigen::Vector3d::UnitX()).normalized();
+            else
+                n_perp = world_axis.cross(Eigen::Vector3d::UnitY()).normalized();
+            Eigen::Vector3d b_perp = world_axis.cross(n_perp).normalized();
+
+            PrismaticJointHostInfo pj;
+            pj.parent_body_id = parent_body;
+            pj.child_body_id  = child_body;
+            pj.world_center   = joint_pos;
+            pj.world_axis     = world_axis;
+            pj.world_normal   = n_perp;
+            pj.world_bitangent = b_perp;
+
+            PrismaticDrivingControlInfo pctrl;
+            pctrl.prismatic_constraint_index = static_cast<int>(tetras.prismatic_constraints.size());
+            pctrl.axis_dir         = world_axis;
+            pctrl.target_distance  = 0.0;
+            pctrl.lower_limit      = jinfo.lower_limit;
+            pctrl.upper_limit      = jinfo.upper_limit;
+            pctrl.joint_name       = jname;
+
+            tetras.prismatic_constraints.push_back(pj);
+            tetras.prismatic_drive_controls.push_back(pctrl);
+
+            // Also add collision exclusion for prismatic joint bodies
+            tetras.collision_exclusion_pairs.push_back({parent_body, child_body});
+
+            std::cout << "[UrdfSceneImporter] Prismatic joint '" << jname
+                      << "': body " << parent_body << " <-> " << child_body
+                      << " axis=(" << world_axis.x() << ", " << world_axis.y()
+                      << ", " << world_axis.z() << ")"
+                      << " limits=[" << jinfo.lower_limit << ", " << jinfo.upper_limit << "]"
+                      << std::endl;
+            continue;
         }
         else
         {
@@ -422,7 +510,8 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
     }
 
     std::cout << "[UrdfSceneImporter] Generated " << tetras.joint_constraints.size()
-              << " joint constraints." << std::endl;
+              << " joint constraints, " << tetras.prismatic_constraints.size()
+              << " prismatic constraints." << std::endl;
 
     std::cout << "[UrdfSceneImporter] Successfully loaded " << loaded_count
               << " ABD bodies from URDF (" << tetras.collision_exclusion_pairs.size()
@@ -522,16 +611,63 @@ bool UrdfSceneImporter::parse_urdf()
                         filename = filename.substr(pos + 3);
                     }
 
-                    // Try to resolve relative to URDF folder
+                    // Try to resolve the mesh path:
+                    //  1) Relative to URDF folder
+                    //  2) As absolute path
+                    //  3) Fallback: try progressively shorter suffixes of the path
+                    //     relative to URDF folder and its ancestors. This handles
+                    //     absolute Linux paths (e.g. /data/.../meshes/foo.stl) when
+                    //     the URDF is at a Windows location that contains the same
+                    //     subdirectory structure.
                     fs::path mesh_path = urdf_folder / filename;
+                    bool found = false;
                     if(fs::exists(mesh_path))
                     {
                         info.collision_mesh_filename = fs::canonical(mesh_path).string();
+                        found = true;
                     }
-                    else
+                    else if(fs::exists(fs::path(filename)))
                     {
-                        // Store raw filename for reference
-                        info.collision_mesh_filename = filename;
+                        info.collision_mesh_filename = fs::canonical(fs::path(filename)).string();
+                        found = true;
+                    }
+
+                    if(!found)
+                    {
+                        // Strip leading slashes for suffix matching
+                        std::string suffix = filename;
+                        while(!suffix.empty() && (suffix[0] == '/' || suffix[0] == '\\'))
+                            suffix = suffix.substr(1);
+
+                        // Walk up from URDF folder trying each ancestor
+                        fs::path search_base = urdf_folder;
+                        for(int depth = 0; depth < 5 && !found; ++depth)
+                        {
+                            // Try progressively shorter suffixes of the path
+                            std::string s = suffix;
+                            while(!s.empty() && !found)
+                            {
+                                fs::path candidate = search_base / s;
+                                if(fs::exists(candidate))
+                                {
+                                    info.collision_mesh_filename = fs::canonical(candidate).string();
+                                    found = true;
+                                }
+                                auto slash = s.find('/');
+                                if(slash == std::string::npos)
+                                    slash = s.find('\\');
+                                if(slash == std::string::npos)
+                                    break;
+                                s = s.substr(slash + 1);
+                            }
+                            if(!search_base.has_parent_path()
+                               || search_base.parent_path() == search_base)
+                                break;
+                            search_base = search_base.parent_path();
+                        }
+
+                        if(!found)
+                            info.collision_mesh_filename = filename;
                     }
 
                     info.collision_scale = Eigen::Vector3d{
