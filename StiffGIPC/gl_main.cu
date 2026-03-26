@@ -2365,7 +2365,7 @@ void set_case15_ridgeback_dual_panda()
     gipc::UrdfSceneImporter urdf_importer;
 
     std::string urdf_path =
-        "D:/Preserntation/SimulationDemo/OtherDemo/ridgeback_dual_panda_soft/"
+        assets_dir + "sim_data/urdf/ridgeback_dual_panda_soft/"
         "franka/ridgeback_dual_panda2_nomobile.urdf";
     urdf_importer.set_urdf_path(urdf_path);
 

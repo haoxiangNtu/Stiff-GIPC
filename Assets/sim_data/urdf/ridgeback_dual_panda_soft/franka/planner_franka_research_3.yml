@@ -1,0 +1,36 @@
+MaxVelocityFactor: 1
+MaxAccelerationFactor: 1
+MaxJerkFactor: 1
+TrajectoryParameters:
+  TrajectoryType: 1
+  TOTP:
+    PathTolerance: 0.1
+    MinAngleChange: 0.001
+  IterativeSpline:
+    ZeroAcc: true
+    EnableJerk: false
+    MinStretch: false
+    MinAngleChange: 0.001
+    Type: 0
+ConfigPlannerName: RRT
+CartesianPlannerName: Basic
+ServoType: 1
+TCPOnly: false
+Scale: 1
+Kinematics:
+  Type: 0
+  Group: franka_research_3
+  EndEffector: left_ee
+Validator:
+  Type: 1
+  Obstacles: 
+    - [1.0, 1.0, 1.0, 0.5]
+  Group: franka_research_3
+  Names:
+    - fr3_joint1
+    - fr3_joint2
+    - fr3_joint3
+    - fr3_joint4
+    - fr3_joint5
+    - fr3_joint6
+    - fr3_joint7
