@@ -8676,9 +8676,17 @@ void GIPC::initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix, int _
 
 void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer)
 {
-    SceneSize     = bvh_f.scene;
+    if(m_skip_all_collision)
+    {
+        SceneSize.upper = make_double3(maxConer.x, maxConer.y, maxConer.z);
+        SceneSize.lower = make_double3(minConer.x, minConer.y, minConer.z);
+    }
+    else
+    {
+        SceneSize = bvh_f.scene;
+    }
     bboxDiagSize2 = __GEIGEN__::__squaredNorm(
-        __GEIGEN__::__minus(SceneSize.upper, SceneSize.lower));  //(maxConer - minConer).squaredNorm();
+        __GEIGEN__::__minus(SceneSize.upper, SceneSize.lower));
     dTol         = 1e-18 * bboxDiagSize2;
     minKappaCoef = 1e11;
     meanMass     = m_meanMass;
@@ -11014,6 +11022,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     double totalTimeStep = 0;
     for(; k < iterCap; ++k)
     {
+        if(k > 0 && k % 10 == 0)
+            printf("  Newton iter %d ...\n", k);
         stats_at_current_frame["newton"].push_back(gipc::Json::object());
 
         totalCollisionPairs += h_cpNum[0];
