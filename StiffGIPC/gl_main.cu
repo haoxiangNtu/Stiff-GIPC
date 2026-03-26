@@ -47,6 +47,7 @@ std::string      metis_dir  = assets_dir + "sorted_mesh/";
 double           collision_detection_buff_scale = 1;
 double           motion_rate                    = 1;
 bool             g_skip_rendering               = false;
+bool             g_headless_benchmark           = false;
 mesh_obj         obj;
 lbvh_f           bvh_f;
 lbvh_e           bvh_e;
@@ -205,26 +206,48 @@ void SaveScreenShot(int width, int height, const std::string& file_name)
 void saveSurfaceMesh(const string& path)
 {
     std::stringstream ss;
-    ss << path << "scene_surface" << (surfNumId++) << ".obj";
+    ss << path;
+    ss.fill('0');
+    ss.width(5);
+    ss << (surfNumId++);
+    ss << ".obj";
     std::string file_path = ss.str();
-    ofstream    outSurf(file_path);
 
-    map<int, int> meshToSurf;
-    outSurf << "s 1" << endl;
-    for(int i = 0; i < tetMesh.surfVerts.size(); i++)
+    const size_t nSurfVerts = tetMesh.surfVerts.size();
+    const size_t nFaces     = tetMesh.surface.size();
+
+    std::vector<int> globalToLocal(tetMesh.vertexNum, -1);
+    for(size_t i = 0; i < nSurfVerts; i++)
+        globalToLocal[tetMesh.surfVerts[i]] = static_cast<int>(i);
+
+    std::string buf;
+    buf.reserve(nSurfVerts * 60 + nFaces * 40 + 64);
+
+    char line[128];
+    buf.append("s 1\n");
+    for(size_t i = 0; i < nSurfVerts; i++)
     {
         const auto& pos = tetMesh.vertexes[tetMesh.surfVerts[i]];
-        outSurf << "v " << pos.x << " " << pos.y << " " << pos.z << endl;
-        meshToSurf[tetMesh.surfVerts[i]] = i;
+        int len = snprintf(line, sizeof(line), "v %.8g %.8g %.8g\n", pos.x, pos.y, pos.z);
+        buf.append(line, len);
     }
 
-    for(int i = 0; i < tetMesh.surface.size(); i++)
+    for(size_t i = 0; i < nFaces; i++)
     {
         const auto& tri = tetMesh.surface[i];
-        outSurf << "f " << meshToSurf[tri.x] + 1 << " " << meshToSurf[tri.y] + 1
-                << " " << meshToSurf[tri.z] + 1 << endl;
+        int len = snprintf(line, sizeof(line), "f %d %d %d\n",
+                           globalToLocal[tri.x] + 1,
+                           globalToLocal[tri.y] + 1,
+                           globalToLocal[tri.z] + 1);
+        buf.append(line, len);
     }
-    outSurf.close();
+
+    FILE* fp = fopen(file_path.c_str(), "wb");
+    if(fp)
+    {
+        fwrite(buf.data(), 1, buf.size(), fp);
+        fclose(fp);
+    }
 }
 
 
@@ -2387,6 +2410,63 @@ void set_case15_ridgeback_dual_panda()
     }
 }
 
+// ==========================================================================
+// ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
+// (no joints, no collision, no rendering, headless)
+// ==========================================================================
+void set_case_abd_freefall_benchmark()
+{
+    std::string stl_dir = assets_dir + "sim_data/urdf/xarm/xarm_description/meshes/xarm6/visual/";
+    std::vector<std::string> stl_files = {
+        stl_dir + "base.stl",
+        stl_dir + "link1.stl",
+        stl_dir + "link2.stl",
+        stl_dir + "link3.stl",
+        stl_dir + "link4.stl",
+        stl_dir + "link5.stl",
+        stl_dir + "link6.stl"
+    };
+
+    double scale = 0.3;
+    double young_modulus = 1e7;
+
+    for(size_t i = 0; i < stl_files.size(); i++)
+    {
+        Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+        transform.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * scale;
+        transform(1, 3) = 0.5 + i * 0.15;
+
+        bool ok = tetMesh.load_surfaceMesh_ABD(stl_files[i],
+                                                transform,
+                                                young_modulus,
+                                                BodyBoundaryType::Free);
+        if(!ok)
+        {
+            std::cerr << "[benchmark] Failed to load: " << stl_files[i] << std::endl;
+        }
+    }
+
+    // Benchmark mode: prioritize throughput over accuracy
+    ipc.Newton_solver_threshold = 5e-2;
+    ipc.pcg_threshold           = 1e-3;
+    ipc.frictionRate            = 0.0;
+    ipc.gd_frictionRate         = 0.0;
+
+    g_skip_rendering = true;
+    g_headless_benchmark = true;
+    ipc.m_skip_all_collision = true;
+    saveSurface = true;
+
+    std::cout << "=== ABD FREEFALL BENCHMARK ===" << std::endl;
+    std::cout << "Bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "Total verts: " << tetMesh.vertexNum << std::endl;
+    std::cout << "Rendering: DISABLED" << std::endl;
+    std::cout << "Collision: DISABLED" << std::endl;
+    std::cout << "OpenGL window: HIDDEN" << std::endl;
+    std::cout << "OBJ export: ENABLED" << std::endl;
+    std::cout << "==============================" << std::endl;
+}
+
 void setMAS_partition()
 {
     tetMesh.partId_map_real.resize(tetMesh.part_offset * BANKSIZE, -1);
@@ -2421,7 +2501,7 @@ void initScene()
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
     ipc.pcg_data.P_type = 1;
 
-    int scene_no            = 13;
+    int scene_no            = 5;
     g_joint_control_enabled = false;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
@@ -2472,6 +2552,9 @@ void initScene()
             break;
         case 14: //Case15: Ridgeback Dual Panda (nomobile)
             set_case15_ridgeback_dual_panda();
+            break;
+        case 99: //ABD Freefall benchmark (no joints, no render, headless)
+            set_case_abd_freefall_benchmark();
             break;
     }
 
@@ -2644,13 +2727,20 @@ void initScene()
     ipc.edge_Num       = tetMesh.surfEdges.size();
     ipc.tri_edge_num   = tetMesh.tri_edges.size();
 
-    //ipc.IPC_dt = 0.01 / 1.0;//1.0 / 30;//1.0 / 100;
-    ipc.MAX_CCD_COLLITION_PAIRS_NUM =
-        1 * collision_detection_buff_scale
-        * (((double)(ipc.surface_Num * 15 + ipc.edge_Num * 10))
-           * std::max((ipc.IPC_dt / 0.01), 2.0));
-    ipc.MAX_COLLITION_PAIRS_NUM = (ipc.surf_vertexNum * 3 + ipc.edge_Num * 2)
-                                  * 3 * collision_detection_buff_scale;
+    if(ipc.m_skip_all_collision)
+    {
+        ipc.MAX_CCD_COLLITION_PAIRS_NUM = 1;
+        ipc.MAX_COLLITION_PAIRS_NUM = 1;
+    }
+    else
+    {
+        ipc.MAX_CCD_COLLITION_PAIRS_NUM =
+            1 * collision_detection_buff_scale
+            * (((double)(ipc.surface_Num * 15 + ipc.edge_Num * 10))
+               * std::max((ipc.IPC_dt / 0.01), 2.0));
+        ipc.MAX_COLLITION_PAIRS_NUM = (ipc.surf_vertexNum * 3 + ipc.edge_Num * 2)
+                                      * 3 * collision_detection_buff_scale;
+    }
 
     ipc.triangleNum        = tetMesh.triangleNum;
     ipc.targetVert         = d_tetMesh.targetVert;
@@ -2853,13 +2943,15 @@ void initScene()
 
     ipc.create_LinearSystem(d_tetMesh);
 
-    bvs.resize(2 * ipc.edge_Num - 1);
-    nodes.resize(2 * ipc.edge_Num - 1);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    CUDA_SAFE_CALL(cudaMemcpy(
-        &bvs[0], ipc.bvh_e._bvs, (2 * ipc.edge_Num - 1) * sizeof(AABB), cudaMemcpyDeviceToHost));
-    CUDA_SAFE_CALL(cudaMemcpy(
-        &nodes[0], ipc.bvh_e._nodes, (2 * ipc.edge_Num - 1) * sizeof(Node), cudaMemcpyDeviceToHost));
+    if(!ipc.m_skip_all_collision && ipc.edge_Num > 0)
+    {
+        bvs.resize(2 * ipc.edge_Num - 1);
+        nodes.resize(2 * ipc.edge_Num - 1);
+        CUDA_SAFE_CALL(cudaMemcpy(
+            &bvs[0], ipc.bvh_e._bvs, (2 * ipc.edge_Num - 1) * sizeof(AABB), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(
+            &nodes[0], ipc.bvh_e._nodes, (2 * ipc.edge_Num - 1) * sizeof(Node), cudaMemcpyDeviceToHost));
+    }
 }
 
 
@@ -2918,21 +3010,28 @@ void outputAnimationMeshInfo(string pathCloth, string pathBody)
     surfNumId++;
 }
 bool pri = true;
+static std::string g_output_path;
+static bool        g_output_dirs_created = false;
+
 void display(void)
 {
-    draw_Scene3D();
-    std::filesystem::exists(std::string{gipc::output_dir()})
-        || std::filesystem::create_directory(std::string{gipc::output_dir()});
-    auto output_path = std::string{gipc::output_dir()} + "saveSurface/";
+    if(!g_headless_benchmark)
+        draw_Scene3D();
 
-    std::filesystem::exists(output_path) || std::filesystem::create_directory(output_path);
+    if(!g_output_dirs_created)
+    {
+        std::filesystem::exists(std::string{gipc::output_dir()})
+            || std::filesystem::create_directory(std::string{gipc::output_dir()});
+        g_output_path = std::string{gipc::output_dir()} + "saveSurface/";
+        std::filesystem::exists(g_output_path) || std::filesystem::create_directory(g_output_path);
+        g_output_dirs_created = true;
+    }
 
     if(stop)
         return;
 
     auto frame_start = std::chrono::high_resolution_clock::now();
 
-    // Update joint angle targets from UI sliders before solving
     if(g_joint_control_enabled)
     {
         ipc.update_joint_angle_targets_from_mesh(tetMesh);
@@ -2945,7 +3044,7 @@ void display(void)
 
     double solver_ms = std::chrono::duration<double, std::milli>(solver_end - solver_start).count();
 
-    if(ipc.animation && true)
+    if(ipc.animation && !g_headless_benchmark)
     {
         std::string filename =
             "triMesh/body4/postcvpr_big_body_" + std::to_string(frameId + 1) + ".obj";
@@ -2965,7 +3064,7 @@ void display(void)
             &nodes[0], ipc.bvh_e._nodes, (2 * ipc.edge_Num - 1) * sizeof(Node), cudaMemcpyDeviceToHost));
     }
 
-    if(!g_skip_rendering)
+    if(!g_skip_rendering || saveSurface)
     {
         CUDA_SAFE_CALL(cudaMemcpy(tetMesh.vertexes.data(),
                                   ipc._vertexes,
@@ -2973,13 +3072,12 @@ void display(void)
                                   cudaMemcpyDeviceToHost));
     }
 
-    // Auto-save surface OBJ each frame
-    if (saveSurface) {
-        saveSurfaceMesh(output_path);
+    if(saveSurface)
+    {
+        saveSurfaceMesh(g_output_path);
     }
 
-
-    if(screenshot)
+    if(screenshot && !g_headless_benchmark)
     {
         std::stringstream ss;
         ss << "saveScreen/step_";
@@ -2995,12 +3093,6 @@ void display(void)
     double frame_ms = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
     printf("step: %d | solver: %.1f ms | frame_total: %.1f ms (%.1f FPS)\n",
            step, solver_ms, frame_ms, 1000.0 / frame_ms);
-
-    //if(step >= 160)
-    //{
-    //    std::cout << "step: " << step << " finished." << std::endl;
-    //    exit(0);
-    //}
 }
 
 void init(void)
@@ -3233,7 +3325,6 @@ void SpecialKey(GLint key, GLint x, GLint y)
 int main(int argc, char** argv)
 {
     glutInit(&argc, argv);
-    //glutInitDisplayMode(GLUT_DEPTH | GLUT_DOUBLE | GLUT_RGBA);
 
     glutSetOption(GLUT_MULTISAMPLE, 16);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH | GLUT_MULTISAMPLE);
@@ -3244,18 +3335,37 @@ int main(int argc, char** argv)
 
     init();
 
+    if(g_headless_benchmark)
+    {
+        glutHideWindow();
+        stop = false;
+        std::cout << "[headless] Entering headless benchmark loop..." << std::endl;
+
+        int max_steps = 500;
+        auto total_start = std::chrono::high_resolution_clock::now();
+
+        for(int s = 0; s < max_steps; s++)
+        {
+            display();
+        }
+
+        auto total_end = std::chrono::high_resolution_clock::now();
+        double total_s = std::chrono::duration<double>(total_end - total_start).count();
+        std::cout << "==============================" << std::endl;
+        std::cout << "[headless] Completed " << max_steps << " steps in "
+                  << total_s << " s (" << (max_steps / total_s) << " FPS)" << std::endl;
+        std::cout << "==============================" << std::endl;
+        return 0;
+    }
+
     glDepthMask(GL_TRUE);
     glEnable(GL_DEPTH_TEST);
-
 
     glEnable(GL_MULTISAMPLE);
     glHint(GL_MULTISAMPLE_FILTER_HINT_NV, GL_NICEST);
 
-
     glutDisplayFunc(display);
 
-
-    //glutDisplayFunc(display_func);
     glutReshapeFunc(reshape_func);
     glutKeyboardFunc(keyboard_func);
     glutSpecialFunc(&SpecialKey);
@@ -3264,7 +3374,5 @@ int main(int argc, char** argv)
     glutPassiveMotionFunc(ImGui_ImplGLUT_MotionFunc);
     glutIdleFunc(idle_func);
 
-
     glutMainLoop();
-    //return 0;
 }
