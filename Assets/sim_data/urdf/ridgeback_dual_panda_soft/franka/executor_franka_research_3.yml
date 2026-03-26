@@ -1,0 +1,22 @@
+Resample: 0.005
+Home:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+address: 192.168.10.95
+port: 10000
+state_port: 8099
+Names:
+  - fr3_joint1
+  - fr3_joint2
+  - fr3_joint3
+  - fr3_joint4
+  - fr3_joint5
+  - fr3_joint6
+  - fr3_joint7
+Topic: /joint_states
+PubTopic: /fr3/joint_states
