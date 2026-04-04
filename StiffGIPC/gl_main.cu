@@ -3388,6 +3388,111 @@ void set_case23_xarm_table_cloth()
     std::cout << "[set_case23] Joint controls (prismatic): " << tetMesh.prismatic_drive_controls.size() << std::endl;
 }
 
+void set_case24_franka_coarse()
+{
+    // --- ABD: load Franka Panda via coarse URDF ---
+    gipc::UrdfSceneImporter urdf_importer;
+    std::string urdf_path = assets_dir + "sim_data/urdf/franka_panda/panda_arm_hand_coarse.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+
+    Transform arm_t = Transform::Identity();
+    arm_t.translate(Eigen::Vector3d(0, -0.71, 0));
+    arm_t.rotate(Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitX()));
+
+    urdf_importer.set_global_transform(arm_t.matrix());
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case24] Franka Panda (coarse) import failed!" << std::endl;
+        std::abort();
+    }
+
+    ipc.m_abd_system->parms.joint_strength_ratio            = 1000.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio  = 1000.0;
+    ipc.m_abd_system->parms.prismatic_driving_strength_ratio = 1000.0;
+
+    for(auto& [link_name, link_info] : urdf_importer.link_infos())
+    {
+        if(link_info.body_id >= 0)
+            tetMesh.ground_collision_skip_body_ids.push_back(link_info.body_id);
+    }
+
+    // --- ABD table ---
+    int arm_body_count = tetMesh.abd_fem_count_info.abd_body_num;
+    double table_cx = 0.55, table_cz = 0.0;
+    {
+        gipc::SimpleSceneImporter table_imp;
+        Eigen::Matrix4d table_tf = Eigen::Matrix4d::Identity();
+        table_tf(0, 0) = 2.0;
+        table_tf(1, 1) = 0.5;
+        table_tf(2, 2) = 2.0;
+        table_tf(0, 3) = table_cx;
+        table_tf(1, 3) = -0.62;
+        table_tf(2, 3) = table_cz;
+
+        table_imp.load_geometry(tetMesh, 3, gipc::BodyType::ABD, table_tf,
+                                1e9, assets_dir + "tetMesh/cube.msh",
+                                ipc.pcg_data.P_type, BodyBoundaryType::Fixed);
+    }
+    int table_body_id = arm_body_count;
+    for(int arm_id = 0; arm_id < arm_body_count; arm_id++)
+        tetMesh.collision_exclusion_pairs.emplace_back(table_body_id, arm_id);
+    tetMesh.ground_collision_skip_body_ids.push_back(table_body_id);
+
+    // --- FEM shirt ---
+    double cloth_E              = 1e4;
+    ipc.clothThickness          = 1e-3;
+    ipc.clothYoungModulus       = 1e4;
+    ipc.clothDensity            = 1000;
+    ipc.strainRate              = 100;
+    ipc.bendStiff               = 1e-5;
+    ipc.softMotionRate          = 1e0;
+    ipc.PoissonRate             = 0.49;
+    ipc.gd_frictionRate         = 0.4;
+    ipc.frictionRate            = 0.4;
+    ipc.relative_dhat           = 1e-3;
+    ipc.IPC_dt                  = 1e-2;
+
+    {
+        std::string shirt_path = assets_dir + "triMesh/shirt_831v.obj";
+        gipc::SimpleSceneImporter cloth_imp;
+        Eigen::Matrix4d cloth_tf = Eigen::Matrix4d::Identity();
+        cloth_tf(0, 3) = table_cx;
+        cloth_tf(1, 3) = -0.15;
+        cloth_tf(2, 3) = table_cz;
+
+        cloth_imp.load_geometry(tetMesh, 2, gipc::BodyType::FEM, cloth_tf,
+                                cloth_E, shirt_path, ipc.pcg_data.P_type,
+                                BodyBoundaryType::Free);
+    }
+
+    // --- Trajectory playback ---
+    g_joint_control_enabled        = true;
+    g_trajectory_playback_enabled  = true;
+    g_trajectory_sim_time          = 0.0;
+    g_skip_rendering               = false;
+
+    std::string traj_path = assets_dir + "trajectories/franka_fold.txt";
+    if(!load_trajectory(traj_path))
+        std::cerr << "[set_case24] WARNING: no trajectory file at " << traj_path << std::endl;
+
+    g_settling_frames = 10;
+
+    std::cout << "[set_case24] Franka Panda (coarse) + Table + Shirt loaded." << std::endl;
+    std::cout << "[set_case24] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case24] FEM bodies: " << tetMesh.abd_fem_count_info.fem_body_num << std::endl;
+    std::cout << "[set_case24] Total vertices: " << tetMesh.vertexNum << std::endl;
+    std::cout << "[set_case24] Joint controls (revolute): " << tetMesh.joint_angle_controls.size() << std::endl;
+    std::cout << "[set_case24] Joint controls (prismatic): " << tetMesh.prismatic_drive_controls.size() << std::endl;
+}
+
 // ==========================================================================
 // ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
 // (no joints, no collision, no rendering, headless)
@@ -3554,6 +3659,9 @@ void initScene()
             break;
         case 22: //Case23: XArm7 + table + cloth + trajectory
             set_case23_xarm_table_cloth();
+            break;
+        case 23: //Case24: Franka coarse + table + shirt + trajectory
+            set_case24_franka_coarse();
             break;
         case 99: //ABD Freefall benchmark (no joints, no render, headless)
             set_case_abd_freefall_benchmark();
