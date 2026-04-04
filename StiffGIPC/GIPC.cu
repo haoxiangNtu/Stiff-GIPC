@@ -11044,6 +11044,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     stats_at_current_frame["newton"] = gipc::Json::array();
 
     int iterCap = 10000, k = 0;
+    double semi_beta = 1.0;
 
     CUDA_SAFE_CALL(cudaMemset(_moveDir, 0, vertexNum * sizeof(double3)));
     double totalTimeStep = 0;
@@ -11168,6 +11169,21 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         (cudaEventDestroy(end3));
         (cudaEventDestroy(end4));
         totalTimeStep += alpha;
+
+        // Semi-implicit early exit (ref: arXiv 2512.12151, Algorithm 1)
+        // beta tracks cumulative line-search progress; when alpha≈1 (good step),
+        // beta decays fast -> early exit.  When alpha is small, beta stays large.
+        if(semi_implicit_enabled && k >= semi_implicit_min_iter)
+        {
+            semi_beta *= (1.0 - alpha);
+            if(semi_beta <= semi_implicit_beta_tol)
+            {
+                printf("  [semi-implicit] early exit at Newton iter %d (beta=%.6e, tol=%.6e)\n",
+                       k, semi_beta, semi_implicit_beta_tol);
+                k++;
+                break;
+            }
+        }
     }
     //iterV.push_back(k);
     //std::ofstream outiter("iterCount.txt");

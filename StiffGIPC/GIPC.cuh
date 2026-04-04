@@ -145,6 +145,11 @@ class GIPC
 
     bool m_skip_all_collision = false;
 
+    // Semi-implicit early exit (ref: https://arxiv.org/abs/2512.12151, Algorithm 1)
+    bool   semi_implicit_enabled  = false;
+    double semi_implicit_beta_tol = 1e-3;
+    int    semi_implicit_min_iter = 1;
+
     int* _point_body_id     = nullptr;
     int* _ground_skip_body  = nullptr;
     int  _ground_body_count = 0;
