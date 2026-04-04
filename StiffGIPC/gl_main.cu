@@ -3493,6 +3493,77 @@ void set_case24_franka_coarse()
     std::cout << "[set_case24] Joint controls (prismatic): " << tetMesh.prismatic_drive_controls.size() << std::endl;
 }
 
+void set_case25_shirt_freefall()
+{
+    // true  = Isaac Lab cloth parameters (from rbs_franka_cloth_grasp-onlyCloth_params.txt)
+    // false = Stiff-GIPC default cloth parameters (same as case 4 curtain)
+    constexpr bool use_isaaclab_params = false;
+
+    double cloth_E;
+    if (use_isaaclab_params)
+    {
+        cloth_E                     = 1e4;
+        ipc.clothThickness          = 5e-4;    // 0.5 mm
+        ipc.clothYoungModulus       = 1e4;     // 10 kPa
+        ipc.bendYoungModulus        = 1e4;
+        ipc.clothDensity            = 20.0;    // 20 kg/m^3
+        ipc.strainRate              = 1;
+        ipc.bendStiff               = 10.0;    // blendingStiffness = 10
+        ipc.softMotionRate          = 1e0;
+        ipc.PoissonRate             = 0.499;
+        ipc.gd_frictionRate         = 0.5;
+        ipc.frictionRate            = 0.5;
+        ipc.relative_dhat           = 1e-3;    // d_hat = 1 mm
+        ipc.IPC_dt                  = 1e-2;    // 100 Hz
+    }
+    else
+    {
+        cloth_E                     = 1e4;
+        ipc.clothThickness          = 1e-3;    // 1 mm
+        ipc.clothYoungModulus       = 1e6;
+        ipc.bendYoungModulus        = 1e5;
+        ipc.clothDensity            = 2e2;     // 200 kg/m^3
+        ipc.strainRate              = 100;
+        ipc.bendStiff               = 3e-4;
+        ipc.softMotionRate          = 1e0;
+        ipc.PoissonRate             = 0.49;
+        ipc.gd_frictionRate         = 0.4;
+        ipc.frictionRate            = 0.4;
+        ipc.relative_dhat           = 1e-3;
+        ipc.IPC_dt                  = 1e-2;
+    }
+
+    // Full Newton convergence (no semi-implicit exit)
+    ipc.semi_implicit_enabled = false;
+
+    // No table — shirt falls directly onto the built-in ground plane (Y = -1).
+    {
+        std::string shirt_path = assets_dir + "triMesh/shirt_6436v.obj";
+        gipc::SimpleSceneImporter cloth_imp;
+        Eigen::Matrix4d cloth_tf = Eigen::Matrix4d::Identity();
+
+        cloth_imp.load_geometry(tetMesh, 2, gipc::BodyType::FEM, cloth_tf,
+                                cloth_E, shirt_path, ipc.pcg_data.P_type,
+                                BodyBoundaryType::Free);
+    }
+
+    g_skip_rendering       = false;
+    g_headless_benchmark   = false;
+
+    std::cout << "=== Case25: SHIRT FREE-FALL (full Newton, params="
+              << (use_isaaclab_params ? "IsaacLab" : "StiffGIPC-default") << ") ===" << std::endl;
+    std::cout << "FEM bodies: "  << tetMesh.abd_fem_count_info.fem_body_num << std::endl;
+    std::cout << "Total verts: " << tetMesh.vertexNum << std::endl;
+    std::cout << "clothYoungModulus: " << ipc.clothYoungModulus << std::endl;
+    std::cout << "clothDensity:     " << ipc.clothDensity << std::endl;
+    std::cout << "clothThickness:   " << ipc.clothThickness << std::endl;
+    std::cout << "bendStiff:        " << ipc.bendStiff << std::endl;
+    std::cout << "PoissonRate:      " << ipc.PoissonRate << std::endl;
+    std::cout << "relative_dhat:    " << ipc.relative_dhat << std::endl;
+    std::cout << "IPC_dt:           " << ipc.IPC_dt << std::endl;
+    std::cout << "semi_implicit:    OFF (full Newton)" << std::endl;
+}
+
 // ==========================================================================
 // ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
 // (no joints, no collision, no rendering, headless)
@@ -3662,6 +3733,9 @@ void initScene()
             break;
         case 23: //Case24: Franka coarse + table + shirt + trajectory
             set_case24_franka_coarse();
+            break;
+        case 24: //Case25: Shirt free-fall full Newton
+            set_case25_shirt_freefall();
             break;
         case 99: //ABD Freefall benchmark (no joints, no render, headless)
             set_case_abd_freefall_benchmark();
