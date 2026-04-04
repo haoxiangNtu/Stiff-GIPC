@@ -1384,7 +1384,7 @@ void set_case7_urdf_test()
                   << "," << info.global_axis.z() << "])"
                   << std::endl;
     }
-    xRot = 25.0f; yRot = -30.f; yTrans = -0.5f; zTrans = 2.0f;
+    xRot = 10.0f; yRot = -30.f; yTrans = -1.0f; zTrans = 0.5f;
 }
 
 // ==========================================================================
@@ -1433,6 +1433,8 @@ void set_case8_xarm6_test()
         std::abort();
     }
 
+    ipc.m_abd_system->parms.joint_strength_ratio = 1000.0;
+
     // Print summary
     std::cout << "[set_case8] XArm6 loaded successfully." << std::endl;
     std::cout << "[set_case8] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
@@ -1460,7 +1462,7 @@ void set_case8_xarm6_test()
                   << "," << info.global_axis.z() << "])"
                   << std::endl;
     }
-    xRot = 25.0f; yRot = -30.f; yTrans = -0.5f; zTrans = 2.0f;
+    xRot = 10.0f; yRot = -30.f; yTrans = -1.5f; zTrans = 0.5f;
 }
 
 // ==========================================================================
@@ -1500,6 +1502,8 @@ void set_case9_xarm7_gripper_test()
         std::abort();
     }
 
+    ipc.m_abd_system->parms.joint_strength_ratio = 1000.0;
+
     // Print summary
     std::cout << "[set_case9] XArm7+Gripper loaded successfully." << std::endl;
     std::cout << "[set_case9] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
@@ -1525,7 +1529,7 @@ void set_case9_xarm7_gripper_test()
                   << " (type=" << static_cast<int>(info.type) << ")" << std::endl;
     }
     std::cout << "[set_case9] Joint constraints: " << tetMesh.joint_constraints.size() << std::endl;
-    xRot = 25.0f; yRot = -30.f; yTrans = -0.5f; zTrans = 2.0f;
+    xRot = 10.0f; yRot = -30.f; yTrans = -1.5f; zTrans = 0.5f;
 }
 
 // ==========================================================================
