@@ -124,6 +124,9 @@ class tetrahedra_obj
     // Typically populated from URDF joint adjacency (parent-child link pairs).
     std::vector<std::pair<int, int>> collision_exclusion_pairs;
 
+    // Per-body ground collision skip flags: body IDs listed here skip ground collision.
+    std::vector<int> ground_collision_skip_body_ids;
+
     // Joint constraints between ABD bodies (populated by URDF importer).
     // World-space anchor positions are stored; material coords computed on GPU after init.
     std::vector<JointConstraintHostInfo> joint_constraints;
