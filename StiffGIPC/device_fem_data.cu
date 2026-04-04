@@ -78,6 +78,8 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
     {
         CUDA_SAFE_CALL(cudaMalloc((void**)&collision_skip_matrix, bodyNum * bodyNum * sizeof(int)));
         CUDA_SAFE_CALL(cudaMemset(collision_skip_matrix, 0, bodyNum * bodyNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&ground_skip_body, bodyNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(ground_skip_body, 0, bodyNum * sizeof(int)));
     }
 
     // Stitch spring GPU arrays (bilateral coupling)
@@ -86,6 +88,10 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_stitch_paired_vertex, softNum * sizeof(int)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_stitch_rest_offset, softNum * sizeof(double3)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_stitch_abd_body_id, softNum * sizeof(int)));
+        // -1 means "no stitch partner"; prevents garbage from triggering stitch logic
+        CUDA_SAFE_CALL(cudaMemset(d_stitch_paired_vertex, 0xFF, softNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(d_stitch_rest_offset, 0, softNum * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaMemset(d_stitch_abd_body_id, 0xFF, softNum * sizeof(int)));
     }
 }
 
@@ -134,6 +140,7 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(tet_id_to_body_id));
     CUDA_SAFE_CALL(cudaFree(body_motor_params));
     CUDA_SAFE_CALL(cudaFree(collision_skip_matrix));
+    CUDA_SAFE_CALL(cudaFree(ground_skip_body));
 
     // Stitch spring GPU arrays
     CUDA_SAFE_CALL(cudaFree(d_stitch_paired_vertex));

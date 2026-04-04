@@ -67,6 +67,8 @@ class device_TetraData
     int*    collision_skip_matrix = nullptr;
     int     collision_body_num    = 0;
 
+    int*    ground_skip_body = nullptr;
+
     int                   m_soft_num   = 0;
     int                   m_vertex_num = 0;
     std::vector<uint32_t> host_target_indices;
