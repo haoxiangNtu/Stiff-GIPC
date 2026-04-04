@@ -167,7 +167,7 @@ class GIPC
 
     void FREE_DEVICE_MEM();
     void initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix = nullptr, int _collision_body_count = 0);
-    void init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer);
+    void init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer, double buffScale = 1);
 
     void buildCP();
     void buildFullCP(const double& alpha);

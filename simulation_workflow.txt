@@ -1,0 +1,285 @@
+================================================================================
+                    StiffGIPC 仿真流程完整分析
+================================================================================
+
+一、项目概述
+============
+StiffGIPC 是一个基于 GPU 的 IPC (Incremental Potential Contact) 仿真框架，
+支持软体 (FEM)、刚体 (ABD)、布料及其混合耦合仿真。
+论文: "StiffGIPC: Advancing GPU IPC for Stiff Affine-Deformable Simulation"
+ACM Transactions on Graphics, 2025
+
+二、编译与运行
+==============
+
+  依赖安装 (Ubuntu):
+    sudo apt install libglew-dev freeglut3-dev libeigen3-dev nlohmann-json3-dev libtbb-dev
+
+  Release 编译:
+    cd build
+    cmake .. -DCMAKE_BUILD_TYPE=Release
+    make -j24
+
+  Debug 编译 (RelWithDebInfo):
+    cd build-debug
+    cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    make -j24
+
+  运行:
+    cd build 或 build-debug
+    ./gipc
+
+  调试:
+    cuda-gdb ./gipc        (可调试 CUDA kernel)
+    gdb ./gipc              (只调试 CPU 端)
+    或在 Cursor 中按 F5 (已配置 .vscode/launch.json)
+
+三、场景选择
+============
+
+  文件: StiffGIPC/gl_main.cu, 第 1095 行
+  变量: scene_no
+
+  ┌──────────┬──────────────────────────────┬────────────┐
+  │ scene_no │ 场景描述                      │ 函数        │
+  ├──────────┼──────────────────────────────┼────────────┤
+  │    0     │ box pipe (ABD+FEM 混合盒子)   │ set_case1()│
+  │    1     │ soft-rigid-cloth coupling     │ set_case2()│
+  │    2     │ wrecking ball case            │ set_case3()│
+  │    3     │ fixed cloth                   │ set_case4()│
+  │    4     │ twisting mat                  │ set_case5()│
+  │    5     │ box pipe large scale + cloth  │ set_case6()│
+  └──────────┴──────────────────────────────┴────────────┘
+
+  修改 scene_no 的值后需重新编译。
+
+四、Case 1 (set_case2) 场景详情: soft-rigid-cloth coupling
+==========================================================
+
+  文件: gl_main.cu:799-849
+
+  加载 3 个物体:
+    ① bunny2.msh  → ABD 刚体  (scale=0.2, y=-0.5, 杨氏模量=1e4)
+    ② bunny2.msh  → FEM 软体  (scale=0.2, y=0.65,  杨氏模量=1e4)
+    ③ cloth_high.obj → FEM 布料 (scale=1.0, 杨氏模量=1e4)
+
+  注意: ABD 必须在 FEM 之前加载 (代码中有 !!!!! 注释提醒)
+
+五、完整仿真流程图
+==================
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                   main() [gl_main.cu:1740]                  │
+  │   glutInit → 创建窗口 → init() → glutMainLoop()             │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+                             ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                   init() [gl_main.cu:1549]                  │
+  │                                                             │
+  │  ① Init_CUDA()             初始化 CUDA 设备                  │
+  │  ② glewInit()              初始化 OpenGL                     │
+  │  ③ LoadSettings()          读取 parameterSetting.txt         │
+  │     - 密度 (density)                                        │
+  │     - 泊松比 (PoissonRate)                                   │
+  │     - 摩擦系数 (frictionRate)                                │
+  │     - 布料杨氏模量/密度/厚度                                  │
+  │     - 时间步长 dt (IPC_dt)                                   │
+  │     - 收敛阈值等                                             │
+  │  ④ ipc.build_gipc_system() 构建 GIPC/ABD 子系统              │
+  │  ⑤ initScene()             加载场景 + 初始化求解器            │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+                             ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                initScene() [gl_main.cu:1090]                │
+  │                                                             │
+  │  switch(scene_no) → set_caseX()    加载网格几何              │
+  │                                                             │
+  │  setMAS_partition()     METIS 图分区 (MAS 预条件器)          │
+  │  tetMesh.getSurface()   提取表面三角形/边/顶点               │
+  │  initFEM(tetMesh)       计算质量、Lamé参数、DM逆矩阵         │
+  │  d_tetMesh.Malloc()     GPU 显存分配                        │
+  │  cudaMemcpy (×N)        CPU → GPU 数据传输                  │
+  │     - vertexes          顶点位置                             │
+  │     - tetrahedras       四面体索引                           │
+  │     - triangles         三角形索引                           │
+  │     - masses            质量                                 │
+  │     - velocities        速度                                 │
+  │     - DmInverses        变形梯度逆矩阵                       │
+  │     - BoundaryType      边界条件                             │
+  │     - body_id           物体标识                             │
+  │  ipc.MALLOC_DEVICE_MEM()  碰撞检测/BVH 显存分配             │
+  │  ipc.initBVH()          初始化层次包围盒                     │
+  │  ipc.buildBVH()         构建 BVH 树                         │
+  │  ipc.init()             计算 dhat/bbox/初始能量              │
+  │  ipc.buildCP()          构建碰撞对 (Collision Pairs)         │
+  │  ipc.computeXTilta()    计算惯性预测 x̃ = x + dt·v + dt²·g  │
+  │  ipc.create_LinearSystem() 创建线性系统(含预条件器)          │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+          glutMainLoop() 启动后, 每帧回调 display()
+                             │
+                             ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │             display() [gl_main.cu:1491]  每帧调用            │
+  │                                                             │
+  │  draw_Scene3D()            渲染当前帧                        │
+  │  if(stop) return;          按空格键暂停/继续                  │
+  │                                                             │
+  │  ipc.IPC_Solver(d_tetMesh)   ← 核心: 一个时间步的求解       │
+  │                                                             │
+  │  cudaMemcpy GPU→CPU        取回顶点位置用于渲染              │
+  │  step++                    帧计数                            │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+                             ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │           IPC_Solver() [GIPC.cu:11067]  核心求解器           │
+  │                                                             │
+  │  ① 边界处理 (如果 isUpdateBoundary)                         │
+  │     updateBoundaryMoveDir()                                 │
+  │     buildBVH_FULLCCD() → buildFullCP()                      │
+  │     CCD 检测 → 计算安全步长 → 更新边界                       │
+  │     while(isIntersected) 检查并消除自交                      │
+  │                                                             │
+  │  ② 接触刚度参数                                             │
+  │     upperBoundKappa() / suggestKappa() / initKappa()         │
+  │                                                             │
+  │  ③ 摩擦集构建 (USE_FRICTION 宏)                              │
+  │     buildFrictionSets()                                     │
+  │                                                             │
+  │  ④ while(true) 子步循环                                     │
+  │     │                                                       │
+  │     ├─ solve_subIP()   牛顿迭代求解 (见下方详情)             │
+  │     │                                                       │
+  │     ├─ 检查 animation_fullRate > 0.99 → break               │
+  │     └─ 否则更新摩擦集, 继续子步                              │
+  │                                                             │
+  │  ⑤ updateVelocities()    v = (x_new - x_old) / dt          │
+  │  ⑥ computeXTilta()       为下一帧计算惯性预测 x̃             │
+  │  ⑦ 统计输出 (时间/碰撞对数/写入 timeCost.txt)               │
+  └─────────────────────────────────────────────────────────────┘
+
+六、牛顿迭代核心: solve_subIP() [GIPC.cu:10854]
+================================================
+
+  for k = 0 to 10000 (最大迭代次数):
+
+    Step A: computeGradientAndHessian() [GIPC.cu:10889]
+    ─────────────────────────────────────────────────────
+      计算总能量的梯度 g 和 Hessian 矩阵 H
+      总能量 = 惯性项 + FEM弹性能 + IPC接触势垒能 + 摩擦能
+      - 惯性项: 1/(2·dt²) · M · ||x - x̃||²
+      - FEM弹性能: Ψ(F) (Neo-Hookean / StVK 等)
+      - IPC势垒: Σ b(d(x)) (距离势垒函数)
+      - 摩擦: Σ f(x) (IPC 摩擦模型)
+
+    Step B: 收敛判断 [GIPC.cu:10894-10910]
+    ─────────────────────────────────────────
+      distToOpt = ||moveDir||  (梯度范数)
+      if distToOpt < sqrt(threshold² · bboxDiagSize² · dt²)
+        → 收敛, break
+
+    Step C: calculateMovingDirection() [GIPC.cu:10914]
+    ────────────────────────────────────────────────────
+      用 PCG (预条件共轭梯度法) 求解:
+        H · dx = -g
+      得到搜索方向 dx
+      预条件器: MAS (Multilevel Additive Schwarz) 预条件器
+        - 使用 METIS 图分区
+        - 多级加性 Schwarz 域分解
+
+    Step D: CCD 安全步长计算 [GIPC.cu:10919-10951]
+    ─────────────────────────────────────────────────
+      ① ground_largestFeasibleStepSize()  地面 CCD
+      ② self_largestFeasibleStepSize()    自碰撞 CCD
+      ③ buildBVH_FULLCCD() + buildFullCP() 全局 CCD
+      ④ CFL 条件: alpha_CFL = sqrt(dHat) / maxSpeed * 0.5
+      最终步长 alpha = min(以上所有约束)
+
+    Step E: lineSearch() [GIPC.cu:10956]
+    ──────────────────────────────────────
+      沿 dx 方向做线搜索 (Armijo 回溯)
+      确保总能量严格下降
+
+    Step F: postLineSearch() [GIPC.cu:10959]
+    ──────────────────────────────────────────
+      更新顶点位置
+      重建 BVH: buildBVH()
+      重建碰撞对: buildCP()
+
+  输出: 牛顿迭代次数 k
+
+七、关键数据结构
+================
+
+  tetMesh (CPU 端):
+    - vertexes[]       顶点坐标 (double3)
+    - tetrahedras[]    四面体索引 (uint4)
+    - triangles[]      三角形索引 (uint3, 用于布料)
+    - surface[]        表面三角形
+    - surfEdges[]      表面边
+    - surfVerts[]      表面顶点
+    - masses[]         顶点质量
+    - velocities[]     顶点速度
+    - DM_inverse[]     参考构型变形梯度逆
+    - boundaryTypies[] 边界类型 (0=自由, 1=固定)
+
+  d_tetMesh (GPU 端):
+    tetMesh 的 GPU 镜像, 存在 CUDA device memory 中
+
+  ipc (GIPC 求解器):
+    - _vertexes        GPU 顶点指针
+    - _faces/_edges    GPU 表面面/边
+    - bvh_f/bvh_e      BVH 树 (面/边)
+    - _collisonPairs   碰撞对
+    - pcg_data         PCG 求解器数据
+    - Kappa            接触刚度
+    - dHat             接触距离阈值
+    - IPC_dt           时间步长
+
+八、关键文件索引
+================
+
+  gl_main.cu          主函数、场景设置、渲染循环、init/display
+  GIPC.cu             核心求解器 (IPC_Solver, solve_subIP, 碰撞检测等)
+  GIPC.cuh            GIPC 类声明
+  GIPC_PDerivative.cuh  IPC 势垒能的偏导数计算
+  femEnergy.cu/cuh    FEM 弹性能计算 (梯度 + Hessian)
+  mlbvh.cu/cuh        Multi-Level BVH 碰撞检测
+  ACCD.cu/cuh         连续碰撞检测 (CCD)
+  MASPreconditioner.cu  MAS 预条件器
+  PCG_SOLVER.cu/cuh   PCG 线性求解器
+  gpu_eigen_libs.cu   GPU 端矩阵运算库
+  load_mesh.cpp/h     网格文件加载 (.msh, .obj)
+  FrictionUtils.cuh   摩擦力计算
+  device_fem_data.cu  GPU 端 FEM 数据管理
+
+九、调试建议 - 关键断点位置
+============================
+
+  gl_main.cu:1095     场景选择 (scene_no)
+  gl_main.cu:1504     每帧入口 ipc.IPC_Solver()
+  GIPC.cu:10871       牛顿迭代循环起点
+  GIPC.cu:10889       梯度/Hessian 计算
+  GIPC.cu:10908       收敛判断
+  GIPC.cu:10914       PCG 线性求解
+  GIPC.cu:10956       线搜索
+  GIPC.cu:10959       后处理 (更新位置/碰撞对)
+  GIPC.cu:11219       速度更新
+
+十、键盘控制 (运行时)
+=====================
+
+  空格键    暂停/继续仿真
+  W/S       前后平移摄像机
+  A/D       左右平移摄像机
+  Q/E       上下平移摄像机
+  鼠标拖拽  旋转视角
+  /         开关截图保存
+  9         开关表面保存
+  K         开关表面绘制
+  F         开关 BVH 绘制
+
+================================================================================

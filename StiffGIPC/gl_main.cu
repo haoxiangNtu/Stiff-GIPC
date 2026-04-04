@@ -75,6 +75,7 @@ bool             g_skip_rendering               = false;
 bool             g_headless_benchmark           = false;
 int              g_headless_max_steps           = 500;
 int              g_scene_no                     = 5;
+double           linear_system_buff_scale       = 1.0;
 mesh_obj         obj;
 lbvh_f           bvh_f;
 lbvh_e           bvh_e;
@@ -997,6 +998,8 @@ void set_case1()
     double                    abd_height = -0.6;
     gipc::SimpleSceneImporter importer;
 
+    linear_system_buff_scale = 1.0;
+
     double Youngth_Modulus = 1e4;
     for(int k = 0; k < count_Y; ++k)
     {
@@ -1070,6 +1073,7 @@ void set_case2()
     transform.block<3, 1>(0, 3) =
         -Eigen::Vector3d(position_offset.x, position_offset.y, position_offset.z);
 
+    linear_system_buff_scale = 1.0;
     double Youngth_Modulus = 1e4;
     string mesh0_path      = assets_dir + "tetMesh/bunny2.msh";
     importer.load_geometry(tetMesh,
@@ -1118,13 +1122,14 @@ void set_case3()
     gipc::SimpleSceneImporter importer{assets_dir + "scene/json/wrecking-ball-simple.json",
                                        assets_dir + "tetMesh/wrecking-ball-mesh/",
                                        gipc::BodyType::ABD};
+    linear_system_buff_scale = 1.0;
     importer.import_scene(tetMesh);
 }
 
 void set_case4()
 {
     ipc.pcg_data.P_type = 1;
-
+    linear_system_buff_scale = 1.0;
     gipc::SimpleSceneImporter importer;
     double                    scale           = 0.6;
     double3                   position_offset = make_double3(0, 1.0, 0);
@@ -1165,7 +1170,7 @@ void set_case4()
 void set_case5()
 {
     ipc.pcg_data.P_type = 1;
-
+    linear_system_buff_scale = 2.0;
     gipc::SimpleSceneImporter importer;
     double                    scale = 1.0;
     Eigen::Vector3d           position_offset{0, 0, 0};
@@ -1235,7 +1240,7 @@ void set_case5()
 
 void set_case6()
 {
-
+    linear_system_buff_scale = 2.0;
     ipc.pcg_data.P_type = 1;
     double scale      = 0.3;
     double dist       = scale / 2;
@@ -4193,7 +4198,7 @@ void initScene()
 
     ipc.buildBVH();
     ipc.setup_surface_mesh_bodies(tetMesh);
-    ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer);
+    ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer, linear_system_buff_scale);
 
     // Initialize joint constraints (revolute + fixed + prismatic) after ABD system is ready
     if(!tetMesh.joint_constraints.empty() || !tetMesh.prismatic_constraints.empty())
