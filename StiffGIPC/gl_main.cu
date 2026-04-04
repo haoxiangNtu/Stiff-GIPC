@@ -10,7 +10,10 @@
 #include "GL/freeglut.h"
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <chrono>
+#include <cstring>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <map>
 // #include "GIPC.cuh"
@@ -44,10 +47,34 @@
 
 auto             assets_dir = std::string{gipc::assets_dir()};
 std::string      metis_dir  = assets_dir + "sorted_mesh/";
+
+// Generate an NxN grid cloth OBJ at runtime. Returns the file path.
+// Vertices span [-0.5, 0.5] in X and Z, Y=0.
+static std::string generate_cloth_obj(int n)
+{
+    std::string path = assets_dir + "triMesh/cloth_" + std::to_string(n) + "x" + std::to_string(n) + ".obj";
+    std::ofstream ofs(path);
+    for(int j = 0; j <= n; j++)
+        for(int i = 0; i <= n; i++)
+            ofs << "v " << (double(i) / n - 0.5) << " 0 " << (double(j) / n - 0.5) << "\n";
+    for(int j = 0; j < n; j++)
+        for(int i = 0; i < n; i++)
+        {
+            int v0 = j * (n + 1) + i + 1;
+            ofs << "f " << v0 << " " << (v0 + n + 1) << " " << (v0 + 1) << "\n";
+            ofs << "f " << (v0 + 1) << " " << (v0 + n + 1) << " " << (v0 + n + 2) << "\n";
+        }
+    ofs.close();
+    std::cout << "[generate_cloth] " << n << "x" << n
+              << " -> " << ((n+1)*(n+1)) << " verts, " << (n*n*2) << " faces: " << path << std::endl;
+    return path;
+}
 double           collision_detection_buff_scale = 1;
 double           motion_rate                    = 1;
 bool             g_skip_rendering               = false;
 bool             g_headless_benchmark           = false;
+int              g_headless_max_steps           = 500;
+int              g_scene_no                     = 5;
 mesh_obj         obj;
 lbvh_f           bvh_f;
 lbvh_e           bvh_e;
@@ -60,16 +87,138 @@ vector<string>   obj_pathes;
 
 // Whether interactive joint control UI is enabled (set by case 12)
 bool g_joint_control_enabled = false;
+
+// ---------------------------------------------------------------------------
+// Trajectory playback infrastructure
+// ---------------------------------------------------------------------------
+struct TrajectoryKeyframe
+{
+    double              time;
+    std::vector<double> revolute_angles;   // radians, one per revolute joint
+    std::vector<double> prismatic_dists;   // metres, one per prismatic joint
+};
+
+static std::vector<TrajectoryKeyframe> g_trajectory;
+static bool   g_trajectory_playback_enabled = false;
+static double g_trajectory_sim_time         = 0.0;
+static int    g_settling_frames             = 0;
+
+static bool load_trajectory(const std::string& path)
+{
+    g_trajectory.clear();
+    std::ifstream ifs(path);
+    if(!ifs.is_open())
+    {
+        std::cerr << "[trajectory] Cannot open " << path << std::endl;
+        return false;
+    }
+
+    std::string line;
+    int n_revolute  = -1;
+    int n_prismatic = -1;
+
+    while(std::getline(ifs, line))
+    {
+        if(line.empty() || line[0] == '#')
+            continue;
+
+        std::istringstream ss(line);
+        TrajectoryKeyframe kf;
+        ss >> kf.time;
+        double v;
+        std::vector<double> vals;
+        while(ss >> v)
+            vals.push_back(v);
+
+        if(n_revolute < 0)
+        {
+            n_revolute  = static_cast<int>(tetMesh.joint_angle_controls.size());
+            n_prismatic = static_cast<int>(tetMesh.prismatic_drive_controls.size());
+        }
+
+        int total = n_revolute + n_prismatic;
+        if(static_cast<int>(vals.size()) < total)
+        {
+            std::cerr << "[trajectory] Line has " << vals.size()
+                      << " values, expected " << total << std::endl;
+            continue;
+        }
+        kf.revolute_angles.assign(vals.begin(), vals.begin() + n_revolute);
+        kf.prismatic_dists.assign(vals.begin() + n_revolute,
+                                  vals.begin() + n_revolute + n_prismatic);
+        g_trajectory.push_back(std::move(kf));
+    }
+    ifs.close();
+    std::cout << "[trajectory] Loaded " << g_trajectory.size()
+              << " keyframes from " << path
+              << " (revolute=" << n_revolute << ", prismatic=" << n_prismatic << ")"
+              << std::endl;
+    return !g_trajectory.empty();
+}
+
+static void update_trajectory(double dt)
+{
+    if(g_trajectory.empty())
+        return;
+
+    g_trajectory_sim_time += dt;
+
+    // Find the two bracketing keyframes for linear interpolation
+    double t = g_trajectory_sim_time;
+    if(t <= g_trajectory.front().time)
+    {
+        auto& kf = g_trajectory.front();
+        for(size_t i = 0; i < kf.revolute_angles.size() && i < tetMesh.joint_angle_controls.size(); i++)
+            tetMesh.joint_angle_controls[i].target_angle = kf.revolute_angles[i];
+        for(size_t i = 0; i < kf.prismatic_dists.size() && i < tetMesh.prismatic_drive_controls.size(); i++)
+            tetMesh.prismatic_drive_controls[i].target_distance = kf.prismatic_dists[i];
+        return;
+    }
+    if(t >= g_trajectory.back().time)
+    {
+        auto& kf = g_trajectory.back();
+        for(size_t i = 0; i < kf.revolute_angles.size() && i < tetMesh.joint_angle_controls.size(); i++)
+            tetMesh.joint_angle_controls[i].target_angle = kf.revolute_angles[i];
+        for(size_t i = 0; i < kf.prismatic_dists.size() && i < tetMesh.prismatic_drive_controls.size(); i++)
+            tetMesh.prismatic_drive_controls[i].target_distance = kf.prismatic_dists[i];
+        return;
+    }
+
+    // Binary search for the interval
+    size_t lo = 0, hi = g_trajectory.size() - 1;
+    while(lo + 1 < hi)
+    {
+        size_t mid = (lo + hi) / 2;
+        if(g_trajectory[mid].time <= t)
+            lo = mid;
+        else
+            hi = mid;
+    }
+
+    auto& kf0 = g_trajectory[lo];
+    auto& kf1 = g_trajectory[hi];
+    double alpha = (t - kf0.time) / (kf1.time - kf0.time + 1e-12);
+    alpha = std::max(0.0, std::min(1.0, alpha));
+
+    for(size_t i = 0; i < kf0.revolute_angles.size() && i < tetMesh.joint_angle_controls.size(); i++)
+        tetMesh.joint_angle_controls[i].target_angle =
+            kf0.revolute_angles[i] * (1.0 - alpha) + kf1.revolute_angles[i] * alpha;
+
+    for(size_t i = 0; i < kf0.prismatic_dists.size() && i < tetMesh.prismatic_drive_controls.size(); i++)
+        tetMesh.prismatic_drive_controls[i].target_distance =
+            kf0.prismatic_dists[i] * (1.0 - alpha) + kf1.prismatic_dists[i] * alpha;
+}
+// ---------------------------------------------------------------------------
 int              initPath = 0;
 using namespace std;
 int   step      = 0;
 int   frameId   = 0;
 int   surfNumId = 0;
-float xRot      = 0.0f;
-float yRot      = 0.f;
+float xRot      = 5.0f;
+float yRot      = -45.f;
 float xTrans    = 0;
-float yTrans    = 0;
-float zTrans    = 0;
+float yTrans    = 0.5f;
+float zTrans    = 2.0f;
 int   ox;
 int   oy;
 int   buttonState;
@@ -3052,6 +3201,15 @@ void display(void)
 
     auto frame_start = std::chrono::high_resolution_clock::now();
 
+    if(g_settling_frames > 0)
+    {
+        ipc.m_abd_system->parms.max_revolute_step_per_frame  = 0.05;
+        ipc.m_abd_system->parms.max_prismatic_step_per_frame = 0.01;
+    }
+
+    if(g_trajectory_playback_enabled)
+        update_trajectory(ipc.IPC_dt);
+
     if(g_joint_control_enabled)
     {
         ipc.update_joint_angle_targets_from_mesh(tetMesh);
@@ -3059,6 +3217,16 @@ void display(void)
 
     auto solver_start = std::chrono::high_resolution_clock::now();
     ipc.IPC_Solver(d_tetMesh);
+
+    if(g_settling_frames > 0)
+    {
+        --g_settling_frames;
+        if(g_settling_frames == 0)
+        {
+            ipc.m_abd_system->parms.max_revolute_step_per_frame  = 1;
+            ipc.m_abd_system->parms.max_prismatic_step_per_frame = 0.002;
+        }
+    }
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     auto solver_end = std::chrono::high_resolution_clock::now();
 
@@ -3361,7 +3529,7 @@ int main(int argc, char** argv)
         stop = false;
         std::cout << "[headless] Entering headless benchmark loop..." << std::endl;
 
-        int max_steps = 500;
+        int max_steps = g_headless_max_steps;
         auto total_start = std::chrono::high_resolution_clock::now();
 
         for(int s = 0; s < max_steps; s++)
