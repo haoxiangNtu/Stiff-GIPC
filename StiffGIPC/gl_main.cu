@@ -3219,7 +3219,6 @@ void set_case22_franka_table_cloth()
     // cube.msh range is 0.4 per axis, so scale = desired_size / 0.4
     int arm_body_count = tetMesh.abd_fem_count_info.abd_body_num;
     double table_cx = 0.55, table_cz = 0.0;
-    constexpr double table_top_y = -0.37;
     {
         gipc::SimpleSceneImporter table_imp;
         Eigen::Matrix4d table_tf = Eigen::Matrix4d::Identity();
@@ -3564,6 +3563,55 @@ void set_case25_shirt_freefall()
     std::cout << "semi_implicit:    OFF (full Newton)" << std::endl;
 }
 
+void set_case26_shirt_freefall_semi_implicit()
+{
+    double cloth_E                  = 1e4;
+    ipc.clothThickness              = 1e-3;    // 1 mm
+    ipc.clothYoungModulus           = 1e6;
+    ipc.bendYoungModulus            = 1e5;
+    ipc.clothDensity                = 2e2;     // 200 kg/m^3
+    ipc.strainRate                  = 100;
+    ipc.bendStiff                   = 3e-4;
+    ipc.softMotionRate              = 1e0;
+    ipc.PoissonRate                 = 0.49;
+    ipc.gd_frictionRate             = 0.4;
+    ipc.frictionRate                = 0.4;
+    ipc.relative_dhat               = 1e-3;
+    ipc.IPC_dt                      = 1e-2;
+
+    // Enable semi-implicit beta-decay early exit
+    ipc.semi_implicit_enabled  = true;
+    ipc.semi_implicit_beta_tol = 1e-3;
+    ipc.semi_implicit_min_iter = 1;
+
+    // No table — falls to built-in ground plane (Y = -1)
+    {
+        std::string shirt_path = assets_dir + "triMesh/shirt_6436v.obj";
+        gipc::SimpleSceneImporter cloth_imp;
+        Eigen::Matrix4d cloth_tf = Eigen::Matrix4d::Identity();
+
+        cloth_imp.load_geometry(tetMesh, 2, gipc::BodyType::FEM, cloth_tf,
+                                cloth_E, shirt_path, ipc.pcg_data.P_type,
+                                BodyBoundaryType::Free);
+    }
+
+    g_skip_rendering       = false;
+    g_headless_benchmark   = false;
+
+    std::cout << "=== Case26: SHIRT FREE-FALL (semi-implicit, StiffGIPC-default) ===" << std::endl;
+    std::cout << "FEM bodies: "  << tetMesh.abd_fem_count_info.fem_body_num << std::endl;
+    std::cout << "Total verts: " << tetMesh.vertexNum << std::endl;
+    std::cout << "clothYoungModulus: " << ipc.clothYoungModulus << std::endl;
+    std::cout << "clothDensity:     " << ipc.clothDensity << std::endl;
+    std::cout << "clothThickness:   " << ipc.clothThickness << std::endl;
+    std::cout << "bendStiff:        " << ipc.bendStiff << std::endl;
+    std::cout << "PoissonRate:      " << ipc.PoissonRate << std::endl;
+    std::cout << "relative_dhat:    " << ipc.relative_dhat << std::endl;
+    std::cout << "IPC_dt:           " << ipc.IPC_dt << std::endl;
+    std::cout << "semi_implicit:    ON (beta_tol=" << ipc.semi_implicit_beta_tol
+              << ", min_iter=" << ipc.semi_implicit_min_iter << ")" << std::endl;
+}
+
 // ==========================================================================
 // ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
 // (no joints, no collision, no rendering, headless)
@@ -3655,7 +3703,7 @@ void initScene()
     std::filesystem::exists(metis_dir) || std::filesystem::create_directory(metis_dir);
     ipc.pcg_data.P_type = 1;
 
-    int scene_no            = 5;
+    int scene_no            = g_scene_no;
     g_joint_control_enabled = false;
     //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     //!!!!!!!!!!!!!!!!ABD must be loaded before FEM!!!!!!!!!!!!!!!!!!
@@ -3736,6 +3784,9 @@ void initScene()
             break;
         case 24: //Case25: Shirt free-fall full Newton
             set_case25_shirt_freefall();
+            break;
+        case 25: //Case26: Shirt free-fall semi-implicit
+            set_case26_shirt_freefall_semi_implicit();
             break;
         case 99: //ABD Freefall benchmark (no joints, no render, headless)
             set_case_abd_freefall_benchmark();
@@ -4547,6 +4598,19 @@ void SpecialKey(GLint key, GLint x, GLint y)
 
 int main(int argc, char** argv)
 {
+    for(int i = 1; i < argc; i++)
+    {
+        if(strcmp(argv[i], "--scene") == 0 && i + 1 < argc)
+        {
+            g_scene_no = atoi(argv[++i]);
+        }
+        else if(argv[i][0] != '-')
+        {
+            g_scene_no = atoi(argv[i]);
+        }
+    }
+    printf(">>> scene_no = %d\n", g_scene_no);
+
     glutInit(&argc, argv);
 
     glutSetOption(GLUT_MULTISAMPLE, 16);
