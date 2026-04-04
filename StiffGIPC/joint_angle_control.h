@@ -35,8 +35,7 @@ struct JointAngleControlInfo
     double strength_ratio = 1.0;
 
     /// Joint limits from URDF (in radians).
-    /// Capped to ±170°: sin²-based driving energy has period π and atan2
-    /// wraps at ±π, so targets near ±180° cause perpetual rotation.
+    /// Kept away from ±180° to avoid unstable branch switching near wrap boundaries.
     static constexpr double kSafeAngleLimit = 3.12413936106985;  // 179 deg
     double lower_limit = -kSafeAngleLimit;
     double upper_limit =  kSafeAngleLimit;

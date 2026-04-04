@@ -79,52 +79,53 @@ MUDA_GENERIC inline Matrix3x3 extract_A(const Vector12& q)
 
 /// Compute the revolute driving joint energy.
 ///
-/// E = 0.5 * K * sin(theta - theta_tgt)^2
-///   = 0.5 * K * (sin_theta * cos_tgt - cos_theta * sin_tgt)^2
+/// E = 0.5 * K * ( sin(delta)^2 + beta * (1 - cos(delta))^2 )
+///
+/// where delta = theta - theta_tgt.
+/// The sin^2 term drives toward delta=0. The small (1-cos)^2 term
+/// breaks the pi-periodic degeneracy of sin^2 (which has minima at
+/// both delta=0 and delta=pi).  beta=0.02 penalises the pi branch
+/// without perturbing normal tracking.
 ///
 MUDA_GENERIC inline Float revolute_driving_energy(
     const RevoluteDrivingGPUData& drv,
     const Vector12& q1,   // parent body state
     const Vector12& q2)   // child body state
 {
+    constexpr Float beta = Float(0.02);
+
     Matrix3x3 A1 = extract_A(q1);
     Matrix3x3 A2 = extract_A(q2);
 
-    // World-space direction vectors
     Vector3 p  = A1 * drv.p_bar;
     Vector3 pN = A1 * drv.pN_bar;
     Vector3 q  = A2 * drv.q_bar;
     Vector3 qN = A2 * drv.qN_bar;
 
-    // Symmetric sin/cos of current angle
     Float cos_theta = 0.5 * (p.dot(q) + pN.dot(qN));
     Float sin_theta = 0.5 * (q.dot(pN) - qN.dot(p));
 
-    // sin(theta - theta_tgt) via trig identity
     Float cos_tgt = cos(drv.target_angle);
     Float sin_tgt = sin(drv.target_angle);
-    Float s = sin_theta * cos_tgt - cos_theta * sin_tgt;
 
-    return 0.5 * drv.stiffness * s * s;
+    Float s     = sin_theta * cos_tgt - cos_theta * sin_tgt;   // sin(delta)
+    Float c     = cos_theta * cos_tgt + sin_theta * sin_tgt;   // cos(delta)
+    Float c_err = Float(1) - c;                                // 1 - cos(delta)
+
+    return Float(0.5) * drv.stiffness * (s * s + beta * c_err * c_err);
 }
 
 
 /// Compute gradient of revolute driving energy w.r.t. q1 and q2.
 ///
-/// Uses chain rule: dE/dq = K * s * ds/dq
-/// where s = sin(theta)*cos_tgt - cos(theta)*sin_tgt
+/// E = 0.5 * K * ( s^2 + beta * c_err^2 )
+/// where  s     = sin(delta),   c_err = 1 - cos(delta)
 ///
-/// ds/dq1 = cos_tgt * d(sin_theta)/dq1 - sin_tgt * d(cos_theta)/dq1
-/// ds/dq2 = cos_tgt * d(sin_theta)/dq2 - sin_tgt * d(cos_theta)/dq2
+/// dE/dq = K * ( s * ds/dq  -  beta * c_err * dc/dq )
 ///
-/// For ABD q = [p, a1, a2, a3] where A = [a1;a2;a3]:
-///   d(A*x_bar)/dq = [0, x_bar^T, 0, 0; 0, 0, x_bar^T, 0; 0, 0, 0, x_bar^T]
-///   This is exactly ABDJacobi(x_bar) without the identity block (translation part).
-///
-/// cos_theta = 0.5*(p·q + pN·qN)
-///   d(cos)/dq1: d(A1*p_bar·A2*q_bar)/dq1 = d(q1^T * Jp^T * Jq * q2)/dq1
-///   But since p = A1*p_bar depends only on q1 (specifically on [a1,a2,a3]):
-///     d(p·q)/dq1_i = d(A1*p_bar)^T/dq1_i · (A2*q_bar) where i indexes q1 components
+/// dc/d{dir} is related to ds/d{dir} by a 90-degree rotation:
+///   dc/dp  =  ds/dpN,   dc/dpN = -ds/dp
+///   dc/dq  = -ds/dqN,   dc/dqN =  ds/dq
 ///
 MUDA_GENERIC inline void revolute_driving_gradient(
     const RevoluteDrivingGPUData& drv,
@@ -133,6 +134,8 @@ MUDA_GENERIC inline void revolute_driving_gradient(
     Vector12& grad_q1_out,
     Vector12& grad_q2_out)
 {
+    constexpr Float beta = Float(0.02);
+
     Matrix3x3 A1 = extract_A(q1);
     Matrix3x3 A2 = extract_A(q2);
 
@@ -146,49 +149,22 @@ MUDA_GENERIC inline void revolute_driving_gradient(
 
     Float cos_tgt = cos(drv.target_angle);
     Float sin_tgt = sin(drv.target_angle);
-    Float s = sin_theta * cos_tgt - cos_theta * sin_tgt;
 
-    // Derivatives of cos_theta and sin_theta w.r.t. world-space directions:
-    // d(cos)/dp  = 0.5 * q,    d(cos)/dpN = 0.5 * qN
-    // d(cos)/dq  = 0.5 * p,    d(cos)/dqN = 0.5 * pN
-    // d(sin)/dp  = -0.5 * qN,  d(sin)/dpN = 0.5 * q
-    // d(sin)/dq  = 0.5 * pN,   d(sin)/dqN = -0.5 * p
+    Float s     = sin_theta * cos_tgt - cos_theta * sin_tgt;   // sin(delta)
+    Float c     = cos_theta * cos_tgt + sin_theta * sin_tgt;   // cos(delta)
+    Float c_err = Float(1) - c;                                // 1 - cos(delta)
 
-    // ds/dp  = cos_tgt * (-0.5*qN) - sin_tgt * (0.5*q)  = -0.5*(cos_tgt*qN + sin_tgt*q)
-    // ds/dpN = cos_tgt * (0.5*q)   - sin_tgt * (0.5*qN)  = 0.5*(cos_tgt*q - sin_tgt*qN)
-    // ds/dq  = cos_tgt * (0.5*pN)  - sin_tgt * (0.5*p)   = 0.5*(cos_tgt*pN - sin_tgt*p)
-    // ds/dqN = cos_tgt * (-0.5*p)  - sin_tgt * (0.5*pN)  = -0.5*(cos_tgt*p + sin_tgt*pN)
-
+    // ds/d{direction}
     Vector3 ds_dp  = -0.5 * (cos_tgt * qN + sin_tgt * q);
     Vector3 ds_dpN =  0.5 * (cos_tgt * q  - sin_tgt * qN);
     Vector3 ds_dq  =  0.5 * (cos_tgt * pN - sin_tgt * p);
     Vector3 ds_dqN = -0.5 * (cos_tgt * p  + sin_tgt * pN);
 
-    // Now chain rule to ABD q1, q2:
-    // d(A1*x_bar)/dq1 is the "direction Jacobi":
-    //   For ABD, d(A*x_bar)/d(a1) = x_bar (row 0 of A contributes x_bar^T·a1 to output[0])
-    //   Specifically: d(A*x)/dq = [0 | x·e1^T | x·e2^T | x·e3^T] (3x12)
-    //   But wait: ABDJacobi(x_bar) * q = p + A*x_bar (includes translation).
-    //   The direction part is just A*x_bar.  So:
-    //     d(A*x_bar)/dq[0..2] = 0   (no dependence on translation p)
-    //     d(A*x_bar)/dq[3..11] = same as ABDJacobi rows 1-9
-    //
-    // We use a helper that computes J_dir^T * g (12x1), where J_dir omits translation.
-
-    // J_dir(x_bar)^T * g = [0; g·x_bar[0]; g·x_bar[1]; g·x_bar[2]]  ... no!
-    // Actually: A*x_bar = [a1·x, a2·x, a3·x] so:
-    //   d(A*x)/da1 = [x^T, 0, 0] -> contributes to row 0 of output
-    //   d(A*x)/da2 = [0, x^T, 0] -> contributes to row 1
-    //   d(A*x)/da3 = [0, 0, x^T] -> contributes to row 2
-    // So d(A*x)/dq (3x12) = [0_{3x3} | x*e1^T; x*e2^T; x*e3^T]
-    //                      = [0_{3x3} | diag block where block(i,*) = e_i * x^T]
-    // Actually simpler: (A*x)_i = a_i · x, so d(A*x)_i / da_j = x * delta_{ij}
-    // So dAx/dq (3x12): cols 0-2 = 0, cols 3-5 = [x^T;0;0], cols 6-8 = [0;x^T;0], cols 9-11 = [0;0;x^T]
-    // This is ABDJacobi(x_bar).to_mat() but with the identity block zeroed out.
-    //
-    // J_dir(x)^T * g:  (12x1)
-    //   [0, 0, 0, g[0]*x[0], g[0]*x[1], g[0]*x[2], g[1]*x[0], ...]
-    //   = [0; x*g[0]; x*g[1]; x*g[2]]
+    // dc/d{direction}  (90-degree relation to ds)
+    Vector3 dc_dp  =  ds_dpN;           //  0.5*(cos_tgt*q  - sin_tgt*qN)
+    Vector3 dc_dpN = -ds_dp;            //  0.5*(cos_tgt*qN + sin_tgt*q)
+    Vector3 dc_dq  = -ds_dqN;           //  0.5*(cos_tgt*p  + sin_tgt*pN)
+    Vector3 dc_dqN =  ds_dq;            //  0.5*(cos_tgt*pN - sin_tgt*p)
 
     auto JdirT_times = [](const Vector3& x_bar, const Vector3& g) -> Vector12
     {
@@ -200,24 +176,27 @@ MUDA_GENERIC inline void revolute_driving_gradient(
         return result;
     };
 
-    // ds/dq1 = J_dir(p_bar)^T * ds_dp + J_dir(pN_bar)^T * ds_dpN
-    Vector12 ds_dq1 = JdirT_times(drv.p_bar, ds_dp) + JdirT_times(drv.pN_bar, ds_dpN);
-    // ds/dq2 = J_dir(q_bar)^T * ds_dq + J_dir(qN_bar)^T * ds_dqN
-    Vector12 ds_dq2 = JdirT_times(drv.q_bar, ds_dq) + JdirT_times(drv.qN_bar, ds_dqN);
+    Vector12 ds_dq1 = JdirT_times(drv.p_bar, ds_dp)  + JdirT_times(drv.pN_bar, ds_dpN);
+    Vector12 ds_dq2 = JdirT_times(drv.q_bar, ds_dq)   + JdirT_times(drv.qN_bar, ds_dqN);
+    Vector12 dc_dq1 = JdirT_times(drv.p_bar, dc_dp)  + JdirT_times(drv.pN_bar, dc_dpN);
+    Vector12 dc_dq2 = JdirT_times(drv.q_bar, dc_dq)   + JdirT_times(drv.qN_bar, dc_dqN);
 
-    grad_q1_out = drv.stiffness * s * ds_dq1;
-    grad_q2_out = drv.stiffness * s * ds_dq2;
+    Float K = drv.stiffness;
+    grad_q1_out = K * (s * ds_dq1 - beta * c_err * dc_dq1);
+    grad_q2_out = K * (s * ds_dq2 - beta * c_err * dc_dq2);
 }
 
 
 /// Compute Hessian of revolute driving energy using Gauss-Newton approximation.
 ///
-/// H ≈ K * [ds/dq1; ds/dq2]^T * [ds/dq1; ds/dq2]   (24x24, rank-1, SPD)
+/// E = 0.5 * K * ( s^2 + beta * c_err^2 )
 ///
-/// We decompose into 12x12 blocks:
-///   H_11 = K * ds_dq1 * ds_dq1^T
-///   H_22 = K * ds_dq2 * ds_dq2^T
-///   H_12 = K * ds_dq1 * ds_dq2^T
+/// Gauss-Newton treats this as sum of squared residuals:
+///   r1 = sqrt(K) * s,     r2 = sqrt(K*beta) * c_err
+///   H_GN = J1^T J1 + J2^T J2
+///        = K * ds*ds^T + K*beta * dc*dc^T
+///
+/// This is SPD by construction (sum of rank-1 outer products).
 ///
 MUDA_GENERIC inline void revolute_driving_hessian(
     const RevoluteDrivingGPUData& drv,
@@ -227,6 +206,8 @@ MUDA_GENERIC inline void revolute_driving_hessian(
     Matrix12x12& H_22_out,
     Matrix12x12& H_12_out)
 {
+    constexpr Float beta = Float(0.02);
+
     Matrix3x3 A1 = extract_A(q1);
     Matrix3x3 A2 = extract_A(q2);
 
@@ -238,10 +219,17 @@ MUDA_GENERIC inline void revolute_driving_hessian(
     Float cos_tgt = cos(drv.target_angle);
     Float sin_tgt = sin(drv.target_angle);
 
+    // ds/d{direction}
     Vector3 ds_dp  = -0.5 * (cos_tgt * qN + sin_tgt * q);
     Vector3 ds_dpN =  0.5 * (cos_tgt * q  - sin_tgt * qN);
     Vector3 ds_dq  =  0.5 * (cos_tgt * pN - sin_tgt * p);
     Vector3 ds_dqN = -0.5 * (cos_tgt * p  + sin_tgt * pN);
+
+    // dc/d{direction}  (90-degree relation)
+    Vector3 dc_dp  =  ds_dpN;
+    Vector3 dc_dpN = -ds_dp;
+    Vector3 dc_dq  = -ds_dqN;
+    Vector3 dc_dqN =  ds_dq;
 
     auto JdirT_times = [](const Vector3& x_bar, const Vector3& g) -> Vector12
     {
@@ -253,14 +241,15 @@ MUDA_GENERIC inline void revolute_driving_hessian(
         return result;
     };
 
-    Vector12 ds_dq1 = JdirT_times(drv.p_bar, ds_dp) + JdirT_times(drv.pN_bar, ds_dpN);
-    Vector12 ds_dq2 = JdirT_times(drv.q_bar, ds_dq) + JdirT_times(drv.qN_bar, ds_dqN);
+    Vector12 ds_dq1 = JdirT_times(drv.p_bar, ds_dp)  + JdirT_times(drv.pN_bar, ds_dpN);
+    Vector12 ds_dq2 = JdirT_times(drv.q_bar, ds_dq)   + JdirT_times(drv.qN_bar, ds_dqN);
+    Vector12 dc_dq1 = JdirT_times(drv.p_bar, dc_dp)  + JdirT_times(drv.pN_bar, dc_dpN);
+    Vector12 dc_dq2 = JdirT_times(drv.q_bar, dc_dq)   + JdirT_times(drv.qN_bar, dc_dqN);
 
-    // Gauss-Newton: H = K * outer(ds/d[q1,q2], ds/d[q1,q2])
     Float K = drv.stiffness;
-    H_11_out = K * ds_dq1 * ds_dq1.transpose();
-    H_22_out = K * ds_dq2 * ds_dq2.transpose();
-    H_12_out = K * ds_dq1 * ds_dq2.transpose();
+    H_11_out = K * (ds_dq1 * ds_dq1.transpose() + beta * dc_dq1 * dc_dq1.transpose());
+    H_22_out = K * (ds_dq2 * ds_dq2.transpose() + beta * dc_dq2 * dc_dq2.transpose());
+    H_12_out = K * (ds_dq1 * ds_dq2.transpose() + beta * dc_dq1 * dc_dq2.transpose());
 }
 
 
