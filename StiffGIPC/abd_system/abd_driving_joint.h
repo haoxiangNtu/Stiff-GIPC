@@ -627,7 +627,7 @@ MUDA_GENERIC inline void prismatic_constraint_gradient_hessian(
 // ============================================================================
 //
 // Energy: E = 0.5 * K * (d - d_target)^2
-// where d = (C_p - C_q) · t_q
+// where d = (C_q - C_p) · t_q
 //
 // Chain rule:
 //   dE/d(qp,qq) = K * (d - d_tgt) * dd/d(qp,qq)
