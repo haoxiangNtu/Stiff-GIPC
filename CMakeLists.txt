@@ -38,7 +38,7 @@ find_package(imgui CONFIG REQUIRED)
 
 # add external libraries
 if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "native")
+    set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 #add_subdirectory("External/muda")
 
@@ -93,7 +93,7 @@ set_target_properties(gipc PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CUDA_STANDARD 17
-    CUDA_ARCHITECTURES native)
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
 
 target_compile_options(gipc
     PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: 
