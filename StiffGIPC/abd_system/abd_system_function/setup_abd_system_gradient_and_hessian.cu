@@ -1775,7 +1775,7 @@ void ABDSystem::update_prismatic_driving_targets(
                    Aq.row(2) = q2.segment<3>(9).transpose();
                    Vector3 tq = Aq * drv.tq_bar;
 
-                   Float d_prev = (Cp - Cq).dot(tq);
+                   Float d_prev = (Cq - Cp).dot(tq);
 
                    Float desired_goal = ctrls(i).target_distance;
                    Float diff = desired_goal - d_prev;

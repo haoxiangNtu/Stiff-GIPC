@@ -669,7 +669,7 @@ MUDA_GENERIC inline Float prismatic_driving_energy(
     Vector3 Cq = ABDJacobi(drv.Cq_bar) * qq;
     Vector3 tq = extract_A(qq) * drv.tq_bar;
 
-    Float d = (Cp - Cq).dot(tq);
+    Float d = (Cq - Cp).dot(tq);
     Float err = d - drv.target_distance;
     return 0.5 * drv.stiffness * err * err;
 }
@@ -694,15 +694,15 @@ MUDA_GENERIC inline void prismatic_driving_gradient_hessian(
     Matrix3x3 Aq = extract_A(qq);
     Vector3 tq = Aq * drv.tq_bar;
 
-    Vector3 diff = Cp - Cq;
+    Vector3 diff = Cq - Cp;
     Float d = diff.dot(tq);
     Float err = d - drv.target_distance;
     Float K = drv.stiffness;
 
-    // d = (Cp - Cq) · tq
-    // dd/dqp = tq^T * J_Cp  (1x12)
-    // dd/dqq = tq^T * (-J_Cq) + (Cp-Cq)^T * J_dir(tq_bar)  (1x12)
-    //        = -tq^T * J_Cq + diff^T * J_dir_tq
+    // d = (Cq - Cp) · tq
+    // dd/dqp = -tq^T * J_Cp  (1x12)
+    // dd/dqq = tq^T * J_Cq + (Cq-Cp)^T * J_dir(tq_bar)  (1x12)
+    //        = tq^T * J_Cq + diff^T * J_dir_tq
 
     auto JdirT = [](const Vector3& x_bar, const Vector3& g) -> Vector12
     {
@@ -715,9 +715,9 @@ MUDA_GENERIC inline void prismatic_driving_gradient_hessian(
     };
 
     // dd/dqp (12x1 via transposition)
-    Vector12 dd_dqp = J_Cp.T() * tq;
-    // dd/dqq: -J_Cq^T * tq + J_dir(tq_bar)^T * diff
-    Vector12 dd_dqq = -(J_Cq.T() * tq) + JdirT(drv.tq_bar, diff);
+    Vector12 dd_dqp = -(J_Cp.T() * tq);
+    // dd/dqq: J_Cq^T * tq + J_dir(tq_bar)^T * diff
+    Vector12 dd_dqq = (J_Cq.T() * tq) + JdirT(drv.tq_bar, diff);
 
     // Gradient: K * err * dd/dq
     grad_p_out = K * err * dd_dqp;
