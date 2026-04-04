@@ -27,5 +27,10 @@ class ABDSystemParms
 
     // Prismatic driving energy: K = strength_ratio * (m_parent + m_child).
     Float    prismatic_driving_strength_ratio = 100.0;
+
+    // Per-frame rate limits for driving target convergence.
+    // Set large values temporarily to allow fast initial settling.
+    Float    max_revolute_step_per_frame  = 0.1;    // rad
+    Float    max_prismatic_step_per_frame = 0.002;  // m
 };
 }  // namespace gipc

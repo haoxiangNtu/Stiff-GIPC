@@ -1287,7 +1287,7 @@ void ABDSystem::update_revolute_driving_targets(
     muda::DeviceBuffer<DrivingCtrlPacked> d_ctrl(n);
     d_ctrl.view().copy_from(host_ctrl.data());
 
-    constexpr Float kMaxStepPerFrame = 0.1;
+    Float kMaxStepPerFrame = parms.max_revolute_step_per_frame;
     Float sr = parms.revolute_driving_strength_ratio;
 
     ParallelFor(256)
@@ -1325,6 +1325,8 @@ void ABDSystem::update_revolute_driving_targets(
 
                    Float desired_goal = ctrls(i).target_angle;
                    Float diff = desired_goal - theta_prev;
+                   const Float TWO_PI = Float(2.0 * 3.14159265358979323846);
+                   diff = diff - TWO_PI * round(diff / TWO_PI);
                    diff = (diff >  kMaxStepPerFrame) ?  kMaxStepPerFrame :
                           (diff < -kMaxStepPerFrame) ? -kMaxStepPerFrame : diff;
 
@@ -1748,7 +1750,7 @@ void ABDSystem::update_prismatic_driving_targets(
     muda::DeviceBuffer<PrisCtrlPacked> d_ctrl(n);
     d_ctrl.view().copy_from(host_ctrl.data());
 
-    constexpr Float kMaxStepPerFrame = 0.002;
+    Float kMaxStepPerFrame = parms.max_prismatic_step_per_frame;
     Float sr = parms.prismatic_driving_strength_ratio;
 
     ParallelFor(256)
