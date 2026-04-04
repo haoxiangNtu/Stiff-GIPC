@@ -3014,6 +3014,86 @@ void set_case19_arm_table_cloth()
     std::cout << "[set_case19] Joint angle controls: " << tetMesh.joint_angle_controls.size() << std::endl;
 }
 
+void set_case20_arm_hanging_cloth()
+{
+    // --- ABD first: load XArm7+Gripper via URDF ---
+    gipc::UrdfSceneImporter urdf_importer;
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm7_with_gripper.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+    double arm_scale = 0.3;
+    Transform arm_t = Transform::Identity();
+    arm_t.translate(Eigen::Vector3d(0, -0.75, 0));
+    arm_t.scale(arm_scale);
+    arm_t.rotate(Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitX()));
+
+    urdf_importer.set_global_transform(arm_t.matrix());
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case20] XArm7+Gripper import failed!" << std::endl;
+        std::abort();
+    }
+
+    ipc.m_abd_system->parms.joint_strength_ratio            = 1000.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio = 1000.0;
+
+    for(auto& [link_name, link_info] : urdf_importer.link_infos())
+    {
+        if(link_info.body_id >= 0)
+            tetMesh.ground_collision_skip_body_ids.push_back(link_info.body_id);
+    }
+
+    // --- FEM cloth: case 3 style (cloth_high.obj, fixed at top corners) ---
+    // Positioned near the arm with X offset so the arm can reach it
+    ipc.clothThickness = 1e-3;
+    int fem_vert_start = tetMesh.vertexNum;
+    {
+        gipc::SimpleSceneImporter importer;
+        double scale = 0.4;
+        Transform t = Transform::Identity();
+        t.translate(Eigen::Vector3d{0.5, -0.3, 0});
+        t.scale(scale);
+        t.rotate(Eigen::AngleAxisd(3.1415926 / 2, Eigen::Vector3d::UnitX()));
+
+        std::string mesh_path = assets_dir + "triMesh/cloth_high.obj";
+        importer.load_geometry(tetMesh, 2, gipc::BodyType::FEM, t.matrix(),
+                               1e4, mesh_path, ipc.pcg_data.P_type);
+    }
+
+    // Fix top-corner vertices (same logic as case 3, but only over FEM verts)
+    int          fixed_vertex_num = 0;
+    const double eps              = 1e-4;
+    double       max_y            = tetMesh.maxTConer.y;
+    double       min_x            = tetMesh.minTConer.x;
+    double       max_x            = tetMesh.maxTConer.x;
+    for(int i = fem_vert_start; i < tetMesh.vertexNum; i++)
+    {
+        if(tetMesh.vertexes[i].y > max_y - eps
+           && (tetMesh.vertexes[i].x < min_x + eps || tetMesh.vertexes[i].x > max_x - eps))
+        {
+            tetMesh.boundaryTypies[i] = 1;
+            fixed_vertex_num++;
+        }
+    }
+    std::cout << "[set_case20] fixed vertex num: " << fixed_vertex_num << std::endl;
+
+    g_joint_control_enabled = true;
+    g_skip_rendering = false;
+
+    std::cout << "[set_case20] Arm + Hanging Cloth loaded." << std::endl;
+    std::cout << "[set_case20] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case20] FEM cloth verts: " << (tetMesh.vertexNum - fem_vert_start) << std::endl;
+    std::cout << "[set_case20] Total vertices: " << tetMesh.vertexNum << std::endl;
+    std::cout << "[set_case20] Joint angle controls: " << tetMesh.joint_angle_controls.size() << std::endl;
+}
+
 // ==========================================================================
 // ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
 // (no joints, no collision, no rendering, headless)
@@ -3168,6 +3248,9 @@ void initScene()
             break;
         case 18: //Case19: Arm + table + cube + cloth
             set_case19_arm_table_cloth();
+            break;
+        case 19: //Case20: Arm + hanging cloth
+            set_case20_arm_hanging_cloth();
             break;
         case 99: //ABD Freefall benchmark (no joints, no render, headless)
             set_case_abd_freefall_benchmark();
