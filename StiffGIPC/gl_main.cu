@@ -214,11 +214,11 @@ using namespace std;
 int   step      = 0;
 int   frameId   = 0;
 int   surfNumId = 0;
-float xRot      = 5.0f;
-float yRot      = -45.f;
+float xRot      = 0.0f;
+float yRot      = 0.f;
 float xTrans    = 0;
-float yTrans    = 0.5f;
-float zTrans    = 2.0f;
+float yTrans    = 0;
+float zTrans    = 0;
 int   ox;
 int   oy;
 int   buttonState;
@@ -1384,6 +1384,7 @@ void set_case7_urdf_test()
                   << "," << info.global_axis.z() << "])"
                   << std::endl;
     }
+    xRot = 25.0f; yRot = -30.f; yTrans = -0.5f; zTrans = 2.0f;
 }
 
 // ==========================================================================
@@ -1459,6 +1460,7 @@ void set_case8_xarm6_test()
                   << "," << info.global_axis.z() << "])"
                   << std::endl;
     }
+    xRot = 25.0f; yRot = -30.f; yTrans = -0.5f; zTrans = 2.0f;
 }
 
 // ==========================================================================
@@ -1523,6 +1525,7 @@ void set_case9_xarm7_gripper_test()
                   << " (type=" << static_cast<int>(info.type) << ")" << std::endl;
     }
     std::cout << "[set_case9] Joint constraints: " << tetMesh.joint_constraints.size() << std::endl;
+    xRot = 25.0f; yRot = -30.f; yTrans = -0.5f; zTrans = 2.0f;
 }
 
 // ==========================================================================
@@ -1835,6 +1838,7 @@ void set_case10_uipc_demo()
 
     std::cout << "[case10] ABD(Animated) + FEM stitch demo setup complete."
               << std::endl;
+    xRot = 15.0f; yRot = -30.f; yTrans = 0.0f; zTrans = 1.5f;
 }
 
 // ==========================================================================
@@ -2295,6 +2299,7 @@ void set_case11_gripper()
 
     std::cout << "[case11] Soft gripper scene setup complete. Bodies=" << d_tetMesh.m_body_count
               << " Verts=" << tetMesh.vertexNum << " Tets=" << tetMesh.tetrahedraNum << std::endl;
+    xRot = 10.0f; yRot = -30.f; yTrans = 0.5f; zTrans = 2.0f;
 }
 
 // ==========================================================================
@@ -2404,6 +2409,7 @@ void set_case12_two_cube_revolute_test()
               << tetMesh.joint_constraints.size() << std::endl;
     std::cout << "[set_case12] Joint angle controls: "
               << tetMesh.joint_angle_controls.size() << std::endl;
+    xRot = 15.0f; yRot = -30.f; yTrans = 0.0f; zTrans = 1.5f;
 }
 
 // ==========================================================================
@@ -2455,6 +2461,7 @@ void set_case13_xarm7_interactive()
                   << " [" << (ctrl.lower_limit * 180.0 / 3.14159265) << ", "
                   << (ctrl.upper_limit * 180.0 / 3.14159265) << "] deg" << std::endl;
     }
+    xRot = 15.0f; yRot = -30.f; yTrans = 0.0f; zTrans = 1.5f;
 }
 
 // ==========================================================================
@@ -2489,8 +2496,7 @@ void set_case14_xarm7_gripper_interactive()
     ipc.m_abd_system->parms.revolute_driving_strength_ratio = 100.0;
 
     ipc.m_skip_all_collision = true;
-    g_skip_rendering = true;
-    std::cout << "[set_case14] DEBUG: collision pipeline completely disabled, rendering skipped" << std::endl;
+    g_skip_rendering = false;
 
     g_joint_control_enabled = true;
 
@@ -2503,6 +2509,7 @@ void set_case14_xarm7_gripper_interactive()
                   << " [" << (ctrl.lower_limit * 180.0 / 3.14159265) << ", "
                   << (ctrl.upper_limit * 180.0 / 3.14159265) << "] deg" << std::endl;
     }
+    xRot = 15.0f; yRot = -30.f; yTrans = 0.0f; zTrans = 1.5f;
 }
 
 // ==========================================================================
@@ -2557,6 +2564,7 @@ void set_case15_ridgeback_dual_panda()
         std::cout << "  - " << ctrl.joint_name
                   << " [" << ctrl.lower_limit << ", " << ctrl.upper_limit << "] m" << std::endl;
     }
+    xRot = 15.0f; yRot = -30.f; yTrans = 0.0f; zTrans = 1.5f;
 }
 
 void set_case16_xarm7_gripper_soft_cube()
@@ -2696,6 +2704,7 @@ void set_case16_xarm7_gripper_soft_cube()
     }
     g_joint_control_enabled = true;
     g_skip_rendering = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "[set_case16] XArm7+Gripper + Table + " << num_soft_cubes
               << " Cubes + Cloth loaded." << std::endl;
@@ -2803,6 +2812,7 @@ void set_case17_xarm7_gripper_cup()
 
     g_joint_control_enabled = true;
     g_skip_rendering = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "[set_case17] XArm7+Gripper + Table + 2 Cups loaded." << std::endl;
     std::cout << "[set_case17] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
@@ -2893,6 +2903,7 @@ void set_case18_table_cloth_no_arm()
 
     g_joint_control_enabled = false;
     g_skip_rendering = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "[set_case18] Table + " << num_soft_cubes
               << " Cubes + Cloth (NO robot arm) loaded." << std::endl;
@@ -3005,6 +3016,7 @@ void set_case19_arm_table_cloth()
 
     g_joint_control_enabled = true;
     g_skip_rendering = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "[set_case19] Arm + Table + " << num_soft_cubes
               << " Cubes + Cloth loaded." << std::endl;
@@ -3086,6 +3098,7 @@ void set_case20_arm_hanging_cloth()
 
     g_joint_control_enabled = true;
     g_skip_rendering = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "[set_case20] Arm + Hanging Cloth loaded." << std::endl;
     std::cout << "[set_case20] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
@@ -3169,6 +3182,7 @@ void set_case21_arm_hanging_cloth_configurable()
 
     g_joint_control_enabled = true;
     g_skip_rendering = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "[set_case21] Arm + Hanging Cloth (res=" << cloth_res
               << ", " << ((cloth_res+1)*(cloth_res+1)) << " verts) loaded." << std::endl;
@@ -3286,6 +3300,7 @@ void set_case22_franka_table_cloth()
     std::cout << "[set_case22] Total vertices: " << tetMesh.vertexNum << std::endl;
     std::cout << "[set_case22] Joint controls (revolute): " << tetMesh.joint_angle_controls.size() << std::endl;
     std::cout << "[set_case22] Joint controls (prismatic): " << tetMesh.prismatic_drive_controls.size() << std::endl;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 }
 
 void set_case23_xarm_table_cloth()
@@ -3385,6 +3400,7 @@ void set_case23_xarm_table_cloth()
     std::cout << "[set_case23] Total vertices: " << tetMesh.vertexNum << std::endl;
     std::cout << "[set_case23] Joint controls (revolute): " << tetMesh.joint_angle_controls.size() << std::endl;
     std::cout << "[set_case23] Joint controls (prismatic): " << tetMesh.prismatic_drive_controls.size() << std::endl;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 }
 
 void set_case24_franka_coarse()
@@ -3490,6 +3506,7 @@ void set_case24_franka_coarse()
     std::cout << "[set_case24] Total vertices: " << tetMesh.vertexNum << std::endl;
     std::cout << "[set_case24] Joint controls (revolute): " << tetMesh.joint_angle_controls.size() << std::endl;
     std::cout << "[set_case24] Joint controls (prismatic): " << tetMesh.prismatic_drive_controls.size() << std::endl;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 }
 
 void set_case25_shirt_freefall()
@@ -3548,6 +3565,7 @@ void set_case25_shirt_freefall()
 
     g_skip_rendering       = false;
     g_headless_benchmark   = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "=== Case25: SHIRT FREE-FALL (full Newton, params="
               << (use_isaaclab_params ? "IsaacLab" : "StiffGIPC-default") << ") ===" << std::endl;
@@ -3597,6 +3615,7 @@ void set_case26_shirt_freefall_semi_implicit()
 
     g_skip_rendering       = false;
     g_headless_benchmark   = false;
+    xRot = 5.0f; yRot = -45.f; yTrans = 0.5f; zTrans = 2.0f;
 
     std::cout << "=== Case26: SHIRT FREE-FALL (semi-implicit, StiffGIPC-default) ===" << std::endl;
     std::cout << "FEM bodies: "  << tetMesh.abd_fem_count_info.fem_body_num << std::endl;
