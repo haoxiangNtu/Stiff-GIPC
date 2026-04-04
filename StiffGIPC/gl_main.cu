@@ -2715,6 +2715,25 @@ void initScene()
                N, N, (int)tetMesh.collision_exclusion_pairs.size());
     }
 
+    // Upload per-body ground collision skip flags
+    if(!tetMesh.ground_collision_skip_body_ids.empty() && d_tetMesh.collision_body_num > 0)
+    {
+        int N = d_tetMesh.collision_body_num;
+        std::vector<int> host_flags(N, 0);
+        for(int bid : tetMesh.ground_collision_skip_body_ids)
+        {
+            if(bid >= 0 && bid < N)
+                host_flags[bid] = 1;
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.ground_skip_body,
+                                  host_flags.data(),
+                                  N * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        ipc._ground_skip_body  = d_tetMesh.ground_skip_body;
+        ipc._ground_body_count = N;
+        printf("[GroundExclusion] %d bodies skip ground collision\n",
+               (int)tetMesh.ground_collision_skip_body_ids.size());
+    }
 
     printf("stretchStiff:  %f,  shearStiff:   %f\n", ipc.stretchStiff, ipc.shearStiff);
 
@@ -2798,6 +2817,7 @@ void initScene()
                               cudaMemcpyHostToDevice));
     ipc.initBVH(d_tetMesh.BoundaryType, d_tetMesh.point_id_to_body_id,
                 d_tetMesh.collision_skip_matrix, d_tetMesh.collision_body_num);
+    ipc._point_body_id = d_tetMesh.point_id_to_body_id;
 
     if(ipc.pcg_data.P_type && true)
     {

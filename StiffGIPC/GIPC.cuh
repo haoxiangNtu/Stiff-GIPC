@@ -145,6 +145,10 @@ class GIPC
 
     bool m_skip_all_collision = false;
 
+    int* _point_body_id     = nullptr;
+    int* _ground_skip_body  = nullptr;
+    int  _ground_body_count = 0;
+
   public:
     GIPC();
     ~GIPC();
