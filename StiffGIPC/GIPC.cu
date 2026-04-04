@@ -6470,16 +6470,26 @@ __global__ void _GroundCollisionDetect(const double3*  vertexes,
                                        uint32_t* _environment_collisionPair,
                                        uint32_t* _gpNum,
                                        double    dHat,
-                                       int       number)
+                                       int       number,
+                                       const int* _point_body_id,
+                                       const int* _ground_skip_body,
+                                       int        _ground_body_count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
-    double dist = __GEIGEN__::__v_vec_dot(*g_normal, vertexes[surfVertIds[idx]]) - *g_offset;
+    int svI = surfVertIds[idx];
+    if(_point_body_id && _ground_skip_body && _ground_body_count > 0)
+    {
+        int bid = _point_body_id[svI];
+        if(bid >= 0 && bid < _ground_body_count && _ground_skip_body[bid])
+            return;
+    }
+    double dist = __GEIGEN__::__v_vec_dot(*g_normal, vertexes[svI]) - *g_offset;
     if(dist * dist > dHat)
         return;
 
-    _environment_collisionPair[atomicAdd(_gpNum, 1)] = surfVertIds[idx];
+    _environment_collisionPair[atomicAdd(_gpNum, 1)] = svI;
 }
 
 __global__ void _getTotalForce(const double3* _force0, double3* _force, int number)
@@ -6939,7 +6949,10 @@ __global__ void _reduct_min_groundTimeStep_to_double(const double3* vertexes,
                                                      const double3* moveDir,
                                                      double* minStepSizes,
                                                      double  slackness,
-                                                     int     number)
+                                                     int     number,
+                                                     const int* _point_body_id,
+                                                     const int* _ground_skip_body,
+                                                     int        _ground_body_count)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -6950,13 +6963,22 @@ __global__ void _reduct_min_groundTimeStep_to_double(const double3* vertexes,
         return;
     int     svI    = surfVertIds[idx];
     double  temp   = 1.0;
-    double3 normal = *g_normal;
-    double  coef   = __GEIGEN__::__v_vec_dot(normal, moveDir[svI]);
-    if(coef > 0.0)
+    bool skip = false;
+    if(_point_body_id && _ground_skip_body && _ground_body_count > 0)
     {
-        double dist = __GEIGEN__::__v_vec_dot(normal, vertexes[svI]) - *g_offset;  //normal
-        temp = coef / (dist * slackness);
-        //printf("%f\n", temp);
+        int bid = _point_body_id[svI];
+        if(bid >= 0 && bid < _ground_body_count && _ground_skip_body[bid])
+            skip = true;
+    }
+    if(!skip)
+    {
+        double3 normal = *g_normal;
+        double  coef   = __GEIGEN__::__v_vec_dot(normal, moveDir[svI]);
+        if(coef > 0.0)
+        {
+            double dist = __GEIGEN__::__v_vec_dot(normal, vertexes[svI]) - *g_offset;
+            temp = coef / (dist * slackness);
+        }
     }
     /*if (blockIdx.x == 4) {
         printf("%f\n", temp);
@@ -8800,9 +8822,10 @@ void GIPC::GroundCollisionDetect()
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
     _GroundCollisionDetect<<<blockNum, threadNum>>>(
-        _vertexes, _surfVerts, _groundOffset, _groundNormal, _environment_collisionPair, _gpNum, dHat, numbers);
+        _vertexes, _surfVerts, _groundOffset, _groundNormal, _environment_collisionPair, _gpNum, dHat, numbers,
+        _point_body_id, _ground_skip_body, _ground_body_count);
 }
 
 void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int global_hessian_fem_offset)
@@ -9111,7 +9134,8 @@ double GIPC::ground_largestFeasibleStepSize(double slackness, double* mqueue)
     //    delete[] mvd;
     //}
     _reduct_min_groundTimeStep_to_double<<<blockNum, threadNum, sharedMsize>>>(
-        _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir, mqueue, slackness, numbers);
+        _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir, mqueue, slackness, numbers,
+        _point_body_id, _ground_skip_body, _ground_body_count);
 
 
     numbers  = blockNum;
@@ -10291,7 +10315,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         gipc::Timer timer{"setup_abd_system_gradient_hessian"};
 
         // Set stitch spring parameters for ABD-side bilateral coupling
-        m_abd_system->m_stitch_count              = softNum;
+        // Only report stitch count when data pointers are valid; otherwise
+        // the ABD system reserves triplet slots that are never written,
+        // leaving garbage in the preconditioner and causing illegal access.
+        m_abd_system->m_stitch_count              = m_d_stitch_paired_vertex ? softNum : 0;
         m_abd_system->m_d_stitch_paired_vertex    = m_d_stitch_paired_vertex;
         m_abd_system->m_d_stitch_rest_offset      = m_d_stitch_rest_offset;
         m_abd_system->m_d_stitch_abd_body_id      = m_d_stitch_abd_body_id;
