@@ -6,6 +6,12 @@
 // Copyright (c) 2024 Kemeng Huang. All rights reserved.
 //
 
+#define _USE_MATH_DEFINES
+#include <cmath>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #include "GL/glew.h"
 #include "GL/freeglut.h"
 #include <fstream>
