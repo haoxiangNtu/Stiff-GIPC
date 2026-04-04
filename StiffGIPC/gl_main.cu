@@ -2901,6 +2901,119 @@ void set_case18_table_cloth_no_arm()
     std::cout << "[set_case18] Total vertices: " << tetMesh.vertexNum << std::endl;
 }
 
+void set_case19_arm_table_cloth()
+{
+    // --- ABD first: load XArm7+Gripper via URDF ---
+    gipc::UrdfSceneImporter urdf_importer;
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm7_with_gripper.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+    double arm_scale = 0.3;
+    Transform arm_t = Transform::Identity();
+    arm_t.translate(Eigen::Vector3d(0, -0.75, 0));
+    arm_t.scale(arm_scale);
+    arm_t.rotate(Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitX()));
+
+    urdf_importer.set_global_transform(arm_t.matrix());
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case19] XArm7+Gripper import failed!" << std::endl;
+        std::abort();
+    }
+
+    ipc.m_abd_system->parms.joint_strength_ratio            = 1000.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio = 1000.0;
+
+    for(auto& [link_name, link_info] : urdf_importer.link_infos())
+    {
+        if(link_info.body_id >= 0)
+            tetMesh.ground_collision_skip_body_ids.push_back(link_info.body_id);
+    }
+
+    // --- ABD table: fixed rigid body ---
+    int arm_body_count = tetMesh.abd_fem_count_info.abd_body_num;
+    double table_cx = 0.15, table_cz = 0.0, table_top_y = -0.78;
+    {
+        gipc::SimpleSceneImporter table_imp;
+        Eigen::Matrix4d table_tf = Eigen::Matrix4d::Identity();
+        table_tf(0, 0) = 1;
+        table_tf(1, 1) = 0.02;
+        table_tf(2, 2) = 1;
+        table_tf(0, 3) = table_cx;
+        table_tf(1, 3) = -0.79;
+        table_tf(2, 3) = 0.0;
+
+        table_imp.load_geometry(tetMesh, 3, gipc::BodyType::ABD, table_tf,
+                                1e9, assets_dir + "tetMesh/cube.msh",
+                                ipc.pcg_data.P_type, BodyBoundaryType::Fixed);
+    }
+    int table_body_id = arm_body_count;
+    for(int arm_id = 0; arm_id < arm_body_count; arm_id++)
+        tetMesh.collision_exclusion_pairs.emplace_back(table_body_id, arm_id);
+    tetMesh.ground_collision_skip_body_ids.push_back(table_body_id);
+
+    // --- Cube on the table ---
+    bool   cube_use_abd = true;
+    double cube_scale   = 0.1;
+    double cube_dist    = cube_scale;
+    int    cube_count_x = 1;
+    int    cube_count_z = 1;
+    {
+        for(int i = 0; i < cube_count_x; i++)
+            for(int j = 0; j < cube_count_z; j++)
+            {
+                double px = table_cx + (i - (cube_count_x - 1) * 0.5) * cube_dist + 0.01;
+                double pz = table_cz + (j - (cube_count_z - 1) * 0.5) * cube_dist;
+                double3 offset = {-px, -(table_top_y + cube_scale * 0.5 - 0.05), -pz};
+                Eigen::Matrix4d tf = Eigen::Matrix4d::Identity();
+                tf.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * cube_scale;
+                tf.block<3, 1>(0, 3) = -Eigen::Vector3d(offset.x, offset.y, offset.z);
+
+                gipc::SimpleSceneImporter soft_imp;
+                soft_imp.load_geometry(tetMesh, 3,
+                                       cube_use_abd ? gipc::BodyType::ABD : gipc::BodyType::FEM,
+                                       tf, cube_use_abd ? 1e8 : 1e3,
+                                       assets_dir + "tetMesh/cube.msh",
+                                       ipc.pcg_data.P_type, BodyBoundaryType::Free);
+            }
+    }
+    int num_soft_cubes = cube_count_x * cube_count_z;
+
+    // --- Cloth above table (same params as case 3) ---
+    int    cloth_res   = 15;
+    double cloth_scale = 0.15;
+    double cloth_E     = 1e4;
+    {
+        std::string cloth_path = generate_cloth_obj(cloth_res);
+        gipc::SimpleSceneImporter cloth_imp;
+        double3 cloth_offset = {-table_cx, -(table_top_y + 0.1), -table_cz};
+        Eigen::Matrix4d cloth_tf = Eigen::Matrix4d::Identity();
+        cloth_tf.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * cloth_scale;
+        cloth_tf.block<3, 1>(0, 3) = -Eigen::Vector3d(cloth_offset.x, cloth_offset.y, cloth_offset.z);
+
+        cloth_imp.load_geometry(tetMesh, 2, gipc::BodyType::FEM, cloth_tf,
+                                cloth_E, cloth_path, ipc.pcg_data.P_type,
+                                BodyBoundaryType::Free);
+    }
+
+    g_joint_control_enabled = true;
+    g_skip_rendering = false;
+
+    std::cout << "[set_case19] Arm + Table + " << num_soft_cubes
+              << " Cubes + Cloth loaded." << std::endl;
+    std::cout << "[set_case19] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case19] FEM bodies: " << tetMesh.abd_fem_count_info.fem_body_num << std::endl;
+    std::cout << "[set_case19] Total vertices: " << tetMesh.vertexNum << std::endl;
+    std::cout << "[set_case19] Joint angle controls: " << tetMesh.joint_angle_controls.size() << std::endl;
+}
+
 // ==========================================================================
 // ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
 // (no joints, no collision, no rendering, headless)
@@ -3052,6 +3165,9 @@ void initScene()
             break;
         case 17: //Case18: Table + cloth (no arm)
             set_case18_table_cloth_no_arm();
+            break;
+        case 18: //Case19: Arm + table + cube + cloth
+            set_case19_arm_table_cloth();
             break;
         case 99: //ABD Freefall benchmark (no joints, no render, headless)
             set_case_abd_freefall_benchmark();
