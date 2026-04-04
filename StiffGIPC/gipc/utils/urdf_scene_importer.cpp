@@ -766,10 +766,11 @@ void UrdfSceneImporter::propagate_transforms(const std::string&     link_name,
         // Child global = parent_global * joint_local_transform
         Eigen::Matrix4d child_global = parent_global * joint_it->second.local_trans;
 
-        // Compute the global-frame rotation axis for revolute/continuous joints
-        // The joint axis is defined in the joint frame, transform the direction
+        // Compute the global-frame axis for revolute/continuous/prismatic joints.
+        // The joint axis is defined in the joint frame; transform it to world frame.
         if(joint_it->second.type == UrdfJointInfo::Type::Revolute
-           || joint_it->second.type == UrdfJointInfo::Type::Continuous)
+           || joint_it->second.type == UrdfJointInfo::Type::Continuous
+           || joint_it->second.type == UrdfJointInfo::Type::Prismatic)
         {
             Eigen::Matrix3d R = child_global.block<3, 3>(0, 0);
             joint_it->second.global_axis = (R * joint_it->second.axis).normalized();
