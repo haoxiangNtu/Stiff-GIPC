@@ -2706,6 +2706,110 @@ void set_case16_xarm7_gripper_soft_cube()
 }
 
 
+void set_case17_xarm7_gripper_cup()
+{
+    // --- ABD first: load XArm7+Gripper via URDF ---
+    gipc::UrdfSceneImporter urdf_importer;
+
+    std::string urdf_path = assets_dir + "sim_data/urdf/xarm/xarm7_with_gripper.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+    double arm_scale = 0.3;
+
+    Transform arm_t = Transform::Identity();
+    arm_t.translate(Eigen::Vector3d(0, -0.75, 0));
+    arm_t.scale(arm_scale);
+    arm_t.rotate(Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitX()));
+
+    urdf_importer.set_global_transform(arm_t.matrix());
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case17] XArm7+Gripper import failed!" << std::endl;
+        std::abort();
+    }
+
+    ipc.m_abd_system->parms.joint_strength_ratio            = 1000.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio = 1000.0;
+
+    for(auto& [link_name, link_info] : urdf_importer.link_infos())
+    {
+        if(link_info.body_id >= 0)
+            tetMesh.ground_collision_skip_body_ids.push_back(link_info.body_id);
+    }
+
+    // --- ABD table: fixed ---
+    int arm_body_count = tetMesh.abd_fem_count_info.abd_body_num;
+    double table_cx = 0.15, table_cz = 0.0, table_top_y = -0.78;
+    {
+        gipc::SimpleSceneImporter table_imp;
+        Eigen::Matrix4d table_tf = Eigen::Matrix4d::Identity();
+        table_tf(0, 0) = 1;
+        table_tf(1, 1) = 0.02;
+        table_tf(2, 2) = 1;
+        table_tf(0, 3) = table_cx;
+        table_tf(1, 3) = -0.79;
+        table_tf(2, 3) = table_cz;
+
+        table_imp.load_geometry(tetMesh, 3, gipc::BodyType::ABD, table_tf,
+                                1e9, assets_dir + "tetMesh/cube.msh",
+                                ipc.pcg_data.P_type, BodyBoundaryType::Fixed);
+    }
+    int table_body_id = arm_body_count;
+
+    for(int arm_id = 0; arm_id < arm_body_count; arm_id++)
+        tetMesh.collision_exclusion_pairs.emplace_back(table_body_id, arm_id);
+    tetMesh.ground_collision_skip_body_ids.push_back(table_body_id);
+
+    // Cup mesh bbox: (0.06, 0.01, -0.04) to (0.14, 0.16, 0.04)
+    // center_x=0.1, center_z=0, y_min=0.01
+    double cup_scale = 0.5;
+    std::string cup_msh = assets_dir + "sim_data/tetmesh/softgriper_cup.msh";
+
+    auto make_cup_tf = [&](double cx, double cz) {
+        Eigen::Matrix4d tf = Eigen::Matrix4d::Identity();
+        tf(0, 0) = cup_scale;
+        tf(1, 1) = cup_scale;
+        tf(2, 2) = cup_scale;
+        tf(0, 3) = cx - cup_scale * 0.1;
+        tf(1, 3) = table_top_y - cup_scale * 0.01 + 0.02;
+        tf(2, 3) = cz;
+        return tf;
+    };
+
+    bool use_soft_cup = true;  // true=FEM (soft), false=ABD (rigid)
+    {
+        gipc::SimpleSceneImporter cup_imp;
+        Eigen::Matrix4d cup_tf = make_cup_tf(table_cx, table_cz);
+        if(use_soft_cup)
+        {
+            cup_imp.load_geometry(tetMesh, 3, gipc::BodyType::FEM, cup_tf,
+                                  1e4, cup_msh, ipc.pcg_data.P_type, BodyBoundaryType::Free);
+            std::cout << "[set_case17] FEM cup (soft, E=1e4) loaded" << std::endl;
+        }
+        else
+        {
+            cup_imp.load_geometry(tetMesh, 3, gipc::BodyType::ABD, cup_tf,
+                                  1e8, cup_msh, ipc.pcg_data.P_type, BodyBoundaryType::Free);
+            std::cout << "[set_case17] ABD cup (rigid) loaded" << std::endl;
+        }
+    }
+
+    g_joint_control_enabled = true;
+    g_skip_rendering = false;
+
+    std::cout << "[set_case17] XArm7+Gripper + Table + 2 Cups loaded." << std::endl;
+    std::cout << "[set_case17] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case17] FEM bodies: " << tetMesh.abd_fem_count_info.fem_body_num << std::endl;
+    std::cout << "[set_case17] Total vertices: " << tetMesh.vertexNum << std::endl;
+}
+
 // ==========================================================================
 // ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
 // (no joints, no collision, no rendering, headless)
@@ -2851,6 +2955,9 @@ void initScene()
             break;
         case 15: //Case16: XArm7 + Gripper + soft cube + table + cloth
             set_case16_xarm7_gripper_soft_cube();
+            break;
+        case 16: //Case17: XArm7 + Gripper + table + cup
+            set_case17_xarm7_gripper_cup();
             break;
         case 99: //ABD Freefall benchmark (no joints, no render, headless)
             set_case_abd_freefall_benchmark();
