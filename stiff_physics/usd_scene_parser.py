@@ -119,38 +119,40 @@ class StiffGipcUsdParser:
 
         if self.debug_verbose:
             print(f"[UsdParser] Loading {len(rigid_bodies)} independent rigid bodies...", flush=True)
-        rb_body_start = self.engine.abd_body_count
+        rb_body_ids_per_env: list[list[int]] = [[] for _ in range(num_envs)]
         for i, rb in enumerate(rigid_bodies):
             self._load_rigid_body(rb, offsets, info)
-        rb_body_end = self.engine.abd_body_count
-        rb_body_ids = list(range(rb_body_start, rb_body_end))
+            for env_idx in range(num_envs):
+                rb_body_ids_per_env[env_idx].append(
+                    info.rigid_body_map[rb["prim_path"]][env_idx])
 
-        art_body_ids = []
+        art_body_ids_per_env: list[list[int]] = [[] for _ in range(num_envs)]
         for art_key, art_val in info.articulation_map.items():
-            for body_list in art_val.get("body_offsets", []):
-                art_body_ids.extend(body_list)
+            for env_idx, body_list in enumerate(art_val.get("body_offsets", [])):
+                art_body_ids_per_env[env_idx].extend(body_list)
 
-        sc_body_ids = []
+        sc_body_ids_per_env: list[list[int]] = [[] for _ in range(num_envs)]
         if static_colliders:
             if self.debug_verbose:
                 print(f"[UsdParser] Loading {len(static_colliders)} static colliders...", flush=True)
-            sc_body_start = self.engine.abd_body_count
             for sc in static_colliders:
                 self._load_rigid_body(sc, offsets, info,
                                       max_verts=self.MAX_STATIC_COLLISION_VERTS)
-            sc_body_end = self.engine.abd_body_count
-            sc_body_ids = list(range(sc_body_start, sc_body_end))
+                for env_idx in range(num_envs):
+                    sc_body_ids_per_env[env_idx].append(
+                        info.rigid_body_map[sc["prim_path"]][env_idx])
 
         excl_count = 0
-        for art_bid in art_body_ids:
-            for sc_bid in sc_body_ids:
-                self.engine.add_collision_exclusion(art_bid, sc_bid)
-                excl_count += 1
-            for rb_bid in rb_body_ids:
-                self.engine.add_collision_exclusion(art_bid, rb_bid)
-                excl_count += 1
+        for env_idx in range(num_envs):
+            for art_bid in art_body_ids_per_env[env_idx]:
+                for sc_bid in sc_body_ids_per_env[env_idx]:
+                    self.engine.add_collision_exclusion(art_bid, sc_bid)
+                    excl_count += 1
+                for rb_bid in rb_body_ids_per_env[env_idx]:
+                    self.engine.add_collision_exclusion(art_bid, rb_bid)
+                    excl_count += 1
         if self.debug_verbose and excl_count:
-            print(f"[UsdParser] Excluded {excl_count} articulation-external pairs "
+            print(f"[UsdParser] Excluded {excl_count} per-env articulation-external pairs "
                   f"(arm vs container + arm vs rigid bodies)", flush=True)
 
         if deformables:
@@ -798,67 +800,84 @@ class StiffGipcUsdParser:
             "root_link_path": root_link_path,
         }
 
-        for env_idx, offset in enumerate(offsets):
-            env_transform = offset  # relative to env_0
-            prev_abd = self.engine.abd_body_count
-            prev_rev_j = self.engine.num_revolute_joints
+        # Phase 1: Load all link meshes as instanced (one call per link, N instances)
+        link_instance_results = {}  # link_path -> instanced load result
+        link_mesh_data = {}         # link_path -> processed mesh data
+        link_boundaries = {}        # link_path -> boundary type
+        link_mesh_prim_paths = {}   # link_path -> mesh prim path
 
-            path_to_body_id = {}
-            mesh_prim_paths = {}
+        for link_path, link_prim in link_prims:
+            is_root = (link_path == root_link_path)
+            boundary = 1 if (is_root and root_fixed) else 0
 
-            for link_path, link_prim in link_prims:
-                is_root = (link_path == root_link_path)
-                boundary = 1 if (is_root and root_fixed) else 0
+            result = self._extract_mesh_from_prim(link_prim)
+            if result is None:
+                if self.debug_verbose:
+                    print(f"[UsdParser]   WARNING: No mesh for link {link_path}, skipping", flush=True)
+                continue
+            mesh_data, mesh_prim = result
+            mesh_prim_path = str(mesh_prim.GetPath())
 
-                result = self._extract_mesh_from_prim(link_prim)
-                if result is None:
-                    if self.debug_verbose:
-                        print(f"[UsdParser]   WARNING: No mesh for link {link_path}, skipping", flush=True)
-                    continue
-                mesh_data, mesh_prim = result
+            if self.debug_verbose:
+                print(f"[UsdParser]   Link {link_prim.GetName()}: "
+                      f"mesh={mesh_prim_path}, boundary={boundary}", flush=True)
 
-                mesh_world = self._get_transform(mesh_prim)
-                load_transform = env_transform @ mesh_world
-                mesh_prim_path = str(mesh_prim.GetPath())
-
-                if self.debug_verbose and env_idx == 0:
-                    print(f"[UsdParser]   Link {link_prim.GetName()}: "
-                          f"mesh={mesh_prim_path}, boundary={boundary}", flush=True)
-
-                approx_cfg = self._get_approximation_config(mesh_prim_path)
-                if approx_cfg is None:
-                    approx_cfg = self._get_approximation_config(str(link_prim.GetPath()))
-                if approx_cfg is not None:
-                    mesh_data = self._approximate_mesh(
-                        mesh_data, approx_cfg["method"],
-                        params=approx_cfg.get("params"),
-                        prim_path=mesh_prim_path,
-                        debug_verbose=self.debug_verbose,
-                    )
-                else:
-                    mesh_data = self._simplify_mesh(mesh_data, self.MAX_COLLISION_VERTS,
-                                                     debug_verbose=self.debug_verbose)
-
-                self.engine.load_mesh_from_data(
-                    vertices=mesh_data["vertices"],
-                    faces=mesh_data["faces"],
-                    verts_per_face=mesh_data["verts_per_face"],
-                    dimensions=3,
-                    body_type="ABD",
-                    transform=load_transform,
-                    young_modulus=1e8,
-                    boundary_type=boundary,
+            approx_cfg = self._get_approximation_config(mesh_prim_path)
+            if approx_cfg is None:
+                approx_cfg = self._get_approximation_config(str(link_prim.GetPath()))
+            if approx_cfg is not None:
+                mesh_data = self._approximate_mesh(
+                    mesh_data, approx_cfg["method"],
+                    params=approx_cfg.get("params"),
+                    prim_path=mesh_prim_path,
+                    debug_verbose=self.debug_verbose,
                 )
-                body_id = self.engine.abd_body_count - 1
-                path_to_body_id[link_path] = body_id
-                info.body_init_transforms[body_id] = load_transform
+            else:
+                mesh_data = self._simplify_mesh(mesh_data, self.MAX_COLLISION_VERTS,
+                                                 debug_verbose=self.debug_verbose)
+
+            mesh_world = self._get_transform(mesh_prim)
+            transforms = [offset @ mesh_world for offset in offsets]
+
+            inst_result = self.engine.load_mesh_instanced(
+                vertices=mesh_data["vertices"],
+                faces=mesh_data["faces"],
+                transforms_list=transforms,
+                verts_per_face=mesh_data["verts_per_face"],
+                dimensions=3,
+                body_type="ABD",
+                young_modulus=1e8,
+                boundary_type=boundary,
+            )
+
+            link_instance_results[link_path] = inst_result
+            link_mesh_data[link_path] = mesh_data
+            link_boundaries[link_path] = boundary
+            link_mesh_prim_paths[link_path] = mesh_prim_path
+
+            for env_idx in range(len(offsets)):
+                body_id = inst_result["body_offsets"][env_idx]
+                info.body_init_transforms[body_id] = transforms[env_idx]
                 info.body_meshes[body_id] = {
                     "vertices": mesh_data["vertices"].copy(),
                     "faces": mesh_data["faces"].copy() if mesh_data["faces"].ndim == 2 else mesh_data["faces"].reshape(-1, mesh_data["verts_per_face"]),
                 }
-                mesh_prim_paths[link_path] = mesh_prim_path
 
-            abd_bodies_this_env = list(range(prev_abd, self.engine.abd_body_count))
+        # Phase 2: Build per-env body mappings, create joints, exclusions, geometry_dict
+        for env_idx, offset in enumerate(offsets):
+            env_transform = offset
+            prev_rev_j = self.engine.num_revolute_joints
+
+            path_to_body_id = {}
+            abd_bodies_this_env = []
+
+            for link_path, _ in link_prims:
+                if link_path not in link_instance_results:
+                    continue
+                body_id = link_instance_results[link_path]["body_offsets"][env_idx]
+                path_to_body_id[link_path] = body_id
+                abd_bodies_this_env.append(body_id)
+
             art_info["body_offsets"].append(abd_bodies_this_env)
             art_info["joint_offset_rev"].append(prev_rev_j)
 
@@ -876,14 +895,16 @@ class StiffGipcUsdParser:
                 if env_idx == 0 and fk_entry is not None:
                     art_info["joint_fk_data"].append(fk_entry)
 
-            for idx, (link_path, _) in enumerate(link_prims):
+            for link_path, _ in link_prims:
                 if link_path not in path_to_body_id:
                     continue
                 bid = path_to_body_id[link_path]
                 clone_link_path = self._remap_path(link_path, offsets, env_idx)
+                asset_id = link_instance_results[link_path]["asset_id"]
                 info.geometry_dict[clone_link_path] = {
                     "type": "rigid_body",
                     "abd_body_offset": bid,
+                    "asset_id": asset_id,
                     "prim_path": clone_link_path,
                     "instance_id": env_idx,
                     "robot_name": art_path,
@@ -1105,21 +1126,22 @@ class StiffGipcUsdParser:
                                      debug_verbose=self.debug_verbose)
         info.rigid_body_map[prim_path] = []
 
-        for env_idx, offset in enumerate(offsets):
-            transform = offset @ rb["transform"]
-            self.engine.load_mesh_from_data(
-                vertices=mesh["vertices"],
-                faces=mesh["faces"],
-                verts_per_face=mesh["verts_per_face"],
-                dimensions=3,
-                body_type="ABD",
-                transform=transform,
-                young_modulus=1e8,
-                boundary_type=rb["boundary_type"],
-            )
-            body_offset = self.engine.abd_body_count - 1
+        transforms = [offset @ rb["transform"] for offset in offsets]
+        result = self.engine.load_mesh_instanced(
+            vertices=mesh["vertices"],
+            faces=mesh["faces"],
+            transforms_list=transforms,
+            verts_per_face=mesh["verts_per_face"],
+            dimensions=3,
+            body_type="ABD",
+            young_modulus=1e8,
+            boundary_type=rb["boundary_type"],
+        )
+
+        for env_idx in range(len(offsets)):
+            body_offset = result["body_offsets"][env_idx]
             info.rigid_body_map[prim_path].append(body_offset)
-            info.body_init_transforms[body_offset] = transform
+            info.body_init_transforms[body_offset] = transforms[env_idx]
             info.body_meshes[body_offset] = {
                 "vertices": mesh["vertices"].copy(),
                 "faces": mesh["faces"].copy() if mesh["faces"].ndim == 2 else mesh["faces"].reshape(-1, mesh["verts_per_face"]),
@@ -1129,6 +1151,7 @@ class StiffGipcUsdParser:
             info.geometry_dict[clone_path] = {
                 "type": "rigid_body",
                 "abd_body_offset": body_offset,
+                "asset_id": result["asset_id"],
                 "prim_path": clone_path,
                 "instance_id": env_idx,
             }
@@ -1169,30 +1192,31 @@ class StiffGipcUsdParser:
                       f"{len(tet_verts)} verts, {len(tet_cells)} tets", flush=True)
             mesh = {"vertices": tet_verts, "faces": tet_cells, "verts_per_face": 4}
 
-        for env_idx, offset in enumerate(offsets):
-            transform = offset @ db["transform"]
-            prev_verts = self.engine.vertex_count_host
-            self.engine.load_mesh_from_data(
-                vertices=mesh["vertices"],
-                faces=mesh["faces"],
-                verts_per_face=mesh["verts_per_face"],
-                dimensions=3,
-                body_type="FEM",
-                transform=transform,
-                young_modulus=db["youngs_modulus"],
-            )
-            new_verts = self.engine.vertex_count_host
-            vert_count = new_verts - prev_verts
-            info.deformable_body_map[prim_path].append((prev_verts, vert_count))
+        transforms = [offset @ db["transform"] for offset in offsets]
+        result = self.engine.load_mesh_instanced(
+            vertices=mesh["vertices"],
+            faces=mesh["faces"],
+            transforms_list=transforms,
+            verts_per_face=mesh["verts_per_face"],
+            dimensions=3,
+            body_type="FEM",
+            young_modulus=db["youngs_modulus"],
+        )
+
+        for env_idx in range(len(offsets)):
+            vert_offset = result["vertex_offsets"][env_idx]
+            vert_count = result["vertex_counts"][env_idx]
+            info.deformable_body_map[prim_path].append((vert_offset, vert_count))
 
             clone_path = self._remap_path(prim_path, offsets, env_idx)
             info.geometry_dict[clone_path] = {
                 "type": "deformable_body",
-                "vertex_offset": prev_verts,
+                "vertex_offset": vert_offset,
                 "vertex_count": vert_count,
+                "asset_id": result["asset_id"],
                 "prim_path": clone_path,
                 "instance_id": env_idx,
-                "load_transform": transform.copy(),
+                "load_transform": transforms[env_idx].copy(),
             }
 
     # ------------------------------------------------------------------
@@ -1209,10 +1233,15 @@ class StiffGipcUsdParser:
         return np.array(mat, dtype=np.float64).T  # pxr is column-major
 
     def _remap_path(self, path: str, offsets: list, env_idx: int) -> str:
-        """Remap env_0 path to env_N."""
+        """Remap env_0 path to env_N.
+
+        Only replaces the first occurrence of env_0 in the path (the
+        environment scope component), avoiding false positives in prim
+        names that happen to contain 'env_0'.
+        """
         if env_idx == 0:
             return path
-        return re.sub(r"env_0", f"env_{env_idx}", path)
+        return re.sub(r"/env_0(/|$)", f"/env_{env_idx}\\1", path, count=1)
 
     @staticmethod
     def _gf_quat_to_mat3(gf_quat) -> np.ndarray:

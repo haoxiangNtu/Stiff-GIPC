@@ -47,6 +47,9 @@ struct SimEngine::Impl
     struct FEMBodyRange { int vertex_start; int vertex_count; };
     std::vector<FEMBodyRange> fem_body_ranges;
 
+    // Shared mesh assets for instanced loading
+    std::vector<MeshAsset> mesh_assets;
+
     void apply_config_to_ipc();
     void do_initFEM();
     void do_setMAS_partition();
@@ -54,6 +57,19 @@ struct SimEngine::Impl
     void do_init_bvh_and_solver();
 
     void record_load(int body_type, int prev_verts);
+
+    // Write mesh to temp file once, return the path.
+    std::string write_temp_mesh(const double* vertices, int num_verts,
+                                const int* faces, int num_faces,
+                                int verts_per_face, int dimensions,
+                                const std::string& suffix);
+
+    // Load from a temp file with a given transform (core loading step).
+    void load_from_temp_file(const std::string& tmp_path,
+                             int dimensions, int body_type,
+                             int verts_per_face,
+                             const Eigen::Matrix4d& transform,
+                             double young_modulus, int boundary_type);
 };
 
 SimEngine::SimEngine()
@@ -1090,6 +1106,160 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     std::cout << "[SimEngine] Mesh from data loaded (dim=" << dimensions
               << ", " << (body_type == 0 ? "ABD" : "FEM")
               << ", verts=" << num_verts << ", faces=" << num_faces << ")" << std::endl;
+}
+
+// ======================== Impl helpers for instanced loading ========================
+
+std::string SimEngine::Impl::write_temp_mesh(
+    const double* vertices, int num_verts,
+    const int* faces, int num_faces,
+    int verts_per_face, int dimensions,
+    const std::string& suffix)
+{
+    std::string tmp_dir = "/tmp/stiffgipc_mesh_data/";
+    std::filesystem::create_directories(tmp_dir);
+
+    if(dimensions == 2 || verts_per_face == 3)
+    {
+        std::string tmp_path = tmp_dir + "tmp_instanced_" + suffix + ".obj";
+        std::ofstream ofs(tmp_path);
+        for(int i = 0; i < num_verts; i++)
+            ofs << "v " << vertices[i*3] << " " << vertices[i*3+1] << " " << vertices[i*3+2] << "\n";
+        for(int i = 0; i < num_faces; i++)
+        {
+            ofs << "f";
+            for(int j = 0; j < verts_per_face; j++)
+                ofs << " " << (faces[i*verts_per_face + j] + 1);
+            ofs << "\n";
+        }
+        ofs.close();
+        return tmp_path;
+    }
+    else
+    {
+        std::string tmp_path = tmp_dir + "tmp_instanced_" + suffix + ".msh";
+        std::ofstream ofs(tmp_path);
+        ofs << "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n";
+        ofs << "$Nodes\n" << num_verts << "\n";
+        for(int i = 0; i < num_verts; i++)
+            ofs << (i+1) << " " << vertices[i*3] << " " << vertices[i*3+1] << " " << vertices[i*3+2] << "\n";
+        ofs << "$EndNodes\n$Elements\n" << num_faces << "\n";
+        for(int i = 0; i < num_faces; i++)
+        {
+            ofs << (i+1) << " 4 2 0 0";
+            for(int j = 0; j < 4; j++)
+                ofs << " " << (faces[i*4 + j] + 1);
+            ofs << "\n";
+        }
+        ofs << "$EndElements\n";
+        ofs.close();
+        return tmp_path;
+    }
+}
+
+void SimEngine::Impl::load_from_temp_file(
+    const std::string& tmp_path,
+    int dimensions, int body_type, int verts_per_face,
+    const Eigen::Matrix4d& transform,
+    double young_modulus, int boundary_type)
+{
+    auto bt = (body_type == 0) ? gipc::BodyType::ABD : gipc::BodyType::FEM;
+    auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
+
+    if(bt == gipc::BodyType::ABD && (dimensions == 2 || verts_per_face == 3))
+    {
+        tetMesh.load_surfaceMesh_ABD(tmp_path, transform, young_modulus, bb);
+    }
+    else
+    {
+        SimpleSceneImporter imp;
+        imp.load_geometry(tetMesh, dimensions, bt, transform,
+                          young_modulus, tmp_path, cfg.preconditioner_type, bb);
+    }
+}
+
+// ======================== load_mesh_instanced ========================
+
+InstancedLoadResult SimEngine::load_mesh_instanced(
+    const double*                       vertices,
+    int                                 num_verts,
+    const int*                          faces,
+    int                                 num_faces,
+    int                                 verts_per_face,
+    int                                 dimensions,
+    int                                 body_type,
+    const std::vector<Eigen::Matrix4d>& transforms,
+    double                              young_modulus,
+    int                                 boundary_type)
+{
+    int N = static_cast<int>(transforms.size());
+    if(N == 0) return {};
+
+    // 1. Register a MeshAsset (store rest topology once)
+    MeshAsset asset;
+    asset.asset_id      = static_cast<int>(m_impl->mesh_assets.size());
+    asset.num_verts     = num_verts;
+    asset.num_faces     = num_faces;
+    asset.verts_per_face = verts_per_face;
+    asset.dimensions    = dimensions;
+    asset.body_type     = body_type;
+    asset.young_modulus = young_modulus;
+    asset.boundary_type = boundary_type;
+    asset.rest_vertices.assign(vertices, vertices + num_verts * 3);
+    asset.faces.assign(faces, faces + num_faces * verts_per_face);
+    m_impl->mesh_assets.push_back(asset);
+
+    // 2. Write temp mesh file ONCE
+    std::string suffix = "asset" + std::to_string(asset.asset_id);
+    std::string tmp_path = m_impl->write_temp_mesh(
+        vertices, num_verts, faces, num_faces,
+        verts_per_face, dimensions, suffix);
+
+    // 3. Load N instances
+    InstancedLoadResult result;
+    result.asset_id = asset.asset_id;
+    result.body_offsets.reserve(N);
+    result.vertex_offsets.reserve(N);
+    result.vertex_counts.reserve(N);
+
+    for(int i = 0; i < N; i++)
+    {
+        int prev_verts = m_impl->tetMesh.vertexNum;
+
+        m_impl->load_from_temp_file(tmp_path, dimensions, body_type,
+                                    verts_per_face, transforms[i],
+                                    young_modulus, boundary_type);
+
+        m_impl->record_load(body_type, prev_verts);
+        auto& rec = m_impl->load_records.back();
+        rec.label       = "instanced_" + suffix + "_i" + std::to_string(i);
+        rec.asset_id    = asset.asset_id;
+        rec.instance_id = i;
+
+        result.body_offsets.push_back(rec.body_offset);
+        result.vertex_offsets.push_back(rec.vertex_offset);
+        result.vertex_counts.push_back(rec.vertex_count);
+    }
+
+    std::cout << "[SimEngine] Instanced load: asset=" << asset.asset_id
+              << ", N=" << N << ", " << (body_type == 0 ? "ABD" : "FEM")
+              << ", verts_per_instance=" << num_verts
+              << ", bodies=" << result.body_offsets.front()
+              << ".." << result.body_offsets.back() << std::endl;
+
+    return result;
+}
+
+// ======================== Mesh asset queries ========================
+
+int SimEngine::get_mesh_asset_count() const
+{
+    return static_cast<int>(m_impl->mesh_assets.size());
+}
+
+const MeshAsset& SimEngine::get_mesh_asset(int asset_id) const
+{
+    return m_impl->mesh_assets.at(asset_id);
 }
 
 // ======================== FEM body count ========================
