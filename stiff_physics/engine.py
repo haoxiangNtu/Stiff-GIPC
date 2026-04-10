@@ -1,0 +1,409 @@
+"""Thin Python wrapper around the pystiffgipc C++ module."""
+
+from __future__ import annotations
+
+import os
+import sys
+import numpy as np
+from pathlib import Path
+from typing import Optional
+
+
+def _bootstrap_build_dir():
+    """Add the build/ directory to sys.path so pystiffgipc can be found
+    without manually setting PYTHONPATH / LD_LIBRARY_PATH."""
+    _project_root = Path(__file__).resolve().parent.parent
+    _build_dir = _project_root / "build"
+    if _build_dir.is_dir():
+        bd = str(_build_dir)
+        if bd not in sys.path:
+            sys.path.insert(0, bd)
+
+
+_bootstrap_build_dir()
+
+try:
+    import pystiffgipc as _C
+except ImportError as e:
+    raise ImportError(
+        "pystiffgipc C++ module not found. "
+        "Build with: cmake -DBUILD_PYTHON_BINDINGS=ON .. && make pystiffgipc"
+    ) from e
+
+
+class Config:
+    """Simulation configuration mirroring gipc::SimEngineConfig."""
+
+    def __init__(
+        self,
+        dt: float = 0.01,
+        density: float = 1e3,
+        young_modulus: float = 1e7,
+        poisson_rate: float = 0.49,
+        friction_rate: float = 0.4,
+        newton_tol: float = 1e-2,
+        pcg_tol: float = 1e-4,
+        relative_dhat: float = 1e-3,
+        joint_strength_ratio: float = 100.0,
+        revolute_driving_strength_ratio: float = 100.0,
+        semi_implicit_enabled: bool = False,
+        semi_implicit_beta_tol: float = 1e-3,
+        semi_implicit_min_iter: int = 1,
+        newton_iter_cap: int = 1000,
+        skip_all_collision: bool = False,
+        preconditioner_type: int = 1,
+        cuda_device: int = 0,
+        assets_dir: str = "",
+        prismatic_strength_ratio: float = 100.0,
+        prismatic_driving_strength_ratio: float = 100.0,
+        gravity: tuple[float, float, float] = (0.0, -9.8, 0.0),
+        velocity_damping: float = 0.0,
+        **kwargs,
+    ):
+        self._cfg = _C.Config()
+        self._cfg.dt = dt
+        self._cfg.density = density
+        self._cfg.young_modulus = young_modulus
+        self._cfg.poisson_rate = poisson_rate
+        self._cfg.friction_rate = friction_rate
+        self._cfg.gd_friction_rate = friction_rate
+        self._cfg.newton_tol = newton_tol
+        self._cfg.pcg_tol = pcg_tol
+        self._cfg.relative_dhat = relative_dhat
+        self._cfg.joint_strength_ratio = joint_strength_ratio
+        self._cfg.revolute_driving_strength_ratio = revolute_driving_strength_ratio
+        self._cfg.prismatic_strength_ratio = prismatic_strength_ratio
+        self._cfg.prismatic_driving_strength_ratio = prismatic_driving_strength_ratio
+        self._cfg.semi_implicit_enabled = semi_implicit_enabled
+        self._cfg.semi_implicit_beta_tol = semi_implicit_beta_tol
+        self._cfg.semi_implicit_min_iter = semi_implicit_min_iter
+        self._cfg.newton_iter_cap = newton_iter_cap
+        self._cfg.skip_all_collision = skip_all_collision
+        self._cfg.preconditioner_type = preconditioner_type
+        self._cfg.cuda_device = cuda_device
+        self._cfg.collision_detection_buff_scale = 6.0
+        self._cfg.velocity_damping = velocity_damping
+        self._cfg.assets_dir = assets_dir
+        import numpy as np
+        self._cfg.gravity = np.array(gravity, dtype=np.float64)
+
+        for k, v in kwargs.items():
+            if hasattr(self._cfg, k):
+                setattr(self._cfg, k, v)
+
+    @property
+    def native(self) -> _C.Config:
+        return self._cfg
+
+    def __repr__(self) -> str:
+        return f"Config(dt={self._cfg.dt}, density={self._cfg.density})"
+
+
+class Engine:
+    """High-level Python interface to the StiffGIPC simulation engine.
+
+    Lifecycle::
+
+        engine = Engine(config)
+        engine.load_urdf("path/to/robot.urdf", scale=0.3)
+        engine.finalize()
+        for _ in range(1000):
+            engine.step()
+            verts = engine.get_vertices()
+    """
+
+    def __init__(self, config: Optional[Config] = None):
+        self._engine = _C.SimEngine()
+        self._config = config or Config()
+        self._engine.set_config(self._config.native)
+        self._engine.init_cuda()
+        self._finalized = False
+
+    @property
+    def native(self) -> _C.SimEngine:
+        return self._engine
+
+    def load_urdf(
+        self,
+        urdf_path: str,
+        scale: float = 1.0,
+        translation: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        root_fixed: bool = True,
+        revolute_as_motor: bool = False,
+        default_young: float = 1e7,
+        initial_joint_angles: dict[str, float] | None = None,
+    ) -> None:
+        """Load a URDF robot model into the scene.
+
+        Args:
+            initial_joint_angles: Optional dict mapping joint names to angles
+                (radians). When provided, the arm is loaded at the FK target
+                pose instead of the zero pose, avoiding pass-through collisions.
+        """
+        transform = np.eye(4)
+        transform[:3, :3] *= scale
+        transform[0, 3] = translation[0]
+        transform[1, 3] = translation[1]
+        transform[2, 3] = translation[2]
+
+        resolved = urdf_path
+        if not os.path.isabs(resolved):
+            assets = self._engine.get_assets_dir()
+            candidate = os.path.join(assets, resolved)
+            if os.path.exists(candidate):
+                resolved = candidate
+
+        self._engine.load_urdf(resolved, transform, root_fixed,
+                               revolute_as_motor, default_young,
+                               initial_joint_angles or {})
+
+    _BODY_TYPE_MAP = {"ABD": 0, "abd": 0, "FEM": 1, "fem": 1}
+    _BOUNDARY_MAP  = {"Free": 0, "free": 0, "Fixed": 1, "fixed": 1}
+
+    def load_mesh(
+        self,
+        mesh_path: str,
+        dimensions: int = 3,
+        body_type: str | int = "FEM",
+        transform: Optional[np.ndarray] = None,
+        young_modulus: float = 1e7,
+        boundary_type: str | int = "Free",
+    ) -> None:
+        """Load a raw mesh (.msh for 3D tet, .obj for 2D cloth/shell).
+
+        Args:
+            mesh_path: Path to mesh file, resolved against assets_dir if relative.
+            dimensions: 2 for triangle shell/cloth, 3 for tet volume.
+            body_type: "ABD" (0) for rigid or "FEM" (1) for deformable.
+            transform: 4x4 transformation matrix (identity if None).
+            young_modulus: Young's modulus for this body.
+            boundary_type: "Free" (0) or "Fixed" (1).
+        """
+        if transform is None:
+            transform = np.eye(4)
+
+        bt = self._BODY_TYPE_MAP.get(body_type, body_type) if isinstance(body_type, str) else body_type
+        bb = self._BOUNDARY_MAP.get(boundary_type, boundary_type) if isinstance(boundary_type, str) else boundary_type
+
+        resolved = mesh_path
+        if not os.path.isabs(resolved):
+            assets = self._engine.get_assets_dir()
+            candidate = os.path.join(assets, resolved)
+            if os.path.exists(candidate):
+                resolved = candidate
+
+        self._engine.load_mesh(resolved, dimensions, bt, transform, young_modulus, bb)
+
+    def load_mesh_from_data(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        verts_per_face: int = 3,
+        dimensions: int = 3,
+        body_type: str | int = "FEM",
+        transform: Optional[np.ndarray] = None,
+        young_modulus: float = 1e7,
+        boundary_type: str | int = "Free",
+    ) -> None:
+        """Load mesh from in-memory vertex/face arrays (no file I/O)."""
+        if transform is None:
+            transform = np.eye(4)
+        bt = self._BODY_TYPE_MAP.get(body_type, body_type) if isinstance(body_type, str) else body_type
+        bb = self._BOUNDARY_MAP.get(boundary_type, boundary_type) if isinstance(boundary_type, str) else boundary_type
+        verts = np.ascontiguousarray(vertices, dtype=np.float64)
+        fcs = np.ascontiguousarray(faces, dtype=np.int32)
+        self._engine.load_mesh_from_data(verts, fcs, verts_per_face,
+                                         dimensions, bt, transform,
+                                         young_modulus, bb)
+
+    def add_collision_exclusion(self, body_a: int, body_b: int) -> None:
+        self._engine.add_collision_exclusion(body_a, body_b)
+
+    def add_ground_collision_skip(self, body_id: int) -> None:
+        self._engine.add_ground_collision_skip(body_id)
+
+    def add_fixed_joint(self, parent_body: int, child_body: int,
+                        world_anchor, world_normal, world_bitangent) -> int:
+        """Create a fixed joint between two ABD bodies. Must call before finalize()."""
+        import numpy as np
+        a = np.asarray(world_anchor, dtype=np.float64).ravel()
+        n = np.asarray(world_normal, dtype=np.float64).ravel()
+        b = np.asarray(world_bitangent, dtype=np.float64).ravel()
+        return self._engine.add_fixed_joint(parent_body, child_body, a, n, b)
+
+    def add_revolute_joint(self, parent_body: int, child_body: int,
+                           world_axis, joint_pos,
+                           lower_limit: float, upper_limit: float,
+                           initial_angle: float = 0.0,
+                           name: str = "") -> int:
+        """Create a revolute joint between two ABD bodies. Must call before finalize()."""
+        import numpy as np
+        ax = np.asarray(world_axis, dtype=np.float64).ravel()
+        p = np.asarray(joint_pos, dtype=np.float64).ravel()
+        return self._engine.add_revolute_joint(parent_body, child_body,
+                                               ax, p, lower_limit, upper_limit,
+                                               initial_angle, name)
+
+    def add_prismatic_joint(self, parent_body: int, child_body: int,
+                            world_center, world_axis,
+                            lower_limit: float, upper_limit: float,
+                            name: str = "") -> int:
+        """Create a prismatic joint between two ABD bodies. Must call before finalize()."""
+        import numpy as np
+        c = np.asarray(world_center, dtype=np.float64).ravel()
+        ax = np.asarray(world_axis, dtype=np.float64).ravel()
+        return self._engine.add_prismatic_joint(parent_body, child_body,
+                                                c, ax, lower_limit, upper_limit,
+                                                name)
+
+    def set_vertex_boundary(self, vertex_index: int, boundary_type: int) -> None:
+        """Set per-vertex boundary type (0=Free, 1=Fixed). Must call before finalize()."""
+        self._engine.set_vertex_boundary(vertex_index, boundary_type)
+
+    def set_vertex_boundaries(self, indices, boundary_type: int) -> None:
+        """Batch version of set_vertex_boundary."""
+        for idx in indices:
+            self._engine.set_vertex_boundary(int(idx), boundary_type)
+
+    @property
+    def abd_body_count(self) -> int:
+        return self._engine.get_abd_body_count()
+
+    @property
+    def fem_body_count(self) -> int:
+        return self._engine.get_fem_body_count()
+
+    @property
+    def vertex_count_host(self) -> int:
+        """Vertex count on host (available before finalize)."""
+        return self._engine.get_vertex_count_host()
+
+    def get_vertex_position_host(self, idx: int) -> tuple[float, float, float]:
+        """Read a single vertex position from host memory (before finalize)."""
+        return self._engine.get_vertex_position_host(idx)
+
+    def finalize(self) -> None:
+        """Finalize the scene: compute FEM data, upload to GPU, build BVH."""
+        self._engine.finalize()
+        self._finalized = True
+
+    def step(self) -> None:
+        """Advance simulation by one timestep (dt)."""
+        self._engine.step()
+
+    # ---- State queries ----
+
+    def get_vertices(self) -> np.ndarray:
+        """Return vertex positions as (N, 3) float64 array."""
+        return self._engine.get_vertices()
+
+    def get_vertex_velocities(self) -> np.ndarray:
+        """Return vertex velocities as (N, 3) float64 array."""
+        return self._engine.get_vertex_velocities()
+
+    def set_vertex_positions_gpu(self, positions: np.ndarray) -> None:
+        """Write vertex positions to GPU from (N, 3) float64."""
+        self._engine.set_vertex_positions_gpu(
+            np.ascontiguousarray(positions, dtype=np.float64))
+
+    def set_vertex_velocities_gpu(self, velocities: np.ndarray) -> None:
+        """Write vertex velocities to GPU from (N, 3) float64."""
+        self._engine.set_vertex_velocities_gpu(
+            np.ascontiguousarray(velocities, dtype=np.float64))
+
+    def get_surface_faces(self) -> np.ndarray:
+        """Return surface triangle indices as (F, 3) uint32 array."""
+        return self._engine.get_surface_faces()
+
+    def get_surface_vertex_indices(self) -> np.ndarray:
+        """Return indices of surface vertices as (S,) uint32 array."""
+        return self._engine.get_surface_vertex_indices()
+
+    @property
+    def vertex_count(self) -> int:
+        return self._engine.get_vertex_count()
+
+    @property
+    def surface_face_count(self) -> int:
+        return self._engine.get_surface_face_count()
+
+    # ---- ABD body state ----
+
+    def get_abd_body_transforms(self, body_offsets: np.ndarray) -> np.ndarray:
+        """Return (N, 4, 4) float64 transforms for ABD bodies at given offsets."""
+        offsets = np.ascontiguousarray(body_offsets, dtype=np.int32)
+        return self._engine.get_abd_body_transforms(offsets)
+
+    def set_abd_body_transforms(self, body_offsets: np.ndarray,
+                                transforms: np.ndarray) -> None:
+        """Set ABD body transforms from (N, 4, 4) float64."""
+        offsets = np.ascontiguousarray(body_offsets, dtype=np.int32)
+        tfs = np.ascontiguousarray(transforms, dtype=np.float64)
+        self._engine.set_abd_body_transforms(offsets, tfs)
+
+    def teleport_abd_bodies(self, body_offsets: np.ndarray,
+                            transforms: np.ndarray) -> None:
+        """Teleport ABD bodies: sets q/q_prev/q_tilde/q_temp and zeros velocity.
+
+        Use this instead of set_abd_body_transforms for init/reset to avoid
+        phantom velocities from stale q_prev.
+        """
+        offsets = np.ascontiguousarray(body_offsets, dtype=np.int32)
+        tfs = np.ascontiguousarray(transforms, dtype=np.float64)
+        self._engine.teleport_abd_bodies(offsets, tfs)
+
+    def get_abd_body_velocities(self, body_offsets: np.ndarray) -> np.ndarray:
+        """Return (N, 4, 4) float64 velocity matrices for ABD bodies."""
+        offsets = np.ascontiguousarray(body_offsets, dtype=np.int32)
+        return self._engine.get_abd_body_velocities(offsets)
+
+    def set_abd_body_velocities(self, body_offsets: np.ndarray,
+                                velocities: np.ndarray) -> None:
+        """Set ABD body velocities from (N, 4, 4) float64."""
+        offsets = np.ascontiguousarray(body_offsets, dtype=np.int32)
+        vels = np.ascontiguousarray(velocities, dtype=np.float64)
+        self._engine.set_abd_body_velocities(offsets, vels)
+
+    # ---- FEM body state ----
+
+    def get_fem_body_vertex_range(self, fem_body_idx: int) -> tuple[int, int]:
+        """Return (vertex_start, vertex_count) for a FEM body."""
+        return self._engine.get_fem_body_vertex_range(fem_body_idx)
+
+    # ---- Load record tracking ----
+
+    def get_load_records(self) -> list:
+        """Return all BodyLoadRecord objects."""
+        return self._engine.get_all_load_records()
+
+    # ---- Joint control ----
+
+    @property
+    def num_revolute_joints(self) -> int:
+        return self._engine.get_num_revolute_joints()
+
+    @property
+    def num_prismatic_joints(self) -> int:
+        return self._engine.get_num_prismatic_joints()
+
+    def get_revolute_joint_info(self, idx: int):
+        return self._engine.get_revolute_joint_info(idx)
+
+    def get_prismatic_joint_info(self, idx: int):
+        return self._engine.get_prismatic_joint_info(idx)
+
+    def set_revolute_target(self, idx: int, angle_rad: float) -> None:
+        self._engine.set_revolute_target(idx, angle_rad)
+
+    def set_revolute_initial_offset(self, idx: int, offset_rad: float) -> None:
+        self._engine.set_revolute_initial_offset(idx, offset_rad)
+
+    def set_prismatic_target(self, idx: int, distance_m: float) -> None:
+        self._engine.set_prismatic_target(idx, distance_m)
+
+    def get_revolute_current_angles(self) -> np.ndarray:
+        """Read actual joint angles from GPU state. Returns (N,) float64 in radians."""
+        return self._engine.get_revolute_current_angles()
+
+    def get_all_joint_infos(self):
+        return self._engine.get_all_joint_infos()

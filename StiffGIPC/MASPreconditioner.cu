@@ -2269,7 +2269,10 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
 {
     //bankSize = 32;
     if(vertNum < 1)
+    {
+        totalNodes = 0;
         return;
+    }
     int maxNodes = partMapSize > vertNum ? partMapSize : vertNum;
     computeNumLevels(maxNodes);
     totalMapNodes         = partMapSize;
@@ -2331,6 +2334,8 @@ void MASPreconditioner::initPreconditioner_Matrix()
 
 void MASPreconditioner::FreeMAS()
 {
+    if(totalNodes < 1)
+        return;
     CUDA_SAFE_CALL(cudaFree(d_denseLevel));
     CUDA_SAFE_CALL(cudaFree(d_coarseSpaceTables));
     CUDA_SAFE_CALL(cudaFree(d_levelSize));

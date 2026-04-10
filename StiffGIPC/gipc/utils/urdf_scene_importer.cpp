@@ -40,6 +40,11 @@ void UrdfSceneImporter::set_mesh_override(const std::string&          link_name,
     m_mesh_overrides[link_name] = override_info;
 }
 
+void UrdfSceneImporter::set_initial_joint_angles(const std::map<std::string, double>& angles)
+{
+    m_initial_joint_angles = angles;
+}
+
 void UrdfSceneImporter::set_root_fixed(bool fixed)
 {
     m_root_fixed = fixed;
@@ -227,8 +232,8 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
         }
         else
         {
-            // ---- Path B: Use the .obj surface mesh directly (fan-tet) ----
-            std::cout << "[UrdfSceneImporter] Loading link '" << link_name << "' from .obj: "
+            // ---- Path B: Use the .obj/.stl surface mesh ----
+            std::cout << "[UrdfSceneImporter] Loading link '" << link_name << "' from: "
                       << obj_collision_path
                       << " (boundary=" << static_cast<int>(boundary_type)
                       << ", E=" << young_modulus << ")" << std::endl;
@@ -239,7 +244,7 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
                                                    boundary_type);
             if(!ok)
             {
-                std::cerr << "[UrdfSceneImporter] Failed to load .obj for link '"
+                std::cerr << "[UrdfSceneImporter] Failed to load mesh for link '"
                           << link_name << "', skipping." << std::endl;
                 continue;
             }
@@ -449,6 +454,14 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
             ctrl.lower_limit        = std::max(jinfo.lower_limit, -JointAngleControlInfo::kSafeAngleLimit);
             ctrl.upper_limit        = std::min(jinfo.upper_limit,  JointAngleControlInfo::kSafeAngleLimit);
             ctrl.joint_name         = jname;
+
+            auto angle_it = m_initial_joint_angles.find(jname);
+            if(angle_it != m_initial_joint_angles.end())
+            {
+                ctrl.initial_angle_offset = angle_it->second;
+                ctrl.target_angle         = angle_it->second;
+            }
+
             tetras.joint_angle_controls.push_back(ctrl);
         }
         else if(jinfo.type == UrdfJointInfo::Type::Prismatic)
@@ -765,6 +778,20 @@ void UrdfSceneImporter::propagate_transforms(const std::string&     link_name,
 
         // Child global = parent_global * joint_local_transform
         Eigen::Matrix4d child_global = parent_global * joint_it->second.local_trans;
+
+        // Apply initial joint angle rotation (FK at target pose instead of zero pose)
+        if((joint_it->second.type == UrdfJointInfo::Type::Revolute
+            || joint_it->second.type == UrdfJointInfo::Type::Continuous)
+           && m_initial_joint_angles.count(joint_name))
+        {
+            double angle = m_initial_joint_angles.at(joint_name);
+            std::cout << "[UrdfSceneImporter] Applying initial angle " << angle
+                      << " rad to joint '" << joint_name << "'" << std::endl;
+            Eigen::Matrix3d R_joint = Eigen::AngleAxisd(angle, joint_it->second.axis).toRotationMatrix();
+            Eigen::Matrix4d T_rot = Eigen::Matrix4d::Identity();
+            T_rot.block<3, 3>(0, 0) = R_joint;
+            child_global = child_global * T_rot;
+        }
 
         // Compute the global-frame axis for revolute/continuous/prismatic joints.
         // The joint axis is defined in the joint frame; transform it to world frame.

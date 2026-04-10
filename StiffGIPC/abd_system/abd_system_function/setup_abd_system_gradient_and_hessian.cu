@@ -1188,8 +1188,9 @@ void ABDSystem::init_revolute_driving(
         drv.q_bar  = Vector3(n.x(), n.y(), n.z());
         drv.qN_bar = Vector3(m.x(), m.y(), m.z());
 
-        drv.stiffness    = 0.0;  // computed on GPU using body masses
-        drv.target_angle = static_cast<Float>(ctrl.target_angle);
+        drv.stiffness              = 0.0;  // computed on GPU using body masses
+        drv.initial_angle_offset   = static_cast<Float>(ctrl.initial_angle_offset);
+        drv.target_angle           = static_cast<Float>(ctrl.target_angle - ctrl.initial_angle_offset);
     }
 
     m_revolute_driving_data.resize(m_num_revolute_driving);
@@ -1323,7 +1324,7 @@ void ABDSystem::update_revolute_driving_targets(
                    Float sin_prev = Float(0.5) * (q.dot(pN) - qN.dot(p));
                    Float theta_prev = atan2(sin_prev, cos_prev);
 
-                   Float desired_goal = ctrls(i).target_angle;
+                   Float desired_goal = ctrls(i).target_angle - drv.initial_angle_offset;
                    Float diff = desired_goal - theta_prev;
                    const Float TWO_PI = Float(2.0 * 3.14159265358979323846);
                    diff = diff - TWO_PI * round(diff / TWO_PI);
