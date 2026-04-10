@@ -216,6 +216,57 @@ class Engine:
                                          dimensions, bt, transform,
                                          young_modulus, bb)
 
+    def load_mesh_instanced(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        transforms_list: list[np.ndarray],
+        verts_per_face: int = 3,
+        dimensions: int = 3,
+        body_type: str | int = "ABD",
+        young_modulus: float = 1e7,
+        boundary_type: str | int = "Free",
+    ) -> dict:
+        """Load one mesh as N instances with different transforms.
+
+        Args:
+            vertices: (V, 3) float64 rest-pose vertex positions.
+            faces: (F, vpf) int32 face index array.
+            transforms_list: List of N (4, 4) float64 transform matrices.
+            verts_per_face: vertices per face (3 for tri, 4 for tet).
+            dimensions: 2 for shell, 3 for volume.
+            body_type: "ABD" / "FEM" (or 0 / 1).
+            young_modulus: Young's modulus.
+            boundary_type: "Free" / "Fixed" (or 0 / 1).
+
+        Returns:
+            dict with keys: body_offsets, vertex_offsets, vertex_counts, asset_id
+        """
+        bt = self._BODY_TYPE_MAP.get(body_type, body_type) if isinstance(body_type, str) else body_type
+        bb = self._BOUNDARY_MAP.get(boundary_type, boundary_type) if isinstance(boundary_type, str) else boundary_type
+        verts = np.ascontiguousarray(vertices, dtype=np.float64)
+        fcs = np.ascontiguousarray(faces, dtype=np.int32)
+        tf_list = [np.ascontiguousarray(t, dtype=np.float64) for t in transforms_list]
+
+        result = self._engine.load_mesh_instanced(
+            verts, fcs, verts_per_face, dimensions, bt,
+            tf_list, young_modulus, bb
+        )
+        return {
+            "body_offsets":   list(result.body_offsets),
+            "vertex_offsets": list(result.vertex_offsets),
+            "vertex_counts":  list(result.vertex_counts),
+            "asset_id":       result.asset_id,
+        }
+
+    def get_mesh_asset(self, asset_id: int):
+        """Return the MeshAsset object for a given asset_id."""
+        return self._engine.get_mesh_asset(asset_id)
+
+    @property
+    def mesh_asset_count(self) -> int:
+        return self._engine.get_mesh_asset_count()
+
     def add_collision_exclusion(self, body_a: int, body_b: int) -> None:
         self._engine.add_collision_exclusion(body_a, body_b)
 

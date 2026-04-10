@@ -72,7 +72,31 @@ struct BodyLoadRecord
     int         body_offset;    // index into ABD or FEM body array
     int         vertex_offset;  // first vertex index in global vertex array
     int         vertex_count;   // number of vertices for this load
+    int         asset_id  = -1; // link to shared MeshAsset (-1 = none)
+    int         instance_id = 0;// which instance of the asset
     std::string label;          // optional identifier (prim path, mesh name, etc.)
+};
+
+struct MeshAsset
+{
+    int                 asset_id;
+    std::vector<double> rest_vertices;  // local-space vertices (N*3 flat)
+    std::vector<int>    faces;          // face indices (M*vpf flat)
+    int                 num_verts;
+    int                 num_faces;
+    int                 verts_per_face;
+    int                 dimensions;
+    int                 body_type;      // 0=ABD, 1=FEM
+    double              young_modulus;
+    int                 boundary_type;
+};
+
+struct InstancedLoadResult
+{
+    std::vector<int> body_offsets;    // N body indices
+    std::vector<int> vertex_offsets;  // N vertex start indices
+    std::vector<int> vertex_counts;   // N vertex counts (all same for same mesh)
+    int              asset_id;        // shared mesh asset reference
 };
 
 class SimEngine
@@ -120,6 +144,26 @@ class SimEngine
                              const Eigen::Matrix4d& transform,
                              double                 young_modulus,
                              int                    boundary_type = 0);
+
+    // Load one mesh as N instances with different transforms.
+    // The mesh topology is parsed/written to disk once; each instance
+    // gets its own body in the engine with an independent transform.
+    // Returns body offsets, vertex ranges, and the shared asset_id.
+    InstancedLoadResult load_mesh_instanced(
+        const double*                          vertices,
+        int                                    num_verts,
+        const int*                             faces,
+        int                                    num_faces,
+        int                                    verts_per_face,
+        int                                    dimensions,
+        int                                    body_type,
+        const std::vector<Eigen::Matrix4d>&    transforms,
+        double                                 young_modulus,
+        int                                    boundary_type = 0);
+
+    // ---- Mesh asset queries ----
+    int              get_mesh_asset_count() const;
+    const MeshAsset& get_mesh_asset(int asset_id) const;
 
     void add_ground(double height = 0.0);
 

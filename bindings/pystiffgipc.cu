@@ -70,12 +70,51 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readonly("body_offset",   &BodyLoadRecord::body_offset)
         .def_readonly("vertex_offset", &BodyLoadRecord::vertex_offset)
         .def_readonly("vertex_count",  &BodyLoadRecord::vertex_count)
+        .def_readonly("asset_id",      &BodyLoadRecord::asset_id)
+        .def_readonly("instance_id",   &BodyLoadRecord::instance_id)
         .def_readonly("label",         &BodyLoadRecord::label)
         .def("__repr__", [](const BodyLoadRecord& r) {
             return "<BodyLoadRecord type=" + std::to_string(r.body_type)
                    + " body_off=" + std::to_string(r.body_offset)
                    + " vert_off=" + std::to_string(r.vertex_offset)
-                   + " vert_cnt=" + std::to_string(r.vertex_count) + ">";
+                   + " vert_cnt=" + std::to_string(r.vertex_count)
+                   + " asset=" + std::to_string(r.asset_id)
+                   + " inst=" + std::to_string(r.instance_id) + ">";
+        });
+
+    // ---- MeshAsset ----
+    py::class_<MeshAsset>(m, "MeshAsset")
+        .def_readonly("asset_id",       &MeshAsset::asset_id)
+        .def_readonly("num_verts",      &MeshAsset::num_verts)
+        .def_readonly("num_faces",      &MeshAsset::num_faces)
+        .def_readonly("verts_per_face", &MeshAsset::verts_per_face)
+        .def_readonly("dimensions",     &MeshAsset::dimensions)
+        .def_readonly("body_type",      &MeshAsset::body_type)
+        .def_readonly("young_modulus",  &MeshAsset::young_modulus)
+        .def_readonly("boundary_type",  &MeshAsset::boundary_type)
+        .def("get_rest_vertices", [](const MeshAsset& a) {
+            return py::array_t<double>({a.num_verts, 3},
+                                       a.rest_vertices.data());
+        })
+        .def("get_faces", [](const MeshAsset& a) {
+            return py::array_t<int>({a.num_faces, a.verts_per_face},
+                                    a.faces.data());
+        })
+        .def("__repr__", [](const MeshAsset& a) {
+            return "<MeshAsset id=" + std::to_string(a.asset_id)
+                   + " verts=" + std::to_string(a.num_verts)
+                   + " faces=" + std::to_string(a.num_faces) + ">";
+        });
+
+    // ---- InstancedLoadResult ----
+    py::class_<InstancedLoadResult>(m, "InstancedLoadResult")
+        .def_readonly("body_offsets",   &InstancedLoadResult::body_offsets)
+        .def_readonly("vertex_offsets", &InstancedLoadResult::vertex_offsets)
+        .def_readonly("vertex_counts",  &InstancedLoadResult::vertex_counts)
+        .def_readonly("asset_id",       &InstancedLoadResult::asset_id)
+        .def("__repr__", [](const InstancedLoadResult& r) {
+            return "<InstancedLoadResult asset=" + std::to_string(r.asset_id)
+                   + " N=" + std::to_string(r.body_offsets.size()) + ">";
         });
 
     // ---- SimEngine ----
@@ -122,6 +161,41 @@ PYBIND11_MODULE(pystiffgipc, m)
             py::arg("verts_per_face"), py::arg("dimensions"),
             py::arg("body_type"), py::arg("transform"),
             py::arg("young_modulus"), py::arg("boundary_type") = 0)
+
+        .def("load_mesh_instanced", [](SimEngine& e,
+                py::array_t<double, py::array::c_style | py::array::forcecast> vertices,
+                py::array_t<int, py::array::c_style | py::array::forcecast> faces,
+                int verts_per_face, int dimensions, int body_type,
+                py::list py_transforms,
+                double young_modulus, int boundary_type) {
+            auto vbuf = vertices.request();
+            auto fbuf = faces.request();
+            int num_verts = static_cast<int>(vbuf.shape[0]);
+            int num_faces = static_cast<int>(fbuf.shape[0]);
+            std::vector<Eigen::Matrix4d> transforms;
+            transforms.reserve(py_transforms.size());
+            for(auto& item : py_transforms) {
+                auto arr = item.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+                auto tbuf = arr.request();
+                if(tbuf.ndim != 2 || tbuf.shape[0] != 4 || tbuf.shape[1] != 4)
+                    throw std::runtime_error("Each transform must be (4,4) float64");
+                Eigen::Matrix4d mat;
+                std::memcpy(mat.data(), tbuf.ptr, 16 * sizeof(double));
+                transforms.push_back(mat.transpose());
+            }
+            return e.load_mesh_instanced(
+                static_cast<const double*>(vbuf.ptr), num_verts,
+                static_cast<const int*>(fbuf.ptr), num_faces,
+                verts_per_face, dimensions, body_type,
+                transforms, young_modulus, boundary_type);
+        },  py::arg("vertices"), py::arg("faces"),
+            py::arg("verts_per_face"), py::arg("dimensions"),
+            py::arg("body_type"), py::arg("transforms"),
+            py::arg("young_modulus"), py::arg("boundary_type") = 0)
+
+        .def("get_mesh_asset_count", &SimEngine::get_mesh_asset_count)
+        .def("get_mesh_asset", &SimEngine::get_mesh_asset, py::arg("asset_id"),
+             py::return_value_policy::reference_internal)
 
         .def("add_collision_exclusion", &SimEngine::add_collision_exclusion,
              py::arg("body_a"), py::arg("body_b"))
