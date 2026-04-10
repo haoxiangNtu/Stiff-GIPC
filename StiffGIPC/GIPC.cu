@@ -8145,22 +8145,22 @@ __global__ void _computeXTilta(int*     _btype,
                                int*     _apply_gravity,
                                double   ipc_dt,
                                double   rate,
+                               double3  gravity_vec,
                                int      numbers)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= numbers)
         return;
 
-    double3 gravityDtSq = make_double3(0, 0, 0);  //__GEIGEN__::__s_vec_multiply(make_double3(0, -9.8, 0), ipc_dt * ipc_dt);//Vector3d(0, gravity, 0) * IPC_dt * IPC_dt;
+    double3 gravityDtSq = make_double3(0, 0, 0);
     if(_btype[idx] == 0 && _apply_gravity[idx])
     {
-        gravityDtSq =
-            __GEIGEN__::__s_vec_multiply(make_double3(0, -9.8, 0), ipc_dt * ipc_dt);
+        gravityDtSq = __GEIGEN__::__s_vec_multiply(gravity_vec, ipc_dt * ipc_dt);
     }
     _xTilta[idx] = __GEIGEN__::__add(
         _o_vertexes[idx],
         __GEIGEN__::__add(__GEIGEN__::__s_vec_multiply(_velocities[idx], ipc_dt),
-                          gravityDtSq));  //(mesh.V_prev[vI] + (mesh.velocities[vI] * IPC_dt + gravityDtSq));
+                          gravityDtSq));
 }
 
 __global__ void _updateSurfaces(uint32_t* sortIndex, uint3* _faces, int _offset_num, int numbers)
@@ -11019,7 +11019,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
     stats_at_current_frame["newton"] = gipc::Json::array();
 
-    int iterCap = 10000, k = 0;
+    int iterCap = newton_iter_cap, k = 0;
     double semi_beta = 1.0;
 
     CUDA_SAFE_CALL(cudaMemset(_moveDir, 0, vertexNum * sizeof(double3)));
@@ -11222,6 +11222,7 @@ void GIPC::computeXTilta(device_TetraData& TetMesh, const double& rate)
                                             TetMesh.apply_gravity,
                                             IPC_dt,
                                             rate,
+                                            gravity,
                                             numbers);
 
     m_abd_system->cal_q_tilde(*m_abd_sim_data);

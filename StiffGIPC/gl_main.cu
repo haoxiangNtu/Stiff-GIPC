@@ -3647,6 +3647,150 @@ void set_case26_shirt_freefall_semi_implicit()
 }
 
 // ==========================================================================
+// Case 27: RealMan arm + box + roller + FEM soft cube
+// Reproduces realman_soft_cube_usd_test.py for C++ debugging.
+// Semi-implicit OFF by default to investigate Newton convergence issues.
+// ==========================================================================
+void set_case27_realman_soft_cube()
+{
+    // --- 1. RealMan arm via URDF (ABD) ---
+    gipc::UrdfSceneImporter urdf_importer;
+    std::string urdf_path =
+        "/home/ps/Downloads/robot_models/realman_03_description/"
+        "xhand_with_realman_arm_only_obb.urdf";
+    urdf_importer.set_urdf_path(urdf_path);
+
+    using Transform = Eigen::Transform<double, 3, Eigen::Affine>;
+
+    // Y-up world: Rx(-90) converts URDF Z-up to Y-up,
+    // then Rz(-90) matches the Python scene's Quat(0.707, 0, 0, -0.707).
+    Transform arm_t = Transform::Identity();
+    arm_t.translate(Eigen::Vector3d(-0.3, 0.05, 0.0));
+    arm_t.rotate(Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitX()));
+    arm_t.rotate(Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitZ()));
+
+    urdf_importer.set_global_transform(arm_t.matrix());
+    urdf_importer.set_root_fixed(true);
+    urdf_importer.set_default_boundary_type(BodyBoundaryType::Free);
+    urdf_importer.set_revolute_as_motor(false);
+    urdf_importer.set_default_young_modulus(1e7);
+
+    // Isaac Lab initial joint angles (radians) — applied during FK so arm
+    // is loaded already at the target pose, avoiding pass-through collisions.
+    std::map<std::string, double> init_angles = {
+        {"RH_joint1",  1.2},
+        {"RH_joint2", -0.5411},
+        {"RH_joint3",  0.3002},
+        {"RH_joint4",  1.3},
+        {"RH_joint5", -2.2951},
+        {"RH_joint6",  0.0},
+    };
+    urdf_importer.set_initial_joint_angles(init_angles);
+
+    bool success = urdf_importer.import_scene(tetMesh, ipc.pcg_data.P_type);
+    if(!success)
+    {
+        std::cerr << "[set_case27] RealMan arm import failed!" << std::endl;
+        std::abort();
+    }
+
+    ipc.m_abd_system->parms.joint_strength_ratio            = 1000.0;
+    ipc.m_abd_system->parms.revolute_driving_strength_ratio  = 1000.0;
+
+    // Skip ground collision for all robot links
+    for(auto& [name, info] : urdf_importer.link_infos())
+        if(info.body_id >= 0)
+            tetMesh.ground_collision_skip_body_ids.push_back(info.body_id);
+
+    int arm_body_count = tetMesh.abd_fem_count_info.abd_body_num;
+
+    // The importer already sets target_angle = initial_angle and
+    // initial_angle_offset = initial_angle for joints in init_angles,
+    // so the driving energy correctly holds the FK pose (effective target = 0).
+
+    // --- 2. Box (ABD, Fixed/Kinematic) ---
+    // cube.msh: each axis spans 0.4 units. Target box: ~0.43 x 0.21 x 0.65 m
+    // In Y-up: box center at Y=1.0 (was Z=1.0 in Python Z-up)
+    {
+        gipc::SimpleSceneImporter box_imp;
+        Eigen::Matrix4d box_tf = Eigen::Matrix4d::Identity();
+        box_tf(0, 0) = 0.43 / 0.4;   // X scale
+        box_tf(1, 1) = 0.21 / 0.4;   // Y scale (short axis = opening depth)
+        box_tf(2, 2) = 0.65 / 0.4;   // Z scale (tall axis)
+        box_tf(0, 3) = 0.0;
+        box_tf(1, 3) = 1.0;           // Y position
+        box_tf(2, 3) = 0.0;
+
+        box_imp.load_geometry(tetMesh, 3, gipc::BodyType::ABD, box_tf,
+                              1e9, assets_dir + "tetMesh/cube.msh",
+                              ipc.pcg_data.P_type, BodyBoundaryType::Fixed);
+    }
+    int box_body_id = arm_body_count;
+
+    // Exclude collision between box and all arm links
+    for(int i = 0; i < arm_body_count; i++)
+        tetMesh.collision_exclusion_pairs.emplace_back(box_body_id, i);
+    tetMesh.ground_collision_skip_body_ids.push_back(box_body_id);
+
+    // --- 3. MINI_ROLLER stand-in (ABD, Free) ---
+    // Python: MINI_ROLLER OBB * scale 0.75 = (0.069, 0.131, 0.125) m
+    // cube.msh spans 0.4 per axis, so scale = extents / 0.4
+    // Z-up -> Y-up: Z_zup(0.125) -> Y_yup, Y_zup(0.131) -> Z_yup
+    {
+        gipc::SimpleSceneImporter roller_imp;
+        Eigen::Matrix4d roller_tf = Eigen::Matrix4d::Identity();
+        roller_tf(0, 0) = 0.069 / 0.4;   // X: ~0.172
+        roller_tf(1, 1) = 0.125 / 0.4;   // Y (up): ~0.312
+        roller_tf(2, 2) = 0.131 / 0.4;   // Z: ~0.327
+        roller_tf(0, 3) = 0.0;
+        roller_tf(1, 3) = 1.5;   // above box
+        roller_tf(2, 3) = 0.0;
+
+        roller_imp.load_geometry(tetMesh, 3, gipc::BodyType::ABD, roller_tf,
+                                 1e8, assets_dir + "tetMesh/cube.msh",
+                                 ipc.pcg_data.P_type, BodyBoundaryType::Free);
+    }
+
+    // --- 4. FEM Soft Cube (must be after all ABD) ---
+    {
+        gipc::SimpleSceneImporter soft_imp;
+        double cube_scale = 0.15;   // 0.4 * 0.15 = 0.06 m = 6 cm
+        Eigen::Matrix4d soft_tf = Eigen::Matrix4d::Identity();
+        soft_tf(0, 0) = cube_scale;
+        soft_tf(1, 1) = cube_scale;
+        soft_tf(2, 2) = cube_scale;
+        soft_tf(0, 3) = 0.0;
+        soft_tf(1, 3) = 2.5;     // well above box
+        soft_tf(2, 3) = 0.0;
+
+        soft_imp.load_geometry(tetMesh, 3, gipc::BodyType::FEM, soft_tf,
+                               1e5, assets_dir + "tetMesh/cube.msh",
+                               ipc.pcg_data.P_type, BodyBoundaryType::Free);
+    }
+
+    // Physics parameters (matching Python Config)
+    ipc.IPC_dt        = 0.01;
+    ipc.YoungModulus   = 1e7;
+    ipc.frictionRate   = 0.4;
+    ipc.gd_frictionRate = 0.4;
+    ipc.relative_dhat  = 1e-3;
+
+    // Semi-implicit ON to match Python scene (needed to reproduce jitter bug)
+    ipc.semi_implicit_enabled = true;
+
+    g_joint_control_enabled = true;
+    g_skip_rendering = false;
+    xRot = 25.0f; yRot = -45.f; yTrans = -0.8f; zTrans = 2.0f;
+
+    std::cout << "[set_case27] RealMan + Box + Roller + Soft Cube loaded." << std::endl;
+    std::cout << "[set_case27] ABD bodies: " << tetMesh.abd_fem_count_info.abd_body_num << std::endl;
+    std::cout << "[set_case27] FEM bodies: " << tetMesh.abd_fem_count_info.fem_body_num << std::endl;
+    std::cout << "[set_case27] Total vertices: " << tetMesh.vertexNum << std::endl;
+    std::cout << "[set_case27] Joint angle controls: " << tetMesh.joint_angle_controls.size() << std::endl;
+    std::cout << "[set_case27] semi_implicit: " << (ipc.semi_implicit_enabled ? "ON" : "OFF") << std::endl;
+}
+
+// ==========================================================================
 // ABD Freefall Benchmark: load xarm6 STL meshes as independent ABD bodies
 // (no joints, no collision, no rendering, headless)
 // ==========================================================================
@@ -3821,6 +3965,9 @@ void initScene()
             break;
         case 25: //Case26: Shirt free-fall semi-implicit
             set_case26_shirt_freefall_semi_implicit();
+            break;
+        case 26: //Case27: RealMan + box + roller + soft cube (Newton debug)
+            set_case27_realman_soft_cube();
             break;
         case 99: //ABD Freefall benchmark (no joints, no render, headless)
             set_case_abd_freefall_benchmark();

@@ -27,8 +27,16 @@ struct JointAngleControlInfo
     Eigen::Vector3d n_dir;               ///< direction ⊥ axis (unit) in world frame
     double          offset_r = 0.05;     ///< (legacy, unused with new driving approach)
 
-    /// Current target angle in radians (set by UI slider)
+    /// Current target angle in radians (set by UI slider).
+    /// When initial_angle_offset != 0 this is still an absolute URDF angle;
+    /// the offset is subtracted internally so the driving energy sees
+    /// effective_target = target_angle - initial_angle_offset.
     double target_angle = 0.0;
+
+    /// Angle offset for FK-loaded poses. When the arm is loaded via
+    /// set_initial_joint_angles(), this stores the initial angle so that
+    /// the driving energy uses the correct reference.
+    double initial_angle_offset = 0.0;
 
     /// Per-joint stiffness multiplier for the revolute driving energy.
     /// Actual K = parms.revolute_driving_strength_ratio * strength_ratio * (m_i+m_j) * dt².

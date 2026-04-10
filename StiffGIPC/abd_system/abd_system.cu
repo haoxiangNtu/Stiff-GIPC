@@ -94,6 +94,26 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
                          abd.body_id_to_q_prev,
                          abd.body_id_to_q_v,
                          abd.body_id_to_dq);
+
+        // DIAG: verify F=I after _setup_abd_state
+        if(abd_body_count > 0)
+        {
+            using Vec12 = Eigen::Matrix<double, 12, 1>;
+            int n = std::min((size_t)3, abd_body_count);
+            std::vector<Vec12> dbg_q(abd_body_count);
+            CUDA_SAFE_CALL(cudaMemcpy(dbg_q.data(), abd.body_id_to_q.data(),
+                                      abd_body_count * sizeof(Vec12), cudaMemcpyDeviceToHost));
+            for(int b = 0; b < n; b++)
+            {
+                auto& q = dbg_q[b];
+                std::cout << "[DIAG-CPP] After _setup_abd_state: body=" << b
+                          << " p=[" << q[0] << "," << q[1] << "," << q[2] << "]"
+                          << " a1=[" << q[3] << "," << q[4] << "," << q[5] << "]"
+                          << " a2=[" << q[6] << "," << q[7] << "," << q[8] << "]"
+                          << " a3=[" << q[9] << "," << q[10] << "," << q[11] << "]"
+                          << std::endl;
+            }
+        }
     }
     else  // rebuild
     {

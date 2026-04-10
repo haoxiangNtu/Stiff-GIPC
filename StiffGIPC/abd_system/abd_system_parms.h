@@ -32,5 +32,7 @@ class ABDSystemParms
     // Set large values temporarily to allow fast initial settling.
     Float    max_revolute_step_per_frame  = 0.1;    // rad
     Float    max_prismatic_step_per_frame = 0.002;  // m
+
+    Float    velocity_damping = 0.0;  // per-step: v *= (1 - damping)
 };
 }  // namespace gipc

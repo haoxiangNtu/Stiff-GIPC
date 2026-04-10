@@ -14,8 +14,8 @@
 class MASPreconditioner
 {
 
-    int totalNodes;
-    int totalMapNodes;
+    int totalNodes = 0;
+    int totalMapNodes = 0;
     int levelnum;
     int collision_node_Offset;
     int totalNumberClusters;

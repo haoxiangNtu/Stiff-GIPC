@@ -67,11 +67,9 @@ struct UrdfLinkMeshOverride
 /// and loads each link's collision mesh as an ABD body into the GIPC simulation.
 ///
 /// Mesh loading supports two paths:
-///   1) Direct .obj surface meshes — if the URDF collision geometry points to an
-///      .obj file, the importer loads it directly using the fan-tet approach
-///      (virtual tetrahedra from component centroids to each face). No pre-
-///      tetrahedralization required. Works best with convex decomposition meshes
-///      (e.g., VHACD output like *_vhacd.obj).
+///   1) Direct .obj/.stl surface meshes — if the URDF collision geometry points
+///      to an .obj or .stl file, the importer loads it directly as an ABD body
+///      using native surface integrals.
 ///   2) Mesh overrides (.msh) — users can provide a mesh_override_map that maps
 ///      link names to pre-tetrahedralized .msh files. Overrides take priority.
 ///
@@ -108,6 +106,10 @@ class UrdfSceneImporter
     void set_mesh_override(const std::string&        link_name,
                            const UrdfLinkMeshOverride& override_info);
 
+    /// Set initial joint angles (radians) for FK computation during import.
+    /// Links will be loaded at the FK pose instead of the zero pose.
+    void set_initial_joint_angles(const std::map<std::string, double>& angles);
+
     /// Set whether root link should be fixed
     void set_root_fixed(bool fixed);
 
@@ -142,12 +144,13 @@ class UrdfSceneImporter
     double          m_default_young_modulus = 1e7;
     BodyBoundaryType m_default_boundary_type = BodyBoundaryType::Free;
     bool            m_root_fixed          = true;
-    bool            m_revolute_as_motor   = false;
-    double          m_default_motor_speed    = 0.0;   // 0 = use ABDSystemParms default
-    double          m_default_motor_strength = 0.0;   // 0 = use ABDSystemParms default
+    bool            m_revolute_as_motor        = false;
+    double          m_default_motor_speed      = 0.0;   // 0 = use ABDSystemParms default
+    double          m_default_motor_strength   = 0.0;   // 0 = use ABDSystemParms default
 
     std::string m_root_link_name;
 
+    std::map<std::string, double>               m_initial_joint_angles;
     std::map<std::string, UrdfLinkMeshOverride> m_mesh_overrides;
     std::map<std::string, UrdfLinkInfo>         m_link_infos;
     std::map<std::string, UrdfJointInfo>        m_joint_infos;

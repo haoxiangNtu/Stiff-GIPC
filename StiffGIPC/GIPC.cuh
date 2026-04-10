@@ -82,6 +82,7 @@ class GIPC
     double   dTol          = 0.0;
     double   minKappaCoef  = 0.0;
     double   IPC_dt        = 0.0;
+    double3  gravity       = make_double3(0, -9.8, 0);
     double   Step          = 0.0;
     double   meanMass      = 0.0;
     double   meanVolumn    = 0.0;
@@ -149,6 +150,8 @@ class GIPC
     bool   semi_implicit_enabled  = false;
     double semi_implicit_beta_tol = 1e-3;
     int    semi_implicit_min_iter = 1;
+
+    int    newton_iter_cap = 1000;
 
     int* _point_body_id     = nullptr;
     int* _ground_skip_body  = nullptr;
