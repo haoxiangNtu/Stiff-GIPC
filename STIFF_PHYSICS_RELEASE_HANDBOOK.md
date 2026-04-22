@@ -202,6 +202,21 @@ git push origin master
 >
 > v0.1.0 是从未 commit 的工作树直接 `pip wheel` 出来的，事后无法定位"wheel 对应哪份源码"，只能通过解包 wheel + 反查 binary symbol 反推（参见第 3 节"v0.1.0 源码映射"）。后续每个版本都必须先把私有仓代码完整 commit、打 tag，再从干净 tag checkout 构建 wheel，避免重蹈覆辙。
 
+#### 分支政策（必读）
+
+发布工作必须在 `release/stable` 分支上进行。这条分支是**唯一**允许打 release tag 的分支，其他分支的 commit 进 release 必须经过 cherry-pick 审计。
+
+| 分支 | 用途 | 能否 cherry-pick 进 `release/stable` |
+|---|---|---|
+| `release/stable` | release 源码权威分支，每个 release tag 都从这里打 | — (本身就是) |
+| `lhx/multi-env-instance` | daily dev | ✅ 单 commit 审过后可以 |
+| `lhx/wip-multi-env-instance` | WIP 暂存（含 post-v0.1.0 待审增量） | ⚠️ 单 commit 审过后可以；不要整分支 merge |
+| `lhx/case26-engine-opt` | ⚠️ 性能实验（PCG warm start 等） | ❌ **禁止**，未稳定，详见 `docs/internal/PERF_OPT_HANDOVER.md` |
+| `lhx/case26-param-tuning` | ⚠️ 参数调优实验 | ❌ **禁止** |
+| `perf/m10-equivalence`、`bench/*` | ⚠️ 基准/实验分支 | ❌ **禁止** |
+
+**违反政策的危害**：上述实验分支的代码未经稳定性验证（部分实测降速、部分依赖未提交的环境改动）。如果需要把里面某个具体优化合入 release，必须：(1) 在 `docs/internal/RELEASE_LOG.md` 记录决策、(2) 单独审 commit、(3) 在 release 前的 worktree 跑过完整 case_26 + headless 回归。
+
 ```bash
 # 1. 私有仓代码必须 100% commit（git status 必须干净）
 cd /home/ps/Downloads/Stiff-GIPC
