@@ -1,4 +1,40 @@
 .vs*
 build*
 Output/*
+
+# Internal-only handover and planning docs — never push to remote.
+# See docs/internal/INDEX.md for what lives there.
+docs/internal/
+
+# Catch-all for stray maintainer-only Markdown at the repo root, in case a
+# new handover/plan/research/findings doc gets created outside docs/internal/.
+*_HANDOVER.md
+*_FINDINGS.md
+PLAN_*.md
+RESEARCH_*.md
+
+# Editor / IDE noise (.cursor/rules/ kept for parity with 87f90be baseline)
+.cursor/
 .cursor/rules/
+.cache/
+.polyscope.ini
+imgui.ini
+
+# Python build / runtime artefacts
+__pycache__/
+*.pyc
+dist/
+*.egg-info/
+uv.lock
+
+# stiff_physics installed-mode artefacts (built by scikit-build into the package)
+stiff_physics/_native/
+stiff_physics/data/
+
+# Mesh-process scratch files (debug dumps from solvers)
+_skipped.face
+_skipped.node
+timeCost.txt
+
+# Demo media — too large for git
+*.mp4
