@@ -613,6 +613,15 @@ void ABDSystem::_setup_abd_dyadic_mass(size_t affine_body_count,
                    std::as_const(abd_dyadic_mass).view(),
                    [] __device__(const ABDJacobiDyadicMass& mass) -> Matrix12x12
                    {
+                       // Surface-mesh bodies have 0 tets so the tet-reduction
+                       // leaves mass = zero here. Detect that and write
+                       // Identity as a placeholder — the real M / M_inv for
+                       // these bodies is uploaded later by
+                       // _apply_surface_mesh_body_overrides(). Skipping the
+                       // inverse() call avoids poisoning the buffer with
+                       // garbage from inverse(zero matrix).
+                       if(mass.mass() < 1e-15)
+                           return Matrix12x12::Identity();
                        // eigen 12x12 inverse does not work in cuda kernel!!!
                        // return mass.to_mat().inverse();
                        return inverse(mass.to_mat());

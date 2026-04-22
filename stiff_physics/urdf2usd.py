@@ -14,12 +14,18 @@ unified USD pipeline (including ``physics:approximation``) is used.
 from __future__ import annotations
 
 import pathlib as pl
+import re
 
 import numpy as np
 import trimesh
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
 from stiff_physics.urdf_loader import UrdfLoader
+
+
+def _sanitize_prim_name(name: str) -> str:
+    """Replace characters invalid in USD prim names with underscores."""
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
 def _quat_from_veca_to_vecb(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -114,7 +120,7 @@ class Urdf2Usd:
                 for path, trans in zip(info.visual_mesh_directories,
                                        info.visual_mesh_transforms):
                     resolved = self._resolve_path(path, mesh_map)
-                    name = pl.Path(resolved).stem
+                    name = _sanitize_prim_name(pl.Path(resolved).stem)
                     mesh_prim = UsdGeom.Mesh.Define(
                         self.usd_stage, f"{visuals.GetPath()}/{name}")
                     self._write_mesh_to_prim(mesh_prim, trans, resolved)
@@ -125,7 +131,7 @@ class Urdf2Usd:
             for path, trans in zip(info.collision_mesh_directories,
                                    info.collision_mesh_transforms):
                 resolved = self._resolve_path(path, mesh_map)
-                name = pl.Path(resolved).stem
+                name = _sanitize_prim_name(pl.Path(resolved).stem)
                 mesh_prim = UsdGeom.Mesh.Define(
                     self.usd_stage, f"{collisions.GetPath()}/{name}")
                 UsdPhysics.CollisionAPI.Apply(mesh_prim.GetPrim())

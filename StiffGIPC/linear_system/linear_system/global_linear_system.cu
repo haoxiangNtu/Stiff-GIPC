@@ -48,6 +48,10 @@ bool GlobalLinearSystem::build_linear_system()
 
     m_b.resize(total_rhs_count);
     m_x.resize(total_rhs_count);
+    // PCG's initial guess must start finite; ::resize() leaves new elements
+    // uninitialized and the IterativeSolver reads x on the very first spmv.
+    CUDA_SAFE_CALL(cudaMemset(m_x.view().data(), 0,
+                              total_rhs_count * sizeof(Float)));
 
     auto rhs_view = m_b.view();
 

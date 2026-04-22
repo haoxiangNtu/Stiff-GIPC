@@ -44,6 +44,8 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readwrite("skip_all_collision",               &SimEngineConfig::skip_all_collision)
         .def_readwrite("velocity_damping",                 &SimEngineConfig::velocity_damping)
         .def_readwrite("gravity",                          &SimEngineConfig::gravity)
+        .def_readwrite("ground_normal",                    &SimEngineConfig::ground_normal)
+        .def_readwrite("ground_offset",                    &SimEngineConfig::ground_offset)
         .def_readwrite("assets_dir",                       &SimEngineConfig::assets_dir)
         .def("__repr__", [](const SimEngineConfig& c) {
             return "<pystiffgipc.Config dt=" + std::to_string(c.dt)

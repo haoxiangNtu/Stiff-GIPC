@@ -53,6 +53,9 @@ struct SimEngineConfig
 
     Eigen::Vector3d gravity = Eigen::Vector3d(0.0, -9.8, 0.0);
 
+    Eigen::Vector3d ground_normal = Eigen::Vector3d(0.0, 1.0, 0.0);
+    double          ground_offset = -1.0;
+
     std::string assets_dir;  // override GIPC_ASSETS_DIR if non-empty
 };
 

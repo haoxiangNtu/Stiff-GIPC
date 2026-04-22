@@ -6,7 +6,10 @@ namespace gipc
 {
 inline __device__ __host__ Matrix12x12 inverse(const Matrix12x12& input)
 {
-    Matrix12x12                   result;
+    // Must zero-init: singular inputs hit the `return result` path below,
+    // which would otherwise return uninitialized stack memory (Eigen does
+    // not default-initialize), poisoning downstream computations.
+    Matrix12x12                   result = Matrix12x12::Zero();
     double                        eps = 1e-15;
     const int                     dim = 12;
     Eigen::Matrix<double, 12, 24> mat;

@@ -212,6 +212,18 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                                                        Ap.buffer_view().data(),
                                                        z.size());
 
+            // Root cause fix: the convergence check below (|rz| <= tol*rz0)
+            // reads the OLD rz — the value from before this iteration
+            // updates r.  If this iteration reduces r to 0 (exact one-step
+            // convergence, common in block-diagonal systems where P == A^-1),
+            // rz_new = dot(r, z) = 0 and the NEXT iter starts with p = 0,
+            // giving dot_res = p^T A p = 0 and rz / dot_res = 0 / 0 = NaN.
+            // Breaking on dot_res = 0 catches this correctly: p^T A p = 0
+            // with PD A implies p = 0, which means PCG has already found the
+            // exact solution on the previous iteration.  Non-finite dot_res
+            // signals numerical failure; break preserves x from previous iter.
+            if(dot_res <= 0.0 || !std::isfinite(dot_res))
+                break;
             alpha = rz / dot_res;
         }
 

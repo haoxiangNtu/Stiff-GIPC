@@ -120,11 +120,14 @@ class StiffGipcUsdParser:
         if self.debug_verbose:
             print(f"[UsdParser] Loading {len(rigid_bodies)} independent rigid bodies...", flush=True)
         rb_body_ids_per_env: list[list[int]] = [[] for _ in range(num_envs)]
+        kinematic_rb_ids_per_env: list[list[int]] = [[] for _ in range(num_envs)]
         for i, rb in enumerate(rigid_bodies):
             self._load_rigid_body(rb, offsets, info)
             for env_idx in range(num_envs):
-                rb_body_ids_per_env[env_idx].append(
-                    info.rigid_body_map[rb["prim_path"]][env_idx])
+                bid = info.rigid_body_map[rb["prim_path"]][env_idx]
+                rb_body_ids_per_env[env_idx].append(bid)
+                if rb.get("boundary_type", 0) == 1:
+                    kinematic_rb_ids_per_env[env_idx].append(bid)
 
         art_body_ids_per_env: list[list[int]] = [[] for _ in range(num_envs)]
         for art_key, art_val in info.articulation_map.items():
@@ -148,12 +151,12 @@ class StiffGipcUsdParser:
                 for sc_bid in sc_body_ids_per_env[env_idx]:
                     self.engine.add_collision_exclusion(art_bid, sc_bid)
                     excl_count += 1
-                for rb_bid in rb_body_ids_per_env[env_idx]:
+                for rb_bid in kinematic_rb_ids_per_env[env_idx]:
                     self.engine.add_collision_exclusion(art_bid, rb_bid)
                     excl_count += 1
         if self.debug_verbose and excl_count:
             print(f"[UsdParser] Excluded {excl_count} per-env articulation-external pairs "
-                  f"(arm vs container + arm vs rigid bodies)", flush=True)
+                  f"(arm vs container + arm vs kinematic rigid bodies)", flush=True)
 
         if deformables:
             if self.debug_verbose:
@@ -863,6 +866,19 @@ class StiffGipcUsdParser:
                     "faces": mesh_data["faces"].copy() if mesh_data["faces"].ndim == 2 else mesh_data["faces"].reshape(-1, mesh_data["verts_per_face"]),
                 }
 
+        # Build parent/child link maps from joints for resolve_body_id fallback.
+        # Needed when intermediate links have no mesh and are skipped.
+        from pxr import UsdPhysics as _UsdPhy
+        child_to_parent: dict[str, str] = {}
+        parent_to_children: dict[str, list[str]] = {}
+        for _, jp, _ in joint_prims:
+            ja = _UsdPhy.Joint(jp)
+            t0, t1 = ja.GetBody0Rel().GetTargets(), ja.GetBody1Rel().GetTargets()
+            if t0 and t1:
+                p, c = str(t0[0]), str(t1[0])
+                child_to_parent[c] = p
+                parent_to_children.setdefault(p, []).append(c)
+
         # Phase 2: Build per-env body mappings, create joints, exclusions, geometry_dict
         for env_idx, offset in enumerate(offsets):
             env_transform = offset
@@ -891,6 +907,7 @@ class StiffGipcUsdParser:
                 fk_entry = self._create_joint_from_usd(
                     joint_prim, joint_type, path_to_body_id,
                     env_transform, robot_path,
+                    child_to_parent, parent_to_children,
                 )
                 if env_idx == 0 and fk_entry is not None:
                     art_info["joint_fk_data"].append(fk_entry)
@@ -901,11 +918,14 @@ class StiffGipcUsdParser:
                 bid = path_to_body_id[link_path]
                 clone_link_path = self._remap_path(link_path, offsets, env_idx)
                 asset_id = link_instance_results[link_path]["asset_id"]
+                mesh_pp = link_mesh_prim_paths.get(link_path, link_path)
+                clone_mesh_path = self._remap_path(mesh_pp, offsets, env_idx)
                 info.geometry_dict[clone_link_path] = {
                     "type": "rigid_body",
                     "abd_body_offset": bid,
                     "asset_id": asset_id,
                     "prim_path": clone_link_path,
+                    "mesh_prim_path": clone_mesh_path,
                     "instance_id": env_idx,
                     "robot_name": art_path,
                 }
@@ -978,9 +998,42 @@ class StiffGipcUsdParser:
             return link_prims[0][0]
         return None
 
+    @staticmethod
+    def _resolve_body_up(path: str, child_to_parent: dict, path_to_body_id: dict,
+                         depth: int = 20) -> Optional[int]:
+        """Walk UP the parent chain to find the nearest link with a body."""
+        cur = path
+        for _ in range(depth):
+            if cur in path_to_body_id:
+                return path_to_body_id[cur]
+            cur = child_to_parent.get(cur)
+            if cur is None:
+                break
+        return None
+
+    @staticmethod
+    def _resolve_body_down(path: str, parent_to_children: dict, path_to_body_id: dict,
+                           depth: int = 20) -> Optional[int]:
+        """Walk DOWN the child chain (BFS) to find the nearest link with a body."""
+        if path in path_to_body_id:
+            return path_to_body_id[path]
+        queue = list(parent_to_children.get(path, []))
+        for _ in range(depth):
+            if not queue:
+                break
+            nxt = []
+            for c in queue:
+                if c in path_to_body_id:
+                    return path_to_body_id[c]
+                nxt.extend(parent_to_children.get(c, []))
+            queue = nxt
+        return None
+
     def _create_joint_from_usd(self, joint_prim, joint_type: str,
                                path_to_body_id: dict, env_transform: np.ndarray,
-                               robot_path: str):
+                               robot_path: str,
+                               child_to_parent: Optional[dict] = None,
+                               parent_to_children: Optional[dict] = None):
         """Create a StiffGIPC joint constraint from a UsdPhysics joint prim.
 
         Returns FK data dict for env_0 (None if joint skipped).
@@ -997,13 +1050,15 @@ class StiffGipcUsdParser:
         body0_path = str(targets0[0])
         body1_path = str(targets1[0])
 
-        if body0_path not in path_to_body_id or body1_path not in path_to_body_id:
-            return None
+        parent_id = path_to_body_id.get(body0_path)
+        child_id = path_to_body_id.get(body1_path)
 
-        parent_id = path_to_body_id[body0_path]
-        child_id = path_to_body_id[body1_path]
+        if parent_id is None and child_to_parent is not None:
+            parent_id = self._resolve_body_up(body0_path, child_to_parent, path_to_body_id)
+        if child_id is None and parent_to_children is not None:
+            child_id = self._resolve_body_down(body1_path, parent_to_children, path_to_body_id)
 
-        if parent_id == child_id:
+        if parent_id is None or child_id is None or parent_id == child_id:
             return None
 
         local_pos0 = np.array(joint_api.GetLocalPos0Attr().Get(), dtype=np.float64)
@@ -1148,11 +1203,14 @@ class StiffGipcUsdParser:
             }
 
             clone_path = self._remap_path(prim_path, offsets, env_idx)
+            mesh_pp = rb.get("mesh_prim_path", prim_path)
+            clone_mesh_path = self._remap_path(mesh_pp, offsets, env_idx)
             info.geometry_dict[clone_path] = {
                 "type": "rigid_body",
                 "abd_body_offset": body_offset,
                 "asset_id": result["asset_id"],
                 "prim_path": clone_path,
+                "mesh_prim_path": clone_mesh_path,
                 "instance_id": env_idx,
             }
 
