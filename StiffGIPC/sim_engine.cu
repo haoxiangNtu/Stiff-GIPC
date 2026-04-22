@@ -215,8 +215,14 @@ void SimEngine::load_mesh(const std::string&     mesh_path,
     auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
 
     SimpleSceneImporter imp;
+    // Pass runtime metis_dir so the metis_partition library writes its
+    // sorted_*/part_* intermediates to a runtime-resolved location instead
+    // of the build-time OUTPUT_DIR macro (Issue 1).
+    std::string metis_dir = m_impl->resolved_assets_dir + "sorted_mesh/";
+    std::filesystem::create_directories(metis_dir);
     imp.load_geometry(m_impl->tetMesh, dimensions, bt, transform,
-                      young_modulus, resolved, m_impl->cfg.preconditioner_type, bb);
+                      young_modulus, resolved,
+                      m_impl->cfg.preconditioner_type, bb, metis_dir);
 
     m_impl->record_load(body_type, prev_verts);
     m_impl->load_records.back().label = resolved;
@@ -1111,8 +1117,13 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     else
     {
         SimpleSceneImporter imp;
+        // Issue 1: pass runtime metis_dir to avoid the OUTPUT_DIR
+        // compile-time path leak (only matters when preconditioner_type != 0).
+        std::string metis_dir = m_impl->resolved_assets_dir + "sorted_mesh/";
+        std::filesystem::create_directories(metis_dir);
         imp.load_geometry(m_impl->tetMesh, dimensions, bt, transform,
-                          young_modulus, tmp_path, m_impl->cfg.preconditioner_type, bb);
+                          young_modulus, tmp_path,
+                          m_impl->cfg.preconditioner_type, bb, metis_dir);
     }
 
     m_impl->record_load(body_type, prev_verts);
@@ -1188,8 +1199,13 @@ void SimEngine::Impl::load_from_temp_file(
     else
     {
         SimpleSceneImporter imp;
+        // Issue 1: pass runtime metis_dir so the MAS preconditioner path
+        // doesn't trip the OUTPUT_DIR build-time path leak.
+        std::string metis_dir = resolved_assets_dir + "sorted_mesh/";
+        std::filesystem::create_directories(metis_dir);
         imp.load_geometry(tetMesh, dimensions, bt, transform,
-                          young_modulus, tmp_path, cfg.preconditioner_type, bb);
+                          young_modulus, tmp_path,
+                          cfg.preconditioner_type, bb, metis_dir);
     }
 }
 

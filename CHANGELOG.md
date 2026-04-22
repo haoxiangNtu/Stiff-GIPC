@@ -6,6 +6,22 @@ and [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **`metis_partition` write path no longer hardcoded to maintainer's source
+  tree.** Previously, the wheel binary embedded a compile-time path
+  (`<source>/MeshProcess/metis_partition/../../Assets/sorted_mesh/`) that
+  the metis library used to write `*_sorted.16.obj` and `*_sorted.16.part`
+  intermediates. On any user machine where that path didn't exist, loading
+  a FEM cloth (the default `preconditioner_type=1` MAS path) raised
+  `RuntimeError: filesystem error: cannot create directory`. Fix: drop the
+  `OUTPUT_DIR` macro to an empty default and plumb a runtime
+  `metis_output_folder` parameter through `metis_sort()` →
+  `SimpleSceneImporter::load_geometry()` → `SimEngine::load_mesh()`. The
+  runtime folder is now derived from `Config.assets_dir` (or the
+  `GIPC_ASSETS_DIR` macro fallback). Verified: the wheel binary no longer
+  contains any source-tree paths under `strings(1)`, and the simulator
+  loads correctly with the build-time path absent on disk.
+
 ## [0.1.0] — 2026-04-14
 
 Initial public release of `stiff-physics` Python wheel.

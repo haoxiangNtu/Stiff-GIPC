@@ -22,13 +22,30 @@ std::string get_extension(const std::string& path)
     return p.extension().string();  // extension() 直接获取扩展名（包含点号）
 }
 
-std::vector<std::string> metis_sort(std::string obj_path, int dimension)
+std::vector<std::string> metis_sort(std::string obj_path,
+                                    int         dimension,
+                                    std::string output_folder)
 {
     std::string mesh_name     = get_filename_without_extension(obj_path);
     std::string extension     = get_extension(obj_path);
     bool        isTriangle    = true;
     size_t      block_size    = 16;
-    std::string output_folder = OUTPUT_DIR;
+
+    // Resolve output_folder. Caller-provided value wins; otherwise fall
+    // back through the OUTPUT_DIR compile-time macro (now empty by default
+    // to avoid leaking source-tree paths into shipped wheels — Issue 1)
+    // and finally to "./sorted_mesh/" relative to the current working
+    // directory.
+    if(output_folder.empty())
+        output_folder = OUTPUT_DIR;
+    if(output_folder.empty())
+        output_folder = "./sorted_mesh/";
+    // Normalise: ensure trailing slash so the simple string-concat below
+    // produces well-formed paths.
+    if(!output_folder.empty() && output_folder.back() != '/'
+       && output_folder.back() != '\\')
+        output_folder += '/';
+
     std::string out_file_path = output_folder + mesh_name + "_sorted."
                                 + std::to_string(block_size) + extension;
 
