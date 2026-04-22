@@ -22,6 +22,15 @@ and [Semantic Versioning](https://semver.org/).
   contains any source-tree paths under `strings(1)`, and the simulator
   loads correctly with the build-time path absent on disk.
 
+### Added
+- New example `examples/case_26_render_obj_indices.py`: per-body coloured
+  rendering of the case_26 scene (XArm7 + falling shirt). Each arm link
+  gets its own polyscope mesh with an HSV hue ramp; the shirt is shaded
+  by a smooth XYZ-as-RGB gradient locked to material points. Uses the
+  default MAS preconditioner so cloth deformation matches the basic
+  `case_26_arm_cloth_semi_implicit.py` (no chaotic divergence from a
+  different inner solver path).
+
 ## [0.1.0] — 2026-04-14
 
 Initial public release of `stiff-physics` Python wheel.
