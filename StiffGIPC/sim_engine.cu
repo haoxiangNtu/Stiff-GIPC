@@ -158,13 +158,25 @@ void SimEngine::load_urdf(const std::string&     urdf_path,
     }
 
     int new_abd = static_cast<int>(m_impl->tetMesh.abd_fem_count_info.abd_body_num);
+    // Derive per-body vertex ranges from point_id_to_body_id (one body id per vertex,
+    // appended in body-order during loading — the per-body span is a contiguous range).
+    const auto& pt2body = m_impl->tetMesh.point_id_to_body_id;
+    std::vector<int> body_start(new_abd, -1);
+    std::vector<int> body_end(new_abd, 0);  // exclusive upper bound
+    for(int i = prev_verts; i < m_impl->tetMesh.vertexNum; i++)
+    {
+        int b = pt2body[i];
+        if(b < 0 || b >= new_abd) continue;
+        if(body_start[b] < 0) body_start[b] = i;
+        body_end[b] = i + 1;
+    }
     for(int b = prev_abd; b < new_abd; b++)
     {
         BodyLoadRecord rec;
         rec.body_type     = 0;
         rec.body_offset   = b;
-        rec.vertex_offset = prev_verts;
-        rec.vertex_count  = m_impl->tetMesh.vertexNum - prev_verts;
+        rec.vertex_offset = body_start[b] >= 0 ? body_start[b] : prev_verts;
+        rec.vertex_count  = body_start[b] >= 0 ? (body_end[b] - body_start[b]) : 0;
         rec.label         = urdf_path;
         m_impl->load_records.push_back(rec);
     }
@@ -382,11 +394,14 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.softMotionRate      = cfg.soft_motion_rate;
     ipc.IPC_dt              = cfg.dt;
     ipc.gravity             = make_double3(cfg.gravity.x(), cfg.gravity.y(), cfg.gravity.z());
+    ipc.ground_normal_cfg   = make_double3(cfg.ground_normal.x(), cfg.ground_normal.y(), cfg.ground_normal.z());
+    ipc.ground_offset_cfg   = cfg.ground_offset;
     ipc.pcg_threshold       = cfg.pcg_tol;
     ipc.Newton_solver_threshold = cfg.newton_tol;
     ipc.relative_dhat       = cfg.relative_dhat;
     ipc.YoungModulus        = cfg.young_modulus;
     ipc.pcg_data.P_type     = cfg.preconditioner_type;
+    ipc.assets_dir_cfg      = resolved_assets_dir;
 
     ipc.semi_implicit_enabled  = cfg.semi_implicit_enabled;
     ipc.semi_implicit_beta_tol = cfg.semi_implicit_beta_tol;

@@ -9,26 +9,44 @@ from pathlib import Path
 from typing import Optional
 
 
-def _bootstrap_build_dir():
-    """Add the build/ directory to sys.path so pystiffgipc can be found
-    without manually setting PYTHONPATH / LD_LIBRARY_PATH."""
+_INSTALLED_MODE = False
+
+def _import_native():
+    """Import pystiffgipc from the installed _native/ sub-package first,
+    falling back to the development build/ directory."""
+    global _INSTALLED_MODE
+
+    # 1. Try installed location (wheel / pip install -e .)
+    try:
+        from stiff_physics._native import pystiffgipc
+        _INSTALLED_MODE = True
+        return pystiffgipc
+    except ImportError:
+        pass
+
+    # 2. Fallback: dev build directory next to the project root
     _project_root = Path(__file__).resolve().parent.parent
     _build_dir = _project_root / "build"
     if _build_dir.is_dir():
         bd = str(_build_dir)
         if bd not in sys.path:
             sys.path.insert(0, bd)
+    try:
+        import pystiffgipc
+        return pystiffgipc
+    except ImportError:
+        pass
 
-
-_bootstrap_build_dir()
-
-try:
-    import pystiffgipc as _C
-except ImportError as e:
     raise ImportError(
         "pystiffgipc C++ module not found. "
-        "Build with: cmake -DBUILD_PYTHON_BINDINGS=ON .. && make pystiffgipc"
-    ) from e
+        "Install the stiff-physics wheel, or build with: "
+        "cmake -DBUILD_PYTHON_BINDINGS=ON .. && make pystiffgipc"
+    )
+
+
+_C = _import_native()
+
+_PACKAGE_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 class Config:
@@ -57,6 +75,8 @@ class Config:
         prismatic_strength_ratio: float = 100.0,
         prismatic_driving_strength_ratio: float = 100.0,
         gravity: tuple[float, float, float] = (0.0, -9.8, 0.0),
+        ground_normal: tuple[float, float, float] = (0.0, 1.0, 0.0),
+        ground_offset: float = -1.0,
         velocity_damping: float = 0.0,
         **kwargs,
     ):
@@ -83,9 +103,14 @@ class Config:
         self._cfg.cuda_device = cuda_device
         self._cfg.collision_detection_buff_scale = 6.0
         self._cfg.velocity_damping = velocity_damping
-        self._cfg.assets_dir = assets_dir
+        if not assets_dir and _INSTALLED_MODE and _PACKAGE_DATA_DIR.is_dir():
+            self._cfg.assets_dir = str(_PACKAGE_DATA_DIR) + "/"
+        else:
+            self._cfg.assets_dir = assets_dir
         import numpy as np
         self._cfg.gravity = np.array(gravity, dtype=np.float64)
+        self._cfg.ground_normal = np.array(ground_normal, dtype=np.float64)
+        self._cfg.ground_offset = ground_offset
 
         for k, v in kwargs.items():
             if hasattr(self._cfg, k):

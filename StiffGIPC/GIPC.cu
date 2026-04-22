@@ -1382,25 +1382,43 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
         Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
     double VProjMag2 = __GEIGEN__::__squaredNorm(VProj);
 
-    if(VProjMag2 > eps2)
+    // Build tangent basis from ground normal (works for any orientation).
+    double3 t1, t2;
     {
-        double VProjMag = sqrt(VProjMag2);
+        double3 ref = make_double3(1.0, 0.0, 0.0);
+        if(fabs(normal.x) > 0.9)
+            ref = make_double3(0.0, 1.0, 0.0);
+        t1 = __GEIGEN__::__v_vec_cross(normal, ref);
+        double t1_len = sqrt(__GEIGEN__::__squaredNorm(t1));
+        t1 = __GEIGEN__::__s_vec_multiply(t1, 1.0 / t1_len);
+        t2 = __GEIGEN__::__v_vec_cross(normal, t1);
+    }
 
-        __GEIGEN__::Matrix2x2d projH;
+    double2 relDX = make_double2(__GEIGEN__::__v_vec_dot(t1, VProj),
+                                 __GEIGEN__::__v_vec_dot(t2, VProj));
+    double  relDXSqNorm = relDX.x * relDX.x + relDX.y * relDX.y;
+
+    __GEIGEN__::Matrix2x2d projH;
+
+    if(relDXSqNorm > eps2)
+    {
+        double relDXNorm = sqrt(relDXSqNorm);
+
         __GEIGEN__::__set_Mat2x2_val_column(projH, make_double2(0, 0), make_double2(0, 0));
 
         double  eigenValues[2];
         int     eigenNum = 0;
         double2 eigenVecs[2];
-        __GEIGEN__::__makePD2x2(VProj.x * VProj.x * -multiplier_vI / VProjMag2 / VProjMag
-                                    + (multiplier_vI / VProjMag),
-                                VProj.x * VProj.z * -multiplier_vI / VProjMag2 / VProjMag,
-                                VProj.x * VProj.z * -multiplier_vI / VProjMag2 / VProjMag,
-                                VProj.z * VProj.z * -multiplier_vI / VProjMag2 / VProjMag
-                                    + (multiplier_vI / VProjMag),
-                                eigenValues,
-                                eigenNum,
-                                eigenVecs);
+        __GEIGEN__::__makePD2x2(
+            relDX.x * relDX.x * -multiplier_vI / relDXSqNorm / relDXNorm
+                + (multiplier_vI / relDXNorm),
+            relDX.x * relDX.y * -multiplier_vI / relDXSqNorm / relDXNorm,
+            relDX.x * relDX.y * -multiplier_vI / relDXSqNorm / relDXNorm,
+            relDX.y * relDX.y * -multiplier_vI / relDXSqNorm / relDXNorm
+                + (multiplier_vI / relDXNorm),
+            eigenValues,
+            eigenNum,
+            eigenVecs);
         for(int i = 0; i < eigenNum; i++)
         {
             if(eigenValues[i] > 0)
@@ -1412,26 +1430,34 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                 projH = __GEIGEN__::__Mat2x2_add(projH, eigenMatrix);
             }
         }
-
-        __GEIGEN__::__set_Mat_val(H_vI,
-                                  projH.m[0][0],
-                                  0,
-                                  projH.m[0][1],
-                                  0,
-                                  0,
-                                  0,
-                                  projH.m[1][0],
-                                  0,
-                                  projH.m[1][1]);
     }
     else
     {
-        __GEIGEN__::__set_Mat_val(
-            H_vI, (multiplier_vI / eps), 0, 0, 0, 0, 0, 0, 0, (multiplier_vI / eps));
+        __GEIGEN__::__set_Mat2x2_val_column(projH,
+            make_double2(multiplier_vI / eps, 0),
+            make_double2(0, multiplier_vI / eps));
     }
 
-    //H3x3[idx]    = H_vI;
-    //D1Index[idx] = gidx;
+    // Map 2x2 tangent-space Hessian back to 3x3: H = T * projH * T^T
+    // where T = [t1 | t2] is a 3x2 matrix.
+    // H_ij = sum_ab t_i^a * projH_ab * t_j^b
+    double t1a[3] = {t1.x, t1.y, t1.z};
+    double t2a[3] = {t2.x, t2.y, t2.z};
+    double h[3][3];
+    for(int i = 0; i < 3; i++)
+    {
+        for(int j = 0; j < 3; j++)
+        {
+            h[i][j] = t1a[i] * projH.m[0][0] * t1a[j]
+                     + t1a[i] * projH.m[0][1] * t2a[j]
+                     + t2a[i] * projH.m[1][0] * t1a[j]
+                     + t2a[i] * projH.m[1][1] * t2a[j];
+        }
+    }
+    __GEIGEN__::__set_Mat_val(H_vI,
+                              h[0][0], h[0][1], h[0][2],
+                              h[1][0], h[1][1], h[1][2],
+                              h[2][0], h[2][1], h[2][2]);
 
     write_triplet<3, 3>(triplet_values, row_ids, col_ids, &gidx, H_vI.m, global_offset + idx);
 }
@@ -6627,7 +6653,7 @@ __global__ void _checkGroundCloseVal(const double3* vertexes,
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
 
-    if(dist2 < _closeConstraintVal[gidx])
+    if(dist2 < _closeConstraintVal[idx])
     {
         *_isChange = 1;
     }
@@ -8638,9 +8664,9 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&_gpNum, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundNormal, 5 * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundOffset, 5 * sizeof(double)));
-    double  h_offset[5] = {-1, -1, 1, -1, 1};
-    double3 H_normal[5];  // = { make_double3(0, 1, 0);
-    H_normal[0] = make_double3(0, 1, 0);
+    double  h_offset[5] = {ground_offset_cfg, -1, 1, -1, 1};
+    double3 H_normal[5];
+    H_normal[0] = ground_normal_cfg;
     H_normal[1] = make_double3(1, 0, 0);
     H_normal[2] = make_double3(-1, 0, 0);
     H_normal[3] = make_double3(0, 0, 1);
@@ -8900,7 +8926,7 @@ void GIPC::computeCloseGroundVal()
     if(h_gpNum <= 0)
         return;
     const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
     _computeGroundCloseVal<<<blockNum, threadNum>>>(_vertexes,
                                                     _groundOffset,
                                                     _groundNormal,
@@ -8910,6 +8936,10 @@ void GIPC::computeCloseGroundVal()
                                                     _closeConstraintVal,
                                                     _close_gpNum,
                                                     numbers);
+    // NOTE: h_close_gpNum is intentionally NOT synced from device here.
+    // The adaptive Kappa doubling path (checkCloseGroundVal) that depends on it
+    // was never functional in the original code and enabling it causes instability.
+    // Fixing this properly requires reworking the adaptive Kappa mechanism.
 }
 
 bool GIPC::checkCloseGroundVal()
@@ -9365,9 +9395,10 @@ void GIPC::computeSelfCloseVal()
     if(numbers <= 0)
         return;
     const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
     _calSelfCloseVal<<<blockNum, threadNum>>>(
         _vertexes, _collisonPairs, _closeMConstraintID, _closeMConstraintVal, _close_cpNum, dTol, numbers);
+    // NOTE: h_close_cpNum intentionally not synced (same as h_close_gpNum above).
 }
 
 bool GIPC::checkSelfCloseVal()
@@ -10981,7 +11012,6 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
 
         computeSelfCloseVal();
     }
-    //printf("------------------------------------------Kappa: %f\n", Kappa);
 }
 
 void GIPC::tempMalloc_closeConstraint()

@@ -89,6 +89,10 @@ class GIPC
     double3* _groundNormal = nullptr;
     double*  _groundOffset = nullptr;
 
+    double3 ground_normal_cfg = make_double3(0, 1, 0);
+    double  ground_offset_cfg = -1.0;
+    std::string assets_dir_cfg;
+
     // for friction
     double*                 lambda_lastH_scalar  = nullptr;
     double2*                distCoord            = nullptr;

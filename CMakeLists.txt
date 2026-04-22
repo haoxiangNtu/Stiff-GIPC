@@ -13,7 +13,7 @@ if(UNIX)
 endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 89)
+    set(CMAKE_CUDA_ARCHITECTURES "89;120")
 endif()
 
 project(StiffGIPC LANGUAGES CXX CUDA)
@@ -71,7 +71,7 @@ macro(set_gipc_cuda_props target)
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
         CUDA_STANDARD 17
-        CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     target_compile_options(${target}
         PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: ${GIPC_CUDA_PRIVATE_OPTS}>
         PUBLIC  $<$<COMPILE_LANGUAGE:CUDA>: ${GIPC_CUDA_PUBLIC_OPTS}>
@@ -113,18 +113,21 @@ source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${GIPC_ALL_SOURCE} ${GIPC_AL
 # ===========================================================================
 # Executable target: gipc (GLUT viewer, links stiffgipc_core + GL + ImGui)
 # ===========================================================================
-find_package(GLEW REQUIRED)
-find_package(GLUT REQUIRED)
-find_package(OpenGL REQUIRED)
-find_package(imgui CONFIG REQUIRED)
+option(BUILD_GL_VIEWER "Build the OpenGL viewer executable" ON)
+if(BUILD_GL_VIEWER)
+    find_package(GLEW REQUIRED)
+    find_package(GLUT REQUIRED)
+    find_package(OpenGL REQUIRED)
+    find_package(imgui CONFIG REQUIRED)
 
-add_executable(gipc "StiffGIPC/gl_main.cu")
-target_link_libraries(gipc PRIVATE
-    stiffgipc_core
-    GLUT::GLUT GLEW::GLEW OpenGL::GLU
-    imgui::imgui
-)
-set_gipc_cuda_props(gipc)
+    add_executable(gipc "StiffGIPC/gl_main.cu")
+    target_link_libraries(gipc PRIVATE
+        stiffgipc_core
+        GLUT::GLUT GLEW::GLEW OpenGL::GLU
+        imgui::imgui
+    )
+    set_gipc_cuda_props(gipc)
+endif()
 
 # ===========================================================================
 # Python bindings: pystiffgipc (optional, requires pybind11)
@@ -143,3 +146,21 @@ if(BUILD_PYTHON_BINDINGS)
 endif()
 
 add_subdirectory("MeshProcess")
+
+# ===========================================================================
+# Install rules (used by scikit-build-core to populate the wheel)
+# ===========================================================================
+if(BUILD_PYTHON_BINDINGS AND pybind11_FOUND)
+    # Set RPATH so pystiffgipc.so finds libstiffgipc_core.so in the same dir
+    set_target_properties(stiffgipc_core PROPERTIES
+        INSTALL_RPATH "$ORIGIN")
+    set_target_properties(pystiffgipc PROPERTIES
+        INSTALL_RPATH "$ORIGIN")
+
+    install(TARGETS pystiffgipc
+            LIBRARY DESTINATION stiff_physics/_native)
+    install(TARGETS stiffgipc_core
+            LIBRARY DESTINATION stiff_physics/_native)
+    install(FILES Assets/scene/abd_system_config.json
+            DESTINATION stiff_physics/data/scene)
+endif()

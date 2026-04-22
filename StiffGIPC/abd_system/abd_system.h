@@ -233,6 +233,7 @@ class ABDSystem
     void cal_x_from_q(ABDSimData& sim_data, muda::BufferView<Vector3> vertices);
     void cal_dx_from_dq(ABDSimData& sim_data, muda::BufferView<Vector3> move_dir);
 
+
     /********************************************************************************/
 
     /// <summary>

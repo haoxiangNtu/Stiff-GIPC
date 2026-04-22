@@ -291,18 +291,61 @@ class UrdfLoader:
     # ------------------------------------------------------------------
 
     def resolve_mesh_path(self, mesh_path: str) -> str:
-        """Resolve a mesh path from URDF (handles package://, relative, absolute)."""
+        """Resolve a mesh path from URDF (handles package://, relative, absolute).
+
+        Mirrors the C++ UrdfSceneImporter fallback: when the resolved path
+        does not exist, progressively strip leading directory components and
+        search relative to the URDF folder and its ancestors.
+        """
         if mesh_path.startswith("package://"):
             rel = mesh_path.replace("package://", "")
             if self.package_path is not None:
-                return str(pl.Path(self.package_path) / rel)
-            return str((self.urdf_folder / rel).resolve())
+                candidate = pl.Path(self.package_path) / rel
+                if candidate.exists():
+                    return str(candidate.resolve())
+            candidate = self.urdf_folder / rel
+            if candidate.exists():
+                return str(candidate.resolve())
+            return self._suffix_search_fallback(rel)
+
+        # Strip protocol prefix (e.g. "file://")
+        proto_pos = mesh_path.find("://")
+        if proto_pos != -1:
+            mesh_path = mesh_path[proto_pos + 3:]
 
         p = pl.Path(mesh_path)
-        if p.is_absolute():
+
+        # Try relative to URDF folder
+        candidate = self.urdf_folder / mesh_path
+        if candidate.exists():
+            return str(candidate.resolve())
+
+        # Try as absolute path
+        if p.is_absolute() and p.exists():
             return str(p.resolve())
 
-        return str((self.urdf_folder / mesh_path).resolve())
+        # Fallback: progressive suffix stripping (matches C++ behaviour)
+        return self._suffix_search_fallback(mesh_path)
+
+    def _suffix_search_fallback(self, path_str: str) -> str:
+        """Strip leading path components and search URDF folder ancestors."""
+        suffix = path_str.replace("\\", "/")
+        search_base = self.urdf_folder
+        for _ in range(6):
+            s = suffix
+            while s:
+                candidate = search_base / s
+                if candidate.exists():
+                    return str(candidate.resolve())
+                slash = s.find("/")
+                if slash == -1:
+                    break
+                s = s[slash + 1:]
+            parent = search_base.parent
+            if parent == search_base:
+                break
+            search_base = parent
+        return str(self.urdf_folder / path_str)
 
     # ------------------------------------------------------------------
     # Public API

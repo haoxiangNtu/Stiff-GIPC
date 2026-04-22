@@ -186,7 +186,6 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
     setup_abd_system_gradient_hessian(sim_data, global_triplets, vertex_barrier_gradient);
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-
     converter3x3.convert(global_triplets,
                          global_triplets.h_abd_abd_contact_start_id,
                          global_triplets.abd_abd_contact_num,
@@ -1897,7 +1896,23 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
     auto  body_hessian_size = sim_data.abd_fem_count_info().abd_body_num;
 
     abd_system_diag_preconditioner.resize(body_hessian_size);
-    //abd_system_diag_preconditioner.fill(Matrix12x12::Zero());
+    // Must zero-init: the scatter loop below only touches bodies that appear
+    // in the contact triplet range.  Bodies with no barrier/joint coupling
+    // (e.g. an isolated free rigid body) would otherwise receive uninitialized
+    // stack memory, and a later inverse(P(i)) propagates NaN.  Build the
+    // per-body block accumulator on a clean zero buffer, then add the mass
+    // diagonal so every body has at least a valid preconditioner.
+    abd_system_diag_preconditioner.fill(Matrix12x12::Zero());
+    {
+        using namespace muda;
+        auto Ms = sim_data.device.body_id_to_abd_mass.cviewer().name("M");
+        ParallelFor(256)
+            .kernel_name("seed_preconditioner_with_mass")
+            .apply(body_hessian_size,
+                   [P = abd_system_diag_preconditioner.viewer().name("P"),
+                    Ms] __device__(int i) mutable
+                   { P(i) = Ms(i).to_mat(); });
+    }
     auto triplet = global_triplet->block_values(global_triplet->h_abd_abd_contact_start_id);
     auto rows = global_triplet->block_row_indices(global_triplet->h_abd_abd_contact_start_id);
     auto cols = global_triplet->block_col_indices(global_triplet->h_abd_abd_contact_start_id);

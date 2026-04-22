@@ -19,7 +19,9 @@ void GIPC::build_gipc_system(device_TetraData& tet)
     m_abd_system->parms.kappa = 1e8;
     m_abd_system->parms.dt    = IPC_dt;
 
-    std::string config_dir = GIPC_ASSETS_DIR "scene/abd_system_config.json";
+    std::string config_dir = assets_dir_cfg.empty()
+        ? std::string(GIPC_ASSETS_DIR) + "scene/abd_system_config.json"
+        : assets_dir_cfg + "scene/abd_system_config.json";
 
     gipc::Json json = gipc::Json::parse(std::ifstream(std::string{config_dir}));
     
