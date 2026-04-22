@@ -55,7 +55,8 @@ void SimpleSceneImporter::load_geometry(tetrahedra_obj&  tetras,
                                         double           YoungthM,
                                         std::string      meth_path,
                                         int              preconditionerType,
-                                        BodyBoundaryType body_boundary_type)
+                                        BodyBoundaryType body_boundary_type,
+                                        std::string      metis_output_folder)
 {
     if(Dimensions == 3)
     {
@@ -68,7 +69,7 @@ void SimpleSceneImporter::load_geometry(tetrahedra_obj&  tetras,
         {
             if(preconditionerType)
             {
-                auto paths = metis_sort(meth_path, Dimensions);
+                auto paths = metis_sort(meth_path, Dimensions, metis_output_folder);
                 tetras.load_tetrahedraMesh(paths[0], transform, YoungthM, bodyType, body_boundary_type);
                 tetras.load_parts(paths[1]);
             }
@@ -82,7 +83,7 @@ void SimpleSceneImporter::load_geometry(tetrahedra_obj&  tetras,
     {
         if(preconditionerType)
         {
-            auto paths = metis_sort(meth_path, Dimensions);
+            auto paths = metis_sort(meth_path, Dimensions, metis_output_folder);
             tetras.load_triMesh(paths[0], transform, 0);
             tetras.load_parts(paths[1]);
         }
