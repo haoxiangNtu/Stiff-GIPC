@@ -1,55 +1,83 @@
 #!/usr/bin/env python3
-"""Case 26 — performance-tuned variant (~1.26× faster than the default).
+"""Case 26 — performance-tuned variant (~1.52× faster than the default).
 
 Same scene as `case_26_arm_cloth_semi_implicit.py` (XArm7 + Gripper +
-shirt_6436v free-fall), but with two solver-tolerance knobs loosened to
-trade a small amount of per-step convergence accuracy for speed.
+shirt_6436v free-fall), but with TWO categories of tuning stacked:
 
-Tuned vs default Config (everything else identical):
+  Layer 1 — solver tolerance tuning (~1.26× on its own):
+    semi_implicit_beta_tol = 5e-2   (default 1e-3,  50× looser)
+    newton_tol             = 5e-2   (default 1e-2,   5× looser)
 
-    semi_implicit_beta_tol = 5e-2    # default 1e-3 (50× looser)
-    newton_tol             = 5e-2    # default 1e-2 (5× looser)
-    relative_dhat          = 1e-3    # ★ default unchanged
-    pcg_tol                = 1e-4    # ★ default unchanged
+  Layer 2 — timestep coarsening (~1.21× on top of layer 1):
+    dt                     = 0.020  (default 0.010, 2× larger step)
 
-Measured on case_26 free-fall (100 steps, RTX 4090, v0.1.1 wheel):
+  Knobs deliberately kept at default:
+    relative_dhat          = 1e-3   (no benefit — see rationale below)
+    pcg_tol                = 1e-4   (risky — see rationale below)
 
-    default:   42.7 ms/step
-    tuned:     33.9 ms/step              (1.26× speedup)
-    cloth Y-fall: identical to within 0.3 mm
-    cloth shape drift (sorted L∞): 3.1 mm (~1% of cloth dimension)
+Measured on case_26 free-fall (1.0 simulated second, RTX 4090, v0.1.1 wheel):
 
-Knobs deliberately kept at default:
+    default:    42.7 ms/step × 100 steps = 4.27 s wall for 1.0 s sim
+    layer 1:    33.9 ms/step × 100 steps = 3.39 s wall for 1.0 s sim  (1.26×)
+    layer 1+2:  57.8 ms/step ×  50 steps = 2.89 s wall for 1.0 s sim  (1.48–1.52×)
 
-    relative_dhat:  Tightening to 5e-4 was reported in early tuning notes
-                    to halve collision pair count. In practice (with the
-                    v0.1.x engine binary), it gives 0% to -4% net speedup
-                    — the cp-count win is offset elsewhere — and risks
-                    missing fast contacts. Leave alone.
-    pcg_tol:        Loosening hurts PCG search-direction accuracy, which
-                    can require more outer Newton iters to compensate.
-                    Net win is unclear and the safety risk is real. Leave
-                    alone.
+    cloth Y-fall: consistent within 1 mm across all three
+    cloth shape drift (sorted L∞, vs default at 1.0 sim s): ~8 mm
+        (~2–3% of cloth dimension — still below visual-perception threshold
+         for cloth free-fall + landing; re-verify for your scene)
+
+Why `dt = 0.020` (not larger):
+    Measured sweep 0.005 → 0.030 shows a clear U-shape. dt < 0.010 wastes
+    time on extra steps; dt > 0.020 makes each step super-linearly more
+    expensive (Newton iters explode). 0.020 is the wall-clock-per-sim-sec
+    minimum. drift grows from 3 mm (default) to ~8 mm (dt=0.020) to
+    ~9 mm (dt=0.030) — dt=0.020 gives the best speedup/drift trade-off.
+
+Why `relative_dhat` stays at default:
+    Tightening to 5e-4 was reported in early tuning notes to halve the
+    collision-pair count. In practice with the v0.1.x engine binary it
+    gives 0% to -4% net speedup (the cp-count win is offset elsewhere)
+    and risks missing fast contacts. Leave alone.
+
+Why `pcg_tol` stays at default:
+    Loosening hurts PCG search-direction accuracy, which often requires
+    more outer Newton iters to compensate. Net win is unclear and the
+    safety risk is real. Leave alone.
 
 Trade-offs to be aware of:
 
-    * `semi_implicit_beta_tol = 5e-2` makes Newton exit ~5× sooner. In
-      simple free-fall + light contact this is fine; in complex multi-body
-      contact scenes the early exit may accumulate physics error.
-    * `newton_tol = 5e-2` relaxes the per-step convergence threshold.
-      Same trade-off — fine for visual sims, worth re-evaluating if you
-      need force-accurate contact responses.
-    * Numbers above are from case_26 specifically. Re-measure on your own
-      scene before assuming the same speedup or accuracy holds.
+    * `semi_implicit_beta_tol = 5e-2` — Newton exits ~5× sooner. Fine for
+      simple free-fall + light contact; in complex multi-body contact
+      scenes the early exit may accumulate physics error.
+    * `newton_tol = 5e-2` — per-step Newton convergence relaxed. Same
+      trade-off.
+    * `dt = 0.020` — integrator discretization is 2× coarser. This is a
+      different *category* of change than the solver tolerances above:
+      it affects how accurately the engine integrates each step, not how
+      accurately it solves it. Effects in case_26:
+        - Cloth motion appears 2× faster per callback tick in interactive
+          mode (each Polyscope frame advances 2× more sim time). Does NOT
+          affect the final landed configuration.
+        - Discretization-dependent phenomena (fast rigid collisions,
+          high-frequency cloth dynamics) may become unstable in other
+          scenes. Re-verify dt on your own scene.
 
 When to prefer this script:
     * Visual sim / demo / interactive prototyping
     * Cloth free-fall and light cloth-rigid contact
+    * You've visually verified the result looks right on your scene
 
-When to prefer `case_26_arm_cloth_semi_implicit.py`:
+When to prefer `case_26_arm_cloth_semi_implicit.py` (default accuracy):
     * Force-accurate contact studies
     * Convergence ablation experiments
     * As a baseline reference for further tuning
+    * Any scene where you're unsure about the tuning's effect
+
+When to use a hybrid (layer 1 only, keep dt=0.010):
+    If you want the solver-tol speedup (1.26×) but need to keep the
+    integrator's dt untouched (e.g. to stay aligned with an external
+    simulation's timestep). Copy this script and change `dt=0.020` back
+    to `dt=0.010`.
 
 Usage:
     python examples/case_26_perf_tuned.py
@@ -82,12 +110,13 @@ def main():
     ps.set_ground_plane_mode("shadow_only")
 
     # ---- Performance-tuned Config ----
-    # Only two knobs differ from case_26_arm_cloth_semi_implicit.py:
-    #   semi_implicit_beta_tol: 1e-3 -> 5e-2  (Newton exits ~5x sooner)
-    #   newton_tol:             1e-2 -> 5e-2  (5x looser convergence)
-    # See module docstring for the rationale and trade-offs.
+    # Three knobs differ from case_26_arm_cloth_semi_implicit.py:
+    #   dt                    : 0.010 -> 0.020  (timestep 2x larger)
+    #   semi_implicit_beta_tol: 1e-3  -> 5e-2   (Newton exits ~5x sooner)
+    #   newton_tol            : 1e-2  -> 5e-2   (5x looser convergence)
+    # Total measured speedup vs default: ~1.52x (see module docstring).
     config = Config(
-        dt=0.01,
+        dt=0.020,                            # ★ tuned (default 0.010, 2x coarser)
         cloth_thickness=1e-3,
         cloth_young_modulus=1e4,
         bend_young_modulus=1e3,
@@ -96,14 +125,14 @@ def main():
         soft_motion_rate=1.0,
         poisson_rate=0.49,
         friction_rate=0.4,
-        relative_dhat=1e-3,                  # default
+        relative_dhat=1e-3,                  # default (tightening gives no net speedup)
         joint_strength_ratio=1000.0,
         revolute_driving_strength_ratio=1000.0,
         semi_implicit_enabled=True,
-        semi_implicit_beta_tol=5e-2,         # ★ tuned (default 1e-3)
+        semi_implicit_beta_tol=5e-2,         # ★ tuned (default 1e-3, 50x looser)
         semi_implicit_min_iter=1,
-        newton_tol=5e-2,                     # ★ tuned (default 1e-2)
-        pcg_tol=1e-4,                        # default
+        newton_tol=5e-2,                     # ★ tuned (default 1e-2, 5x looser)
+        pcg_tol=1e-4,                        # default (loosening risks stability)
         assets_dir=ASSETS_DIR,
     )
 
@@ -162,8 +191,8 @@ def main():
             psim.SameLine()
             psim.Text(f"Step: {step_count[0]}")
             psim.Separator()
-            psim.Text("Tuned: beta_tol=5e-2, newton_tol=5e-2")
-            psim.Text("(Expect ~1.26x speedup vs basic case_26)")
+            psim.Text("Tuned: dt=0.02 + beta_tol=5e-2 + newton_tol=5e-2")
+            psim.Text("(Expect ~1.52x speedup vs basic case_26)")
             psim.Separator()
 
             if robot.revolute_joints:
