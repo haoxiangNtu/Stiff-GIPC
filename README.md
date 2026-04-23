@@ -153,42 +153,60 @@ for frame in range(100):
 
 The default `Config` is tuned for **accuracy first** — it is conservative on
 solver tolerances so simulation results stay close to a fully-converged
-reference solution. If your scene tolerates a small amount of per-step
-convergence slack (e.g. visual demos, prototyping, simple cloth + light
-contact), you can trade a bit of accuracy for noticeable speedup.
+reference solution. If your scene tolerates a small amount of accuracy
+slack (e.g. visual demos, prototyping, simple cloth + light contact), you
+can trade a bit of accuracy for noticeable speedup.
 
-### Tunable Config knobs
+### Tunable Config knobs (tested on `case_26`)
 
-| Knob | Default | Loosen for speed | Effect when loosened |
+| Knob | Default | Tuned value | Effect | Safe? |
+|---|---|---|---|---|
+| `semi_implicit_beta_tol` | `1e-3` | **`5e-2`** (50× looser) | Newton early-exits sooner — biggest single speedup knob | ✅ low risk |
+| `newton_tol` | `1e-2` | **`5e-2`** (5× looser) | Per-step Newton convergence threshold relaxed | ✅ low risk |
+| `dt` (timestep) | `0.010` | **`0.020`** (2× larger) | Integrator takes larger steps — fewer steps per sim-sec, but each step harder | ⚠️ scene-dependent |
+| `relative_dhat` | `1e-3` | (leave alone) | Tightening to `5e-4` gives ~0% net speedup; may miss fast contacts | ❌ not worth it |
+| `pcg_tol` | `1e-4` | (leave alone) | Loosening hurts inner PCG search direction — net speedup unclear | ❌ not worth it |
+| `joint_strength_ratio` | `100` | (leave alone) | No measurable effect on speed in `case_26` — joint solve is not the bottleneck | ❌ no effect |
+
+### Measured speedup on `case_26` (RTX 4090, 1.0 simulated second)
+
+| Configuration | Wall time | Speedup | Cloth-shape drift (vs default) |
 |---|---|---|---|
-| `semi_implicit_beta_tol` | `1e-3` | `5e-2` (50× looser) | Newton early-exits sooner; biggest single speedup knob |
-| `newton_tol` | `1e-2` | `5e-2` (5× looser) | Per-step Newton convergence threshold relaxed |
-| `relative_dhat` | `1e-3` | (leave alone) | Tightening to `5e-4` reduces collision-pair count but yields ~0% net speedup in practice and risks missing fast contacts |
-| `pcg_tol` | `1e-4` | (leave alone) | Loosening hurts inner PCG search direction; net win unclear |
+| All defaults (`case_26_arm_cloth_semi_implicit.py`) | 4.27 s | 1.00× | — |
+| Solver tol only (`beta_tol=5e-2 + newton_tol=5e-2`) | 3.39 s | **1.26×** | ~3 mm |
+| Solver tol + `dt=0.020` (`case_26_perf_tuned.py`) | 2.89 s | **~1.52×** | ~8 mm |
 
-### Measured speedup on `case_26` (RTX 4090, 100 free-fall steps)
+Cloth-shape drift of 3–8 mm on a ~30 cm cloth is below visual perception;
+Y-fall trajectory is consistent within 1 mm across all three configurations.
 
-| Configuration | ms/step | Speedup | Cloth shape drift (sorted L∞) |
-|---|---|---|---|
-| All defaults (`case_26_arm_cloth_semi_implicit.py`) | 42.7 | 1.00× | — |
-| `beta_tol=5e-2` only | 37.2 | **1.15×** | 4.2 mm |
-| `beta_tol=5e-2` + `newton_tol=5e-2` (`case_26_perf_tuned.py`) | 33.9 | **1.26×** | 3.1 mm |
+### dt sweep observations
 
-Cloth shape drift of ~3–4 mm on a ~30 cm cloth is below visual perception
-threshold; Y-fall trajectory is identical to within sub-mm.
+`dt` has a U-shape — neither "smaller is always more accurate" nor "bigger
+is always faster":
 
-### When to use which
+| `dt` | Wall / sim-sec | vs default |
+|---|---|---|
+| `0.005` | 5.14 s | 0.68× (slower — step count doubles) |
+| `0.0075` | 4.02 s | 0.87× (slower) |
+| `0.010` | 3.46 s | 1.00× (default) |
+| `0.015` | 3.00 s | 1.16× |
+| **`0.020`** | **2.89 s** | **1.21× (peak)** |
+| `0.025` | 3.02 s | 1.15× (Newton iters start exploding) |
+| `0.030` | 2.96 s | 1.17× (no further benefit, drift grows) |
+
+### When to use which script
 
 | Use case | Recommended script |
 |---|---|
 | Visual demo / interactive prototyping | `case_26_perf_tuned.py` |
-| Force-accurate contact study | `case_26_arm_cloth_semi_implicit.py` |
-| Convergence ablation / research baseline | `case_26_arm_cloth_semi_implicit.py` |
+| Need solver speedup but keep default `dt` (e.g. external sim pacing) | Copy `case_26_perf_tuned.py` and change `dt=0.020` back to `dt=0.010` |
+| Force-accurate contact study | `case_26_arm_cloth_semi_implicit.py` (default) |
+| Convergence ablation / research baseline | `case_26_arm_cloth_semi_implicit.py` (default) |
 
 The tuning above is **measured on `case_26` specifically** (XArm7 + single
 falling shirt, mostly self-contact). Re-measure on your own scene before
-assuming the same speedup or accuracy holds — complex multi-body contact
-or fast-moving rigid scenes may behave differently.
+assuming the same speedup or accuracy holds — complex multi-body contact,
+fast-moving rigid scenes, or stiffer cloth may behave differently.
 
 ## Project Structure
 
