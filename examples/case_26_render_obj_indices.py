@@ -46,6 +46,7 @@ Run:
 import colorsys
 import math
 import os
+from pathlib import Path
 import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
@@ -90,14 +91,13 @@ def main():
     ps.set_up_dir("y_up")
     ps.set_ground_plane_mode("shadow_only")
 
-    # NOTE (ad-hoc: 2026-04-22 physics-A/B run): preconditioner_type set to 1 (MAS)
-    # to match case_26_arm_cloth_semi_implicit.py's solver path, so cloth
-    # deformation reproduces the basic-case_26 trajectory.
-    # Side effect: MAS reorders FEM vertices, breaking the engine_verts <-> obj_faces
-    # index alignment this script depends on — the shirt rendering will be
-    # visually garbled (faces connect reordered vertices) and the L2 err print
-    # below will report a large number. Arm (ABD) rendering is unaffected.
-    # Flip back to 0 when you want the colored-shirt render to look correct.
+    # Resolve assets dir relative to this script's location (e.g. when the
+    # repo is cloned to ~/Downloads/test-stiff-physics/, this picks up
+    # ~/Downloads/test-stiff-physics/assets/). The wheel-shipped data dir
+    # only contains scene/abd_system_config.json — it does NOT carry the
+    # URDF + mesh assets, which live in the public-repo's assets/ dir.
+    ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+
     config = Config(
         dt=0.01,
         cloth_thickness=1e-3,
@@ -115,6 +115,7 @@ def main():
         semi_implicit_beta_tol=1e-3,
         semi_implicit_min_iter=1,
         preconditioner_type=1,
+        assets_dir=ASSETS_DIR,
     )
 
     engine = Engine(config)
