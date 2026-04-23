@@ -159,25 +159,38 @@ can trade a bit of accuracy for noticeable speedup.
 
 ### Tunable Config knobs (tested on `case_26`)
 
-| Knob | Default | Tuned value | Effect | Safe? |
-|---|---|---|---|---|
-| `semi_implicit_beta_tol` | `1e-3` | **`5e-2`** (50× looser) | Newton early-exits sooner — biggest single speedup knob | ✅ low risk |
-| `newton_tol` | `1e-2` | **`5e-2`** (5× looser) | Per-step Newton convergence threshold relaxed | ✅ low risk |
-| `dt` (timestep) | `0.010` | **`0.020`** (2× larger) | Integrator takes larger steps — fewer steps per sim-sec, but each step harder | ⚠️ scene-dependent |
-| `relative_dhat` | `1e-3` | (leave alone) | Tightening to `5e-4` gives ~0% net speedup; may miss fast contacts | ❌ not worth it |
-| `pcg_tol` | `1e-4` | (leave alone) | Loosening hurts inner PCG search direction — net speedup unclear | ❌ not worth it |
-| `joint_strength_ratio` | `100` | (leave alone) | No measurable effect on speed in `case_26` — joint solve is not the bottleneck | ❌ no effect |
+All measurements below: RTX 4090, n=30 trials per cell (3 independent batches × 10 trials each, with 3-round GPU warmup per batch, randomized cell order, paired t-test).
 
-### Measured speedup on `case_26` (RTX 4090, 1.0 simulated second)
+**Effective tuning knobs** (stacked in `case_26_perf_tuned.py`):
 
-| Configuration | Wall time | Speedup | Cloth-shape drift (vs default) |
+| Knob | Default | Tuned | Marginal speedup | Stacked speedup vs default | p-value |
+|---|---|---|---|---|---|
+| `semi_implicit_beta_tol` | `1e-3` | **`5e-2`** | **+10.6%** | 1.11× | 3×10⁻¹⁹ |
+| `newton_tol` (on top) | `1e-2` | **`5e-2`** | +7.5% | 1.19× | 5×10⁻²⁵ |
+| `dt` timestep (on top) | `0.010` | **`0.020`** | +20.5% | **1.43×** | 6×10⁻³¹ |
+
+**Knobs tested but NOT worth changing** (rigorous measurement, no measurable speedup):
+
+| Knob | Tried | Effect on case_26 | Why skipped |
 |---|---|---|---|
-| All defaults (`case_26_arm_cloth_semi_implicit.py`) | 4.27 s | 1.00× | — |
-| Solver tol only (`beta_tol=5e-2 + newton_tol=5e-2`) | 3.39 s | **1.26×** | ~3 mm |
-| Solver tol + `dt=0.020` (`case_26_perf_tuned.py`) | 2.89 s | **~1.52×** | ~8 mm |
+| `relative_dhat` | `5e-4` (tighter) | ~0% (noise-level) | Halves collision-pair count but doesn't reduce total wall time on this binary |
+| `pcg_tol` | any looser value | inconclusive | Loosening hurts PCG search direction; net win unclear, real stability risk |
+| `joint_strength_ratio` | `50` … `5000` sweep | all within ±1% (noise) | Joint solve is not the bottleneck — all variants identical at `p > 0.5` |
+| **finger-only collision exclusion** (shirt vs `left_finger` + `right_finger` only, exclude other 13 arm bodies) | explicit `engine.add_collision_exclusion(non_finger_bid, shirt_bid)` | **+0.48% (basic), −0.08% (perf_tuned), `p ≥ 0.5`** | Cloth self-contact dominates the collision-pair count; arm-shirt pairs are <5% of total cp, so excluding them has no measurable effect |
+| `collision_detection_buff_scale`, `linear_system_buff_scale`, `semi_implicit_min_iter` | various | individually borderline, combined −4% | Negative interaction when stacked; not worth the complexity |
+| H2 PCG warm start / H3+H4 cudaMalloc-event / H5 CUB + FEM reduce (engine-level) | cherry-pick from experimental branches | all p>0.8, indistinguishable from zero | See maintainer notes; PERF_OPT_HANDOVER's 2.17× numbers were on a different baseline (pre-stability-fix), not reproducible on the shipped binary |
+
+### Measured speedup on `case_26` (RTX 4090, 1.0 simulated second, n=30)
+
+| Configuration | Wall time | 95% CI | Speedup | Cloth drift (vs default) |
+|---|---|---|---|---|
+| All defaults (`case_26_arm_cloth_semi_implicit.py`) | 4.14 s | [4.10, 4.19] | 1.00× | — |
+| `beta_tol=5e-2` only | 3.75 s | [3.70, 3.79] | **1.11×** | ~3 mm |
+| `beta_tol=5e-2` + `newton_tol=5e-2` | 3.49 s | [3.45, 3.52] | **1.19×** | ~3 mm |
+| Full `case_26_perf_tuned.py` (+ `dt=0.020`) | **2.89 s** | **[2.87, 2.91]** | **1.43×** | ~8 mm |
 
 Cloth-shape drift of 3–8 mm on a ~30 cm cloth is below visual perception;
-Y-fall trajectory is consistent within 1 mm across all three configurations.
+Y-fall trajectory is consistent within 1 mm across all four configurations.
 
 ### dt sweep observations
 
@@ -193,6 +206,23 @@ is always faster":
 | **`0.020`** | **2.89 s** | **1.21× (peak)** |
 | `0.025` | 3.02 s | 1.15× (Newton iters start exploding) |
 | `0.030` | 2.96 s | 1.17× (no further benefit, drift grows) |
+
+### Advanced: collision exclusion for scene-specific constraints
+
+If your scene design requires excluding specific body pairs from collision
+checking (e.g. you know certain bodies should pass through each other), you
+can use `engine.add_collision_exclusion(body_a, body_b)`. Note this does
+NOT give a speedup on `case_26`-like scenes where cloth self-contact
+dominates the collision-pair budget — but it can matter for scene logic:
+
+```python
+# Example: exclude all arm links except fingers from colliding with shirt
+finger_ids = {13, 14}   # left_finger, right_finger (XArm7+gripper body order)
+shirt_bid = engine.abd_body_count   # FEM shirt body, right after ABD bodies
+for bid in range(engine.abd_body_count):
+    if bid not in finger_ids:
+        engine.add_collision_exclusion(bid, shirt_bid)
+```
 
 ### When to use which script
 
