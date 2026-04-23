@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
-"""Case 26 — performance-tuned variant (~1.52× faster than the default).
+"""Case 26 — performance-tuned variant (~1.43× faster than the default).
 
 Same scene as `case_26_arm_cloth_semi_implicit.py` (XArm7 + Gripper +
 shirt_6436v free-fall), but with TWO categories of tuning stacked:
 
-  Layer 1 — solver tolerance tuning (~1.26× on its own):
-    semi_implicit_beta_tol = 5e-2   (default 1e-3,  50× looser)
-    newton_tol             = 5e-2   (default 1e-2,   5× looser)
+  Layer 1 — solver tolerance tuning (~1.19× on its own):
+    semi_implicit_beta_tol = 5e-2   (default 1e-3,  50× looser; +10.6% alone)
+    newton_tol             = 5e-2   (default 1e-2,   5× looser; +7.5% marginal)
 
-  Layer 2 — timestep coarsening (~1.21× on top of layer 1):
+  Layer 2 — timestep coarsening (+20.5% marginal on top of layer 1):
     dt                     = 0.020  (default 0.010, 2× larger step)
 
   Knobs deliberately kept at default:
     relative_dhat          = 1e-3   (no benefit — see rationale below)
     pcg_tol                = 1e-4   (risky — see rationale below)
 
-Measured on case_26 free-fall (1.0 simulated second, RTX 4090, v0.1.1 wheel):
+Measured on case_26 free-fall, rigorous A/B: RTX 4090, v0.1.1 wheel, n=30
+trials per cell across 3 independent batches with 3-round GPU warmup each,
+randomized cell order, paired t-test. Metric: wall-clock to simulate
+exactly 1.0 sim-sec of physics.
 
-    default:    42.7 ms/step × 100 steps = 4.27 s wall for 1.0 s sim
-    layer 1:    33.9 ms/step × 100 steps = 3.39 s wall for 1.0 s sim  (1.26×)
-    layer 1+2:  57.8 ms/step ×  50 steps = 2.89 s wall for 1.0 s sim  (1.48–1.52×)
+    default:    4.144 s wall   95% CI [4.095, 4.194]  (1.00×)
+    layer 1:    3.485 s wall   95% CI [3.449, 3.520]  (1.19×, p=5e-25)
+    layer 1+2:  2.892 s wall   95% CI [2.872, 2.911]  (1.43×, p=6e-31)
 
-    cloth Y-fall: consistent within 1 mm across all three
+    cloth Y-fall: consistent within 1 mm across all three configs
     cloth shape drift (sorted L∞, vs default at 1.0 sim s): ~8 mm
-        (~2–3% of cloth dimension — still below visual-perception threshold
-         for cloth free-fall + landing; re-verify for your scene)
+        (~2–3% of cloth dimension — below visual-perception threshold for
+         cloth free-fall + landing; re-verify for your scene)
 
 Why `dt = 0.020` (not larger):
     Measured sweep 0.005 → 0.030 shows a clear U-shape. dt < 0.010 wastes
@@ -43,6 +46,24 @@ Why `pcg_tol` stays at default:
     Loosening hurts PCG search-direction accuracy, which often requires
     more outer Newton iters to compensate. Net win is unclear and the
     safety risk is real. Leave alone.
+
+Knobs tested and found NOT to help (for the record, so you don't re-test):
+    * `joint_strength_ratio` sweep (50 … 5000): all within ±1% of noise,
+      p > 0.5. Joint solve is not the bottleneck.
+    * finger-only collision exclusion (shirt vs left_finger + right_finger
+      only, other arm bodies excluded via add_collision_exclusion):
+      +0.48% on basic, −0.08% on perf_tuned, p = 0.50/0.84 respectively.
+      Cloth self-contact dominates the collision-pair count (~90% of all
+      pairs); arm-shirt pairs are too small a fraction to move the needle.
+    * `collision_detection_buff_scale` / `linear_system_buff_scale` /
+      `semi_implicit_min_iter`: individually borderline, combined −4%
+      (negative interaction). Skipped.
+    * Engine-level perf commits H2/H3+H4/H5 from earlier experimental
+      branches: all give null effect (p > 0.8) on the v0.1.1 binary. The
+      published PERF_OPT_HANDOVER 2.17× numbers were measured on a
+      pre-87f90be baseline whose stability bugs (uninitialized ABD
+      preconditioner, etc.) made those optimisations helpful; after the
+      bugs got fixed, their optimisation target disappeared.
 
 Trade-offs to be aware of:
 
@@ -192,7 +213,7 @@ def main():
             psim.Text(f"Step: {step_count[0]}")
             psim.Separator()
             psim.Text("Tuned: dt=0.02 + beta_tol=5e-2 + newton_tol=5e-2")
-            psim.Text("(Expect ~1.52x speedup vs basic case_26)")
+            psim.Text("(Measured 1.43x speedup vs basic case_26, n=30)")
             psim.Separator()
 
             if robot.revolute_joints:
