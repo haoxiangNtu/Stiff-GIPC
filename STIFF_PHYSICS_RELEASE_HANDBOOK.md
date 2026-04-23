@@ -271,7 +271,13 @@ cd build      && cmake --build . --target pystiffgipc -j$(nproc) && cd ..
 
 ## 5. 测试流程
 
-### 5.1 端到端安装测试
+### 5.1 端到端安装测试（**release 必跑**）
+
+> **强制规则（v0.1.1 教训）：每次发新 release 之前，every example script 都必须从这条 fresh wheel-install 流程跑过一遍**。
+>
+> 原因：在私有仓 dev worktree 里跑 example 时 `_INSTALLED_MODE=False`，engine 的 `assets_dir` fallback 到编译时 `GIPC_ASSETS_DIR` 宏（巧合指向源码 `Assets/`），脚本即使没显式传 `assets_dir=` 也能跑通；但用户 `pip install` 后 `_INSTALLED_MODE=True`，fallback 切换到 wheel 内 `stiff_physics/data/`（**只含 `scene/abd_system_config.json` 132 字节**，没有 URDF / mesh），脚本立刻 `URDF file does not exist`。
+>
+> v0.1.1 的 `case_26_render_obj_indices.py` 第一次发布就踩了这个坑（dev 测试通过、用户装好后崩）—— 后续每个 example 都必须显式 `Config(assets_dir=ASSETS_DIR)`，且必须在干净 wheel-install env 里 sanity-check 通过才算 release-ready。
 
 在一个干净的 conda 环境中测试（模拟用户首次安装）：
 
@@ -284,22 +290,39 @@ conda activate test_stiff
 cd ~/Downloads
 git clone https://github.com/haoxiangNtu/stiff-physics.git test-stiff-physics
 cd test-stiff-physics
-pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.1.0/stiff_physics-0.1.0-cp311-cp311-linux_x86_64.whl
+pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.1.1/stiff_physics-0.1.1-cp311-cp311-linux_x86_64.whl
 pip install polyscope scipy
 
-# 运行核心示例
+# === 必跑：每个 examples/*.py 都要 sanity-check 至少能加载 ===
+# 基础场景（GUI）
 python examples/case_26_arm_cloth_semi_implicit.py
-# 应弹出 Polyscope 窗口，点 Run 启动仿真
+# 应弹出 Polyscope 窗口，URDF 18 link 加载，shirt mesh 加载，点 Run 启动仿真
+
+# v0.1.1 新增：per-body 彩色渲染
+python examples/case_26_render_obj_indices.py
+# 应弹出 Polyscope 窗口（同 case_26 物理），arm 各 link HSV 渐变颜色，shirt XYZ→RGB
 
 # headless 测试（无 GUI）
 python examples/headless_joint_control.py
-# 应打印 vertex 数据，3 帧后退出
+# 应打印 vertex 数据 + 100 帧仿真完成，无 RuntimeError
+
+# === sanity check 验证清单 ===
+# [ ] 没有 "URDF file does not exist" 错误（说明 assets_dir 解析正确）
+# [ ] 没有 "cannot create directory: .../sorted_mesh/" 错误（说明 metis 路径已不烤死）
+# [ ] Polyscope 窗口正常弹出，仿真可启动
+# [ ] headless 100 帧跑完无崩
 
 # 清理
 conda deactivate
 conda env remove -n test_stiff -y
 rm -rf ~/Downloads/test-stiff-physics
 ```
+
+**新增 example 时的检查表**：
+- [ ] 显式 `ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"`
+- [ ] 显式 `Config(..., assets_dir=ASSETS_DIR)` 不要依赖 `engine.native.get_assets_dir()` 默认
+- [ ] 在 fresh wheel-install env 里跑过，确认能加载 URDF / mesh
+- [ ] 没有用 wheel 没暴露的 API（比如 `get_last_diag()` 是 post-v0.1.x 才有）
 
 ### 5.2 开发模式快速测试
 
