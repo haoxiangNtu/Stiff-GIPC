@@ -4,7 +4,33 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-04-24
+
+### Performance (case_26 scene, validated)
+
+- **case_26 step speedup: ~18%** vs v0.1.x baseline (23.8 → 19.5 ms/step
+  median, n=30 paired t-test, p<0.0001, bootstrap 95% CI [0.791, 0.823]).
+  Measured on RTX 4090D + `case_26_arm_cloth_semi_implicit.py`.
+  Physics cross-drift within 1.04× GPU non-determinism floor across
+  9 checkpoints (1 → 300 steps): no observable physics divergence.
+
+  Composed of three orthogonal engine-level optimizations:
+
+  - **PCG D2H elimination**: alpha/beta/convergence moved to device-side
+    scalars; stride-K=8 convergence check. Saves 504 D2H sync stalls
+    per frame (contribution: -5.7% on free-fall scenario).
+  - **Multi-stream BVH self-collision**: `bvh_e` on side stream,
+    concurrent with `bvh_f` on default. case_26's 8593 surface verts
+    underfill the 114-SM GPU; concurrency ~14% more SM occupancy
+    (contribution: -10.5%).
+  - **Fused PCG inner kernels**: `update_vector_dx_r_fused` re-derives
+    alpha per-thread (eliminates `compute_alpha_kernel` launch);
+    `cub::DeviceReduce::Sum` + `TransformInputIterator` replaces manual
+    tree reduction (saves 2 launches per dot); combined swap+convergence
+    kernel (contribution: -1.6% on top of the above, n=90 aggregate).
+
+  See private `docs/internal/RELEASE_LOG.md` §v0.2.0 prep for the full
+  audit trail including 9 null/infeasible experiments that were rejected.
 
 ### Fixed
 - **`metis_partition` write path no longer hardcoded to maintainer's source
