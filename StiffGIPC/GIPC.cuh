@@ -165,6 +165,14 @@ class GIPC
     // bvh_f (default stream). Created lazily; destroyed in dtor.
     cudaStream_t m_aux_stream = nullptr;
 
+    // Side streams for parallelizing the FEM/cloth gradient+hessian block
+    // (bending, triangle FEM, soft constraint) — they write to disjoint
+    // triplet ranges (offsets pre-computed) and accumulate into shape_grads
+    // via atomicAdd, so cross-stream concurrency is safe.
+    cudaStream_t m_grad_stream_a = nullptr;
+    cudaStream_t m_grad_stream_b = nullptr;
+    cudaStream_t m_grad_stream_c = nullptr;
+
   public:
     GIPC();
     ~GIPC();

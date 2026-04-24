@@ -8790,6 +8790,9 @@ GIPC::~GIPC()
         cudaStreamDestroy(m_aux_stream);
         m_aux_stream = nullptr;
     }
+    if(m_grad_stream_a) { cudaStreamDestroy(m_grad_stream_a); m_grad_stream_a = nullptr; }
+    if(m_grad_stream_b) { cudaStreamDestroy(m_grad_stream_b); m_grad_stream_b = nullptr; }
+    if(m_grad_stream_c) { cudaStreamDestroy(m_grad_stream_c); m_grad_stream_c = nullptr; }
     FREE_DEVICE_MEM();
 }
 
@@ -9563,14 +9566,15 @@ void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInverses,
                                     int*                    row_ids,
                                     int*                    col_ids,
                                     double                  IPC_dt,
-                                    int global_hessian_fem_offset)
+                                    int global_hessian_fem_offset,
+                                    cudaStream_t            stream = 0)
 {
     int numbers = tetrahedraNum_FEM;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calculate_fem_gradient_hessian<<<blockNum, threadNum>>>(
+    _calculate_fem_gradient_hessian<<<blockNum, threadNum, 0, stream>>>(
         DmInverses + tetrahedraNum_ABD,
         vertexes,
         tetrahedras + tetrahedraNum_ABD,
@@ -9602,14 +9606,15 @@ void calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* triDmInvers
                                              int*             row_ids,
                                              int*             col_ids,
                                              double           IPC_dt,
-                                             int global_hessian_fem_offset)
+                                             int global_hessian_fem_offset,
+                                             cudaStream_t     stream = 0)
 {
     int numbers = triangleNum;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calculate_triangle_fem_gradient_hessian<<<blockNum, threadNum>>>(triDmInverses,
+    _calculate_triangle_fem_gradient_hessian<<<blockNum, threadNum, 0, stream>>>(triDmInverses,
                                                                       vertexes,
                                                                       triangles,
                                                                       area,
@@ -9681,14 +9686,15 @@ void calculate_bending_gradient_hessian(const double3*   vertexes,
                                         int*             row_ids,
                                         int*             col_ids,
                                         double           IPC_dt,
-                                        int global_hessian_fem_offset)
+                                        int global_hessian_fem_offset,
+                                        cudaStream_t     stream = 0)
 {
     int numbers = edgeNum;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calculate_bending_gradient_hessian<<<blockNum, threadNum>>>(vertexes,
+    _calculate_bending_gradient_hessian<<<blockNum, threadNum, 0, stream>>>(vertexes,
                                                                  rest_vertexes,
                                                                  edges,
                                                                  edges_adj_vertex,
@@ -9718,14 +9724,15 @@ void calculate_quad_bending_gradient_hessian(const double3* vertexes,
                                              int*             row_ids,
                                              int*             col_ids,
                                              double           IPC_dt,
-                                             int global_hessian_fem_offset)
+                                             int global_hessian_fem_offset,
+                                             cudaStream_t     stream = 0)
 {
     int numbers = edgeNum;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calculate_quad_bending_gradient_hessian<<<blockNum, threadNum>>>(vertexes,
+    _calculate_quad_bending_gradient_hessian<<<blockNum, threadNum, 0, stream>>>(vertexes,
                                                                       rest_vertexes,
                                                                       edges,
                                                                       edges_adj_vertex,
@@ -10429,7 +10436,32 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     {
         gipc::Timer timer{"cal_fem_gradient_hessian"};
         int fem_triplet_start = gipc_global_triplet.global_triplet_offset;
-        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+        // Pre-compute per-kernel offsets so we can launch in parallel on
+        // separate streams. Each kernel writes to a disjoint slot range
+        // and accumulates into shape_grads via atomicAdd → safe under
+        // cross-stream concurrency.
+        const int fem_off       = gipc_global_triplet.global_triplet_offset;
+        const int bending_off   = fem_off + abd_fem_count_info.fem_tet_num * 10;
+        const int triangle_off  = bending_off + tri_edge_num * 10;
+        const int soft_off      = triangle_off + triangleNum * 6;
+        const int final_off     = soft_off + softNum;
+
+        if(!m_grad_stream_a) cudaStreamCreate(&m_grad_stream_a);
+        if(!m_grad_stream_b) cudaStreamCreate(&m_grad_stream_b);
+        if(!m_grad_stream_c) cudaStreamCreate(&m_grad_stream_c);
+
+        // Fence so side streams see all prior writes (shape_grads memset,
+        // partition output, ABD setup output) before launching their own.
+        cudaEvent_t fence;
+        cudaEventCreateWithFlags(&fence, cudaEventDisableTiming);
+        cudaEventRecord(fence, 0);
+        cudaStreamWaitEvent(m_grad_stream_a, fence, 0);
+        cudaStreamWaitEvent(m_grad_stream_b, fence, 0);
+        cudaStreamWaitEvent(m_grad_stream_c, fence, 0);
+
+        // Stream 0 (default): FEM tet grad+hess (typically 0 work for
+        // case_26 cloth scenarios, but kept here for generality).
         calculate_fem_gradient_hessian(TetMesh.DmInverses,
                                        TetMesh.vertexes,
                                        TetMesh.tetrahedras,
@@ -10439,15 +10471,15 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                        abd_fem_count_info.abd_tet_num,
                                        TetMesh.lengthRate,
                                        TetMesh.volumeRate,
-                                       gipc_global_triplet.global_triplet_offset,
+                                       fem_off,
                                        gipc_global_triplet.block_values(),
                                        gipc_global_triplet.block_row_indices(),
                                        gipc_global_triplet.block_col_indices(),
                                        IPC_dt,
-                                       fem_global_hessian_index_offset);
-        gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_tet_num * 10;
+                                       fem_global_hessian_index_offset,
+                                       0 /* default stream */);
 
-
+        // Stream A: bending grad+hess.
 #ifdef USE_QUADRATIC_BENDING
         calculate_quad_bending_gradient_hessian(TetMesh.vertexes,
                                                 TetMesh.rest_vertexes,
@@ -10457,12 +10489,13 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                                 shape_grads,
                                                 tri_edge_num,
                                                 bendStiff,
-                                                gipc_global_triplet.global_triplet_offset,
+                                                bending_off,
                                                 gipc_global_triplet.block_values(),
                                                 gipc_global_triplet.block_row_indices(),
                                                 gipc_global_triplet.block_col_indices(),
                                                 IPC_dt,
-                                                fem_global_hessian_index_offset);
+                                                fem_global_hessian_index_offset,
+                                                m_grad_stream_a);
 #else
         calculate_bending_gradient_hessian(TetMesh.vertexes,
                                            TetMesh.rest_vertexes,
@@ -10471,16 +10504,16 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                            shape_grads,
                                            tri_edge_num,
                                            bendStiff,
-                                           gipc_global_triplet.global_triplet_offset,
+                                           bending_off,
                                            gipc_global_triplet.block_values(),
                                            gipc_global_triplet.block_row_indices(),
                                            gipc_global_triplet.block_col_indices(),
                                            IPC_dt,
-                                           fem_global_hessian_index_offset);
+                                           fem_global_hessian_index_offset,
+                                           m_grad_stream_a);
 #endif
-        gipc_global_triplet.global_triplet_offset += tri_edge_num * 10;
-        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
+        // Stream B: triangle FEM (the largest of the three).
         calculate_triangle_fem_gradient_hessian(TetMesh.triDmInverses,
                                                 TetMesh.vertexes,
                                                 TetMesh.triangles,
@@ -10490,18 +10523,30 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                                 stretchStiff,
                                                 shearStiff,
                                                 strainRate,
-                                                gipc_global_triplet.global_triplet_offset,
+                                                triangle_off,
                                                 gipc_global_triplet.block_values(),
                                                 gipc_global_triplet.block_row_indices(),
                                                 gipc_global_triplet.block_col_indices(),
                                                 IPC_dt,
-                                                fem_global_hessian_index_offset);
+                                                fem_global_hessian_index_offset,
+                                                m_grad_stream_b);
 
-        gipc_global_triplet.global_triplet_offset += triangleNum * 6;
-
-
+        // Stream C: soft constraint (kept on default stream below since it
+        // is a member fn and re-plumbing it through is a bigger change;
+        // measured impact is small). We sync default-stream-fence below
+        // so soft constraint runs sequentially with the other streams'
+        // joins, which is fine for correctness.
+        gipc_global_triplet.global_triplet_offset = soft_off;
         computeSoftConstraintGradientAndHessian(shape_grads, fem_global_hessian_index_offset);
-        gipc_global_triplet.global_triplet_offset += softNum;
+
+        // Join the side streams back to default before any subsequent
+        // kernel reads shape_grads / triplet array (PCG SpMV in
+        // calculateMovingDirection is the next consumer).
+        cudaStreamSynchronize(m_grad_stream_a);
+        cudaStreamSynchronize(m_grad_stream_b);
+        cudaEventDestroy(fence);
+
+        gipc_global_triplet.global_triplet_offset = final_off;
 
         int fem_triplet_num = gipc_global_triplet.global_triplet_offset - fem_triplet_start;
         muda::ParallelFor()
