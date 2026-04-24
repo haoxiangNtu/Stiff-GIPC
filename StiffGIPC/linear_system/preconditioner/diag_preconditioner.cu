@@ -59,7 +59,8 @@ void DiagPreconditioner::assemble(GIPCTripletMatrix& global_triplets)
 }
 
 void DiagPreconditioner::apply(muda::CDenseVectorView<gipc::Float> r,
-                                  muda::DenseVectorView<gipc::Float>  z)
+                                  muda::DenseVectorView<gipc::Float>  z,
+                                  cudaStream_t                        stream)
 {
     //z.buffer_view().copy_from(r.buffer_view());
     details::apply_diag(r, z, m_diag3x3);

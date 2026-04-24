@@ -14,7 +14,8 @@ class DiagPreconditioner : public GlobalPreconditioner
     virtual void assemble(GIPCTripletMatrix& global_triplets) override;
 
     virtual void apply(muda::CDenseVectorView<gipc::Float> r,
-                       muda::DenseVectorView<gipc::Float>  z) override;
+                       muda::DenseVectorView<gipc::Float>  z,
+                       cudaStream_t                        stream = 0) override;
 
   private:
     muda::DeviceBuffer<gipc::Matrix3x3> m_diag3x3;

@@ -88,12 +88,13 @@ int* LocalPreconditioner::system_bcoo_cols() const
 }
 
 void LocalPreconditioner::do_apply(muda::CDenseVectorView<Float> r,
-                                   muda::DenseVectorView<Float>  z)
+                                   muda::DenseVectorView<Float>  z,
+                                   cudaStream_t                  stream)
 {
     auto dof_offset = m_subsystem->dof_offset()[0];
     auto dof_count  = m_subsystem->right_hand_side_dof();
 
-    apply(r.subview(dof_offset, dof_count), z.subview(dof_offset, dof_count));
+    apply(r.subview(dof_offset, dof_count), z.subview(dof_offset, dof_count), stream);
 }
 
 void LocalPreconditioner::do_assemble(GIPCTripletMatrix& global_triplets)
@@ -104,9 +105,10 @@ void LocalPreconditioner::do_assemble(GIPCTripletMatrix& global_triplets)
 
 
 void GlobalPreconditioner::do_apply(muda::CDenseVectorView<Float> r,
-                                    muda::DenseVectorView<Float>  z)
+                                    muda::DenseVectorView<Float>  z,
+                                    cudaStream_t                  stream)
 {
-    apply(r, z);
+    apply(r, z, stream);
 }
 
 void GlobalPreconditioner::do_assemble(GIPCTripletMatrix& global_triplets)

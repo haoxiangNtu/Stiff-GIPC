@@ -90,11 +90,12 @@ class GlobalLinearSystem
     bool build_linear_system();
     void distribute_solution();
     void apply_preconditioner(muda::DenseVectorView<Float>  z,
-                              muda::CDenseVectorView<Float> r);
+                              muda::CDenseVectorView<Float> r,
+                              cudaStream_t                  stream = 0);
 
     void convert_new();
 
-    void spmv(Float a, muda::CDenseVectorView<Float> x, Float b, muda::DenseVectorView<Float> y);
+    void spmv(Float a, muda::CDenseVectorView<Float> x, Float b, muda::DenseVectorView<Float> y, cudaStream_t stream = 0);
 
     DiagonalSubsystem& _create_subsystem(U<DiagonalSubsystem>&& subsystem);
 

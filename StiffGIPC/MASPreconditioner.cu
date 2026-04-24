@@ -2093,7 +2093,7 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
 }
 
 
-void MASPreconditioner::BuildMultiLevelR(const double3* R)
+void MASPreconditioner::BuildMultiLevelR(const double3* R, cudaStream_t stream)
 {
 
 
@@ -2103,7 +2103,7 @@ void MASPreconditioner::BuildMultiLevelR(const double3* R)
         return;
     int blockSize = DEFAULT_BLOCKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
-    __buildMultiLevelR_optimized_new<<<numBlocks, blockSize>>>(
+    __buildMultiLevelR_optimized_new<<<numBlocks, blockSize, 0, stream>>>(
         R, d_multiLevelR, d_goingNext, d_prefixOriginal, d_fineConnectMask, d_partId_map_real, levelnum, number);
 
 #else
@@ -2112,7 +2112,7 @@ void MASPreconditioner::BuildMultiLevelR(const double3* R)
         return;
     int blockSize = DEFAULT_BLOCKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
-    __buildMultiLevelR_optimized<<<numBlocks, blockSize>>>(
+    __buildMultiLevelR_optimized<<<numBlocks, blockSize, 0, stream>>>(
         R, d_multiLevelR, d_goingNext, d_fineConnectMask, levelnum, number);
 #endif
 }
@@ -2131,7 +2131,7 @@ void MASPreconditioner::SchwarzLocalXSym()
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number);
 }
 
-void MASPreconditioner::SchwarzLocalXSym_block3()
+void MASPreconditioner::SchwarzLocalXSym_block3(cudaStream_t stream)
 {
     //int matNum    = totalNumberClusters / BANKSIZE;
     int number = totalNumberClusters * BANKSIZE;
@@ -2141,7 +2141,7 @@ void MASPreconditioner::SchwarzLocalXSym_block3()
     int numBlocks = (number + blockSize - 1) / blockSize;
 
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
-    _schwarzLocalXSym6<<<numBlocks, blockSize>>>(
+    _schwarzLocalXSym6<<<numBlocks, blockSize, 0, stream>>>(
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number);
 }
 
@@ -2159,7 +2159,7 @@ void MASPreconditioner::SchwarzLocalXSym_sym()
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number);
 }
 
-void MASPreconditioner::CollectFinalZ(double3* Z)
+void MASPreconditioner::CollectFinalZ(double3* Z, cudaStream_t stream)
 {
     int number = totalNodes;
     if(number < 1)
@@ -2167,10 +2167,10 @@ void MASPreconditioner::CollectFinalZ(double3* Z)
     int blockSize = DEFAULT_BLOCKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
 #ifdef GROUP
-    __collectFinalZ_new<<<numBlocks, blockSize>>>(
+    __collectFinalZ_new<<<numBlocks, blockSize, 0, stream>>>(
         Z, d_multiLevelZ, d_coarseTable, d_real_map_partId, levelnum, number);
 #else
-    __collectFinalZ<<<numBlocks, blockSize>>>(Z, d_multiLevelZ, d_coarseTable, levelnum, number);
+    __collectFinalZ<<<numBlocks, blockSize, 0, stream>>>(Z, d_multiLevelZ, d_coarseTable, levelnum, number);
 #endif
 
 }
@@ -2218,32 +2218,20 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
 }
 
 
-void MASPreconditioner::preconditioning(const double3* R, double3* Z)
+void MASPreconditioner::preconditioning(const double3* R, double3* Z, cudaStream_t stream)
 {
     if(totalNodes < 1)
         return;
-    CUDA_SAFE_CALL(cudaMemset(d_multiLevelR + totalMapNodes,
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelR + totalMapNodes,
                               0,
-                              (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f)));
+                              (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f),
+                              stream));
 
-    CUDA_SAFE_CALL(cudaMemset(d_multiLevelZ, 0, (totalNumberClusters) * sizeof(Precision_T3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelZ, 0, (totalNumberClusters) * sizeof(Precision_T3), stream));
 
-    //cudaEvent_t start, end0, end1, end2;
-    //cudaEventCreate(&start);
-    //cudaEventCreate(&end0);
-    //cudaEventCreate(&end1);
-    //cudaEventCreate(&end2);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    //cudaEventRecord(start);
-    BuildMultiLevelR(R);
-    //cudaEventRecord(end0);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-    SchwarzLocalXSym_block3();
-    //cudaEventRecord(end1);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-    CollectFinalZ(Z);
+    BuildMultiLevelR(R, stream);
+    SchwarzLocalXSym_block3(stream);
+    CollectFinalZ(Z, stream);
     //cudaEventRecord(end2);
 
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());

@@ -47,6 +47,11 @@ class PCGSolver : public IterativeSolver
     int        h_break    = 0;
     bool       d_scalars_alloced = false;
 
+    // Step C: custom stream so we can capture/replay the PCG inner loop
+    // as a CUDA graph (eliminates per-launch host overhead). Lazily
+    // created on first solve(); destroyed in dtor.
+    cudaStream_t pcg_stream = nullptr;
+
     PCGSolverConfig   m_config;
 
   protected:

@@ -154,18 +154,19 @@ Json GlobalLinearSystem::as_json() const
 }
 
 void GlobalLinearSystem::apply_preconditioner(muda::DenseVectorView<Float>  z,
-                                              muda::CDenseVectorView<Float> r)
+                                              muda::CDenseVectorView<Float> r,
+                                              cudaStream_t                  stream)
 {
     // first apply global preconditioner
     if(m_global_preconditioner)
-        m_global_preconditioner->do_apply(r, z);
+        m_global_preconditioner->do_apply(r, z, stream);
     else  // if no global preconditioner, use identity
         z.buffer_view().copy_from(r.buffer_view());
 
     // then apply local preconditioners
     // it's user's choice to rewrite or reuse the global preconditioner
     for(auto& p : m_local_preconditioners)
-        p->do_apply(r, z);
+        p->do_apply(r, z, stream);
 }
 
 
@@ -186,7 +187,8 @@ void GlobalLinearSystem::convert_new()
 void GlobalLinearSystem::spmv(Float                         a,
                               muda::CDenseVectorView<Float> x,
                               Float                         b,
-                              muda::DenseVectorView<Float>  y)
+                              muda::DenseVectorView<Float>  y,
+                              cudaStream_t                  stream)
 {
 
     m_spmv.warp_reduce_sym_spmv(a,
@@ -196,6 +198,7 @@ void GlobalLinearSystem::spmv(Float                         a,
                                 gipc_global_triplet->h_unique_key_number,
                                 x,
                                 b,
-                                y);
+                                y,
+                                stream);
 }
 }  // namespace gipc

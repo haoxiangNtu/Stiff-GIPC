@@ -16,6 +16,7 @@ class Spmv
                               int                           triplet_count,
                               muda::CDenseVectorView<Float> x,
                               Float                         b,
-                              muda::DenseVectorView<Float>  y);
+                              muda::DenseVectorView<Float>  y,
+                              cudaStream_t                  stream = 0);
 };
 }  // namespace gipc

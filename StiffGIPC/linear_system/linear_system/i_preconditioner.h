@@ -35,7 +35,8 @@ class IPreconditioner
     void system(GlobalLinearSystem& system) { m_system = &system; }
 
     virtual void do_apply(muda::CDenseVectorView<Float> r,
-                          muda::DenseVectorView<Float>  z) = 0;
+                          muda::DenseVectorView<Float>  z,
+                          cudaStream_t                  stream = 0) = 0;
 
     //virtual void do_assemble(muda::CBCOOMatrixView<Float, 3> hessian) = 0;
     virtual void do_assemble(GIPCTripletMatrix& global_triplets)      = 0;
@@ -58,10 +59,10 @@ class LocalPreconditioner : public IPreconditioner
     int                             preconditioner_id;
   protected:
     virtual void assemble(){};
-    virtual void apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z) = 0;
+    virtual void apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z, cudaStream_t stream = 0) = 0;
 
   private:
-    void do_apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z) override;
+    void do_apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z, cudaStream_t stream = 0) override;
     void do_assemble(GIPCTripletMatrix& global_triplets) override;
     mutable muda::DeviceBuffer<int> m_indices_input;
     mutable muda::DeviceBuffer<int> m_flags;
@@ -88,10 +89,10 @@ class GlobalPreconditioner : public IPreconditioner
   protected:
     //virtual void assemble(muda::CBCOOMatrixView<Float, 3> hessian) = 0;
     virtual void assemble(GIPCTripletMatrix& global_triplets)      = 0;
-    virtual void apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z) = 0;
+    virtual void apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z, cudaStream_t stream = 0) = 0;
 
   private:
-    void do_apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z) override;
+    void do_apply(muda::CDenseVectorView<Float> r, muda::DenseVectorView<Float> z, cudaStream_t stream = 0) override;
 
     //virtual void do_assemble(muda::CBCOOMatrixView<Float, 3> hessian) override;
     virtual void do_assemble(GIPCTripletMatrix& global_triplets) override;

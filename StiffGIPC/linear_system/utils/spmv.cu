@@ -12,7 +12,8 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                                 int                           triplet_count,
                                 muda::CDenseVectorView<Float> x,
                                 Float                         b,
-                                muda::DenseVectorView<Float>  y)
+                                muda::DenseVectorView<Float>  y,
+                                cudaStream_t                  stream)
 
 {
     using namespace muda;
@@ -21,7 +22,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
 
     if(b != 0)
     {
-        muda::ParallelFor()
+        muda::ParallelFor(256, 0, stream)
             .kernel_name(__FUNCTION__)
             .apply(y.size(),
                    [b = b, y = y.viewer().name("y")] __device__(int i) mutable
@@ -29,7 +30,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
     }
     else
     {
-        muda::BufferLaunch().fill<Float>(y.buffer_view(), 0);
+        muda::BufferLaunch(stream).fill<Float>(y.buffer_view(), 0);
     }
 
     constexpr int          warp_size = 32;
@@ -37,7 +38,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
     constexpr int          block_dim = 256;
     int block_count = (triplet_count + block_dim - 1) / block_dim;
 
-    muda::Launch(block_count, block_dim)
+    muda::Launch(block_count, block_dim, 0, stream)
         .kernel_name(__FUNCTION__)
         .apply(
             [a     = a,

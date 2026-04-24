@@ -93,3 +93,15 @@ void LaunchCudaKernal_default(int total, int bs, size_t mem, void (*f)(Arguments
         exit(0);
     }
 }
+
+// Step C: stream-aware variant. Skips the post-launch cudaGetLastError
+// check since that triggers a host sync and breaks graph capture.
+template <typename... Arguments>
+void LaunchCudaKernal_default_stream(int total, int bs, size_t mem, cudaStream_t stream,
+                                     void (*f)(Arguments...), Arguments... args)
+{
+    int gs = (total + bs - 1) / bs;
+    if(gs < 1)
+        return;
+    f<<<gs, bs, mem, stream>>>(args...);
+}

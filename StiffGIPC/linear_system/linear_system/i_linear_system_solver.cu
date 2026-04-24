@@ -8,15 +8,17 @@ IterativeSolver::~IterativeSolver() {}
 void IterativeSolver::spmv(Float                         a,
                            muda::CDenseVectorView<Float> x,
                            Float                         b,
-                           muda::DenseVectorView<Float>  y)
+                           muda::DenseVectorView<Float>  y,
+                           cudaStream_t                  stream)
 {
-    m_system->spmv(a, x, b, y);
+    m_system->spmv(a, x, b, y, stream);
 }
 
 void IterativeSolver::apply_preconditioner(muda::DenseVectorView<Float> z,
-                                           muda::CDenseVectorView<Float> r) const
+                                           muda::CDenseVectorView<Float> r,
+                                           cudaStream_t                  stream) const
 {
-    m_system->apply_preconditioner(z, r);
+    m_system->apply_preconditioner(z, r, stream);
 }
 
 

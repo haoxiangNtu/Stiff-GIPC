@@ -43,14 +43,15 @@ class IterativeSolver
     virtual SizeT solve(muda::DenseVectorView<Float>  x,
                         muda::CDenseVectorView<Float> b) = 0;
 
-    void spmv(Float a, muda::CDenseVectorView<Float> x, Float b, muda::DenseVectorView<Float> y);
-    void spmv(muda::CDenseVectorView<Float> x, muda::DenseVectorView<Float> y)
+    void spmv(Float a, muda::CDenseVectorView<Float> x, Float b, muda::DenseVectorView<Float> y, cudaStream_t stream = 0);
+    void spmv(muda::CDenseVectorView<Float> x, muda::DenseVectorView<Float> y, cudaStream_t stream = 0)
     {
-        spmv(1.0, x, 0.0, y);
+        spmv(1.0, x, 0.0, y, stream);
     }
 
     void apply_preconditioner(muda::DenseVectorView<Float>  z,
-                              muda::CDenseVectorView<Float> r) const;
+                              muda::CDenseVectorView<Float> r,
+                              cudaStream_t                  stream = 0) const;
 
     muda::LinearSystemContext& ctx() const;
 

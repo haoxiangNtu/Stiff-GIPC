@@ -31,8 +31,9 @@ void MAS_Preconditioner::assemble()
 }
 
 void MAS_Preconditioner::apply(muda::CDenseVectorView<Float> r,
-                              muda::DenseVectorView<Float>  z)
+                              muda::DenseVectorView<Float>  z,
+                              cudaStream_t                  stream)
 {
-    MAS_Prec.preconditioning((double3*)r.data(), (double3*)z.data());
+    MAS_Prec.preconditioning((double3*)r.data(), (double3*)z.data(), stream);
 }
 }  // namespace gipc

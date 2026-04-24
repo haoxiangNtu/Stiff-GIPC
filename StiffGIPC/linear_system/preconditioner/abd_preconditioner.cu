@@ -18,14 +18,15 @@ void ABDPreconditioner::assemble()
 }
 
 void ABDPreconditioner::apply(muda::CDenseVectorView<Float> r,
-                              muda::DenseVectorView<Float>  z)
+                              muda::DenseVectorView<Float>  z,
+                              cudaStream_t                  stream)
 {
     using namespace muda;
 
     auto abd_body_count = m_sim_data.abd_fem_count_info().abd_body_num;
     auto abd_inv_diag   = m_abd.abd_system_diag_preconditioner.view();
 
-    ParallelFor()
+    ParallelFor(256, 0, stream)
         .kernel_name(__FUNCTION__)
         .apply(abd_body_count,
                [r = r.viewer().name("r"),
