@@ -2,6 +2,9 @@
 #include <gipc/utils/timer.h>
 #include <gipc/statistics.h>
 #include <cuda_tools/cuda_tools.h>
+#include <cub/device/device_reduce.cuh>
+#include <cub/iterator/transform_input_iterator.cuh>
+#include <cub/iterator/counting_input_iterator.cuh>
 
 
 
@@ -141,6 +144,53 @@ __global__ void update_vector_c_dev(
     c[idx] = s[idx] + (*d_beta) * c[idx];
 }
 
+// === Step E: fused PCG kernels ===
+// Each thread re-derives alpha = *d_rz / *d_dot_res. Saves 1 launch per
+// PCG iter (the separate compute_alpha_kernel<<<1,1>>>). Cost: every
+// thread does the divide instead of just one — negligible for 25K-thread
+// kernels (one div is ~30ns on Ada FP64; launch overhead is ~500ns).
+// Soundness: if dot_res <= 0 || !isfinite, thread 0 sets d_break (same
+// guard the original compute_alpha_kernel had); axpy still runs with
+// alpha = inf/nan but won't propagate further because d_break causes the
+// host-side break check to fire on next K-stride sync.
+__global__ void update_vector_dx_r_fused(
+    double* dx, double* r, const double* c, const double* q,
+    const double* d_rz, const double* d_dot_res, int* d_break, int numbers)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= numbers) return;
+    double dot = *d_dot_res;
+    if(idx == 0 && (!isfinite(dot) || dot <= 0.0))
+        *d_break = 1;
+    double a = (*d_rz) / dot;  // each thread re-derives
+    dx[idx] = dx[idx] + a * c[idx];
+    r[idx]  = r[idx] - a * q[idx];
+}
+
+// Same trick for beta + axpy on p. Swap (d_rz = d_rz_new) and convergence
+// check are deferred to a tiny <<<1,1>>> post kernel below.
+__global__ void update_vector_c_fused(
+    double* c, const double* s, const double* d_rz_new, const double* d_rz_old, int numbers)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= numbers) return;
+    double b = (*d_rz_new) / (*d_rz_old);
+    c[idx] = s[idx] + b * c[idx];
+}
+
+// Combines the swap (d_rz = d_rz_new) with the convergence check into one
+// <<<1,1>>> kernel. Replaces the separate compute_beta_and_swap_kernel +
+// check_convergence_kernel pair (saves 1 launch per iter).
+__global__ void post_iter_swap_and_check(
+    double* d_rz, const double* d_rz_new, const double* d_rz0,
+    double tol_rate, int* d_break)
+{
+    double new_v = *d_rz_new;
+    *d_rz = new_v;
+    if(fabs(new_v) <= tol_rate * (*d_rz0))
+        *d_break = 1;
+}
+
 // alpha = rz / dot_res; if dot_res <= 0 or non-finite, set break flag.
 __global__ void compute_alpha_kernel(const double* d_rz,
                                      const double* d_dot_res,
@@ -211,6 +261,42 @@ double My_PCG_General_v_v_Reduction_Algorithm(double* temp, double* A, double* B
     return result;
 }
 
+// === Step E: cub-based fused dot product ===
+// Uses cub::DeviceReduce::Sum + a TransformInputIterator that fuses the
+// elementwise multiply (a[i] * b[i]) with the tree reduction, into a
+// single kernel launch (instead of the 2-3 launches of the manual
+// PCG_vdv_Reduction + add_reduction loop).
+struct DotProductOp
+{
+    const double* a;
+    const double* b;
+    __host__ __device__ __forceinline__
+    double operator()(int i) const { return a[i] * b[i]; }
+};
+
+// Cached cub temp storage (lives in PCGSolver, passed in by ref).
+void Cub_PCG_DotReduction(double* A, double* B, int n, double* d_out,
+                          void** cub_temp_ptr, size_t* cub_temp_bytes)
+{
+    if(n < 1) {
+        cudaMemset(d_out, 0, sizeof(double));
+        return;
+    }
+
+    cub::CountingInputIterator<int>                       counter(0);
+    cub::TransformInputIterator<double, DotProductOp,
+                                cub::CountingInputIterator<int>> input(
+        counter, DotProductOp{A, B});
+
+    // Query temp size on first call; alloc lazily.
+    if(*cub_temp_ptr == nullptr)
+    {
+        cub::DeviceReduce::Sum(nullptr, *cub_temp_bytes, input, d_out, n);
+        cudaMalloc(cub_temp_ptr, *cub_temp_bytes);
+    }
+    cub::DeviceReduce::Sum(*cub_temp_ptr, *cub_temp_bytes, input, d_out, n);
+}
+
 // Device-output variant: leaves the reduced scalar in *d_out (which can be
 // `temp` itself or any device address). Skips the final cudaMemcpy/D2H.
 void My_PCG_General_v_v_Reduction_DeviceOut(double* temp, double* A, double* B,
@@ -263,6 +349,7 @@ PCGSolver::~PCGSolver()
         cudaFree(d_beta);
         cudaFree(d_break);
     }
+    if(cub_temp_ptr) cudaFree(cub_temp_ptr);
 }
 
 SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b)
@@ -305,99 +392,83 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         apply_preconditioner(z, r);
     }
 
-    // Initial rz = dot(r, z), reduced into d_rz on device.
-    My_PCG_General_v_v_Reduction_DeviceOut(p.buffer_view().data(),
-                                           r.buffer_view().data(),
-                                           z.buffer_view().data(),
-                                           z.size(),
-                                           d_rz);
-    // d_rz0 = d_rz
+    // Step E: cub-based fused dot for initial rz = dot(r, z).
+    Cub_PCG_DotReduction(r.buffer_view().data(),
+                         z.buffer_view().data(),
+                         z.size(),
+                         d_rz,
+                         &cub_temp_ptr, &cub_temp_bytes);
     copy_scalar_kernel<<<1, 1>>>(d_rz0, d_rz);
     cudaMemsetAsync(d_break, 0, sizeof(int));
 
     p = z;
 
-    // Convergence-flag check stride: K=8 means D2H once per 8 iters.
-    // Was 2 D2H per iter for alpha/beta scalars; now 1 D2H per K iters.
     const SizeT K = 8;
 
     for(k = 1; k < max_iter; ++k)
     {
-        {
-            //Timer timer{"spmv"};
-            // Ap = A * p
-            spmv(p.cview(), Ap.view());
-        }
+        // Ap = A * p
+        spmv(p.cview(), Ap.view());
 
-        {
-            //Timer timer{"dot"};
+        // Step E: cub fused dot(p, Ap) -> d_dot_res (1 launch instead of 2-3).
+        Cub_PCG_DotReduction(p.buffer_view().data(),
+                             Ap.buffer_view().data(),
+                             z.size(),
+                             d_dot_res,
+                             &cub_temp_ptr, &cub_temp_bytes);
 
-            // dot(p, Ap) -> d_dot_res (no D2H here)
-            My_PCG_General_v_v_Reduction_DeviceOut(z.buffer_view().data(),
-                                                   p.buffer_view().data(),
-                                                   Ap.buffer_view().data(),
-                                                   z.size(),
-                                                   d_dot_res);
+        // Step E: fused axpy that re-derives alpha = *d_rz / *d_dot_res
+        // per-thread (saves the separate compute_alpha_kernel<<<1,1>>>).
+        // Same dot_res<=0 || !isfinite guard sets d_break (thread 0).
+        LaunchCudaKernal_default(z.size(),
+                                 256,
+                                 0,
+                                 update_vector_dx_r_fused,
+                                 x.buffer_view().data(),
+                                 r.buffer_view().data(),
+                                 (const double*)p.buffer_view().data(),
+                                 (const double*)Ap.buffer_view().data(),
+                                 (const double*)d_rz,
+                                 (const double*)d_dot_res,
+                                 d_break,
+                                 (int)z.size());
 
-            // alpha = rz / dot_res; sets d_break if non-finite or <= 0.
-            // Same soundness invariant as the original host-side check
-            // (rz/0 NaN guard + PD A => p^T A p > 0 unless converged).
-            compute_alpha_kernel<<<1, 1>>>(d_rz, d_dot_res, d_alpha, d_break);
-        }
+        // Convergence check on rz (still the old rz at this point) is
+        // deferred to post_iter_swap_and_check below — saves one launch
+        // by combining swap+check.
 
-        {
-            //Timer timer{"axpby"};
-            LaunchCudaKernal_default(z.size(),
-                                     256,
-                                     0,
-                                     update_vector_dx_r_dev,
-                                     x.buffer_view().data(),
-                                     r.buffer_view().data(),
-                                     (const double*)p.buffer_view().data(),
-                                     (const double*)Ap.buffer_view().data(),
-                                     (const double*)d_alpha,
-                                     (int)z.size());
-        }
-
-        // Convergence check on rz (still the old rz at this point, same as
-        // the original host-side check): |rz| <= tol * rz0  -> set d_break.
-        check_convergence_kernel<<<1, 1>>>(d_rz, d_rz0, m_config.global_tol_rate, d_break);
-
-        // Stride: only D2H the break flag every K iters. Up to K-1 extra
-        // iters past convergence in the worst case, but each is ~25 us so
-        // <0.2 ms/frame penalty (vs ~0.7 ms/frame saved on D2H stalls).
         if(k % K == 0)
         {
             cudaMemcpy(&h_break, d_break, sizeof(int), cudaMemcpyDeviceToHost);
             if(h_break) break;
         }
 
-        {
-            //Timer timer{"preconditioner"};
-            apply_preconditioner(z, r);
-        }
+        apply_preconditioner(z, r);
 
-        // dot(r, z) -> d_rz_new
-        My_PCG_General_v_v_Reduction_DeviceOut(Ap.buffer_view().data(),
-                                               r.buffer_view().data(),
-                                               z.buffer_view().data(),
-                                               z.size(),
-                                               d_rz_new);
+        // Step E: cub fused dot(r, z) -> d_rz_new.
+        Cub_PCG_DotReduction(r.buffer_view().data(),
+                             z.buffer_view().data(),
+                             z.size(),
+                             d_rz_new,
+                             &cub_temp_ptr, &cub_temp_bytes);
 
-        // beta = rz_new / rz, then rz <- rz_new
-        compute_beta_and_swap_kernel<<<1, 1>>>(d_rz, d_rz_new, d_beta);
+        // Step E: fused axpy on p that re-derives beta = *d_rz_new / *d_rz
+        // per-thread (saves the compute_beta side; swap is handled below).
+        LaunchCudaKernal_default(z.size(),
+                                 256,
+                                 0,
+                                 update_vector_c_fused,
+                                 p.buffer_view().data(),
+                                 (const double*)z.buffer_view().data(),
+                                 (const double*)d_rz_new,
+                                 (const double*)d_rz,
+                                 (int)z.size());
 
-        {
-            //Timer timer{"axpby"};
-            LaunchCudaKernal_default(z.size(),
-                                     256,
-                                     0,
-                                     update_vector_c_dev,
-                                     p.buffer_view().data(),
-                                     (const double*)z.buffer_view().data(),
-                                     (const double*)d_beta,
-                                     (int)z.size());
-        }
+        // Step E: combined swap (d_rz = d_rz_new) + convergence check.
+        // Replaces compute_beta_and_swap_kernel + check_convergence_kernel
+        // pair (saves 1 launch per iter).
+        post_iter_swap_and_check<<<1, 1>>>(d_rz, d_rz_new, d_rz0,
+                                           m_config.global_tol_rate, d_break);
     }
 
     // Final sync of break flag (in case loop exited on max_iter).

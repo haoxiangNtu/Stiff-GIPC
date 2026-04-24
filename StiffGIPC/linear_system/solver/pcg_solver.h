@@ -47,6 +47,10 @@ class PCGSolver : public IterativeSolver
     int        h_break    = 0;
     bool       d_scalars_alloced = false;
 
+    // Step E: cub::DeviceReduce temp storage (alloc'd lazily on first dot).
+    void*      cub_temp_ptr   = nullptr;
+    size_t     cub_temp_bytes = 0;
+
     PCGSolverConfig   m_config;
 
   protected:
