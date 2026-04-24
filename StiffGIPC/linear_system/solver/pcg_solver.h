@@ -21,7 +21,7 @@ class PCGSolver : public IterativeSolver
 
   public:
     PCGSolver(const PCGSolverConfig& cfg);
-    virtual ~PCGSolver() = default;
+    virtual ~PCGSolver();
 
     void config(const PCGSolverConfig& config) { this->m_config = config; }
     const auto& config() const { return this->m_config; }
@@ -32,6 +32,21 @@ class PCGSolver : public IterativeSolver
     DeviceDenseVector r;   // residual
     DeviceDenseVector p;   // search direction
     DeviceDenseVector Ap;  // A*p
+
+    // Device-side scalars to keep alpha/beta/rz/dot_res off the host hot path.
+    // Each PCG iter previously synced to host twice (one cudaMemcpy per dot
+    // product); with these on device, host only syncs every K iters to read
+    // the convergence flag.
+    Float*     d_rz       = nullptr;
+    Float*     d_rz0      = nullptr;
+    Float*     d_rz_new   = nullptr;
+    Float*     d_dot_res  = nullptr;
+    Float*     d_alpha    = nullptr;
+    Float*     d_beta     = nullptr;
+    int*       d_break    = nullptr;
+    int        h_break    = 0;
+    bool       d_scalars_alloced = false;
+
     PCGSolverConfig   m_config;
 
   protected:
