@@ -160,9 +160,16 @@ __global__ void update_vector_dx_r_fused(
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= numbers) return;
     double dot = *d_dot_res;
-    if(idx == 0 && (!isfinite(dot) || dot <= 0.0))
-        *d_break = 1;
-    double a = (*d_rz) / dot;  // each thread re-derives
+    // Soundness: same exit criteria as original compute_alpha_kernel —
+    // dot_res<=0 or non-finite means PCG has effectively converged (PD A
+    // implies p^T A p > 0 unless p = 0). Set break flag and SKIP axpy
+    // on every thread (otherwise alpha=inf/nan would propagate into x/r).
+    if(!isfinite(dot) || dot <= 0.0)
+    {
+        if(idx == 0) *d_break = 1;
+        return;
+    }
+    double a = (*d_rz) / dot;
     dx[idx] = dx[idx] + a * c[idx];
     r[idx]  = r[idx] - a * q[idx];
 }
@@ -174,7 +181,13 @@ __global__ void update_vector_c_fused(
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= numbers) return;
-    double b = (*d_rz_new) / (*d_rz_old);
+    double rz_old = *d_rz_old;
+    // Soundness: rz_old should be > 0 in a healthy PCG (it's |r|_M from
+    // previous iter). If it's 0/non-finite, original compute_beta_and_swap
+    // would have produced inf and propagated. Skip axpy under the same
+    // condition the original would have failed on.
+    if(!isfinite(rz_old) || rz_old == 0.0) return;
+    double b = (*d_rz_new) / rz_old;
     c[idx] = s[idx] + b * c[idx];
 }
 
