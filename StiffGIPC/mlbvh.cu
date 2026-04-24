@@ -1915,7 +1915,8 @@ void selfQuery_ee(const int*     _bodyID,
                   double         dHat,
                   int            number,
                   const int*     _collision_skip_matrix,
-                  int            _collision_body_count)
+                  int            _collision_body_count,
+                  cudaStream_t   stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
@@ -1923,7 +1924,7 @@ void selfQuery_ee(const int*     _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_ee<<<blockNum, threadNum>>>(_bodyID,
+    _selfQuery_ee<<<blockNum, threadNum, 0, stream>>>(_bodyID,
                                            _btype,
                                            _vertexes,
                                            _rest_vertexes,
@@ -1953,7 +1954,8 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
                          double         dHat,
                          int            number,
                          const int*     _collision_skip_matrix,
-                         int            _collision_body_count)
+                         int            _collision_body_count,
+                         cudaStream_t   stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
@@ -1961,7 +1963,7 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_ee_ccd<<<blockNum, threadNum>>>(
+    _selfQuery_ee_ccd<<<blockNum, threadNum, 0, stream>>>(
         _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
         _collision_skip_matrix, _collision_body_count);
 }
@@ -1980,7 +1982,8 @@ void selfQuery_vf(const int*      _bodyID,
                   double          dHat,
                   int             number,
                   const int*      _collision_skip_matrix,
-                  int             _collision_body_count)
+                  int             _collision_body_count,
+                  cudaStream_t    stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
@@ -1988,7 +1991,7 @@ void selfQuery_vf(const int*      _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_vf<<<blockNum, threadNum>>>(_bodyID,
+    _selfQuery_vf<<<blockNum, threadNum, 0, stream>>>(_bodyID,
                                            _btype,
                                            _vertexes,
                                            _faces,
@@ -2019,7 +2022,8 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
                          double          dHat,
                          int             number,
                          const int*      _collision_skip_matrix,
-                         int             _collision_body_count)
+                         int             _collision_body_count,
+                         cudaStream_t    stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
@@ -2027,7 +2031,7 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_vf_ccd<<<blockNum, threadNum>>>(
+    _selfQuery_vf_ccd<<<blockNum, threadNum, 0, stream>>>(
         _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
         _collision_skip_matrix, _collision_body_count);
 }
@@ -2236,7 +2240,7 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha)
 }
 
 
-void lbvh_f::SelfCollitionDetect(double dHat)
+void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
 {
 
     selfQuery_vf(_bodyId,
@@ -2253,10 +2257,11 @@ void lbvh_f::SelfCollitionDetect(double dHat)
                  dHat,
                  vert_number,
                  _collision_skip_matrix,
-                 _collision_body_count);
+                 _collision_body_count,
+                 stream);
 }
 
-void lbvh_e::SelfCollitionDetect(double dHat)
+void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
 {
 
     selfQuery_ee(_bodyId,
@@ -2273,23 +2278,24 @@ void lbvh_e::SelfCollitionDetect(double dHat)
                  dHat,
                  edge_number,
                  _collision_skip_matrix,
-                 _collision_body_count);
+                 _collision_body_count,
+                 stream);
 }
 
-void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha)
+void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream)
 {
 
     fullCCDselfQuery_vf(
         _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
-        _collision_skip_matrix, _collision_body_count);
+        _collision_skip_matrix, _collision_body_count, stream);
 }
 
-void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha)
+void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream)
 {
 
     fullCCDselfQuery_ee(
         _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, edge_number,
-        _collision_skip_matrix, _collision_body_count);
+        _collision_skip_matrix, _collision_body_count, stream);
 }
 
 
