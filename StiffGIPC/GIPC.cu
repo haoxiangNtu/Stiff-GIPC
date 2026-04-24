@@ -8785,6 +8785,11 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
 GIPC::~GIPC()
 {
+    if(m_aux_stream)
+    {
+        cudaStreamDestroy(m_aux_stream);
+        m_aux_stream = nullptr;
+    }
     FREE_DEVICE_MEM();
 }
 
@@ -9228,21 +9233,30 @@ void GIPC::buildCP()
         return;
     }
 
-    CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMemset(_gpNum, 0, sizeof(uint32_t)));
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    //bvh_f.Construct();
+    if(!m_aux_stream)
+        cudaStreamCreate(&m_aux_stream);
+
+    // Memsets on default stream. Use an event so aux stream observes them
+    // before its kernel reads/atomicAdds _cpNum.
+    CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
+    cudaEvent_t reset_evt;
+    cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
+    cudaEventRecord(reset_evt, 0);
+    cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
+
+    // bvh_f on default stream, bvh_e on aux stream -> overlap.
+    // Both atomicAdd into _cpNum & _collisionPair; CUDA atomics handle
+    // cross-stream contention correctly. Pair-set order doesn't matter
+    // to consumers (they iterate 0..h_cpNum[0]).
     bvh_f.SelfCollitionDetect(dHat);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    //bvh_e.Construct();
-    bvh_e.SelfCollitionDetect(dHat);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
     GroundCollisionDetect();
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+    cudaEventDestroy(reset_evt);
+
     CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(&h_gpNum, _gpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    /*CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMemset(_gpNum, 0, sizeof(uint32_t)));*/
 }
 
 void GIPC::buildFullCP(const double& alpha)
@@ -9253,10 +9267,21 @@ void GIPC::buildFullCP(const double& alpha)
         return;
     }
 
-    CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, sizeof(uint32_t)));
+    if(!m_aux_stream)
+        cudaStreamCreate(&m_aux_stream);
 
+    CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
+    cudaEvent_t reset_evt;
+    cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
+    cudaEventRecord(reset_evt, 0);
+    cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
+
+    // Same overlap pattern as buildCP.
     bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
-    bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha);
+    bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, m_aux_stream);
+    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+    cudaEventDestroy(reset_evt);
+
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 }
 

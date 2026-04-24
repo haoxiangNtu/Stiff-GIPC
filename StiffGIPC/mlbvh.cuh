@@ -93,8 +93,8 @@ class lbvh_f : public lbvh
     double Construct();
     AABB*  getSceneSize();
     double ConstructFullCCD(const double3* moveDir, const double& alpha);
-    void   SelfCollitionDetect(double dHat);
-    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha);
+    void   SelfCollitionDetect(double dHat, cudaStream_t stream = 0);
+    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream = 0);
 };
 
 class lbvh_e : public lbvh
@@ -120,8 +120,8 @@ class lbvh_e : public lbvh
                 int        collision_body_count  = 0);
     double Construct();
     double ConstructFullCCD(const double3* moveDir, const double& alpha);
-    void   SelfCollitionDetect(double dHat);
-    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha);
+    void   SelfCollitionDetect(double dHat, cudaStream_t stream = 0);
+    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream = 0);
 };
 
 __device__ void _d_PP(const double3& v0, const double3& v1, double& d);

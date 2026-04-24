@@ -161,6 +161,10 @@ class GIPC
     int* _ground_skip_body  = nullptr;
     int  _ground_body_count = 0;
 
+    // Auxiliary stream for overlapping bvh_e collision detection with
+    // bvh_f (default stream). Created lazily; destroyed in dtor.
+    cudaStream_t m_aux_stream = nullptr;
+
   public:
     GIPC();
     ~GIPC();
