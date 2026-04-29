@@ -17,17 +17,26 @@ namespace gipc
 /// Compute the enclosed volume of a closed triangle mesh using the
 /// scalar-triple-product formula (Divergence theorem):
 ///   V = (1/6) * sum_i  p0_i . (p1_i x p2_i)
+///
+/// Optional `orient` (libuipc-style): per-triangle in {-1, 0, +1}.
+/// Negative values flip the contribution sign, equivalent to swapping
+/// two of the triangle's vertices but without mutating topology. Pass
+/// nullptr or empty vector to use face winding as-is.
 inline double compute_trimesh_volume(
     const std::vector<Eigen::Vector3d>& vertices,
-    const std::vector<Eigen::Vector3i>& triangles)
+    const std::vector<Eigen::Vector3i>& triangles,
+    const std::vector<int>*             orient = nullptr)
 {
+    const bool has_orient = orient && orient->size() == triangles.size();
     double volume = 0.0;
-    for(auto& tri : triangles)
+    for(size_t i = 0; i < triangles.size(); i++)
     {
-        const auto& p0 = vertices[tri[0]];
-        const auto& p1 = vertices[tri[1]];
-        const auto& p2 = vertices[tri[2]];
-        volume += p0.cross(p1).dot(p2) / 6.0;
+        const auto& tri = triangles[i];
+        const auto& p0  = vertices[tri[0]];
+        const auto& p1  = vertices[tri[1]];
+        const auto& p2  = vertices[tri[2]];
+        const double s  = (has_orient && (*orient)[i] < 0) ? -1.0 : 1.0;
+        volume += s * p0.cross(p1).dot(p2) / 6.0;
     }
     return volume;
 }
@@ -47,19 +56,24 @@ inline void compute_trimesh_dyadic_mass(
     double                              density,
     double&                             out_m,
     Eigen::Vector3d&                    out_m_x_bar,
-    Eigen::Matrix3d&                    out_m_x_bar_x_bar)
+    Eigen::Matrix3d&                    out_m_x_bar_x_bar,
+    const std::vector<int>*             orient = nullptr)
 {
     out_m = 0.0;
     out_m_x_bar.setZero();
     out_m_x_bar_x_bar.setZero();
 
-    for(auto& tri : triangles)
+    const bool has_orient = orient && orient->size() == triangles.size();
+    for(size_t i = 0; i < triangles.size(); i++)
     {
-        const auto& p0 = vertices[tri[0]];
-        const auto& p1 = vertices[tri[1]];
-        const auto& p2 = vertices[tri[2]];
+        const auto& tri = triangles[i];
+        const auto& p0  = vertices[tri[0]];
+        const auto& p1  = vertices[tri[1]];
+        const auto& p2  = vertices[tri[2]];
 
         Eigen::Vector3d N = (p1 - p0).cross(p2 - p0);
+        if(has_orient && (*orient)[i] < 0)
+            N = -N;  // libuipc-style: flip integration sign without mutating topology
 
         // Mass: m += rho * p0 . N / 6
         out_m += density * p0.dot(N) / 6.0;
@@ -156,17 +170,22 @@ inline void compute_trimesh_dyadic_mass(
 inline Vector12 compute_trimesh_body_force(
     const std::vector<Eigen::Vector3d>& vertices,
     const std::vector<Eigen::Vector3i>& triangles,
-    const Eigen::Vector3d&              gravity)
+    const Eigen::Vector3d&              gravity,
+    const std::vector<int>*             orient = nullptr)
 {
     Vector12 body_force = Vector12::Zero();
 
-    for(auto& tri : triangles)
+    const bool has_orient = orient && orient->size() == triangles.size();
+    for(size_t i = 0; i < triangles.size(); i++)
     {
-        const auto& p0 = vertices[tri[0]];
-        const auto& p1 = vertices[tri[1]];
-        const auto& p2 = vertices[tri[2]];
+        const auto& tri = triangles[i];
+        const auto& p0  = vertices[tri[0]];
+        const auto& p1  = vertices[tri[1]];
+        const auto& p2  = vertices[tri[2]];
 
         Eigen::Vector3d N = (p1 - p0).cross(p2 - p0);
+        if(has_orient && (*orient)[i] < 0)
+            N = -N;
         double V = p0.dot(N) / 6.0;
 
         auto Q_p = [&](int a) -> double

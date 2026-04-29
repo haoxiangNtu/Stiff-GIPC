@@ -53,6 +53,7 @@ void GIPC::setup_surface_mesh_bodies(tetrahedra_obj& tetMesh)
         gipc::ABDSurfaceMeshBody body;
         body.vertices  = smb.vertices;
         body.triangles = smb.triangles;
+        body.orient    = smb.orient;     // copy per-face orient labels (may be empty)
         body.body_id   = smb.body_id;
 
         // Find vertex range for this body in the ABD unique-point space
