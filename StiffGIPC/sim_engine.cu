@@ -170,6 +170,15 @@ void SimEngine::load_urdf(const std::string&     urdf_path,
         if(body_start[b] < 0) body_start[b] = i;
         body_end[b] = i + 1;
     }
+    // Map body_id -> URDF link name (importer already parsed these; without
+    // this, every body would just record the URDF file path as label and
+    // become indistinguishable downstream).
+    std::vector<std::string> body_link_name(new_abd);
+    for(const auto& [link_name, link_info] : urdf_importer.link_infos())
+    {
+        if(link_info.body_id >= 0 && link_info.body_id < new_abd)
+            body_link_name[link_info.body_id] = link_name;
+    }
     for(int b = prev_abd; b < new_abd; b++)
     {
         BodyLoadRecord rec;
@@ -177,7 +186,7 @@ void SimEngine::load_urdf(const std::string&     urdf_path,
         rec.body_offset   = b;
         rec.vertex_offset = body_start[b] >= 0 ? body_start[b] : prev_verts;
         rec.vertex_count  = body_start[b] >= 0 ? (body_end[b] - body_start[b]) : 0;
-        rec.label         = urdf_path;
+        rec.label         = body_link_name[b].empty() ? urdf_path : body_link_name[b];
         m_impl->load_records.push_back(rec);
     }
 
