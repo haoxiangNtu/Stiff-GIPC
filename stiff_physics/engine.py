@@ -49,6 +49,94 @@ _C = _import_native()
 _PACKAGE_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
+class BodyView:
+    """A read-only view of one body's slice of the global vertex/face arrays.
+
+    Lightweight — holds no data of its own; every accessor re-slices the
+    engine's current state. Cheap because slicing is a numpy view, but the
+    `get_vertices()` slice DOES reflect the latest engine.step() (you don't
+    need to fetch a fresh BodyView each frame).
+
+    Use `Engine.get_bodies()` / `get_abd_body(id)` / `get_fem_body(id)` to
+    obtain BodyViews — don't construct directly.
+    """
+
+    __slots__ = ("_engine", "_record")
+
+    def __init__(self, engine: "Engine", record):
+        self._engine = engine
+        self._record = record
+
+    @property
+    def kind(self) -> str:
+        """'ABD' (rigid affine body) or 'FEM' (deformable)."""
+        return "ABD" if self._record.body_type == 0 else "FEM"
+
+    @property
+    def body_id(self) -> int:
+        """Index within this body's kind (e.g. 0..N-1 for ABD bodies)."""
+        return self._record.body_offset
+
+    @property
+    def label(self) -> str:
+        """URDF link name (e.g. 'link_base'), .obj filename, or other source label."""
+        return self._record.label
+
+    @property
+    def asset_id(self) -> int:
+        """Shared MeshAsset id (-1 if not from a shared asset)."""
+        return self._record.asset_id
+
+    @property
+    def instance_id(self) -> int:
+        """Instance index for instanced loads (0 if not instanced)."""
+        return self._record.instance_id
+
+    @property
+    def vertex_offset(self) -> int:
+        """Start index in engine.get_vertices()."""
+        return self._record.vertex_offset
+
+    @property
+    def vertex_count(self) -> int:
+        return self._record.vertex_count
+
+    def get_vertices(self) -> np.ndarray:
+        """Current deformed vertices for this body, shape (vertex_count, 3)."""
+        v = self._engine.get_vertices()
+        s = self._record.vertex_offset
+        return v[s : s + self._record.vertex_count]
+
+    def get_vertex_velocities(self) -> np.ndarray:
+        v = self._engine.get_vertex_velocities()
+        s = self._record.vertex_offset
+        return v[s : s + self._record.vertex_count]
+
+    def get_surface_faces(self, local_indices: bool = True) -> np.ndarray:
+        """Surface triangles belonging to this body.
+
+        Args:
+            local_indices: when True (default), vertex refs are 0-based for
+                this body so faces directly index into self.get_vertices().
+                Set False to keep global indices that match
+                engine.get_vertices().
+        """
+        all_faces = self._engine.get_surface_faces()
+        s = self._record.vertex_offset
+        e = s + self._record.vertex_count
+        if self._record.vertex_count == 0:
+            return np.empty((0, all_faces.shape[1]), dtype=all_faces.dtype)
+        in_range = ((all_faces >= s) & (all_faces < e)).all(axis=1)
+        body_faces = all_faces[in_range]
+        if local_indices:
+            body_faces = (body_faces - s).astype(all_faces.dtype, copy=False)
+        return body_faces
+
+    def __repr__(self) -> str:
+        return (f"BodyView(kind={self.kind} body_id={self.body_id} "
+                f"label='{self.label}' verts={self.vertex_count})")
+
+
 class Config:
     """Simulation configuration mirroring gipc::SimEngineConfig."""
 
@@ -451,6 +539,48 @@ class Engine:
     def get_load_records(self) -> list:
         """Return all BodyLoadRecord objects."""
         return self._engine.get_all_load_records()
+
+    # ---- Per-body views ----
+
+    def get_bodies(self) -> list[BodyView]:
+        """All bodies (ABD + FEM mixed) in load-record order."""
+        return [BodyView(self, r) for r in self._engine.get_all_load_records()]
+
+    def get_abd_body(self, body_id: int) -> BodyView:
+        """Get the ABD body with the given index (0..abd_body_count-1)."""
+        for r in self._engine.get_all_load_records():
+            if r.body_type == 0 and r.body_offset == body_id:
+                return BodyView(self, r)
+        raise IndexError(f"ABD body {body_id} not found")
+
+    def get_fem_body(self, body_id: int) -> BodyView:
+        """Get the FEM body with the given index (0..fem_body_count-1)."""
+        for r in self._engine.get_all_load_records():
+            if r.body_type == 1 and r.body_offset == body_id:
+                return BodyView(self, r)
+        raise IndexError(f"FEM body {body_id} not found")
+
+    def get_vertex_body_ids(self) -> np.ndarray:
+        """Per-vertex body identification, shape (N, 2) int32.
+
+        Column 0: body_type (0=ABD, 1=FEM)
+        Column 1: body_offset (index within its kind)
+
+        Useful for mask-based filtering across the global vertex array::
+
+            ids = engine.get_vertex_body_ids()
+            verts = engine.get_vertices()
+            fem_verts = verts[ids[:, 0] == 1]      # all FEM vertices
+            link3_verts = verts[(ids[:, 0] == 0) & (ids[:, 1] == 3)]
+        """
+        n = len(self.get_vertices())
+        ids = np.zeros((n, 2), dtype=np.int32)
+        for r in self._engine.get_all_load_records():
+            s = r.vertex_offset
+            e = s + r.vertex_count
+            ids[s:e, 0] = r.body_type
+            ids[s:e, 1] = r.body_offset
+        return ids
 
     # ---- Joint control ----
 
