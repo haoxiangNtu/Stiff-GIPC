@@ -204,6 +204,25 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("add_ground_collision_skip", &SimEngine::add_ground_collision_skip,
              py::arg("body_id"))
 
+        .def("set_abd_body_face_orient", &SimEngine::set_abd_body_face_orient,
+             py::arg("body_id"), py::arg("orient"))
+        .def("get_abd_body_face_orient", &SimEngine::get_abd_body_face_orient,
+             py::arg("body_id"))
+        .def("get_abd_surface_body_vertices", [](const SimEngine& e, int body_id) {
+            auto flat = e.get_abd_surface_body_vertices(body_id);
+            int n = static_cast<int>(flat.size() / 3);
+            auto arr = py::array_t<double>({n, 3});
+            std::memcpy(arr.mutable_data(), flat.data(), flat.size() * sizeof(double));
+            return arr;
+        }, py::arg("body_id"))
+        .def("get_abd_surface_body_triangles", [](const SimEngine& e, int body_id) {
+            auto flat = e.get_abd_surface_body_triangles(body_id);
+            int n = static_cast<int>(flat.size() / 3);
+            auto arr = py::array_t<int>({n, 3});
+            std::memcpy(arr.mutable_data(), flat.data(), flat.size() * sizeof(int));
+            return arr;
+        }, py::arg("body_id"))
+
         .def("add_fixed_joint", [](SimEngine& self, int parent, int child,
                                    py::array_t<double> anchor,
                                    py::array_t<double> normal,

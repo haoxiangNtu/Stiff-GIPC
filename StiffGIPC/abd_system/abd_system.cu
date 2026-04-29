@@ -735,7 +735,8 @@ void ABDSystem::_fix_surface_mesh_vertex_masses(muda::DeviceBuffer<Float>& uniqu
 {
     for(auto& smb : m_surface_mesh_bodies)
     {
-        double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles);
+        const std::vector<int>* orient_ptr = smb.orient.empty() ? nullptr : &smb.orient;
+        double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles, orient_ptr);
         double total_mass = std::abs(volume) * parms.mass_density;
         double mass_per_vertex = total_mass / static_cast<double>(smb.point_count);
 
@@ -759,8 +760,10 @@ void ABDSystem::_fix_surface_mesh_mass_centers()
         double m = 0.0;
         Eigen::Vector3d m_x = Eigen::Vector3d::Zero();
         Eigen::Matrix3d m_xx = Eigen::Matrix3d::Zero();
+        const std::vector<int>* orient_ptr = smb.orient.empty() ? nullptr : &smb.orient;
         gipc::compute_trimesh_dyadic_mass(smb.vertices, smb.triangles,
-                                          parms.mass_density, m, m_x, m_xx);
+                                          parms.mass_density, m, m_x, m_xx,
+                                          orient_ptr);
 
         Eigen::Vector3d center = m_x / m;
         Vector3 h_center = center;
@@ -780,9 +783,11 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
         double out_m = 0.0;
         Eigen::Vector3d out_m_x = Eigen::Vector3d::Zero();
         Eigen::Matrix3d out_m_xx = Eigen::Matrix3d::Zero();
+        const std::vector<int>* orient_ptr = smb.orient.empty() ? nullptr : &smb.orient;
         gipc::compute_trimesh_dyadic_mass(smb.vertices, smb.triangles,
                                           parms.mass_density,
-                                          out_m, out_m_x, out_m_xx);
+                                          out_m, out_m_x, out_m_xx,
+                                          orient_ptr);
 
         Eigen::Vector3d center = out_m_x / out_m;
 
@@ -808,7 +813,7 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
                    cudaMemcpyHostToDevice);
 
         // Upload volume
-        double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles);
+        double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles, orient_ptr);
         Float h_vol = static_cast<Float>(std::abs(volume));
         cudaMemcpy(abd.body_id_to_volume.data() + smb.body_id,
                    &h_vol,

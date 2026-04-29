@@ -198,6 +198,11 @@ class tetrahedra_obj
     {
         std::vector<Eigen::Vector3d> vertices;
         std::vector<Eigen::Vector3i> triangles;
+        /// Per-face orientation override (libuipc-style). Same semantics as
+        /// `ABDSurfaceMeshBody::orient` — empty = use winding, non-empty = one
+        /// {-1,0,+1} per face used to flip integration-time normal sign.
+        /// Populated via `SimEngine::set_abd_body_face_orient` before finalize.
+        std::vector<int>             orient;
         int body_id          = -1;
         int vert_global_offset = 0;  // global index of this body's first vertex
     };

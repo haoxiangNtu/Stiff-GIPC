@@ -19,6 +19,13 @@ struct ABDSurfaceMeshBody
 {
     std::vector<Eigen::Vector3d> vertices;
     std::vector<Eigen::Vector3i> triangles;
+    /// Per-face orientation override (libuipc-style), values in {-1, 0, +1}.
+    /// Empty (the default) means "use face winding as-is" — preserves
+    /// pre-orient-feature behavior for assets that already have correct
+    /// winding. Set per-face to -1 to flip a single face's normal at
+    /// integration time without mutating the topology, so collision /
+    /// BVH / render code still see the original face order.
+    std::vector<int>             orient;
     int body_id     = -1;
     int point_start = -1;  // first unique_point_id belonging to this body
     int point_count = 0;   // number of unique points in this body

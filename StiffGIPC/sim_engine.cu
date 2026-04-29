@@ -257,6 +257,70 @@ void SimEngine::add_ground_collision_skip(int body_id)
     m_impl->tetMesh.ground_collision_skip_body_ids.push_back(body_id);
 }
 
+bool SimEngine::set_abd_body_face_orient(int body_id, const std::vector<int>& orient)
+{
+    for(auto& smb : m_impl->tetMesh.surface_mesh_bodies)
+    {
+        if(smb.body_id != body_id) continue;
+        if(!orient.empty() && orient.size() != smb.triangles.size())
+        {
+            std::cerr << "[set_abd_body_face_orient] body " << body_id
+                      << ": orient size (" << orient.size() << ") != face count ("
+                      << smb.triangles.size() << "), ignoring." << std::endl;
+            return false;
+        }
+        smb.orient = orient;
+        return true;
+    }
+    std::cerr << "[set_abd_body_face_orient] no surface-mesh body with body_id="
+              << body_id << " (FEM body, or invalid index)." << std::endl;
+    return false;
+}
+
+std::vector<int> SimEngine::get_abd_body_face_orient(int body_id) const
+{
+    for(auto& smb : m_impl->tetMesh.surface_mesh_bodies)
+    {
+        if(smb.body_id == body_id)
+            return smb.orient;
+    }
+    return {};
+}
+
+std::vector<double> SimEngine::get_abd_surface_body_vertices(int body_id) const
+{
+    for(auto& smb : m_impl->tetMesh.surface_mesh_bodies)
+    {
+        if(smb.body_id != body_id) continue;
+        std::vector<double> out(smb.vertices.size() * 3);
+        for(size_t i = 0; i < smb.vertices.size(); i++)
+        {
+            out[3 * i + 0] = smb.vertices[i].x();
+            out[3 * i + 1] = smb.vertices[i].y();
+            out[3 * i + 2] = smb.vertices[i].z();
+        }
+        return out;
+    }
+    return {};
+}
+
+std::vector<int> SimEngine::get_abd_surface_body_triangles(int body_id) const
+{
+    for(auto& smb : m_impl->tetMesh.surface_mesh_bodies)
+    {
+        if(smb.body_id != body_id) continue;
+        std::vector<int> out(smb.triangles.size() * 3);
+        for(size_t i = 0; i < smb.triangles.size(); i++)
+        {
+            out[3 * i + 0] = smb.triangles[i].x();
+            out[3 * i + 1] = smb.triangles[i].y();
+            out[3 * i + 2] = smb.triangles[i].z();
+        }
+        return out;
+    }
+    return {};
+}
+
 // ---------------------------------------------------------------------------
 // Programmatic joint creation (mirrors UrdfSceneImporter logic)
 // ---------------------------------------------------------------------------

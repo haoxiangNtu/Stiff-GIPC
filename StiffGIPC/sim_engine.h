@@ -173,6 +173,28 @@ class SimEngine
     void add_collision_exclusion(int body_a, int body_b);
     void add_ground_collision_skip(int body_id);
 
+    /// libuipc-style per-face orient labels for an ABD surface body.
+    /// Pass one int per triangle, in {-1, 0, +1}; non-zero values flip
+    /// (or preserve) the face's normal sign at mass/centroid/inertia
+    /// integration time WITHOUT mutating face vertex order. Empty vector
+    /// = revert to "use winding as-is" (default behavior).
+    /// MUST be called before finalize() (after that, surface mesh data
+    /// has already been copied to ABDSystem).
+    /// Returns false if body_id has no surface mesh body in tetMesh
+    /// (e.g. it's a FEM body or out-of-range).
+    bool set_abd_body_face_orient(int body_id, const std::vector<int>& orient);
+
+    /// Read current per-face orient labels for an ABD surface body.
+    /// Returns empty vector if body has no orient overrides set.
+    std::vector<int> get_abd_body_face_orient(int body_id) const;
+
+    /// Pre-finalize accessors for per-body surface mesh data — needed by
+    /// Python helpers that compute orient labels before finalize().
+    /// Returns flattened (N,3) double for verts, (M,3) int for faces.
+    /// Empty if body_id has no surface-mesh body in tetMesh.
+    std::vector<double> get_abd_surface_body_vertices(int body_id) const;
+    std::vector<int>    get_abd_surface_body_triangles(int body_id) const;
+
     // ---- Programmatic joint creation (must call before finalize()) ----
     // Returns the constraint index.
 
