@@ -386,6 +386,60 @@ class Engine:
     def add_ground_collision_skip(self, body_id: int) -> None:
         self._engine.add_ground_collision_skip(body_id)
 
+    # ---- libuipc-style per-face orient labels (pre-finalize) ----
+
+    def set_abd_body_face_orient(self, body_id: int, orient) -> bool:
+        """Override per-face orientation for an ABD surface body.
+
+        `orient` is one int per triangle in {-1, 0, +1}: -1 flips that
+        face's normal at integration time (mass / centroid / inertia),
+        0 or +1 leaves it untouched. Topology (face vertex order) is
+        NOT modified — collision / BVH / render code see the original.
+
+        Must be called BEFORE finalize() (after that, surface mesh data
+        has already been copied to ABDSystem and changes are ignored).
+        Returns True on success, False if body_id has no surface body.
+        """
+        arr = np.ascontiguousarray(np.asarray(orient, dtype=np.int32))
+        return self._engine.set_abd_body_face_orient(body_id, arr.tolist())
+
+    def get_abd_body_face_orient(self, body_id: int) -> np.ndarray:
+        """Read current per-face orient labels (empty if none set)."""
+        return np.asarray(self._engine.get_abd_body_face_orient(body_id),
+                          dtype=np.int32)
+
+    def get_abd_surface_body_vertices(self, body_id: int) -> np.ndarray:
+        """Pre-finalize: per-body local surface vertices. Shape (N, 3) float64."""
+        return self._engine.get_abd_surface_body_vertices(body_id)
+
+    def get_abd_surface_body_triangles(self, body_id: int) -> np.ndarray:
+        """Pre-finalize: per-body local triangle indices. Shape (M, 3) int32."""
+        return self._engine.get_abd_surface_body_triangles(body_id)
+
+    def label_face_orient_for_abd_body(self, body_id: int, method: str = "flood_fill") -> int:
+        """Compute per-face orient labels for an ABD body and write them
+        into the engine. Must be called BEFORE finalize().
+
+        method: only 'flood_fill' supported currently. Builds edge
+            adjacency, BFS-propagates winding consistency from face 0
+            (handles multi-component meshes by restarting from each
+            unvisited face), then checks signed volume sign — if
+            negative, flips the orient label of every face so that
+            outward normal convention is restored.
+
+        Returns: number of faces marked as inverted (orient = -1).
+        Returns 0 if no fix was needed (mesh already correctly wound)
+        or if body_id has no surface body.
+        """
+        from stiff_physics.mesh_utils import compute_face_orient_flood_fill
+        verts = self.get_abd_surface_body_vertices(body_id)
+        faces = self.get_abd_surface_body_triangles(body_id)
+        if verts.size == 0 or faces.size == 0:
+            return 0
+        orient = compute_face_orient_flood_fill(verts, faces)
+        self.set_abd_body_face_orient(body_id, orient)
+        return int((orient == -1).sum())
+
     def add_fixed_joint(self, parent_body: int, child_body: int,
                         world_anchor, world_normal, world_bitangent) -> int:
         """Create a fixed joint between two ABD bodies. Must call before finalize()."""
