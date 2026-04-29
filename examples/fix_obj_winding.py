@@ -66,7 +66,7 @@ Usage
 
 Requires `trimesh` (pip install trimesh).
 """
-import argparse, sys, os, re
+import argparse, sys, os, re, shutil
 from pathlib import Path
 
 try:
@@ -98,8 +98,15 @@ def winding_stats(mesh: trimesh.Trimesh) -> dict:
 
 
 def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
-            convex_hull: bool = False) -> dict:
-    """Returns {input, before, after, output, changed}."""
+            convex_hull: bool = False,
+            backup_suffix: str = ".orig") -> dict:
+    """Returns {input, before, after, output, changed}.
+
+    When `output_path == input_path` (in-place rewrite), copies the
+    original to ``input_path + backup_suffix`` first so a later
+    `--restore` can recover. Skips backup if one already exists (so
+    re-running the fix doesn't clobber the original).
+    """
     # process=True merges duplicate vertices (essential for STL files which
     # store 3 verts per triangle independently — without merging there are
     # no shared edges and the winding check is vacuous).
@@ -125,11 +132,19 @@ def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
     )
 
     saved_to = None
+    backed_up = None
     if not dry_run and changed:
         if output_path is None:
             stem = input_path.stem
             ext = input_path.suffix
             output_path = input_path.parent / f"{stem}_fixed{ext}"
+        # If overwriting in place, snapshot original first (idempotent —
+        # don't overwrite an existing backup).
+        if output_path.resolve() == input_path.resolve():
+            backup = input_path.with_suffix(input_path.suffix + backup_suffix)
+            if not backup.exists():
+                shutil.copy2(input_path, backup)
+                backed_up = backup
         # trimesh.export honors file extension
         fixed.export(str(output_path))
         saved_to = output_path
@@ -140,17 +155,42 @@ def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
         "after": after,
         "changed": changed,
         "saved_to": saved_to,
+        "backed_up": backed_up,
     }
 
 
-def collect_urdf_meshes(urdf_path: Path) -> list[Path]:
-    """Find all <mesh filename="..."/> references in a URDF and resolve them."""
+def restore_one(target_path: Path, backup_suffix: str = ".orig") -> bool:
+    """Move <target><backup_suffix> back to <target>. Returns True if a
+    backup existed and was restored, False otherwise."""
+    backup = target_path.with_suffix(target_path.suffix + backup_suffix)
+    if not backup.exists():
+        return False
+    if target_path.exists():
+        target_path.unlink()
+    backup.rename(target_path)
+    return True
+
+
+def collect_urdf_meshes(urdf_path: Path,
+                        collision_only: bool = False) -> list[Path]:
+    """Find <mesh filename="..."/> references in a URDF and resolve them.
+
+    collision_only: when True, return only meshes inside <collision> blocks
+        (skip <visual>). Crucial for convex-hull replacement — visual
+        meshes drive rendering and must not be simplified.
+    """
     text = urdf_path.read_text()
     base_dir = urdf_path.parent
-    refs = re.findall(r'<mesh\s+filename="([^"]+)"', text)
+    if collision_only:
+        # Pull the substring inside each <collision> ... </collision> block.
+        blocks = re.findall(r"<collision>(.*?)</collision>", text, flags=re.DOTALL)
+        refs = []
+        for blk in blocks:
+            refs.extend(re.findall(r'<mesh\s+filename="([^"]+)"', blk))
+    else:
+        refs = re.findall(r'<mesh\s+filename="([^"]+)"', text)
     paths = []
     for ref in refs:
-        # URDF may use package://, ROS-style. Strip and try relative.
         ref = re.sub(r"^package://[^/]+/", "", ref)
         ref = re.sub(r"^file://", "", ref)
         cand = (base_dir / ref).resolve()
@@ -185,6 +225,21 @@ def main():
                          "(non-closed source). Loses concavity detail; only "
                          "appropriate when the original is approximately "
                          "convex (gripper fingers, link cylinders, etc.).")
+    ap.add_argument("--collision-only", action="store_true",
+                    help="URDF batch mode: only process <collision> meshes, "
+                         "skip <visual>. Strongly recommended with "
+                         "--convex-hull (don't replace render-only assets).")
+    ap.add_argument("--backup-suffix", default=".orig",
+                    help="suffix for original-mesh backup written next to "
+                         "each modified file (default: '.orig'). The "
+                         "backup is created only when the mesh actually "
+                         "changes and only if no backup already exists "
+                         "(safe to re-run).")
+    ap.add_argument("--restore", action="store_true",
+                    help="Reverse mode: rename each <name><backup-suffix> "
+                         "back to <name>, undoing a prior --convex-hull "
+                         "or --fix-normals run. Works in URDF batch mode "
+                         "too (restores all meshes referenced by the URDF).")
     args = ap.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -197,10 +252,24 @@ def main():
             print("ERROR: --output not supported in URDF batch mode "
                   "(use --in-place or default)", file=sys.stderr)
             sys.exit(2)
-        meshes = collect_urdf_meshes(input_path)
+        meshes = collect_urdf_meshes(input_path, collision_only=args.collision_only)
         if not meshes:
             print("No meshes found in URDF.")
             return
+
+        if args.restore:
+            print(f"Restoring originals for {len(meshes)} mesh(es) "
+                  f"using suffix '{args.backup_suffix}'")
+            n_done = 0
+            for m_path in meshes:
+                if restore_one(m_path, args.backup_suffix):
+                    print(f"  RESTORED: {m_path.name}")
+                    n_done += 1
+                else:
+                    print(f"  no backup: {m_path.name}")
+            print(f"\n{n_done}/{len(meshes)} files restored.")
+            return
+
         print(f"Scanning {len(meshes)} mesh(es) referenced by {input_path.name}\n")
         n_fixed = 0
         for m_path in meshes:
@@ -208,7 +277,8 @@ def main():
                 # In-place means write to same path as input. Otherwise default
                 # rule (<stem>_fixed.<ext> next to input) applies.
                 out = m_path if args.in_place else None
-                r = fix_one(m_path, out, args.dry_run, args.convex_hull)
+                r = fix_one(m_path, out, args.dry_run, args.convex_hull,
+                            args.backup_suffix)
             except Exception as ex:
                 print(f"  {m_path.name}: ERROR — {type(ex).__name__}: {ex}")
                 continue
@@ -224,8 +294,14 @@ def main():
                     print(f"    (dry-run — not written)")
         print(f"\n{n_fixed}/{len(meshes)} meshes needed winding fix.")
     else:
+        if args.restore:
+            ok = restore_one(input_path, args.backup_suffix)
+            print(f"  RESTORED: {input_path.name}" if ok
+                  else f"  no backup found ({input_path.name}{args.backup_suffix})")
+            return
         out_path = Path(args.output).resolve() if args.output else None
-        r = fix_one(input_path, out_path, args.dry_run, args.convex_hull)
+        r = fix_one(input_path, out_path, args.dry_run, args.convex_hull,
+                    args.backup_suffix)
         print(f"  before: {fmt_stats(r['before'])}")
         if r["changed"]:
             print(f"  after : {fmt_stats(r['after'])}")
