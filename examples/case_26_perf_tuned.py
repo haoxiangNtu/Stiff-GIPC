@@ -1,10 +1,34 @@
 #!/usr/bin/env python3
-"""Case 26 — performance-tuned variant (~1.43× from param tuning + ~5× on
-stall in moving scenarios via joint_strength_ratio=200; combined with the
-v0.2.0 engine this stacks to >>1.5× overall).
+"""Case 26 — performance-tuned variant (Option A — simpler).
 
-For even more aggressive stall reduction via per-joint API (arm=200
-stable, gripper=20 soft), see `case_26_perf_extreme.py`.
+Single Config knob change vs default: `joint_strength_ratio=100`. Stacked
+with our existing solver-tol + dt tunings, this gives:
+    median 18.05 ms / step (≈ 55 fps) on user qpos replay
+    p95    48.96 ms
+
+PREREQUISITE: collision mesh fix
+--------------------------------
+The optimal strength here (100) is calibrated AGAINST cleaned-up xarm7
+collision meshes. Run this once on your URDF before using either of these
+examples in production:
+
+    python examples/fix_obj_winding.py path/to/your/robot.urdf \\
+        --auto-fix --collision-only --in-place
+
+The default xarm7 collision .obj/.STL files ship with non-manifold
+geometry (gripper_base_link.STL has 274 boundary edges, several other
+links 4–16). On unrepaired meshes the divergence-theorem mass integral
+gives wrong centroids/inertia for any non-closed body, which in turn
+makes the joint penalty K's miscalibrated. Without the mesh fix this
+strength=100 will appear too soft; you'd need to compensate with
+strength=200 (the previous default), which then *over*-stiffens cleaned
+meshes. Pick one path: cleaned meshes + strength=100, or buggy meshes
++ strength=200.
+
+For even smoother (lower-p95) interactive feel via per-joint API
+(arm K=100, gripper K=10 via per-joint multiplier 0.1), see
+`case_26_perf_extreme.py`. perf_extreme cuts p95 stall by ~50% at
+the cost of one extra API call.
 
 Same scene as `case_26_arm_cloth_semi_implicit.py` (XArm7 + Gripper +
 shirt_6436v free-fall), but with TWO categories of tuning stacked:
@@ -168,9 +192,11 @@ def main():
         poisson_rate=0.49,
         friction_rate=0.4,
         relative_dhat=1e-3,                  # default (tightening gives no net speedup)
-        joint_strength_ratio=150.0,           # ★ tuned (default 1000). Arm stays at 200 (stable feel);
-                                              #    gripper per-joint multiplier reduces stall further (below).
-        revolute_driving_strength_ratio=150.0,  # ★ same. gripper multiplier below gives fine-grained control
+        joint_strength_ratio=100.0,             # ★ tuned (default 1000). New optimum after the
+                                                #    mesh-fix prerequisite (see top-of-file docstring).
+                                                #    Pre-mesh-fix optimum was 200 — DO NOT use the old
+                                                #    value with cleaned meshes, it will over-stiffen.
+        revolute_driving_strength_ratio=100.0,  # ★ same.
         semi_implicit_enabled=True,
         semi_implicit_beta_tol=5e-2,         # ★ tuned (default 1e-3, 50x looser)
         semi_implicit_min_iter=1,

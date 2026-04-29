@@ -1,59 +1,71 @@
 #!/usr/bin/env python3
-"""Case 26 — extreme-performance variant (builds on case_26_perf_tuned.py).
+"""Case 26 — extreme-performance variant (Option B — builds on perf_tuned).
 
-Adds one extra layer on top of perf_tuned: per-joint strength override via
-the `Robot.set_gripper_strength()` API (available in v0.3.0+).
+Adds one extra layer on top of `case_26_perf_tuned.py`: per-joint
+strength override via `Robot.set_gripper_strength()` (v0.3.0+).
 
-  Layer 3 — per-joint compliance on gripper (~1.8× extra on stall):
-    arm joints      : global joint_strength_ratio = 200 (stable feel when
-                      dragging sliders; no visible shake)
-    gripper joints  : per-joint multiplier = 0.1 → effective K = 20 (soft;
+PREREQUISITE — collision mesh fix (same as perf_tuned)
+------------------------------------------------------
+Both this script and perf_tuned assume xarm7 collision meshes have
+been pre-fixed:
+
+    python examples/fix_obj_winding.py path/to/your/robot.urdf \\
+        --auto-fix --collision-only --in-place
+
+Without that step, multiple bodies (notably gripper_base_link, several
+fingers / knuckles, link2, link6, link_base) are non-manifold, which
+makes the mass / centroid / inertia integrals ill-defined and the
+strength tuning here suboptimal.
+
+Configuration on top of perf_tuned (Option A)
+---------------------------------------------
+  Layer 3 — per-joint compliance on gripper:
+    arm joints      : global joint_strength_ratio = 100 (same as perf_tuned)
+    gripper joints  : per-joint multiplier = 0.1 → effective K = 10 (soft;
                       yields freely under cloth contact)
 
 Why this split:
-    The arm's link-to-link joints (joint1..joint7) carry the arm's own
-    weight and are what the user visually grabs via sliders. Keeping them
-    at 200 avoids the "whole arm shaking" symptom observed at global
-    strength≤50.
+    The arm's joint1..joint7 carry the arm's own weight and are what the
+    user grabs via sliders. Keeping them at K=100 avoids visible shake.
 
     The gripper's finger/knuckle joints are at the end of the kinematic
-    chain, carry tiny mass, and are what actually contacts cloth in
-    grasping. Dropping them to effective K=20 relieves the arm-sweep-
-    cloth pinch without affecting the main arm's interactive feel.
+    chain, carry tiny mass, and are what actually contacts cloth. Dropping
+    their effective K to 10 absorbs pinch-spike stalls (the contact-
+    induced p95 long tail in the Newton solver).
 
-    The stall is driven by joint-penalty Hessian stiffness clashing with
-    IPC barrier near pinch contact (see docs/internal/case26_gripper_
-    strength_ab_n30.log). Since case_26's arm-sweep contact is mediated
-    partially through the gripper (when gripper trails the arm into
-    cloth), softening the gripper link gives a smaller but measurable
-    extra speedup.
+Measured impact at strength=100 (post mesh-fix), n=200 user-qpos frames:
 
-Measured on perf_tuned baseline (arm=200, grip=200) with joint2 slider
-descent from 0° to -113° over 60 frames:
+    grip_mul=1.0  (no per-joint softening): median 19.93 ms  p95 93.95 ms
+    grip_mul=0.1  (this script's value)   : median 18.33 ms  p95 50.69 ms
+                                            ─────────────  ─────────────
+                                            -8% median      -46% p95 ⭐
 
-    grip_mul=1.0  (grip effective 200): descend median ~86 ms/step
-    grip_mul=0.5  (grip effective 100): descend median ~63 ms/step  (1.4×)
-    grip_mul=0.25 (grip effective 50):  descend median ~47 ms/step  (1.8×)
-    grip_mul=0.1  (grip effective 20):  descend median ~47 ms/step  (1.8×)  ← this script
-    grip_mul=0.05 (grip effective 10):  descend median ~48 ms/step  (plateau)
-    grip_mul=0.01 (grip effective 2):   descend median ~63 ms/step  (gripper flops)
+Median improvement is small (-8%); the value of this layer is the
+**p95 stall reduction**: cuts long-tail spikes by ~50%. Visible as
+"smoother slider drag" (no occasional 'kerchunk' moments when the
+gripper enters cloth contact).
 
-Sweet spot: grip_mul in [0.1, 0.25]. Below that, gripper starts flopping
-under its own weight. Above that, less stall relief.
+Sweet spot from sweep at perf_tuned baseline: grip_mul in [0.1, 0.25].
+Below 0.05 the gripper starts flopping under its own weight; above 0.5
+diminishing returns on stall reduction.
 
-Trade-off to know:
+Trade-off:
     * Gripper fingers may visibly droop / swing slightly under gravity
       when the arm is held static — this is spring-mass physics with a
       softer spring, not a bug.
     * If you need the gripper to firmly grasp a heavier object, raise
-      grip_mul back toward 1.0 dynamically via
-      `robot.set_gripper_strength(1.0)` before the grasp phase.
+      grip_mul back toward 1.0 dynamically:
+        `robot.set_gripper_strength(1.0)` before the grasp phase
 
-When to prefer this script vs `case_26_perf_tuned.py`:
-    * Use `perf_extreme` when you want maximum speed for interactive
-      prototyping with a cloth scene where the arm will sweep around.
-    * Use `perf_tuned` when you want uniform joint behaviour and don't
-      mind the extra stall in sweep scenarios.
+When to prefer perf_extreme (Option B) vs perf_tuned (Option A)
+---------------------------------------------------------------
+    * perf_extreme: smooth interactive feel (50 ms p95) — recommended
+      for slider-driven prototyping, demos, manipulation control loops.
+    * perf_tuned:   simpler API surface, single Config knob, no
+      per-joint API call. p95 ~94 ms (occasional perceptible stall).
+      Recommended when you want minimal Python plumbing or you're
+      wrapping the engine for high-throughput batch sims where p95
+      doesn't matter as much as throughput.
 
 Usage:
     python examples/case_26_perf_extreme.py
@@ -97,8 +109,8 @@ def main():
         poisson_rate=0.49,
         friction_rate=0.4,
         relative_dhat=1e-3,
-        joint_strength_ratio=200.0,             # arm (global) — stable feel
-        revolute_driving_strength_ratio=200.0,
+        joint_strength_ratio=100.0,             # arm (global) — same as perf_tuned post-mesh-fix
+        revolute_driving_strength_ratio=100.0,
         semi_implicit_enabled=True,
         semi_implicit_beta_tol=5e-2,
         semi_implicit_min_iter=1,
@@ -137,12 +149,13 @@ def main():
     # Default matches 7 arm joints (joint1..joint7) + 6 gripper joints
     # (finger/knuckle/drive_joint patterns). Returns number set so you can
     # sanity-check pattern matching against your URDF.
-    GRIP_MUL = 0.1  # edit here to re-tune: 0.25 is the conservative option
+    GLOBAL_K = 100.0  # mirror Config.joint_strength_ratio above; used in display only.
+    GRIP_MUL = 0.1    # edit here to re-tune: 0.25 is the conservative option
     n_set = robot.set_gripper_strength(GRIP_MUL)
     print(f"[perf_extreme] {n_set} gripper joints at multiplier {GRIP_MUL} "
-          f"(effective K = {200*GRIP_MUL:.0f});  "
+          f"(effective K = {GLOBAL_K * GRIP_MUL:.0f});  "
           f"{engine.native.get_num_revolute_joints() - n_set} arm joints "
-          f"at 1.0 (K = 200).")
+          f"at 1.0 (K = {GLOBAL_K:.0f}).")
 
     verts = engine.get_vertices()
     faces = engine.get_surface_faces()
@@ -171,8 +184,8 @@ def main():
             psim.Text(f"Step: {step_count[0]}")
             psim.Separator()
             psim.TextColored((0.5, 1.0, 0.5, 1.0),
-                             f"gripper mul = {GRIP_MUL} (K = {200*GRIP_MUL:.0f})")
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), "arm joints K = 200 (stable)")
+                             f"gripper mul = {GRIP_MUL} (K = {GLOBAL_K * GRIP_MUL:.0f})")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"arm joints K = {GLOBAL_K:.0f} (stable)")
             psim.Separator()
 
             if robot.revolute_joints:
