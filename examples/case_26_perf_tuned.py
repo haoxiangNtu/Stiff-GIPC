@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Case 26 — performance-tuned variant (~1.43× faster than the default).
+"""Case 26 — performance-tuned variant (~1.43× from param tuning + ~5x on
+stall in moving scenarios via joint_strength_ratio=200; combined with the
+v0.2.0 engine this stacks to >>1.5x overall).
 
 Same scene as `case_26_arm_cloth_semi_implicit.py` (XArm7 + Gripper +
 shirt_6436v free-fall), but with TWO categories of tuning stacked:
@@ -48,8 +50,13 @@ Why `pcg_tol` stays at default:
     safety risk is real. Leave alone.
 
 Knobs tested and found NOT to help (for the record, so you don't re-test):
-    * `joint_strength_ratio` sweep (50 … 5000): all within ±1% of noise,
-      p > 0.5. Joint solve is not the bottleneck.
+    * `joint_strength_ratio` sweep (50 … 5000) in *static* scenarios (no
+      arm-cloth pinch): all within ±1% of noise, p > 0.5. Correction (2026-
+      04-24): in *moving* scenarios where the arm sweeps through cloth
+      pressed on the ground, strength matters a lot — 1000 → 200 gives
+      5.1× wall-time reduction (n=30 paired, p<0.0001). This perf_tuned
+      script now uses strength=200 to capture that win. See the "Joint
+      strength note" in the Config block below.
     * finger-only collision exclusion (shirt vs left_finger + right_finger
       only, other arm bodies excluded via add_collision_exclusion):
       +0.48% on basic, −0.08% on perf_tuned, p = 0.50/0.84 respectively.
@@ -131,11 +138,22 @@ def main():
     ps.set_ground_plane_mode("shadow_only")
 
     # ---- Performance-tuned Config ----
-    # Three knobs differ from case_26_arm_cloth_semi_implicit.py:
+    # Four knobs differ from case_26_arm_cloth_semi_implicit.py:
     #   dt                    : 0.010 -> 0.020  (timestep 2x larger)
     #   semi_implicit_beta_tol: 1e-3  -> 5e-2   (Newton exits ~5x sooner)
     #   newton_tol            : 1e-2  -> 5e-2   (5x looser convergence)
-    # Total measured speedup vs default: ~1.52x (see module docstring).
+    #   joint_strength_ratio  : 1000  -> 200    (arm yields to cloth under contact;
+    #                                            stops ~5x slowdown when arm sweeps
+    #                                            through shirt-pressed-on-ground)
+    # Joint strength note:
+    #   Earlier docstring claimed joint_strength_ratio sweep 50-5000 was null —
+    #   that was measured in *static* scenarios where arm holds steady and no
+    #   pinch happens. In *moving* scenarios where the arm sweeps through cloth
+    #   pinned against the ground, strength=1000 lets joint penalty crush the
+    #   cloth thin, barrier Kappa inflates, Hessian goes ill-conditioned, Newton
+    #   slows ~5x. strength=200 gives the arm enough "give" to avoid this while
+    #   keeping tracking error under 0.01 deg. See docs/internal/case26_gripper_
+    #   strength_ab_n30.log for the rigorous n=30 A/B.
     config = Config(
         dt=0.020,                            # ★ tuned (default 0.010, 2x coarser)
         cloth_thickness=1e-3,
@@ -147,8 +165,8 @@ def main():
         poisson_rate=0.49,
         friction_rate=0.4,
         relative_dhat=1e-3,                  # default (tightening gives no net speedup)
-        joint_strength_ratio=1000.0,
-        revolute_driving_strength_ratio=1000.0,
+        joint_strength_ratio=200.0,          # ★ tuned (default 1000, 5x softer for stall avoidance)
+        revolute_driving_strength_ratio=200.0,  # ★ same reason
         semi_implicit_enabled=True,
         semi_implicit_beta_tol=5e-2,         # ★ tuned (default 1e-3, 50x looser)
         semi_implicit_min_iter=1,
