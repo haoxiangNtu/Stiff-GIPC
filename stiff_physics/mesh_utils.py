@@ -154,6 +154,127 @@ def convex_decompose(
     return parts
 
 
+# ---------------------------------------------------------------------------
+# Per-face orientation labeling (libuipc-style)
+# ---------------------------------------------------------------------------
+
+def compute_face_orient_flood_fill(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Compute per-face orient labels via flood-fill BFS.
+
+    For an ABD body whose source mesh has inconsistent triangle winding,
+    this returns an ``orient`` array where ``orient[i] = -1`` flags
+    triangles that should be sign-flipped at integration time, and
+    ``+1`` (or implicit) for already-correct ones. Pass the result to
+    ``Engine.set_abd_body_face_orient(body_id, orient)`` BEFORE
+    finalize() to fix mass/centroid/inertia without mutating face
+    vertex order.
+
+    Algorithm:
+      1. Build edge → list of face ids.
+      2. BFS from face 0 (restart for each disconnected component): a
+         neighbor sharing edge (a,b) must traverse it as (b,a) for
+         consistent winding; if it traverses (a,b) instead, mark its
+         orient as flipped relative to its current direction.
+      3. After flood-fill, all faces in each component agree on a local
+         "outward" direction. Compute signed volume; if < 0, the
+         component's outward direction is actually inward, so flip ALL
+         labels in it so outward convention is restored.
+
+    Limitations: requires a manifold mesh (each edge in ≤2 faces).
+    Cannot fix non-closed meshes (where the volume integral is
+    mathematically meaningless) — for those, fix the asset upstream
+    (e.g. ``examples/fix_obj_winding.py --convex-hull``).
+
+    Returns
+    -------
+    orient : (n_faces,) int32 array, values in {-1, +1}.
+    """
+    from collections import defaultdict, deque
+
+    verts = np.asarray(vertices, dtype=np.float64)
+    tris  = np.asarray(faces, dtype=np.int32)
+    n     = len(tris)
+    if n == 0:
+        return np.empty((0,), dtype=np.int32)
+
+    # Edge → face list
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi, t in enumerate(tris):
+        for k in range(3):
+            a, b = int(t[k]), int(t[(k + 1) % 3])
+            edge_to_faces[(min(a, b), max(a, b))].append(fi)
+
+    # current_swap[fi] tracks whether face fi has been (logically) flipped
+    # during the BFS. We don't mutate `tris` to keep the algorithm
+    # idempotent / non-destructive.
+    swap = np.zeros(n, dtype=np.int8)  # 0 = original, 1 = flipped
+
+    def edge_dir_after_swap(fi: int, a: int, b: int) -> int:
+        """Returns 0 if face fi (with its current swap state) traverses
+        edge (a,b) in the order a→b; 1 if b→a."""
+        t = tris[fi]
+        if swap[fi]:
+            t0, t1, t2 = int(t[0]), int(t[2]), int(t[1])
+        else:
+            t0, t1, t2 = int(t[0]), int(t[1]), int(t[2])
+        for k, (x, y) in enumerate([(t0, t1), (t1, t2), (t2, t0)]):
+            if x == a and y == b:
+                return 0
+            if x == b and y == a:
+                return 1
+        raise ValueError(f"face {fi} does not contain edge ({a},{b})")
+
+    visited = np.zeros(n, dtype=bool)
+
+    # BFS each component independently
+    for seed in range(n):
+        if visited[seed]:
+            continue
+        visited[seed] = True
+        component = [seed]
+        q = deque([seed])
+        while q:
+            f = q.popleft()
+            t = tris[f]
+            t_eff = (int(t[0]), int(t[2]), int(t[1])) if swap[f] else \
+                    (int(t[0]), int(t[1]), int(t[2]))
+            for k in range(3):
+                a, b = t_eff[k], t_eff[(k + 1) % 3]
+                my_dir = 0  # by construction we just read t_eff
+                for nbr in edge_to_faces[(min(a, b), max(a, b))]:
+                    if nbr == f or visited[nbr]:
+                        continue
+                    visited[nbr] = True
+                    nd = edge_dir_after_swap(nbr, a, b)
+                    if nd == my_dir:
+                        # Same direction → inconsistent; mark neighbor as
+                        # needing a swap to bring it in line.
+                        swap[nbr] = 1
+                    component.append(nbr)
+                    q.append(nbr)
+
+        # Component-level orientation check via signed volume
+        V = 0.0
+        for fi in component:
+            t = tris[fi]
+            if swap[fi]:
+                p0, p1, p2 = verts[t[0]], verts[t[2]], verts[t[1]]
+            else:
+                p0, p1, p2 = verts[t[0]], verts[t[1]], verts[t[2]]
+            V += float(np.dot(p0, np.cross(p1, p2)))
+        if V < 0:
+            # Whole component is consistently inward → flip every label
+            for fi in component:
+                swap[fi] ^= 1
+
+    # Convert swap[] (0/1) to orient (+1/-1)
+    orient = np.where(swap == 1, np.int32(-1), np.int32(1))
+    return orient
+
+
 def write_vhacd_obj(
     path: str,
     parts: list[tuple[np.ndarray, np.ndarray]],
