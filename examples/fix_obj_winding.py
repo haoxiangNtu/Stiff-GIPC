@@ -97,7 +97,8 @@ def winding_stats(mesh: trimesh.Trimesh) -> dict:
     }
 
 
-def fix_one(input_path: Path, output_path: Path | None, dry_run: bool) -> dict:
+def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
+            convex_hull: bool = False) -> dict:
     """Returns {input, before, after, output, changed}."""
     # process=True merges duplicate vertices (essential for STL files which
     # store 3 verts per triangle independently — without merging there are
@@ -107,13 +108,20 @@ def fix_one(input_path: Path, output_path: Path | None, dry_run: bool) -> dict:
         raise ValueError(f"{input_path}: did not load as a single trimesh "
                          f"(got {type(mesh).__name__})")
     before = winding_stats(mesh)
-    fixed = mesh.copy()
-    fixed.fix_normals()
+    if convex_hull:
+        # Replace with convex hull — guaranteed closed manifold, well-oriented.
+        # Loses concavity detail but for ABD collision meshes that are
+        # approximately convex (gripper fingers/knuckles, link cylinders),
+        # the loss is negligible vs the gain of correct mass/centroid/inertia.
+        fixed = mesh.convex_hull
+    else:
+        fixed = mesh.copy()
+        fixed.fix_normals()
     after = winding_stats(fixed)
     changed = (
         before["consistent_winding"] != after["consistent_winding"]
-        or abs(before["signed_volume"]) != abs(after["signed_volume"])
-        or before["signed_volume"] * after["signed_volume"] < 0   # sign flipped
+        or before["is_volume"] != after["is_volume"]
+        or abs(before["signed_volume"] - after["signed_volume"]) > 1e-12
     )
 
     saved_to = None
@@ -170,6 +178,13 @@ def main():
                          "(otherwise writes <name>_fixed.<ext>)")
     ap.add_argument("--dry-run", action="store_true",
                     help="just analyze, don't write any files")
+    ap.add_argument("--convex-hull", action="store_true",
+                    help="replace mesh with its convex hull. Guaranteed to "
+                         "produce a closed manifold — use for ABD collision "
+                         "meshes that trimesh.fix_normals() can't repair "
+                         "(non-closed source). Loses concavity detail; only "
+                         "appropriate when the original is approximately "
+                         "convex (gripper fingers, link cylinders, etc.).")
     args = ap.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -193,7 +208,7 @@ def main():
                 # In-place means write to same path as input. Otherwise default
                 # rule (<stem>_fixed.<ext> next to input) applies.
                 out = m_path if args.in_place else None
-                r = fix_one(m_path, out, args.dry_run)
+                r = fix_one(m_path, out, args.dry_run, args.convex_hull)
             except Exception as ex:
                 print(f"  {m_path.name}: ERROR — {type(ex).__name__}: {ex}")
                 continue
@@ -210,7 +225,7 @@ def main():
         print(f"\n{n_fixed}/{len(meshes)} meshes needed winding fix.")
     else:
         out_path = Path(args.output).resolve() if args.output else None
-        r = fix_one(input_path, out_path, args.dry_run)
+        r = fix_one(input_path, out_path, args.dry_run, args.convex_hull)
         print(f"  before: {fmt_stats(r['before'])}")
         if r["changed"]:
             print(f"  after : {fmt_stats(r['after'])}")
