@@ -97,9 +97,115 @@ def winding_stats(mesh: trimesh.Trimesh) -> dict:
     }
 
 
+def boundary_edge_count(faces: np.ndarray) -> int:
+    """Count edges that appear in != 2 triangles (= holes)."""
+    from collections import Counter
+    e = Counter()
+    for tri in faces:
+        for k in range(3):
+            a, b = int(tri[k]), int(tri[(k + 1) % 3])
+            e[(min(a, b), max(a, b))] += 1
+    return sum(1 for c in e.values() if c != 2)
+
+
+def smart_repair(verts: np.ndarray, faces: np.ndarray,
+                 min_vertex_keep: float = 0.95,
+                 verbose: bool = False) -> tuple[np.ndarray, np.ndarray, str]:
+    """Repair a possibly-non-manifold mesh, preferring shape-preserving methods.
+
+    Cascade (each tried in order, accepts first that succeeds):
+      1. Already closed (boundary_edges == 0) → return as-is
+      2. pymeshfix.fill_holes(refine=True) only — gentlest, adds new
+         triangles to close boundaries, leaves rest of mesh untouched
+      3. pymeshfix.clean() + fill_holes — also removes degenerate /
+         self-intersecting triangles before filling
+      4. pymeshfix.repair() — aggressive (may delete chunks)
+      5. trimesh.convex_hull — last-resort fallback
+
+    Acceptance criteria for steps 2-4:
+      - output is closed (boundary_edges == 0)
+      - output vertex count >= input * min_vertex_keep
+      - output volume > 0
+
+    Returns: (verts, faces, method_used)
+    """
+    n_in = len(verts)
+
+    # Step 1: already closed?
+    if boundary_edge_count(faces) == 0:
+        return verts, faces, "already_closed"
+
+    # Steps 2-4 require pymeshfix
+    try:
+        import pymeshfix
+        v_in = np.ascontiguousarray(verts, dtype=np.float64)
+        f_in = np.ascontiguousarray(faces, dtype=np.int32)
+
+        # Step 2: fill_holes only
+        try:
+            fix = pymeshfix.MeshFix(v_in, f_in)
+            fix.fill_holes(refine=True)
+            v_out = np.asarray(fix.points, dtype=np.float64)
+            f_out = np.asarray(fix.faces, dtype=np.int32)
+            if (len(v_out) >= n_in * min_vertex_keep
+                and boundary_edge_count(f_out) == 0
+                and signed_volume(v_out, f_out) > 0):
+                return v_out, f_out, "fill_holes"
+            if verbose:
+                print(f"    fill_holes failed: v={len(v_out)} bd={boundary_edge_count(f_out)}")
+        except Exception as e:
+            if verbose:
+                print(f"    fill_holes raised: {e}")
+
+        # Step 3: clean (degeneracy + intersection removal) + fill_holes
+        try:
+            fix = pymeshfix.MeshFix(v_in, f_in)
+            fix.clean(max_iters=10, inner_loops=3)
+            fix.fill_holes(refine=True)
+            v_out = np.asarray(fix.points, dtype=np.float64)
+            f_out = np.asarray(fix.faces, dtype=np.int32)
+            if (len(v_out) >= n_in * min_vertex_keep
+                and boundary_edge_count(f_out) == 0
+                and signed_volume(v_out, f_out) > 0):
+                return v_out, f_out, "clean+fill_holes"
+            if verbose:
+                print(f"    clean+fill_holes: v={len(v_out)} bd={boundary_edge_count(f_out)}")
+        except Exception as e:
+            if verbose:
+                print(f"    clean+fill_holes raised: {e}")
+
+        # Step 4: full repair (aggressive — may delete a lot)
+        try:
+            fix = pymeshfix.MeshFix(v_in, f_in)
+            fix.repair()
+            v_out = np.asarray(fix.points, dtype=np.float64)
+            f_out = np.asarray(fix.faces, dtype=np.int32)
+            if (len(v_out) >= n_in * min_vertex_keep
+                and boundary_edge_count(f_out) == 0
+                and signed_volume(v_out, f_out) > 0):
+                return v_out, f_out, "full_repair"
+            if verbose:
+                print(f"    full_repair: v={len(v_out)} bd={boundary_edge_count(f_out)} (rejected)")
+        except Exception as e:
+            if verbose:
+                print(f"    full_repair raised: {e}")
+    except ImportError:
+        if verbose:
+            print("    pymeshfix not installed; skipping shape-preserving repair")
+
+    # Step 5: convex hull fallback
+    tm = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+    hull = tm.convex_hull
+    return (np.asarray(hull.vertices, dtype=np.float64),
+            np.asarray(hull.faces, dtype=np.int32),
+            "convex_hull")
+
+
 def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
             convex_hull: bool = False,
-            backup_suffix: str = ".orig") -> dict:
+            backup_suffix: str = ".orig",
+            auto_fix: bool = False,
+            min_vertex_keep: float = 0.95) -> dict:
     """Returns {input, before, after, output, changed}.
 
     When `output_path == input_path` (in-place rewrite), copies the
@@ -115,12 +221,22 @@ def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
         raise ValueError(f"{input_path}: did not load as a single trimesh "
                          f"(got {type(mesh).__name__})")
     before = winding_stats(mesh)
-    if convex_hull:
+    method_used = "fix_normals"
+    if auto_fix:
+        # Cascade: closed → fill_holes → clean+fill_holes → repair → convex hull
+        v_in = np.asarray(mesh.vertices, dtype=np.float64)
+        f_in = np.asarray(mesh.faces, dtype=np.int32)
+        v_out, f_out, method_used = smart_repair(
+            v_in, f_in, min_vertex_keep=min_vertex_keep, verbose=False
+        )
+        fixed = trimesh.Trimesh(vertices=v_out, faces=f_out, process=False)
+    elif convex_hull:
         # Replace with convex hull — guaranteed closed manifold, well-oriented.
         # Loses concavity detail but for ABD collision meshes that are
         # approximately convex (gripper fingers/knuckles, link cylinders),
         # the loss is negligible vs the gain of correct mass/centroid/inertia.
         fixed = mesh.convex_hull
+        method_used = "convex_hull"
     else:
         fixed = mesh.copy()
         fixed.fix_normals()
@@ -129,6 +245,8 @@ def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
         before["consistent_winding"] != after["consistent_winding"]
         or before["is_volume"] != after["is_volume"]
         or abs(before["signed_volume"] - after["signed_volume"]) > 1e-12
+        or len(mesh.vertices) != len(fixed.vertices)
+        or len(mesh.faces) != len(fixed.faces)
     )
 
     saved_to = None
@@ -156,6 +274,7 @@ def fix_one(input_path: Path, output_path: Path | None, dry_run: bool,
         "changed": changed,
         "saved_to": saved_to,
         "backed_up": backed_up,
+        "method": method_used,
     }
 
 
@@ -225,6 +344,20 @@ def main():
                          "(non-closed source). Loses concavity detail; only "
                          "appropriate when the original is approximately "
                          "convex (gripper fingers, link cylinders, etc.).")
+    ap.add_argument("--auto-fix", action="store_true",
+                    help="Smart per-mesh repair cascade (recommended): "
+                         "1) closed mesh → leave alone, "
+                         "2) pymeshfix.fill_holes (preserve shape), "
+                         "3) clean+fill_holes (more aggressive), "
+                         "4) full repair, "
+                         "5) convex hull (last-resort fallback). "
+                         "First step that produces closed mesh with vertex "
+                         "count >= input * --min-vertex-keep is accepted. "
+                         "Requires pymeshfix (pip install pymeshfix).")
+    ap.add_argument("--min-vertex-keep", type=float, default=0.95,
+                    help="--auto-fix: minimum vertex retention ratio "
+                         "(default 0.95 = at most 5%% loss before falling "
+                         "back to the next repair stage)")
     ap.add_argument("--collision-only", action="store_true",
                     help="URDF batch mode: only process <collision> meshes, "
                          "skip <visual>. Strongly recommended with "
@@ -278,13 +411,15 @@ def main():
                 # rule (<stem>_fixed.<ext> next to input) applies.
                 out = m_path if args.in_place else None
                 r = fix_one(m_path, out, args.dry_run, args.convex_hull,
-                            args.backup_suffix)
+                            args.backup_suffix, args.auto_fix,
+                            args.min_vertex_keep)
             except Exception as ex:
                 print(f"  {m_path.name}: ERROR — {type(ex).__name__}: {ex}")
                 continue
             tag = "MODIFIED" if r["changed"] else "ok      "
+            method = r.get("method", "")
             if r["changed"]: n_fixed += 1
-            print(f"  [{tag}] {m_path.name}")
+            print(f"  [{tag}] {m_path.name}  (method: {method})")
             print(f"    before: {fmt_stats(r['before'])}")
             if r["changed"]:
                 print(f"    after : {fmt_stats(r['after'])}")
@@ -301,7 +436,8 @@ def main():
             return
         out_path = Path(args.output).resolve() if args.output else None
         r = fix_one(input_path, out_path, args.dry_run, args.convex_hull,
-                    args.backup_suffix)
+                    args.backup_suffix, args.auto_fix,
+                    args.min_vertex_keep)
         print(f"  before: {fmt_stats(r['before'])}")
         if r["changed"]:
             print(f"  after : {fmt_stats(r['after'])}")
