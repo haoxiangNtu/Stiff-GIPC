@@ -477,6 +477,18 @@ class Engine:
     def set_prismatic_target(self, idx: int, distance_m: float) -> None:
         self._engine.set_prismatic_target(idx, distance_m)
 
+    def set_revolute_strength(self, idx: int, strength: float) -> None:
+        """Set per-joint driving strength multiplier.
+
+        Effective K = Config.revolute_driving_strength_ratio * strength *
+        (m_parent + m_child). Default 1.0 (no change vs global ratio).
+        Lower = joint yields under contact.
+        """
+        self._engine.set_revolute_strength(idx, strength)
+
+    def set_prismatic_strength(self, idx: int, strength: float) -> None:
+        self._engine.set_prismatic_strength(idx, strength)
+
     def get_revolute_current_angles(self) -> np.ndarray:
         """Read actual joint angles from GPU state. Returns (N,) float64 in radians."""
         return self._engine.get_revolute_current_angles()

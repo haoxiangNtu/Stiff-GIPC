@@ -969,6 +969,16 @@ void SimEngine::set_prismatic_target(int idx, double distance_m)
     m_impl->tetMesh.prismatic_drive_controls.at(idx).target_distance = distance_m;
 }
 
+void SimEngine::set_revolute_strength(int idx, double strength)
+{
+    m_impl->tetMesh.joint_angle_controls.at(idx).strength_ratio = strength;
+}
+
+void SimEngine::set_prismatic_strength(int idx, double strength)
+{
+    m_impl->tetMesh.prismatic_drive_controls.at(idx).strength_ratio = strength;
+}
+
 double SimEngine::get_revolute_target(int idx) const
 {
     return m_impl->tetMesh.joint_angle_controls.at(idx).target_angle;
