@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Case 26 — performance-tuned variant (~1.43× from param tuning + ~5x on
+"""Case 26 — performance-tuned variant (~1.43× from param tuning + ~5× on
 stall in moving scenarios via joint_strength_ratio=200; combined with the
-v0.2.0 engine this stacks to >>1.5x overall).
+v0.2.0 engine this stacks to >>1.5× overall).
+
+For even more aggressive stall reduction via per-joint API (arm=200
+stable, gripper=20 soft), see `case_26_perf_extreme.py`.
 
 Same scene as `case_26_arm_cloth_semi_implicit.py` (XArm7 + Gripper +
 shirt_6436v free-fall), but with TWO categories of tuning stacked:
@@ -165,8 +168,9 @@ def main():
         poisson_rate=0.49,
         friction_rate=0.4,
         relative_dhat=1e-3,                  # default (tightening gives no net speedup)
-        joint_strength_ratio=200.0,          # ★ tuned (default 1000, 5x softer for stall avoidance)
-        revolute_driving_strength_ratio=200.0,  # ★ same reason
+        joint_strength_ratio=150.0,           # ★ tuned (default 1000). Arm stays at 200 (stable feel);
+                                              #    gripper per-joint multiplier reduces stall further (below).
+        revolute_driving_strength_ratio=150.0,  # ★ same. gripper multiplier below gives fine-grained control
         semi_implicit_enabled=True,
         semi_implicit_beta_tol=5e-2,         # ★ tuned (default 1e-3, 50x looser)
         semi_implicit_min_iter=1,
