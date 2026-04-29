@@ -410,6 +410,14 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("set_prismatic_target",      &SimEngine::set_prismatic_target,
              py::arg("idx"), py::arg("distance_m"))
 
+        .def("set_revolute_strength",     &SimEngine::set_revolute_strength,
+             py::arg("idx"), py::arg("strength"),
+             "Set per-joint driving strength multiplier. Lower = joint yields "
+             "under contact (e.g. gripper vs cloth). Effective K = "
+             "Config.revolute_driving_strength_ratio * strength * (m_p+m_c).")
+        .def("set_prismatic_strength",    &SimEngine::set_prismatic_strength,
+             py::arg("idx"), py::arg("strength"))
+
         .def("get_revolute_target",       &SimEngine::get_revolute_target,  py::arg("idx"))
         .def("get_prismatic_target",      &SimEngine::get_prismatic_target, py::arg("idx"))
 

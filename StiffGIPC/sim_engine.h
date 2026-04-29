@@ -251,6 +251,16 @@ class SimEngine
     void set_revolute_initial_offset(int idx, double offset_rad);
     void set_prismatic_target(int idx, double distance_m);
 
+    /// Set per-joint driving strength multiplier.
+    /// Effective stiffness = Config.revolute_driving_strength_ratio *
+    /// strength * (m_parent + m_child). Default 1.0.
+    /// Lower values (e.g. 0.1) make the joint "give way" under contact —
+    /// useful for gripper fingers that should yield when pressing against
+    /// cloth instead of crushing it thin (which triggers barrier-Kappa
+    /// cascade and slows Newton). Applied starting next step().
+    void set_revolute_strength(int idx, double strength);
+    void set_prismatic_strength(int idx, double strength);
+
     double get_revolute_target(int idx) const;
     double get_prismatic_target(int idx) const;
 

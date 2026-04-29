@@ -132,6 +132,38 @@ class Robot:
     def get_revolute_target_deg(self, index: int) -> float:
         return self._targets_deg.get(index, 0.0)
 
+    def set_revolute_strength(self, index: int, strength: float) -> None:
+        """Set per-joint driving strength multiplier.
+
+        Effective stiffness K = Config.revolute_driving_strength_ratio *
+        strength * (m_parent + m_child). Default 1.0 (uses global ratio
+        unchanged). Lower values (e.g. 0.1) let the joint "give way"
+        under contact — useful for gripper fingers that should yield when
+        pressing against cloth rather than crushing it thin (which
+        triggers IPC-barrier-Kappa cascade and slows Newton 5x).
+
+        Takes effect on the next engine.step().
+        """
+        self._engine.set_revolute_strength(index, strength)
+
+    def set_gripper_strength(self, strength: float,
+                             name_patterns: tuple[str, ...] = ("finger", "knuckle", "drive_joint")) -> int:
+        """Convenience: set `strength` for all gripper revolute joints.
+
+        Matches joint name substrings in `name_patterns`. Returns number
+        of joints updated.
+
+        Typical use for xarm7+gripper: arm joints remain at default 1.0
+        (precise tracking) while gripper joints drop to 0.1-0.5 for
+        compliant cloth interaction.
+        """
+        n = 0
+        for i, ji in enumerate(self._revolute_joints):
+            if any(pat in ji.name for pat in name_patterns):
+                self.set_revolute_strength(i, strength)
+                n += 1
+        return n
+
     # ---- Prismatic joints ----
 
     def set_prismatic_position(
