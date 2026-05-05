@@ -273,11 +273,11 @@ cd build      && cmake --build . --target pystiffgipc -j$(nproc) && cd ..
 
 ### 5.1 端到端安装测试（**release 必跑**）
 
-> **强制规则（v0.1.1 教训）：每次发新 release 之前，every example script 都必须从这条 fresh wheel-install 流程跑过一遍**。
+> **强制规则（v0.1.1 + v0.3.0 双教训）：每次发新 release 之前，**`examples/` 下的每一个 `.py` 文件**都必须从这条 fresh wheel-install 流程跑过一遍**——不是抽样、不是只跑 main path、不是只跑改动过的 demo。
 >
-> 原因：在私有仓 dev worktree 里跑 example 时 `_INSTALLED_MODE=False`，engine 的 `assets_dir` fallback 到编译时 `GIPC_ASSETS_DIR` 宏（巧合指向源码 `Assets/`），脚本即使没显式传 `assets_dir=` 也能跑通；但用户 `pip install` 后 `_INSTALLED_MODE=True`，fallback 切换到 wheel 内 `stiff_physics/data/`（**只含 `scene/abd_system_config.json` 132 字节**，没有 URDF / mesh），脚本立刻 `URDF file does not exist`。
+> v0.1.1 教训：在私有仓 dev worktree 里跑 example 时 `_INSTALLED_MODE=False`，engine 的 `assets_dir` fallback 到编译时 `GIPC_ASSETS_DIR` 宏（巧合指向源码 `Assets/`），脚本即使没显式传 `assets_dir=` 也能跑通；但用户 `pip install` 后 `_INSTALLED_MODE=True`，fallback 切换到 wheel 内 `stiff_physics/data/`（**只含 `scene/abd_system_config.json` 132 字节**，没有 URDF / mesh），脚本立刻 `URDF file does not exist`。`case_26_render_obj_indices.py` 第一次发布就踩了这个坑（dev 测试通过、用户装好后崩）—— 后续每个 example 都必须显式 `Config(assets_dir=ASSETS_DIR)`。
 >
-> v0.1.1 的 `case_26_render_obj_indices.py` 第一次发布就踩了这个坑（dev 测试通过、用户装好后崩）—— 后续每个 example 都必须显式 `Config(assets_dir=ASSETS_DIR)`，且必须在干净 wheel-install env 里 sanity-check 通过才算 release-ready。
+> v0.3.0 教训（依赖版本漂移）：`pyproject.toml` 里 `vis = ["polyscope"]` 没有版本约束，**fresh-env install 抓到的是当下 PyPI 上最新版**——dev env (env_isaaclab, frozen 2026-02-06) 一直是 polyscope 2.5.0、demo 在那里测试通过；但 fresh-env 在 4 月底已经升到 2.6.1，**该版本删除了 `psim.SetWindowFontScale`**（imgui upstream 的 deprecation cleanup 引入的 breaking change，但 polyscope 自己没 bump major 版本号）。`case_replay_user_gui.py` 和 `demo_body_view.py` 调用了这个 API，**fresh-env 测试如果真的全跑就该崩、但 v0.3.0 漏测了**。修复：(a) `vis = ["polyscope>=2.4,<2.6"]` 锁定上限（commit c059969），(b) 把 `SetWindowFontScale` 包 `getattr(... , lambda x: None)` fallback。**根因还是 §5.1 流程没真正全跑——以下流程图加严，不能再漏**。
 
 在一个干净的 conda 环境中测试（模拟用户首次安装）：
 
@@ -290,25 +290,38 @@ conda activate test_stiff
 cd ~/Downloads
 git clone https://github.com/haoxiangNtu/stiff-physics.git test-stiff-physics
 cd test-stiff-physics
-pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.1.1/stiff_physics-0.1.1-cp311-cp311-linux_x86_64.whl
-pip install polyscope scipy
+pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v<VERSION>/stiff_physics-<VERSION>-cp311-cp311-linux_x86_64.whl
+# IMPORTANT: 使用 pyproject.toml 声明的同一个 polyscope 版本范围。
+# 不要写裸 `pip install polyscope`——那会跨时间不可复现，v0.3.0 就因此漏抓 2.6.1 breaking change。
+pip install "polyscope>=2.4,<2.6" scipy h5py
 
-# === 必跑：每个 examples/*.py 都要 sanity-check 至少能加载 ===
-# 基础场景（GUI）
-python examples/case_26_arm_cloth_semi_implicit.py
-# 应弹出 Polyscope 窗口，URDF 18 link 加载，shirt mesh 加载，点 Run 启动仿真
+# === 必跑：examples/ 下每一个 *.py 都要 sanity-check ===
+# 不允许只测主线（case_26_arm_cloth_semi_implicit）然后假定其他都 OK。
+# 用脚本扫一遍，确保没有遗漏：
+ls examples/*.py | while read f; do
+  echo "=== smoke: $f ==="
+  timeout 30 python "$f" --help 2>&1 | head -3 || true
+  # 对支持 --help 的 demo 看是否打印；不支持的就 try 启动 5 秒后 SIGINT
+done
 
-# v0.1.1 新增：per-body 彩色渲染
-python examples/case_26_render_obj_indices.py
-# 应弹出 Polyscope 窗口（同 case_26 物理），arm 各 link HSV 渐变颜色，shirt XYZ→RGB
+# 然后每个 GUI demo 至少手动启动一次（Polyscope 窗口必须能弹出，仿真能跑 1 step 不崩）：
+python examples/case_26_arm_cloth_semi_implicit.py    # 基础 slider GUI
+python examples/case_26_perf_tuned.py                 # tuned variant
+python examples/case_26_perf_extreme.py               # extreme variant
+python examples/case_26_render_obj_indices.py         # per-body 彩色 (v0.1.1)
+python examples/case_replay_user_gui.py               # 477 帧 qpos replay (v0.3.0)
+python examples/demo_body_view.py                     # body-view demo
+# ...其余 examples/*.py 一个不漏
 
-# headless 测试（无 GUI）
+# headless（无 GUI）
 python examples/headless_joint_control.py
 # 应打印 vertex 数据 + 100 帧仿真完成，无 RuntimeError
 
 # === sanity check 验证清单 ===
-# [ ] 没有 "URDF file does not exist" 错误（说明 assets_dir 解析正确）
+# [ ] 每个 examples/*.py 都至少 import + load + step 1 帧成功（用上面 ls + timeout 循环验过）
+# [ ] 没有 "URDF file does not exist" 错误（说明 assets_dir 解析正确，v0.1.1 教训）
 # [ ] 没有 "cannot create directory: .../sorted_mesh/" 错误（说明 metis 路径已不烤死）
+# [ ] 没有 AttributeError 在 polyscope.imgui 或 stiff_physics.engine.* 上（v0.3.0 教训：依赖漂移）
 # [ ] Polyscope 窗口正常弹出，仿真可启动
 # [ ] headless 100 帧跑完无崩
 
@@ -323,6 +336,7 @@ rm -rf ~/Downloads/test-stiff-physics
 - [ ] 显式 `Config(..., assets_dir=ASSETS_DIR)` 不要依赖 `engine.native.get_assets_dir()` 默认
 - [ ] 在 fresh wheel-install env 里跑过，确认能加载 URDF / mesh
 - [ ] 没有用 wheel 没暴露的 API（比如 `get_last_diag()` 是 post-v0.1.x 才有）
+- [ ] 用到的第三方 API（`polyscope.imgui` 等）确认在 `pyproject.toml` 锁定的版本范围下都存在；如果用了可能跨版本变化的 API（如 `psim.SetWindowFontScale`），用 `getattr(psim, "...", lambda *a: None)` 包一层 fallback（v0.3.0 教训）
 
 ### 5.2 开发模式快速测试
 
@@ -356,7 +370,7 @@ python examples/headless_joint_control.py
 | GPU | NVIDIA RTX 4090 (sm_89) 或 RTX 5090 (sm_120) |
 | 驱动 | NVIDIA driver with CUDA 12.x support |
 | Python | 3.11（wheel 当前编译版本） |
-| 运行依赖 | `numpy`（wheel 自带）、`polyscope`（可视化）、`scipy`（旋转计算） |
+| 运行依赖 | `numpy`（wheel 自带）、`polyscope>=2.4,<2.6`（可视化；2.6 删了 SetWindowFontScale，跟着 imgui upstream，未做 demo 迁移前不能解锁）、`scipy`（旋转计算）、`h5py`（部分 replay demo） |
 | 系统库 | `liburdfdom-dev`（`sudo apt install liburdfdom-dev`） |
 
 ## 7. 已知问题与注意事项
