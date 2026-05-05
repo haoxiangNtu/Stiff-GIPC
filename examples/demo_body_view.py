@@ -213,10 +213,10 @@ def main():
         if isinstance(opened, tuple):
             opened = opened[0]
         if opened:
-            psim.SetWindowFontScale(1.5)
+            getattr(psim, "SetWindowFontScale", lambda x: None)(1.5)
             psim.TextColored((0.7, 0.95, 0.7, 1.0),
                              f"{len(bodies)} bodies registered as separate meshes")
-            psim.SetWindowFontScale(1.0)
+            getattr(psim, "SetWindowFontScale", lambda x: None)(1.0)
             psim.Separator()
             n_abd = sum(1 for b in bodies if b.kind == "ABD")
             n_fem = sum(1 for b in bodies if b.kind == "FEM")
