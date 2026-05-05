@@ -13,7 +13,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vis = ["polyscope"]
+# polyscope 2.6.x removed psim.SetWindowFontScale (followed imgui upstream
+# deprecation). Until demos migrate to PushFont/PopFont, pin to <2.6.
+# Lower bound 2.4 = first version with the imgui binding subset we use.
+vis = ["polyscope>=2.4,<2.6"]
 usd = ["usd-core"]
 dev = ["pytest", "black", "ruff"]
 
