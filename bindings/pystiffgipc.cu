@@ -290,6 +290,13 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("get_assets_dir", &SimEngine::get_assets_dir)
 
+        .def("get_total_newton_iters", &SimEngine::get_total_newton_iters)
+        .def("get_total_pcg_iters", &SimEngine::get_total_pcg_iters)
+        .def("get_total_collision_pairs", &SimEngine::get_total_collision_pairs)
+        .def("get_max_collision_pairs", &SimEngine::get_max_collision_pairs)
+        .def("get_total_frames_done", &SimEngine::get_total_frames_done)
+
+
         // Vertex positions as numpy array (N, 3) float64
         .def("get_vertices", [](const SimEngine& e) {
             int n = e.get_vertex_count();
