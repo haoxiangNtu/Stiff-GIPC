@@ -141,6 +141,8 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(body_motor_params));
     CUDA_SAFE_CALL(cudaFree(collision_skip_matrix));
     CUDA_SAFE_CALL(cudaFree(ground_skip_body));
+    CUDA_SAFE_CALL(cudaFree(bvh_active_face_idx));
+    CUDA_SAFE_CALL(cudaFree(bvh_active_edge_idx));
 
     // Stitch spring GPU arrays
     CUDA_SAFE_CALL(cudaFree(d_stitch_paired_vertex));

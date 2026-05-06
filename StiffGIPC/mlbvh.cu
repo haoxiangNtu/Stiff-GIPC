@@ -1161,7 +1161,10 @@ __global__ void _calcLeafBvs(const double3*      _vertexes,
                              const element_type* _elements,
                              AABB*               _bvs,
                              int                 faceNum,
-                             int                 type = 0)
+                             int                 type = 0,
+                             const int*          _bodyID = nullptr,
+                             const int*          _collision_skip_matrix = nullptr,
+                             int                 _collision_body_count = 0)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= faceNum)
@@ -1169,6 +1172,21 @@ __global__ void _calcLeafBvs(const double3*      _vertexes,
     AABB _bv;
 
     element_type _e = _elements[idx];
+
+    // BVH-skip optimization (audit/perf-bvh-skip-isolated): if the element's
+    // body has all collisions excluded (diag matrix[B][B]==1), leave _bv as
+    // default (empty: lower>upper). Cloth/other-body queries' overlap tests
+    // will return false, so the entire isolated-body subtree is naturally
+    // pruned during traversal — no descent into these leaves at all.
+    if(_bodyID && _collision_skip_matrix && _collision_body_count > 0) {
+        int B = _bodyID[_e.x];
+        if(B >= 0 && B < _collision_body_count
+           && _collision_skip_matrix[B * _collision_body_count + B] != 0) {
+            _bvs[idx] = _bv;  // default empty bbox
+            return;
+        }
+    }
+
     double3      _v = _vertexes[_e.x];
     _bv.combines(_v.x, _v.y, _v.z);
     _v = _vertexes[_e.y];
@@ -1188,7 +1206,10 @@ __global__ void _calcLeafBvs_ccd(const double3*      _vertexes,
                                  const element_type* _elements,
                                  AABB*               _bvs,
                                  int                 faceNum,
-                                 int                 type = 0)
+                                 int                 type = 0,
+                                 const int*          _bodyID = nullptr,
+                                 const int*          _collision_skip_matrix = nullptr,
+                                 int                 _collision_body_count = 0)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= faceNum)
@@ -1196,6 +1217,17 @@ __global__ void _calcLeafBvs_ccd(const double3*      _vertexes,
     AABB _bv;
 
     element_type _e   = _elements[idx];
+
+    // BVH-skip optimization (audit/perf-bvh-skip-isolated)
+    if(_bodyID && _collision_skip_matrix && _collision_body_count > 0) {
+        int B = _bodyID[_e.x];
+        if(B >= 0 && B < _collision_body_count
+           && _collision_skip_matrix[B * _collision_body_count + B] != 0) {
+            _bvs[idx] = _bv;
+            return;
+        }
+    }
+
     double3      _v   = _vertexes[_e.x];
     double3      _mvD = _moveDir[_e.x];
     _bv.combines(_v.x, _v.y, _v.z);
@@ -1214,6 +1246,96 @@ __global__ void _calcLeafBvs_ccd(const double3*      _vertexes,
         _bv.combines(_v.x - _mvD.x * alpha, _v.y - _mvD.y * alpha, _v.z - _mvD.z * alpha);
     }
     _bvs[idx] = _bv;
+}
+
+// BVH-skip #3: indirect leaf-bbox kernel.
+// Builds bbox for n_active leaves; thread t reads element via _active_idx[t]
+// and writes _bvs[t]. Combined with calcLeafNodes_indirect, the final BVH stores
+// ORIGINAL face/edge indices in element_idx (so query kernels can dereference
+// _faces[element_idx] correctly), while topology size is reduced to n_active.
+template <class element_type>
+__global__ void _calcLeafBvs_indirect(const double3*      _vertexes,
+                                      const element_type* _elements,
+                                      const int*          _active_idx,
+                                      AABB*               _bvs,
+                                      int                 n_active,
+                                      int                 type)
+{
+    int t = threadIdx.x + blockIdx.x * blockDim.x;
+    if(t >= n_active)
+        return;
+    int          orig = _active_idx[t];
+    element_type _e   = _elements[orig];
+    AABB         _bv;
+    double3      _v = _vertexes[_e.x];
+    _bv.combines(_v.x, _v.y, _v.z);
+    _v = _vertexes[_e.y];
+    _bv.combines(_v.x, _v.y, _v.z);
+    if(type == 0)
+    {
+        _v = _vertexes[*((uint32_t*)(&_e) + 2)];
+        _bv.combines(_v.x, _v.y, _v.z);
+    }
+    _bvs[t] = _bv;
+}
+
+template <class element_type>
+__global__ void _calcLeafBvs_ccd_indirect(const double3*      _vertexes,
+                                          const double3*      _moveDir,
+                                          double              alpha,
+                                          const element_type* _elements,
+                                          const int*          _active_idx,
+                                          AABB*               _bvs,
+                                          int                 n_active,
+                                          int                 type)
+{
+    int t = threadIdx.x + blockIdx.x * blockDim.x;
+    if(t >= n_active)
+        return;
+    int          orig = _active_idx[t];
+    element_type _e   = _elements[orig];
+    AABB         _bv;
+    double3      _v   = _vertexes[_e.x];
+    double3      _mvD = _moveDir[_e.x];
+    _bv.combines(_v.x, _v.y, _v.z);
+    _bv.combines(_v.x - _mvD.x * alpha, _v.y - _mvD.y * alpha, _v.z - _mvD.z * alpha);
+
+    _v   = _vertexes[_e.y];
+    _mvD = _moveDir[_e.y];
+    _bv.combines(_v.x, _v.y, _v.z);
+    _bv.combines(_v.x - _mvD.x * alpha, _v.y - _mvD.y * alpha, _v.z - _mvD.z * alpha);
+    if(type == 0)
+    {
+        _v   = _vertexes[*((uint32_t*)(&_e) + 2)];
+        _mvD = _moveDir[*((uint32_t*)(&_e) + 2)];
+        _bv.combines(_v.x, _v.y, _v.z);
+        _bv.combines(_v.x - _mvD.x * alpha, _v.y - _mvD.y * alpha, _v.z - _mvD.z * alpha);
+    }
+    _bvs[t] = _bv;
+}
+
+// Variant of _calcLeafNodes that maps the (sorted) leaf-array index back to
+// the ORIGINAL face/edge index via _active_idx, so query kernels work unchanged.
+__global__ void _calcLeafNodes_indirect(Node*           _nodes,
+                                        const uint32_t* _indices,
+                                        const int*      _active_idx,
+                                        int             number)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= number)
+        return;
+    if(idx < number - 1)
+    {
+        _nodes[idx].left_idx    = 0xFFFFFFFF;
+        _nodes[idx].right_idx   = 0xFFFFFFFF;
+        _nodes[idx].parent_idx  = 0xFFFFFFFF;
+        _nodes[idx].element_idx = 0xFFFFFFFF;
+    }
+    int l_idx                 = idx + number - 1;
+    _nodes[l_idx].left_idx    = 0xFFFFFFFF;
+    _nodes[l_idx].right_idx   = 0xFFFFFFFF;
+    _nodes[l_idx].parent_idx  = 0xFFFFFFFF;
+    _nodes[l_idx].element_idx = _active_idx[_indices[idx]];
 }
 
 __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number)
@@ -1342,6 +1464,16 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
 
     AABB _bv;
     idx       = _surfVerts[idx];
+
+    // BVH-skip: query vertex's body has no possible collisions → exit early.
+    // (audit/perf-bvh-skip-isolated: diag[B][B]==1 marks isolated body)
+    if(_collision_skip_matrix && _collision_body_count > 0) {
+        int B = _bodyID[idx];
+        if(B >= 0 && B < _collision_body_count
+           && _collision_skip_matrix[B * _collision_body_count + B] != 0)
+            return;
+    }
+
     _bv.upper = _vertexes[idx];
     _bv.lower = _vertexes[idx];
     //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_bvs[0].upper, _bvs[0].lower));
@@ -1450,6 +1582,15 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
 
     AABB _bv;
     idx                    = _surfVerts[idx];
+
+    // BVH-skip (audit/perf-bvh-skip-isolated)
+    if(_collision_skip_matrix && _collision_body_count > 0) {
+        int B = _bodyID[idx];
+        if(B >= 0 && B < _collision_body_count
+           && _collision_skip_matrix[B * _collision_body_count + B] != 0)
+            return;
+    }
+
     double3 current_vertex = _vertexes[idx];
     double3 mvD            = moveDir[idx];
     _bv.upper              = current_vertex;
@@ -1558,6 +1699,16 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
     idx               = idx + number - 1;
     AABB     _bv      = _bvs[idx];
     uint32_t self_eid = _nodes[idx].element_idx;
+
+    // BVH-skip (audit/perf-bvh-skip-isolated): if both edge endpoints' body
+    // is isolated, no collision is possible — exit early.
+    if(_collision_skip_matrix && _collision_body_count > 0) {
+        int B = _bodyID[_edges[self_eid].x];
+        if(B >= 0 && B < _collision_body_count
+           && _collision_skip_matrix[B * _collision_body_count + B] != 0)
+            return;
+    }
+
     //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_bvs[0].upper, _bvs[0].lower));
     //printf("%f\n", bboxDiagSize2);
     double gapl = sqrt(dHat);  //0.001 * sqrt(bboxDiagSize2);
@@ -1688,6 +1839,14 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
     AABB     _bv          = _bvs[idx];
     uint32_t self_eid     = _nodes[idx].element_idx;
     uint2    current_edge = _edges[self_eid];
+
+    // BVH-skip (audit/perf-bvh-skip-isolated)
+    if(_collision_skip_matrix && _collision_body_count > 0) {
+        int B = _bodyID[current_edge.x];
+        if(B >= 0 && B < _collision_body_count
+           && _collision_skip_matrix[B * _collision_body_count + B] != 0)
+            return;
+    }
     //double3 edge_tvert0 = __GEIGEN__::__minus(_vertexes[current_edge.x], __GEIGEN__::__s_vec_multiply(moveDir[current_edge.x], alpha));
     //double3 edge_tvert1 = __GEIGEN__::__minus(_vertexes[current_edge.y], __GEIGEN__::__s_vec_multiply(moveDir[current_edge.y], alpha));
     //_bv.combines(edge_tvert0.x, edge_tvert0.y, edge_tvert0.z);
@@ -1814,14 +1973,18 @@ void calcLeafBvs(const double3*      _vertexes,
                  const element_type* _faces,
                  AABB*               _bvs,
                  const int&          faceNum,
-                 const int&          type)
+                 const int&          type,
+                 const int*          _bodyID = nullptr,
+                 const int*          _collision_skip_matrix = nullptr,
+                 int                 _collision_body_count = 0)
 {
     int numbers = faceNum;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calcLeafBvs<<<blockNum, threadNum>>>(_vertexes, _faces, _bvs + numbers - 1, faceNum, type);
+    _calcLeafBvs<<<blockNum, threadNum>>>(_vertexes, _faces, _bvs + numbers - 1, faceNum, type,
+                                          _bodyID, _collision_skip_matrix, _collision_body_count);
 }
 
 template <class element_type>
@@ -1831,7 +1994,10 @@ void calcLeafBvs_fullCCD(const double3*      _vertexes,
                          const element_type* _faces,
                          AABB*               _bvs,
                          const int&          faceNum,
-                         const int&          type)
+                         const int&          type,
+                         const int*          _bodyID = nullptr,
+                         const int*          _collision_skip_matrix = nullptr,
+                         int                 _collision_body_count = 0)
 {
     int numbers = faceNum;
     if(numbers < 1)
@@ -1839,7 +2005,56 @@ void calcLeafBvs_fullCCD(const double3*      _vertexes,
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     _calcLeafBvs_ccd<<<blockNum, threadNum>>>(
-        _vertexes, _moveDir, alpha, _faces, _bvs + numbers - 1, faceNum, type);
+        _vertexes, _moveDir, alpha, _faces, _bvs + numbers - 1, faceNum, type,
+        _bodyID, _collision_skip_matrix, _collision_body_count);
+}
+
+// BVH-skip #3 launchers: write n_active leaves at _bvs+(n_active-1), saving
+// sort/tree-build work proportional to the fraction of isolated faces/edges.
+template <class element_type>
+void calcLeafBvs_indirect(const double3*      _vertexes,
+                          const element_type* _faces,
+                          const int*          _active_idx,
+                          AABB*               _bvs,
+                          int                 n_active,
+                          int                 type)
+{
+    if(n_active < 1)
+        return;
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (n_active + threadNum - 1) / threadNum;
+    _calcLeafBvs_indirect<<<blockNum, threadNum>>>(
+        _vertexes, _faces, _active_idx, _bvs + n_active - 1, n_active, type);
+}
+
+template <class element_type>
+void calcLeafBvs_fullCCD_indirect(const double3*      _vertexes,
+                                  const double3*      _moveDir,
+                                  const double&       alpha,
+                                  const element_type* _faces,
+                                  const int*          _active_idx,
+                                  AABB*               _bvs,
+                                  int                 n_active,
+                                  int                 type)
+{
+    if(n_active < 1)
+        return;
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (n_active + threadNum - 1) / threadNum;
+    _calcLeafBvs_ccd_indirect<<<blockNum, threadNum>>>(
+        _vertexes, _moveDir, alpha, _faces, _active_idx, _bvs + n_active - 1, n_active, type);
+}
+
+void calcLeafNodes_indirect(Node*           _nodes,
+                            const uint32_t* _indices,
+                            const int*      _active_idx,
+                            int             n_active)
+{
+    if(n_active < 1)
+        return;
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (n_active + threadNum - 1) / threadNum;
+    _calcLeafNodes_indirect<<<blockNum, threadNum>>>(_nodes, _indices, _active_idx, n_active);
 }
 
 void calcMChash(uint64_t* _MChash, AABB* _bvs, int number)
@@ -2126,7 +2341,8 @@ void lbvh_e::init(int*       _mbodyID,
 
 AABB* lbvh_f::getSceneSize()
 {
-    calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0);
+    calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
+                _bodyId, _collision_skip_matrix, _collision_body_count);
 
     calcMaxBV(_bvs, _tempLeafBox, face_number);
     return _bvs;
@@ -2134,7 +2350,29 @@ AABB* lbvh_f::getSceneSize()
 
 double lbvh_f::Construct()
 {
-    calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0);
+    // BVH-skip #3: when _active_idx is set and shrinks the input, build BVH on
+    // n_active leaves instead of full face_number — saves work in calcMaxBV,
+    // sort_by_key, sortBvs, internal-node + AABB passes proportional to (1 - n_active/face_number).
+    if(_active_idx != nullptr && face_number_active > 0
+       && face_number_active <= (int)face_number)
+    {
+        const int N = face_number_active;
+        calcLeafBvs_indirect(_vertexes, _faces, _active_idx, _bvs, N, 0);
+        scene = calcMaxBV(_bvs, _tempLeafBox, N);
+        calcMChash(_MChash, _bvs, N);
+        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
+                         thrust::device_ptr<uint32_t>(_indices) + N);
+        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
+                            thrust::device_ptr<uint64_t>(_MChash) + N,
+                            thrust::device_ptr<uint32_t>(_indices));
+        sortBvs(_indices, _bvs, _tempLeafBox, N);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
+        calcInternalNodes(_nodes, _MChash, N);
+        calcInternalAABB(_nodes, _bvs, _flags, N);
+        return 0;
+    }
+    calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
+                _bodyId, _collision_skip_matrix, _collision_body_count);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
     calcMChash(_MChash, _bvs, face_number);
@@ -2153,7 +2391,27 @@ double lbvh_f::Construct()
 
 double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha)
 {
-    calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0);
+    if(_active_idx != nullptr && face_number_active > 0
+       && face_number_active <= (int)face_number)
+    {
+        const int N = face_number_active;
+        calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _faces,
+                                     _active_idx, _bvs, N, 0);
+        scene = calcMaxBV(_bvs, _tempLeafBox, N);
+        calcMChash(_MChash, _bvs, N);
+        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
+                         thrust::device_ptr<uint32_t>(_indices) + N);
+        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
+                            thrust::device_ptr<uint64_t>(_MChash) + N,
+                            thrust::device_ptr<uint32_t>(_indices));
+        sortBvs(_indices, _bvs, _tempLeafBox, N);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
+        calcInternalNodes(_nodes, _MChash, N);
+        calcInternalAABB(_nodes, _bvs, _flags, N);
+        return 0;
+    }
+    calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
+                        _bodyId, _collision_skip_matrix, _collision_body_count);
     scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
     calcMChash(_MChash, _bvs, face_number);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
@@ -2174,6 +2432,25 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha)
 
 double lbvh_e::Construct()
 {
+    // BVH-skip #3: when _active_idx is set (face_number_active reused as edge active count)
+    if(_active_idx != nullptr && face_number_active > 0
+       && face_number_active <= (int)edge_number)
+    {
+        const int N = face_number_active;
+        calcLeafBvs_indirect(_vertexes, _edges, _active_idx, _bvs, N, 1);
+        scene = calcMaxBV(_bvs, _tempLeafBox, N);
+        calcMChash(_MChash, _bvs, N);
+        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
+                         thrust::device_ptr<uint32_t>(_indices) + N);
+        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
+                            thrust::device_ptr<uint64_t>(_MChash) + N,
+                            thrust::device_ptr<uint32_t>(_indices));
+        sortBvs(_indices, _bvs, _tempLeafBox, N);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
+        calcInternalNodes(_nodes, _MChash, N);
+        calcInternalAABB(_nodes, _bvs, _flags, N);
+        return 0;
+    }
 
     /*cudaEvent_t start, end0, end1, end2;
     cudaEventCreate(&start);
@@ -2182,7 +2459,8 @@ double lbvh_e::Construct()
     cudaEventCreate(&end2);
 
     cudaEventRecord(start);*/
-    calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1);
+    calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1,
+                _bodyId, _collision_skip_matrix, _collision_body_count);
     scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
     calcMChash(_MChash, _bvs, edge_number);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
@@ -2219,7 +2497,27 @@ double lbvh_e::Construct()
 
 double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha)
 {
-    calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1);
+    if(_active_idx != nullptr && face_number_active > 0
+       && face_number_active <= (int)edge_number)
+    {
+        const int N = face_number_active;
+        calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _edges,
+                                     _active_idx, _bvs, N, 1);
+        scene = calcMaxBV(_bvs, _tempLeafBox, N);
+        calcMChash(_MChash, _bvs, N);
+        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
+                         thrust::device_ptr<uint32_t>(_indices) + N);
+        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
+                            thrust::device_ptr<uint64_t>(_MChash) + N,
+                            thrust::device_ptr<uint32_t>(_indices));
+        sortBvs(_indices, _bvs, _tempLeafBox, N);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
+        calcInternalNodes(_nodes, _MChash, N);
+        calcInternalAABB(_nodes, _bvs, _flags, N);
+        return 0;
+    }
+    calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
+                        _bodyId, _collision_skip_matrix, _collision_body_count);
     scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
     calcMChash(_MChash, _bvs, edge_number);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
@@ -2263,7 +2561,13 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
 
 void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
 {
-
+    // BVH-skip #3: EE self-query reads leaves at offset [N-1, 2N-1). When
+    // indirect BVH is active, leaves live at [n_active-1, 2*n_active-1), so
+    // we must launch with N = n_active edges, not the full edge_number.
+    int N = (_active_idx != nullptr && face_number_active > 0
+             && face_number_active <= (int)edge_number)
+                ? face_number_active
+                : (int)edge_number;
     selfQuery_ee(_bodyId,
                  _btype,
                  _vertexes,
@@ -2276,7 +2580,7 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  _cpNum,
                  _MatIndex,
                  dHat,
-                 edge_number,
+                 N,
                  _collision_skip_matrix,
                  _collision_body_count,
                  stream);
@@ -2292,9 +2596,13 @@ void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
 
 void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream)
 {
-
+    // Same fix as SelfCollitionDetect: launch count must match leaf count.
+    int N = (_active_idx != nullptr && face_number_active > 0
+             && face_number_active <= (int)edge_number)
+                ? face_number_active
+                : (int)edge_number;
     fullCCDselfQuery_ee(
-        _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, edge_number,
+        _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, N,
         _collision_skip_matrix, _collision_body_count, stream);
 }
 

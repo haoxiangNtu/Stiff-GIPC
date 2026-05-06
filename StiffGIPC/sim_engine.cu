@@ -701,6 +701,48 @@ void SimEngine::Impl::do_upload_to_gpu()
         ipc._ground_body_count = N;
     }
 
+    // BVH-skip optimization (audit/perf-bvh-skip-isolated): mark "isolated"
+    // bodies via the diagonal of collision_skip_matrix. Body i is isolated iff
+    // ground_skip_body[i]==1 AND all off-diagonal cells in row i are 1.
+    // Kernels detect this with a single matrix lookup at thread entry.
+    //
+    // Toggle: BVHSKIP2=0 disables this (and #3, since #3 piggy-backs on the
+    // same isolation flag). Use to measure #1-only baseline.
+    const char* bvhskip2_env_local = std::getenv("BVHSKIP2");
+    bool bvhskip2_enabled_local = (bvhskip2_env_local == nullptr) || (std::string(bvhskip2_env_local) != "0");
+    if(!bvhskip2_enabled_local) {
+        printf("[BVHSkip#2] DISABLED via BVHSKIP2=0 (kernels see no isolated diag bits)\n");
+    }
+    if(bvhskip2_enabled_local && d_tetMesh.collision_body_num > 0)
+    {
+        int N = d_tetMesh.collision_body_num;
+        std::vector<int> ground_flags(N, 0);
+        for(int bid : tetMesh.ground_collision_skip_body_ids)
+            if(bid >= 0 && bid < N) ground_flags[bid] = 1;
+        std::vector<int> matrix(N * N, 0);
+        for(auto& [a, b] : tetMesh.collision_exclusion_pairs)
+            if(a >= 0 && a < N && b >= 0 && b < N) {
+                matrix[a*N+b] = 1; matrix[b*N+a] = 1;
+            }
+        int n_iso = 0;
+        for(int i = 0; i < N; ++i) {
+            if(!ground_flags[i]) continue;
+            bool all_excluded = true;
+            for(int j = 0; j < N; ++j) {
+                if(i == j) continue;
+                if(matrix[i*N+j] == 0) { all_excluded = false; break; }
+            }
+            if(all_excluded) {
+                int one = 1;
+                CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.collision_skip_matrix + i*N + i,
+                                          &one, sizeof(int), cudaMemcpyHostToDevice));
+                n_iso++;
+            }
+        }
+        printf("[BVHSkip] %d/%d bodies fully isolated → diag[i][i]=1 short-circuit set\n",
+               n_iso, N);
+    }
+
     // Stitch springs
     if(tetMesh.softNum > 0 && !d_tetMesh.stitch_paired_vertex.empty())
     {
@@ -785,6 +827,8 @@ void SimEngine::Impl::do_init_bvh_and_solver()
                 d_tetMesh.collision_skip_matrix, d_tetMesh.collision_body_num);
     ipc._point_body_id = d_tetMesh.point_id_to_body_id;
 
+    // BVH-skip #3 wiring is deferred until after ipc.init() — see "[BVHSkip#3-WIRE]" marker.
+
     // MAS preconditioner setup (must run even for pure-ABD scenes, matching gl_main.cu)
     if(ipc.pcg_data.P_type)
     {
@@ -860,6 +904,106 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     ipc.setup_surface_mesh_bodies(tetMesh);
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer,
              cfg.linear_system_buff_scale);
+
+    // [BVHSkip#3-WIRE] Wire _active_idx now that ipc.init() has captured the
+    // full-scene bbox into bboxDiagSize2/dHat. Subsequent buildBVH() in step()
+    // uses the indirect (filtered) path. (Wiring before ipc.init() shrinks the
+    // scene bbox to active leaves only → dHat too small → cloth self-intersect.)
+    //
+    // Toggle: BVHSKIP3=0 disables (BVH still uses default path, only #1+#2 active).
+    // Note: requires BVHSKIP2=1 — #3 reuses the isolation set from #2; if #2
+    // is disabled there are no diag bits to read.
+    {
+        const char* bvhskip3_env = std::getenv("BVHSKIP3");
+        bool bvhskip3_enabled = (bvhskip3_env == nullptr) || (std::string(bvhskip3_env) != "0");
+        const char* bvhskip2_env = std::getenv("BVHSKIP2");
+        bool bvhskip2_enabled = (bvhskip2_env == nullptr) || (std::string(bvhskip2_env) != "0");
+        if(!bvhskip3_enabled) {
+            printf("[BVHSkip#3] DISABLED via BVHSKIP3=0\n");
+        } else if(!bvhskip2_enabled) {
+            printf("[BVHSkip#3] AUTO-DISABLED (BVHSKIP2=0 — #3 requires #2's isolation set)\n");
+        } else if(d_tetMesh.collision_body_num > 0
+                  && (!tetMesh.collision_exclusion_pairs.empty()
+                      || !tetMesh.ground_collision_skip_body_ids.empty()))
+        {
+            const int N = d_tetMesh.collision_body_num;
+            std::vector<int> ground_flags(N, 0);
+            for(int bid : tetMesh.ground_collision_skip_body_ids)
+                if(bid >= 0 && bid < N) ground_flags[bid] = 1;
+            std::vector<int> matrix(N * N, 0);
+            for(auto& [a, b] : tetMesh.collision_exclusion_pairs)
+                if(a >= 0 && a < N && b >= 0 && b < N) {
+                    matrix[a*N+b] = 1; matrix[b*N+a] = 1;
+                }
+            std::vector<int> isolated(N, 0);
+            int n_iso = 0;
+            for(int i = 0; i < N; ++i) {
+                if(!ground_flags[i]) continue;
+                bool all_excl = true;
+                for(int j = 0; j < N; ++j) {
+                    if(i == j) continue;
+                    if(matrix[i*N+j] == 0) { all_excl = false; break; }
+                }
+                if(all_excl) { isolated[i] = 1; n_iso++; }
+            }
+            // Drop face only if all 3 vertices belong to an isolated body.
+            // Drop edge only if both endpoints belong to an isolated body.
+            // Conservative: cross-body or cloth-touching primitives stay active.
+            auto is_iso = [&](int B) { return (B >= 0 && B < N && isolated[B] != 0); };
+
+            std::vector<int> active_face;
+            active_face.reserve(tetMesh.surface.size());
+            for(int f = 0; f < (int)tetMesh.surface.size(); ++f) {
+                const auto& t = tetMesh.surface[f];
+                int Bx = tetMesh.point_id_to_body_id[t.x];
+                int By = tetMesh.point_id_to_body_id[t.y];
+                int Bz = tetMesh.point_id_to_body_id[t.z];
+                if(is_iso(Bx) && is_iso(By) && is_iso(Bz)) continue;
+                active_face.push_back(f);
+            }
+            std::vector<int> active_edge;
+            active_edge.reserve(tetMesh.surfEdges.size());
+            for(int e = 0; e < (int)tetMesh.surfEdges.size(); ++e) {
+                const auto& ed = tetMesh.surfEdges[e];
+                int Bx = tetMesh.point_id_to_body_id[ed.x];
+                int By = tetMesh.point_id_to_body_id[ed.y];
+                if(is_iso(Bx) && is_iso(By)) continue;
+                active_edge.push_back(e);
+            }
+            const int n_af = (int)active_face.size();
+            const int n_ae = (int)active_edge.size();
+            if(n_af > 0 && n_af < (int)tetMesh.surface.size()) {
+                CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.bvh_active_face_idx,
+                                          n_af * sizeof(int)));
+                CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.bvh_active_face_idx,
+                                          active_face.data(),
+                                          n_af * sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                d_tetMesh.bvh_active_face_num = n_af;
+                ipc.bvh_f._active_idx         = d_tetMesh.bvh_active_face_idx;
+                ipc.bvh_f.face_number_active  = n_af;
+            }
+            if(n_ae > 0 && n_ae < (int)tetMesh.surfEdges.size()) {
+                CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.bvh_active_edge_idx,
+                                          n_ae * sizeof(int)));
+                CUDA_SAFE_CALL(cudaMemcpy(d_tetMesh.bvh_active_edge_idx,
+                                          active_edge.data(),
+                                          n_ae * sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                d_tetMesh.bvh_active_edge_num = n_ae;
+                ipc.bvh_e._active_idx         = d_tetMesh.bvh_active_edge_idx;
+                ipc.bvh_e.face_number_active  = n_ae;
+            }
+            printf("[BVHSkip#3] %d/%d isolated  active faces=%d/%zu  active edges=%d/%zu\n",
+                   n_iso, N, n_af, tetMesh.surface.size(),
+                   n_ae, tetMesh.surfEdges.size());
+            // Re-build BVH so it transitions from default (full) to indirect
+            // (active subset). Without this, the next buildCP() launches EE
+            // self-query with N=active leaves but BVH leaves are still at the
+            // default-path offset → reads stale internal nodes → illegal access.
+            ipc.buildBVH();
+        }
+    }
 
     // Joint constraints
     if(!tetMesh.joint_constraints.empty() || !tetMesh.prismatic_constraints.empty())
