@@ -223,6 +223,10 @@ class SimEngine
     int  get_fem_body_count() const;
     int  get_vertex_count_host() const;
     void get_vertex_position_host(int idx, double out_xyz[3]) const;
+    /// Batch host-side vertex getter (zero device sync, reads from
+    /// tetMesh.vertexes directly). Useful PRE-finalize for setting up
+    /// stitch springs / joint constraints / etc.
+    void get_vertex_positions_host(double* out_xyz, int count) const;
 
     void finalize();
 

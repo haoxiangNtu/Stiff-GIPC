@@ -127,6 +127,19 @@ class tetrahedra_obj
     // Per-body ground collision skip flags: body IDs listed here skip ground collision.
     std::vector<int> ground_collision_skip_body_ids;
 
+    // [MAS-perm] Global vertex permutation: vertex_metis_to_input[engine_idx]
+    // returns the input-mesh vertex index for the i-th engine-internal vertex.
+    // Identity (== engine_idx) for ABD bodies and FEM bodies loaded with
+    // preconditioner_type == 0 (no MAS reorder). Populated only when
+    // simple_scene_importer.cpp captures sort_index from metis_sort.
+    // Size grows with each load_mesh / load_geometry call.
+    //
+    // Used by SimEngine::get_vertex_positions / get_surface_faces /
+    // set_vertex_positions_gpu to expose user-facing API in the original
+    // input-mesh order (transparent unscramble), independent of whether
+    // MAS preconditioner shuffles internal storage for PCG-banking.
+    std::vector<int> vertex_metis_to_input;
+
     // Joint constraints between ABD bodies (populated by URDF importer).
     // World-space anchor positions are stored; material coords computed on GPU after init.
     std::vector<JointConstraintHostInfo> joint_constraints;

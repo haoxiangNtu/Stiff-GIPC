@@ -445,16 +445,56 @@ int SimEngine::get_vertex_count_host() const
 
 void SimEngine::get_vertex_position_host(int idx, double out_xyz[3]) const
 {
-    if(idx >= 0 && idx < m_impl->tetMesh.vertexNum)
-    {
-        const auto& v = m_impl->tetMesh.vertexes[idx];
-        out_xyz[0] = v.x;
-        out_xyz[1] = v.y;
-        out_xyz[2] = v.z;
-    }
-    else
+    // [MAS-perm] idx here is INPUT-mesh order. Resolve via inverse perm:
+    // find engine_idx such that perm[engine_idx] == idx. Without perm,
+    // identity (engine_idx == idx).
+    if(idx < 0 || idx >= m_impl->tetMesh.vertexNum)
     {
         out_xyz[0] = out_xyz[1] = out_xyz[2] = 0.0;
+        return;
+    }
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    int engine_idx = idx;
+    if(!perm.empty() && static_cast<int>(perm.size()) >= m_impl->tetMesh.vertexNum)
+    {
+        // Linear search; expected use is sparse (one-off lookups). For a
+        // batch use case, prefer get_vertex_positions_host below.
+        for(int i = 0; i < m_impl->tetMesh.vertexNum; i++)
+        {
+            if(perm[i] == idx) { engine_idx = i; break; }
+        }
+    }
+    const auto& v = m_impl->tetMesh.vertexes[engine_idx];
+    out_xyz[0] = v.x;
+    out_xyz[1] = v.y;
+    out_xyz[2] = v.z;
+}
+
+void SimEngine::get_vertex_positions_host(double* out_xyz, int count) const
+{
+    int n = std::min(count, static_cast<int>(m_impl->tetMesh.vertexNum));
+    if(n <= 0) return;
+    // [MAS-perm] tetMesh.vertexes is engine (metis) order; output in input order.
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    bool use_perm = !perm.empty()
+                    && static_cast<int>(perm.size()) >= m_impl->tetMesh.vertexNum;
+    if(!use_perm)
+    {
+        for(int i = 0; i < n; i++)
+        {
+            const auto& v = m_impl->tetMesh.vertexes[i];
+            out_xyz[3*i + 0] = v.x; out_xyz[3*i + 1] = v.y; out_xyz[3*i + 2] = v.z;
+        }
+        return;
+    }
+    for(int i = 0; i < n; i++)
+    {
+        const auto& v = m_impl->tetMesh.vertexes[i];
+        int j = perm[i];
+        if(j < 0 || j >= n) { j = i; }
+        out_xyz[3*j + 0] = v.x;
+        out_xyz[3*j + 1] = v.y;
+        out_xyz[3*j + 2] = v.z;
     }
 }
 
@@ -1115,23 +1155,85 @@ int SimEngine::get_surface_vertex_count() const
 void SimEngine::get_vertex_positions(double* out_xyz, int count) const
 {
     int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum));
-    if(n > 0)
+    if(n <= 0) return;
+
+    // [MAS-perm] Transparent unscramble. perm[i] = j means engine-internal
+    // vertex i corresponds to input-mesh vertex j. We want user-facing
+    // output in input order: out[j] = engine_pos[i] for each i.
+    // If perm is empty / mismatched, fall back to identity (raw copy).
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    bool use_perm = !perm.empty() && static_cast<int>(perm.size()) >= n;
+    if(!use_perm)
+    {
         CUDA_SAFE_CALL(cudaMemcpy(out_xyz, m_impl->ipc._vertexes,
                                   n * sizeof(double3), cudaMemcpyDeviceToHost));
+        return;
+    }
+    // Read engine-order vertices to a temp buffer, then permute into out.
+    std::vector<double3> tmp(n);
+    CUDA_SAFE_CALL(cudaMemcpy(tmp.data(), m_impl->ipc._vertexes,
+                              n * sizeof(double3), cudaMemcpyDeviceToHost));
+    for(int i = 0; i < n; i++)
+    {
+        int j = perm[i];
+        if(j < 0 || j >= n)
+        {
+            // Defensive: out-of-range perm entry, fall back to identity for this slot.
+            out_xyz[3 * i + 0] = tmp[i].x;
+            out_xyz[3 * i + 1] = tmp[i].y;
+            out_xyz[3 * i + 2] = tmp[i].z;
+            continue;
+        }
+        out_xyz[3 * j + 0] = tmp[i].x;
+        out_xyz[3 * j + 1] = tmp[i].y;
+        out_xyz[3 * j + 2] = tmp[i].z;
+    }
 }
 
 void SimEngine::get_surface_faces(uint32_t* out_idx, int face_count) const
 {
     int n = std::min(face_count, static_cast<int>(m_impl->tetMesh.surface.size()));
-    if(n > 0)
+    if(n <= 0) return;
+
+    // [MAS-perm] Map engine face indices (a, b, c) to input-mesh indices via perm.
+    // Output triangle vertices reference vertex_metis_to_input[engine_idx].
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    bool use_perm = !perm.empty()
+                    && static_cast<int>(perm.size()) >= m_impl->ipc.vertexNum;
+    if(!use_perm)
+    {
         std::memcpy(out_idx, m_impl->tetMesh.surface.data(), n * sizeof(uint3));
+        return;
+    }
+    const auto& surf = m_impl->tetMesh.surface;
+    for(int i = 0; i < n; i++)
+    {
+        const uint3& f = surf[i];
+        out_idx[3 * i + 0] = static_cast<uint32_t>(perm[f.x]);
+        out_idx[3 * i + 1] = static_cast<uint32_t>(perm[f.y]);
+        out_idx[3 * i + 2] = static_cast<uint32_t>(perm[f.z]);
+    }
 }
 
 void SimEngine::get_surface_vertex_indices(uint32_t* out_idx, int count) const
 {
     int n = std::min(count, static_cast<int>(m_impl->tetMesh.surfVerts.size()));
-    if(n > 0)
+    if(n <= 0) return;
+
+    // [MAS-perm] surfVerts stores engine-order vertex indices; translate to
+    // input-order via perm so user-facing indexing is consistent with
+    // get_vertices() / get_surface_faces().
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    bool use_perm = !perm.empty()
+                    && static_cast<int>(perm.size()) >= m_impl->ipc.vertexNum;
+    if(!use_perm)
+    {
         std::memcpy(out_idx, m_impl->tetMesh.surfVerts.data(), n * sizeof(uint32_t));
+        return;
+    }
+    const auto& sv = m_impl->tetMesh.surfVerts;
+    for(int i = 0; i < n; i++)
+        out_idx[i] = static_cast<uint32_t>(perm[sv[i]]);
 }
 
 // ======================== joint control ========================
@@ -1718,25 +1820,88 @@ void SimEngine::set_abd_body_velocities(const int* body_offsets, const double* m
 void SimEngine::get_vertex_velocities(double* out_xyz, int count) const
 {
     int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum));
-    if(n > 0)
+    if(n <= 0) return;
+
+    // [MAS-perm] Same convention as get_vertex_positions: output in input order.
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    bool use_perm = !perm.empty() && static_cast<int>(perm.size()) >= n;
+    if(!use_perm)
+    {
         CUDA_SAFE_CALL(cudaMemcpy(out_xyz, m_impl->d_tetMesh.velocities,
                                   n * sizeof(double3), cudaMemcpyDeviceToHost));
+        return;
+    }
+    std::vector<double3> tmp(n);
+    CUDA_SAFE_CALL(cudaMemcpy(tmp.data(), m_impl->d_tetMesh.velocities,
+                              n * sizeof(double3), cudaMemcpyDeviceToHost));
+    for(int i = 0; i < n; i++)
+    {
+        int j = perm[i];
+        if(j < 0 || j >= n) j = i;
+        out_xyz[3*j + 0] = tmp[i].x;
+        out_xyz[3*j + 1] = tmp[i].y;
+        out_xyz[3*j + 2] = tmp[i].z;
+    }
 }
 
 void SimEngine::set_vertex_positions_gpu(const double* xyz, int count)
 {
     int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum));
-    if(n > 0)
+    if(n <= 0) return;
+
+    // [MAS-perm] xyz is in input order: xyz[3*j] = pos of input vertex j.
+    // Engine internal storage is in metis-sort order (or identity).
+    // For each engine vertex i, write user input at perm[i]: gpu[i] = xyz[3*perm[i]].
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    bool use_perm = !perm.empty() && static_cast<int>(perm.size()) >= n;
+    if(!use_perm)
+    {
         CUDA_SAFE_CALL(cudaMemcpy(m_impl->ipc._vertexes, xyz,
                                   n * sizeof(double3), cudaMemcpyHostToDevice));
+        return;
+    }
+    std::vector<double3> tmp(n);
+    for(int i = 0; i < n; i++)
+    {
+        int j = perm[i];
+        if(j < 0 || j >= n)
+        {
+            tmp[i] = make_double3(xyz[3*i], xyz[3*i+1], xyz[3*i+2]);
+            continue;
+        }
+        tmp[i] = make_double3(xyz[3*j], xyz[3*j+1], xyz[3*j+2]);
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(m_impl->ipc._vertexes, tmp.data(),
+                              n * sizeof(double3), cudaMemcpyHostToDevice));
 }
 
 void SimEngine::set_vertex_velocities_gpu(const double* xyz, int count)
 {
     int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum));
-    if(n > 0)
+    if(n <= 0) return;
+
+    // Same MAS-perm convention as set_vertex_positions_gpu.
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    bool use_perm = !perm.empty() && static_cast<int>(perm.size()) >= n;
+    if(!use_perm)
+    {
         CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.velocities, xyz,
                                   n * sizeof(double3), cudaMemcpyHostToDevice));
+        return;
+    }
+    std::vector<double3> tmp(n);
+    for(int i = 0; i < n; i++)
+    {
+        int j = perm[i];
+        if(j < 0 || j >= n)
+        {
+            tmp[i] = make_double3(xyz[3*i], xyz[3*i+1], xyz[3*i+2]);
+            continue;
+        }
+        tmp[i] = make_double3(xyz[3*j], xyz[3*j+1], xyz[3*j+2]);
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.velocities, tmp.data(),
+                              n * sizeof(double3), cudaMemcpyHostToDevice));
 }
 
 void SimEngine::get_fem_body_vertex_range(int fem_body_idx, int* out_start, int* out_count) const
