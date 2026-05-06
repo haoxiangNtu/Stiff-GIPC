@@ -43,12 +43,19 @@ __device__ __host__ inline bool overlap(const AABB& lhs, const AABB& rhs, const 
 
 // Check if collision between bodyA and bodyB should be skipped
 // according to the collision exclusion matrix.
+//
+// FEM body vertices carry body_id == -1 (legacy semantic from
+// tetrahedra_obj::begin_load_body). To honor add_collision_exclusion(
+// abd_body, fem_global_id) calls in narrow-phase + sanity-check kernels,
+// we map -1 to the last matrix row (assumes a single FEM body).
 __device__ inline bool _is_collision_excluded(int bodyA, int bodyB,
                                               const int* _collision_skip_matrix,
                                               int _collision_body_count)
 {
     if(_collision_skip_matrix == nullptr || _collision_body_count <= 0)
         return false;
+    if(bodyA == -1) bodyA = _collision_body_count - 1;
+    if(bodyB == -1) bodyB = _collision_body_count - 1;
     if(bodyA < 0 || bodyB < 0 || bodyA >= _collision_body_count || bodyB >= _collision_body_count)
         return false;
     return _collision_skip_matrix[bodyA * _collision_body_count + bodyB] != 0;
