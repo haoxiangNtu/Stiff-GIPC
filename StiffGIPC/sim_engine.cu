@@ -257,6 +257,27 @@ void SimEngine::add_ground_collision_skip(int body_id)
     m_impl->tetMesh.ground_collision_skip_body_ids.push_back(body_id);
 }
 
+void SimEngine::add_stitch_spring(int fem_vertex_global_id,
+                                  int abd_anchor_vertex_global_id,
+                                  int abd_body_id,
+                                  const Eigen::Vector3d& rest_offset_world)
+{
+    auto& tm  = m_impl->tetMesh;
+    auto& dtm = m_impl->d_tetMesh;
+    // FEM vertex this spring acts on
+    tm.targetIndex.push_back(static_cast<uint32_t>(fem_vertex_global_id));
+    // Initial target world position; engine will overwrite each step from
+    // ABD body's current vertex world pos. Seed with 0 (or pass current pos
+    // if available -- engine reads from ABD anchor vertex anyway).
+    tm.targetPos.push_back(make_double3(0.0, 0.0, 0.0));
+    // Bilateral stitch-spring info (consumed at finalize -> safe_copy to GPU)
+    dtm.stitch_paired_vertex.push_back(abd_anchor_vertex_global_id);
+    dtm.stitch_rest_offset.push_back(make_double3(
+        rest_offset_world.x(), rest_offset_world.y(), rest_offset_world.z()));
+    dtm.stitch_abd_body_id.push_back(abd_body_id);
+    tm.softNum = static_cast<int>(tm.targetIndex.size());
+}
+
 bool SimEngine::set_abd_body_face_orient(int body_id, const std::vector<int>& orient)
 {
     for(auto& smb : m_impl->tetMesh.surface_mesh_bodies)
@@ -495,6 +516,18 @@ void SimEngine::get_vertex_positions_host(double* out_xyz, int count) const
         out_xyz[3*j + 0] = v.x;
         out_xyz[3*j + 1] = v.y;
         out_xyz[3*j + 2] = v.z;
+    }
+}
+
+void SimEngine::get_vertex_positions_host(double* out_xyz, int count) const
+{
+    int n = std::min(count, static_cast<int>(m_impl->tetMesh.vertexNum));
+    for(int i = 0; i < n; i++)
+    {
+        const auto& v = m_impl->tetMesh.vertexes[i];
+        out_xyz[3*i + 0] = v.x;
+        out_xyz[3*i + 1] = v.y;
+        out_xyz[3*i + 2] = v.z;
     }
 }
 

@@ -173,6 +173,23 @@ class SimEngine
     void add_collision_exclusion(int body_a, int body_b);
     void add_ground_collision_skip(int body_id);
 
+    /// Stitch a FEM vertex to an ABD body via a soft spring constraint.
+    /// At each step, the FEM vertex is pulled toward
+    ///   target_world = world_pos(_bodyId-th vertex of abd_body) + rest_offset_world
+    /// where rest_offset_world is a world-frame offset (NOT body-local).
+    /// For best behavior with ABD rotation, place the FEM vertex coincident
+    /// with the chosen ABD anchor vertex at finalize time (rest_offset = 0).
+    ///
+    /// Must be called before finalize().
+    /// Spring stiffness is controlled by Config::soft_motion_rate.
+    /// Internally appends to tetMesh.targetIndex / tetMesh.targetPos and
+    /// d_tetMesh.stitch_paired_vertex / .stitch_rest_offset / .stitch_abd_body_id,
+    /// bumping tetMesh.softNum.
+    void add_stitch_spring(int fem_vertex_global_id,
+                           int abd_anchor_vertex_global_id,
+                           int abd_body_id,
+                           const Eigen::Vector3d& rest_offset_world);
+
     /// libuipc-style per-face orient labels for an ABD surface body.
     /// Pass one int per triangle, in {-1, 0, +1}; non-zero values flip
     /// (or preserve) the face's normal sign at mass/centroid/inertia
