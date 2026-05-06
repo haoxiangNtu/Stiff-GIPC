@@ -60,6 +60,13 @@ class lbvh
     int*      _collision_skip_matrix = nullptr;  // NxN exclusion matrix (null if none)
     int       _collision_body_count = 0;        // N dimension of exclusion matrix
 
+    // BVH-skip #3: filter input faces/edges. _active_idx[t] = original face/edge index
+    // for t-th active leaf (i.e. excludes isolated body's faces/edges entirely from
+    // sort + tree build). face_number_active = active count. When set, Construct()
+    // operates on n_active leaves instead of full face_number.
+    int*      _active_idx           = nullptr;
+    int       face_number_active    = 0;
+
   public:
     lbvh() {}
     ~lbvh();
