@@ -22,9 +22,32 @@ std::string get_extension(const std::string& path)
     return p.extension().string();  // extension() 直接获取扩展名（包含点号）
 }
 
+// Helper: write sort_index to disk as one int per line.
+static void write_sort_index_file(const std::string& path,
+                                  const std::vector<int>& sort_index)
+{
+    std::ofstream ofs(path);
+    if(!ofs) return;
+    ofs << sort_index.size() << "\n";
+    for(int v : sort_index) ofs << v << "\n";
+}
+
+// Helper: read sort_index from disk. Returns empty vector on failure.
+static std::vector<int> read_sort_index_file(const std::string& path)
+{
+    std::ifstream ifs(path);
+    std::vector<int> out;
+    if(!ifs) return out;
+    size_t n; ifs >> n;
+    out.resize(n);
+    for(size_t i = 0; i < n; i++) ifs >> out[i];
+    return out;
+}
+
 std::vector<std::string> metis_sort(std::string obj_path,
                                     int         dimension,
-                                    std::string output_folder)
+                                    std::string output_folder,
+                                    std::vector<int>* out_sort_index)
 {
     std::string mesh_name     = get_filename_without_extension(obj_path);
     std::string extension     = get_extension(obj_path);
@@ -51,6 +74,9 @@ std::vector<std::string> metis_sort(std::string obj_path,
 
     std::filesystem::exists(output_folder)
         || std::filesystem::create_directory(output_folder);
+    std::string sort_idx_path = output_folder + mesh_name + "_sorted."
+                                + std::to_string(block_size) + ".idx";
+
     std::ifstream ifs(out_file_path);
     if(ifs)
     {
@@ -65,6 +91,16 @@ std::vector<std::string> metis_sort(std::string obj_path,
 
         out_paths.push_back(out_file_path);
         out_paths.push_back(sort_part_path);
+        // Restore sort_index from sidecar .idx file if caller requested it
+        // and the sidecar is available.
+        if(out_sort_index)
+        {
+            *out_sort_index = read_sort_index_file(sort_idx_path);
+            if(out_sort_index->empty())
+                std::cerr << "[metis_sort] WARNING: cached sorted mesh exists but "
+                             ".idx sidecar missing; perm unavailable for "
+                          << mesh_name << ". Delete cache to regenerate.\n";
+        }
         return out_paths;
     }
     ifs.close();
@@ -230,6 +266,12 @@ std::vector<std::string> metis_sort(std::string obj_path,
         sorted_mesh.export_mesh(output_folder + mesh_name + "_sorted."
                                 + std::to_string(block_size) + extension);
 
+        // Persist sort_index to sidecar .idx file so cache hits can recover it,
+        // and forward to caller if requested.
+        write_sort_index_file(sort_idx_path, sort_index);
+        if(out_sort_index)
+            *out_sort_index = sort_index;
+
         out_paths.push_back(sort_obj_path);
         out_paths.push_back(sort_part_path);
         return out_paths;
@@ -392,6 +434,11 @@ std::vector<std::string> metis_sort(std::string obj_path,
         std::cout << "export sorted tet mesh ..." << std::endl;
         sorted_mesh.export_mesh(output_folder + mesh_name + "_sorted."
                                 + std::to_string(block_size) + extension);
+
+        // Persist sort_index for cache hits + forward to caller.
+        write_sort_index_file(sort_idx_path, sort_index);
+        if(out_sort_index)
+            *out_sort_index = sort_index;
 
         out_paths.push_back(sort_obj_path);
         out_paths.push_back(sort_part_path);

@@ -58,6 +58,9 @@ void SimpleSceneImporter::load_geometry(tetrahedra_obj&  tetras,
                                         BodyBoundaryType body_boundary_type,
                                         std::string      metis_output_folder)
 {
+    int vert_count_before = tetras.vertexes.size();
+    std::vector<int> sort_index;  // metis-sorted-idx -> input-vertex-idx (only when MAS active)
+
     if(Dimensions == 3)
     {
 
@@ -69,7 +72,7 @@ void SimpleSceneImporter::load_geometry(tetrahedra_obj&  tetras,
         {
             if(preconditionerType)
             {
-                auto paths = metis_sort(meth_path, Dimensions, metis_output_folder);
+                auto paths = metis_sort(meth_path, Dimensions, metis_output_folder, &sort_index);
                 tetras.load_tetrahedraMesh(paths[0], transform, YoungthM, bodyType, body_boundary_type);
                 tetras.load_parts(paths[1]);
             }
@@ -83,13 +86,52 @@ void SimpleSceneImporter::load_geometry(tetrahedra_obj&  tetras,
     {
         if(preconditionerType)
         {
-            auto paths = metis_sort(meth_path, Dimensions, metis_output_folder);
+            auto paths = metis_sort(meth_path, Dimensions, metis_output_folder, &sort_index);
             tetras.load_triMesh(paths[0], transform, 0);
             tetras.load_parts(paths[1]);
         }
         else
         {
             tetras.load_triMesh(meth_path, transform, 0);
+        }
+    }
+
+    // [MAS-perm] Append per-vertex perm for this body. For non-MAS bodies
+    // (or ABD), append identity. For MAS-FEM bodies, append the metis
+    // sort_index translated to global indexing (engine_global = body_offset
+    // + body_local_engine, input_global = body_offset + body_local_input).
+    // The user-facing API (get_vertex_positions / get_surface_faces /
+    // set_vertex_positions_gpu) reads this map to transparently expose data
+    // in the original input-mesh order.
+    int vert_count_after = static_cast<int>(tetras.vertexes.size());
+    int n_added          = vert_count_after - vert_count_before;
+    if(n_added > 0)
+    {
+        // First close any gap from earlier loaders (URDF importer) that
+        // added vertices without going through SimpleSceneImporter. Identity-
+        // pad for those, so perm is contiguous and indexable.
+        if(static_cast<int>(tetras.vertex_metis_to_input.size()) < vert_count_before)
+        {
+            int gap_start = static_cast<int>(tetras.vertex_metis_to_input.size());
+            for(int i = gap_start; i < vert_count_before; i++)
+                tetras.vertex_metis_to_input.push_back(i);
+        }
+
+        size_t old_perm_size = tetras.vertex_metis_to_input.size();
+        tetras.vertex_metis_to_input.resize(old_perm_size + n_added);
+        if(!sort_index.empty() && static_cast<int>(sort_index.size()) == n_added)
+        {
+            // MAS active: engine vertex (body_offset + i) corresponds to
+            // input vertex (body_offset + sort_index[i]).
+            for(int i = 0; i < n_added; i++)
+                tetras.vertex_metis_to_input[old_perm_size + i] =
+                    vert_count_before + sort_index[i];
+        }
+        else
+        {
+            // No MAS or empty perm: identity within this body.
+            for(int i = 0; i < n_added; i++)
+                tetras.vertex_metis_to_input[old_perm_size + i] = vert_count_before + i;
         }
     }
 }
