@@ -69,6 +69,14 @@ class device_TetraData
 
     int*    ground_skip_body = nullptr;
 
+    // BVH-skip #3: filtered face/edge index lists. bvh_active_face_idx[t] holds
+    // the original face index of the t-th non-isolated face; same for edges.
+    // Sized n_active_face / n_active_edge (<= surface count / edge count).
+    int*    bvh_active_face_idx = nullptr;
+    int     bvh_active_face_num = 0;
+    int*    bvh_active_edge_idx = nullptr;
+    int     bvh_active_edge_num = 0;
+
     int                   m_soft_num   = 0;
     int                   m_vertex_num = 0;
     std::vector<uint32_t> host_target_indices;
