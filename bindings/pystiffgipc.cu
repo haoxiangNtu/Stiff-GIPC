@@ -203,6 +203,15 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("body_a"), py::arg("body_b"))
         .def("add_ground_collision_skip", &SimEngine::add_ground_collision_skip,
              py::arg("body_id"))
+        .def("add_stitch_spring",
+             [](SimEngine& e, int fem_v, int abd_v, int abd_body,
+                std::array<double, 3> rest_off) {
+                 Eigen::Vector3d ro(rest_off[0], rest_off[1], rest_off[2]);
+                 e.add_stitch_spring(fem_v, abd_v, abd_body, ro);
+             },
+             py::arg("fem_vertex_id"), py::arg("abd_anchor_vertex_id"),
+             py::arg("abd_body_id"),
+             py::arg("rest_offset_world") = std::array<double, 3>{0.0, 0.0, 0.0})
 
         .def("set_abd_body_face_orient", &SimEngine::set_abd_body_face_orient,
              py::arg("body_id"), py::arg("orient"))
@@ -276,6 +285,12 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_abd_body_count",    &SimEngine::get_abd_body_count)
         .def("get_fem_body_count",    &SimEngine::get_fem_body_count)
         .def("get_vertex_count_host", &SimEngine::get_vertex_count_host)
+        .def("get_vertices_host", [](const SimEngine& e) {
+            int n = e.get_vertex_count_host();
+            auto arr = py::array_t<double>({n, 3});
+            if(n > 0) e.get_vertex_positions_host(arr.mutable_data(), n);
+            return arr;
+        })
 
         .def("get_vertex_position_host", [](const SimEngine& e, int idx) {
             double xyz[3];

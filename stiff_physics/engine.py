@@ -386,6 +386,27 @@ class Engine:
     def add_ground_collision_skip(self, body_id: int) -> None:
         self._engine.add_ground_collision_skip(body_id)
 
+    def add_stitch_spring(self, fem_vertex_id: int, abd_anchor_vertex_id: int,
+                          abd_body_id: int,
+                          rest_offset_world=(0.0, 0.0, 0.0)) -> None:
+        """Stitch a FEM vertex to an ABD body via a soft-spring constraint.
+
+        At each step the FEM vertex is pulled toward
+            target_world = abd_anchor_vertex_world_pos + rest_offset_world
+
+        For best behavior under ABD body rotation, place the FEM vertex
+        coincident with the ABD anchor vertex at finalize time and pass
+        rest_offset_world = (0, 0, 0). Then the spring naturally tracks
+        both translation and rotation of the ABD body.
+
+        Spring stiffness is governed by Config.soft_motion_rate.
+
+        Must be called BEFORE finalize().
+        """
+        self._engine.add_stitch_spring(
+            int(fem_vertex_id), int(abd_anchor_vertex_id), int(abd_body_id),
+            tuple(float(x) for x in rest_offset_world))
+
     # ---- libuipc-style per-face orient labels (pre-finalize) ----
 
     def set_abd_body_face_orient(self, body_id: int, orient) -> bool:
