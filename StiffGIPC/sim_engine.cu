@@ -531,6 +531,18 @@ void SimEngine::get_vertex_positions_host(double* out_xyz, int count) const
     }
 }
 
+void SimEngine::get_vertex_positions_host(double* out_xyz, int count) const
+{
+    int n = std::min(count, static_cast<int>(m_impl->tetMesh.vertexNum));
+    for(int i = 0; i < n; i++)
+    {
+        const auto& v = m_impl->tetMesh.vertexes[i];
+        out_xyz[3*i + 0] = v.x;
+        out_xyz[3*i + 1] = v.y;
+        out_xyz[3*i + 2] = v.z;
+    }
+}
+
 // ---------- apply config to IPC fields ----------
 void SimEngine::Impl::apply_config_to_ipc()
 {
