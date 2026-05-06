@@ -290,6 +290,15 @@ class SimEngine
 
     std::string get_assets_dir() const;
 
+    // ---- Per-step counters (perf debugging; cumulative since process start) ----
+    // Read directly from GIPC.cu file-scope globals. Caller computes per-step delta.
+    int    get_total_newton_iters() const;
+    double get_total_pcg_iters() const;
+    double get_total_collision_pairs() const;
+    double get_max_collision_pairs() const;
+    int    get_total_frames_done() const;
+
+
   private:
     struct Impl;
     Impl* m_impl;
