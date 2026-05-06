@@ -8339,12 +8339,18 @@ __global__ void _updateSurfVerts(uint32_t* sortIndex, uint32_t* _sVerts, int _of
 
 // Check if collision between bodyA and bodyB should be skipped
 // according to the collision exclusion matrix.
+// See note above mlbvh.cu's _is_collision_excluded: FEM body vertices carry
+// body_id == -1 by legacy semantic; map to the last matrix slot so
+// add_collision_exclusion(abd_body, fem_global_id) is honored by narrow-
+// phase + sanity-check kernels that look up this matrix.
 __device__ inline bool _is_collision_excluded_gipc(int bodyA, int bodyB,
                                                    const int* _collision_skip_matrix,
                                                    int _collision_body_count)
 {
     if(_collision_skip_matrix == nullptr || _collision_body_count <= 0)
         return false;
+    if(bodyA == -1) bodyA = _collision_body_count - 1;
+    if(bodyB == -1) bodyB = _collision_body_count - 1;
     if(bodyA < 0 || bodyB < 0 || bodyA >= _collision_body_count || bodyB >= _collision_body_count)
         return false;
     return _collision_skip_matrix[bodyA * _collision_body_count + bodyB] != 0;
