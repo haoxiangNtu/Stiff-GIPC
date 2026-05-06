@@ -1765,3 +1765,19 @@ const BodyLoadRecord& SimEngine::get_load_record(int idx) const
 }
 
 }  // namespace gipc
+
+
+// ======================== Per-step counters (perf debugging) ========================
+extern int    totalNT;
+extern double total_Cg_count;
+extern double totalCollisionPairs;
+extern double maxCOllisionPairNum;
+extern int    total_Frames;
+
+namespace gipc {
+int    SimEngine::get_total_newton_iters() const     { return totalNT; }
+double SimEngine::get_total_pcg_iters() const        { return total_Cg_count; }
+double SimEngine::get_total_collision_pairs() const  { return totalCollisionPairs; }
+double SimEngine::get_max_collision_pairs() const    { return maxCOllisionPairNum; }
+int    SimEngine::get_total_frames_done() const      { return total_Frames; }
+}  // namespace gipc
