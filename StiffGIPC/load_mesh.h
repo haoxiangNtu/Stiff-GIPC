@@ -133,6 +133,16 @@ class tetrahedra_obj
     // Per-body ground collision skip flags: body IDs listed here skip ground collision.
     std::vector<int> ground_collision_skip_body_ids;
 
+    // [FEM-pin] Hard-constraint pins: each entry forces a FEM vertex's
+    // world position to follow an ABD anchor vertex by a fixed offset.
+    // Acts like a stitch spring with infinite stiffness — applied as a
+    // direct projection right after the IPC line-search step. Useful for
+    // attaching a deformable body to a rigid body without introducing
+    // soft-spring tracking error or PCG condition-number blowup.
+    std::vector<int>     fem_pin_fem_vertex;     // FEM vertex global idx
+    std::vector<int>     fem_pin_abd_anchor;     // ABD anchor vertex global idx
+    std::vector<double3> fem_pin_rest_offset;    // fem_pos - abd_pos at pin time
+
     // [MAS-perm] Global vertex permutation: vertex_metis_to_input[engine_idx]
     // returns the input-mesh vertex index for the i-th engine-internal vertex.
     // Identity (== engine_idx) for ABD bodies and FEM bodies loaded with

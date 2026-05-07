@@ -190,6 +190,29 @@ class SimEngine
                            int abd_body_id,
                            const Eigen::Vector3d& rest_offset_world);
 
+    /// [FEM-pin] Hard-constraint pin: forces a FEM vertex's world position
+    /// to follow an ABD anchor vertex by a fixed offset, EXACTLY (no soft
+    /// spring error). Acts like a stitch spring with infinite stiffness —
+    /// implemented as a direct projection kernel applied right after each
+    /// line-search step (so IPC's contact barrier sees the corrected FEM
+    /// pose).
+    ///
+    /// When to use vs add_stitch_spring:
+    ///   spring: bilateral force-based coupling, FEM can lag ABD under
+    ///           fast motion (line-search retreats), rest length sets
+    ///           how slack the connection is.
+    ///   pin:    FEM vertex *equals* abd_anchor + offset every step.
+    ///           ABD doesn't feel any reaction force from the pin (no
+    ///           condition-number blowup), and FEM tracks ABD perfectly.
+    ///           Useful for "rigidly-attached" parts of a deformable
+    ///           body (e.g. soft gripper finger pad fused to a rigid
+    ///           finger backbone).
+    ///
+    /// Must be called before finalize().
+    void add_fem_pin_to_abd(int fem_vertex_global_id,
+                            int abd_anchor_vertex_global_id,
+                            const Eigen::Vector3d& rest_offset_world);
+
     /// libuipc-style per-face orient labels for an ABD surface body.
     /// Pass one int per triangle, in {-1, 0, +1}; non-zero values flip
     /// (or preserve) the face's normal sign at mass/centroid/inertia

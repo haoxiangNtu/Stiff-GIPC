@@ -212,6 +212,18 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("fem_vertex_id"), py::arg("abd_anchor_vertex_id"),
              py::arg("abd_body_id"),
              py::arg("rest_offset_world") = std::array<double, 3>{0.0, 0.0, 0.0})
+        .def("add_fem_pin_to_abd",
+             [](SimEngine& e, int fem_v, int abd_anchor_v,
+                std::array<double, 3> rest_off) {
+                 Eigen::Vector3d ro(rest_off[0], rest_off[1], rest_off[2]);
+                 e.add_fem_pin_to_abd(fem_v, abd_anchor_v, ro);
+             },
+             py::arg("fem_vertex_id"), py::arg("abd_anchor_vertex_id"),
+             py::arg("rest_offset_world") = std::array<double, 3>{0.0, 0.0, 0.0},
+             "Hard kinematic constraint: FEM vertex's world position is "
+             "forced to abd_anchor_pos + rest_offset every step (post "
+             "line-search). Acts like a stitch spring with infinite "
+             "stiffness; ABD doesn't feel any reaction force from the pin.")
 
         .def("set_abd_body_face_orient", &SimEngine::set_abd_body_face_orient,
              py::arg("body_id"), py::arg("orient"))

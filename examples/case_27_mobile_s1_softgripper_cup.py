@@ -321,8 +321,19 @@ def main():
             abd_pos = f_verts[j_f]
             rest_off = (fem_pos - abd_pos).tolist()
             if os.environ.get("NO_STITCH") != "1":
-                eng.add_stitch_spring(fem_global, abd_global, f_rec.body_offset,
-                                      rest_offset_world=rest_off)
+                # USE_HARD_PIN=1 + STIFFGIPC_PIN_PROJECT=1 enables the
+                # experimental hard-constraint pin (FEM vertex tracks ABD
+                # anchor exactly post-step). Currently this breaks IPC's
+                # implicit energy continuity and causes line-search to
+                # retreat to alpha~=0 (200+ sec/step). The proper fix is
+                # IPC-level substitution method (mark pinned DOF as
+                # non-solved); that's deferred future work. Default off.
+                if os.environ.get("USE_HARD_PIN", "0") == "1":
+                    eng.native.add_fem_pin_to_abd(fem_global, abd_global,
+                                                  rest_offset_world=rest_off)
+                else:
+                    eng.add_stitch_spring(fem_global, abd_global, f_rec.body_offset,
+                                          rest_offset_world=rest_off)
             stitch_viz_pairs.append((fem_global, abd_global))
             used_fem_y.append(e_sub[k, 1])
             n_pairs += 1

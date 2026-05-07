@@ -278,6 +278,17 @@ void SimEngine::add_stitch_spring(int fem_vertex_global_id,
     tm.softNum = static_cast<int>(tm.targetIndex.size());
 }
 
+void SimEngine::add_fem_pin_to_abd(int fem_vertex_global_id,
+                                   int abd_anchor_vertex_global_id,
+                                   const Eigen::Vector3d& rest_offset_world)
+{
+    auto& tm = m_impl->tetMesh;
+    tm.fem_pin_fem_vertex.push_back(fem_vertex_global_id);
+    tm.fem_pin_abd_anchor.push_back(abd_anchor_vertex_global_id);
+    tm.fem_pin_rest_offset.push_back(make_double3(
+        rest_offset_world.x(), rest_offset_world.y(), rest_offset_world.z()));
+}
+
 bool SimEngine::set_abd_body_face_orient(int body_id, const std::vector<int>& orient)
 {
     for(auto& smb : m_impl->tetMesh.surface_mesh_bodies)
@@ -846,6 +857,26 @@ void SimEngine::Impl::do_upload_to_gpu()
         ipc.m_d_stitch_paired_vertex = d_tetMesh.d_stitch_paired_vertex;
         ipc.m_d_stitch_rest_offset   = d_tetMesh.d_stitch_rest_offset;
         ipc.m_d_stitch_abd_body_id   = d_tetMesh.d_stitch_abd_body_id;
+    }
+
+    // [FEM-pin] Hard-constraint pin arrays
+    int n_pins = static_cast<int>(tetMesh.fem_pin_fem_vertex.size());
+    if(n_pins > 0)
+    {
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_fem_vertex,
+                                  n_pins * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_abd_anchor,
+                                  n_pins * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_rest_offset,
+                                  n_pins * sizeof(double3)));
+        d_tetMesh.n_fem_pins = n_pins;
+        safe_copy(d_tetMesh.d_fem_pin_fem_vertex, tetMesh.fem_pin_fem_vertex.data(),
+                  n_pins * sizeof(int), cudaMemcpyHostToDevice);
+        safe_copy(d_tetMesh.d_fem_pin_abd_anchor, tetMesh.fem_pin_abd_anchor.data(),
+                  n_pins * sizeof(int), cudaMemcpyHostToDevice);
+        safe_copy(d_tetMesh.d_fem_pin_rest_offset, tetMesh.fem_pin_rest_offset.data(),
+                  n_pins * sizeof(double3), cudaMemcpyHostToDevice);
+        printf("[FEM-pin] uploaded %d hard-constraint pins\n", n_pins);
     }
 }
 
