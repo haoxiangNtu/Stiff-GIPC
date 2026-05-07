@@ -67,6 +67,13 @@ class device_TetraData
     int*    collision_skip_matrix = nullptr;
     int     collision_body_num    = 0;
 
+    // [multi-FEM-bodyid] Per-body flag (size = collision_body_num).
+    //   body_id_to_is_fem[i] = 1 -> body i is FEM (self-collision allowed)
+    //   body_id_to_is_fem[i] = 0 -> body i is ABD (skip same-body checks)
+    // Replaces the legacy "_bodyId == -1" sentinel that aliased all FEM
+    // bodies into one matrix slot.
+    int*    body_id_to_is_fem = nullptr;
+
     int*    ground_skip_body = nullptr;
 
     // BVH-skip #3: filtered face/edge index lists. bvh_active_face_idx[t] holds

@@ -59,6 +59,10 @@ class lbvh
     int*      _bodyId;
     int*      _collision_skip_matrix = nullptr;  // NxN exclusion matrix (null if none)
     int       _collision_body_count = 0;        // N dimension of exclusion matrix
+    // [multi-FEM-bodyid] per-body flag table (size = _collision_body_count).
+    // Set by GIPC::initBVH after wiring d_tetMesh.body_id_to_is_fem.
+    // 1 = FEM body (allow self-collision), 0 = ABD body (skip self).
+    int*      _body_id_to_is_fem    = nullptr;
 
     // BVH-skip #3: filter input faces/edges. _active_idx[t] = original face/edge index
     // for t-th active leaf (i.e. excludes isolated body's faces/edges entirely from

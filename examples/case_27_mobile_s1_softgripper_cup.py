@@ -49,7 +49,15 @@ def parse_xyz_rpy(s):
 
 
 def parse_soft_material_world_tfs(urdf_path, scale, base_tf):
-    """Parse URDF to compute world TFs of 4 soft_material links."""
+    """Parse URDF to compute world TFs of 4 soft_material links.
+
+    NOTE: each *_soft_material link in this URDF has a mesh-in-link origin
+    on its <visual>/<collision> tag (rpy=(-pi/2, 0.20, -pi/2), xyz=
+    (-0.0165, 0.0165, 0.128)). The URDF importer already applies this when
+    loading ABD finger backbones, so ABD fingers stand upright. We must
+    apply the same transform to the FEM softpad mesh, otherwise it lies
+    horizontally instead of along the finger axis.
+    """
     src = open(urdf_path).read()
     joints = {}
     for m in re.finditer(r'<joint\s+name="([^"]+)"[^>]*>(.*?)</joint>', src, re.DOTALL):
@@ -76,15 +84,40 @@ def parse_soft_material_world_tfs(urdf_path, scale, base_tf):
             cur = j['parent']
         return T
 
+    def visual_origin_in_link(link_name):
+        """Extract the <visual>/<collision> origin of a link as a 4x4 mat.
+        Returns identity if no origin is found."""
+        m = re.search(
+            r'<link\s+name="' + re.escape(link_name) + r'"[^>]*>(.*?)</link>',
+            src, re.DOTALL)
+        if not m: return np.eye(4)
+        body = m.group(1)
+        # Prefer collision origin; fall back to visual.
+        section = (re.search(r'<collision[^>]*>(.*?)</collision>', body, re.DOTALL)
+                   or re.search(r'<visual[^>]*>(.*?)</visual>', body, re.DOTALL))
+        if not section: return np.eye(4)
+        sbody = section.group(1)
+        om_xyz = re.search(r'<origin[^/>]*xyz="([^"]+)"', sbody)
+        om_rpy = re.search(r'<origin[^/>]*rpy="([^"]+)"', sbody)
+        if not (om_xyz or om_rpy): return np.eye(4)
+        xyz = parse_xyz_rpy(om_xyz.group(1)) if om_xyz else np.zeros(3)
+        rpy = parse_xyz_rpy(om_rpy.group(1)) if om_rpy else np.zeros(3)
+        T = np.eye(4)
+        T[:3, :3] = Rotation.from_euler('xyz', rpy).as_matrix()
+        T[:3, 3] = xyz
+        return T
+
     targets = ['left_arm_leftfinger_soft_material', 'left_arm_rightfinger_soft_material',
                'right_arm_leftfinger_soft_material', 'right_arm_rightfinger_soft_material']
     out = []
     for name in targets:
-        T_local = world_tf(name)
-        # NOTE: don't pre-scale T_local. base_tf has SCALE in its 3x3, and
-        # 4x4 mat-mul already scales the translation: base_tf @ T_local has
-        # base_tf[:3,:3] @ T_local[:3,3] = (SCALE*R) @ t_link as desired.
-        out.append(base_tf @ T_local)
+        T_link_in_world = world_tf(name)
+        T_mesh_in_link = visual_origin_in_link(name)
+        T_mesh_in_world = T_link_in_world @ T_mesh_in_link
+        # NOTE: don't pre-scale here. base_tf has SCALE in its 3x3, and
+        # 4x4 mat-mul already scales the translation: base_tf @ T has
+        # base_tf[:3,:3] @ T[:3,3] = (SCALE*R) @ t as desired.
+        out.append(base_tf @ T_mesh_in_world)
     return out
 
 
@@ -110,13 +143,28 @@ def main():
         dt=0.020,
         cloth_thickness=1e-3, cloth_young_modulus=1e4, bend_young_modulus=1e3,
         cloth_density=200, strain_rate=100, soft_motion_rate=1e6,
-        poisson_rate=0.49, friction_rate=0.4, relative_dhat=1e-3,
+        # relative_dhat=1e-4 (not 1e-3) is required because the FEM softpad
+        # mesh (softgriper_part3.msh, scaled by 0.3) has median edge length
+        # ~0.38mm. With the default 1e-3 and the full-scene bbox dominated by
+        # the ridgeback base (~0.7m diag), gapl = sqrt(dhat) ~0.87mm > median
+        # edge length, so EE self-collision detection finds far more pairs
+        # than _collisionPair[] can hold and overflows (illegal mem access in
+        # mlbvh.cu _selfQuery_ee). 1e-4 brings gapl to ~0.087mm, well below
+        # the FEM mesh resolution.
+        poisson_rate=0.49, friction_rate=0.4, relative_dhat=1e-4,
         joint_strength_ratio=100.0, revolute_driving_strength_ratio=100.0,
         semi_implicit_enabled=True, semi_implicit_beta_tol=5e-2,
         semi_implicit_min_iter=1, newton_tol=5e-2,
         preconditioner_type=0, ground_offset=-0.5,
         assets_dir=ASSETS_DIR,
     )
+    # CCD buffer scale (default 6, bump to 16 for safety with FEM bodies).
+    # The original (pre-multi-FEM-bodyid) crash at GIPC.cu:9288 was caused
+    # by all 4 FEM softpads aliasing to body_id=-1 and forced into mutual
+    # EE check, exploding the CCD candidate count. Now FEM-vs-FEM is
+    # precisely excluded via real body_ids, so the candidate count stays
+    # bounded. Keep a 2.7x safety margin for aggressive arm motions.
+    config._cfg.collision_detection_buff_scale = 16.0
     eng = Engine(config)
     assets_dir = eng.native.get_assets_dir()
 
@@ -203,6 +251,7 @@ def main():
     # 7. Stitch springs (batch read all host vertices once for fast lookup)
     all_verts = all_host_vertices(eng)
     total_pairs = 0
+    stitch_viz_pairs = []  # list of (fem_global, abd_global) for GUI viz
     for f_rec, e_rec in finger_to_fem:
         f_verts = all_verts[f_rec.vertex_offset:f_rec.vertex_offset + f_rec.vertex_count]
         e_verts = all_verts[e_rec.vertex_offset:e_rec.vertex_offset + e_rec.vertex_count]
@@ -235,6 +284,7 @@ def main():
                 abd_global = f_rec.vertex_offset + f_in[j_f]
                 if os.environ.get("NO_STITCH") != "1":
                     eng.add_stitch_spring(fem_global, abd_global, f_rec.body_offset)
+                stitch_viz_pairs.append((fem_global, abd_global))
                 n_pairs += 1
         print(f"[softgripper] stitch {f_rec.label} -> FEM#{fem_records.index(e_rec)}: "
               f"{n_pairs} pairs (overlap Y=[{y_overlap_lo:.4f},{y_overlap_hi:.4f}], "
@@ -242,6 +292,49 @@ def main():
               flush=True)
         total_pairs += n_pairs
     print(f"[softgripper] total stitch pairs: {total_pairs}", flush=True)
+
+    # 8. Exclude every arm ABD body vs the FEM "slot" so the IPC initial-
+    # intersect check doesn't reject FEM softpads that are stitched flush
+    # against (or slightly overlapping) the ABD finger backbones. Engine
+    # collapses every FEM body's body_id to -1, which the matrix maps to
+    # slot (abd_count + fem_count - 1); excluding any arm body against this
+    # slot also excludes it from all 4 FEM softpads, but that's fine —
+    # arm should never collide with any softpad. Cup + table are kept
+    # un-excluded so gripping physics still works.
+    # [multi-FEM-bodyid] Engine v0.5+ assigns each FEM body its own body_id
+    # (no longer aliased to -1), so we can address each one individually
+    # in the exclusion matrix.
+    #
+    # NOTE: BodyLoadRecord.body_offset is a *type-local* index — for ABD
+    # bodies it equals the global body_id (since ABDs come first), but for
+    # FEM bodies it's 0..fem_count-1 (sub-id). The exclusion matrix is
+    # indexed by the *global* body_id, so we add abd_body_count to FEM
+    # offsets to get the global id.
+    if eng.fem_body_count > 0:
+        records = list(eng.get_load_records())
+        fem_records   = [r for r in records if r.body_type == 1]
+        arm_records   = [r for r in records
+                         if r.body_type == 0
+                         and 'cup'  not in r.label.lower()
+                         and 'cube' not in r.label.lower()]
+        abd_count = eng.abd_body_count
+        fem_global_ids = [abd_count + fr.body_offset for fr in fem_records]
+        # 1. arm × all FEM softpads — arm shouldn't collide with FEM (stitch
+        # springs already attach them, geometry overlaps).
+        for ar in arm_records:
+            for fid in fem_global_ids:
+                eng.add_collision_exclusion(ar.body_offset, fid)
+        # 2. FEM_i × FEM_j (i != j) — 4 softpads sit on 4 separate fingers
+        # at >10cm separation, no physical reason to check inter-FEM.
+        # Each FEM's *own* self-collision is preserved (we don't add the
+        # (i, i) self-exclusion).
+        for i, fid_i in enumerate(fem_global_ids):
+            for fid_j in fem_global_ids[i+1:]:
+                eng.add_collision_exclusion(fid_i, fid_j)
+        print(f"[softgripper] excluded {len(arm_records) * len(fem_records)} arm-FEM "
+              f"pairs + {len(fem_records)*(len(fem_records)-1)//2} FEM-FEM pairs "
+              f"(FEM global body ids: {fem_global_ids})",
+              flush=True)
 
     eng.finalize()
     robot = Robot(eng)
@@ -262,6 +355,20 @@ def main():
     faces = eng.get_surface_faces()
     mesh = ps.register_surface_mesh("scene", verts, faces, smooth_shade=True)
     mesh.set_color((0.6, 0.7, 0.8))
+
+    # Stitch springs viz: one curve-network edge per (FEM vertex, ABD anchor)
+    # pair, showing the stitch in red. Updated each step.
+    stitch_curve = None
+    if stitch_viz_pairs:
+        n_pairs = len(stitch_viz_pairs)
+        stitch_node_idx = np.array(stitch_viz_pairs, dtype=np.int64).reshape(-1)
+        # node array layout: [(fem0, abd0, fem1, abd1, ...)] then update by indexing verts
+        stitch_nodes = verts[stitch_node_idx]
+        stitch_edges = np.array([(2*i, 2*i+1) for i in range(n_pairs)], dtype=int)
+        stitch_curve = ps.register_curve_network(
+            "stitch springs", stitch_nodes, stitch_edges)
+        stitch_curve.set_color((1.0, 0.2, 0.2))
+        stitch_curve.set_radius(0.0008, relative=False)
 
     running = [False]
     step_count = [0]
@@ -301,7 +408,10 @@ def main():
         if running[0]:
             eng.step()
             step_count[0] += 1
-            mesh.update_vertex_positions(eng.get_vertices())
+            v_now = eng.get_vertices()
+            mesh.update_vertex_positions(v_now)
+            if stitch_curve is not None:
+                stitch_curve.update_node_positions(v_now[stitch_node_idx])
 
     ps.set_user_callback(callback)
     ps.show()

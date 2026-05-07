@@ -726,6 +726,12 @@ void SimEngine::Impl::do_upload_to_gpu()
 
     safe_copy(d_tetMesh.body_id_to_boundary_type, tetMesh.body_id_to_is_fixed.data(),
               tetMesh.body_id_to_is_fixed.size() * sizeof(int), cudaMemcpyHostToDevice);
+    // [multi-FEM-bodyid] upload per-body FEM flag (size = collision_body_num).
+    if(d_tetMesh.body_id_to_is_fem != nullptr && !tetMesh.body_id_to_is_fem.empty())
+    {
+        safe_copy(d_tetMesh.body_id_to_is_fem, tetMesh.body_id_to_is_fem.data(),
+                  tetMesh.body_id_to_is_fem.size() * sizeof(int), cudaMemcpyHostToDevice);
+    }
     safe_copy(d_tetMesh.point_id_to_body_id, tetMesh.point_id_to_body_id.data(),
               tetMesh.point_id_to_body_id.size() * sizeof(int), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.tet_id_to_body_id, tetMesh.tet_id_to_body_id.data(),
@@ -908,9 +914,14 @@ void SimEngine::Impl::do_init_bvh_and_solver()
         CUDA_SAFE_CALL(cudaMemcpy(ipc._surfVerts, tetMesh.surfVerts.data(),
                                   ipc.surf_vertexNum * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
+    // [multi-FEM-bodyid] hand the per-body FEM flag table to GIPC so the
+    // narrow-phase / sanity-check kernels can distinguish FEM vs ABD
+    // without the legacy "_bodyId == -1" sentinel. Must be set BEFORE
+    // initBVH() so bvh_f/bvh_e read a non-null pointer.
+    ipc._body_id_to_is_fem  = d_tetMesh.body_id_to_is_fem;
     ipc.initBVH(d_tetMesh.BoundaryType, d_tetMesh.point_id_to_body_id,
                 d_tetMesh.collision_skip_matrix, d_tetMesh.collision_body_num);
-    ipc._point_body_id = d_tetMesh.point_id_to_body_id;
+    ipc._point_body_id      = d_tetMesh.point_id_to_body_id;
 
     // BVH-skip #3 wiring is deferred until after ipc.init() — see "[BVHSkip#3-WIRE]" marker.
 
