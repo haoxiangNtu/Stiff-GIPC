@@ -1126,6 +1126,54 @@ void SimEngine::finalize()
               << impl.ipc.surface_Num << " surface faces, "
               << impl.ipc.edge_Num << " edges" << std::endl;
 
+    // [stitch sanity] Warn if soft_motion_rate (stitch spring stiffness) is
+    // large compared to FEM Young modulus and the scene has many stitch
+    // springs. The stitch Hessian diagonal contribution is
+    //   H_stitch_total ≈ stitch_count * soft_motion_rate
+    // and gets summed with the FEM elasticity Hessian (~Young per tet) +
+    // IPC barrier Hessian (~kappa per contact). If H_stitch dominates by
+    // 10x or more, the combined matrix's condition number can blow up
+    // and PCG produces NaN. (Verified empirically on case_27_softgripper:
+    // motionRate=1e6 + 130 stitch + Young=1e6 -> NaN at step ~131.)
+    {
+        int stitch_count = impl.tetMesh.softNum;
+        double rate = impl.cfg.soft_motion_rate;
+        // Average per-vertex Young modulus across all FEM vertices — this
+        // is the actual elasticity stiffness the stitch is competing with,
+        // unlike cfg.cloth_young_modulus which only applies to dim=2 cloth
+        // FEM bodies and may be unset for tet (dim=3) FEM scenes.
+        double young_avg = 0.0;
+        const auto& yvec = impl.tetMesh.vert_youngth_modules;
+        if(!yvec.empty())
+        {
+            double sum = 0.0;
+            for(double y : yvec) sum += y;
+            young_avg = sum / static_cast<double>(yvec.size());
+        }
+        if(stitch_count > 0 && rate > 0.0 && young_avg > 0.0)
+        {
+            double total_stitch_h = stitch_count * rate;
+            double ratio = total_stitch_h / young_avg;
+            // Empirical thresholds (case_27_softgripper, 130 stitch, FEM
+            // young 1e6):
+            //   ratio = 130    (motionRate=1e4) -> stable
+            //   ratio = 1.3e4  (motionRate=1e6) -> NaN at step ~131
+            // Set threshold = 1000 (~middle in log scale).
+            if(ratio > 1000.0)
+            {
+                printf("\n[SimEngine] *** WARNING: stitch system may be too stiff ***\n");
+                printf("[SimEngine]   stitch_count=%d  soft_motion_rate=%.1e  avg FEM Young=%.1e\n",
+                       stitch_count, rate, young_avg);
+                printf("[SimEngine]   stitch_count * soft_motion_rate / avg_young = %.1f (threshold = 1000)\n",
+                       ratio);
+                printf("[SimEngine]   Empirically, ratio > 1000 risks PCG NaN under aggressive joint trajectories.\n");
+                printf("[SimEngine]   If you hit NaN, try reducing soft_motion_rate (e.g. /100) or raising\n");
+                printf("[SimEngine]   per-mesh young_modulus, or run with NAN_DIAG=1 to confirm.\n\n");
+                fflush(stdout);
+            }
+        }
+    }
+
     // DIAG: dump q for first 3 bodies after full finalize
     {
         int nb = impl.ipc.abd_fem_count_info.abd_body_num;
@@ -1154,8 +1202,8 @@ void SimEngine::finalize()
 // ======================== step ========================
 // [NAN_DIAG] Per-step diagnostic dump (env-gated). Pulls FEM tet volumes,
 // vertex velocities and positions to host; reports min/max + NaN counts.
-// Useful for pinning down which of R1-R5 (tet-inverted, stitch-spring,
-// kappa-overflow, CFL div-by-zero, Hessian-zeroed) caused a NaN.
+// Useful for pinning down whether NaN is born from tet inversion,
+// stitch-spring blowup, kappa overflow, or PCG numerical breakdown.
 //
 // Activate: NAN_DIAG=1 ./run examples/...
 //
@@ -1176,7 +1224,72 @@ struct NanDiagState {
     }
 };
 static NanDiagState g_diag;
+
+// [NaN-sentinel] lightweight always-on NaN watchdog. One device int gets
+// atomicCAS'd if any vertex is NaN/Inf; first occurrence triggers a
+// human-readable warning.
+struct NanSentinelState {
+    int* d_flag = nullptr;
+    bool warned = false;
+    int  step_count = 0;
+    void ensure_buffer() {
+        if(d_flag == nullptr) {
+            cudaMalloc(&d_flag, sizeof(int));
+        }
+    }
+};
+static NanSentinelState g_sentinel;
 }  // namespace
+
+__global__ static void _nan_sentinel_kernel(const double3* verts,
+                                            const double3* velocities,
+                                            int n,
+                                            int* out_flag)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    double3 p = verts[idx];
+    double3 v = velocities[idx];
+    bool bad = isnan(p.x) || isnan(p.y) || isnan(p.z)
+               || isinf(p.x) || isinf(p.y) || isinf(p.z)
+               || isnan(v.x) || isnan(v.y) || isnan(v.z)
+               || isinf(v.x) || isinf(v.y) || isinf(v.z);
+    if(bad) atomicCAS(out_flag, 0, 1);
+}
+
+static void check_nan_sentinel_(int n_v,
+                                const double3* d_vertexes,
+                                const double3* d_velocities)
+{
+    g_sentinel.ensure_buffer();
+    if(n_v <= 0 || g_sentinel.d_flag == nullptr) return;
+    int sc = g_sentinel.step_count++;
+
+    cudaMemset(g_sentinel.d_flag, 0, sizeof(int));
+    int blocks = (n_v + 255) / 256;
+    _nan_sentinel_kernel<<<blocks, 256>>>(d_vertexes,
+                                          d_velocities,
+                                          n_v,
+                                          g_sentinel.d_flag);
+    int h_flag = 0;
+    cudaMemcpy(&h_flag, g_sentinel.d_flag, sizeof(int), cudaMemcpyDeviceToHost);
+    if(h_flag != 0 && !g_sentinel.warned) {
+        g_sentinel.warned = true;
+        printf("\n========================================================================\n");
+        printf("[NaN-SENTINEL] *** NaN/Inf detected in vertex positions or velocities\n");
+        printf("[NaN-SENTINEL] *** at step %d. Physics has DIVERGED — subsequent steps\n", sc);
+        printf("[NaN-SENTINEL] *** will be garbage and the engine cannot self-recover.\n");
+        printf("[NaN-SENTINEL] *** Most common causes:\n");
+        printf("[NaN-SENTINEL] ***   1. soft_motion_rate too high vs FEM Young modulus\n");
+        printf("[NaN-SENTINEL] ***      (causes Hessian condition number blowup -> PCG NaN)\n");
+        printf("[NaN-SENTINEL] ***   2. dt too large for the prescribed joint speed\n");
+        printf("[NaN-SENTINEL] ***   3. FEM tet inverted (collision-driven over-compression)\n");
+        printf("[NaN-SENTINEL] *** Re-run with NAN_DIAG=1 to see per-step min(tet_vol),\n");
+        printf("[NaN-SENTINEL] *** max|v|, max|p|, NaN count + body_id breakdown.\n");
+        printf("========================================================================\n\n");
+        fflush(stdout);
+    }
+}
 
 static void dump_nan_diagnostics_(int n_tet, int n_v,
                                   const double* d_volum,
@@ -1270,6 +1383,13 @@ void SimEngine::step()
     impl.ipc.IPC_Solver(impl.d_tetMesh);
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     impl.step_count++;
+
+    // [NaN-sentinel] always-on lightweight NaN watchdog (~1 atomic int +
+    // 4-byte D->H copy per step). Prints a one-time warning at first
+    // occurrence so users notice silent physics divergence.
+    check_nan_sentinel_(impl.tetMesh.vertexNum,
+                        impl.d_tetMesh.vertexes,
+                        impl.d_tetMesh.velocities);
 
     // [NAN_DIAG] env-gated — only runs when NAN_DIAG=1.
     dump_nan_diagnostics_(impl.tetMesh.tetrahedraNum,
