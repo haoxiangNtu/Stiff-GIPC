@@ -44,21 +44,36 @@ __device__ __host__ inline bool overlap(const AABB& lhs, const AABB& rhs, const 
 // Check if collision between bodyA and bodyB should be skipped
 // according to the collision exclusion matrix.
 //
-// FEM body vertices carry body_id == -1 (legacy semantic from
-// tetrahedra_obj::begin_load_body). To honor add_collision_exclusion(
-// abd_body, fem_global_id) calls in narrow-phase + sanity-check kernels,
-// we map -1 to the last matrix row (assumes a single FEM body).
+// [multi-FEM-bodyid] Previously mapped body_id == -1 (legacy FEM sentinel)
+// to the last matrix row, which aliased all FEM bodies into a single slot.
+// Now every body (ABD or FEM) carries its own real body_id and indexes the
+// matrix directly.
 __device__ inline bool _is_collision_excluded(int bodyA, int bodyB,
                                               const int* _collision_skip_matrix,
                                               int _collision_body_count)
 {
     if(_collision_skip_matrix == nullptr || _collision_body_count <= 0)
         return false;
-    if(bodyA == -1) bodyA = _collision_body_count - 1;
-    if(bodyB == -1) bodyB = _collision_body_count - 1;
     if(bodyA < 0 || bodyB < 0 || bodyA >= _collision_body_count || bodyB >= _collision_body_count)
         return false;
     return _collision_skip_matrix[bodyA * _collision_body_count + bodyB] != 0;
+}
+
+// [multi-FEM-bodyid] Should we run narrow-phase contact / sanity check
+// between two vertices/edges/faces with body IDs (bodyA, bodyB)?
+// Rules:
+//   bodyA != bodyB                       -> YES (different bodies)
+//   bodyA == bodyB && is_fem[bodyA]      -> YES (FEM body self-collision)
+//   bodyA == bodyB && !is_fem[bodyA]     -> NO (ABD body, no self-collision)
+//   bodyA == -1 (unassigned)             -> NO (defensive)
+// Replaces the legacy `(A != B) || (A == -1)` pattern that hardcoded
+// "all FEM share body_id -1, FEM-self always on" assumption.
+__device__ inline bool _should_check_pair(int bodyA, int bodyB,
+                                          const int* _body_id_to_is_fem)
+{
+    if(bodyA != bodyB) return true;
+    if(bodyA < 0 || _body_id_to_is_fem == nullptr) return false;
+    return _body_id_to_is_fem[bodyA] != 0;
 }
 
 __device__ __host__ inline double3 centroid(const AABB& box) noexcept
@@ -1459,7 +1474,8 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                               double          dHat,
                               int             number,
                               const int*      _collision_skip_matrix,
-                              int             _collision_body_count)
+                              int             _collision_body_count,
+                              const int*      _body_id_to_is_fem)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1499,7 +1515,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count))
                 {
@@ -1532,7 +1548,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count))
                 {
@@ -1577,7 +1593,8 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                   double          dHat,
                                   int             number,
                                   const int*      _collision_skip_matrix,
-                                  int             _collision_body_count)
+                                  int             _collision_body_count,
+                                  const int*      _body_id_to_is_fem)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1621,7 +1638,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count))
                 {
@@ -1651,7 +1668,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
-                if(((_bodyID[idx] != _bodyID[_faces[obj_idx].x]) || (_bodyID[idx] == -1))
+                if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count))
                 {
@@ -1693,7 +1710,8 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                               double         dHat,
                               int            number,
                               const int*     _collision_skip_matrix,
-                              int            _collision_body_count)
+                              int            _collision_body_count,
+                              const int*     _body_id_to_is_fem)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1734,8 +1752,7 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
-                       || (_bodyID[_edges[self_eid].x] == -1))
+                    if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count))
                     {
@@ -1780,8 +1797,7 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
-                       || (_bodyID[_edges[self_eid].x] == -1))
+                    if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count))
                     {
@@ -1833,7 +1849,8 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                                   double         dHat,
                                   int            number,
                                   const int*     _collision_skip_matrix,
-                                  int            _collision_body_count)
+                                  int            _collision_body_count,
+                                  const int*     _body_id_to_is_fem)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -1874,8 +1891,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
-                       || (_bodyID[_edges[self_eid].x] == -1))
+                    if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count))
                     {
@@ -1909,8 +1925,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             {
                 if(self_eid != obj_idx)
                 {
-                    if(((_bodyID[_edges[self_eid].x] != _bodyID[_edges[obj_idx].x])
-                       || (_bodyID[_edges[self_eid].x] == -1))
+                    if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count))
                     {
@@ -2138,6 +2153,7 @@ void selfQuery_ee(const int*     _bodyID,
                   int            number,
                   const int*     _collision_skip_matrix,
                   int            _collision_body_count,
+                  const int*     _body_id_to_is_fem,
                   cudaStream_t   stream = 0)
 {
     int numbers = number;
@@ -2160,7 +2176,8 @@ void selfQuery_ee(const int*     _bodyID,
                                            dHat,
                                            numbers,
                                            _collision_skip_matrix,
-                                           _collision_body_count);
+                                           _collision_body_count,
+                                           _body_id_to_is_fem);
 }
 
 void fullCCDselfQuery_ee(const int*     _bodyID,
@@ -2177,6 +2194,7 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
                          int            number,
                          const int*     _collision_skip_matrix,
                          int            _collision_body_count,
+                         const int*     _body_id_to_is_fem,
                          cudaStream_t   stream = 0)
 {
     int numbers = number;
@@ -2187,7 +2205,7 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
 
     _selfQuery_ee_ccd<<<blockNum, threadNum, 0, stream>>>(
         _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
-        _collision_skip_matrix, _collision_body_count);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem);
 }
 
 void selfQuery_vf(const int*      _bodyID,
@@ -2205,6 +2223,7 @@ void selfQuery_vf(const int*      _bodyID,
                   int             number,
                   const int*      _collision_skip_matrix,
                   int             _collision_body_count,
+                  const int*      _body_id_to_is_fem,
                   cudaStream_t    stream = 0)
 {
     int numbers = number;
@@ -2227,7 +2246,8 @@ void selfQuery_vf(const int*      _bodyID,
                                            dHat,
                                            numbers,
                                            _collision_skip_matrix,
-                                           _collision_body_count);
+                                           _collision_body_count,
+                                           _body_id_to_is_fem);
 }
 
 void fullCCDselfQuery_vf(const int*      _bodyID,
@@ -2245,6 +2265,7 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
                          int             number,
                          const int*      _collision_skip_matrix,
                          int             _collision_body_count,
+                         const int*      _body_id_to_is_fem,
                          cudaStream_t    stream = 0)
 {
     int numbers = number;
@@ -2255,7 +2276,7 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
 
     _selfQuery_vf_ccd<<<blockNum, threadNum, 0, stream>>>(
         _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
-        _collision_skip_matrix, _collision_body_count);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem);
 }
 
 void lbvh::FREE_DEVICE_MEM()
@@ -2563,6 +2584,7 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  vert_number,
                  _collision_skip_matrix,
                  _collision_body_count,
+                 _body_id_to_is_fem,
                  stream);
 }
 
@@ -2590,6 +2612,7 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  N,
                  _collision_skip_matrix,
                  _collision_body_count,
+                 _body_id_to_is_fem,
                  stream);
 }
 
@@ -2598,7 +2621,7 @@ void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
 
     fullCCDselfQuery_vf(
         _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
-        _collision_skip_matrix, _collision_body_count, stream);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, stream);
 }
 
 void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream)
@@ -2610,7 +2633,7 @@ void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
                 : (int)edge_number;
     fullCCDselfQuery_ee(
         _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, N,
-        _collision_skip_matrix, _collision_body_count, stream);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, stream);
 }
 
 

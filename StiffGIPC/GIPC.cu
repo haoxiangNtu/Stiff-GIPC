@@ -8339,21 +8339,32 @@ __global__ void _updateSurfVerts(uint32_t* sortIndex, uint32_t* _sVerts, int _of
 
 // Check if collision between bodyA and bodyB should be skipped
 // according to the collision exclusion matrix.
-// See note above mlbvh.cu's _is_collision_excluded: FEM body vertices carry
-// body_id == -1 by legacy semantic; map to the last matrix slot so
-// add_collision_exclusion(abd_body, fem_global_id) is honored by narrow-
-// phase + sanity-check kernels that look up this matrix.
+//
+// [multi-FEM-bodyid] Previously mapped body_id == -1 (legacy FEM sentinel)
+// to the last matrix slot. Now every body has its real body_id and indexes
+// the matrix directly.
 __device__ inline bool _is_collision_excluded_gipc(int bodyA, int bodyB,
                                                    const int* _collision_skip_matrix,
                                                    int _collision_body_count)
 {
     if(_collision_skip_matrix == nullptr || _collision_body_count <= 0)
         return false;
-    if(bodyA == -1) bodyA = _collision_body_count - 1;
-    if(bodyB == -1) bodyB = _collision_body_count - 1;
     if(bodyA < 0 || bodyB < 0 || bodyA >= _collision_body_count || bodyB >= _collision_body_count)
         return false;
     return _collision_skip_matrix[bodyA * _collision_body_count + bodyB] != 0;
+}
+
+// [multi-FEM-bodyid] Skip same-body filter for sanity-check kernels
+// (segment-triangle intersection). Mirrors mlbvh.cu's _should_check_pair
+// but inverted: returns TRUE if the pair should be SKIPPED (same ABD body,
+// no point checking).
+__device__ inline bool _skip_same_abd_body(int bodyA, int bodyB,
+                                           const int* _body_id_to_is_fem)
+{
+    if(bodyA != bodyB) return false;        // different bodies -> not skipped here
+    if(bodyA < 0) return false;             // unassigned -> defensive (don't skip)
+    if(_body_id_to_is_fem == nullptr) return true;  // legacy fallback: skip same body
+    return _body_id_to_is_fem[bodyA] == 0;  // skip if same ABD body
 }
 
 __global__ void _edgeTriIntersectionQuery(const int*     _bodyId,
@@ -8367,7 +8378,8 @@ __global__ void _edgeTriIntersectionQuery(const int*     _bodyId,
                                           double         dHat,
                                           int            number,
                                           const int*     _collision_skip_matrix,
-                                          int            _collision_body_count)
+                                          int            _collision_body_count,
+                                          const int*     _body_id_to_is_fem)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -8411,11 +8423,13 @@ __global__ void _edgeTriIntersectionQuery(const int*     _bodyId,
                      || face.y == _edges[obj_idx].x || face.y == _edges[obj_idx].y
                      || face.z == _edges[obj_idx].x || face.z == _edges[obj_idx].y))
                 {
-                    // Skip if face and edge belong to the same ABD body
-                    if((_bodyId[face.x] == _bodyId[_edges[obj_idx].x])
-                       && (_bodyId[face.x] != -1))
+                    // [multi-FEM-bodyid] Skip if face and edge belong to the same
+                    // ABD body. FEM body self-intersection sanity-check is still
+                    // run (allowed) since the FEM mesh might fold onto itself.
+                    if(_skip_same_abd_body(_bodyId[face.x], _bodyId[_edges[obj_idx].x],
+                                           _body_id_to_is_fem))
                     {
-                        // same body, skip
+                        // same ABD body, skip
                     }
                     // Skip if bodies are in the collision exclusion list
                     else if(_is_collision_excluded_gipc(_bodyId[face.x], _bodyId[_edges[obj_idx].x],
@@ -8454,11 +8468,13 @@ __global__ void _edgeTriIntersectionQuery(const int*     _bodyId,
                      || face.y == _edges[obj_idx].x || face.y == _edges[obj_idx].y
                      || face.z == _edges[obj_idx].x || face.z == _edges[obj_idx].y))
                 {
-                    // Skip if face and edge belong to the same ABD body
-                    if((_bodyId[face.x] == _bodyId[_edges[obj_idx].x])
-                       && (_bodyId[face.x] != -1))
+                    // [multi-FEM-bodyid] Skip if face and edge belong to the same
+                    // ABD body. FEM body self-intersection sanity-check is still
+                    // run (allowed) since the FEM mesh might fold onto itself.
+                    if(_skip_same_abd_body(_bodyId[face.x], _bodyId[_edges[obj_idx].x],
+                                           _body_id_to_is_fem))
                     {
-                        // same body, skip
+                        // same ABD body, skip
                     }
                     // Skip if bodies are in the collision exclusion list
                     else if(_is_collision_excluded_gipc(_bodyId[face.x], _bodyId[_edges[obj_idx].x],
@@ -8724,6 +8740,11 @@ void GIPC::initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix, int _
                surf_vertexNum,
                _collision_skip_matrix,
                _collision_body_count);
+    // [multi-FEM-bodyid] forward the per-body FEM flag table directly
+    // (set by sim_engine.cu after this call returns; see ipc._body_id_to_is_fem
+    // assignment in do_init_bvh_and_solver).
+    bvh_e._body_id_to_is_fem = _body_id_to_is_fem;
+    bvh_f._body_id_to_is_fem = _body_id_to_is_fem;
 }
 
 void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer, double buffScale)
@@ -10833,7 +10854,8 @@ bool edgeTriIntersectionQuery(const int*     _bodyId,
                               double         dHat,
                               int            number,
                               const int*     _collision_skip_matrix,
-                              int            _collision_body_count)
+                              int            _collision_body_count,
+                              const int*     _body_id_to_is_fem)
 {
     int numbers = number;
     if(numbers <= 0)
@@ -10846,7 +10868,7 @@ bool edgeTriIntersectionQuery(const int*     _bodyId,
 
     _edgeTriIntersectionQuery<<<blockNum, threadNum>>>(
         _bodyId, _btype, _vertexes, _edges, _faces, _edge_bvs, _edge_nodes, _isIntersect, dHat, numbers,
-        _collision_skip_matrix, _collision_body_count);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem);
 
     int h_isITST;
     cudaMemcpy(&h_isITST, _isIntersect, sizeof(int), cudaMemcpyDeviceToHost);
@@ -10870,7 +10892,8 @@ bool GIPC::checkEdgeTriIntersectionIfAny(device_TetraData& TetMesh)
                                     dHat,
                                     bvh_f.face_number,
                                     bvh_e._collision_skip_matrix,
-                                    bvh_e._collision_body_count);
+                                    bvh_e._collision_body_count,
+                                    _body_id_to_is_fem);
 }
 
 bool GIPC::checkGroundIntersection()
