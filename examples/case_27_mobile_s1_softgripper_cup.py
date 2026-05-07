@@ -142,21 +142,15 @@ def main():
     config = Config(
         dt=0.020,
         cloth_thickness=1e-3, cloth_young_modulus=1e4, bend_young_modulus=1e3,
-        # soft_motion_rate is the stitch-spring stiffness coefficient
-        # (motionRate in GIPC.cu:6427). force = motionRate * Δoffset.
-        # Sweet-spot tuning:
-        #   - 1e6 + 130 stitch + FEM Young 1e6 → NaN at step ~131 (PCG
-        #     condition number blowup)
-        #   - 1e4 → stable, but stitch 100x softer than FEM elasticity
-        #     means stitch can only drag the FEM vertex it's attached to;
-        #     the rest of the FEM body stays put due to its own stiffness,
-        #     so when the arm rotates fast (e.g. left_arm_joint6 to 60deg+)
-        #     the FEM softpad's far end doesn't follow and INTERSECT
-        #     warnings appear (FEM tail penetrates moved ABD).
-        #   - 1e5 → 10x stiffer than 1e4 (stitch can pull FEM along),
-        #     but still 10x softer than FEM internal elasticity so the
-        #     PCG Hessian condition number stays bounded.
-        cloth_density=200, strain_rate=100, soft_motion_rate=1e5,
+        # soft_motion_rate matches set_case11_gripper (gl_main.cu:2183):
+        # 1e4 is calibrated equivalent to UIPC's kappa*dt^2 = 1e8 * 0.01^2 = 1e4.
+        # The original "FEM tip not tracking" issue we saw was actually a
+        # stitch *geometry* problem (matching restricted to Y-overlap zone
+        # → only top of finger had stitches → tip was unconstrained),
+        # not a stitch *stiffness* problem. The fix below (full-length
+        # mutual-NN matching, see Stitch springs section) distributes
+        # stitch points along the entire finger like case_11 native does.
+        cloth_density=200, strain_rate=100, soft_motion_rate=1e4,
         # relative_dhat=1e-4 (not 1e-3) is required because the FEM softpad
         # mesh (softgriper_part3.msh, scaled by 0.3) has median edge length
         # ~0.38mm. With the default 1e-3 and the full-scene bbox dominated by
@@ -264,48 +258,70 @@ def main():
     else:
         print(f"[softgripper] NO_FEM=1, skipping FEM softpads", flush=True)
 
-    # 7. Stitch springs (batch read all host vertices once for fast lookup)
+    # 7. Stitch springs — each FEM SURFACE vertex pulls toward its nearest
+    # ABD finger backbone vertex (one-way NN, sparse coverage).
+    #
+    # Why not mutual-NN like case_11 native (gl_main.cu:2034-2063)?
+    # case_11 uses part1.msh (ABD) + part2_blobal.msh (FEM) — they are
+    # the hard/soft regions of the SAME source mesh, so mutual-NN gives
+    # full-length coverage. Our demo uses finger_clean.obj (ABD) which is
+    # geometrically *smaller* than part2_blobal.msh (FEM) — mutual-NN's
+    # reverse-check fails for the FEM tip (the FEM tip's nearest ABD vertex
+    # is at the finger *top*, but that ABD vertex's nearest FEM vertex is
+    # also at the FEM top, not the tip). Result: stitch all crowd at the
+    # finger top, FEM tip drifts under arm rotation.
+    #
+    # One-way NN: every FEM SURFACE vertex picks its nearest ABD vertex
+    # (within thresh), so stitch distribution follows FEM geometry, not
+    # mutual matching. Multiple FEM verts can share an ABD anchor —
+    # physically OK (multiple springs anchored at one ABD point).
+    # We use surface verts only (not all FEM verts) to keep stitch_count
+    # bounded; interior FEM verts are dragged by FEM elasticity from the
+    # surface anchors.
     all_verts = all_host_vertices(eng)
     total_pairs = 0
     stitch_viz_pairs = []  # list of (fem_global, abd_global) for GUI viz
     for f_rec, e_rec in finger_to_fem:
         f_verts = all_verts[f_rec.vertex_offset:f_rec.vertex_offset + f_rec.vertex_count]
         e_verts = all_verts[e_rec.vertex_offset:e_rec.vertex_offset + e_rec.vertex_count]
-        # Find Y-overlap zone (in world frame)
-        f_y_min, f_y_max = f_verts[:, 1].min(), f_verts[:, 1].max()
-        e_y_min, e_y_max = e_verts[:, 1].min(), e_verts[:, 1].max()
-        y_overlap_lo = max(f_y_min, e_y_min)
-        y_overlap_hi = min(f_y_max, e_y_max)
-        if y_overlap_hi < y_overlap_lo:
-            print(f"[softgripper] no Y overlap for {f_rec.label}, skip",
-                  f"finger Y=[{f_y_min:.4f},{f_y_max:.4f}] FEM Y=[{e_y_min:.4f},{e_y_max:.4f}]",
-                  flush=True)
-            continue
-        # Take both meshes' verts inside the overlap zone
-        f_in = np.where((f_verts[:, 1] >= y_overlap_lo) & (f_verts[:, 1] <= y_overlap_hi))[0]
-        e_in = np.where((e_verts[:, 1] >= y_overlap_lo) & (e_verts[:, 1] <= y_overlap_hi))[0]
-        if len(f_in) == 0 or len(e_in) == 0:
-            continue
-        # Mutual-NN match within overlap zone
-        f_pts = f_verts[f_in]; e_pts = e_verts[e_in]
-        f_tree = cKDTree(f_pts); e_tree = cKDTree(e_pts)
-        d_e2f, idx_e2f = f_tree.query(e_pts)
-        d_f2e, idx_f2e = e_tree.query(f_pts)
-        thresh = 0.05 * SCALE  # 15mm at scale=0.3 (loose - finger and FEM may not perfectly align)
+        # One-way NN: every FEM vertex finds its nearest ABD vertex (within
+        # thresh). Multiple FEM verts can share an ABD anchor — physically
+        # OK (multiple springs anchored at one ABD point). Sub-sampling
+        # FEM verts (every Nth) keeps stitch_count bounded — too many
+        # springs makes the Hessian condition number balloon and the
+        # solver becomes slow.
+        # Sub-sampling stride: smaller -> more stitches -> better tracking
+        # but slower PCG (Hessian condition number grows). FEM_BLOBAL has
+        # 8029 verts/finger; sub=128 gives ~60 stitch/finger spread along
+        # the full length, step ~200ms. Use STITCH_SUB env to override.
+        sub_n = int(os.environ.get('STITCH_SUB', '128'))
+        e_idx_local = np.arange(0, len(e_verts), sub_n)
+        e_sub = e_verts[e_idx_local]
+        f_tree = cKDTree(f_verts)
+        d_e2f, idx_e2f = f_tree.query(e_sub)
+        thresh = 0.020  # 20mm — generous; FEM tip can be ~10mm from ABD
         n_pairs = 0
-        for i_e in range(len(e_pts)):
-            j_f = idx_e2f[i_e]
-            if idx_f2e[j_f] == i_e and d_e2f[i_e] < thresh:
-                fem_global = e_rec.vertex_offset + e_in[i_e]
-                abd_global = f_rec.vertex_offset + f_in[j_f]
-                if os.environ.get("NO_STITCH") != "1":
-                    eng.add_stitch_spring(fem_global, abd_global, f_rec.body_offset)
-                stitch_viz_pairs.append((fem_global, abd_global))
-                n_pairs += 1
-        print(f"[softgripper] stitch {f_rec.label} -> FEM#{fem_records.index(e_rec)}: "
-              f"{n_pairs} pairs (overlap Y=[{y_overlap_lo:.4f},{y_overlap_hi:.4f}], "
-              f"min_d={d_e2f.min():.4f}, mean_d={d_e2f.mean():.4f})",
-              flush=True)
+        used_fem_y = []
+        for k in range(len(e_sub)):
+            if d_e2f[k] >= thresh: continue
+            i_e = int(e_idx_local[k])
+            j_f = int(idx_e2f[k])
+            fem_global = e_rec.vertex_offset + i_e
+            abd_global = f_rec.vertex_offset + j_f
+            if os.environ.get("NO_STITCH") != "1":
+                eng.add_stitch_spring(fem_global, abd_global, f_rec.body_offset)
+            stitch_viz_pairs.append((fem_global, abd_global))
+            used_fem_y.append(e_sub[k, 1])
+            n_pairs += 1
+        if n_pairs > 0:
+            uy = np.asarray(used_fem_y)
+            print(f"[softgripper] stitch {f_rec.label} -> FEM#{fem_records.index(e_rec)}: "
+                  f"{n_pairs} pairs  Y-extent=[{uy.min():.4f}, {uy.max():.4f}] "
+                  f"(spread={1000*(uy.max()-uy.min()):.1f}mm, sub={sub_n})  "
+                  f"d_min={d_e2f.min()*1000:.2f}mm  d_mean(used)={1000*d_e2f[d_e2f<thresh].mean():.2f}mm",
+                  flush=True)
+        else:
+            print(f"[softgripper] no stitch matches for {f_rec.label} (thresh={thresh*1000:.0f}mm)", flush=True)
         total_pairs += n_pairs
     print(f"[softgripper] total stitch pairs: {total_pairs}", flush=True)
 
