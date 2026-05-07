@@ -142,7 +142,18 @@ def main():
     config = Config(
         dt=0.020,
         cloth_thickness=1e-3, cloth_young_modulus=1e4, bend_young_modulus=1e3,
-        cloth_density=200, strain_rate=100, soft_motion_rate=1e6,
+        # soft_motion_rate is the stitch-spring stiffness coefficient
+        # (motionRate in GIPC.cu:6427). force = motionRate * Δoffset, and
+        # Hessian diag = motionRate per spring. With motionRate=1e6 the
+        # stitch Hessian dominates over FEM elasticity (Young=1e6) and the
+        # IPC barrier (kappa~2e7) when 130 stitch springs are active,
+        # making the full Hessian condition number large enough that
+        # PCG hits NaN around step 131 of a 30-deg-over-50-step revolute
+        # ramp. Lowering to 1e4 keeps stitch ~100x softer than FEM
+        # elasticity, eliminating the NaN while still tracking ABD finger
+        # motion well enough that the 4 softpads follow the gripper
+        # closing/opening visually correctly.
+        cloth_density=200, strain_rate=100, soft_motion_rate=1e4,
         # relative_dhat=1e-4 (not 1e-3) is required because the FEM softpad
         # mesh (softgriper_part3.msh, scaled by 0.3) has median edge length
         # ~0.38mm. With the default 1e-3 and the full-scene bbox dominated by
