@@ -172,13 +172,15 @@ def main():
         preconditioner_type=0, ground_offset=-0.5,
         assets_dir=ASSETS_DIR,
     )
-    # CCD buffer scale (default 6, bump to 16 for safety with FEM bodies).
-    # The original (pre-multi-FEM-bodyid) crash at GIPC.cu:9288 was caused
-    # by all 4 FEM softpads aliasing to body_id=-1 and forced into mutual
-    # EE check, exploding the CCD candidate count. Now FEM-vs-FEM is
-    # precisely excluded via real body_ids, so the candidate count stays
-    # bounded. Keep a 2.7x safety margin for aggressive arm motions.
-    config._cfg.collision_detection_buff_scale = 16.0
+    # CCD buffer scale (default 6, bumped to 64 for FEM_BLOBAL aggressive
+    # joint motions). compute-sanitizer pinpointed _selfQuery_vf_ccd at
+    # mlbvh.cu:1681 overflowing _ccd_collisionPair[] when left_arm_joint6
+    # ramps to ~30deg with the full part2_blobal mesh (34k verts, 30k tet
+    # / softpad). buff=16 wasn't enough; buff=64 (~620 MB CCD buffer)
+    # covers a 60deg single-step SHOCK in earlier tests. The proper fix
+    # is engine-side atomic cap (task #66 in tracker) — until that lands,
+    # large buffers are the practical workaround.
+    config._cfg.collision_detection_buff_scale = 64.0
     eng = Engine(config)
     assets_dir = eng.native.get_assets_dir()
 
