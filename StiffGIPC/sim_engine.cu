@@ -1152,6 +1152,110 @@ void SimEngine::finalize()
 }
 
 // ======================== step ========================
+// [NAN_DIAG] Per-step diagnostic dump (env-gated). Pulls FEM tet volumes,
+// vertex velocities and positions to host; reports min/max + NaN counts.
+// Useful for pinning down which of R1-R5 (tet-inverted, stitch-spring,
+// kappa-overflow, CFL div-by-zero, Hessian-zeroed) caused a NaN.
+//
+// Activate: NAN_DIAG=1 ./run examples/...
+//
+// Overhead: ~ vertexNum * 48 bytes D->H copy per step, only when enabled.
+namespace {
+struct NanDiagState {
+    bool enabled = false;
+    bool initialized = false;
+    int  step_count = 0;
+    bool nan_seen   = false;
+
+    void init() {
+        if(initialized) return;
+        const char* e = std::getenv("NAN_DIAG");
+        enabled = (e != nullptr && std::string(e) != "0");
+        initialized = true;
+        if(enabled) printf("[NAN_DIAG] enabled (env NAN_DIAG=1)\n");
+    }
+};
+static NanDiagState g_diag;
+}  // namespace
+
+static void dump_nan_diagnostics_(int n_tet, int n_v,
+                                  const double* d_volum,
+                                  const double3* d_velocities,
+                                  const double3* d_vertexes,
+                                  const std::vector<int>& point_id_to_body_id)
+{
+    g_diag.init();
+    if(!g_diag.enabled) return;
+    int sc = g_diag.step_count++;
+
+    // ---- min(tet_vol) — H1 tet-inverted detector ----
+    double min_vol = 0.0;
+    int    n_neg_vol = 0;
+    if(n_tet > 0)
+    {
+        std::vector<double> host_vol(n_tet);
+        cudaMemcpy(host_vol.data(), d_volum,
+                   n_tet * sizeof(double), cudaMemcpyDeviceToHost);
+        min_vol = *std::min_element(host_vol.begin(), host_vol.end());
+        for(double v : host_vol) if(v < 0.0) ++n_neg_vol;
+    }
+
+    // ---- velocities + positions — H2/H4 detectors + NaN tracker ----
+    std::vector<double3> host_v(n_v), host_p(n_v);
+    cudaMemcpy(host_v.data(), d_velocities,
+               n_v * sizeof(double3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_p.data(), d_vertexes,
+               n_v * sizeof(double3), cudaMemcpyDeviceToHost);
+
+    double max_v2 = 0.0, max_p2 = 0.0;
+    int n_nan_v = 0, n_nan_p = 0;
+    int first_nan_v = -1, first_nan_p = -1;
+    for(int i = 0; i < n_v; i++)
+    {
+        const double3& v = host_v[i];
+        const double3& p = host_p[i];
+        bool vn = (std::isnan(v.x) || std::isnan(v.y) || std::isnan(v.z)
+                   || std::isinf(v.x) || std::isinf(v.y) || std::isinf(v.z));
+        bool pn = (std::isnan(p.x) || std::isnan(p.y) || std::isnan(p.z)
+                   || std::isinf(p.x) || std::isinf(p.y) || std::isinf(p.z));
+        if(vn) { ++n_nan_v; if(first_nan_v < 0) first_nan_v = i; }
+        if(pn) { ++n_nan_p; if(first_nan_p < 0) first_nan_p = i; }
+        if(!vn) {
+            double s = v.x*v.x + v.y*v.y + v.z*v.z;
+            if(s > max_v2) max_v2 = s;
+        }
+        if(!pn) {
+            double s = p.x*p.x + p.y*p.y + p.z*p.z;
+            if(s > max_p2) max_p2 = s;
+        }
+    }
+    double max_v = std::sqrt(max_v2);
+    double max_p = std::sqrt(max_p2);
+
+    bool first_nan_step = (n_nan_p + n_nan_v > 0) && !g_diag.nan_seen;
+    if(first_nan_step) g_diag.nan_seen = true;
+
+    printf("[NAN_DIAG] step=%4d  min_tet_vol=%+10.3e  neg_vol=%4d  "
+           "max|v|=%9.3e  max|p|=%9.3e  nan_v=%4d  nan_p=%4d%s\n",
+           sc, min_vol, n_neg_vol, max_v, max_p, n_nan_v, n_nan_p,
+           first_nan_step ? "  <-- FIRST NaN HERE" : "");
+    if(first_nan_step) {
+        if(first_nan_p >= 0) {
+            int bid = (first_nan_p < (int)point_id_to_body_id.size())
+                      ? point_id_to_body_id[first_nan_p] : -2;
+            printf("[NAN_DIAG]   first NaN position vertex idx=%d body_id=%d\n",
+                   first_nan_p, bid);
+        }
+        if(first_nan_v >= 0) {
+            int bid = (first_nan_v < (int)point_id_to_body_id.size())
+                      ? point_id_to_body_id[first_nan_v] : -2;
+            printf("[NAN_DIAG]   first NaN velocity vertex idx=%d body_id=%d\n",
+                   first_nan_v, bid);
+        }
+    }
+    fflush(stdout);
+}
+
 void SimEngine::step()
 {
     auto& impl = *m_impl;
@@ -1166,6 +1270,14 @@ void SimEngine::step()
     impl.ipc.IPC_Solver(impl.d_tetMesh);
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     impl.step_count++;
+
+    // [NAN_DIAG] env-gated — only runs when NAN_DIAG=1.
+    dump_nan_diagnostics_(impl.tetMesh.tetrahedraNum,
+                          impl.tetMesh.vertexNum,
+                          impl.d_tetMesh.volum,
+                          impl.d_tetMesh.velocities,
+                          impl.d_tetMesh.vertexes,
+                          impl.tetMesh.point_id_to_body_id);
 }
 
 // ======================== state queries ========================
