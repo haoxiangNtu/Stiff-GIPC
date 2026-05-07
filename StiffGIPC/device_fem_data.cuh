@@ -76,6 +76,14 @@ class device_TetraData
 
     int*    ground_skip_body = nullptr;
 
+    // [FEM-pin] hard-constraint pin GPU arrays (size = n_fem_pins).
+    // Allocated only if pin count > 0. Apply kernel reads these to
+    // directly project pinned FEM vertex positions to abd_anchor + offset.
+    int*     d_fem_pin_fem_vertex   = nullptr;
+    int*     d_fem_pin_abd_anchor   = nullptr;
+    double3* d_fem_pin_rest_offset  = nullptr;
+    int      n_fem_pins             = 0;
+
     // BVH-skip #3: filtered face/edge index lists. bvh_active_face_idx[t] holds
     // the original face index of the t-th non-isolated face; same for edges.
     // Sized n_active_face / n_active_edge (<= surface count / edge count).

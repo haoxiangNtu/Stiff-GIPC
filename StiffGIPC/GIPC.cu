@@ -9860,6 +9860,41 @@ void stepForward(double3* _vertexes,
         _vertexes, _vertexesTemp, _moveDir, bType, alpha, moveBoundary, numbers);
 }
 
+// [FEM-pin] Hard-constraint projection kernel: after step_forward updates
+// both ABD and FEM verts via line-search alpha, this kernel overrides each
+// pinned FEM vertex's position to abd_anchor + rest_offset, enforcing the
+// kinematic constraint exactly.
+__global__ void _apply_fem_pins(double3*       _vertexes,
+                                const int*     _pin_fem_vertex,
+                                const int*     _pin_abd_anchor,
+                                const double3* _pin_rest_offset,
+                                int            n_pins)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n_pins) return;
+    int     fem_v   = _pin_fem_vertex[idx];
+    int     abd_v   = _pin_abd_anchor[idx];
+    double3 abd_pos = _vertexes[abd_v];
+    double3 off     = _pin_rest_offset[idx];
+    _vertexes[fem_v].x = abd_pos.x + off.x;
+    _vertexes[fem_v].y = abd_pos.y + off.y;
+    _vertexes[fem_v].z = abd_pos.z + off.z;
+}
+
+void apply_fem_pins(double3* _vertexes,
+                    const int* _pin_fem_vertex,
+                    const int* _pin_abd_anchor,
+                    const double3* _pin_rest_offset,
+                    int n_pins)
+{
+    if(n_pins <= 0) return;
+    const unsigned int threadNum = default_threads;
+    int blockNum = (n_pins + threadNum - 1) / threadNum;
+    _apply_fem_pins<<<blockNum, threadNum>>>(_vertexes, _pin_fem_vertex,
+                                             _pin_abd_anchor, _pin_rest_offset,
+                                             n_pins);
+}
+
 void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_boundary)
 {
     auto vertexes = muda::BufferView<double3>{TetMesh.vertexes, vertexNum};
@@ -9895,6 +9930,35 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
         abd_fem_count_info.abd_point_offset, abd_fem_count_info.abd_point_num);
 
     m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, alpha);
+
+    // [FEM-pin] Hard-constraint projection. NOTE: doing this here (after
+    // every line-search step) breaks IPC's implicit energy continuity:
+    // the FEM elasticity sees a sudden vertex jump and the line search
+    // retreats to alpha~=0, causing 200+ sec/step. To make hard pin
+    // production-ready, we'd need to mark pinned verts as not-a-DOF in
+    // the Newton solve (substitution method), which is a larger refactor.
+    //
+    // Until that's done, pin projection runs ONLY when n_fem_pins > 0
+    // AND env STIFFGIPC_PIN_PROJECT=1 (experimental opt-in). Default off.
+    if(TetMesh.n_fem_pins > 0)
+    {
+        static bool pin_proj_initialized = false;
+        static bool pin_proj_enabled = false;
+        if(!pin_proj_initialized) {
+            const char* e = std::getenv("STIFFGIPC_PIN_PROJECT");
+            pin_proj_enabled = (e != nullptr && std::string(e) != "0");
+            pin_proj_initialized = true;
+            if(pin_proj_enabled)
+                printf("[FEM-pin] STIFFGIPC_PIN_PROJECT=1 — projection ON (experimental, slow)\n");
+        }
+        if(pin_proj_enabled) {
+            apply_fem_pins(TetMesh.vertexes,
+                           TetMesh.d_fem_pin_fem_vertex,
+                           TetMesh.d_fem_pin_abd_anchor,
+                           TetMesh.d_fem_pin_rest_offset,
+                           TetMesh.n_fem_pins);
+        }
+    }
 }
 
 void updateSurfaces(uint32_t* sortIndex, uint3* _faces, const int& offset_num, const int& numbers)
