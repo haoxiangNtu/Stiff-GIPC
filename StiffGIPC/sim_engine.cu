@@ -1249,13 +1249,35 @@ struct NanDiagState {
 };
 static NanDiagState g_diag;
 
-// [NaN-sentinel] lightweight always-on NaN watchdog. One device int gets
-// atomicCAS'd if any vertex is NaN/Inf; first occurrence triggers a
-// human-readable warning.
+// [NaN-sentinel] opt-in NaN watchdog. One device int gets atomicCAS'd if
+// any vertex is NaN/Inf; first occurrence triggers a human-readable
+// warning.
+//
+// **Default OFF** — measured ~163 ms/step overhead on case_27_softgripper
+// (12k verts), which is ~150% of a normal 100ms step. The cost comes
+// from the synchronous cudaMemcpy(4B, D->H) breaking GPU pipeline
+// overlap with the IPC solver. Activate only when debugging NaN:
+//
+//     NAN_SENTINEL=1 ./run examples/...
+//
+// Or set NAN_DIAG=1 (which is even more verbose, also opt-in).
 struct NanSentinelState {
     int* d_flag = nullptr;
     bool warned = false;
+    bool enabled = false;
+    bool initialized = false;
     int  step_count = 0;
+    void init() {
+        if(initialized) return;
+        const char* e = std::getenv("NAN_SENTINEL");
+        enabled = (e != nullptr && std::string(e) != "0");
+        // NAN_DIAG implies NAN_SENTINEL — the diagnostic dump already
+        // pulls vertex data, may as well surface a clear warning too.
+        const char* diag = std::getenv("NAN_DIAG");
+        if(diag != nullptr && std::string(diag) != "0") enabled = true;
+        initialized = true;
+        if(enabled) printf("[NaN-SENTINEL] enabled (env NAN_SENTINEL=1 or NAN_DIAG=1)\n");
+    }
     void ensure_buffer() {
         if(d_flag == nullptr) {
             cudaMalloc(&d_flag, sizeof(int));
@@ -1285,6 +1307,8 @@ static void check_nan_sentinel_(int n_v,
                                 const double3* d_vertexes,
                                 const double3* d_velocities)
 {
+    g_sentinel.init();
+    if(!g_sentinel.enabled) return;
     g_sentinel.ensure_buffer();
     if(n_v <= 0 || g_sentinel.d_flag == nullptr) return;
     int sc = g_sentinel.step_count++;
