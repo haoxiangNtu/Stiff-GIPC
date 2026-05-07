@@ -117,6 +117,12 @@ class tetrahedra_obj
 
     gipc::ABDFEMCountInfo         abd_fem_count_info{};
     std::vector<BodyBoundaryType> body_id_to_is_fixed;
+    // [multi-FEM-bodyid] Per-body flag: 1 = body is FEM, 0 = body is ABD.
+    // Indexed by body_id (0..total_body_num-1). Used by narrow-phase
+    // kernels to enable self-collision for FEM bodies and skip same-body
+    // collision for ABD bodies, replacing the legacy "_bodyId == -1"
+    // sentinel that aliased all FEM bodies into one slot.
+    std::vector<int>              body_id_to_is_fem;
     std::vector<int>              point_id_to_body_id;
     std::vector<int>              tet_id_to_body_id;
 

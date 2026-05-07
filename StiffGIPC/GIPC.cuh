@@ -161,6 +161,11 @@ class GIPC
     int* _ground_skip_body  = nullptr;
     int  _ground_body_count = 0;
 
+    // [multi-FEM-bodyid] Per-body FEM flag table (size = _collision_body_num
+    // when initBVH() is called with a non-null table). Owned by
+    // device_TetraData; only borrowed pointer here.
+    int* _body_id_to_is_fem = nullptr;
+
     // Auxiliary stream for overlapping bvh_e collision detection with
     // bvh_f (default stream). Created lazily; destroyed in dtor.
     cudaStream_t m_aux_stream = nullptr;

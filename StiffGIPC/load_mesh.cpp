@@ -1419,13 +1419,18 @@ void tetrahedra_obj::begin_load_body(const std::string& filename,
                                      BodyBoundaryType   body_boundary_type)
 {
     current_body_id = abd_fem_count_info.total_body_num();
-    
+
     // check the body order: ABD then FEM
     if(body_type == gipc::BodyType::FEM)
     {
-        current_body_id = -1;
+        // [multi-FEM-bodyid] previously: current_body_id = -1 (sentinel
+        // shared by all FEM vertices). Aliased multiple FEM bodies into
+        // one matrix slot, so add_collision_exclusion(arm, FEM_x) leaked
+        // to all FEM bodies and add_collision_exclusion(FEM_x, FEM_y)
+        // also disabled each FEM's self-collision. Now FEM bodies get
+        // unique IDs (continuing past abd_body_num); narrow-phase kernels
+        // distinguish FEM from ABD via body_id_to_is_fem[] table.
         abd_load_phase = false;
-        // increase the number of FEM body
         abd_fem_count_info.fem_body_num++;
     }
     else if(body_type == gipc::BodyType::ABD)
@@ -1442,6 +1447,7 @@ void tetrahedra_obj::begin_load_body(const std::string& filename,
     }
 
     body_id_to_is_fixed.push_back(body_boundary_type);
+    body_id_to_is_fem.push_back(body_type == gipc::BodyType::FEM ? 1 : 0);
     body_motor_infos.push_back({});  // default motor info (UnitX axis, 0 speed/strength)
 }
 
