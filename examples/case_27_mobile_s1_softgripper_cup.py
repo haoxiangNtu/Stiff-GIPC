@@ -308,8 +308,21 @@ def main():
             j_f = int(idx_e2f[k])
             fem_global = e_rec.vertex_offset + i_e
             abd_global = f_rec.vertex_offset + j_f
+            # CRITICAL: must pass rest_offset = current (fem_pos - abd_pos)
+            # so the stitch spring's *natural length* is the current spatial
+            # offset. Without this, default rest_offset=(0,0,0) tells the
+            # spring to pull FEM vertex onto the same world position as the
+            # ABD anchor — which in one-way-NN multi-to-one matching causes
+            # every FEM vertex to get yanked toward the same ABD vertex,
+            # crumpling the FEM mesh into a ball. case_11 set_case11_gripper
+            # at gl_main.cu:2165 does the same:
+            #     rest_off = fp - ap
+            fem_pos = e_verts[i_e]
+            abd_pos = f_verts[j_f]
+            rest_off = (fem_pos - abd_pos).tolist()
             if os.environ.get("NO_STITCH") != "1":
-                eng.add_stitch_spring(fem_global, abd_global, f_rec.body_offset)
+                eng.add_stitch_spring(fem_global, abd_global, f_rec.body_offset,
+                                      rest_offset_world=rest_off)
             stitch_viz_pairs.append((fem_global, abd_global))
             used_fem_y.append(e_sub[k, 1])
             n_pairs += 1
