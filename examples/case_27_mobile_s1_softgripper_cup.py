@@ -143,17 +143,20 @@ def main():
         dt=0.020,
         cloth_thickness=1e-3, cloth_young_modulus=1e4, bend_young_modulus=1e3,
         # soft_motion_rate is the stitch-spring stiffness coefficient
-        # (motionRate in GIPC.cu:6427). force = motionRate * Δoffset, and
-        # Hessian diag = motionRate per spring. With motionRate=1e6 the
-        # stitch Hessian dominates over FEM elasticity (Young=1e6) and the
-        # IPC barrier (kappa~2e7) when 130 stitch springs are active,
-        # making the full Hessian condition number large enough that
-        # PCG hits NaN around step 131 of a 30-deg-over-50-step revolute
-        # ramp. Lowering to 1e4 keeps stitch ~100x softer than FEM
-        # elasticity, eliminating the NaN while still tracking ABD finger
-        # motion well enough that the 4 softpads follow the gripper
-        # closing/opening visually correctly.
-        cloth_density=200, strain_rate=100, soft_motion_rate=1e4,
+        # (motionRate in GIPC.cu:6427). force = motionRate * Δoffset.
+        # Sweet-spot tuning:
+        #   - 1e6 + 130 stitch + FEM Young 1e6 → NaN at step ~131 (PCG
+        #     condition number blowup)
+        #   - 1e4 → stable, but stitch 100x softer than FEM elasticity
+        #     means stitch can only drag the FEM vertex it's attached to;
+        #     the rest of the FEM body stays put due to its own stiffness,
+        #     so when the arm rotates fast (e.g. left_arm_joint6 to 60deg+)
+        #     the FEM softpad's far end doesn't follow and INTERSECT
+        #     warnings appear (FEM tail penetrates moved ABD).
+        #   - 1e5 → 10x stiffer than 1e4 (stitch can pull FEM along),
+        #     but still 10x softer than FEM internal elasticity so the
+        #     PCG Hessian condition number stays bounded.
+        cloth_density=200, strain_rate=100, soft_motion_rate=1e5,
         # relative_dhat=1e-4 (not 1e-3) is required because the FEM softpad
         # mesh (softgriper_part3.msh, scaled by 0.3) has median edge length
         # ~0.38mm. With the default 1e-3 and the full-scene bbox dominated by
