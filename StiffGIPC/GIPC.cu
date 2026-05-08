@@ -7,6 +7,7 @@
 //
 
 #include "GIPC.cuh"
+#include "eigen_data.h"  // Vector12 for stitch local-frame fix
 #include <gipc/gipc.h>
 #include "cuda_tools/cuda_tools.h"
 #include "GIPC_PDerivative.cuh"
@@ -6400,6 +6401,8 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
                                                          int global_hessian_fem_offset,
                                                          const int*     stitch_paired_vertex,
                                                          const double3* stitch_rest_offset,
+                                                         const int*     stitch_abd_body_id,
+                                                         const __GEIGEN__::Vector12* abd_body_q,
                                                          int number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6408,13 +6411,33 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
     uint32_t vInd = targetInd[idx];
     double   x = vertexes[vInd].x, y = vertexes[vInd].y, z = vertexes[vInd].z;
     double   a, b, c;
-    // For bilateral stitch springs, compute target dynamically from current ABD vertex
+    // For bilateral stitch springs, compute target dynamically from current ABD vertex.
+    // [stitch local-frame fix] target = anchor_world + R_now * local_offset where
+    // local_offset is in the ABD body's rest frame. R_now is the current rotation
+    // of the ABD body extracted from q's axis_x/y/z (q.v[3..5], v[6..8], v[9..11]).
+    // Without this, the stitch target only follows ABD translation, not rotation,
+    // so FEM mesh visibly fails to track ABD rotation.
     if(stitch_paired_vertex && stitch_paired_vertex[idx] >= 0)
     {
         int abd_idx = stitch_paired_vertex[idx];
-        a = vertexes[abd_idx].x + stitch_rest_offset[idx].x;
-        b = vertexes[abd_idx].y + stitch_rest_offset[idx].y;
-        c = vertexes[abd_idx].z + stitch_rest_offset[idx].z;
+        double3 lo = stitch_rest_offset[idx];
+        if(abd_body_q != nullptr && stitch_abd_body_id != nullptr)
+        {
+            int bid = stitch_abd_body_id[idx];
+            const __GEIGEN__::Vector12& q = abd_body_q[bid];
+            // R = [axis_x | axis_y | axis_z] columns
+            // R * lo = ax * lo.x + ay * lo.y + az * lo.z
+            a = vertexes[abd_idx].x + q.v[3] * lo.x + q.v[6] * lo.y + q.v[9]  * lo.z;
+            b = vertexes[abd_idx].y + q.v[4] * lo.x + q.v[7] * lo.y + q.v[10] * lo.z;
+            c = vertexes[abd_idx].z + q.v[5] * lo.x + q.v[8] * lo.y + q.v[11] * lo.z;
+        }
+        else
+        {
+            // Fallback: legacy world-frame offset (no rotation tracking).
+            a = vertexes[abd_idx].x + lo.x;
+            b = vertexes[abd_idx].y + lo.y;
+            c = vertexes[abd_idx].z + lo.z;
+        }
     }
     else
     {
@@ -6456,6 +6479,8 @@ __global__ void _computeSoftConstraintGradient(const double3*  vertexes,
                                                double          rate,
                                                const int*      stitch_paired_vertex,
                                                const double3*  stitch_rest_offset,
+                                               const int*      stitch_abd_body_id,
+                                               const __GEIGEN__::Vector12* abd_body_q,
                                                int             number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6464,12 +6489,25 @@ __global__ void _computeSoftConstraintGradient(const double3*  vertexes,
     uint32_t vInd = targetInd[idx];
     double   x = vertexes[vInd].x, y = vertexes[vInd].y, z = vertexes[vInd].z;
     double   a, b, c;
+    // [stitch local-frame fix] see _computeSoftConstraintGradientAndHessian
     if(stitch_paired_vertex && stitch_paired_vertex[idx] >= 0)
     {
         int abd_idx = stitch_paired_vertex[idx];
-        a = vertexes[abd_idx].x + stitch_rest_offset[idx].x;
-        b = vertexes[abd_idx].y + stitch_rest_offset[idx].y;
-        c = vertexes[abd_idx].z + stitch_rest_offset[idx].z;
+        double3 lo = stitch_rest_offset[idx];
+        if(abd_body_q != nullptr && stitch_abd_body_id != nullptr)
+        {
+            int bid = stitch_abd_body_id[idx];
+            const __GEIGEN__::Vector12& q = abd_body_q[bid];
+            a = vertexes[abd_idx].x + q.v[3] * lo.x + q.v[6] * lo.y + q.v[9]  * lo.z;
+            b = vertexes[abd_idx].y + q.v[4] * lo.x + q.v[7] * lo.y + q.v[10] * lo.z;
+            c = vertexes[abd_idx].z + q.v[5] * lo.x + q.v[8] * lo.y + q.v[11] * lo.z;
+        }
+        else
+        {
+            a = vertexes[abd_idx].x + lo.x;
+            b = vertexes[abd_idx].y + lo.y;
+            c = vertexes[abd_idx].z + lo.z;
+        }
     }
     else
     {
@@ -8909,6 +8947,8 @@ void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int globa
         global_hessian_fem_offset,
         m_d_stitch_paired_vertex,
         m_d_stitch_rest_offset,
+        m_d_stitch_abd_body_id,
+        reinterpret_cast<const __GEIGEN__::Vector12*>(m_d_abd_body_q),
         softNum);
 }
 
@@ -9058,7 +9098,10 @@ void GIPC::computeSoftConstraintGradient(double3* _gradient)
     // offset
     _computeSoftConstraintGradient<<<blockNum, threadNum>>>(
         _vertexes, targetVert, targetInd, _gradient, softMotionRate, animation_fullRate,
-        m_d_stitch_paired_vertex, m_d_stitch_rest_offset, softNum);
+        m_d_stitch_paired_vertex, m_d_stitch_rest_offset,
+        m_d_stitch_abd_body_id,
+        reinterpret_cast<const __GEIGEN__::Vector12*>(m_d_abd_body_q),
+        softNum);
 }
 
 double GIPC::self_largestFeasibleStepSize(double slackness, double* mqueue, int numbers)
