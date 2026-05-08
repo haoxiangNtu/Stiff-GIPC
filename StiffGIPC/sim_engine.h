@@ -211,6 +211,7 @@ class SimEngine
     /// Must be called before finalize().
     void add_fem_pin_to_abd(int fem_vertex_global_id,
                             int abd_anchor_vertex_global_id,
+                            int abd_body_id,
                             const Eigen::Vector3d& rest_offset_world);
 
     /// libuipc-style per-face orient labels for an ABD surface body.

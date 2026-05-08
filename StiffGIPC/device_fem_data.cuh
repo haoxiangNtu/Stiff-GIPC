@@ -79,10 +79,22 @@ class device_TetraData
     // [FEM-pin] hard-constraint pin GPU arrays (size = n_fem_pins).
     // Allocated only if pin count > 0. Apply kernel reads these to
     // directly project pinned FEM vertex positions to abd_anchor + offset.
+    // [M1 substitution method] device-side pin registry
+    //   d_fem_pin_fem_vertex[i]    FEM vertex idx (global)
+    //   d_fem_pin_abd_body_id[i]   ABD body the vertex follows
+    //   d_fem_pin_abd_local_pos[i] vertex's position in ABD rest frame.
+    //                              kernel: world = q.t + R(q) * local_pos
     int*     d_fem_pin_fem_vertex   = nullptr;
-    int*     d_fem_pin_abd_anchor   = nullptr;
-    double3* d_fem_pin_rest_offset  = nullptr;
+    int*     d_fem_pin_abd_body_id  = nullptr;
+    double3* d_fem_pin_abd_local_pos = nullptr;
+    int*     d_fem_pin_abd_anchor   = nullptr;  // legacy/diag
+    double3* d_fem_pin_rest_offset  = nullptr;  // legacy/diag
     int      n_fem_pins             = 0;
+    // [M2 substitution method] per-vertex bitmap, size = vertexNum.
+    //   is_pinned_vertex[v] = 1 iff v is a pinned FEM vertex.
+    // Read by FEM elasticity / barrier kernels to skip writing
+    // pinned row/col to the global Hessian.
+    int*     is_pinned_vertex       = nullptr;
 
     // BVH-skip #3: filtered face/edge index lists. bvh_active_face_idx[t] holds
     // the original face index of the t-th non-isolated face; same for edges.

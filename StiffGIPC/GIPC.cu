@@ -9903,39 +9903,47 @@ void stepForward(double3* _vertexes,
         _vertexes, _vertexesTemp, _moveDir, bType, alpha, moveBoundary, numbers);
 }
 
-// [FEM-pin] Hard-constraint projection kernel: after step_forward updates
-// both ABD and FEM verts via line-search alpha, this kernel overrides each
-// pinned FEM vertex's position to abd_anchor + rest_offset, enforcing the
-// kinematic constraint exactly.
-__global__ void _apply_fem_pins(double3*       _vertexes,
-                                const int*     _pin_fem_vertex,
-                                const int*     _pin_abd_anchor,
-                                const double3* _pin_rest_offset,
-                                int            n_pins)
+// [M1 substitution method] Hard-constraint projection kernel.
+// world_pos = q.t + R(q) * local_pos
+//   q.v[0..2]  : translation t
+//   q.v[3..5]  : axis_x  (R column 1)
+//   q.v[6..8]  : axis_y  (R column 2)
+//   q.v[9..11] : axis_z  (R column 3)
+// Called after ABD step_forward (each line-search alpha try). pinned FEM
+// vertices follow ABD's q exactly, so their motion is consistent with the
+// ABD body's affine transform, and IPC line search sees a smooth energy.
+__global__ void _apply_fem_pins(double3* _vertexes,
+                                const int* _pin_fem_vertex,
+                                const int* _pin_abd_body_id,
+                                const double3* _pin_abd_local_pos,
+                                const __GEIGEN__::Vector12* _abd_q,
+                                int n_pins)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= n_pins) return;
-    int     fem_v   = _pin_fem_vertex[idx];
-    int     abd_v   = _pin_abd_anchor[idx];
-    double3 abd_pos = _vertexes[abd_v];
-    double3 off     = _pin_rest_offset[idx];
-    _vertexes[fem_v].x = abd_pos.x + off.x;
-    _vertexes[fem_v].y = abd_pos.y + off.y;
-    _vertexes[fem_v].z = abd_pos.z + off.z;
+    int fem_v = _pin_fem_vertex[idx];
+    int bid   = _pin_abd_body_id[idx];
+    const __GEIGEN__::Vector12& q = _abd_q[bid];
+    double3 lp = _pin_abd_local_pos[idx];
+    _vertexes[fem_v].x = q.v[0] + q.v[3] * lp.x + q.v[6]  * lp.y + q.v[9]  * lp.z;
+    _vertexes[fem_v].y = q.v[1] + q.v[4] * lp.x + q.v[7]  * lp.y + q.v[10] * lp.z;
+    _vertexes[fem_v].z = q.v[2] + q.v[5] * lp.x + q.v[8]  * lp.y + q.v[11] * lp.z;
 }
 
 void apply_fem_pins(double3* _vertexes,
                     const int* _pin_fem_vertex,
-                    const int* _pin_abd_anchor,
-                    const double3* _pin_rest_offset,
+                    const int* _pin_abd_body_id,
+                    const double3* _pin_abd_local_pos,
+                    const void* _abd_q,
                     int n_pins)
 {
-    if(n_pins <= 0) return;
+    if(n_pins <= 0 || _abd_q == nullptr) return;
     const unsigned int threadNum = default_threads;
     int blockNum = (n_pins + threadNum - 1) / threadNum;
-    _apply_fem_pins<<<blockNum, threadNum>>>(_vertexes, _pin_fem_vertex,
-                                             _pin_abd_anchor, _pin_rest_offset,
-                                             n_pins);
+    _apply_fem_pins<<<blockNum, threadNum>>>(
+        _vertexes, _pin_fem_vertex, _pin_abd_body_id, _pin_abd_local_pos,
+        reinterpret_cast<const __GEIGEN__::Vector12*>(_abd_q),
+        n_pins);
 }
 
 void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_boundary)
@@ -9974,33 +9982,21 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
 
     m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, alpha);
 
-    // [FEM-pin] Hard-constraint projection. NOTE: doing this here (after
-    // every line-search step) breaks IPC's implicit energy continuity:
-    // the FEM elasticity sees a sudden vertex jump and the line search
-    // retreats to alpha~=0, causing 200+ sec/step. To make hard pin
-    // production-ready, we'd need to mark pinned verts as not-a-DOF in
-    // the Newton solve (substitution method), which is a larger refactor.
-    //
-    // Until that's done, pin projection runs ONLY when n_fem_pins > 0
-    // AND env STIFFGIPC_PIN_PROJECT=1 (experimental opt-in). Default off.
-    if(TetMesh.n_fem_pins > 0)
+    // [M1 substitution method] After ABD step_forward updates q, project
+    // pinned FEM vertices to ABD-derived positions: world = q.t + R(q)*lp.
+    // Combined with mass=∞ and BoundaryType=Fixed (set in finalize), the
+    // pinned vertices' Δx from PCG is ~0 and step_forward leaves them
+    // alone; this kernel writes the correct ABD-derived position. IPC
+    // line search now sees a smooth energy E(alpha) along the ABD's q
+    // direction.
+    if(TetMesh.n_fem_pins > 0 && m_d_abd_body_q != nullptr)
     {
-        static bool pin_proj_initialized = false;
-        static bool pin_proj_enabled = false;
-        if(!pin_proj_initialized) {
-            const char* e = std::getenv("STIFFGIPC_PIN_PROJECT");
-            pin_proj_enabled = (e != nullptr && std::string(e) != "0");
-            pin_proj_initialized = true;
-            if(pin_proj_enabled)
-                printf("[FEM-pin] STIFFGIPC_PIN_PROJECT=1 — projection ON (experimental, slow)\n");
-        }
-        if(pin_proj_enabled) {
-            apply_fem_pins(TetMesh.vertexes,
-                           TetMesh.d_fem_pin_fem_vertex,
-                           TetMesh.d_fem_pin_abd_anchor,
-                           TetMesh.d_fem_pin_rest_offset,
-                           TetMesh.n_fem_pins);
-        }
+        apply_fem_pins(TetMesh.vertexes,
+                       TetMesh.d_fem_pin_fem_vertex,
+                       TetMesh.d_fem_pin_abd_body_id,
+                       TetMesh.d_fem_pin_abd_local_pos,
+                       m_d_abd_body_q,
+                       TetMesh.n_fem_pins);
     }
 }
 

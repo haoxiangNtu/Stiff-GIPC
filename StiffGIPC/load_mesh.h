@@ -139,9 +139,19 @@ class tetrahedra_obj
     // direct projection right after the IPC line-search step. Useful for
     // attaching a deformable body to a rigid body without introducing
     // soft-spring tracking error or PCG condition-number blowup.
-    std::vector<int>     fem_pin_fem_vertex;     // FEM vertex global idx
-    std::vector<int>     fem_pin_abd_anchor;     // ABD anchor vertex global idx
-    std::vector<double3> fem_pin_rest_offset;    // fem_pos - abd_pos at pin time
+    // [M1 substitution method] Pin storage:
+    //   fem_pin_fem_vertex[i]      FEM vertex global idx
+    //   fem_pin_abd_body_id[i]     which ABD body the FEM vertex tracks
+    //   fem_pin_abd_local_pos[i]   pinned FEM vertex's position in the ABD
+    //                               body's REST frame. Each step the kernel
+    //                               does: world_pos = q.t + R(q) * local_pos
+    //   fem_pin_abd_anchor[i]      (for legacy/diagnostic; not used by M1)
+    //   fem_pin_rest_offset[i]     (for legacy/diagnostic; not used by M1)
+    std::vector<int>     fem_pin_fem_vertex;
+    std::vector<int>     fem_pin_abd_body_id;
+    std::vector<double3> fem_pin_abd_local_pos;
+    std::vector<int>     fem_pin_abd_anchor;
+    std::vector<double3> fem_pin_rest_offset;
 
     // [MAS-perm] Global vertex permutation: vertex_metis_to_input[engine_idx]
     // returns the input-mesh vertex index for the i-th engine-internal vertex.

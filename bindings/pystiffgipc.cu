@@ -213,17 +213,22 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("abd_body_id"),
              py::arg("rest_offset_world") = std::array<double, 3>{0.0, 0.0, 0.0})
         .def("add_fem_pin_to_abd",
-             [](SimEngine& e, int fem_v, int abd_anchor_v,
+             [](SimEngine& e, int fem_v, int abd_anchor_v, int abd_body_id,
                 std::array<double, 3> rest_off) {
                  Eigen::Vector3d ro(rest_off[0], rest_off[1], rest_off[2]);
-                 e.add_fem_pin_to_abd(fem_v, abd_anchor_v, ro);
+                 e.add_fem_pin_to_abd(fem_v, abd_anchor_v, abd_body_id, ro);
              },
              py::arg("fem_vertex_id"), py::arg("abd_anchor_vertex_id"),
+             py::arg("abd_body_id"),
              py::arg("rest_offset_world") = std::array<double, 3>{0.0, 0.0, 0.0},
-             "Hard kinematic constraint: FEM vertex's world position is "
-             "forced to abd_anchor_pos + rest_offset every step (post "
-             "line-search). Acts like a stitch spring with infinite "
-             "stiffness; ABD doesn't feel any reaction force from the pin.")
+             "[M1 substitution method] Hard kinematic constraint: FEM vertex's "
+             "world position is forced to q.t + R(q) * fem_local_pos each step "
+             "(after ABD step_forward, before line-search energy eval). "
+             "Implementation: vertex's BoundaryType set to Fixed and mass=1e30, "
+             "so PCG gives Δx≈0; this kernel then writes the ABD-derived "
+             "position. ABD body doesn't feel reaction force from the pin "
+             "(in M1 — M2 will add the cross-term Hessian for proper "
+             "force feedback).")
 
         .def("set_abd_body_face_orient", &SimEngine::set_abd_body_face_orient,
              py::arg("body_id"), py::arg("orient"))
