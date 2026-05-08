@@ -10681,6 +10681,106 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         //getTotalForce(shape_grads, TetMesh.totalForce);
     }
 
+    // [M2 substitution method] Chain-rule pinned FEM vertex gradient to ABD body q-DOFs.
+    // For each pinned vertex p (body b, rest-frame local_pos lo):
+    //   ABD gradient += J_p^T * (shape_grads[p] + fb[p])
+    // where J_p^T * g = [g; lo.x*g; lo.y*g; lo.z*g]  (from ABDJacobiT operator*).
+    // FEMLinearSubsystem::assemble() already zeros pinned DOFs in the PCG RHS via
+    // BoundaryType check, so no double-counting occurs.
+    if(TetMesh.n_fem_pins > 0 && m_abd_system && m_d_abd_body_q != nullptr)
+    {
+        muda::ParallelFor(256)
+            .file_line(__FILE__, __LINE__)
+            .apply(TetMesh.n_fem_pins,
+                   [sys_grad    = m_abd_system->system_gradient.viewer(),
+                    shape_grads = TetMesh.shape_grads,
+                    fb          = TetMesh.fb,
+                    pin_fem_v   = TetMesh.d_fem_pin_fem_vertex,
+                    pin_body_id = TetMesh.d_fem_pin_abd_body_id,
+                    pin_lo      = TetMesh.d_fem_pin_abd_local_pos] __device__(int i) mutable
+                   {
+                       int     fem_v   = pin_fem_v[i];
+                       int     body_id = pin_body_id[i];
+                       double3 lo      = pin_lo[i];
+
+                       double gx = shape_grads[fem_v].x + fb[fem_v].x;
+                       double gy = shape_grads[fem_v].y + fb[fem_v].y;
+                       double gz = shape_grads[fem_v].z + fb[fem_v].z;
+
+                       // J_p^T * [gx, gy, gz]:
+                       // segment [0:3]  = g
+                       // segment [3:6]  = lo * gx
+                       // segment [6:9]  = lo * gy
+                       // segment [9:12] = lo * gz
+                       gipc::Vector12 g12;
+                       g12(0)  = gx;        g12(1)  = gy;        g12(2)  = gz;
+                       g12(3)  = lo.x * gx; g12(4)  = lo.y * gx; g12(5)  = lo.z * gx;
+                       g12(6)  = lo.x * gy; g12(7)  = lo.y * gy; g12(8)  = lo.z * gy;
+                       g12(9)  = lo.x * gz; g12(10) = lo.y * gz; g12(11) = lo.z * gz;
+
+                       sys_grad.segment<12>(body_id * 12).atomic_add(g12);
+                   });
+    }
+
+    // [M3 substitution method] Add J^T * (m * I) * J to the global Hessian at
+    // the pinned ABD body's diagonal block. This makes the Newton step account
+    // for the pinned FEM vertex's effective inertia in the ABD body's
+    // curvature.  Each pin appends 16 triplets (4x4 grid of 3x3 sub-blocks)
+    // at body's (b*4+i, b*4+j) range.  Duplicates with write_abd_body_hessian's
+    // 10 triplets at the same (i,j) are summed during CSR conversion.
+    //
+    // Without M3 the system_gradient already includes pinned contributions
+    // (M2), so the Newton direction is descent; M3 corrects the step
+    // magnitude when pinned mass is comparable to body mass and improves
+    // robustness when semi-implicit early exit is disabled.
+    //
+    // Note: only the inertia (mass*I) term is added.  Elasticity / barrier
+    // contributions through the pinned vertex are not chain-ruled here
+    // (their FEM Hessian rows/cols are zeroed by the BoundaryType check at
+    // ~line 10644-10655).  Adding those would require intercepting the
+    // FEM elasticity Hessian write to preserve pinned (p,q) blocks.
+    if(TetMesh.n_fem_pins > 0)
+    {
+        int triplet_offset_start = gipc_global_triplet.global_triplet_offset;
+        muda::ParallelFor(256)
+            .file_line(__FILE__, __LINE__)
+            .apply(TetMesh.n_fem_pins,
+                   [tri_rows = gipc_global_triplet.block_row_indices(triplet_offset_start),
+                    tri_cols = gipc_global_triplet.block_col_indices(triplet_offset_start),
+                    tri_vals = gipc_global_triplet.block_values(triplet_offset_start),
+                    pin_fem_v   = TetMesh.d_fem_pin_fem_vertex,
+                    pin_body_id = TetMesh.d_fem_pin_abd_body_id,
+                    pin_lo      = TetMesh.d_fem_pin_abd_local_pos,
+                    masses      = TetMesh.masses] __device__(int i) mutable
+                   {
+                       int     fem_v   = pin_fem_v[i];
+                       int     body_id = pin_body_id[i];
+                       double3 lo3     = pin_lo[i];
+                       double  m       = masses[fem_v];
+
+                       gipc::Vector3   lo{lo3.x, lo3.y, lo3.z};
+                       gipc::Matrix3x3 mI = m * gipc::Matrix3x3::Identity();
+                       gipc::ABDJacobi   J(lo);
+                       gipc::Matrix12x12 H =
+                           gipc::ABDJacobi::JT_H_J(J.T(), mI, J);
+
+                       int slot_base = i * 16;
+                       #pragma unroll
+                       for(int r = 0; r < 4; ++r)
+                       {
+                           #pragma unroll
+                           for(int c = 0; c < 4; ++c)
+                           {
+                               int slot           = slot_base + r * 4 + c;
+                               tri_rows[slot]     = body_id * 4 + r;
+                               tri_cols[slot]     = body_id * 4 + c;
+                               tri_vals[slot]     = H.block<3, 3>(r * 3, c * 3);
+                           }
+                       }
+                   });
+        gipc_global_triplet.global_triplet_offset += TetMesh.n_fem_pins * 16;
+    }
+
     return time00;
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
