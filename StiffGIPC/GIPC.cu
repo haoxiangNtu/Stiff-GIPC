@@ -10637,7 +10637,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         muda::ParallelFor()
             .file_line(__FILE__, __LINE__)
             .apply(fem_triplet_num,
-                   [  
+                   [
                        cfem_rows = gipc_global_triplet.block_row_indices(fem_triplet_start),
                        cfem_cols = gipc_global_triplet.block_col_indices(fem_triplet_start),
                        triplet_fem = gipc_global_triplet.block_values(fem_triplet_start),
@@ -10648,7 +10648,17 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                        int col    = cfem_cols[i];
                        int btypeA = BDType[row - hess_index2fem_index];
                        int btypeB = BDType[col - hess_index2fem_index];
-                       if(btypeA != 0 || btypeB != 0)
+                       // [substitution method] Only zero pinned-pinned blocks.
+                       // Free-pinned cross terms must stay so PCG accounts for
+                       // elasticity coupling: when joint motion drives a pinned
+                       // vertex, free FEM neighbors feel the elastic pull-back.
+                       // Without this Newton fails to converge under fast joint
+                       // rotation (k=1000 cap; verified m5_drive_joint2_test).
+                       // The pinned vertex's PCG-returned dx is overridden by
+                       // apply_fem_pins post-step_forward, so its row solve
+                       // doesn't have to be perfect — it just needs to
+                       // propagate the right elasticity to free neighbors.
+                       if(btypeA != 0 && btypeB != 0)
                        {
                            triplet_fem[i].setZero();
                        }
@@ -10723,22 +10733,23 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     }
 
     // [M3 substitution method] Add J^T * (m * I) * J to the global Hessian at
-    // the pinned ABD body's diagonal block. This makes the Newton step account
-    // for the pinned FEM vertex's effective inertia in the ABD body's
-    // curvature.  Each pin appends 16 triplets (4x4 grid of 3x3 sub-blocks)
-    // at body's (b*4+i, b*4+j) range.  Duplicates with write_abd_body_hessian's
-    // 10 triplets at the same (i,j) are summed during CSR conversion.
+    // the pinned ABD body's diagonal block.  Writes the UPPER TRIANGLE only
+    // (10 triplets per pin), matching write_abd_body_hessian's storage
+    // convention.  The CSR converter sums duplicates with the ABD body's
+    // own 10 triplets at the same (i,j) positions.
     //
-    // Without M3 the system_gradient already includes pinned contributions
-    // (M2), so the Newton direction is descent; M3 corrects the step
-    // magnitude when pinned mass is comparable to body mass and improves
-    // robustness when semi-implicit early exit is disabled.
+    // KNOWN LIMITATION: only the inertia term (mass*I) is chain-ruled.
+    // The FEM elasticity Hessian's cross-terms H_fp * J_p (free-free row,
+    // ABD col) and their transposes are NOT chain-ruled — the BoundaryType
+    // zeroing at line 10644-10655 drops them.  Without these cross-terms,
+    // PCG decouples FEM and ABD: ABD moves q ignoring elasticity pull-back
+    // from the free FEM vertices, and Newton fails to converge under
+    // joint-driven motion (k=1000 cap hit, verified via m5_drive_joint2_test).
     //
-    // Note: only the inertia (mass*I) term is added.  Elasticity / barrier
-    // contributions through the pinned vertex are not chain-ruled here
-    // (their FEM Hessian rows/cols are zeroed by the BoundaryType check at
-    // ~line 10644-10655).  Adding those would require intercepting the
-    // FEM elasticity Hessian write to preserve pinned (p,q) blocks.
+    // For static gripper-close scenarios M2 + M3 inertia is sufficient
+    // (Newton k=1-2).  For dynamic joint motion the user should set
+    // USE_HARD_PIN=0 (stitch spring) until full elasticity chain-rule is
+    // implemented (TODO M3.5).
     if(TetMesh.n_fem_pins > 0)
     {
         int triplet_offset_start = gipc_global_triplet.global_triplet_offset;
@@ -10764,21 +10775,23 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                        gipc::Matrix12x12 H =
                            gipc::ABDJacobi::JT_H_J(J.T(), mI, J);
 
-                       int slot_base = i * 16;
+                       int slot_base = i * 10;
+                       int kk = 0;
                        #pragma unroll
                        for(int r = 0; r < 4; ++r)
                        {
                            #pragma unroll
-                           for(int c = 0; c < 4; ++c)
+                           for(int c = r; c < 4; ++c)
                            {
-                               int slot           = slot_base + r * 4 + c;
+                               int slot           = slot_base + kk;
                                tri_rows[slot]     = body_id * 4 + r;
                                tri_cols[slot]     = body_id * 4 + c;
                                tri_vals[slot]     = H.block<3, 3>(r * 3, c * 3);
+                               kk++;
                            }
                        }
                    });
-        gipc_global_triplet.global_triplet_offset += TetMesh.n_fem_pins * 16;
+        gipc_global_triplet.global_triplet_offset += TetMesh.n_fem_pins * 10;
     }
 
     return time00;
