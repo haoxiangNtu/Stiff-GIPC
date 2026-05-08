@@ -175,6 +175,12 @@ class GIPC
     // device_TetraData; only borrowed pointer here.
     int* _body_id_to_is_fem = nullptr;
 
+    // [M2 substitution method] Per-vertex pinned-mask (size = vertexNum).
+    // is_pinned_vertex[v] == 1 if FEM vertex v is hard-pinned to ABD.
+    // Used by elasticity/barrier kernels to skip writing pinned vertex's
+    // row/col to the global Hessian (so PCG sees them as disconnected DOFs).
+    int* m_d_is_pinned_vertex = nullptr;
+
     // Auxiliary stream for overlapping bvh_e collision detection with
     // bvh_f (default stream). Created lazily; destroyed in dtor.
     cudaStream_t m_aux_stream = nullptr;

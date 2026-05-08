@@ -280,10 +280,15 @@ void SimEngine::add_stitch_spring(int fem_vertex_global_id,
 
 void SimEngine::add_fem_pin_to_abd(int fem_vertex_global_id,
                                    int abd_anchor_vertex_global_id,
+                                   int abd_body_id,
                                    const Eigen::Vector3d& rest_offset_world)
 {
     auto& tm = m_impl->tetMesh;
     tm.fem_pin_fem_vertex.push_back(fem_vertex_global_id);
+    tm.fem_pin_abd_body_id.push_back(abd_body_id);
+    // abd_local_pos placeholder; populated at finalize() once ABD's q is initialized.
+    // Stored here as the world rest_offset; finalize transforms it to local pos.
+    tm.fem_pin_abd_local_pos.push_back(make_double3(0.0, 0.0, 0.0));
     tm.fem_pin_abd_anchor.push_back(abd_anchor_vertex_global_id);
     tm.fem_pin_rest_offset.push_back(make_double3(
         rest_offset_world.x(), rest_offset_world.y(), rest_offset_world.z()));
@@ -859,24 +864,35 @@ void SimEngine::Impl::do_upload_to_gpu()
         ipc.m_d_stitch_abd_body_id   = d_tetMesh.d_stitch_abd_body_id;
     }
 
-    // [FEM-pin] Hard-constraint pin arrays
+    // [FEM-pin / M1 substitution] Hard-constraint pin arrays.
+    // Each pin: FEM vertex idx + ABD body id + local position in ABD rest frame.
+    // The local position is computed from the world-frame offset given to
+    // add_fem_pin_to_abd, transformed back through R_finalize^{-1}.
     int n_pins = static_cast<int>(tetMesh.fem_pin_fem_vertex.size());
     if(n_pins > 0)
     {
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_fem_vertex,
                                   n_pins * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_abd_body_id,
+                                  n_pins * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_abd_local_pos,
+                                  n_pins * sizeof(double3)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_abd_anchor,
                                   n_pins * sizeof(int)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_fem_pin_rest_offset,
                                   n_pins * sizeof(double3)));
         d_tetMesh.n_fem_pins = n_pins;
+
         safe_copy(d_tetMesh.d_fem_pin_fem_vertex, tetMesh.fem_pin_fem_vertex.data(),
                   n_pins * sizeof(int), cudaMemcpyHostToDevice);
+        safe_copy(d_tetMesh.d_fem_pin_abd_body_id, tetMesh.fem_pin_abd_body_id.data(),
+                  n_pins * sizeof(int), cudaMemcpyHostToDevice);
+        // (abd_local_pos transform is done later in SimEngine::finalize after ABD q init)
         safe_copy(d_tetMesh.d_fem_pin_abd_anchor, tetMesh.fem_pin_abd_anchor.data(),
                   n_pins * sizeof(int), cudaMemcpyHostToDevice);
         safe_copy(d_tetMesh.d_fem_pin_rest_offset, tetMesh.fem_pin_rest_offset.data(),
                   n_pins * sizeof(double3), cudaMemcpyHostToDevice);
-        printf("[FEM-pin] uploaded %d hard-constraint pins\n", n_pins);
+        printf("[FEM-pin] allocated %d hard-constraint pins (local_pos transform deferred to finalize)\n", n_pins);
     }
 }
 
@@ -1253,18 +1269,107 @@ void SimEngine::finalize()
         }
     }
 
-    // [stitch local-frame fix] DISABLED — see GIPC.cu kernel comments.
-    // The naive local-frame transform breaks Newton convergence because the
-    // stitch spring's gradient uses target = anchor + R(q) * lo (which
-    // depends on ABD's q), but the Hessian doesn't include the
-    // ∂grad/∂q cross term. Result: Newton iter 200+ no convergence.
-    // To make this work, we'd need full ABD↔FEM rigid coupling Hessian
-    // (essentially the substitution method) — large refactor, deferred.
-    //
-    // Until then, m_d_abd_body_q stays nullptr and the kernel falls back
-    // to the legacy world-frame offset path (FEM follows ABD translation
-    // but not ABD rotation).
+    // [stitch local-frame fix] DISABLED — see commits e0990e6 / pre-substitution-method.
     impl.ipc.m_d_abd_body_q = nullptr;
+
+    // [M1 substitution method] FEM pin transform world→local.
+    // After ABD q is initialized, transform pinned FEM vertices' world rest
+    // offset into the ABD body's REST frame, store as local_pos. Each step
+    // the kernel does world_pos = q.t + R(q) * local_pos.
+    // Also wire the ABD q pointer for the apply-pins kernel.
+    if(impl.ipc.m_abd_sim_data && impl.d_tetMesh.n_fem_pins > 0)
+    {
+        int n_pins = impl.d_tetMesh.n_fem_pins;
+        int nb     = impl.ipc.abd_fem_count_info.abd_body_num;
+
+        // Read q from GPU
+        using Vec12 = Eigen::Matrix<double, 12, 1>;
+        std::vector<Vec12> host_q(nb);
+        CUDA_SAFE_CALL(cudaMemcpy(host_q.data(),
+                                  impl.ipc.m_abd_sim_data->device.body_id_to_q.data(),
+                                  nb * sizeof(Vec12), cudaMemcpyDeviceToHost));
+
+        // Pull anchor + body_id arrays, compute local_pos
+        const auto& fem_v_vec   = impl.tetMesh.fem_pin_fem_vertex;
+        const auto& bid_vec     = impl.tetMesh.fem_pin_abd_body_id;
+        const auto& anchor_vec  = impl.tetMesh.fem_pin_abd_anchor;
+        const auto& rest_w_vec  = impl.tetMesh.fem_pin_rest_offset;
+
+        std::vector<double3> local_pos(n_pins);
+        std::vector<double3> host_verts(impl.tetMesh.vertexNum);
+        cudaMemcpy(host_verts.data(), impl.d_tetMesh.vertexes,
+                   impl.tetMesh.vertexNum * sizeof(double3), cudaMemcpyDeviceToHost);
+
+        for(int i = 0; i < n_pins; i++)
+        {
+            int bid = bid_vec[i];
+            int av  = anchor_vec[i];
+            double3 fem_world = host_verts[fem_v_vec[i]];
+            // Compute fem's position in ABD body's rest frame:
+            //   world = q.t + R(q) * fem_local
+            //   fem_local = R(q)^T * (world - q.t)   (assuming R orthogonal)
+            const Vec12& q = host_q[bid];
+            double3 d = make_double3(fem_world.x - q[0], fem_world.y - q[1], fem_world.z - q[2]);
+            double3 lo;
+            lo.x = q[3] * d.x + q[4]  * d.y + q[5]  * d.z;  // R^T row 1 = a1 (q[3..5])
+            lo.y = q[6] * d.x + q[7]  * d.y + q[8]  * d.z;
+            lo.z = q[9] * d.x + q[10] * d.y + q[11] * d.z;
+            local_pos[i] = lo;
+        }
+        // Upload local_pos to GPU
+        CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.d_fem_pin_abd_local_pos,
+                                  local_pos.data(),
+                                  n_pins * sizeof(double3), cudaMemcpyHostToDevice));
+
+        // Wire ABD q pointer to GIPC for apply_fem_pins kernel
+        impl.ipc.m_d_abd_body_q = reinterpret_cast<void*>(
+            impl.ipc.m_abd_sim_data->device.body_id_to_q.data());
+
+        // Mark pinned FEM vertices' BoundaryType = Fixed (=2). step_forward
+        // kernel uses btype=0 check to update positions from PCG Δx; setting
+        // it to 2 means the line-search position update is skipped, which
+        // is what we want — apply_fem_pins kernel will write the correct
+        // ABD-derived position right after step_forward.
+        //
+        // **NOT changing mass** — earlier we tried mass=1e30 to make PCG
+        // naturally output Δx_pinned ≈ 0, but that made inertia energy
+        // E_kin = ½ m v² explode (1e30 × 5mm² = 1e23) and broke line search.
+        // The fix is at the IPC matrix level (M2 below): when assembling
+        // the FEM elasticity / barrier / inertia Hessian, skip the
+        // pinned vertex's row/col entirely so PCG sees them as
+        // disconnected DOFs.
+        std::vector<int> btype_host(impl.tetMesh.vertexNum);
+        cudaMemcpy(btype_host.data(), impl.d_tetMesh.BoundaryType,
+                   impl.tetMesh.vertexNum * sizeof(int), cudaMemcpyDeviceToHost);
+        for(int i = 0; i < n_pins; i++)
+        {
+            int v = fem_v_vec[i];
+            btype_host[v] = 2;            // Fixed; PCG Δx update skipped
+        }
+        cudaMemcpy(impl.d_tetMesh.BoundaryType, btype_host.data(),
+                   impl.tetMesh.vertexNum * sizeof(int), cudaMemcpyHostToDevice);
+
+        // Build per-vertex pin map for O(1) lookup in elasticity kernels:
+        // is_pinned_vertex[v] = 1 if v is a pinned FEM vertex, 0 otherwise.
+        // Used in M2 to skip writing pinned row/col to the FEM Hessian.
+        std::vector<int> pinned_mask(impl.tetMesh.vertexNum, 0);
+        for(int i = 0; i < n_pins; i++)
+            pinned_mask[fem_v_vec[i]] = 1;
+        if(impl.d_tetMesh.is_pinned_vertex == nullptr)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_tetMesh.is_pinned_vertex,
+                                      impl.tetMesh.vertexNum * sizeof(int)));
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.is_pinned_vertex,
+                                  pinned_mask.data(),
+                                  impl.tetMesh.vertexNum * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        // wire the mask into GIPC for kernel access
+        impl.ipc.m_d_is_pinned_vertex = impl.d_tetMesh.is_pinned_vertex;
+
+        printf("[M1+M2] %d FEM pins: local_pos transformed, btype=Fixed, "
+               "is_pinned_vertex mask uploaded for kernel skip\n", n_pins);
+    }
 }
 
 // ======================== step ========================
