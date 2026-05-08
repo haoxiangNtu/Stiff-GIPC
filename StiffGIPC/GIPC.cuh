@@ -40,8 +40,17 @@ class GIPC
 
     // Bilateral stitch spring GPU pointers (point into device_TetraData's d_stitch_* arrays)
     int*     m_d_stitch_paired_vertex = nullptr;
-    double3* m_d_stitch_rest_offset   = nullptr;
+    double3* m_d_stitch_rest_offset   = nullptr;  // [stitch local-frame fix]
+                                                  // After finalize, contents
+                                                  // are in ABD body rest
+                                                  // frame (R_finalize^T * world).
+                                                  // Kernel uses target =
+                                                  // anchor_world + R_now * lo.
     int*     m_d_stitch_abd_body_id   = nullptr;
+    // [stitch local-frame fix] Pointer to ABDSystem's per-body q array
+    // (Vector12 each: t.xyz, axis_x.xyz, axis_y.xyz, axis_z.xyz).
+    // Wired in finalize from m_abd_sim_data->device.body_id_to_q.
+    void*    m_d_abd_body_q           = nullptr;  // void* to avoid Vector12 forward-decl pain
 
 
     double3* _moveDir = nullptr;

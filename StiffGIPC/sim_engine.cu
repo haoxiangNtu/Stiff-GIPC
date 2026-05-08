@@ -1252,6 +1252,19 @@ void SimEngine::finalize()
             }
         }
     }
+
+    // [stitch local-frame fix] DISABLED — see GIPC.cu kernel comments.
+    // The naive local-frame transform breaks Newton convergence because the
+    // stitch spring's gradient uses target = anchor + R(q) * lo (which
+    // depends on ABD's q), but the Hessian doesn't include the
+    // ∂grad/∂q cross term. Result: Newton iter 200+ no convergence.
+    // To make this work, we'd need full ABD↔FEM rigid coupling Hessian
+    // (essentially the substitution method) — large refactor, deferred.
+    //
+    // Until then, m_d_abd_body_q stays nullptr and the kernel falls back
+    // to the legacy world-frame offset path (FEM follows ABD translation
+    // but not ABD rotation).
+    impl.ipc.m_d_abd_body_q = nullptr;
 }
 
 // ======================== step ========================
