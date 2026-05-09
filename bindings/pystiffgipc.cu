@@ -476,6 +476,15 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("set_prismatic_strength",    &SimEngine::set_prismatic_strength,
              py::arg("idx"), py::arg("strength"))
 
+        .def("set_max_revolute_step_per_frame",
+             &SimEngine::set_max_revolute_step_per_frame, py::arg("rad"),
+             "Cap on per-step revolute joint angle change (radians).  Default "
+             "0.1 rad (5.7 deg).  For scenes with fine FEM softpads pinned to "
+             "ABD bodies, lower this (e.g. 0.01 rad = 0.6 deg) so the "
+             "kinematic teleport of pinned FEM vertices does not outpace the "
+             "elastic response of free neighbors and trigger softpad "
+             "self-intersection.")
+
         .def("get_revolute_target",       &SimEngine::get_revolute_target,  py::arg("idx"))
         .def("get_prismatic_target",      &SimEngine::get_prismatic_target, py::arg("idx"))
 

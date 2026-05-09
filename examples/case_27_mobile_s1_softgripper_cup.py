@@ -395,6 +395,18 @@ def main():
     robot = Robot(eng)
     print(f"[softgripper] finalized: verts={len(eng.get_vertices())}", flush=True)
 
+    # USE_HARD_PIN=1: clamp per-step revolute angle change so kinematic pin
+    # teleport stays under FEM mesh resolution.  Default 5.7 deg / step is
+    # too big — softpad self-intersects (see HANDOVER_M3.5_substitution_method.txt).
+    # 0.5 deg/step is safe for softgriper_part2_blobal.msh; user can override
+    # via HARD_PIN_MAX_DEG env.
+    if os.environ.get("USE_HARD_PIN", "0") == "1":
+        max_deg = float(os.environ.get("HARD_PIN_MAX_DEG", "0.5"))
+        max_rad = math.radians(max_deg)
+        eng.native.set_max_revolute_step_per_frame(max_rad)
+        print(f"[softgripper] USE_HARD_PIN=1: revolute angle clamp set to "
+              f"{max_deg} deg / step ({max_rad:.4f} rad)", flush=True)
+
     # AUTO-STEP mode for testing (no GUI loop)
     auto_n = int(os.environ.get("AUTO_STEP", "0"))
     if auto_n > 0:
