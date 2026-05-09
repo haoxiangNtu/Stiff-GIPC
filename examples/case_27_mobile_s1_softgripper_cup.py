@@ -281,29 +281,57 @@ def main():
     all_verts = all_host_vertices(eng)
     total_pairs = 0
     stitch_viz_pairs = []  # list of (fem_global, abd_global) for GUI viz
+    # [pin scope tuning] STITCH_THRESH (meters): NN distance cutoff.  Default
+    # 20mm matches even FEM tip vertices to the small ABD finger backbone,
+    # which over-constrains the softpad: under fast joint rotation, near-pin
+    # and far-pin radii differ → arc-length difference imposes >mesh-edge
+    # internal stretching → guaranteed self-intersection (see HANDOVER).
+    # Tighten to e.g. 0.003 (3mm) to keep pins only where FEM and ABD
+    # vertices are physically near-touching.
+    pin_thresh = float(os.environ.get('STITCH_THRESH', '0.020'))
+    # [pin scope tuning] STITCH_TOP_FRACTION (0..1]: keep only the top
+    # fraction of pinned FEM verts ranked by Y-coordinate (proxy for
+    # closeness to the rigid finger backbone in URDF coords; finger axis
+    # is along Y).  Default 1.0 = no Y-filtering.  E.g. 0.5 keeps only
+    # the upper half — pins concentrate near the rigid backbone, tip is
+    # left elastically free.
+    top_frac = float(os.environ.get('STITCH_TOP_FRACTION', '1.0'))
     for f_rec, e_rec in finger_to_fem:
         f_verts = all_verts[f_rec.vertex_offset:f_rec.vertex_offset + f_rec.vertex_count]
         e_verts = all_verts[e_rec.vertex_offset:e_rec.vertex_offset + e_rec.vertex_count]
-        # One-way NN: every FEM vertex finds its nearest ABD vertex (within
-        # thresh). Multiple FEM verts can share an ABD anchor — physically
-        # OK (multiple springs anchored at one ABD point). Sub-sampling
-        # FEM verts (every Nth) keeps stitch_count bounded — too many
-        # springs makes the Hessian condition number balloon and the
-        # solver becomes slow.
-        # Sub-sampling stride: smaller -> more stitches -> better tracking
-        # but slower PCG (Hessian condition number grows). FEM_BLOBAL has
-        # 8029 verts/finger; sub=128 gives ~60 stitch/finger spread along
-        # the full length, step ~200ms. Use STITCH_SUB env to override.
+        # Sub-sample FEM verts (every Nth) — STITCH_SUB env, default 128.
         sub_n = int(os.environ.get('STITCH_SUB', '128'))
         e_idx_local = np.arange(0, len(e_verts), sub_n)
         e_sub = e_verts[e_idx_local]
         f_tree = cKDTree(f_verts)
         d_e2f, idx_e2f = f_tree.query(e_sub)
-        thresh = 0.020  # 20mm — generous; FEM tip can be ~10mm from ABD
+        thresh = pin_thresh
+        # Y-fraction filter: rank candidates within thresh by Y desc, keep top fraction.
+        if top_frac < 1.0:
+            within = np.where(d_e2f < thresh)[0]
+            if len(within) > 0:
+                ys_within = e_sub[within, 1]
+                # finger axis along URDF Y; "top" near rigid finger = larger Y in URDF
+                # frame, but post-arm_tf the global Y-direction may be flipped.
+                # Use ABD finger backbone's mean Y as anchor: keep candidates
+                # whose Y is in the top fraction relative to f_verts' Y range.
+                f_y_min, f_y_max = f_verts[:, 1].min(), f_verts[:, 1].max()
+                f_y_root = f_y_max  # ABD top of finger (root) — closest to wrist
+                # Distance from finger root, smaller = closer to root
+                dist_from_root = np.abs(ys_within - f_y_root)
+                cutoff_idx = max(1, int(len(within) * top_frac))
+                # keep `cutoff_idx` candidates with smallest dist_from_root
+                keep_local = np.argsort(dist_from_root)[:cutoff_idx]
+                keep_set = set(within[keep_local].tolist())
+            else:
+                keep_set = set()
+        else:
+            keep_set = None  # accept all within thresh
         n_pairs = 0
         used_fem_y = []
         for k in range(len(e_sub)):
             if d_e2f[k] >= thresh: continue
+            if keep_set is not None and k not in keep_set: continue
             i_e = int(e_idx_local[k])
             j_f = int(idx_e2f[k])
             fem_global = e_rec.vertex_offset + i_e
@@ -340,11 +368,13 @@ def main():
             uy = np.asarray(used_fem_y)
             print(f"[softgripper] stitch {f_rec.label} -> FEM#{fem_records.index(e_rec)}: "
                   f"{n_pairs} pairs  Y-extent=[{uy.min():.4f}, {uy.max():.4f}] "
-                  f"(spread={1000*(uy.max()-uy.min()):.1f}mm, sub={sub_n})  "
+                  f"(spread={1000*(uy.max()-uy.min()):.1f}mm, sub={sub_n}, "
+                  f"thresh={1000*thresh:.1f}mm, top_frac={top_frac:.2f})  "
                   f"d_min={d_e2f.min()*1000:.2f}mm  d_mean(used)={1000*d_e2f[d_e2f<thresh].mean():.2f}mm",
                   flush=True)
         else:
-            print(f"[softgripper] no stitch matches for {f_rec.label} (thresh={thresh*1000:.0f}mm)", flush=True)
+            print(f"[softgripper] no stitch matches for {f_rec.label} "
+                  f"(thresh={thresh*1000:.1f}mm, top_frac={top_frac:.2f})", flush=True)
         total_pairs += n_pairs
     print(f"[softgripper] total stitch pairs: {total_pairs}", flush=True)
 
