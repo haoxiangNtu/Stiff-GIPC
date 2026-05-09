@@ -10634,35 +10634,240 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         gipc_global_triplet.global_triplet_offset += softNum;
 
         int fem_triplet_num = gipc_global_triplet.global_triplet_offset - fem_triplet_start;
-        muda::ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(fem_triplet_num,
-                   [
-                       cfem_rows = gipc_global_triplet.block_row_indices(fem_triplet_start),
-                       cfem_cols = gipc_global_triplet.block_col_indices(fem_triplet_start),
-                       triplet_fem = gipc_global_triplet.block_values(fem_triplet_start),
-                       BDType = TetMesh.BoundaryType,
-                       hess_index2fem_index = fem_global_hessian_index_offset] __device__(int i) mutable
-                   {
-                       int row    = cfem_rows[i];
-                       int col    = cfem_cols[i];
-                       int btypeA = BDType[row - hess_index2fem_index];
-                       int btypeB = BDType[col - hess_index2fem_index];
-                       // [substitution method] Only zero pinned-pinned blocks.
-                       // Free-pinned cross terms must stay so PCG accounts for
-                       // elasticity coupling: when joint motion drives a pinned
-                       // vertex, free FEM neighbors feel the elastic pull-back.
-                       // Without this Newton fails to converge under fast joint
-                       // rotation (k=1000 cap; verified m5_drive_joint2_test).
-                       // The pinned vertex's PCG-returned dx is overridden by
-                       // apply_fem_pins post-step_forward, so its row solve
-                       // doesn't have to be perfect — it just needs to
-                       // propagate the right elasticity to free neighbors.
-                       if(btypeA != 0 && btypeB != 0)
+
+        // [M3.5 substitution method] Chain-rule pinned-vertex FEM Hessian
+        // rows/cols onto the ABD body's q-DOFs.  After this:
+        //   pinned-pinned block H_pp  -> J_p^T * H_pp * J_p added at (body*4+r, body*4+c)
+        //   pinned-free  block H_pf   -> J_p^T * H_pf added at (body*4+r, free_v_col)
+        //   free-pinned  block H_fp   -> H_fp * J_p added at (free_v_row, body*4+c)
+        //   in all cases, original (pinned-touching) triplet is zeroed.
+        //
+        // Without this routing, PCG sees pinned vertex as a free DOF whose
+        // dx is later overridden by apply_fem_pins; the free-vertex dx is
+        // computed against an incorrect dx_p estimate (elasticity-driven
+        // instead of J*dq), and Newton fails to converge under joint
+        // motion (k=1000 cap, verified by m5_drive_joint2_test).  After
+        // routing, the substituted system has the pinned DOF's contribution
+        // baked into the ABD body row, which Newton can solve consistently.
+        //
+        // Output goes to an "extension range" past the current
+        // global_triplet_offset; we use an atomic counter for slot
+        // allocation, then bump global_triplet_offset by the final count.
+        if(TetMesh.n_fem_pins > 0 && TetMesh.vertex_to_pin_idx != nullptr)
+        {
+            int ext_start    = gipc_global_triplet.global_triplet_offset;
+            // Reserve space (worst case: 16 expansions per pinned-touching triplet).
+            // Actual count tracked via atomic counter.
+            int ext_capacity = fem_triplet_num * 16;
+
+            // Reset counter device-side.  Reuse the existing
+            // d_unique_key_number scratch int* on GIPCTripletMatrix.
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_unique_key_number,
+                                           0, sizeof(int)));
+
+            muda::ParallelFor(256)
+                .file_line(__FILE__, __LINE__)
+                .apply(fem_triplet_num,
+                       [cfem_rows = gipc_global_triplet.block_row_indices(fem_triplet_start),
+                        cfem_cols = gipc_global_triplet.block_col_indices(fem_triplet_start),
+                        triplet_fem = gipc_global_triplet.block_values(fem_triplet_start),
+                        ext_rows = gipc_global_triplet.block_row_indices(ext_start),
+                        ext_cols = gipc_global_triplet.block_col_indices(ext_start),
+                        ext_vals = gipc_global_triplet.block_values(ext_start),
+                        ext_count = gipc_global_triplet.d_unique_key_number,
+                        BDType   = TetMesh.BoundaryType,
+                        v2pin    = TetMesh.vertex_to_pin_idx,
+                        pin_body = TetMesh.d_fem_pin_abd_body_id,
+                        pin_lo   = TetMesh.d_fem_pin_abd_local_pos,
+                        hess_index2fem_index = fem_global_hessian_index_offset,
+                        ext_capacity] __device__(int i) mutable
                        {
+                           int row = cfem_rows[i];
+                           int col = cfem_cols[i];
+                           int row_v = row - hess_index2fem_index;
+                           int col_v = col - hess_index2fem_index;
+                           int btypeA = BDType[row_v];
+                           int btypeB = BDType[col_v];
+                           if(btypeA == 0 && btypeB == 0)
+                               return;  // both free: keep original
+
+                           // Read original block, then zero it (will be replaced
+                           // with chain-ruled triplets in extension range).
+                           gipc::Matrix3x3 H = triplet_fem[i];
                            triplet_fem[i].setZero();
-                       }
-                   });
+
+                           int pin_a = (btypeA != 0) ? v2pin[row_v] : -1;
+                           int pin_b = (btypeB != 0) ? v2pin[col_v] : -1;
+
+                           // Helper: append a triplet to extension range.
+                           auto append = [&](int r, int c, const gipc::Matrix3x3& V) {
+                               int slot = atomicAdd(ext_count, 1);
+                               if(slot < ext_capacity) {
+                                   ext_rows[slot] = r;
+                                   ext_cols[slot] = c;
+                                   ext_vals[slot] = V;
+                               }
+                           };
+
+                           if(pin_a >= 0 && pin_b < 0)
+                           {
+                               // Row pinned, col free: write 4 triplets at
+                               // (body*4+r, col) for r=0..3.
+                               // J^T * H (12x3) split into 4 (3x3) sub-blocks.
+                               int     body = pin_body[pin_a];
+                               double3 lo3  = pin_lo[pin_a];
+                               // Sub-block 0 = H itself
+                               append(body * 4 + 0, col, H);
+                               // Sub-block r (r=1,2,3) = lo * H[r-1, :]^T (outer product)
+                               // == column-vec lo times row r-1 of H
+                               #pragma unroll
+                               for(int r = 1; r < 4; ++r)
+                               {
+                                   gipc::Matrix3x3 B;
+                                   double Hr0 = H(r - 1, 0), Hr1 = H(r - 1, 1), Hr2 = H(r - 1, 2);
+                                   B(0, 0) = lo3.x * Hr0; B(0, 1) = lo3.x * Hr1; B(0, 2) = lo3.x * Hr2;
+                                   B(1, 0) = lo3.y * Hr0; B(1, 1) = lo3.y * Hr1; B(1, 2) = lo3.y * Hr2;
+                                   B(2, 0) = lo3.z * Hr0; B(2, 1) = lo3.z * Hr1; B(2, 2) = lo3.z * Hr2;
+                                   int new_row = body * 4 + r;
+                                   if(new_row <= col) append(new_row, col, B);
+                                   else               append(col, new_row, B.transpose());
+                               }
+                           }
+                           else if(pin_a < 0 && pin_b >= 0)
+                           {
+                               // Col pinned, row free: write 4 triplets routed to
+                               // (row, body*4+c) for c=0..3.  But row > body*4+c
+                               // typically (FEM row is in [N_abd*4, ...) range and
+                               // body*4+c is in [0, N_abd*4)).  So store at
+                               // (body*4+c, row) with TRANSPOSED block to keep
+                               // upper-triangle convention.
+                               // H * J (3x12) split into 4 (3x3) sub-blocks per col.
+                               int     body = pin_body[pin_b];
+                               double3 lo3  = pin_lo[pin_b];
+                               // Sub-block 0 (cols 0-2) = H itself
+                               // Stored at (body*4+0, row) transposed = H.transpose()
+                               int new_col = body * 4 + 0;
+                               if(new_col <= row) append(new_col, row, H.transpose());
+                               else               append(row, new_col, H);
+                               // Sub-block c (c=1,2,3) = H[:, c-1] * lo^T (outer)
+                               // Stored at (body*4+c, row) transposed = lo * H[:, c-1]^T
+                               #pragma unroll
+                               for(int c = 1; c < 4; ++c)
+                               {
+                                   gipc::Matrix3x3 B;  // = H[:, c-1] outer lo
+                                   double H0 = H(0, c - 1), H1 = H(1, c - 1), H2 = H(2, c - 1);
+                                   B(0, 0) = H0 * lo3.x; B(0, 1) = H0 * lo3.y; B(0, 2) = H0 * lo3.z;
+                                   B(1, 0) = H1 * lo3.x; B(1, 1) = H1 * lo3.y; B(1, 2) = H1 * lo3.z;
+                                   B(2, 0) = H2 * lo3.x; B(2, 1) = H2 * lo3.y; B(2, 2) = H2 * lo3.z;
+                                   // B is original (row, body*4+c). Transposed = (body*4+c, row)
+                                   int nc = body * 4 + c;
+                                   if(nc <= row) append(nc, row, B.transpose());
+                                   else          append(row, nc, B);
+                               }
+                           }
+                           else  // both pinned
+                           {
+                               // The original triplet (p1, p2, H) with p1<p2
+                               // represents H_{p1,p2}=H AND H_{p2,p1}=H^T (sym).
+                               // After substitution x_p1=J_a*q_a, x_p2=J_b*q_b:
+                               //   y_a += J_a^T * H * J_b * q_b   (path 1)
+                               //   y_b += J_b^T * H^T * J_a * q_a (path 2, = transpose of path 1)
+                               //
+                               // For SAME body (body_a==body_b==body), both paths
+                               // target body's diagonal:
+                               //   total = J_a^T*H*J_b + (J_a^T*H*J_b)^T (symmetric)
+                               // Sym storage upper-tri at body's (r,c) sub-block:
+                               //   For r<=c: store M12.block(r,c) + M12.block(c,r)^T
+                               //
+                               // For DIFFERENT bodies (body_a < body_b), the paths
+                               // target distinct off-diagonal block (body_a, body_b)
+                               // with M12 stored once; sym SpMV via M^T handles the
+                               // implicit (body_b, body_a) direction.
+                               int     body_a = pin_body[pin_a];
+                               int     body_b = pin_body[pin_b];
+                               double3 lo_a   = pin_lo[pin_a];
+                               double3 lo_b   = pin_lo[pin_b];
+                               gipc::Vector3   xa{lo_a.x, lo_a.y, lo_a.z};
+                               gipc::Vector3   xb{lo_b.x, lo_b.y, lo_b.z};
+                               gipc::ABDJacobi   Ja(xa), Jb(xb);
+                               gipc::Matrix12x12 M12 =
+                                   gipc::ABDJacobi::JT_H_J(Ja.T(), H, Jb);
+                               if(body_a == body_b)
+                               {
+                                   #pragma unroll
+                                   for(int r = 0; r < 4; ++r)
+                                   {
+                                       #pragma unroll
+                                       for(int c = r; c < 4; ++c)
+                                       {
+                                           gipc::Matrix3x3 B =
+                                               M12.block<3, 3>(r * 3, c * 3)
+                                               + M12.block<3, 3>(c * 3, r * 3).transpose();
+                                           append(body_a * 4 + r, body_a * 4 + c, B);
+                                       }
+                                   }
+                               }
+                               else
+                               {
+                                   // body_a != body_b: store M12 (no symmetrization)
+                                   // at (body_a*4+r, body_b*4+c) for body_a < body_b
+                                   // (so always upper-tri); transpose if reversed.
+                                   bool a_lt_b = (body_a < body_b);
+                                   #pragma unroll
+                                   for(int r = 0; r < 4; ++r)
+                                   {
+                                       #pragma unroll
+                                       for(int c = 0; c < 4; ++c)
+                                       {
+                                           gipc::Matrix3x3 B =
+                                               M12.block<3, 3>(r * 3, c * 3);
+                                           if(a_lt_b)
+                                               append(body_a * 4 + r, body_b * 4 + c, B);
+                                           else
+                                               append(body_b * 4 + c, body_a * 4 + r, B.transpose());
+                                       }
+                                   }
+                               }
+                           }
+                       });
+
+            // Read final extension count and bump triplet offset.
+            int h_ext_count = 0;
+            CUDA_SAFE_CALL(cudaMemcpy(&h_ext_count,
+                                      gipc_global_triplet.d_unique_key_number,
+                                      sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+            if(h_ext_count > ext_capacity)
+            {
+                printf("[M3.5] WARN ext_count=%d > capacity=%d (truncated; expect "
+                       "Newton instability)\n", h_ext_count, ext_capacity);
+                h_ext_count = ext_capacity;
+            }
+            gipc_global_triplet.global_triplet_offset += h_ext_count;
+        }
+        else
+        {
+            // No pins: use the original simple zeroing logic for
+            // non-zero BoundaryType (e.g. user-defined boundary conditions).
+            muda::ParallelFor()
+                .file_line(__FILE__, __LINE__)
+                .apply(fem_triplet_num,
+                       [cfem_rows = gipc_global_triplet.block_row_indices(fem_triplet_start),
+                        cfem_cols = gipc_global_triplet.block_col_indices(fem_triplet_start),
+                        triplet_fem = gipc_global_triplet.block_values(fem_triplet_start),
+                        BDType   = TetMesh.BoundaryType,
+                        hess_index2fem_index = fem_global_hessian_index_offset] __device__(int i) mutable
+                       {
+                           int row    = cfem_rows[i];
+                           int col    = cfem_cols[i];
+                           int btypeA = BDType[row - hess_index2fem_index];
+                           int btypeB = BDType[col - hess_index2fem_index];
+                           if(btypeA != 0 || btypeB != 0)
+                           {
+                               triplet_fem[i].setZero();
+                           }
+                       });
+        }
 
 
         //int massNum =
