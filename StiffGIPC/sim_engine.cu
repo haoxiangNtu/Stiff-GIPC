@@ -1367,8 +1367,23 @@ void SimEngine::finalize()
         // wire the mask into GIPC for kernel access
         impl.ipc.m_d_is_pinned_vertex = impl.d_tetMesh.is_pinned_vertex;
 
-        printf("[M1+M2] %d FEM pins: local_pos transformed, btype=Fixed, "
-               "is_pinned_vertex mask uploaded for kernel skip\n", n_pins);
+        // [M3.5] Build vertex_to_pin_idx (size = vertexNum) for O(1)
+        // lookup of (body_id, lo) given a vertex index.  -1 = not pinned.
+        std::vector<int> v2pin_host(impl.tetMesh.vertexNum, -1);
+        for(int i = 0; i < n_pins; i++)
+            v2pin_host[fem_v_vec[i]] = i;
+        if(impl.d_tetMesh.vertex_to_pin_idx == nullptr)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_tetMesh.vertex_to_pin_idx,
+                                      impl.tetMesh.vertexNum * sizeof(int)));
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.vertex_to_pin_idx,
+                                  v2pin_host.data(),
+                                  impl.tetMesh.vertexNum * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+
+        printf("[M1+M2+M3.5] %d FEM pins: local_pos transformed, btype=Fixed, "
+               "is_pinned_vertex mask + vertex_to_pin_idx uploaded\n", n_pins);
     }
 }
 

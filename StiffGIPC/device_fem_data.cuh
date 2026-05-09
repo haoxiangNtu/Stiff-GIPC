@@ -95,6 +95,11 @@ class device_TetraData
     // Read by FEM elasticity / barrier kernels to skip writing
     // pinned row/col to the global Hessian.
     int*     is_pinned_vertex       = nullptr;
+    // [M3.5 substitution method] per-vertex pin index map, size = vertexNum.
+    //   vertex_to_pin_idx[v] = pin_idx if v is pinned, -1 otherwise.
+    // Used by the chain-rule kernel to fetch body_id and lo (local_pos)
+    // for a given pinned vertex without searching d_fem_pin_fem_vertex.
+    int*     vertex_to_pin_idx      = nullptr;
 
     // BVH-skip #3: filtered face/edge index lists. bvh_active_face_idx[t] holds
     // the original face index of the t-th non-isolated face; same for edges.
