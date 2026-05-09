@@ -328,6 +328,14 @@ class SimEngine
     void set_revolute_strength(int idx, double strength);
     void set_prismatic_strength(int idx, double strength);
 
+    /// Set the maximum revolute joint angle change per IPC step (in radians).
+    /// Default 0.1 rad ≈ 5.7°.  For scenes with fine FEM softpads pinned to
+    /// ABD bodies, large per-step rotation triggers FEM mesh self-intersection
+    /// (the kinematic teleport of pinned vertices outpaces the elastic
+    /// response of free neighbors).  Lower values (e.g. 0.01 rad ≈ 0.6°)
+    /// keep softpad self-collision tame.  Applied starting next step().
+    void set_max_revolute_step_per_frame(double rad);
+
     double get_revolute_target(int idx) const;
     double get_prismatic_target(int idx) const;
 
