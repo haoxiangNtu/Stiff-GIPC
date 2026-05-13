@@ -1380,6 +1380,16 @@ void SimEngine::get_revolute_current_angles(double* out, int count) const
     }
 }
 
+void SimEngine::get_revolute_initial_offsets(double* out, int count) const
+{
+    auto& ctrls = m_impl->tetMesh.joint_angle_controls;
+    int   n     = std::min(count, static_cast<int>(ctrls.size()));
+    for(int i = 0; i < n; i++)
+        out[i] = ctrls[i].initial_angle_offset;
+    for(int i = n; i < count; i++)
+        out[i] = 0.0;
+}
+
 // ======================== load_mesh_from_data ========================
 void SimEngine::load_mesh_from_data(const double*          vertices,
                                     int                    num_verts,

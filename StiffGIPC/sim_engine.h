@@ -292,6 +292,14 @@ class SimEngine
 
     void   get_revolute_current_angles(double* out, int count) const;
 
+    /// Read each revolute joint's `initial_angle_offset` — the URDF-frame
+    /// angle the joint was at when `load_urdf(initial_joint_angles=...)`
+    /// applied FK at load time.  Used to convert the relative angle
+    /// returned by `get_revolute_current_angles` to absolute URDF angle:
+    ///   absolute_urdf = relative + initial_offset
+    /// Returns 0.0 per joint when no `initial_joint_angles` was passed.
+    void   get_revolute_initial_offsets(double* out, int count) const;
+
     std::string get_assets_dir() const;
 
   private:

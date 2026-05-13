@@ -674,8 +674,33 @@ class Engine:
         self._engine.set_prismatic_strength(idx, strength)
 
     def get_revolute_current_angles(self) -> np.ndarray:
-        """Read actual joint angles from GPU state. Returns (N,) float64 in radians."""
+        """Read actual joint angles from GPU state.
+
+        Returns (N,) float64 in radians.  IMPORTANT: this is the angle
+        RELATIVE TO THE LOAD-TIME POSE.  If the URDF was loaded via
+        `load_urdf(initial_joint_angles=...)`, this returns 0 immediately
+        after load (not the offset values).  For ABSOLUTE URDF angles
+        use `get_revolute_current_angles_abs()`.
+        """
         return self._engine.get_revolute_current_angles()
+
+    def get_revolute_initial_offsets(self) -> np.ndarray:
+        """Per-joint URDF angle at URDF load time.
+
+        Returns (N,) float64 in radians.  Comes from the `initial_joint_angles`
+        dict passed to `load_urdf`; all zeros if it wasn't passed.
+        """
+        return self._engine.get_revolute_initial_offsets()
+
+    def get_revolute_current_angles_abs(self) -> np.ndarray:
+        """Absolute URDF joint angles = relative-from-load + initial-offset.
+
+        Returns (N,) float64 in radians.  Use this when you need 'what
+        angle does the URDF think the joint is at right now' — e.g. for
+        RL state observation, saving to disk, comparison with joint limits.
+        """
+        return (self._engine.get_revolute_current_angles()
+                + self._engine.get_revolute_initial_offsets())
 
     def get_all_joint_infos(self):
         return self._engine.get_all_joint_infos()

@@ -448,6 +448,16 @@ PYBIND11_MODULE(pystiffgipc, m)
             return arr;
         })
 
+        .def("get_revolute_initial_offsets", [](const SimEngine& e) {
+            int n = e.get_num_revolute_joints();
+            auto arr = py::array_t<double>({n});
+            if(n > 0)
+                e.get_revolute_initial_offsets(arr.mutable_data(), n);
+            return arr;
+        },
+        "Per-joint URDF angle at load time (from load_urdf initial_joint_angles). "
+        "Add to get_revolute_current_angles() to get absolute URDF angle.")
+
         // Convenience: list all joints
         .def("get_all_joint_infos", [](const SimEngine& e) {
             std::vector<JointInfo> joints;
