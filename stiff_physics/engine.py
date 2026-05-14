@@ -13,8 +13,26 @@ _INSTALLED_MODE = False
 
 def _import_native():
     """Import pystiffgipc from the installed _native/ sub-package first,
-    falling back to the development build/ directory."""
+    falling back to the development build/ directory.
+
+    Override path via env var STIFFGIPC_NATIVE_DIR — useful when working
+    in a worktree whose build/ should be used instead of the venv's
+    installed _native/ (which may point at a different worktree).
+    """
     global _INSTALLED_MODE
+
+    # 0. Env-var override (worktree dev workflow) — always wins
+    override = os.environ.get("STIFFGIPC_NATIVE_DIR")
+    if override:
+        if os.path.isdir(override) and override not in sys.path:
+            sys.path.insert(0, override)
+        try:
+            import pystiffgipc
+            return pystiffgipc
+        except ImportError as exc:
+            raise ImportError(
+                f"STIFFGIPC_NATIVE_DIR={override} but pystiffgipc not "
+                f"importable from there ({exc})") from exc
 
     # 1. Try installed location (wheel / pip install -e .)
     try:
