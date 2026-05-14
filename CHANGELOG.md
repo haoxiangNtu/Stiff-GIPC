@@ -4,6 +4,104 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-05-15 (UPCOMING)
+
+### Added
+
+#### Hybrid ABD-FEM mesh API
+- **`add_fem_pins_with_local_pos(fem_ids, body_ids, local_pos)`**: bulk pin
+  API for hybrid mesh scenarios where the rigid region of a continuous tet
+  mesh is kinematically driven by an ABD body.  Avoids the per-pin
+  Python↔C++ round-trip of `add_fem_pin_to_abd` at hybrid-mesh scales
+  (1k+ pins).  Caller provides each pinned vertex's coordinate in the
+  ABD body's REST frame directly.
+- **`Engine.add_hybrid_fem_body(npz, transform=None)`**: Python wrapper
+  that loads a hybrid mesh `.npz` (from `tools/build_hybrid_mesh.py`)
+  and bulk-pins its rigid verts in one call.
+- **Phase 4 hybrid kernel skip**: rigid-internal tets (all 4 verts pinned
+  to the same ABD body) now skipped in `_calculate_fem_gradient_hessian`
+  — their Green strain is structurally redundant w.r.t. the ABD body's
+  E_orth penalty.  Saves a co-rotational SVD per such tet per Newton iter.
+- **Chain-rule buffer 2× → 32×** in `GIPC::init`: the M3.5 chain-rule
+  kernel reserves an extension range past the FEM triplets for diff-body
+  pin-pin expansion (worst-case 16×).  Original 2× margin overflowed when
+  the rigid region was large → CUDA illegal memory access.  32× gives
+  comfortable margin.
+
+#### URDF helpers
+- **`get_urdf_link_transform(link_name)` → 4×4 world transform**: returns
+  the importer's FK output for any URDF link.  Available right after
+  `load_urdf` (no need to finalize).  Use to attach extra bodies in the
+  correct world frame.
+- **`set_urdf_mesh_override(link_name, msh_path, young_modulus=1e7)`**:
+  override the mesh used for a URDF link in the next `load_urdf` call.
+  Required when URDF references a mesh file that doesn't exist on disk
+  (without override, the importer silently skips the link).
+
+#### Per-body / per-joint controls
+- **`set_body_animated_target(body_id, x, y, z, strength=1e6)`**: per-step
+  soft-target driver for ABD bodies loaded with `boundary_type='Animated'`
+  (=3).  Pulls `q.t` toward `(x,y,z)` and `q.A` toward identity via a
+  quadratic penalty.  Body's 12 DOFs stay in PCG so joint constraints +
+  M3.5 chain-rule pins still propagate.
+- **`set_body_apply_gravity(body_id, enabled)`**: toggle gravity per body
+  at runtime (ABD path zeros/restores the body's 12-DOF gravity vector
+  via cached pre-toggle state; FEM path flips the per-vertex
+  `apply_gravity[]` flags).  Use for gripper ABD bodies hanging off URDF
+  arms via revolute joint to avoid joint-vs-gravity drift accumulation.
+- **`set_fixed_joint_strength(idx, kappa)`**: override per-fixed-joint
+  kappa post-finalize.  Default `joint_strength_ratio·(m_p+m_c)` ≈ 8e-3
+  is too weak for a hybrid gripper welded to a heavy arm hand.  Set ~1e6
+  for tight tracking.
+- **`engine.py` `_BOUNDARY_MAP`** adds `"Motor"` (=2) and `"Animated"`
+  (=3) so users can pass them as strings to `load_mesh`.
+
+#### Developer experience
+- **`STIFFGIPC_NATIVE_DIR` env var**: override the engine `.so` load path.
+  Useful when developing across multiple worktrees — the venv's installed
+  `stiff_physics._native` points to whichever worktree was last
+  pip-installed; `STIFFGIPC_NATIVE_DIR=/path/to/another/worktree/build_312`
+  uses a different build without re-installing.
+
+### Fixed
+
+- **`_apply_fem_pins` kernel: A·lp not A^T·lp** (commit `3d1d54b`).
+  The hard-pin projection kernel computed `world.x = q[0] + q[3]*lp.x +
+  q[6]*lp.y + q[9]*lp.z` which is `A.col(0)·lp = (A^T·lp)[0]`.  Per the
+  canonical `q` layout in `abd_jacobi_matrix.inl`, `q[3..5]` is `A.row(0)`
+  — so the correct expression is `q[3]*lp.x + q[4]*lp.y + q[5]*lp.z`.
+  Bug only surfaced when ABD bodies rotated non-trivially (URDF arms
+  with revolute joints driving a hybrid gripper); pinned FEM verts
+  visually drifted off the rigid sub-mesh by `~|sin(θ)·(n × lp)|`.
+  Fully backward compatible: A symmetric → old/new numerically identical.
+
+- **`_computeSoftConstraintGradient` kernels: A·lo not A^T·lo** (commit
+  `27922c1`).  The `add_stitch_spring` local-frame target computation
+  had the same row/col bug as `_apply_fem_pins`.  Stitch springs that
+  pull FEM verts toward an anchor on a rotating ABD body now track the
+  rigid frame correctly instead of lagging by `~|sin(θ)·(n × lo)|`.
+  Also corrects the misleading `R = [axis_x | axis_y | axis_z] columns`
+  comment to reflect the canonical row layout.
+
+### Known issues
+
+- ⚠️ **`case_27_mobile_s1_softgripper_cup.py` regression**: the URDF
+  importer joint-angle clamp (this release) puts the arm at limit pose
+  at frame 0 instead of the legacy 0-pose.  case_27's softpad placement
+  is computed via a Python URDF parser that assumes joint angles = 0,
+  causing a frame-0 mismatch between FEM softpad rest position and
+  pinned-vertex world target → ~1M self-intersection contact pairs +
+  step 3/8 multi-second-stuck (vs ~30ms baseline).  No NaN, no crash —
+  simulation completes but is very slow and visually wrong.
+  **Workaround**: pass explicit `initial_joint_angles={...}` matching
+  the new clamp values, OR retune softpad placement to use
+  `eng.native.get_urdf_link_transform(soft_material_link_name)` after
+  `load_urdf`.  Other demos using `add_fem_pins_with_local_pos`
+  (case_29..41 hybrid family) are unaffected because the hybrid pin API
+  computes pin positions in the ABD body's REST frame (independent of
+  joint pose).  Tracking issue: maintainer-only
+  `docs/internal/BUG_y5_case27_softpad_intersect.md`.
+
 ## [0.2.0] — 2026-04-24
 
 ### Performance (case_26 scene, validated)

@@ -209,7 +209,9 @@ git push origin master
 | 分支 | 用途 | 能否 cherry-pick 进 `release/stable` |
 |---|---|---|
 | `release/stable` | release 源码权威分支，每个 release tag 都从这里打 | — (本身就是) |
-| `lhx/multi-env-instance` | daily dev | ✅ 单 commit 审过后可以 |
+| `lhx/daily-v2` | **当前 daily-dev** (引擎 API + hybrid mesh 工作主线) | ✅ 单 commit 审过后可以 |
+| `lhx/multi-env-instance` | multi-env-instance feature 分支 (多环境 Python API) | ✅ 单 commit 审过后可以 |
+| `lhx/hybrid-mesh` | hybrid mesh 研究 + demo (case_29..41) | ⚠️ 引擎部分镜像 daily-v2; 研究 demo 不进 release |
 | `lhx/wip-multi-env-instance` | WIP 暂存（含 post-v0.1.0 待审增量） | ⚠️ 单 commit 审过后可以；不要整分支 merge |
 | `lhx/case26-engine-opt` | ⚠️ 性能实验（PCG warm start 等） | ❌ **禁止**，未稳定，详见 `docs/internal/PERF_OPT_HANDOVER.md` |
 | `lhx/case26-param-tuning` | ⚠️ 参数调优实验 | ❌ **禁止** |
