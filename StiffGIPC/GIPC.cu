@@ -6412,9 +6412,11 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
     double   x = vertexes[vInd].x, y = vertexes[vInd].y, z = vertexes[vInd].z;
     double   a, b, c;
     // For bilateral stitch springs, compute target dynamically from current ABD vertex.
-    // [stitch local-frame fix] target = anchor_world + R_now * local_offset where
-    // local_offset is in the ABD body's rest frame. R_now is the current rotation
-    // of the ABD body extracted from q's axis_x/y/z (q.v[3..5], v[6..8], v[9..11]).
+    // [stitch local-frame fix] target = anchor_world + A_now * local_offset where
+    // local_offset is in the ABD body's rest frame.  Per the canonical q layout in
+    // abd_jacobi_matrix.inl operator*(ABDJacobi, Vector12):
+    //   q[3..5]  = A.row(0),  q[6..8]  = A.row(1),  q[9..11] = A.row(2)
+    // So (A * lo).x = q[3]*lo.x + q[4]*lo.y + q[5]*lo.z, etc.
     // Without this, the stitch target only follows ABD translation, not rotation,
     // so FEM mesh visibly fails to track ABD rotation.
     if(stitch_paired_vertex && stitch_paired_vertex[idx] >= 0)
@@ -6425,11 +6427,12 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
         {
             int bid = stitch_abd_body_id[idx];
             const __GEIGEN__::Vector12& q = abd_body_q[bid];
-            // R = [axis_x | axis_y | axis_z] columns
-            // R * lo = ax * lo.x + ay * lo.y + az * lo.z
-            a = vertexes[abd_idx].x + q.v[3] * lo.x + q.v[6] * lo.y + q.v[9]  * lo.z;
-            b = vertexes[abd_idx].y + q.v[4] * lo.x + q.v[7] * lo.y + q.v[10] * lo.z;
-            c = vertexes[abd_idx].z + q.v[5] * lo.x + q.v[8] * lo.y + q.v[11] * lo.z;
+            // Previous code used q[3]/q[6]/q[9] for the x-component, which is
+            // A.col(0)·lo = (A^T·lo)[0] — wrong for non-symmetric A.  Only
+            // worked when A ≈ scale·I (Animated mode where ABD barely rotates).
+            a = vertexes[abd_idx].x + q.v[3] * lo.x + q.v[4] * lo.y + q.v[5]  * lo.z;
+            b = vertexes[abd_idx].y + q.v[6] * lo.x + q.v[7] * lo.y + q.v[8]  * lo.z;
+            c = vertexes[abd_idx].z + q.v[9] * lo.x + q.v[10] * lo.y + q.v[11] * lo.z;
         }
         else
         {
@@ -6498,9 +6501,10 @@ __global__ void _computeSoftConstraintGradient(const double3*  vertexes,
         {
             int bid = stitch_abd_body_id[idx];
             const __GEIGEN__::Vector12& q = abd_body_q[bid];
-            a = vertexes[abd_idx].x + q.v[3] * lo.x + q.v[6] * lo.y + q.v[9]  * lo.z;
-            b = vertexes[abd_idx].y + q.v[4] * lo.x + q.v[7] * lo.y + q.v[10] * lo.z;
-            c = vertexes[abd_idx].z + q.v[5] * lo.x + q.v[8] * lo.y + q.v[11] * lo.z;
+            // q[3..5]/q[6..8]/q[9..11] = A.row(0/1/2); see _computeSoftConstraintGradientAndHessian.
+            a = vertexes[abd_idx].x + q.v[3] * lo.x + q.v[4] * lo.y + q.v[5]  * lo.z;
+            b = vertexes[abd_idx].y + q.v[6] * lo.x + q.v[7] * lo.y + q.v[8]  * lo.z;
+            c = vertexes[abd_idx].z + q.v[9] * lo.x + q.v[10] * lo.y + q.v[11] * lo.z;
         }
         else
         {
