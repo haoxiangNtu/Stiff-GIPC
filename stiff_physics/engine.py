@@ -405,6 +405,87 @@ class Engine:
     def add_ground_collision_skip(self, body_id: int) -> None:
         self._engine.add_ground_collision_skip(body_id)
 
+    def add_hybrid_fem_body(self, hybrid_data, transform=None,
+                            target_abd_body_offset=None):
+        """Load a hybrid ABD-FEM tet mesh produced by tools/build_hybrid_mesh.py.
+
+        Parameters
+        ----------
+        hybrid_data : str | dict | numpy.lib.npyio.NpzFile
+            Either a path to a .npz file produced by build_hybrid_mesh.py,
+            or an already-loaded mapping with the same field names
+            (vertices, tets, vertex_abd_body_id, vertex_local_pos, density,
+            young_modulus, poisson_ratio, ...).
+        transform : np.ndarray of shape (4,4), optional
+            World-frame transform applied to the FEM mesh on load.  Pass
+            this when the .npz vertices are in a per-body local frame and
+            you need to place the hybrid mesh somewhere specific in the
+            world.  Default: identity (.npz vertices used as-is).
+        target_abd_body_offset : int, optional
+            If given, ALL pin body_ids in the .npz are shifted by this
+            offset before being passed to the engine.  Useful when the
+            .npz was authored against a different ABD body indexing.
+            Default: 0 (use .npz body_ids verbatim).
+
+        Returns
+        -------
+        fem_body_offset : int
+            The vertex_offset of the loaded FEM body (use this to convert
+            local FEM vertex indices to global if you need them later).
+        """
+        if isinstance(hybrid_data, (str, os.PathLike)):
+            data = np.load(str(hybrid_data))
+        else:
+            data = hybrid_data
+
+        verts = np.ascontiguousarray(data["vertices"], dtype=np.float64)
+        tets = np.ascontiguousarray(data["tets"], dtype=np.int32)
+        v_body = np.ascontiguousarray(data["vertex_abd_body_id"], dtype=np.int32)
+        v_lo = np.ascontiguousarray(data["vertex_local_pos"], dtype=np.float64)
+        young = float(data["young_modulus"])
+        # density/poisson currently unused by the FEM loader (engine derives
+        # mass from volume & a fixed density); kept here for completeness.
+
+        T = np.eye(4) if transform is None else np.asarray(transform, dtype=np.float64)
+
+        # Add FEM body via load_mesh_from_data.  Tet mesh: verts (N,3),
+        # tets (M,4), pass as-is (engine binding expects faces shape[0]==M
+        # and a separate verts_per_face int).  body_type='FEM', initial
+        # boundary_type='Free' — pinned verts are upgraded to 'Fixed' in
+        # finalize() via the add_fem_pins_with_local_pos → existing M1 path.
+        n_v = verts.shape[0]
+        n_t = tets.shape[0]
+        self.load_mesh_from_data(
+            verts, tets, verts_per_face=4, dimensions=3,
+            body_type="FEM", transform=T, young_modulus=young,
+            boundary_type="Free",
+        )
+        rec = self.get_load_records()[-1]
+        body_offset_v = rec.vertex_offset
+
+        # Build pin arrays — only rigid verts (vertex_abd_body_id >= 0).
+        rigid_mask = v_body >= 0
+        if not np.any(rigid_mask):
+            print(f"[add_hybrid_fem_body] no rigid verts in npz — pure FEM body")
+            return body_offset_v
+        rigid_local_idx = np.nonzero(rigid_mask)[0].astype(np.int32)
+        fem_global_ids = (rigid_local_idx + body_offset_v).astype(np.int32)
+        body_ids_arr = v_body[rigid_mask].astype(np.int32)
+        if target_abd_body_offset is not None:
+            body_ids_arr = body_ids_arr + int(target_abd_body_offset)
+        local_pos_arr = np.ascontiguousarray(v_lo[rigid_mask], dtype=np.float64)
+
+        self._engine.add_fem_pins_with_local_pos(
+            fem_global_ids, body_ids_arr, local_pos_arr)
+
+        n_rigid = int(rigid_mask.sum())
+        n_iface_t = int((data["tet_region"] == 1).sum())
+        n_rigid_t = int((data["tet_region"] == 2).sum())
+        print(f"[add_hybrid_fem_body] {n_v}v/{n_t}t loaded; "
+              f"{n_rigid} rigid pins to bodies {sorted(set(body_ids_arr.tolist()))}; "
+              f"{n_iface_t} interface tets, {n_rigid_t} rigid-internal tets")
+        return body_offset_v
+
     def add_stitch_spring(self, fem_vertex_id: int, abd_anchor_vertex_id: int,
                           abd_body_id: int,
                           rest_offset_world=(0.0, 0.0, 0.0)) -> None:

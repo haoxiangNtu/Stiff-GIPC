@@ -202,7 +202,7 @@ __device__ Eigen::Matrix<double, 9, 12> __computePFPX3D_Eigen_double(const __GEI
 
 __global__ void _calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInverses,
                                                 const double3* vertexes,
-                                                const uint4*   tetrahedras,                                              
+                                                const uint4*   tetrahedras,
                                                 const double* volume,
                                                 double3*      gradient,
                                                 int           tetrahedraNum,
@@ -214,7 +214,8 @@ __global__ void _calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInvers
                                                 int*             row_ids,
                                                 int*             col_ids,
                                                 double           IPC_dt,
-                                                int global_hessian_fem_offset);
+                                                int global_hessian_fem_offset,
+                                                const int* tet_to_abd_body /* nullable */);
 __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* trimInverses,
                                                          const double3* vertexes,
                                                          const uint3* triangles,

@@ -214,6 +214,28 @@ class SimEngine
                             int abd_body_id,
                             const Eigen::Vector3d& rest_offset_world);
 
+    /// [Hybrid mesh] bulk-add FEM pins with EXPLICIT local positions.
+    ///
+    /// This is the per-vertex pin API designed for hybrid ABD-FEM mesh
+    /// scenarios where the rigid region of a continuous tet mesh is
+    /// kinematically driven by an ABD body.  Use this when you already
+    /// know each pinned vertex's coordinate in the ABD body's REST frame
+    /// (e.g. from tools/build_hybrid_mesh.py output's vertex_local_pos).
+    ///
+    /// Difference from add_fem_pin_to_abd:
+    ///   - No anchor vertex needed (no need to identify a paired ABD vert).
+    ///   - local_pos is taken AS-IS, not re-derived in finalize() from a
+    ///     world-space rest offset.
+    ///   - Fast bulk path: avoids per-pin Python<->C++ round-trips at
+    ///     hybrid-mesh scales (1k+ pins).
+    ///
+    /// The three input vectors must have the same length n_pins.
+    /// Must be called before finalize().
+    void add_fem_pins_with_local_pos(
+        const std::vector<int>&             fem_vertex_global_ids,
+        const std::vector<int>&             abd_body_ids,
+        const std::vector<Eigen::Vector3d>& abd_local_positions);
+
     /// libuipc-style per-face orient labels for an ABD surface body.
     /// Pass one int per triangle, in {-1, 0, +1}; non-zero values flip
     /// (or preserve) the face's normal sign at mass/centroid/inertia

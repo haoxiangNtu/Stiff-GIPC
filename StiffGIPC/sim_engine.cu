@@ -322,6 +322,41 @@ void SimEngine::add_fem_pin_to_abd(int fem_vertex_global_id,
         rest_offset_world.x(), rest_offset_world.y(), rest_offset_world.z()));
 }
 
+void SimEngine::add_fem_pins_with_local_pos(
+    const std::vector<int>&             fem_vertex_global_ids,
+    const std::vector<int>&             abd_body_ids,
+    const std::vector<Eigen::Vector3d>& abd_local_positions)
+{
+    const size_t n = fem_vertex_global_ids.size();
+    if(abd_body_ids.size() != n || abd_local_positions.size() != n)
+    {
+        throw std::invalid_argument(
+            "add_fem_pins_with_local_pos: input vectors size mismatch ("
+            + std::to_string(fem_vertex_global_ids.size()) + ", "
+            + std::to_string(abd_body_ids.size()) + ", "
+            + std::to_string(abd_local_positions.size()) + ")");
+    }
+    auto& tm = m_impl->tetMesh;
+    tm.fem_pin_fem_vertex.reserve(tm.fem_pin_fem_vertex.size() + n);
+    tm.fem_pin_abd_body_id.reserve(tm.fem_pin_abd_body_id.size() + n);
+    tm.fem_pin_abd_local_pos.reserve(tm.fem_pin_abd_local_pos.size() + n);
+    tm.fem_pin_abd_anchor.reserve(tm.fem_pin_abd_anchor.size() + n);
+    tm.fem_pin_rest_offset.reserve(tm.fem_pin_rest_offset.size() + n);
+    for(size_t i = 0; i < n; ++i)
+    {
+        tm.fem_pin_fem_vertex.push_back(fem_vertex_global_ids[i]);
+        tm.fem_pin_abd_body_id.push_back(abd_body_ids[i]);
+        // local_pos provided directly — finalize() must skip the world-rest-offset
+        // → local-pos transform for these pins.  Sentinel: anchor = -1.
+        const auto& lp = abd_local_positions[i];
+        tm.fem_pin_abd_local_pos.push_back(make_double3(lp.x(), lp.y(), lp.z()));
+        tm.fem_pin_abd_anchor.push_back(-1);
+        tm.fem_pin_rest_offset.push_back(make_double3(0.0, 0.0, 0.0));
+    }
+    printf("[Hybrid] add_fem_pins_with_local_pos: appended %zu pins "
+           "(total now %zu)\n", n, tm.fem_pin_fem_vertex.size());
+}
+
 bool SimEngine::set_abd_body_face_orient(int body_id, const std::vector<int>& orient)
 {
     for(auto& smb : m_impl->tetMesh.surface_mesh_bodies)
@@ -1332,6 +1367,14 @@ void SimEngine::finalize()
         {
             int bid = bid_vec[i];
             int av  = anchor_vec[i];
+            // [Hybrid mesh] anchor == -1 sentinel: caller used
+            // add_fem_pins_with_local_pos and provided local_pos directly
+            // (already in ABD rest frame).  Pass through verbatim.
+            if(av == -1)
+            {
+                local_pos[i] = impl.tetMesh.fem_pin_abd_local_pos[i];
+                continue;
+            }
             double3 fem_world = host_verts[fem_v_vec[i]];
             // Compute fem's position in ABD body's rest frame:
             //   world = q.t + R(q) * fem_local
@@ -1409,6 +1452,50 @@ void SimEngine::finalize()
                                   v2pin_host.data(),
                                   impl.tetMesh.vertexNum * sizeof(int),
                                   cudaMemcpyHostToDevice));
+
+        // [Hybrid mesh] populate d_tet_to_abd_body (per-tet body assignment).
+        // A tet whose 4 verts are ALL pinned to the SAME ABD body is rigid-
+        // internal: its Green strain is zero for any rigid motion of the
+        // body, so its FEM elasticity is structurally redundant w.r.t. the
+        // ABD body's own energy.  Marking it here lets Phase 4's elasticity
+        // kernel early-exit, saving a co-rotational SVD per such tet per
+        // Newton iter.  Computed once at finalize since pin info is static.
+        {
+            const auto& tets    = impl.tetMesh.tetrahedras;       // vector<uint4>
+            const auto& body_id = impl.tetMesh.fem_pin_abd_body_id; // vector<int>
+            std::vector<int> tet_to_abd(impl.tetMesh.tetrahedraNum, -1);
+            int n_rigid_tets = 0;
+            for(int t = 0; t < impl.tetMesh.tetrahedraNum; ++t)
+            {
+                const uint4 vs = tets[t];
+                const int p0 = v2pin_host[vs.x];
+                const int p1 = v2pin_host[vs.y];
+                const int p2 = v2pin_host[vs.z];
+                const int p3 = v2pin_host[vs.w];
+                if(p0 < 0 || p1 < 0 || p2 < 0 || p3 < 0) continue;
+                const int b0 = body_id[p0];
+                if(body_id[p1] != b0 || body_id[p2] != b0 || body_id[p3] != b0)
+                    continue;
+                tet_to_abd[t] = b0;
+                ++n_rigid_tets;
+            }
+            if(impl.d_tetMesh.d_tet_to_abd_body == nullptr)
+            {
+                CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_tetMesh.d_tet_to_abd_body,
+                                          impl.tetMesh.tetrahedraNum * sizeof(int)));
+            }
+            CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.d_tet_to_abd_body,
+                                      tet_to_abd.data(),
+                                      impl.tetMesh.tetrahedraNum * sizeof(int),
+                                      cudaMemcpyHostToDevice));
+            if(n_rigid_tets > 0)
+            {
+                printf("[Hybrid] %d / %d tets are rigid-internal "
+                       "(all 4 verts pinned to same body) — Phase 4 will "
+                       "skip their elasticity\n",
+                       n_rigid_tets, impl.tetMesh.tetrahedraNum);
+            }
+        }
 
         printf("[M1+M2+M3.5] %d FEM pins: local_pos transformed, btype=Fixed, "
                "is_pinned_vertex mask + vertex_to_pin_idx uploaded\n", n_pins);

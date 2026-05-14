@@ -8832,8 +8832,17 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     long long unsigned total_max_collision_triplet_num =
         minCollisionBuffer4 * 16 + minCollisionBuffer3 * 9
         + minCollisionBuffer2 * 4 + minCollisionBuffer1;
+    // [Strategy D] M3.5 chain-rule kernel reserves an extension range past
+    // the FEM triplets, with capacity = fem_triplet_num * 16 (worst-case
+    // diff-body pin-pin expansion).  When rigid region is large (Strategy D
+    // hybrid mesh), this 16× factor easily exceeds the previous 2×
+    // allocation → CUDA illegal memory access.  Use 32× to give margin
+    // (the actual ext_count is usually < 16× but allocation math conservative).
     long long unsigned total_max_global_triplet_num =
-        total_internal_triplet_num * 2 + total_max_collision_triplet_num;
+        total_internal_triplet_num * 32 + total_max_collision_triplet_num;
+    printf("[buffer] total_internal_triplet_num=%llu, total_max=%llu (3x3 doubles ~ %llu MB)\n",
+           total_internal_triplet_num, total_max_global_triplet_num,
+           total_max_global_triplet_num * 80 / 1024 / 1024);
 
     gipc_global_triplet.init_var();
 
@@ -9637,7 +9646,8 @@ void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInverses,
                                     int*                    row_ids,
                                     int*                    col_ids,
                                     double                  IPC_dt,
-                                    int global_hessian_fem_offset)
+                                    int global_hessian_fem_offset,
+                                    const int*              tet_to_abd_body /* nullable, indexed in GLOBAL tet space */)
 {
     int numbers = tetrahedraNum_FEM;
     if(numbers < 1)
@@ -9659,7 +9669,8 @@ void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInverses,
         row_ids,
         col_ids,
         IPC_dt,
-        global_hessian_fem_offset);
+        global_hessian_fem_offset,
+        tet_to_abd_body ? tet_to_abd_body + tetrahedraNum_ABD : nullptr);
 }
 
 void calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* triDmInverses,
@@ -10586,7 +10597,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                        gipc_global_triplet.block_row_indices(),
                                        gipc_global_triplet.block_col_indices(),
                                        IPC_dt,
-                                       fem_global_hessian_index_offset);
+                                       fem_global_hessian_index_offset,
+                                       TetMesh.d_tet_to_abd_body);
         gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_tet_num * 10;
 
 

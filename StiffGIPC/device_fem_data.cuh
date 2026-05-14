@@ -101,6 +101,20 @@ class device_TetraData
     // for a given pinned vertex without searching d_fem_pin_fem_vertex.
     int*     vertex_to_pin_idx      = nullptr;
 
+    // [Hybrid mesh] per-tet ABD body assignment, size = tetrahedraNum.
+    //   d_tet_to_abd_body[t] = body_id  if all 4 verts of tet t are pinned
+    //                                   to the SAME ABD body (rigid-internal
+    //                                   tet — Phase 4 FEM elasticity kernel
+    //                                   skips this tet because its rigid-
+    //                                   motion Green strain is structurally
+    //                                   zero, and chain-rule routing of any
+    //                                   numerical noise is wasted work).
+    //                        = -1       otherwise (interface tet straddling
+    //                                   rigid/FEM regions, or pure-FEM tet).
+    // Populated in sim_engine.cu finalize() after vertex_to_pin_idx is set.
+    // nullptr when no pins exist (kernel must null-check before deref).
+    int*     d_tet_to_abd_body      = nullptr;
+
     // BVH-skip #3: filtered face/edge index lists. bvh_active_face_idx[t] holds
     // the original face index of the t-th non-isolated face; same for edges.
     // Sized n_active_face / n_active_edge (<= surface count / edge count).
