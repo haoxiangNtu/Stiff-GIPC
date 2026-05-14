@@ -27,7 +27,6 @@ for arg in sys.argv[1:]:
 
 # Ensure dailyv2 engine resolves
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import _use_dailyv2_engine  # noqa
 
 # ------ Monkey-patch polyscope so case_27 doesn't open a window --------
 class _FakePsShow(Exception):

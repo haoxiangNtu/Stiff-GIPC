@@ -20,10 +20,6 @@ Usage (after `pip install stiff_physics`):
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    import _use_dailyv2_engine  # noqa: F401
-except ImportError:
-    pass
 
 import numpy as np
 import polyscope as ps

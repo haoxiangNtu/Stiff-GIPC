@@ -17,7 +17,6 @@ or softgriper_part2.msh (12k tet/finger).
 """
 import sys, os, math, re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import _use_dailyv2_engine  # noqa: F401
 
 import numpy as np
 import polyscope as ps

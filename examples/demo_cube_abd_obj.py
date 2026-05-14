@@ -26,10 +26,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Dev-mode prelude: bypass any editable-install hook so this script uses
 # the dailyv2 build.  Released wheel users don't need this (the prelude
 # file just doesn't exist in the wheel).
-try:
-    import _use_dailyv2_engine  # noqa: F401
-except ImportError:
-    pass
 
 import numpy as np
 import polyscope as ps
