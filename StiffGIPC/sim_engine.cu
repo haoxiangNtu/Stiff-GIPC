@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <map>
 #include <cuda_runtime.h>
 
 #include "GIPC.cuh"
@@ -49,6 +50,18 @@ struct SimEngine::Impl
 
     // Shared mesh assets for instanced loading
     std::vector<MeshAsset> mesh_assets;
+
+    // Cache of original abd-gravity vectors when set_body_apply_gravity(off) is
+    // called.  Allows restoring without recomputing tet integrals.
+    std::map<int, Eigen::Matrix<double, 12, 1>> disabled_abd_gravity_cache;
+
+    // Pending mesh overrides for the next load_urdf() call.
+    // Map link_name -> (msh_path, young_modulus). Cleared after load_urdf.
+    std::map<std::string, std::pair<std::string, double>> pending_urdf_mesh_overrides;
+
+    // Cache of URDF link world transforms after load_urdf (link_name -> 4x4).
+    // Used by get_urdf_link_transform() for hybrid attachment placement.
+    std::map<std::string, Eigen::Matrix4d> urdf_link_transforms;
 
     void apply_config_to_ipc();
     void do_initFEM();
@@ -150,12 +163,27 @@ void SimEngine::load_urdf(const std::string&     urdf_path,
     if(!initial_joint_angles.empty())
         urdf_importer.set_initial_joint_angles(initial_joint_angles);
 
+    // Apply any pending mesh overrides (set via set_urdf_mesh_override
+    // before this load_urdf call).
+    for(const auto& [link_name, info] : m_impl->pending_urdf_mesh_overrides)
+    {
+        UrdfLinkMeshOverride o;
+        o.msh_path      = info.first;
+        o.young_modulus = info.second;
+        urdf_importer.set_mesh_override(link_name, o);
+    }
+    m_impl->pending_urdf_mesh_overrides.clear();
+
     bool ok = urdf_importer.import_scene(m_impl->tetMesh, m_impl->cfg.preconditioner_type);
     if(!ok)
     {
         std::cerr << "[SimEngine] URDF import failed: " << urdf_path << std::endl;
         return;
     }
+
+    // Cache each link's world transform for later get_urdf_link_transform()
+    for(const auto& [name, info] : urdf_importer.link_infos())
+        m_impl->urdf_link_transforms[name] = info.global_transform;
 
     int new_abd = static_cast<int>(m_impl->tetMesh.abd_fem_count_info.abd_body_num);
     // Derive per-body vertex ranges from point_id_to_body_id (one body id per vertex,
@@ -221,7 +249,13 @@ void SimEngine::load_mesh(const std::string&     mesh_path,
     }
 
     auto bt = (body_type == 0) ? gipc::BodyType::ABD : gipc::BodyType::FEM;
-    auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
+    BodyBoundaryType bb;
+    switch(boundary_type) {
+        case 1:  bb = BodyBoundaryType::Fixed;    break;
+        case 2:  bb = BodyBoundaryType::Motor;    break;
+        case 3:  bb = BodyBoundaryType::Animated; break;
+        default: bb = BodyBoundaryType::Free;     break;
+    }
 
     SimpleSceneImporter imp;
     // Pass runtime metis_dir so the metis_partition library writes its
@@ -239,7 +273,9 @@ void SimEngine::load_mesh(const std::string&     mesh_path,
     std::cout << "[SimEngine] Mesh loaded: " << resolved
               << " (dim=" << dimensions
               << ", " << (body_type == 0 ? "ABD" : "FEM")
-              << ", " << (boundary_type == 1 ? "Fixed" : "Free")
+              << ", " << (boundary_type == 1 ? "Fixed"
+                          : boundary_type == 2 ? "Motor"
+                          : boundary_type == 3 ? "Animated" : "Free")
               << ", E=" << young_modulus << ")" << std::endl;
     std::cout << "  Total verts: " << m_impl->tetMesh.vertexNum
               << ", ABD bodies: " << m_impl->tetMesh.abd_fem_count_info.abd_body_num
@@ -292,6 +328,41 @@ void SimEngine::add_fem_pin_to_abd(int fem_vertex_global_id,
     tm.fem_pin_abd_anchor.push_back(abd_anchor_vertex_global_id);
     tm.fem_pin_rest_offset.push_back(make_double3(
         rest_offset_world.x(), rest_offset_world.y(), rest_offset_world.z()));
+}
+
+void SimEngine::add_fem_pins_with_local_pos(
+    const std::vector<int>&             fem_vertex_global_ids,
+    const std::vector<int>&             abd_body_ids,
+    const std::vector<Eigen::Vector3d>& abd_local_positions)
+{
+    const size_t n = fem_vertex_global_ids.size();
+    if(abd_body_ids.size() != n || abd_local_positions.size() != n)
+    {
+        throw std::invalid_argument(
+            "add_fem_pins_with_local_pos: input vectors size mismatch ("
+            + std::to_string(fem_vertex_global_ids.size()) + ", "
+            + std::to_string(abd_body_ids.size()) + ", "
+            + std::to_string(abd_local_positions.size()) + ")");
+    }
+    auto& tm = m_impl->tetMesh;
+    tm.fem_pin_fem_vertex.reserve(tm.fem_pin_fem_vertex.size() + n);
+    tm.fem_pin_abd_body_id.reserve(tm.fem_pin_abd_body_id.size() + n);
+    tm.fem_pin_abd_local_pos.reserve(tm.fem_pin_abd_local_pos.size() + n);
+    tm.fem_pin_abd_anchor.reserve(tm.fem_pin_abd_anchor.size() + n);
+    tm.fem_pin_rest_offset.reserve(tm.fem_pin_rest_offset.size() + n);
+    for(size_t i = 0; i < n; ++i)
+    {
+        tm.fem_pin_fem_vertex.push_back(fem_vertex_global_ids[i]);
+        tm.fem_pin_abd_body_id.push_back(abd_body_ids[i]);
+        // local_pos provided directly — finalize() must skip the world-rest-offset
+        // → local-pos transform for these pins.  Sentinel: anchor = -1.
+        const auto& lp = abd_local_positions[i];
+        tm.fem_pin_abd_local_pos.push_back(make_double3(lp.x(), lp.y(), lp.z()));
+        tm.fem_pin_abd_anchor.push_back(-1);
+        tm.fem_pin_rest_offset.push_back(make_double3(0.0, 0.0, 0.0));
+    }
+    printf("[Hybrid] add_fem_pins_with_local_pos: appended %zu pins "
+           "(total now %zu)\n", n, tm.fem_pin_fem_vertex.size());
 }
 
 bool SimEngine::set_abd_body_face_orient(int body_id, const std::vector<int>& orient)
@@ -1280,6 +1351,14 @@ void SimEngine::finalize()
         {
             int bid = bid_vec[i];
             int av  = anchor_vec[i];
+            // [Hybrid mesh] anchor == -1 sentinel: caller used
+            // add_fem_pins_with_local_pos and provided local_pos directly
+            // (already in ABD rest frame).  Pass through verbatim.
+            if(av == -1)
+            {
+                local_pos[i] = impl.tetMesh.fem_pin_abd_local_pos[i];
+                continue;
+            }
             double3 fem_world = host_verts[fem_v_vec[i]];
             // Compute fem's position in ABD body's rest frame:
             //   world = q.t + R(q) * fem_local
@@ -1357,6 +1436,50 @@ void SimEngine::finalize()
                                   v2pin_host.data(),
                                   impl.tetMesh.vertexNum * sizeof(int),
                                   cudaMemcpyHostToDevice));
+
+        // [Hybrid mesh] populate d_tet_to_abd_body (per-tet body assignment).
+        // A tet whose 4 verts are ALL pinned to the SAME ABD body is rigid-
+        // internal: its Green strain is zero for any rigid motion of the
+        // body, so its FEM elasticity is structurally redundant w.r.t. the
+        // ABD body's own energy.  Marking it here lets Phase 4's elasticity
+        // kernel early-exit, saving a co-rotational SVD per such tet per
+        // Newton iter.  Computed once at finalize since pin info is static.
+        {
+            const auto& tets    = impl.tetMesh.tetrahedras;       // vector<uint4>
+            const auto& body_id = impl.tetMesh.fem_pin_abd_body_id; // vector<int>
+            std::vector<int> tet_to_abd(impl.tetMesh.tetrahedraNum, -1);
+            int n_rigid_tets = 0;
+            for(int t = 0; t < impl.tetMesh.tetrahedraNum; ++t)
+            {
+                const uint4 vs = tets[t];
+                const int p0 = v2pin_host[vs.x];
+                const int p1 = v2pin_host[vs.y];
+                const int p2 = v2pin_host[vs.z];
+                const int p3 = v2pin_host[vs.w];
+                if(p0 < 0 || p1 < 0 || p2 < 0 || p3 < 0) continue;
+                const int b0 = body_id[p0];
+                if(body_id[p1] != b0 || body_id[p2] != b0 || body_id[p3] != b0)
+                    continue;
+                tet_to_abd[t] = b0;
+                ++n_rigid_tets;
+            }
+            if(impl.d_tetMesh.d_tet_to_abd_body == nullptr)
+            {
+                CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_tetMesh.d_tet_to_abd_body,
+                                          impl.tetMesh.tetrahedraNum * sizeof(int)));
+            }
+            CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.d_tet_to_abd_body,
+                                      tet_to_abd.data(),
+                                      impl.tetMesh.tetrahedraNum * sizeof(int),
+                                      cudaMemcpyHostToDevice));
+            if(n_rigid_tets > 0)
+            {
+                printf("[Hybrid] %d / %d tets are rigid-internal "
+                       "(all 4 verts pinned to same body) — Phase 4 will "
+                       "skip their elasticity\n",
+                       n_rigid_tets, impl.tetMesh.tetrahedraNum);
+            }
+        }
 
         printf("[M1+M2+M3.5] %d FEM pins: local_pos transformed, btype=Fixed, "
                "is_pinned_vertex mask + vertex_to_pin_idx uploaded\n", n_pins);
@@ -1750,6 +1873,35 @@ void SimEngine::set_prismatic_strength(int idx, double strength)
     m_impl->tetMesh.prismatic_drive_controls.at(idx).strength_ratio = strength;
 }
 
+void SimEngine::set_fixed_joint_strength(int idx, double kappa)
+{
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_system) {
+        std::cerr << "[set_fixed_joint_strength] sim not finalized" << std::endl;
+        return;
+    }
+    auto& abd_sys = *impl.ipc.m_abd_system;
+    if(idx < 0 || idx >= abd_sys.m_num_joints) {
+        std::cerr << "[set_fixed_joint_strength] idx " << idx
+                  << " out of range [0," << abd_sys.m_num_joints << ")" << std::endl;
+        return;
+    }
+
+    // Read current GPU data for this joint, modify kappa, write back.
+    JointConstraintGPUData host_jd;
+    CUDA_SAFE_CALL(cudaMemcpy(&host_jd,
+                              abd_sys.m_joint_data.data() + idx,
+                              sizeof(JointConstraintGPUData),
+                              cudaMemcpyDeviceToHost));
+    host_jd.kappa = static_cast<Float>(kappa);
+    CUDA_SAFE_CALL(cudaMemcpy(abd_sys.m_joint_data.data() + idx,
+                              &host_jd,
+                              sizeof(JointConstraintGPUData),
+                              cudaMemcpyHostToDevice));
+    std::cout << "[set_fixed_joint_strength] joint #" << idx
+              << " kappa = " << kappa << std::endl;
+}
+
 void SimEngine::set_max_revolute_step_per_frame(double rad)
 {
     auto& impl = *m_impl;
@@ -1898,7 +2050,13 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     }
 
     auto bt = (body_type == 0) ? gipc::BodyType::ABD : gipc::BodyType::FEM;
-    auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
+    BodyBoundaryType bb;
+    switch(boundary_type) {
+        case 1:  bb = BodyBoundaryType::Fixed;    break;
+        case 2:  bb = BodyBoundaryType::Motor;    break;
+        case 3:  bb = BodyBoundaryType::Animated; break;
+        default: bb = BodyBoundaryType::Free;     break;
+    }
 
     if(bt == gipc::BodyType::ABD && (dimensions == 2 || verts_per_face == 3))
     {
@@ -1980,7 +2138,13 @@ void SimEngine::Impl::load_from_temp_file(
     double young_modulus, int boundary_type)
 {
     auto bt = (body_type == 0) ? gipc::BodyType::ABD : gipc::BodyType::FEM;
-    auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
+    BodyBoundaryType bb;
+    switch(boundary_type) {
+        case 1:  bb = BodyBoundaryType::Fixed;    break;
+        case 2:  bb = BodyBoundaryType::Motor;    break;
+        case 3:  bb = BodyBoundaryType::Animated; break;
+        default: bb = BodyBoundaryType::Free;     break;
+    }
 
     if(bt == gipc::BodyType::ABD && (dimensions == 2 || verts_per_face == 3))
     {
@@ -2275,6 +2439,129 @@ void SimEngine::set_abd_body_velocities(const int* body_offsets, const double* m
     CUDA_SAFE_CALL(cudaMemcpy(impl.ipc.m_abd_sim_data->device.body_id_to_q_v.data(),
                               host_qv.data(),
                               num_bodies * sizeof(Vec12), cudaMemcpyHostToDevice));
+}
+
+void SimEngine::set_body_animated_target(int body_id,
+                                         double target_x, double target_y, double target_z,
+                                         double strength)
+{
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_sim_data) return;
+
+    int num_bodies = impl.ipc.abd_fem_count_info.abd_body_num;
+    if(body_id < 0 || body_id >= num_bodies) return;
+
+    if(impl.d_tetMesh.body_motor_params == nullptr) {
+        // Buffer wasn't allocated (no motor_infos at finalize time).  Allocate
+        // it here so per-step Animated drive can be set on bodies that
+        // weren't pre-registered with body_motor_infos.
+        size_t bytes = (size_t)num_bodies * 5 * sizeof(double);
+        CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_tetMesh.body_motor_params, bytes));
+        CUDA_SAFE_CALL(cudaMemset(impl.d_tetMesh.body_motor_params, 0, bytes));
+    }
+
+    double host_params[5] = {target_x, target_y, target_z, strength, 0.0};
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.body_motor_params + body_id * 5,
+                              host_params,
+                              5 * sizeof(double),
+                              cudaMemcpyHostToDevice));
+}
+
+void SimEngine::set_urdf_mesh_override(const std::string& link_name,
+                                       const std::string& msh_path,
+                                       double young_modulus)
+{
+    m_impl->pending_urdf_mesh_overrides[link_name] = {msh_path, young_modulus};
+}
+
+Eigen::Matrix4d SimEngine::get_urdf_link_transform(const std::string& link_name) const
+{
+    auto it = m_impl->urdf_link_transforms.find(link_name);
+    if(it == m_impl->urdf_link_transforms.end()) {
+        std::cerr << "[get_urdf_link_transform] link '" << link_name
+                  << "' not found (URDF not loaded or wrong name)" << std::endl;
+        return Eigen::Matrix4d::Identity();
+    }
+    return it->second;
+}
+
+void SimEngine::set_body_apply_gravity(int body_id, bool enabled)
+{
+    auto& impl = *m_impl;
+    int n_abd = static_cast<int>(impl.tetMesh.abd_fem_count_info.abd_body_num);
+
+    if(body_id < n_abd)
+    {
+        // ABD body: gravity is precomputed at finalize as a 12-DOF
+        // body_id_to_abd_gravity[i] vector. apply_gravity[] (per-vertex) is
+        // ignored for ABD verts. To toggle, zero/restore the cached vector.
+        if(!impl.ipc.m_abd_sim_data) {
+            std::cerr << "[set_body_apply_gravity] sim not finalized" << std::endl;
+            return;
+        }
+
+        using Vec12 = Eigen::Matrix<double, 12, 1>;
+        auto& g_buf = impl.ipc.m_abd_sim_data->device.body_id_to_abd_gravity;
+        if(static_cast<int>(g_buf.size()) <= body_id) {
+            std::cerr << "[set_body_apply_gravity] ABD body_id " << body_id
+                      << " out of range (size=" << g_buf.size() << ")" << std::endl;
+            return;
+        }
+
+        if(!enabled) {
+            // Cache current gravity (so we can restore it).  Stored on host
+            // in m_disabled_abd_gravity[body_id] keyed by body_id.
+            Vec12 host_g = Vec12::Zero();
+            CUDA_SAFE_CALL(cudaMemcpy(host_g.data(),
+                                      g_buf.data() + body_id,
+                                      sizeof(Vec12), cudaMemcpyDeviceToHost));
+            impl.disabled_abd_gravity_cache[body_id] = host_g;
+
+            Vec12 zero = Vec12::Zero();
+            CUDA_SAFE_CALL(cudaMemcpy(g_buf.data() + body_id,
+                                      zero.data(),
+                                      sizeof(Vec12), cudaMemcpyHostToDevice));
+        } else {
+            // Restore from cache if we previously disabled it
+            auto it = impl.disabled_abd_gravity_cache.find(body_id);
+            if(it != impl.disabled_abd_gravity_cache.end()) {
+                CUDA_SAFE_CALL(cudaMemcpy(g_buf.data() + body_id,
+                                          it->second.data(),
+                                          sizeof(Vec12), cudaMemcpyHostToDevice));
+                impl.disabled_abd_gravity_cache.erase(it);
+            }
+        }
+        return;
+    }
+
+    // FEM body: per-vertex apply_gravity[] flag
+    const auto& pt2body = impl.tetMesh.point_id_to_body_id;
+    if(pt2body.empty() || impl.d_tetMesh.apply_gravity == nullptr) return;
+
+    int v_start = -1, v_end = -1;
+    int N = static_cast<int>(pt2body.size());
+    for(int i = 0; i < N; i++)
+    {
+        if(pt2body[i] == body_id)
+        {
+            if(v_start < 0) v_start = i;
+            v_end = i + 1;
+        }
+    }
+    if(v_start < 0) {
+        std::cerr << "[set_body_apply_gravity] body_id " << body_id
+                  << " has no vertices" << std::endl;
+        return;
+    }
+
+    int n = v_end - v_start;
+    std::vector<int> host_flags(n, enabled ? 1 : 0);
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.apply_gravity + v_start,
+                              host_flags.data(),
+                              n * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    for(int i = v_start; i < v_end; i++)
+        impl.tetMesh.apply_gravity[i] = enabled ? 1 : 0;
 }
 
 // ======================== FEM vertex state ========================

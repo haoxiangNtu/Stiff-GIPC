@@ -214,6 +214,28 @@ class SimEngine
                             int abd_body_id,
                             const Eigen::Vector3d& rest_offset_world);
 
+    /// [Hybrid mesh] bulk-add FEM pins with EXPLICIT local positions.
+    ///
+    /// This is the per-vertex pin API designed for hybrid ABD-FEM mesh
+    /// scenarios where the rigid region of a continuous tet mesh is
+    /// kinematically driven by an ABD body.  Use this when you already
+    /// know each pinned vertex's coordinate in the ABD body's REST frame
+    /// (e.g. from tools/build_hybrid_mesh.py output's vertex_local_pos).
+    ///
+    /// Difference from add_fem_pin_to_abd:
+    ///   - No anchor vertex needed (no need to identify a paired ABD vert).
+    ///   - local_pos is taken AS-IS, not re-derived in finalize() from a
+    ///     world-space rest offset.
+    ///   - Fast bulk path: avoids per-pin Python<->C++ round-trips at
+    ///     hybrid-mesh scales (1k+ pins).
+    ///
+    /// The three input vectors must have the same length n_pins.
+    /// Must be called before finalize().
+    void add_fem_pins_with_local_pos(
+        const std::vector<int>&             fem_vertex_global_ids,
+        const std::vector<int>&             abd_body_ids,
+        const std::vector<Eigen::Vector3d>& abd_local_positions);
+
     /// libuipc-style per-face orient labels for an ABD surface body.
     /// Pass one int per triangle, in {-1, 0, +1}; non-zero values flip
     /// (or preserve) the face's normal sign at mass/centroid/inertia
@@ -297,6 +319,49 @@ class SimEngine
     void get_abd_body_velocities(const int* body_offsets, double* out_mat4x4, int count) const;
     void set_abd_body_velocities(const int* body_offsets, const double* mat4x4, int count);
 
+    /// Set per-frame Animated-target for an ABD body that was loaded with
+    /// boundary_type=Animated (=3).  Each step the engine adds a soft
+    /// quadratic penalty
+    ///     E += 0.5 * strength * (||q.t - target||^2 + ||A(q) - I||_F^2)
+    /// to the body's energy.  This keeps the body's translation tracking
+    /// `target` and its rotation near identity, without removing the body's
+    /// 12 DOFs from the PCG system — so M3.5 chain-rule pins to this body
+    /// still propagate correctly, and standard joint constraints can attach
+    /// to the body's q.  Coordinates are in world space (meters).
+    /// Strength <= 0 falls back to the default 1e6.
+    void set_body_animated_target(int body_id,
+                                  double target_x, double target_y, double target_z,
+                                  double strength = 0.0);
+
+    /// Toggle gravity for all vertices of a body, applied at next step.  Use
+    /// this for ABD bodies that are kinematically driven by joints to a
+    /// Fixed parent — e.g. a gripper hanging off an arm link via revolute
+    /// joint.  Without disabling, joint penalty must continuously cancel
+    /// gravity each step, leaving residual that accumulates as drift +
+    /// destabilizes Newton when combined with chain-rule pins.  body_id is
+    /// the GLOBAL body id (ABD bodies first, then FEM).  Must call AFTER
+    /// finalize() (writes to GPU buffer directly).
+    void set_body_apply_gravity(int body_id, bool enabled);
+
+    /// Returns the 4×4 world transform of a URDF link, computed by the
+    /// importer's forward kinematics from the link tree + joint angles.
+    /// Available immediately after load_urdf() (no need to finalize).
+    /// Useful for placing additional bodies (e.g. hybrid gripper) attached
+    /// to a specific link with correct orientation in world space.
+    /// Returns identity if link_name not found.
+    Eigen::Matrix4d get_urdf_link_transform(const std::string& link_name) const;
+
+    /// Override the mesh used for a URDF link in the next load_urdf() call.
+    /// URDF importer normally reads the link's <collision> mesh filename
+    /// (.obj/.stl) — but for engine bodies we usually want a tetrahedralized
+    /// .msh.  Call this BEFORE load_urdf() for each link you want overridden.
+    /// All overrides are consumed (cleared) by the next load_urdf().
+    /// Required when the URDF references a mesh file that doesn't exist on
+    /// disk — without override, URDF importer skips that link silently.
+    void set_urdf_mesh_override(const std::string& link_name,
+                                const std::string& msh_path,
+                                double young_modulus = 1e7);
+
     // ---- FEM vertex state ----
     void get_vertex_velocities(double* out_xyz, int count) const;
     void set_vertex_positions_gpu(const double* xyz, int count);
@@ -327,6 +392,17 @@ class SimEngine
     /// cascade and slows Newton). Applied starting next step().
     void set_revolute_strength(int idx, double strength);
     void set_prismatic_strength(int idx, double strength);
+
+    /// Override per-fixed-joint stiffness (kappa).  By default kappa is set
+    /// at finalize as `joint_strength_ratio * (m_parent + m_child)` for ALL
+    /// joints (including URDF revolute constraint points + manually added
+    /// fixed joints).  When a hybrid gripper is welded to a URDF arm hand
+    /// via fixed_joint, the default kappa (~8e-3) is far too weak to hold
+    /// the gripper rigid against the arm — it lags 8mm+ per cm of hand
+    /// motion.  Use this to set the fixed_joint kappa directly (e.g. 1e6
+    /// matches Animated PD strength). idx = constraint index returned by
+    /// add_fixed_joint().  Call AFTER finalize().
+    void set_fixed_joint_strength(int idx, double kappa);
 
     /// Set the maximum revolute joint angle change per IPC step (in radians).
     /// Default 0.1 rad ≈ 5.7°.  For scenes with fine FEM softpads pinned to

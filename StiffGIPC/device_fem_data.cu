@@ -151,6 +151,9 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(d_stitch_paired_vertex));
     CUDA_SAFE_CALL(cudaFree(d_stitch_rest_offset));
     CUDA_SAFE_CALL(cudaFree(d_stitch_abd_body_id));
+
+    // [Hybrid mesh] per-tet ABD body assignment.
+    CUDA_SAFE_CALL(cudaFree(d_tet_to_abd_body));
 }
 
 void device_TetraData::update_soft_constraint_target_position(int step_id, double ipc_dt)

@@ -1,6 +1,7 @@
 #include <gipc/utils/urdf_scene_importer.h>
 #include <gipc/utils/simple_scene_importer.h>
 #include <urdf_parser/urdf_parser.h>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <set>
@@ -450,16 +451,38 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
             ctrl.constraint_index   = static_cast<int>(tetras.joint_constraints.size());
             ctrl.axis_dir           = world_axis;
             ctrl.n_dir              = n_perp;
-            ctrl.target_angle       = 0.0;
             ctrl.lower_limit        = std::max(jinfo.lower_limit, -JointAngleControlInfo::kSafeAngleLimit);
             ctrl.upper_limit        = std::min(jinfo.upper_limit,  JointAngleControlInfo::kSafeAngleLimit);
             ctrl.joint_name         = jname;
 
+            // Default target = 0, but clamp to limit if 0 is outside the
+            // joint's valid range.  Some URDFs (e.g. Franka panda joint4/6)
+            // have limits that exclude 0 — leaving target=0 creates UI
+            // inconsistency (slider shows 0 but slider range excludes 0)
+            // and physics contention (PD spring vs joint limit constraint
+            // tugging in opposite directions).  Clamping ensures cached
+            // target == physically achievable equilibrium.
+            //
+            // CRITICAL: also set initial_angle_offset to the same clamped
+            // value.  The driving energy computes theta_current from q.A
+            // (which init to identity in engine), but link FK is at the
+            // clamped pose.  Without offset = clamped, driving energy sees
+            // theta=0 vs target=0.5445 → sin² penalty non-zero → first step
+            // rotates q.A to "make joint reach target" → arm drifts ~30mm.
+            // With offset = clamped, effective_target = target - offset = 0,
+            // matching theta=0 → driving energy zero at init → no drift.
+            double clamped_default = std::clamp(0.0, ctrl.lower_limit, ctrl.upper_limit);
+            ctrl.target_angle         = clamped_default;
+            ctrl.initial_angle_offset = clamped_default;
+
             auto angle_it = m_initial_joint_angles.find(jname);
             if(angle_it != m_initial_joint_angles.end())
             {
-                ctrl.initial_angle_offset = angle_it->second;
-                ctrl.target_angle         = angle_it->second;
+                // User-supplied initial angle — clamp + sync offset
+                double user_angle = std::clamp(angle_it->second,
+                                                ctrl.lower_limit, ctrl.upper_limit);
+                ctrl.initial_angle_offset = user_angle;
+                ctrl.target_angle         = user_angle;
             }
 
             tetras.joint_angle_controls.push_back(ctrl);
@@ -779,18 +802,36 @@ void UrdfSceneImporter::propagate_transforms(const std::string&     link_name,
         // Child global = parent_global * joint_local_transform
         Eigen::Matrix4d child_global = parent_global * joint_it->second.local_trans;
 
-        // Apply initial joint angle rotation (FK at target pose instead of zero pose)
-        if((joint_it->second.type == UrdfJointInfo::Type::Revolute
-            || joint_it->second.type == UrdfJointInfo::Type::Continuous)
-           && m_initial_joint_angles.count(joint_name))
+        // Apply initial joint angle rotation.  FK angle must equal the
+        // physically-achievable pose:
+        //   1) start from user-supplied initial_joint_angles if given, else 0
+        //   2) clamp to URDF [lower_limit, upper_limit]
+        // This means link transforms (and hence get_urdf_link_transform / any
+        // attached body placement) reflect a VALID pose from t=0, not the
+        // zero-angle "fake" pose that may be outside joint limits.  Without
+        // this, visual loads in an invalid pose and only snaps into limit
+        // after the first step (PD spring + joint constraint resolve).
+        if(joint_it->second.type == UrdfJointInfo::Type::Revolute
+           || joint_it->second.type == UrdfJointInfo::Type::Continuous)
         {
-            double angle = m_initial_joint_angles.at(joint_name);
-            std::cout << "[UrdfSceneImporter] Applying initial angle " << angle
-                      << " rad to joint '" << joint_name << "'" << std::endl;
-            Eigen::Matrix3d R_joint = Eigen::AngleAxisd(angle, joint_it->second.axis).toRotationMatrix();
-            Eigen::Matrix4d T_rot = Eigen::Matrix4d::Identity();
-            T_rot.block<3, 3>(0, 0) = R_joint;
-            child_global = child_global * T_rot;
+            double angle = 0.0;
+            auto angle_it = m_initial_joint_angles.find(joint_name);
+            if(angle_it != m_initial_joint_angles.end())
+                angle = angle_it->second;
+            // Clamp to joint limit (continuous joints have no limit → skip)
+            if(joint_it->second.type == UrdfJointInfo::Type::Revolute) {
+                angle = std::clamp(angle, joint_it->second.lower_limit,
+                                          joint_it->second.upper_limit);
+            }
+            if(std::abs(angle) > 1e-12)
+            {
+                std::cout << "[UrdfSceneImporter] FK joint '" << joint_name
+                          << "' at angle " << angle << " rad (clamped to limit)" << std::endl;
+                Eigen::Matrix3d R_joint = Eigen::AngleAxisd(angle, joint_it->second.axis).toRotationMatrix();
+                Eigen::Matrix4d T_rot = Eigen::Matrix4d::Identity();
+                T_rot.block<3, 3>(0, 0) = R_joint;
+                child_global = child_global * T_rot;
+            }
         }
 
         // Compute the global-frame axis for revolute/continuous/prismatic joints.

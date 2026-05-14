@@ -230,6 +230,41 @@ PYBIND11_MODULE(pystiffgipc, m)
              "(in M1 — M2 will add the cross-term Hessian for proper "
              "force feedback).")
 
+        .def("add_fem_pins_with_local_pos",
+             [](SimEngine& e,
+                py::array_t<int, py::array::c_style | py::array::forcecast> fem_ids,
+                py::array_t<int, py::array::c_style | py::array::forcecast> body_ids,
+                py::array_t<double, py::array::c_style | py::array::forcecast> local_pos)
+             {
+                 auto fi = fem_ids.unchecked<1>();
+                 auto bi = body_ids.unchecked<1>();
+                 auto lp = local_pos.unchecked<2>();
+                 const int n = static_cast<int>(fi.shape(0));
+                 if(bi.shape(0) != n || lp.shape(0) != n || lp.shape(1) != 3)
+                 {
+                     throw std::invalid_argument(
+                         "add_fem_pins_with_local_pos: array shapes must be "
+                         "(n,), (n,), (n,3)");
+                 }
+                 std::vector<int> fv(n), bv(n);
+                 std::vector<Eigen::Vector3d> lv(n);
+                 for(int i = 0; i < n; ++i)
+                 {
+                     fv[i] = fi(i);
+                     bv[i] = bi(i);
+                     lv[i] = Eigen::Vector3d(lp(i, 0), lp(i, 1), lp(i, 2));
+                 }
+                 e.add_fem_pins_with_local_pos(fv, bv, lv);
+             },
+             py::arg("fem_vertex_ids"), py::arg("abd_body_ids"),
+             py::arg("abd_local_positions"),
+             "[Hybrid mesh] Bulk-add FEM pins with explicit local positions in "
+             "the ABD body's rest frame.  Use this with the .npz output from "
+             "tools/build_hybrid_mesh.py — feed in vertex_abd_body_id (filtered "
+             "to >=0) and vertex_local_pos (matching rows).  fem_vertex_ids "
+             "must be GLOBAL vertex indices (= local_idx + body_offset for the "
+             "FEM body).")
+
         .def("set_abd_body_face_orient", &SimEngine::set_abd_body_face_orient,
              py::arg("body_id"), py::arg("orient"))
         .def("get_abd_body_face_orient", &SimEngine::get_abd_body_face_orient,
@@ -416,6 +451,36 @@ PYBIND11_MODULE(pystiffgipc, m)
                                       static_cast<const double*>(vbuf.ptr), count);
         }, py::arg("body_offsets"), py::arg("velocities"))
 
+        // Per-step soft-target driver for ABD bodies loaded with
+        // boundary_type=Animated (=3).  Updates body_motor_params on the GPU
+        // so the engine's Animated penalty pulls q.t toward (x,y,z) and
+        // q.A toward identity.  The body's 12 DOFs stay in PCG → joint
+        // attachments and M3.5 chain-rule pins propagate normally.
+        .def("set_body_animated_target", &SimEngine::set_body_animated_target,
+             py::arg("body_id"),
+             py::arg("target_x"), py::arg("target_y"), py::arg("target_z"),
+             py::arg("strength") = 0.0,
+             "Set per-step Animated target for an ABD body (target world position, "
+             "soft penalty stiffness). Strength<=0 → engine default 1e6. "
+             "Body must have been loaded with boundary_type='Animated' or =3.")
+
+        .def("set_body_apply_gravity", &SimEngine::set_body_apply_gravity,
+             py::arg("body_id"), py::arg("enabled"),
+             "Toggle gravity for all verts of body_id (global body id).  Use "
+             "for ABD bodies anchored to Fixed parent via joint to avoid drift "
+             "from joint penalty wrestling gravity.  Call AFTER finalize().")
+
+        .def("get_urdf_link_transform", &SimEngine::get_urdf_link_transform,
+             py::arg("link_name"),
+             "Returns 4x4 world transform of a URDF link (computed by importer's "
+             "FK after load_urdf). Use to attach extra bodies in correct frame.")
+
+        .def("set_urdf_mesh_override", &SimEngine::set_urdf_mesh_override,
+             py::arg("link_name"), py::arg("msh_path"), py::arg("young_modulus") = 1e7,
+             "Override the mesh used for a URDF link.  Call BEFORE load_urdf(). "
+             "Required when URDF references a mesh file that doesn't exist on "
+             "disk.  Cleared after each load_urdf() call.")
+
         // FEM body vertex range
         .def("get_fem_body_vertex_range", [](const SimEngine& e, int fem_body_idx) {
             int start = 0, count = 0;
@@ -468,6 +533,10 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("set_prismatic_target",      &SimEngine::set_prismatic_target,
              py::arg("idx"), py::arg("distance_m"))
 
+        .def("set_fixed_joint_strength",  &SimEngine::set_fixed_joint_strength,
+             py::arg("idx"), py::arg("kappa"),
+             "Override per-fixed-joint stiffness (kappa). Default ~8e-3 is "
+             "too weak for hybrid gripper attachment; set 1e6 for tight tracking.")
         .def("set_revolute_strength",     &SimEngine::set_revolute_strength,
              py::arg("idx"), py::arg("strength"),
              "Set per-joint driving strength multiplier. Lower = joint yields "

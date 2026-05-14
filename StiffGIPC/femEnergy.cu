@@ -1729,11 +1729,32 @@ __global__ void _calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInvers
                                                 Eigen::Matrix3d* triplet_values,
                                                 int*             row_ids,
                                                 int*             col_ids,
-                                                double IPC_dt,int global_hessian_fem_offset)
+                                                double IPC_dt,int global_hessian_fem_offset,
+                                                const int* tet_to_abd_body /* nullable */)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= tetrahedraNum)
         return;
+
+    // [Phase 4 hybrid] If this tet is rigid-internal (all 4 verts pinned to
+    // the SAME ABD body), its strain energy is structurally redundant w.r.t.
+    // the ABD body's own E_orth orthogonality penalty (per Phase 0/3 design).
+    // Skip the SVD + makePD work; write 10 zero-valued triplets at (v0, v0)
+    // to keep the global triplet array layout stable for the downstream
+    // chain-rule kernel and CSR converter (each FEM tet must occupy 10 slots).
+    if(tet_to_abd_body != nullptr && tet_to_abd_body[idx] >= 0)
+    {
+        int v0      = tetrahedras[idx].x;
+        int row     = v0 + global_hessian_fem_offset;
+        int gtrioff = global_offset + idx * 10;
+        for(int kk = 0; kk < 10; ++kk)
+        {
+            row_ids[gtrioff + kk] = row;
+            col_ids[gtrioff + kk] = row;
+            triplet_values[gtrioff + kk].setZero();
+        }
+        return;
+    }
 
     Eigen::Matrix<double, 9, 12> PFPX = __computePFPX3D_Eigen_double(DmInverses[idx]);
 
