@@ -1,5 +1,6 @@
 .vs*
 build*
+!tools/build_*.py
 Output/*
 
 # Internal-only handover and planning docs — never push to remote.
