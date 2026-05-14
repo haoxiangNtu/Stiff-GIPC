@@ -4,7 +4,7 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
-## [0.5.0] — 2026-05-15 (UPCOMING)
+## [0.5.0] — 2026-05-15
 
 ### Added
 
