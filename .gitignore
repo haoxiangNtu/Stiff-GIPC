@@ -33,9 +33,23 @@ stiff_physics/_native/
 stiff_physics/data/
 
 # Mesh-process scratch files (debug dumps from solvers)
-_skipped.face
-_skipped.node
+*_skipped.face
+*_skipped.node
+__tracked_surface.stl
 timeCost.txt
+
+# Metis partitioner runtime cache (regenerated per scene per process count)
+Assets/sorted_mesh/*.idx
+Assets/sorted_mesh/*.msh
+Assets/sorted_mesh/*.part
+
+# Claude Code session state (per-worktree)
+.claude/
+
+# Per-user symlink directory (some demos hard-code `assets/...` paths;
+# point this at your local stiff-physics asset root manually if you need
+# them). Real engine assets live in capital-A `Assets/`.
+/assets/
 
 # Demo media — too large for git
 *.mp4

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Launcher: runs a Python script with this worktree's source/.so injected
+# ahead of daily-dev's editable install.  Bypasses the scikit-build
+# redirecting finder via the PYTHONSTARTUP hook.
+# Use as: ./run examples/foo.py [args...]
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PYTHONPATH="$HERE:$HERE/build_312:$PYTHONPATH" \
+PYTHONSTARTUP="" \
+  exec /home/ps/Downloads/Stiff-GIPC/.venv/bin/python -c "
+import sys, os, runpy
+sys.path[:] = [p for p in sys.path if p != '/home/ps/Downloads/Stiff-GIPC']
+sys.meta_path[:] = [f for f in sys.meta_path if type(f).__name__ != 'ScikitBuildRedirectingFinder']
+sys.path.insert(0, '$HERE')
+sys.path.insert(0, '$HERE/build_312')
+if len(sys.argv) > 1 and sys.argv[1] == '-c':
+    exec(sys.argv[2])
+elif len(sys.argv) > 1:
+    sys.argv[:] = sys.argv[1:]
+    runpy.run_path(sys.argv[0], run_name='__main__')
+else:
+    import code
+    code.interact()
+" "$@"
