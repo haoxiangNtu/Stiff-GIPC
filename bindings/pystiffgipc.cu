@@ -416,6 +416,25 @@ PYBIND11_MODULE(pystiffgipc, m)
                                       static_cast<const double*>(vbuf.ptr), count);
         }, py::arg("body_offsets"), py::arg("velocities"))
 
+        // Per-step soft-target driver for ABD bodies loaded with
+        // boundary_type=Animated (=3).  Updates body_motor_params on the GPU
+        // so the engine's Animated penalty pulls q.t toward (x,y,z) and
+        // q.A toward identity.  The body's 12 DOFs stay in PCG → joint
+        // attachments and M3.5 chain-rule pins propagate normally.
+        .def("set_body_animated_target", &SimEngine::set_body_animated_target,
+             py::arg("body_id"),
+             py::arg("target_x"), py::arg("target_y"), py::arg("target_z"),
+             py::arg("strength") = 0.0,
+             "Set per-step Animated target for an ABD body (target world position, "
+             "soft penalty stiffness). Strength<=0 → engine default 1e6. "
+             "Body must have been loaded with boundary_type='Animated' or =3.")
+
+        .def("set_body_apply_gravity", &SimEngine::set_body_apply_gravity,
+             py::arg("body_id"), py::arg("enabled"),
+             "Toggle gravity for all verts of body_id (global body id).  Use "
+             "for ABD bodies anchored to Fixed parent via joint to avoid drift "
+             "from joint penalty wrestling gravity.  Call AFTER finalize().")
+
         // FEM body vertex range
         .def("get_fem_body_vertex_range", [](const SimEngine& e, int fem_body_idx) {
             int start = 0, count = 0;
@@ -468,6 +487,10 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("set_prismatic_target",      &SimEngine::set_prismatic_target,
              py::arg("idx"), py::arg("distance_m"))
 
+        .def("set_fixed_joint_strength",  &SimEngine::set_fixed_joint_strength,
+             py::arg("idx"), py::arg("kappa"),
+             "Override per-fixed-joint stiffness (kappa). Default ~8e-3 is "
+             "too weak for hybrid gripper attachment; set 1e6 for tight tracking.")
         .def("set_revolute_strength",     &SimEngine::set_revolute_strength,
              py::arg("idx"), py::arg("strength"),
              "Set per-joint driving strength multiplier. Lower = joint yields "

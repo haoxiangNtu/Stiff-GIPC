@@ -289,7 +289,8 @@ class Engine:
                                initial_joint_angles or {})
 
     _BODY_TYPE_MAP = {"ABD": 0, "abd": 0, "FEM": 1, "fem": 1}
-    _BOUNDARY_MAP  = {"Free": 0, "free": 0, "Fixed": 1, "fixed": 1}
+    _BOUNDARY_MAP  = {"Free": 0, "free": 0, "Fixed": 1, "fixed": 1,
+                      "Motor": 2, "motor": 2, "Animated": 3, "animated": 3}
 
     def load_mesh(
         self,

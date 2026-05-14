@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <map>
 #include <cuda_runtime.h>
 
 #include "GIPC.cuh"
@@ -49,6 +50,10 @@ struct SimEngine::Impl
 
     // Shared mesh assets for instanced loading
     std::vector<MeshAsset> mesh_assets;
+
+    // Cache of original abd-gravity vectors when set_body_apply_gravity(off) is
+    // called.  Allows restoring without recomputing tet integrals.
+    std::map<int, Eigen::Matrix<double, 12, 1>> disabled_abd_gravity_cache;
 
     void apply_config_to_ipc();
     void do_initFEM();
@@ -1772,6 +1777,139 @@ void SimEngine::set_revolute_strength(int idx, double strength)
 void SimEngine::set_prismatic_strength(int idx, double strength)
 {
     m_impl->tetMesh.prismatic_drive_controls.at(idx).strength_ratio = strength;
+}
+
+void SimEngine::set_fixed_joint_strength(int idx, double kappa)
+{
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_system) {
+        std::cerr << "[set_fixed_joint_strength] sim not finalized" << std::endl;
+        return;
+    }
+    auto& abd_sys = *impl.ipc.m_abd_system;
+    if(idx < 0 || idx >= abd_sys.m_num_joints) {
+        std::cerr << "[set_fixed_joint_strength] idx " << idx
+                  << " out of range [0," << abd_sys.m_num_joints << ")" << std::endl;
+        return;
+    }
+
+    // Read current GPU data for this joint, modify kappa, write back.
+    JointConstraintGPUData host_jd;
+    CUDA_SAFE_CALL(cudaMemcpy(&host_jd,
+                              abd_sys.m_joint_data.data() + idx,
+                              sizeof(JointConstraintGPUData),
+                              cudaMemcpyDeviceToHost));
+    host_jd.kappa = static_cast<Float>(kappa);
+    CUDA_SAFE_CALL(cudaMemcpy(abd_sys.m_joint_data.data() + idx,
+                              &host_jd,
+                              sizeof(JointConstraintGPUData),
+                              cudaMemcpyHostToDevice));
+    std::cout << "[set_fixed_joint_strength] joint #" << idx
+              << " kappa = " << kappa << std::endl;
+}
+
+void SimEngine::set_body_animated_target(int body_id,
+                                         double target_x, double target_y, double target_z,
+                                         double strength)
+{
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_sim_data) return;
+
+    int num_bodies = impl.ipc.abd_fem_count_info.abd_body_num;
+    if(body_id < 0 || body_id >= num_bodies) return;
+
+    if(impl.d_tetMesh.body_motor_params == nullptr) {
+        // Buffer wasn't allocated (no motor_infos at finalize time).  Allocate
+        // it here so per-step Animated drive can be set on bodies that
+        // weren't pre-registered with body_motor_infos.
+        size_t bytes = (size_t)num_bodies * 5 * sizeof(double);
+        CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_tetMesh.body_motor_params, bytes));
+        CUDA_SAFE_CALL(cudaMemset(impl.d_tetMesh.body_motor_params, 0, bytes));
+    }
+
+    double host_params[5] = {target_x, target_y, target_z, strength, 0.0};
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.body_motor_params + body_id * 5,
+                              host_params,
+                              5 * sizeof(double),
+                              cudaMemcpyHostToDevice));
+}
+
+void SimEngine::set_body_apply_gravity(int body_id, bool enabled)
+{
+    auto& impl = *m_impl;
+    int n_abd = static_cast<int>(impl.tetMesh.abd_fem_count_info.abd_body_num);
+
+    if(body_id < n_abd)
+    {
+        // ABD body: gravity is precomputed at finalize as a 12-DOF
+        // body_id_to_abd_gravity[i] vector. apply_gravity[] (per-vertex) is
+        // ignored for ABD verts. To toggle, zero/restore the cached vector.
+        if(!impl.ipc.m_abd_sim_data) {
+            std::cerr << "[set_body_apply_gravity] sim not finalized" << std::endl;
+            return;
+        }
+
+        using Vec12 = Eigen::Matrix<double, 12, 1>;
+        auto& g_buf = impl.ipc.m_abd_sim_data->device.body_id_to_abd_gravity;
+        if(static_cast<int>(g_buf.size()) <= body_id) {
+            std::cerr << "[set_body_apply_gravity] ABD body_id " << body_id
+                      << " out of range (size=" << g_buf.size() << ")" << std::endl;
+            return;
+        }
+
+        if(!enabled) {
+            // Cache current gravity (so we can restore it).
+            Vec12 host_g = Vec12::Zero();
+            CUDA_SAFE_CALL(cudaMemcpy(host_g.data(),
+                                      g_buf.data() + body_id,
+                                      sizeof(Vec12), cudaMemcpyDeviceToHost));
+            impl.disabled_abd_gravity_cache[body_id] = host_g;
+
+            Vec12 zero = Vec12::Zero();
+            CUDA_SAFE_CALL(cudaMemcpy(g_buf.data() + body_id,
+                                      zero.data(),
+                                      sizeof(Vec12), cudaMemcpyHostToDevice));
+        } else {
+            // Restore from cache if we previously disabled it
+            auto it = impl.disabled_abd_gravity_cache.find(body_id);
+            if(it != impl.disabled_abd_gravity_cache.end()) {
+                CUDA_SAFE_CALL(cudaMemcpy(g_buf.data() + body_id,
+                                          it->second.data(),
+                                          sizeof(Vec12), cudaMemcpyHostToDevice));
+                impl.disabled_abd_gravity_cache.erase(it);
+            }
+        }
+        return;
+    }
+
+    // FEM body: per-vertex apply_gravity[] flag
+    const auto& pt2body = impl.tetMesh.point_id_to_body_id;
+    if(pt2body.empty() || impl.d_tetMesh.apply_gravity == nullptr) return;
+
+    int v_start = -1, v_end = -1;
+    int N = static_cast<int>(pt2body.size());
+    for(int i = 0; i < N; i++)
+    {
+        if(pt2body[i] == body_id)
+        {
+            if(v_start < 0) v_start = i;
+            v_end = i + 1;
+        }
+    }
+    if(v_start < 0) {
+        std::cerr << "[set_body_apply_gravity] body_id " << body_id
+                  << " has no vertices" << std::endl;
+        return;
+    }
+
+    int n = v_end - v_start;
+    std::vector<int> host_flags(n, enabled ? 1 : 0);
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_tetMesh.apply_gravity + v_start,
+                              host_flags.data(),
+                              n * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    for(int i = v_start; i < v_end; i++)
+        impl.tetMesh.apply_gravity[i] = enabled ? 1 : 0;
 }
 
 void SimEngine::set_max_revolute_step_per_frame(double rad)

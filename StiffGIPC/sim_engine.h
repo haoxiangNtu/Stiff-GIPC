@@ -297,6 +297,30 @@ class SimEngine
     void get_abd_body_velocities(const int* body_offsets, double* out_mat4x4, int count) const;
     void set_abd_body_velocities(const int* body_offsets, const double* mat4x4, int count);
 
+    /// Set per-frame Animated-target for an ABD body that was loaded with
+    /// boundary_type=Animated (=3).  Each step the engine adds a soft
+    /// quadratic penalty
+    ///     E += 0.5 * strength * (||q.t - target||^2 + ||A(q) - I||_F^2)
+    /// to the body's energy.  This keeps the body's translation tracking
+    /// `target` and its rotation near identity, without removing the body's
+    /// 12 DOFs from the PCG system — so M3.5 chain-rule pins to this body
+    /// still propagate correctly, and standard joint constraints can attach
+    /// to the body's q.  Coordinates are in world space (meters).
+    /// Strength <= 0 falls back to the default 1e6.
+    void set_body_animated_target(int body_id,
+                                  double target_x, double target_y, double target_z,
+                                  double strength = 0.0);
+
+    /// Toggle gravity for all vertices of a body, applied at next step.  Use
+    /// this for ABD bodies that are kinematically driven by joints to a
+    /// Fixed parent — e.g. a gripper hanging off an arm link via revolute
+    /// joint.  Without disabling, joint penalty must continuously cancel
+    /// gravity each step, leaving residual that accumulates as drift +
+    /// destabilizes Newton when combined with chain-rule pins.  body_id is
+    /// the GLOBAL body id (ABD bodies first, then FEM).  Must call AFTER
+    /// finalize() (writes to GPU buffer directly).
+    void set_body_apply_gravity(int body_id, bool enabled);
+
     // ---- FEM vertex state ----
     void get_vertex_velocities(double* out_xyz, int count) const;
     void set_vertex_positions_gpu(const double* xyz, int count);
@@ -317,6 +341,17 @@ class SimEngine
     void set_revolute_target(int idx, double angle_rad);
     void set_revolute_initial_offset(int idx, double offset_rad);
     void set_prismatic_target(int idx, double distance_m);
+
+    /// Override per-fixed-joint stiffness (kappa).  By default kappa is set
+    /// at finalize as `joint_strength_ratio * (m_parent + m_child)` for ALL
+    /// joints (including URDF revolute constraint points + manually added
+    /// fixed joints).  When a hybrid gripper is welded to a URDF arm hand
+    /// via fixed_joint, the default kappa (~8e-3) is far too weak to hold
+    /// the gripper rigid against the arm — it lags 8mm+ per cm of hand
+    /// motion.  Use this to set the fixed_joint kappa directly (e.g. 1e6
+    /// matches Animated PD strength). idx = constraint index returned by
+    /// add_fixed_joint().  Call AFTER finalize().
+    void set_fixed_joint_strength(int idx, double kappa);
 
     /// Set per-joint driving strength multiplier.
     /// Effective stiffness = Config.revolute_driving_strength_ratio *
