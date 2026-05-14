@@ -321,6 +321,25 @@ class SimEngine
     /// finalize() (writes to GPU buffer directly).
     void set_body_apply_gravity(int body_id, bool enabled);
 
+    /// Returns the 4×4 world transform of a URDF link, computed by the
+    /// importer's forward kinematics from the link tree + joint angles.
+    /// Available immediately after load_urdf() (no need to finalize).
+    /// Useful for placing additional bodies (e.g. hybrid gripper) attached
+    /// to a specific link with correct orientation in world space.
+    /// Returns identity if link_name not found.
+    Eigen::Matrix4d get_urdf_link_transform(const std::string& link_name) const;
+
+    /// Override the mesh used for a URDF link in the next load_urdf() call.
+    /// URDF importer normally reads the link's <collision> mesh filename
+    /// (.obj/.stl) — but for engine bodies we usually want a tetrahedralized
+    /// .msh.  Call this BEFORE load_urdf() for each link you want overridden.
+    /// All overrides are consumed (cleared) by the next load_urdf().
+    /// Required when the URDF references a mesh file that doesn't exist on
+    /// disk — without override, URDF importer skips that link silently.
+    void set_urdf_mesh_override(const std::string& link_name,
+                                const std::string& msh_path,
+                                double young_modulus = 1e7);
+
     // ---- FEM vertex state ----
     void get_vertex_velocities(double* out_xyz, int count) const;
     void set_vertex_positions_gpu(const double* xyz, int count);

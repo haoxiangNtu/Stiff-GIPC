@@ -435,6 +435,17 @@ PYBIND11_MODULE(pystiffgipc, m)
              "for ABD bodies anchored to Fixed parent via joint to avoid drift "
              "from joint penalty wrestling gravity.  Call AFTER finalize().")
 
+        .def("get_urdf_link_transform", &SimEngine::get_urdf_link_transform,
+             py::arg("link_name"),
+             "Returns 4x4 world transform of a URDF link (computed by importer's "
+             "FK after load_urdf). Use to attach extra bodies in correct frame.")
+
+        .def("set_urdf_mesh_override", &SimEngine::set_urdf_mesh_override,
+             py::arg("link_name"), py::arg("msh_path"), py::arg("young_modulus") = 1e7,
+             "Override the mesh used for a URDF link.  Call BEFORE load_urdf(). "
+             "Required when URDF references a mesh file that doesn't exist on "
+             "disk.  Cleared after each load_urdf() call.")
+
         // FEM body vertex range
         .def("get_fem_body_vertex_range", [](const SimEngine& e, int fem_body_idx) {
             int start = 0, count = 0;

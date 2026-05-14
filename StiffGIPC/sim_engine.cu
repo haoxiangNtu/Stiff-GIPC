@@ -55,6 +55,14 @@ struct SimEngine::Impl
     // called.  Allows restoring without recomputing tet integrals.
     std::map<int, Eigen::Matrix<double, 12, 1>> disabled_abd_gravity_cache;
 
+    // Pending mesh overrides for the next load_urdf() call.
+    // Map link_name -> (msh_path, young_modulus). Cleared after load_urdf.
+    std::map<std::string, std::pair<std::string, double>> pending_urdf_mesh_overrides;
+
+    // Cache of URDF link world transforms after load_urdf (link_name -> 4x4).
+    // Used by get_urdf_link_transform() for hybrid attachment placement.
+    std::map<std::string, Eigen::Matrix4d> urdf_link_transforms;
+
     void apply_config_to_ipc();
     void do_initFEM();
     void do_setMAS_partition();
@@ -155,12 +163,27 @@ void SimEngine::load_urdf(const std::string&     urdf_path,
     if(!initial_joint_angles.empty())
         urdf_importer.set_initial_joint_angles(initial_joint_angles);
 
+    // Apply any pending mesh overrides (set via set_urdf_mesh_override
+    // before this load_urdf call).
+    for(const auto& [link_name, info] : m_impl->pending_urdf_mesh_overrides)
+    {
+        UrdfLinkMeshOverride o;
+        o.msh_path      = info.first;
+        o.young_modulus = info.second;
+        urdf_importer.set_mesh_override(link_name, o);
+    }
+    m_impl->pending_urdf_mesh_overrides.clear();
+
     bool ok = urdf_importer.import_scene(m_impl->tetMesh, m_impl->cfg.preconditioner_type);
     if(!ok)
     {
         std::cerr << "[SimEngine] URDF import failed: " << urdf_path << std::endl;
         return;
     }
+
+    // Cache each link's world transform for later get_urdf_link_transform()
+    for(const auto& [name, info] : urdf_importer.link_infos())
+        m_impl->urdf_link_transforms[name] = info.global_transform;
 
     int new_abd = static_cast<int>(m_impl->tetMesh.abd_fem_count_info.abd_body_num);
     // Derive per-body vertex ranges from point_id_to_body_id (one body id per vertex,
@@ -1832,6 +1855,24 @@ void SimEngine::set_body_animated_target(int body_id,
                               host_params,
                               5 * sizeof(double),
                               cudaMemcpyHostToDevice));
+}
+
+void SimEngine::set_urdf_mesh_override(const std::string& link_name,
+                                       const std::string& msh_path,
+                                       double young_modulus)
+{
+    m_impl->pending_urdf_mesh_overrides[link_name] = {msh_path, young_modulus};
+}
+
+Eigen::Matrix4d SimEngine::get_urdf_link_transform(const std::string& link_name) const
+{
+    auto it = m_impl->urdf_link_transforms.find(link_name);
+    if(it == m_impl->urdf_link_transforms.end()) {
+        std::cerr << "[get_urdf_link_transform] link '" << link_name
+                  << "' not found (URDF not loaded or wrong name)" << std::endl;
+        return Eigen::Matrix4d::Identity();
+    }
+    return it->second;
 }
 
 void SimEngine::set_body_apply_gravity(int body_id, bool enabled)
