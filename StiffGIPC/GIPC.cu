@@ -9904,11 +9904,13 @@ void stepForward(double3* _vertexes,
 }
 
 // [M1 substitution method] Hard-constraint projection kernel.
-// world_pos = q.t + R(q) * local_pos
+// world_pos = q.t + A(q) * local_pos
+// Canonical q layout per abd_jacobi_matrix.inl operator*(ABDJacobi, Vector12):
 //   q.v[0..2]  : translation t
-//   q.v[3..5]  : axis_x  (R column 1)
-//   q.v[6..8]  : axis_y  (R column 2)
-//   q.v[9..11] : axis_z  (R column 3)
+//   q.v[3..5]  : A.row(0)
+//   q.v[6..8]  : A.row(1)
+//   q.v[9..11] : A.row(2)
+// So (A * lp).x = q[3]*lp.x + q[4]*lp.y + q[5]*lp.z, etc.
 // Called after ABD step_forward (each line-search alpha try). pinned FEM
 // vertices follow ABD's q exactly, so their motion is consistent with the
 // ABD body's affine transform, and IPC line search sees a smooth energy.
@@ -9925,9 +9927,15 @@ __global__ void _apply_fem_pins(double3* _vertexes,
     int bid   = _pin_abd_body_id[idx];
     const __GEIGEN__::Vector12& q = _abd_q[bid];
     double3 lp = _pin_abd_local_pos[idx];
-    _vertexes[fem_v].x = q.v[0] + q.v[3] * lp.x + q.v[6]  * lp.y + q.v[9]  * lp.z;
-    _vertexes[fem_v].y = q.v[1] + q.v[4] * lp.x + q.v[7]  * lp.y + q.v[10] * lp.z;
-    _vertexes[fem_v].z = q.v[2] + q.v[5] * lp.x + q.v[8]  * lp.y + q.v[11] * lp.z;
+    // Previous code used q[3]/q[6]/q[9] for the x-component, which is
+    // A.col(0)·lp = (A^T·lp)[0] — wrong for non-symmetric A.  Only
+    // worked when A ≈ scale·I (e.g. Animated mode where the ABD
+    // barely rotates).  Showed up under URDF arms with revolute
+    // joints (case_35+): pinned FEM verts visually drift off the
+    // rigid sub-mesh as the ABD body rotates.
+    _vertexes[fem_v].x = q.v[0] + q.v[3] * lp.x + q.v[4]  * lp.y + q.v[5]  * lp.z;
+    _vertexes[fem_v].y = q.v[1] + q.v[6] * lp.x + q.v[7]  * lp.y + q.v[8]  * lp.z;
+    _vertexes[fem_v].z = q.v[2] + q.v[9] * lp.x + q.v[10] * lp.y + q.v[11] * lp.z;
 }
 
 void apply_fem_pins(double3* _vertexes,
