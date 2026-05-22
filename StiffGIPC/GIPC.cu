@@ -26,6 +26,13 @@
 
 #include <muda/cub/device/device_radix_sort.h>
 using namespace Eigen;
+
+// Global log verbosity for the per-frame + one-time solver prints.  0 = silent
+// (engine plays nice in co-simulation / piped tooling); >=1 = default verbose.
+// Defined here (top of TU) so every use below — incl. the buffer-alloc print
+// at ~line 8843, which precedes solve_subIP — can see it.  Set from Python via
+// SimEngine::set_log_level (extern'd in sim_engine.cu).
+int g_gipc_log_level = 1;
 #define RANK 2
 #define NEWF
 
@@ -8840,7 +8847,7 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     // (the actual ext_count is usually < 16× but allocation math conservative).
     long long unsigned total_max_global_triplet_num =
         total_internal_triplet_num * 32 + total_max_collision_triplet_num;
-    printf("[buffer] total_internal_triplet_num=%llu, total_max=%llu (3x3 doubles ~ %llu MB)\n",
+    if(::g_gipc_log_level >= 1) printf("[buffer] total_internal_triplet_num=%llu, total_max=%llu (3x3 doubles ~ %llu MB)\n",
            total_internal_triplet_num, total_max_global_triplet_num,
            total_max_global_triplet_num * 80 / 1024 / 1024);
 
@@ -10863,7 +10870,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                       cudaMemcpyDeviceToHost));
             if(h_ext_count > ext_capacity)
             {
-                printf("[M3.5] WARN ext_count=%d > capacity=%d (truncated; expect "
+                if(g_gipc_log_level >= 1) printf("[M3.5] WARN ext_count=%d > capacity=%d (truncated; expect "
                        "Newton instability)\n", h_ext_count, ext_capacity);
                 h_ext_count = ext_capacity;
             }
@@ -11454,7 +11461,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         testingE = computeEnergy(TetMesh);
     }
     if(numOfLineSearch > report_line_search_threshold)
-        printf("!!!!!!!!!!!!!!!!!!!linesearch number is a bit high, lineSearchCount=%d !!!!!!!!!!!!!!!!!!!!!!\n",
+        if(g_gipc_log_level >= 1) printf("!!!!!!!!!!!!!!!!!!!linesearch number is a bit high, lineSearchCount=%d !!!!!!!!!!!!!!!!!!!!!!\n",
                numOfLineSearch);
 
 
@@ -11535,6 +11542,7 @@ double timemakePd          = 0;
 #include <vector>
 #include <fstream>
 std::vector<int> iterV;
+
 int              GIPC::solve_subIP(device_TetraData& TetMesh,
                       double&           time0,
                       double&           time1,
@@ -11543,8 +11551,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                       double&           time4)
 {
     auto& stats_at_current_frame = gipc::Statistics::instance().at_current_frame();
-    std::cout << "solve_subIP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
-              << std::endl;
+    if(g_gipc_log_level >= 1)
+        std::cout << "solve_subIP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+                  << std::endl;
 
     stats_at_current_frame["newton"] = gipc::Json::array();
 
@@ -11555,7 +11564,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     double totalTimeStep = 0;
     for(; k < iterCap; ++k)
     {
-        if(k > 0 && k % 10 == 0)
+        if(g_gipc_log_level >= 1 && k > 0 && k % 10 == 0)
             printf("  Newton iter %d ...\n", k);
         stats_at_current_frame["newton"].push_back(gipc::Json::object());
 
@@ -11697,7 +11706,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     //    outiter << iterV[ii] << std::endl;
     //}
     //outiter.close();
-    printf("\n\n      Kappa: %f                               iteration k:  %d\n", Kappa, k);
+    if(g_gipc_log_level >= 1)
+        printf("\n\n      Kappa: %f                               iteration k:  %d\n", Kappa, k);
     return k;
 }
 
@@ -11928,7 +11938,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     cudaEventElapsedTime(&tttime, start, end0);
     totalTime += tttime;
     total_Frames++;
-    printf("average time cost:     %f,    frame id:   %d\n", totalTime / totalNT, total_Frames);
+    if(g_gipc_log_level >= 1)
+        printf("average time cost:     %f,    frame id:   %d\n", totalTime / totalNT, total_Frames);
 
 
     ttime0 += time0;
@@ -11961,7 +11972,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
     stats.at_current_frame()["timer"] =
         gipc::GlobalTimer::current()->report_merged_as_json();
-    gipc::GlobalTimer::current()->print_merged_timings();
+    if(g_gipc_log_level >= 1)
+        gipc::GlobalTimer::current()->print_merged_timings();
     gipc::GlobalTimer::current()->clear();
     stats.write_to_file(std::string{gipc::output_dir()} + "/stats.json");
 

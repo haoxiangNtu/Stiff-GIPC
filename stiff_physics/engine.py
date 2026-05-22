@@ -630,6 +630,27 @@ class Engine:
         """Advance simulation by one timestep (dt)."""
         self._engine.step()
 
+    def set_log_level(self, level: int) -> None:
+        """Control per-frame solver log verbosity.
+
+        0 = silent (suppress solver banner, Newton-iteration, Kappa,
+        ``average time cost``, timer breakdown and one-time setup prints);
+        >=1 = verbose (default).  Use 0 for co-simulation / piped tooling that
+        needs a clean stdout.
+        """
+        self._engine.set_log_level(int(level))
+
+    def reset(self) -> None:
+        """Tear down the entire world and return to a fresh empty state.
+
+        Frees all loaded bodies (FEM/ABD), constraints and GPU buffers while
+        keeping the current :class:`Config`.  After ``reset()`` re-run the usual
+        ``load_mesh()`` / ``load_urdf()`` / ``add_*`` + :meth:`finalize` sequence
+        in the same process — no need to recreate the Engine.
+        """
+        self._engine.reset()
+        self._finalized = False
+
     # ---- State queries ----
 
     def get_vertices(self) -> np.ndarray:

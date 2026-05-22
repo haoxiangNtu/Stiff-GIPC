@@ -114,6 +114,14 @@ class SimEngine
     void set_config(const SimEngineConfig& cfg);
     const SimEngineConfig& config() const;
 
+    // Per-frame solver log verbosity: 0 = silent (engine plays nice in
+    // co-simulation / piped tooling), >=1 = verbose (default).
+    void set_log_level(int level);
+
+    // Tear down the whole world (bodies, FEM/ABD, constraints, GPU buffers) and
+    // return to a fresh empty state, preserving Config.  Re-run load_*()+finalize().
+    void reset();
+
     void init_cuda();
 
     void load_urdf(const std::string&     urdf_path,

@@ -352,6 +352,12 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("finalize", &SimEngine::finalize)
 
+        .def("set_log_level", &SimEngine::set_log_level, py::arg("level"),
+             "Per-frame solver log verbosity: 0 = silent, >=1 = verbose (default).")
+        .def("reset", &SimEngine::reset,
+             "Tear down the whole world (bodies, constraints, GPU buffers), keep "
+             "Config. Re-run load_*()+finalize() after.")
+
         .def("step", &SimEngine::step,
              py::call_guard<py::gil_scoped_release>())
 
