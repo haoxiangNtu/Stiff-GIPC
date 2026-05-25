@@ -8726,6 +8726,12 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
 #endif
 
+    // ②a: free persistent close-constraint buffers.
+    CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
+    CUDA_SAFE_CALL(cudaFree(_closeConstraintVal));
+    CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
+    CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
+
     pcg_data.FREE_DEVICE_MEM();
 
     bvh_e.FREE_DEVICE_MEM();
@@ -8777,6 +8783,13 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, surf_vertexNum * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd, surf_vertexNum * sizeof(uint32_t)));
 #endif
+
+    // ②a: preallocate close-constraint buffers once at capacity (were
+    // tempMalloc/tempFree'd every IPC_Solver sub-iteration).
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintID, surf_vertexNum * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintVal, surf_vertexNum * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintID, MAX_COLLITION_PAIRS_NUM * sizeof(int4)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintVal, MAX_COLLITION_PAIRS_NUM * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -11547,18 +11560,12 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
 
 void GIPC::tempMalloc_closeConstraint()
 {
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintID, h_gpNum * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintVal, h_gpNum * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintID, h_cpNum[0] * sizeof(int4)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintVal, h_cpNum[0] * sizeof(double)));
+    // ②a: no-op — buffers preallocated at capacity in MALLOC_DEVICE_MEM.
 }
 
 void GIPC::tempFree_closeConstraint()
 {
-    CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
-    CUDA_SAFE_CALL(cudaFree(_closeConstraintVal));
-    CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
-    CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
+    // ②a: no-op — buffers persist; freed in FREE_DEVICE_MEM.
 }
 double maxCOllisionPairNum = 0;
 double totalCollisionPairs = 0;
