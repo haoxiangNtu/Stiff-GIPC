@@ -10384,25 +10384,17 @@ void GIPC::partitionContactHessian()
     //gipc_global_triplet.h_fem_fem_contact_start_id =
     //    gipc_global_triplet.d_fem_fem_contact_start_id;
 
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_abd_abd_contact_start_id),
+    // ②-D2H: single batched copy of the 4 contiguous start-ids (block[0..3])
+    // replaces 4 separate blocking D2H (each of which drains the GPU).
+    int h_csb[4];
+    CUDA_SAFE_CALL(cudaMemcpy(h_csb,
                               gipc_global_triplet.d_abd_abd_contact_start_id,
-                              sizeof(int),
+                              4 * sizeof(int),
                               cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_abd_fem_contact_start_id),
-                              gipc_global_triplet.d_abd_fem_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_fem_abd_contact_start_id),
-                              gipc_global_triplet.d_fem_abd_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_fem_fem_contact_start_id),
-                              gipc_global_triplet.d_fem_fem_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
+    gipc_global_triplet.h_abd_abd_contact_start_id = h_csb[0];
+    gipc_global_triplet.h_abd_fem_contact_start_id = h_csb[1];
+    gipc_global_triplet.h_fem_abd_contact_start_id = h_csb[2];
+    gipc_global_triplet.h_fem_fem_contact_start_id = h_csb[3];
 
 
     if(gipc_global_triplet.h_fem_fem_contact_start_id >= 0)
