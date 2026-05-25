@@ -4548,6 +4548,15 @@ void display(void)
     double frame_ms = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
     printf("step: %d | solver: %.1f ms | frame_total: %.1f ms (%.1f FPS)\n",
            step, solver_ms, frame_ms, 1000.0 / frame_ms);
+
+    if(!g_headless_benchmark)
+    {
+        char title[160];
+        snprintf(title, sizeof(title),
+                 "StiffGIPC wrecking-ball | step %d | solver %.1f ms | %.1f FPS",
+                 step, solver_ms, 1000.0 / frame_ms);
+        glutSetWindowTitle(title);
+    }
 }
 
 void init(void)
@@ -4779,11 +4788,26 @@ void SpecialKey(GLint key, GLint x, GLint y)
 
 int main(int argc, char** argv)
 {
+    bool verify = false;  // --verify: print per-step vertex checksum for correctness diff
     for(int i = 1; i < argc; i++)
     {
         if(strcmp(argv[i], "--scene") == 0 && i + 1 < argc)
         {
             g_scene_no = atoi(argv[++i]);
+        }
+        else if(strcmp(argv[i], "--headless") == 0)
+        {
+            // Benchmark harness flag: run any scene headless and time it.
+            // Does not touch collision/solver settings, so per-step solver
+            // time reflects the scene's own configuration.
+            g_headless_benchmark = true;
+            g_skip_rendering     = true;
+            if(i + 1 < argc && argv[i + 1][0] != '-')
+                g_headless_max_steps = atoi(argv[++i]);
+        }
+        else if(strcmp(argv[i], "--verify") == 0)
+        {
+            verify = true;
         }
         else if(argv[i][0] != '-')
         {
@@ -4815,6 +4839,23 @@ int main(int argc, char** argv)
         for(int s = 0; s < max_steps; s++)
         {
             display();
+            if(verify)
+            {
+                CUDA_SAFE_CALL(cudaMemcpy(tetMesh.vertexes.data(),
+                                          ipc._vertexes,
+                                          ipc.vertexNum * sizeof(double3),
+                                          cudaMemcpyDeviceToHost));
+                long double s1 = 0.0L, s2 = 0.0L;
+                for(int v = 0; v < ipc.vertexNum; v++)
+                {
+                    const double3& q = tetMesh.vertexes[v];
+                    s1 += (long double)q.x + q.y + q.z;
+                    s2 += (long double)q.x * q.x + (long double)q.y * q.y
+                          + (long double)q.z * q.z;
+                }
+                printf("VERIFY step %d  sum=%.12Le  sumsq=%.12Le\n",
+                       s, s1, s2);
+            }
         }
 
         auto total_end = std::chrono::high_resolution_clock::now();

@@ -8715,6 +8715,17 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_edges));
     CUDA_SAFE_CALL(cudaFree(_surfVerts));
 
+#ifdef USE_FRICTION
+    // ②a: free persistent friction buffers (preallocated in MALLOC_DEVICE_MEM).
+    CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
+    CUDA_SAFE_CALL(cudaFree(distCoord));
+    CUDA_SAFE_CALL(cudaFree(tanBasis));
+    CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
+    CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
+    CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
+    CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
+#endif
+
     pcg_data.FREE_DEVICE_MEM();
 
     bvh_e.FREE_DEVICE_MEM();
@@ -8752,6 +8763,20 @@ void GIPC::MALLOC_DEVICE_MEM()
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_cpNum, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_gpNum, sizeof(uint32_t)));
+
+#ifdef USE_FRICTION
+    // ②a: preallocate friction lastH buffers ONCE at capacity (kernels only
+    // touch [0, h_cpNum)/[0, h_gpNum); cp count <= MAX_COLLITION_PAIRS_NUM,
+    // ground count <= surf_vertexNum). Removes ~14 per-step cudaMalloc/cudaFree
+    // (each implicitly device-synchronizes) from IPC_Solver.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, MAX_COLLITION_PAIRS_NUM * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, MAX_COLLITION_PAIRS_NUM * sizeof(double2)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&tanBasis, MAX_COLLITION_PAIRS_NUM * sizeof(__GEIGEN__::Matrix3x2d)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, MAX_COLLITION_PAIRS_NUM * sizeof(int4)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex_last, MAX_COLLITION_PAIRS_NUM * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, surf_vertexNum * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd, surf_vertexNum * sizeof(uint32_t)));
+#endif
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -11845,14 +11870,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     initKappa(TetMesh);
     //Kappa = 1e4;
 #ifdef USE_FRICTION
-    CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, h_cpNum[0] * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, h_cpNum[0] * sizeof(double2)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&tanBasis, h_cpNum[0] * sizeof(__GEIGEN__::Matrix3x2d)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, h_cpNum[0] * sizeof(int4)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex_last, h_cpNum[0] * sizeof(int)));
-
-    CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, h_gpNum * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd, h_gpNum * sizeof(uint32_t)));
+    // ②a: friction lastH buffers preallocated at capacity in MALLOC_DEVICE_MEM;
+    // no per-step cudaMalloc/cudaFree (those implicitly sync the whole device).
     buildFrictionSets();
 #endif
     animation_fullRate = animation_subRate;
@@ -11896,37 +11915,14 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
         //computeXTilta(TetMesh, 1);
 #ifdef USE_FRICTION
-        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
-        CUDA_SAFE_CALL(cudaFree(distCoord));
-        CUDA_SAFE_CALL(cudaFree(tanBasis));
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
-        CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
-
-        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
-
-        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, h_cpNum[0] * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, h_cpNum[0] * sizeof(double2)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&tanBasis,
-                                  h_cpNum[0] * sizeof(__GEIGEN__::Matrix3x2d)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, h_cpNum[0] * sizeof(int4)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex_last, h_cpNum[0] * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, h_gpNum * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd,
-                                  h_gpNum * sizeof(uint32_t)));
+        // ②a: buffers persistent at capacity; just rebuild the friction sets
+        // for the next sub-iteration (no free/realloc).
         buildFrictionSets();
 #endif
     }
 
 #ifdef USE_FRICTION
-    CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
-    CUDA_SAFE_CALL(cudaFree(distCoord));
-    CUDA_SAFE_CALL(cudaFree(tanBasis));
-    CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
-    CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
-
-    CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
-    CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
+    // ②a: friction buffers are persistent (freed in FREE_DEVICE_MEM), no per-step free.
 #endif
 
     updateVelocities(TetMesh);
