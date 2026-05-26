@@ -114,6 +114,18 @@ class GIPC
     uint32_t* _collisonPairs_lastH_gd = nullptr;
     uint32_t  h_gpNum_last;
 
+    // ②-D2H: persistent 9-slot device buffer for batched energy reductions.
+    // computeEnergy() previously did 9 blocking cudaMemcpy(D2H) — one per
+    // Energy_Add_Reduction_Algorithm call. Now each reduction writes its
+    // final scalar into m_energy_slots[i] via D2D (queued, async), then
+    // ONE blocking D2H grabs all 9 doubles at the end.
+    static constexpr int kEnergySlotCount = 9;
+    double* m_energy_slots = nullptr;
+    // ②-D2H: 2-slot device buffer for batching ground+self largestFeasibleStepSize
+    // reductions (called back-to-back at the top of each line search). One D2H
+    // of 2 doubles instead of 2 separate blocking D2Hs.
+    double* m_alpha_slots = nullptr;
+
     uint32_t vertexNum      = 0;
     uint32_t surf_vertexNum = 0;
     uint32_t edge_Num       = 0;
@@ -233,6 +245,15 @@ class GIPC
     double computeEnergy(device_TetraData& TetMesh);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
+    // ②-D2H batched variant: writes reduced scalar to device slot via D2D
+    // (queued, async). Caller drives a single D2H after all slots are filled.
+    void   Energy_Add_Reduction_Algorithm_DeviceOut(int type,
+                                                    device_TetraData& TetMesh,
+                                                    double* out_slot);
+    // ②-D2H batched variants — write minValue (NOT 1.0/minValue) to slot.
+    // Caller does the 1.0/x and the m_skip_all_collision / numbers<1 guards.
+    void   ground_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, double* out_slot);
+    void   self_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, int numbers, double* out_slot);
 
     double ground_largestFeasibleStepSize(double slackness, double* mqueue);
 

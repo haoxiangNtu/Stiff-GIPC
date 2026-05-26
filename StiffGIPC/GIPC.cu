@@ -8732,6 +8732,10 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
     CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
 
+    // ②-D2H: free energy slots
+    if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
+    if(m_alpha_slots)  { CUDA_SAFE_CALL(cudaFree(m_alpha_slots));  m_alpha_slots  = nullptr; }
+
     pcg_data.FREE_DEVICE_MEM();
 
     bvh_e.FREE_DEVICE_MEM();
@@ -8790,6 +8794,11 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintVal, surf_vertexNum * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintID, MAX_COLLITION_PAIRS_NUM * sizeof(int4)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintVal, MAX_COLLITION_PAIRS_NUM * sizeof(double)));
+
+    // ②-D2H: 9-slot device buffer for batched energy reductions in computeEnergy.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
+    // ②-D2H: 2-slot buffer for ground+self largestFeasibleStepSize batching.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_alpha_slots, 2 * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -9315,6 +9324,55 @@ double GIPC::ground_largestFeasibleStepSize(double slackness, double* mqueue)
     //CUDA_SAFE_CALL(cudaFree(_minSteps));
     return 1.0 / minValue;
 }
+
+// ②-D2H batched variants for the two CCD step-size reductions that fire
+// back-to-back at the top of each line search. Each writes minValue to
+// out_slot via D2D (no blocking sync). Caller does host-side 1.0/x and the
+// m_skip_all_collision / numbers<1 guards (we don't queue any kernels when
+// the early-return condition holds).
+
+void GIPC::ground_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, double* out_slot)
+{
+    int numbers = surf_vertexNum;
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_min_groundTimeStep_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir, mqueue, slackness, numbers,
+        _point_body_id, _ground_skip_body, _ground_body_count);
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, int numbers, double* out_slot)
+{
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_min_selfTimeStep_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes, _ccd_collisonPairs, _moveDir, mqueue, slackness, numbers);
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
 
 double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueue, uint4* tets)
 {
@@ -10384,25 +10442,17 @@ void GIPC::partitionContactHessian()
     //gipc_global_triplet.h_fem_fem_contact_start_id =
     //    gipc_global_triplet.d_fem_fem_contact_start_id;
 
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_abd_abd_contact_start_id),
+    // ②-D2H: single batched copy of the 4 contiguous start-ids (block[0..3])
+    // replaces 4 separate blocking D2H (each of which drains the GPU).
+    int h_csb[4];
+    CUDA_SAFE_CALL(cudaMemcpy(h_csb,
                               gipc_global_triplet.d_abd_abd_contact_start_id,
-                              sizeof(int),
+                              4 * sizeof(int),
                               cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_abd_fem_contact_start_id),
-                              gipc_global_triplet.d_abd_fem_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_fem_abd_contact_start_id),
-                              gipc_global_triplet.d_fem_abd_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_fem_fem_contact_start_id),
-                              gipc_global_triplet.d_fem_fem_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
+    gipc_global_triplet.h_abd_abd_contact_start_id = h_csb[0];
+    gipc_global_triplet.h_abd_fem_contact_start_id = h_csb[1];
+    gipc_global_triplet.h_fem_abd_contact_start_id = h_csb[2];
+    gipc_global_triplet.h_fem_fem_contact_start_id = h_csb[3];
 
 
     if(gipc_global_triplet.h_fem_fem_contact_start_id >= 0)
@@ -11247,19 +11297,169 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
 }
 
 
+// ②-D2H batched variant: instead of doing a blocking cudaMemcpy(D2H) at the
+// end, copies the final scalar to a caller-provided device slot via D2D
+// (queued, async). The caller can then do ONE D2H across many slots.
+void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
+                                                     device_TetraData& TetMesh,
+                                                     double*           out_slot)
+{
+    int tet_offset   = abd_fem_count_info.fem_tet_offset;
+    int tet_count    = abd_fem_count_info.fem_tet_num;
+    int point_offset = abd_fem_count_info.fem_point_offset;
+    int point_count  = abd_fem_count_info.fem_point_num;
+
+    int numbers = tet_count;
+    if(type == 0 || type == 3)      numbers = point_count;
+    else if(type == 2)              numbers = h_cpNum[0];
+    else if(type == 4)              numbers = h_gpNum;
+    else if(type == 5)              numbers = h_cpNum_last[0];
+    else if(type == 6)              numbers = h_gpNum_last;
+    else if(type == 7 || type == 1) numbers = tet_count;
+    else if(type == 8 || type == 11)numbers = triangleNum;
+    else if(type == 9)              numbers = softNum;
+    else if(type == 10)             numbers = tri_edge_num;
+
+    if(numbers == 0)
+    {
+        // Match original `return 0;` behavior — pre-zero the slot.
+        CUDA_SAFE_CALL(cudaMemsetAsync(out_slot, 0, sizeof(double)));
+        return;
+    }
+
+    double*            queue       = pcg_data.squeue;
+    const unsigned int threadNum   = 256;
+    int                blockNum    = (numbers + threadNum - 1) / threadNum;
+    unsigned int       sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    switch(type)
+    {
+        case 0:
+            _getKineticEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                TetMesh.vertexes + point_offset, TetMesh.xTilta + point_offset,
+                queue, TetMesh.masses + point_offset, numbers);
+            break;
+        case 1:
+            _getFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.tetrahedras + tet_offset,
+                TetMesh.DmInverses + tet_offset, TetMesh.volum + tet_offset,
+                numbers, TetMesh.lengthRate + tet_offset, TetMesh.volumeRate + tet_offset);
+            break;
+        case 2:
+            _getBarrierEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs, Kappa, dHat, numbers);
+            break;
+        case 3:
+            _getDeltaEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.fb + point_offset, _moveDir + point_offset, numbers);
+            break;
+        case 4:
+            _computeGroundEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, _groundOffset, _groundNormal,
+                _environment_collisionPair, dHat, Kappa, numbers);
+            break;
+        case 5:
+            _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
+                numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
+                fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt);
+            break;
+        case 6:
+            _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
+                _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
+                sqrt(fDhat) * IPC_dt);
+            break;
+        case 7:
+            _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.volum + tet_offset, numbers, lengthRate, volumeRate);
+            break;
+        case 8:
+            _get_triangleFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.triangles, TetMesh.triDmInverses,
+                TetMesh.area, numbers, stretchStiff, shearStiff, strainRate);
+            break;
+        case 9:
+            _computeSoftConstraintEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.targetVert, TetMesh.targetIndex,
+                softMotionRate, animation_fullRate, TetMesh.d_stitch_paired_vertex,
+                TetMesh.d_stitch_rest_offset, numbers);
+            break;
+        case 10:
+#ifdef USE_QUADRATIC_BENDING
+            _getQuadBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
+                TetMesh.tri_edge_adj_vertex, TetMesh.quad_bending_Q, numbers, bendStiff);
+#else
+            _getBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
+                TetMesh.tri_edge_adj_vertex, numbers, bendStiff);
+#endif
+            break;
+    }
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        __add_reduction<<<blockNum, threadNum, sharedMsize>>>(queue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+
+    // D2D copy queue[0] into the caller's slot — queued on PTDS, async.
+    // Next call's reduction kernel will not start until this D2D completes
+    // (stream ordering), so reusing `queue` for the next call is safe.
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, queue, sizeof(double),
+                                   cudaMemcpyDeviceToDevice));
+}
+
+
 double GIPC::computeEnergy(device_TetraData& TetMesh)
 {
+    // ②-D2H: batch the 9 Energy_Add_Reduction_Algorithm calls (types
+    // 0,1,2,4,5,6,8,9,10) into a single D2H. Each reduction writes its scalar
+    // to a device slot via D2D (queued, async); ONE blocking D2H grabs all 9
+    // at the end. Saves 8 blocking syncs per energy evaluation (called every
+    // line-search trial).
+    //
+    // ABD energies (m_abd_system->cal_abd_*) are NOT batched here — they have
+    // their own internal scratch + D2H. Future refactor target. We KEEP the
+    // ORIGINAL host-side summation ORDER below so vertex checksum stays
+    // bit-identical (FP add is non-associative).
+    //
+    // slot indices: 0=fem_kinetic 1=fem 2=tri_fem 3=bend 4=constraint
+    //               5=barrier   6=ground 7=fric  8=fric_ground
+
+    Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, m_energy_slots + 0);
+    Energy_Add_Reduction_Algorithm_DeviceOut(1,  TetMesh, m_energy_slots + 1);
+    Energy_Add_Reduction_Algorithm_DeviceOut(8,  TetMesh, m_energy_slots + 2);
+    Energy_Add_Reduction_Algorithm_DeviceOut(10, TetMesh, m_energy_slots + 3);
+    Energy_Add_Reduction_Algorithm_DeviceOut(9,  TetMesh, m_energy_slots + 4);
+    Energy_Add_Reduction_Algorithm_DeviceOut(2,  TetMesh, m_energy_slots + 5);
+    Energy_Add_Reduction_Algorithm_DeviceOut(4,  TetMesh, m_energy_slots + 6);
+#ifdef USE_FRICTION
+    Energy_Add_Reduction_Algorithm_DeviceOut(5,  TetMesh, m_energy_slots + 7);
+    Energy_Add_Reduction_Algorithm_DeviceOut(6,  TetMesh, m_energy_slots + 8);
+#endif
+
+    double h_slots[9] = {0,0,0,0,0,0,0,0,0};
+#ifdef USE_FRICTION
+    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 9 * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+#else
+    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 7 * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+#endif
+
     double Energy      = 0.0;
-    auto   fem_kinetic = Energy_Add_Reduction_Algorithm(0, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto   fem_kinetic = h_slots[0];
     Energy += fem_kinetic;
 
     auto abd_kinetic = m_abd_system->cal_abd_kinetic_energy(*m_abd_sim_data);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += abd_kinetic;
 
     auto abd_shape = m_abd_system->cal_abd_shape_energy(*m_abd_sim_data);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += abd_shape;
 
     auto abd_joint = m_abd_system->cal_abd_joint_energy(*m_abd_sim_data);
@@ -11274,46 +11474,28 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
     auto abd_prismatic_driving = m_abd_system->cal_abd_prismatic_driving_energy(*m_abd_sim_data);
     Energy += abd_prismatic_driving;
 
-    auto fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(1, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto fem = IPC_dt * IPC_dt * h_slots[1];
     Energy += fem;
 
-    auto tri_fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(8, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto tri_fem = IPC_dt * IPC_dt * h_slots[2];
     Energy += tri_fem;
 
-    auto bend = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(10, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto bend = IPC_dt * IPC_dt * h_slots[3];
     Energy += bend;
 
-    auto constraint = Energy_Add_Reduction_Algorithm(9, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto constraint = h_slots[4];
     Energy += constraint;
 
-    auto barrier = Energy_Add_Reduction_Algorithm(2, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto barrier = h_slots[5];
     Energy += barrier;
 
-    auto ground = Kappa * Energy_Add_Reduction_Algorithm(4, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto ground = Kappa * h_slots[6];
     Energy += ground;
 
-    //std::cout << "fem_kinetic: " << fem_kinetic << std::endl;
-    //std::cout << "abd_kinetic: " << abd_kinetic << std::endl;
-    //std::cout << "abd_shape: " << abd_shape << std::endl;
-    //std::cout << "fem: " << fem << std::endl;
-    //std::cout << "tri_fem: " << tri_fem << std::endl;
-    //std::cout << "bend: " << bend << std::endl;
-    //std::cout << "constraint: " << constraint << std::endl;
-    //std::cout << "barrier: " << barrier << std::endl;
-    //std::cout << "ground: " << ground << std::endl;
-
 #ifdef USE_FRICTION
-    auto fric = frictionRate * Energy_Add_Reduction_Algorithm(5, TetMesh);
+    auto fric = frictionRate * h_slots[7];
     Energy += fric;
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    auto fric_ground = gd_frictionRate * Energy_Add_Reduction_Algorithm(6, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto fric_ground = gd_frictionRate * h_slots[8];
     Energy += fric_ground;
 #endif
 
@@ -11646,11 +11828,30 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         cudaEventRecord(end1);
         double alpha = 1.0, slackness_a = 0.8, slackness_m = 0.8;
 
-        alpha =
-            std::min(alpha, ground_largestFeasibleStepSize(slackness_a, pcg_data.squeue));
+        // ②-D2H: batch the two back-to-back CCD step-size reductions (ground +
+        // self) into one D2H of 2 doubles. Preserves original early-return
+        // semantics: m_skip_all_collision skips ALL reductions; surf_vertexNum<1
+        // skips ground; h_cpNum[0]<1 skips self. Each "did" branch only queues
+        // kernels when its preconditions are met.
+        if(m_skip_all_collision)
+        {
+            // both functions short-circuit to 1.0 -> no change to alpha
+        }
+        else
+        {
+            bool g_did = (surf_vertexNum >= 1);
+            bool s_did = (h_cpNum[0]     >= 1);
+            if(g_did) ground_largestFeasibleStepSize_DeviceOut(slackness_a, pcg_data.squeue, m_alpha_slots + 0);
+            if(s_did) self_largestFeasibleStepSize_DeviceOut  (slackness_m, pcg_data.squeue, h_cpNum[0], m_alpha_slots + 1);
+            if(g_did || s_did)
+            {
+                double h_alpha[2] = {1.0, 1.0};
+                CUDA_SAFE_CALL(cudaMemcpy(h_alpha, m_alpha_slots, 2 * sizeof(double), cudaMemcpyDeviceToHost));
+                if(g_did) alpha = std::min(alpha, 1.0 / h_alpha[0]);
+                if(s_did) alpha = std::min(alpha, 1.0 / h_alpha[1]);
+            }
+        }
         //alpha = std::min(alpha, InjectiveStepSize(0.2, 1e-6, pcg_data.squeue, TetMesh.tetrahedras));
-        alpha = std::min(
-            alpha, self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_cpNum[0]));
         double temp_alpha = alpha;
         double alpha_CFL  = alpha;
 
