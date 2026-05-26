@@ -401,6 +401,14 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
 {
     SizeT k = 0;
 
+    // ③ Invalidate captured graph from PREVIOUS solve — the sparse matrix is
+    // rebuilt each Newton iteration (different block_values pointer + new
+    // h_unique_key_number triplet_count baked into the captured spmv kernel).
+    // Re-capture per solve; instantiate cost (~100us) << per-iter launch savings
+    // across ~25 PCG iters. This was the source of the ~7e-5 checksum drift.
+    if(m_pcg_graph_exec) { cudaGraphExecDestroy(m_pcg_graph_exec); m_pcg_graph_exec = nullptr; }
+    m_graph_dof = 0;
+
     r.buffer_view().copy_from(b.buffer_view());
 
     {
@@ -421,31 +429,22 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
 
     const SizeT K = 8;
 
-    // ③ CUDA Graph PoC infrastructure — currently DORMANT (see m_graph_enabled
-    // in pcg_solver.h). When enabled it would capture this iter body and replay
-    // it, but stream capture fails because muda has an internal cudaStreamSync
-    // somewhere in spmv / preconditioner / CUB. Once that sync is located and
-    // eliminated, flip m_graph_enabled=true. The fallback path below is the
-    // ORIGINAL body (with mid-iter h_break check) — byte-identical to baseline.
-    for(k = 1; k < max_iter; ++k)
-    {
-        // Ap = A * p
+    // ③ CUDA Graph PoC: unlocked by adding capture-guards in muda's
+    // wait_stream/wait_device. The iteration body is split into two halves
+    // around the mid-iter h_break check (matching the original control flow
+    // exactly — keeps physics bit-identical, unlike the single-graph version).
+    //   first_half  : spmv, dot(p,Ap), fused axpy (x,r)         [sets d_break on breakdown]
+    //   mid-iter check on d_break (every K iters)
+    //   second_half : apply_precond, dot(r,z), fused axpy(p), post_iter_swap_and_check
+    auto first_half = [&]() {
         spmv(p.cview(), Ap.view());
-
-        // Step E: cub fused dot(p, Ap) -> d_dot_res (1 launch instead of 2-3).
         Cub_PCG_DotReduction(p.buffer_view().data(),
                              Ap.buffer_view().data(),
                              z.size(),
                              d_dot_res,
                              &cub_temp_ptr, &cub_temp_bytes);
-
-        // Step E: fused axpy that re-derives alpha = *d_rz / *d_dot_res
-        // per-thread (saves the separate compute_alpha_kernel<<<1,1>>>).
-        // Same dot_res<=0 || !isfinite guard sets d_break (thread 0).
         LaunchCudaKernal_default(z.size(),
-                                 256,
-                                 0,
-                                 update_vector_dx_r_fused,
+                                 256, 0, update_vector_dx_r_fused,
                                  x.buffer_view().data(),
                                  r.buffer_view().data(),
                                  (const double*)p.buffer_view().data(),
@@ -454,44 +453,96 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                                  (const double*)d_dot_res,
                                  d_break,
                                  (int)z.size());
+    };
+    auto second_half = [&]() {
+        apply_preconditioner(z, r);
+        Cub_PCG_DotReduction(r.buffer_view().data(),
+                             z.buffer_view().data(),
+                             z.size(),
+                             d_rz_new,
+                             &cub_temp_ptr, &cub_temp_bytes);
+        LaunchCudaKernal_default(z.size(),
+                                 256, 0, update_vector_c_fused,
+                                 p.buffer_view().data(),
+                                 (const double*)z.buffer_view().data(),
+                                 (const double*)d_rz_new,
+                                 (const double*)d_rz,
+                                 (int)z.size());
+        post_iter_swap_and_check<<<1, 1>>>(d_rz, d_rz_new, d_rz0,
+                                           m_config.global_tol_rate, d_break);
+    };
 
-        // Convergence check on rz (still the old rz at this point) is
-        // deferred to post_iter_swap_and_check below — saves one launch
-        // by combining swap+check.
+    // Helper: try to capture a sub-body as a graph (re-used for both halves).
+    auto try_capture = [&](auto&& body, cudaGraphExec_t& exec_out) -> bool {
+        if(cudaStreamBeginCapture(cudaStreamPerThread,
+                                  cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+            return false;
+        body();
+        cudaGraph_t g = nullptr;
+        if(cudaStreamEndCapture(cudaStreamPerThread, &g) != cudaSuccess)
+        {
+            if(g) cudaGraphDestroy(g);
+            return false;
+        }
+        cudaGraphExec_t exec = nullptr;
+        if(cudaGraphInstantiate(&exec, g, nullptr, nullptr, 0) != cudaSuccess)
+        {
+            cudaGraphDestroy(g);
+            return false;
+        }
+        cudaGraphDestroy(g);  // graph descriptor not needed after instantiate
+        exec_out = exec;
+        return true;
+    };
 
+    // exec_half_b is per-solve (not cached across solves yet); first_half exec
+    // (m_pcg_graph_exec) is a class member so it caches across solves with same dof.
+    cudaGraphExec_t exec_half_b = nullptr;
+    bool tried_capture = false;
+    for(k = 1; k < max_iter; ++k)
+    {
+        // ─── Capture-once block ─── at iter 2, after iter 1 ran normally and
+        // lazily allocated cub_temp. Capture is RECORD-ONLY (no execution); we
+        // launch the captured graphs below for actual work.
+        if(m_graph_enabled && k == 2 && !tried_capture && cub_temp_ptr != nullptr)
+        {
+            tried_capture = true;
+            if(m_pcg_graph_exec) { cudaGraphExecDestroy(m_pcg_graph_exec); m_pcg_graph_exec = nullptr; }
+            cudaGraphExec_t exec_a = nullptr;
+            if(try_capture(first_half, exec_a))
+            {
+                m_pcg_graph_exec = exec_a;
+                m_graph_dof      = z.size();
+                cudaGraphExec_t exec_b = nullptr;
+                if(try_capture(second_half, exec_b))
+                    exec_half_b = exec_b;
+                // If second_half capture failed, exec_half_b stays nullptr -> fallback for B.
+            }
+            // If first_half capture failed, m_pcg_graph_exec stays nullptr -> fallback for both.
+        }
+
+        // ─── First half ── spmv + dot(p,Ap) + axpy(x,r); may set d_break on breakdown.
+        if(m_graph_enabled && m_pcg_graph_exec && m_graph_dof == z.size())
+            cudaGraphLaunch(m_pcg_graph_exec, cudaStreamPerThread);
+        else
+            first_half();
+
+        // ─── Mid-iter h_break check (SAME logical position as original) ───
         if(k % K == 0)
         {
             cudaMemcpy(&h_break, d_break, sizeof(int), cudaMemcpyDeviceToHost);
             if(h_break) break;
         }
 
-        apply_preconditioner(z, r);
-
-        // Step E: cub fused dot(r, z) -> d_rz_new.
-        Cub_PCG_DotReduction(r.buffer_view().data(),
-                             z.buffer_view().data(),
-                             z.size(),
-                             d_rz_new,
-                             &cub_temp_ptr, &cub_temp_bytes);
-
-        // Step E: fused axpy on p that re-derives beta = *d_rz_new / *d_rz
-        // per-thread (saves the compute_beta side; swap is handled below).
-        LaunchCudaKernal_default(z.size(),
-                                 256,
-                                 0,
-                                 update_vector_c_fused,
-                                 p.buffer_view().data(),
-                                 (const double*)z.buffer_view().data(),
-                                 (const double*)d_rz_new,
-                                 (const double*)d_rz,
-                                 (int)z.size());
-
-        // Step E: combined swap (d_rz = d_rz_new) + convergence check.
-        // Replaces compute_beta_and_swap_kernel + check_convergence_kernel
-        // pair (saves 1 launch per iter).
-        post_iter_swap_and_check<<<1, 1>>>(d_rz, d_rz_new, d_rz0,
-                                           m_config.global_tol_rate, d_break);
+        // ─── Second half ── precond + dot(r,z) + axpy(p) + swap_and_check.
+        if(m_graph_enabled && exec_half_b)
+            cudaGraphLaunch(exec_half_b, cudaStreamPerThread);
+        else
+            second_half();
     }
+
+    // Cleanup local per-solve second-half exec.
+    if(exec_half_b) cudaGraphExecDestroy(exec_half_b);
 
     // Final sync of break flag (in case loop exited on max_iter).
     cudaMemcpy(&h_break, d_break, sizeof(int), cudaMemcpyDeviceToHost);

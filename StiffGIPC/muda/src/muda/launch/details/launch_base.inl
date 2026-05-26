@@ -191,6 +191,16 @@ MUDA_INLINE void LaunchCore::wait_event(cudaEvent_t event)
 
 MUDA_INLINE void LaunchCore::wait_stream(cudaStream_t stream)
 {
+    // ③ CUDA Graph PoC: during stream capture, cudaStreamSynchronize is
+    // semantically a no-op (queued kernels aren't executing yet) AND is
+    // forbidden by CUDA (cudaErrorStreamCaptureUnsupported). Skip it so the
+    // capture can proceed. The sync is only a debug/serialization aid for
+    // direct-launch paths anyway.
+    cudaStreamCaptureStatus _cap_status;
+    if(cudaStreamIsCapturing(stream, &_cap_status) == cudaSuccess
+       && _cap_status == cudaStreamCaptureStatusActive)
+        return;
+
     MUDA_ASSERT(ComputeGraphBuilder::is_phase_none(),
                 "`wait_stream()` a stream is meaningless in ComputeGraph");
     checkCudaErrors(cudaStreamSynchronize(stream));
@@ -203,6 +213,12 @@ MUDA_INLINE void LaunchCore::wait_stream(cudaStream_t stream)
 
 MUDA_INLINE void LaunchCore::wait_device()
 {
+    // ③ Same rationale as wait_stream above.
+    cudaStreamCaptureStatus _cap_status;
+    if(cudaStreamIsCapturing(cudaStreamPerThread, &_cap_status) == cudaSuccess
+       && _cap_status == cudaStreamCaptureStatusActive)
+        return;
+
     MUDA_ASSERT(ComputeGraphBuilder::is_phase_none(),
                 "`wait_device()` a stream is meaningless in ComputeGraph");
     checkCudaErrors(cudaDeviceSynchronize());

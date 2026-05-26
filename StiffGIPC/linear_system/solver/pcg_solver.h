@@ -63,7 +63,7 @@ class PCGSolver : public IterativeSolver
     // cudaErrorStreamCaptureUnsupported even in Relaxed mode. Until that sync
     // is located and eliminated (muda surgery), keep the graph dormant.
     // Flip to true to retry once the muda block is fixed.
-    bool             m_graph_enabled  = false;
+    bool             m_graph_enabled  = true;  // unlocked after muda capture-guard fix
 
     PCGSolverConfig   m_config;
 
