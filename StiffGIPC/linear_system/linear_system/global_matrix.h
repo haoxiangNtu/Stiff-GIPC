@@ -204,4 +204,21 @@ class GIPCTripletMatrix
     uint32_t abd_fem_contact_num = 0;
     uint32_t fem_fem_contact_num = 0;
     uint32_t fem_abd_contact_num = 0;
+
+    // ① Sparsity-pattern cache for the GLOBAL convert_new() path.
+    // When the input (row,col) sequence is IDENTICAL to the previous Newton
+    // iter (detected via XOR-fold fingerprint), we skip the radix sort + RLE
+    // + index-scatter (the big chunk of assembly GPU time) and just gather
+    // the new VALUES through the cached permutation and segmented-reduce
+    // through the cached partition output. Pattern arrays (row/col/hash) are
+    // restored from cache. Bit-identical to the full path when input matches.
+    cudatool::CudaDeviceBuffer<uint32_t> m_cache_sort_index;
+    cudatool::CudaDeviceBuffer<uint32_t> m_cache_partition_output;
+    cudatool::CudaDeviceBuffer<int>      m_cache_unique_row;
+    cudatool::CudaDeviceBuffer<int>      m_cache_unique_col;
+    cudatool::CudaDeviceBuffer<uint64_t> m_cache_unique_hash;
+    int      m_cache_unique_count      = 0;
+    int      m_cache_length            = 0;
+    uint64_t m_cache_input_fingerprint = 0;
+    bool     m_cache_valid             = false;
 };
