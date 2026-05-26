@@ -531,8 +531,8 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
 
     int number    = body_hessian_size;
-    int threadNum = 256;
-    //int blockNum  = (number + threadNum - 1) / threadNum;
+    // ncu: N=574 bodies, was grid=3 (block=256) -> use 32 -> grid=18 across SMs.
+    int threadNum = 32;
 
     LaunchCudaKernal_default(
         body_hessian_size,
