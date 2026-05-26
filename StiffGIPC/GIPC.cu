@@ -9432,32 +9432,76 @@ void GIPC::buildCP()
 
     if(!m_aux_stream)
         cudaStreamCreate(&m_aux_stream);
+    // Pre-allocate events once (capture forbids cudaEventCreate inside).
+    if(!m_buildCP_reset_evt)
+        cudaEventCreateWithFlags(&m_buildCP_reset_evt, cudaEventDisableTiming);
+    if(!m_buildCP_end_evt)
+        cudaEventCreateWithFlags(&m_buildCP_end_evt, cudaEventDisableTiming);
 
-    // Memsets on default stream. Use an event so aux stream observes them
-    // before its kernel reads/atomicAdds _cpNum.
-    CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
-    CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
-    cudaEvent_t reset_evt;
-    cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
-    cudaEventRecord(reset_evt, 0);
-    cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
+    // Try graph replay if a previous capture succeeded.
+    if(m_buildCP_capture_works && m_buildCP_graph_exec)
+    {
+        cudaGraphLaunch(m_buildCP_graph_exec, 0);
+        return;
+    }
 
-    // bvh_f on default stream, bvh_e on aux stream -> overlap.
-    // Both atomicAdd into _cpNum & _collisionPair; CUDA atomics handle
-    // cross-stream contention correctly. Pair-set order doesn't matter
-    // to consumers (they iterate 0..h_cpNum[0]).
-    bvh_f.SelfCollitionDetect(dHat);
-    bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
-    GroundCollisionDetect();
-    // Device-side event join (capture-friendly): PTDS waits for aux on GPU.
-    cudaEvent_t end_evt;
-    cudaEventCreateWithFlags(&end_evt, cudaEventDisableTiming);
-    cudaEventRecord(end_evt, m_aux_stream);
-    cudaStreamWaitEvent(0, end_evt, 0);
-    cudaEventDestroy(end_evt);
-    cudaEventDestroy(reset_evt);
-    // ②-D2H elim: D2H of h_cpNum/h_gpNum moved out — callers explicitly
-    // sync_cpNum() before reading host vars. buildCP() body is now sync-free.
+    auto run_body = [&]() {
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
+        CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
+        cudaEventRecord(m_buildCP_reset_evt, 0);
+        cudaStreamWaitEvent(m_aux_stream, m_buildCP_reset_evt, 0);
+        bvh_f.SelfCollitionDetect(dHat);
+        bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
+        GroundCollisionDetect();
+        cudaEventRecord(m_buildCP_end_evt, m_aux_stream);
+        cudaStreamWaitEvent(0, m_buildCP_end_evt, 0);
+    };
+
+    // First-call capture attempt. If it fails, fall back to direct execution
+    // and remember the failure so subsequent calls don't retry.
+    if(!m_buildCP_capture_tried)
+    {
+        m_buildCP_capture_tried = true;
+        cudaError_t e1 = cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
+        if(e1 == cudaSuccess)
+        {
+            run_body();
+            cudaError_t e2 = cudaStreamEndCapture(0, &m_buildCP_graph);
+            if(e2 == cudaSuccess)
+            {
+                cudaError_t e3 = cudaGraphInstantiate(
+                    &m_buildCP_graph_exec, m_buildCP_graph, nullptr, nullptr, 0);
+                if(e3 == cudaSuccess)
+                {
+                    m_buildCP_capture_works = true;
+                    cudaGraphLaunch(m_buildCP_graph_exec, 0);
+                    fprintf(stderr, "[buildCP] CUDA graph capture SUCCESS\n");
+                    return;
+                }
+                fprintf(stderr, "[buildCP] graph instantiate failed: %s\n",
+                        cudaGetErrorString(e3));
+                cudaGraphDestroy(m_buildCP_graph);
+                m_buildCP_graph = nullptr;
+            }
+            else
+            {
+                fprintf(stderr, "[buildCP] graph EndCapture failed: %s\n",
+                        cudaGetErrorString(e2));
+            }
+        }
+        else
+        {
+            fprintf(stderr, "[buildCP] BeginCapture failed: %s\n",
+                    cudaGetErrorString(e1));
+        }
+        // Capture failed at some stage — fall through to direct execution.
+        // Note: if BeginCapture succeeded but downstream failed, the stream
+        // may be in a captured-failed state; EndCapture should have cleared.
+    }
+
+    // Direct execution (capture not attempted yet on this call, or earlier
+    // capture failed -> permanent fallback).
+    run_body();
 }
 
 void GIPC::sync_cpNum()

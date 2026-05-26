@@ -214,12 +214,19 @@ class GIPC
 
     void buildCP();
     void buildFullCP(const double& alpha);
-    // ②-D2H elim: the in-buildCP cudaMemcpy(D2H) of h_cpNum/h_gpNum was
-    // moved out so buildCP()'s body is sync-free (capture-friendly). Callers
-    // that need h_cpNum[0..4]/h_gpNum on host must call sync_cpNum() AFTER
-    // buildCP/buildFullCP, BEFORE reading those host variables.
     void sync_cpNum();
     void sync_ccd_cpNum();
+
+    // ③ assembly graph: pre-allocated events + cached graph for buildCP body.
+    // Per-call cudaEventCreate/Destroy is capture-hostile, so events are
+    // pre-allocated; the captured graph replays the {memset, fork, detect,
+    // detect, ground-detect, join} sequence on subsequent calls.
+    cudaEvent_t     m_buildCP_reset_evt   = nullptr;
+    cudaEvent_t     m_buildCP_end_evt     = nullptr;
+    cudaGraph_t     m_buildCP_graph       = nullptr;
+    cudaGraphExec_t m_buildCP_graph_exec  = nullptr;
+    bool            m_buildCP_capture_tried   = false;
+    bool            m_buildCP_capture_works   = false;
     void buildBVH();
 
     AABB* calcuMaxSceneSize();
