@@ -8707,7 +8707,8 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_close_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_gpNum));
     CUDA_SAFE_CALL(cudaFree(_environment_collisionPair));
-    CUDA_SAFE_CALL(cudaFree(_gpNum));
+    // _gpNum aliases (_cpNum + 5) — single allocation, freed above with _cpNum.
+    _gpNum = nullptr;
     CUDA_SAFE_CALL(cudaFree(_groundNormal));
     CUDA_SAFE_CALL(cudaFree(_groundOffset));
 
@@ -8752,8 +8753,11 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&_environment_collisionPair,
                               surf_vertexNum * sizeof(int)));
     //CUDA_SAFE_CALL(cudaMalloc((void**)&_moveDir, vertexNum * sizeof(double3)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_cpNum, 5 * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_gpNum, sizeof(uint32_t)));
+    // ②-D2H batch: one contiguous [6]-uint32 block. _cpNum aliases [0:5],
+    // _gpNum aliases [5]. Kernel-side code unchanged (it takes uint32_t*).
+    // buildCP reads all 6 in one D2H instead of 2 blocking transfers.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_cpNum, 6 * sizeof(uint32_t)));
+    _gpNum = _cpNum + 5;
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundNormal, 5 * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundOffset, 5 * sizeof(double)));
     double  h_offset[5] = {ground_offset_cfg, -1, 1, -1, 1};
@@ -9441,8 +9445,12 @@ void GIPC::buildCP()
     CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
     cudaEventDestroy(reset_evt);
 
-    CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_SAFE_CALL(cudaMemcpy(&h_gpNum, _gpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // ②-D2H batch: _cpNum [0:5] and _gpNum [5] are contiguous; one 6-uint32 D2H.
+    uint32_t cp_gp_buf[6];
+    CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+    memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
+    h_gpNum = cp_gp_buf[5];
 }
 
 void GIPC::buildFullCP(const double& alpha)
