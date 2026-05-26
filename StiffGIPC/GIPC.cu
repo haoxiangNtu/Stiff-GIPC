@@ -9424,6 +9424,9 @@ void GIPC::buildCP()
     {
         memset(h_cpNum, 0, sizeof(h_cpNum));
         h_gpNum = 0;
+        // ②-D2H elim: device must mirror host 0-state so caller's
+        // sync_cpNum() (which D2Hs from _cpNum/_gpNum) reads 0.
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 6 * sizeof(uint32_t)));
         return;
     }
 
@@ -9446,18 +9449,19 @@ void GIPC::buildCP()
     bvh_f.SelfCollitionDetect(dHat);
     bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
     GroundCollisionDetect();
-    // ②-D2H + ③-graph prep: replace host-side sync with device-side event
-    // join. PTDS now waits on aux's completion via cudaStreamWaitEvent
-    // (capture-friendly) instead of cudaStreamSynchronize (capture-hostile,
-    // host blocks). Same dependency, no host stall.
+    // Device-side event join (capture-friendly): PTDS waits for aux on GPU.
     cudaEvent_t end_evt;
     cudaEventCreateWithFlags(&end_evt, cudaEventDisableTiming);
     cudaEventRecord(end_evt, m_aux_stream);
     cudaStreamWaitEvent(0, end_evt, 0);
     cudaEventDestroy(end_evt);
     cudaEventDestroy(reset_evt);
+    // ②-D2H elim: D2H of h_cpNum/h_gpNum moved out — callers explicitly
+    // sync_cpNum() before reading host vars. buildCP() body is now sync-free.
+}
 
-    // ②-D2H batch: _cpNum [0:5] and _gpNum [5] are contiguous; one 6-uint32 D2H.
+void GIPC::sync_cpNum()
+{
     uint32_t cp_gp_buf[6];
     CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t),
                               cudaMemcpyDeviceToHost));
@@ -9465,11 +9469,19 @@ void GIPC::buildCP()
     h_gpNum = cp_gp_buf[5];
 }
 
+void GIPC::sync_ccd_cpNum()
+{
+    CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum,
+                              sizeof(uint32_t), cudaMemcpyDeviceToHost));
+}
+
 void GIPC::buildFullCP(const double& alpha)
 {
     if(m_skip_all_collision)
     {
         h_ccd_cpNum = 0;
+        // ②-D2H elim: ensure device state matches host for sync_ccd_cpNum.
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t)));
         return;
     }
 
@@ -9491,8 +9503,8 @@ void GIPC::buildFullCP(const double& alpha)
     cudaStreamWaitEvent(0, end_evt, 0);
     cudaEventDestroy(end_evt);
     cudaEventDestroy(reset_evt);
-
-    CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // ②-D2H elim: D2H moved to sync_ccd_cpNum(); callers sync before reading
+    // h_ccd_cpNum on host. buildFullCP() body is now sync-free.
 }
 
 
@@ -11681,6 +11693,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     }
 
     buildCP();
+    sync_cpNum();  // ②-D2H elim: D2H moved out of buildCP; sync before host reads
 
     double testingE = computeEnergy(TetMesh);
 
@@ -11700,6 +11713,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         step_forward(TetMesh, alpha, false);
         buildBVH();
         buildCP();
+        sync_cpNum();  // ②-D2H elim
         testingE = computeEnergy(TetMesh);
     }
     if(numOfLineSearch > report_line_search_threshold)
@@ -11725,6 +11739,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         if(needRecomputeCS)
         {
             buildCP();
+            sync_cpNum();  // ②-D2H elim
         }
     }
 
@@ -11884,6 +11899,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         buildBVH_FULLCCD(temp_alpha);
         buildFullCP(temp_alpha);
+        sync_ccd_cpNum();  // ②-D2H elim
         if(h_ccd_cpNum > 0)
         {
             double maxSpeed = cfl_largestSpeed(pcg_data.squeue);
@@ -12049,6 +12065,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         updateBoundaryMoveDir(TetMesh, alpha, total_Frames);
         buildBVH_FULLCCD(alpha);
         buildFullCP(alpha);
+        sync_ccd_cpNum();  // ②-D2H elim
         if(h_ccd_cpNum > 0)
         {
             double slackness_m = 0.8;
@@ -12087,6 +12104,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         }
 
         buildCP();
+        sync_cpNum();  // ②-D2H elim
         printf("boundary alpha: %f\n  finished a step\n", alpha);
     }
 

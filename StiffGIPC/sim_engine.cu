@@ -1232,6 +1232,7 @@ void SimEngine::Impl::do_init_bvh_and_solver()
 
     // Build collision pairs + solver warm-start (mirrors gl_main.cu post-init)
     ipc.buildCP();
+    ipc.sync_cpNum();  // ②-D2H elim
     ipc._moveDir          = ipc.pcg_data.dx;
     ipc.animation_subRate = 1.0;
     ipc.computeXTilta(d_tetMesh, 1);
