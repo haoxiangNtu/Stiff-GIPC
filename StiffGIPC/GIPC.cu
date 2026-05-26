@@ -5309,10 +5309,14 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                                     double3*          _gradient,
                                     double            dHat,
                                     double            Kappa,
-                                    int               number)
+                                    const uint32_t*   _cpNum)
 {
+    // ②-D2H elimination PoC: range-check against device-side count instead
+    // of host-passed int. Host launches with over-provisioned grid; threads
+    // beyond the active count early-out. Reading *_cpNum once into shared
+    // would be optimal but at this kernel's grid size the cost is negligible.
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= number)
+    if(idx >= (int)*_cpNum)
         return;
     int4   MMCVIDI   = _collisionPair[idx];
     double dHat_sqrt = sqrt(dHat);
@@ -9696,15 +9700,13 @@ double2 GIPC::minMaxSelfDist()
 
 void GIPC::calBarrierGradient(double3* _gradient, double mKappa)
 {
-    int numbers = h_cpNum[0];
-    if(numbers < 1)
-        return;
+    // ②-D2H elimination PoC: device-driven grid + range check. Host no
+    // longer reads h_cpNum[0] for this call. Launches MAX_COLLITION_PAIRS_NUM
+    // threads; kernel early-outs against *_cpNum.
     const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
-
-
+    int                blockNum  = (MAX_COLLITION_PAIRS_NUM + threadNum - 1) / threadNum;
     _calBarrierGradient<<<blockNum, threadNum>>>(
-        _vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, numbers);
+        _vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, _cpNum);
 }
 
 void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
