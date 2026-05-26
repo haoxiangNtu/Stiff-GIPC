@@ -302,7 +302,63 @@ __global__ void __gather_values_by_perm(Eigen::Matrix3d*       dst_val,
     if(idx >= n) return;
     dst_val[idx] = src_val[perm[idx]];
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// ③ Assembly CUDA Graph (skip-path):
+// The convert_new() skip path is 6 sync-free ops (3 D2D + gather kernel +
+// memset + FastSegmentalReduce). Capture them once into a CUDA graph and
+// replay across Newton iters when the cached pointers/sizes match. Invalidate
+// when length, N_unique, or any buffer pointer changes (resize realloc).
+// ───────────────────────────────────────────────────────────────────────────
+struct SkipGraphState
+{
+    cudaGraph_t     graph      = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    int             length     = -1;
+    int             N_unique   = -1;
+    const void*     src_perm   = nullptr;
+    const void*     src_part   = nullptr;
+    const void*     src_row    = nullptr;
+    const void*     src_col    = nullptr;
+    const void*     src_hash   = nullptr;
+    const void*     dst_row    = nullptr;
+    const void*     dst_col    = nullptr;
+    const void*     dst_hash   = nullptr;
+    const void*     values     = nullptr;
+    int             replays    = 0;
+    int             captures   = 0;
+};
+SkipGraphState g_skip_g;
+
+bool skip_graph_can_replay(GIPCTripletMatrix* gt, int length, int N_unique)
+{
+    return g_skip_g.graph_exec != nullptr
+           && g_skip_g.length   == length
+           && g_skip_g.N_unique == N_unique
+           && g_skip_g.src_perm == gt->m_cache_sort_index.data()
+           && g_skip_g.src_part == gt->m_cache_partition_output.data()
+           && g_skip_g.src_row  == gt->m_cache_unique_row.data()
+           && g_skip_g.src_col  == gt->m_cache_unique_col.data()
+           && g_skip_g.src_hash == gt->m_cache_unique_hash.data()
+           && g_skip_g.dst_row  == gt->block_row_indices()
+           && g_skip_g.dst_col  == gt->block_col_indices()
+           && g_skip_g.dst_hash == gt->block_hash_value()
+           && g_skip_g.values   == gt->block_values();
+}
+
+void skip_graph_destroy()
+{
+    if(g_skip_g.graph_exec) { cudaGraphExecDestroy(g_skip_g.graph_exec); g_skip_g.graph_exec = nullptr; }
+    if(g_skip_g.graph)      { cudaGraphDestroy(g_skip_g.graph);          g_skip_g.graph      = nullptr; }
+}
 }  // namespace
+
+// Expose for harness stats.
+void gipc_skip_graph_get_stats(int* replays, int* captures)
+{
+    if(replays)  *replays  = g_skip_g.replays;
+    if(captures) *captures = g_skip_g.captures;
+}
 
 void GlobalLinearSystem::convert_new()
 {
@@ -334,55 +390,74 @@ void GlobalLinearSystem::convert_new()
     {
         // ─── SKIP PATH ─── pattern matches cache. Skip radix sort + RLE +
         // scatter; only gather new values and segmental-reduce them.
-        // Memory layout matches the full path's: input values live at
-        // block_values[0:length); gather writes sorted-permuted values to
-        // block_values[length:2*length); segmental-reduce reads from there
-        // and writes aggregated unique values back to block_values[0:N_unique).
-        // (Buffer capacity covers this — total_max_global_triplet_num*32 in
-        // GIPC::build_gipc_system.)
+        // Memory layout matches the full path's (out_start_id=length): input
+        // at [0:length), scratch at [length:2*length), output at [0:N_unique).
+        // ALL six ops below are async / launch-only (no host sync), so they
+        // capture into a single CUDA graph that we replay across Newton iters
+        // with the same cached pointers — see SkipGraphState above.
         const int N_unique = gt->m_cache_unique_count;
 
-        // Restore pattern arrays into their canonical positions (downstream
-        // consumers read block_row_indices/col_indices/hash_value[0:N_unique]).
-        CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_row_indices(),
-                                       gt->m_cache_unique_row.data(),
-                                       N_unique * sizeof(int),
-                                       cudaMemcpyDeviceToDevice));
-        CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_col_indices(),
-                                       gt->m_cache_unique_col.data(),
-                                       N_unique * sizeof(int),
-                                       cudaMemcpyDeviceToDevice));
-        CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_hash_value(),
-                                       gt->m_cache_unique_hash.data(),
-                                       N_unique * sizeof(uint64_t),
-                                       cudaMemcpyDeviceToDevice));
-
-        // Gather new values through the cached permutation. Write to scratch
-        // region [length:2*length) (NOT in-place — avoids the same race the
-        // original sort path also avoids by using out_start_id=length).
+        if(!skip_graph_can_replay(gt, length, N_unique))
         {
-            int blocks = (length + 255) / 256;
-            __gather_values_by_perm<<<blocks, 256>>>(
-                gt->block_values() + length,  // dst (sorted values scratch)
-                gt->block_values(),           // src (new input values)
-                gt->m_cache_sort_index.data(), length);
+            skip_graph_destroy();
+            cudaStream_t s = cudaStreamPerThread;
+            CUDA_SAFE_CALL(cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed));
+
+            CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_row_indices(),
+                                           gt->m_cache_unique_row.data(),
+                                           N_unique * sizeof(int),
+                                           cudaMemcpyDeviceToDevice, s));
+            CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_col_indices(),
+                                           gt->m_cache_unique_col.data(),
+                                           N_unique * sizeof(int),
+                                           cudaMemcpyDeviceToDevice, s));
+            CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_hash_value(),
+                                           gt->m_cache_unique_hash.data(),
+                                           N_unique * sizeof(uint64_t),
+                                           cudaMemcpyDeviceToDevice, s));
+            {
+                int blocks = (length + 255) / 256;
+                __gather_values_by_perm<<<blocks, 256, 0, s>>>(
+                    gt->block_values() + length,
+                    gt->block_values(),
+                    gt->m_cache_sort_index.data(), length);
+            }
+            CUDA_SAFE_CALL(cudaMemsetAsync(gt->block_values(), 0,
+                                           N_unique * sizeof(Eigen::Matrix3d), s));
+            muda::FastSegmentalReduce(s)
+                .kernel_name("convert_new_skip_graph")
+                .reduce(length,
+                        gt->m_cache_partition_output.data(),
+                        gt->block_values() + length,
+                        gt->block_values());
+
+            CUDA_SAFE_CALL(cudaStreamEndCapture(s, &g_skip_g.graph));
+            CUDA_SAFE_CALL(cudaGraphInstantiate(&g_skip_g.graph_exec, g_skip_g.graph,
+                                                nullptr, nullptr, 0));
+
+            g_skip_g.length   = length;
+            g_skip_g.N_unique = N_unique;
+            g_skip_g.src_perm = gt->m_cache_sort_index.data();
+            g_skip_g.src_part = gt->m_cache_partition_output.data();
+            g_skip_g.src_row  = gt->m_cache_unique_row.data();
+            g_skip_g.src_col  = gt->m_cache_unique_col.data();
+            g_skip_g.src_hash = gt->m_cache_unique_hash.data();
+            g_skip_g.dst_row  = gt->block_row_indices();
+            g_skip_g.dst_col  = gt->block_col_indices();
+            g_skip_g.dst_hash = gt->block_hash_value();
+            g_skip_g.values   = gt->block_values();
+            g_skip_g.captures++;
         }
 
-        // Zero the aggregation range [0:N_unique), then segmental-reduce
-        // from the scratch sorted values into it.
-        CUDA_SAFE_CALL(cudaMemsetAsync(gt->block_values(),
-                                       0,
-                                       N_unique * sizeof(Eigen::Matrix3d)));
-        muda::FastSegmentalReduce()
-            .kernel_name("convert_new_skip")
-            .reduce(length,
-                    gt->m_cache_partition_output.data(),
-                    gt->block_values() + length,  // INPUT (sorted scratch)
-                    gt->block_values());          // OUTPUT (aggregated)
+        CUDA_SAFE_CALL(cudaGraphLaunch(g_skip_g.graph_exec, cudaStreamPerThread));
+        g_skip_g.replays++;
 
         gt->h_unique_key_number = N_unique;
         return;
     }
+
+    // Full-path = pattern changed → cached buffers may shift → invalidate graph.
+    skip_graph_destroy();
 
     // ─── FULL PATH ─── pattern changed (or first call). Run normal convert
     // (original signature: out_start_id = length so sort writes to
