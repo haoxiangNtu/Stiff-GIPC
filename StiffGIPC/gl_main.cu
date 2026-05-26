@@ -4372,7 +4372,7 @@ void initScene()
 
     printf("restSNKE: %f\n", ipc.RestNHEnergy);
     ipc.buildCP();
-
+    ipc.sync_cpNum();  // ②-D2H elim: D2H moved out of buildCP
     ipc._moveDir          = ipc.pcg_data.dx;
     ipc.animation_subRate = 1.0 / motion_rate;
     //ipc.animation_fullRate = ipc.animation_subRate;

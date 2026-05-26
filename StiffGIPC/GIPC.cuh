@@ -214,6 +214,12 @@ class GIPC
 
     void buildCP();
     void buildFullCP(const double& alpha);
+    // ②-D2H elim: the in-buildCP cudaMemcpy(D2H) of h_cpNum/h_gpNum was
+    // moved out so buildCP()'s body is sync-free (capture-friendly). Callers
+    // that need h_cpNum[0..4]/h_gpNum on host must call sync_cpNum() AFTER
+    // buildCP/buildFullCP, BEFORE reading those host variables.
+    void sync_cpNum();
+    void sync_ccd_cpNum();
     void buildBVH();
 
     AABB* calcuMaxSceneSize();
