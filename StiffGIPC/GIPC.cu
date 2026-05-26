@@ -9418,6 +9418,120 @@ double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueu
     return 1.0 / minValue;
 }
 
+// ============================================================================
+// Warp-divergence reduction for _calBarrierGradient / _calBarrierGradientAndHessian.
+//
+// NCU showed Avg Active Threads Per Warp = 5.56/32 (17.4%) — meaning 82.6%
+// of warp work is masked off because the 32 threads in a warp take 5+ different
+// branches based on MMCVIDI sign bits. buildCP writes pairs in DETECTION order
+// (atomicAdd ordering), so warps are random mixes of types.
+//
+// Fix: classify each pair into a small (5) type bucket, CUB-radix-sort pairs
+// by type, reorder _collisonPairs and _MatIndex in lockstep. After sort,
+// threads in same warp share the same branch path → near-100% active threads.
+// Bit-exact preserved because pair set is unchanged + downstream convert_new
+// sorts triplets by hash (order-insensitive aggregation).
+// ============================================================================
+
+__device__ __forceinline__ uint8_t __pair_branch_type(int4 mm)
+{
+    // Mirrors the if/else cascade in _calBarrierGradient/AndHessian:
+    //   x>=0 & w>=0  : EE regular     -> 0
+    //   x>=0 & w<0   : EE/PT degen    -> 1
+    //   x<0  & y<0   : PP             -> 2
+    //   x<0  & y>=0 & z<0 : PE        -> 3
+    //   x<0  & y>=0 & z>=0: PT        -> 4
+    if(mm.x >= 0)
+        return (mm.w >= 0) ? (uint8_t)0 : (uint8_t)1;
+    if(mm.y < 0)
+        return (uint8_t)2;
+    if(mm.z < 0)
+        return (uint8_t)3;
+    return (uint8_t)4;
+}
+
+__global__ void __classify_pair_type_k(const int4* _collisionPair,
+                                       uint8_t* type_out, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    type_out[idx] = __pair_branch_type(_collisionPair[idx]);
+}
+
+__global__ void __iota_uint32_k(uint32_t* out, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    out[idx] = (uint32_t)idx;
+}
+
+__global__ void __gather_int4_by_perm_k(int4* dst, const int4* src,
+                                        const uint32_t* perm, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    dst[idx] = src[perm[idx]];
+}
+
+__global__ void __gather_int_by_perm_k(int* dst, const int* src,
+                                       const uint32_t* perm, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    dst[idx] = src[perm[idx]];
+}
+
+void GIPC::sort_collision_pairs_by_type()
+{
+    int N = h_cpNum[0];
+    if(N <= 0) return;
+
+    // Lazy first-call alloc — sized to MAX_COLLITION_PAIRS_NUM (already chosen
+    // as the over-provision capacity for _collisonPairs).
+    if(!m_pair_type)
+    {
+        CUDA_SAFE_CALL(cudaMalloc(&m_pair_type, MAX_COLLITION_PAIRS_NUM * sizeof(uint8_t)));
+        CUDA_SAFE_CALL(cudaMalloc(&m_pair_type_out, MAX_COLLITION_PAIRS_NUM * sizeof(uint8_t)));
+        CUDA_SAFE_CALL(cudaMalloc(&m_pair_perm_in, MAX_COLLITION_PAIRS_NUM * sizeof(uint32_t)));
+        CUDA_SAFE_CALL(cudaMalloc(&m_pair_perm_out, MAX_COLLITION_PAIRS_NUM * sizeof(uint32_t)));
+        CUDA_SAFE_CALL(cudaMalloc(&m_collisionPair_sorted, MAX_COLLITION_PAIRS_NUM * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc(&m_MatIndex_sorted, MAX_COLLITION_PAIRS_NUM * sizeof(int)));
+        // Query CUB temp storage size with max N
+        size_t tb = 0;
+        cub::DeviceRadixSort::SortPairs(
+            nullptr, tb, m_pair_type, m_pair_type_out,
+            m_pair_perm_in, m_pair_perm_out, MAX_COLLITION_PAIRS_NUM, 0, 4);
+        m_cub_sort_temp_bytes = tb;
+        CUDA_SAFE_CALL(cudaMalloc(&m_cub_sort_temp, tb));
+    }
+
+    int blocks = (N + 255) / 256;
+
+    // 1. Classify each pair into a 3-bit type (5 codes).
+    __classify_pair_type_k<<<blocks, 256>>>(_collisonPairs, m_pair_type, N);
+
+    // 2. Initialize identity perm [0, 1, ..., N-1].
+    __iota_uint32_k<<<blocks, 256>>>(m_pair_perm_in, N);
+
+    // 3. CUB radix sort by type; carries perm as the value side.
+    size_t tb = m_cub_sort_temp_bytes;
+    cub::DeviceRadixSort::SortPairs(
+        m_cub_sort_temp, tb,
+        m_pair_type, m_pair_type_out,
+        m_pair_perm_in, m_pair_perm_out,
+        N, 0, 4);  // 3 bits enough, use 4 for safety
+
+    // 4. Gather _collisonPairs + _MatIndex via sorted perm.
+    __gather_int4_by_perm_k<<<blocks, 256>>>(m_collisionPair_sorted, _collisonPairs, m_pair_perm_out, N);
+    __gather_int_by_perm_k <<<blocks, 256>>>(m_MatIndex_sorted, _MatIndex, m_pair_perm_out, N);
+
+    // 5. Copy sorted data back to canonical buffers (downstream uses originals).
+    CUDA_SAFE_CALL(cudaMemcpyAsync(_collisonPairs, m_collisionPair_sorted,
+                                   N * sizeof(int4), cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(_MatIndex, m_MatIndex_sorted,
+                                   N * sizeof(int), cudaMemcpyDeviceToDevice));
+}
+
 void GIPC::buildCP()
 {
     if(m_skip_all_collision)
@@ -11737,7 +11851,8 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     }
 
     buildCP();
-    sync_cpNum();  // ②-D2H elim: D2H moved out of buildCP; sync before host reads
+    sync_cpNum();  // ②-D2H elim
+    sort_collision_pairs_by_type();  // warp-div fix: D2H moved out of buildCP; sync before host reads
 
     double testingE = computeEnergy(TetMesh);
 
@@ -11758,6 +11873,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         buildBVH();
         buildCP();
         sync_cpNum();  // ②-D2H elim
+    sort_collision_pairs_by_type();  // warp-div fix
         testingE = computeEnergy(TetMesh);
     }
     if(numOfLineSearch > report_line_search_threshold)
@@ -11784,6 +11900,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         {
             buildCP();
             sync_cpNum();  // ②-D2H elim
+    sort_collision_pairs_by_type();  // warp-div fix
         }
     }
 
@@ -12149,6 +12266,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
         buildCP();
         sync_cpNum();  // ②-D2H elim
+    sort_collision_pairs_by_type();  // warp-div fix
         printf("boundary alpha: %f\n  finished a step\n", alpha);
     }
 
