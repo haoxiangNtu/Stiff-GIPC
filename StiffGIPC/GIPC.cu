@@ -8966,6 +8966,10 @@ void GIPC::buildFrictionSets()
                                                               h_cpNum[0]);
     }
     CUDA_SAFE_CALL(cudaMemcpy(h_cpNum_last, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // warp-div fix for friction kernels: sort _collisonPairs_lastH + its
+    // sidecar arrays (distCoord, tanBasis, lambda_lastH_scalar) by branch
+    // type so _calFrictionGradient / _calFrictionHessian warps share path.
+    sort_friction_pairs_by_type();
     numbers = h_gpNum;
     if(numbers > 0)
     {
@@ -9530,6 +9534,80 @@ void GIPC::sort_collision_pairs_by_type()
                                    N * sizeof(int4), cudaMemcpyDeviceToDevice));
     CUDA_SAFE_CALL(cudaMemcpyAsync(_MatIndex, m_MatIndex_sorted,
                                    N * sizeof(int), cudaMemcpyDeviceToDevice));
+}
+
+// Friction-pair sort: identical machinery but additionally permutes the
+// 3 sidecar arrays (distCoord, tanBasis, lambda_lastH_scalar) that index
+// in lockstep with _collisonPairs_lastH. _calFrictionHessian / Gradient /
+// LastH_DistAndTan read these by the same idx, so all four must move
+// together.
+__global__ void __gather_double2_by_perm_k(double2* dst, const double2* src,
+                                           const uint32_t* perm, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    dst[idx] = src[perm[idx]];
+}
+
+__global__ void __gather_M3x2d_by_perm_k(__GEIGEN__::Matrix3x2d* dst,
+                                         const __GEIGEN__::Matrix3x2d* src,
+                                         const uint32_t* perm, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    dst[idx] = src[perm[idx]];
+}
+
+__global__ void __gather_double_by_perm_k(double* dst, const double* src,
+                                          const uint32_t* perm, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    dst[idx] = src[perm[idx]];
+}
+
+void GIPC::sort_friction_pairs_by_type()
+{
+    int N = h_cpNum_last[0];
+    if(N <= 0) return;
+
+    if(!m_distCoord_sorted)
+    {
+        CUDA_SAFE_CALL(cudaMalloc(&m_distCoord_sorted, MAX_COLLITION_PAIRS_NUM * sizeof(double2)));
+        CUDA_SAFE_CALL(cudaMalloc(&m_tanBasis_sorted, MAX_COLLITION_PAIRS_NUM * sizeof(__GEIGEN__::Matrix3x2d)));
+        CUDA_SAFE_CALL(cudaMalloc(&m_lambda_sorted, MAX_COLLITION_PAIRS_NUM * sizeof(double)));
+    }
+    // Note: m_pair_type / m_pair_perm_* / m_collisionPair_sorted are already
+    // pre-allocated by sort_collision_pairs_by_type's lazy-init.
+
+    int blocks = (N + 255) / 256;
+
+    // 1. Classify friction pairs by branch type (same MMCVIDI sign encoding).
+    __classify_pair_type_k<<<blocks, 256>>>(_collisonPairs_lastH, m_pair_type, N);
+    // 2. Identity perm.
+    __iota_uint32_k<<<blocks, 256>>>(m_pair_perm_in, N);
+    // 3. CUB radix sort: keys=type, values=perm.
+    size_t tb = m_cub_sort_temp_bytes;
+    cub::DeviceRadixSort::SortPairs(
+        m_cub_sort_temp, tb,
+        m_pair_type, m_pair_type_out,
+        m_pair_perm_in, m_pair_perm_out,
+        N, 0, 4);
+    // 4. Gather all 4 lockstep-indexed arrays.
+    __gather_int4_by_perm_k    <<<blocks, 256>>>(m_collisionPair_sorted, _collisonPairs_lastH, m_pair_perm_out, N);
+    __gather_double2_by_perm_k <<<blocks, 256>>>((double2*)m_distCoord_sorted, distCoord, m_pair_perm_out, N);
+    __gather_M3x2d_by_perm_k   <<<blocks, 256>>>((__GEIGEN__::Matrix3x2d*)m_tanBasis_sorted, tanBasis, m_pair_perm_out, N);
+    __gather_double_by_perm_k  <<<blocks, 256>>>(m_lambda_sorted, lambda_lastH_scalar, m_pair_perm_out, N);
+
+    // 5. Copy sorted data back to canonical buffers.
+    CUDA_SAFE_CALL(cudaMemcpyAsync(_collisonPairs_lastH, m_collisionPair_sorted,
+                                   N * sizeof(int4), cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(distCoord, m_distCoord_sorted,
+                                   N * sizeof(double2), cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(tanBasis, m_tanBasis_sorted,
+                                   N * sizeof(__GEIGEN__::Matrix3x2d), cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(lambda_lastH_scalar, m_lambda_sorted,
+                                   N * sizeof(double), cudaMemcpyDeviceToDevice));
 }
 
 void GIPC::buildCP()
