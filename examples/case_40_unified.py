@@ -197,7 +197,7 @@ def main():
         semi_implicit_enabled=bool(int(os.environ.get("CASE40_SEMI", "0"))),
         semi_implicit_beta_tol=5e-2,
         semi_implicit_min_iter=1, newton_tol=5e-2,
-        preconditioner_type=0, ground_offset=-1.67,   # case_39 full-scale
+        preconditioner_type=int(os.environ.get("CASE40_PRECOND", "1")), ground_offset=-1.67,   # case_39 full-scale
         assets_dir=_ASSETS_DIR + "",
     )
     cfg._cfg.collision_detection_buff_scale = float(
