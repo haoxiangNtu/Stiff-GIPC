@@ -65,6 +65,18 @@ class GIPC
     int*      _MatIndex          = nullptr;
     uint32_t* _close_cpNum       = nullptr;
 
+    // Warp-divergence fix: classify collision pairs by branch type and sort
+    // so that same-type pairs cluster into same warps (eliminates the
+    // Avg-Active-Threads=5.56/32 = 17.4% measured by ncu).
+    uint8_t*  m_pair_type        = nullptr;  // type code per pair, 5 buckets
+    uint8_t*  m_pair_type_out    = nullptr;  // CUB output keys (unused, kept)
+    uint32_t* m_pair_perm_in     = nullptr;  // identity (i)
+    uint32_t* m_pair_perm_out    = nullptr;  // sorted perm result
+    int4*     m_collisionPair_sorted = nullptr;  // gather destination
+    int*      m_MatIndex_sorted  = nullptr;
+    void*     m_cub_sort_temp    = nullptr;  // CUB sort scratch
+    size_t    m_cub_sort_temp_bytes = 0;
+
     uint32_t* _environment_collisionPair = nullptr;
 
     uint32_t* _closeConstraintID  = nullptr;
@@ -216,6 +228,10 @@ class GIPC
     void buildFullCP(const double& alpha);
     void sync_cpNum();
     void sync_ccd_cpNum();
+    // Warp-divergence fix: cluster pairs by branch type so warps execute
+    // a single branch path → eliminates the 5.56/32 active threads/warp
+    // divergence ncu found in _calBarrierGradientAndHessian.
+    void sort_collision_pairs_by_type();
 
     // ③ assembly graph: pre-allocated events + cached graph for buildCP body.
     // Per-call cudaEventCreate/Destroy is capture-hostile, so events are
