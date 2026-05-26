@@ -29,6 +29,8 @@
 #include "load_mesh.h"
 #include "cuda_tools/cuda_tools.h"
 #include <queue>
+// ① PoC pattern detector — defined in linear_system/linear_system/global_linear_system.cu
+namespace gipc { void gipc_pattern_get_stats(int* total, int* matched); }
 //#include "timer.h"
 #include "femEnergy.cuh"
 #include "gpu_eigen_libs.cuh"
@@ -4863,6 +4865,15 @@ int main(int argc, char** argv)
         std::cout << "==============================" << std::endl;
         std::cout << "[headless] Completed " << max_steps << " steps in "
                   << total_s << " s (" << (max_steps / total_s) << " FPS)" << std::endl;
+        // ① PoC: report sparsity-pattern stability stats from the detector
+        {
+            int total = 0, matched = 0;
+            gipc::gipc_pattern_get_stats(&total, &matched);
+            double pct = total > 0 ? (100.0 * matched / total) : 0.0;
+            std::cout << "[PATTERN-FINAL] total_calls=" << total
+                      << "  matched=" << matched
+                      << "  reuse_rate=" << pct << "%" << std::endl;
+        }
         std::cout << "==============================" << std::endl;
         return 0;
     }

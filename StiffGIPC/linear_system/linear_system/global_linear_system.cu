@@ -2,9 +2,102 @@
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <gipc/utils/timer.h>
+#include <cuda_tools/cuda_device_buffer.h>
+#include <cstdio>
+#include <cstdlib>
 
 namespace gipc
 {
+
+// ============================================================================
+// ① PoC: Sparsity-pattern stability detector
+// ----------------------------------------------------------------------------
+// After each Newton iter's global matrix build, compare the sorted unique
+// (row,col) hash array to the previous Newton iter's. Equal hash arrays =>
+// pattern unchanged => future ① sparsity caching can skip the radix sort and
+// dedup, reusing the cached permutation. Pure INSTRUMENTATION here: doesn't
+// change correctness or speed (slight overhead from the 1-int D2H per call).
+//
+// Enable logging by setting env STIFF_PATTERN_LOG=1.
+// ============================================================================
+namespace
+{
+__global__ void __pattern_compare_kernel(const uint64_t* cur,
+                                         const uint64_t* prev,
+                                         int             N,
+                                         int*            diff_flag)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    if(cur[idx] != prev[idx]) atomicOr(diff_flag, 1);
+}
+
+struct PatternDetectorState
+{
+    cudatool::CudaDeviceBuffer<uint64_t> prev_buf;
+    int  prev_count    = -1;
+    int* d_diff_flag   = nullptr;
+    int  total_calls   = 0;
+    int  matched_calls = 0;
+    bool log_enabled   = false;
+    bool log_checked   = false;
+};
+PatternDetectorState g_pat;
+
+void check_pattern_log_env()
+{
+    if(g_pat.log_checked) return;
+    const char* e = std::getenv("STIFF_PATTERN_LOG");
+    g_pat.log_enabled = (e && *e && *e != '0');
+    g_pat.log_checked = true;
+}
+
+void detect_pattern_change(GIPCTripletMatrix* gt)
+{
+    check_pattern_log_env();
+    int             N       = gt->h_unique_key_number;
+    const uint64_t* current = gt->block_hash_value();
+
+    if(g_pat.d_diff_flag == nullptr)
+        CUDA_SAFE_CALL(cudaMalloc(&g_pat.d_diff_flag, sizeof(int)));
+
+    g_pat.total_calls++;
+    int matched = 0;
+
+    if(g_pat.prev_count == N && N > 0)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(g_pat.d_diff_flag, 0, sizeof(int)));
+        int blocks = (N + 255) / 256;
+        __pattern_compare_kernel<<<blocks, 256>>>(
+            current, g_pat.prev_buf.data(), N, g_pat.d_diff_flag);
+        int h_diff = 0;
+        CUDA_SAFE_CALL(cudaMemcpy(&h_diff, g_pat.d_diff_flag,
+                                  sizeof(int), cudaMemcpyDeviceToHost));
+        if(h_diff == 0) { g_pat.matched_calls++; matched = 1; }
+    }
+
+    // Save current as prev for next compare
+    g_pat.prev_buf.resize(N);
+    if(N > 0)
+        CUDA_SAFE_CALL(cudaMemcpyAsync(g_pat.prev_buf.data(), current,
+                                       N * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
+    g_pat.prev_count = N;
+
+    if(g_pat.log_enabled)
+        fprintf(stderr, "[PATTERN] call=%d N=%d matched=%d cum=%d/%d (%.1f%%)\n",
+                g_pat.total_calls, N, matched,
+                g_pat.matched_calls, g_pat.total_calls,
+                100.0 * g_pat.matched_calls / g_pat.total_calls);
+}
+}  // namespace
+
+// Exposed so the headless harness can print final stats.
+void gipc_pattern_get_stats(int* total, int* matched)
+{
+    if(total)   *total   = g_pat.total_calls;
+    if(matched) *matched = g_pat.matched_calls;
+}
+
 bool GlobalLinearSystem::build_linear_system()
 {
     auto hessian_provider_count  = m_subsystems.size();
@@ -65,6 +158,10 @@ bool GlobalLinearSystem::build_linear_system()
         start_preconditioner_id++;
     }
     convert_new();
+
+    // ① PoC: detect whether the sparsity PATTERN (sorted unique (row,col)
+    // hashes) is unchanged from the previous Newton iter. Statistic only.
+    detect_pattern_change(gipc_global_triplet);
 
     if(m_global_preconditioner)
         m_global_preconditioner->do_assemble(*gipc_global_triplet);
