@@ -19,6 +19,7 @@
 #include <thrust/device_ptr.h>
 #include "FrictionUtils.cuh"
 #include <fstream>
+#include <cstdlib>   // std::getenv for STIFF_SKIP_CCD_SANITY
 #include "Eigen/Eigen"
 #include <gipc/statistics.h>
 #include <gipc_path.h>
@@ -11376,6 +11377,17 @@ bool GIPC::isIntersected(device_TetraData& TetMesh)
 {
     if(m_skip_all_collision)
         return false;
+
+    // CCD line-search already constrains alpha to a non-intersecting step.
+    // The line-search-tail isIntersected() check is a paranoid second pass
+    // that re-runs _edgeTriIntersectionQuery (42% of GPU time in case39)
+    // for every line-search alpha bisection.  On smooth contact scenes it
+    // never fires.  Opt-in skip for those cases.
+    static const bool skip = []{
+        const char* v = std::getenv("STIFF_SKIP_CCD_SANITY");
+        return v && v[0] && v[0] != '0';
+    }();
+    if(skip) return false;
 
     if(checkGroundIntersection())
     {
