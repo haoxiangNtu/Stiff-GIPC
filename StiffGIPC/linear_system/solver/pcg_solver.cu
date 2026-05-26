@@ -363,6 +363,9 @@ PCGSolver::~PCGSolver()
         cudaFree(d_break);
     }
     if(cub_temp_ptr) cudaFree(cub_temp_ptr);
+    // ③ Graph PoC cleanup
+    if(m_pcg_graph_exec) cudaGraphExecDestroy(m_pcg_graph_exec);
+    if(m_pcg_graph)      cudaGraphDestroy(m_pcg_graph);
 }
 
 SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b)
@@ -418,6 +421,12 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
 
     const SizeT K = 8;
 
+    // ③ CUDA Graph PoC infrastructure — currently DORMANT (see m_graph_enabled
+    // in pcg_solver.h). When enabled it would capture this iter body and replay
+    // it, but stream capture fails because muda has an internal cudaStreamSync
+    // somewhere in spmv / preconditioner / CUB. Once that sync is located and
+    // eliminated, flip m_graph_enabled=true. The fallback path below is the
+    // ORIGINAL body (with mid-iter h_break check) — byte-identical to baseline.
     for(k = 1; k < max_iter; ++k)
     {
         // Ap = A * p
