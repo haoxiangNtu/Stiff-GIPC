@@ -4,6 +4,69 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] — 2026-05-27
+
+### Fixed
+
+- **MAS preconditioner now works with stitch springs** (`sim_engine.cu`):
+  when `Config(preconditioner_type=1)` (MAS) was used together with FEM bodies
+  that had `add_stitch_spring` constraints, Newton would stall at the
+  iteration cap because stitch indices were passed in input-mesh order while
+  the FEM solver remapped vertices to metis-sorted order.  Fixed by
+  translating stitch indices through `vertex_metis_to_input` at upload time;
+  `preconditioner_type=0` and pure-FEM scenes are unaffected.  Effect on the
+  bundled `replay_case39` example: ~1.9x speed-up (9.4 → 18.0 fps) versus the
+  previous mandatory MAS-off fallback.
+
+### Added
+
+- **`SimEngine.set_per_tet_young_for_body(body_offset, per_tet_young)`**: per-tet
+  Young's modulus override for one FEM body, callable before `finalize()`.
+  Lets one mesh have different stiffness regions (e.g. stiff contact face +
+  soft interior).  Array length must equal the body's tet count (tets all of
+  whose 4 vertices lie in the body's vertex range).
+- **`examples/replay_case39.py`**: pre-recorded qpos trajectory replay on the
+  case_39 dual-panda + soft-gripper + cup + shirt scene, with defaults tuned
+  for successful cup pickup (`FRICTION=0.8`, `CLOSE_RATIO=0.5`, `PRECOND=1`).
+  Includes an opt-in `CASE39_YOUNG_PART2 / PART3` knob that demonstrates
+  per-region Young's modulus.  Bundled trajectory:
+  `assets/trajectories/qpos_case39.h5` (29 KB, 1018 frames).
+
+### Changed
+
+- **`case_39_full_scale.py` and `case_40_unified.py`**: default
+  `preconditioner_type` is now MAS-on (`CASE39_PRECOND=1` / `CASE40_PRECOND=1`)
+  now that the stitch fix above makes MAS correct on hybrid grippers.  Set
+  the env var to `0` to fall back to the prior diagonal-preconditioner
+  behavior.
+
+### Assets
+
+- **Added missing assets** that the `case_39_full_scale.py` example shipped in
+  v0.6.0 referenced but that were never tracked: `ridgeback_dual_panda2_mobile_s1_softgripper.urdf`,
+  `ridgeback_dual_panda2_mobile_s1_full.urdf`, hybrid_d STRATEGY_F (`rigid.msh`,
+  `rigid_remap.npz`, `unified.npz`), `softgriper_part2.msh`, `softgriper_part3.msh`.
+  v0.6.0 users who tried to run `case_39_full_scale.py` would hit
+  "URDF file does not exist" — v0.6.1 fixes that.
+
+## [0.6.0] — 2026-05-15
+
+### Added
+
+- **`SimEngine.set_log_level(level)`**: control per-frame solver log verbosity
+  (0 = silent via `std::cout` redirect + `printf` gating, >= 1 = verbose
+  default).  For co-simulation and piped tooling.
+- **`SimEngine.reset()`**: tear down the whole world (bodies, FEM/ABD,
+  constraints, GPU buffers) and return to an empty state with the current
+  `Config` preserved.  Re-run `load_*() + finalize()` afterwards without
+  recreating the `Engine`.
+- **Hybrid-gripper example improvements** (`case_39_full_scale.py`,
+  `case_40_unified.py`):
+  - default to `CASE40_BRIDGE_B` hybrid gripper mesh (bridge-filled
+    finger↔soft gap, fTetWild 0% bad tet, `rigid:FEM` 0.18); FEM young `1e8`.
+  - `FJ_ANCHORS=3` multi-anchor green→finger fixed joint to fix the
+    anchor/finger split observed in the single-anchor variant.
+
 ## [0.5.0] — 2026-05-15
 
 ### Added
