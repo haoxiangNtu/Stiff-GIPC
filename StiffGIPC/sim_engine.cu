@@ -28,7 +28,8 @@
 #include "abd_system/abd_system.h"
 #include <Eigen/Geometry>
 
-// Defined at GLOBAL scope in GIPC.cu (GIPC class is not in namespace gipc).
+// Defined at GLOBAL scope in GIPC.cu (the GIPC class is not in namespace gipc).
+// Declared here outside `namespace gipc` so it resolves to ::g_gipc_log_level.
 extern int g_gipc_log_level;
 
 namespace gipc
@@ -98,10 +99,12 @@ SimEngine::~SimEngine()
     delete m_impl;
 }
 
-// Null sink to fully silence std::cout when log_level <= 0 (catches every
-// std::cout-based engine print in one shot).  printf-based prints are gated
-// separately by g_gipc_log_level.  Python print() is unaffected (uses Python
-// sys.stdout, not C++ std::cout).
+// Null sink to fully silence std::cout when log_level <= 0.  This catches every
+// std::cout-based engine print in one shot ([SimEngine]/[ABDSystem]/
+// [UrdfSceneImporter]/solve_subIP banner) without gating each call site.
+// printf-based prints are gated separately by g_gipc_log_level.  Python's
+// print() goes through Python's own sys.stdout (not C++ std::cout) so user
+// output is unaffected.
 namespace {
 struct NullStreambuf : std::streambuf { int overflow(int c) override { return c; } };
 NullStreambuf  g_null_streambuf;
@@ -110,13 +113,13 @@ std::streambuf* g_saved_cout_buf = nullptr;
 
 void SimEngine::set_log_level(int level)
 {
-    ::g_gipc_log_level = level;
+    ::g_gipc_log_level = level;   // global, extern'd before `namespace gipc`
     if(level <= 0)
     {
-        if(!g_saved_cout_buf)
+        if(!g_saved_cout_buf)               // redirect once
             g_saved_cout_buf = std::cout.rdbuf(&g_null_streambuf);
     }
-    else if(g_saved_cout_buf)
+    else if(g_saved_cout_buf)               // restore
     {
         std::cout.rdbuf(g_saved_cout_buf);
         g_saved_cout_buf = nullptr;
@@ -125,13 +128,14 @@ void SimEngine::set_log_level(int level)
 
 void SimEngine::reset()
 {
-    // Recreate the whole Impl: ~Impl frees GPU buffers via ~GIPC/~device_TetraData
-    // (no leak); a fresh Impl gives an empty world.  Preserve Config + re-init CUDA.
+    // Recreate the whole Impl: ~Impl runs ~GIPC and ~device_TetraData which
+    // free their GPU buffers (no leak), and a fresh Impl gives an empty world.
+    // Preserve the current config across the rebuild.
     SimEngineConfig saved_cfg = m_impl->cfg;
     delete m_impl;
     m_impl = new Impl;
     m_impl->cfg = saved_cfg;
-    init_cuda();
+    init_cuda();   // re-resolve assets dir + cudaSetDevice on the fresh Impl
 }
 
 void SimEngine::set_config(const SimEngineConfig& cfg)
@@ -288,7 +292,13 @@ void SimEngine::load_mesh(const std::string&     mesh_path,
     }
 
     auto bt = (body_type == 0) ? gipc::BodyType::ABD : gipc::BodyType::FEM;
-    auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
+    BodyBoundaryType bb;
+    switch(boundary_type) {
+        case 1:  bb = BodyBoundaryType::Fixed;    break;
+        case 2:  bb = BodyBoundaryType::Motor;    break;
+        case 3:  bb = BodyBoundaryType::Animated; break;
+        default: bb = BodyBoundaryType::Free;     break;
+    }
 
     SimpleSceneImporter imp;
     // Pass runtime metis_dir so the metis_partition library writes its
@@ -306,7 +316,9 @@ void SimEngine::load_mesh(const std::string&     mesh_path,
     std::cout << "[SimEngine] Mesh loaded: " << resolved
               << " (dim=" << dimensions
               << ", " << (body_type == 0 ? "ABD" : "FEM")
-              << ", " << (boundary_type == 1 ? "Fixed" : "Free")
+              << ", " << (boundary_type == 1 ? "Fixed"
+                          : boundary_type == 2 ? "Motor"
+                          : boundary_type == 3 ? "Animated" : "Free")
               << ", E=" << young_modulus << ")" << std::endl;
     std::cout << "  Total verts: " << m_impl->tetMesh.vertexNum
               << ", ABD bodies: " << m_impl->tetMesh.abd_fem_count_info.abd_body_num
@@ -799,6 +811,34 @@ void SimEngine::Impl::do_upload_to_gpu()
               tetMesh.vertexNum * sizeof(int), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.velocities, tetMesh.velocities.data(),
               tetMesh.vertexNum * sizeof(double3), cudaMemcpyHostToDevice);
+    // [MAS stitch index fix] When MAS is active (preconditioner_type != 0), FEM
+    // bodies are loaded in metis-SORTED order: engine vertex (off+i) holds INPUT
+    // vertex (off + sort_index[i]); vertex_metis_to_input[engine] = input.
+    // Stitch springs are added by the user in INPUT-vertex order, so without
+    // this translation they pull the WRONG engine vertices -> garbage forces ->
+    // Newton never converges (the case_40 MAS-on bug). P_type==0 => perm is
+    // identity => skipped (no-op).
+    if(cfg.preconditioner_type != 0 && tetMesh.softNum > 0
+       && !tetMesh.vertex_metis_to_input.empty())
+    {
+        const auto& m2i = tetMesh.vertex_metis_to_input;  // engine_idx -> input_idx
+        std::vector<int> i2m(m2i.size(), -1);             // input_idx -> engine_idx
+        for(int e = 0; e < (int)m2i.size(); e++)
+            if(m2i[e] >= 0 && m2i[e] < (int)i2m.size())
+                i2m[m2i[e]] = e;
+        auto to_engine = [&](int input_id) -> int {
+            return (input_id >= 0 && input_id < (int)i2m.size() && i2m[input_id] >= 0)
+                       ? i2m[input_id] : input_id;
+        };
+        for(auto& v : tetMesh.targetIndex)
+            v = static_cast<uint32_t>(to_engine(static_cast<int>(v)));
+        for(auto& v : d_tetMesh.stitch_paired_vertex)  // ABD anchors: identity, safe
+            v = to_engine(v);
+        if(g_gipc_log_level >= 1)
+            printf("[MAS-fix] remapped %d stitch FEM indices input->engine (metis) order\n",
+                   tetMesh.softNum);
+    }
+
     safe_copy(d_tetMesh.targetIndex, tetMesh.targetIndex.data(),
               tetMesh.softNum * sizeof(uint32_t), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.targetVert, tetMesh.targetPos.data(),
@@ -2215,7 +2255,13 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     }
 
     auto bt = (body_type == 0) ? gipc::BodyType::ABD : gipc::BodyType::FEM;
-    auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
+    BodyBoundaryType bb;
+    switch(boundary_type) {
+        case 1:  bb = BodyBoundaryType::Fixed;    break;
+        case 2:  bb = BodyBoundaryType::Motor;    break;
+        case 3:  bb = BodyBoundaryType::Animated; break;
+        default: bb = BodyBoundaryType::Free;     break;
+    }
 
     if(bt == gipc::BodyType::ABD && (dimensions == 2 || verts_per_face == 3))
     {
@@ -2297,7 +2343,13 @@ void SimEngine::Impl::load_from_temp_file(
     double young_modulus, int boundary_type)
 {
     auto bt = (body_type == 0) ? gipc::BodyType::ABD : gipc::BodyType::FEM;
-    auto bb = (boundary_type == 1) ? BodyBoundaryType::Fixed : BodyBoundaryType::Free;
+    BodyBoundaryType bb;
+    switch(boundary_type) {
+        case 1:  bb = BodyBoundaryType::Fixed;    break;
+        case 2:  bb = BodyBoundaryType::Motor;    break;
+        case 3:  bb = BodyBoundaryType::Animated; break;
+        default: bb = BodyBoundaryType::Free;     break;
+    }
 
     if(bt == gipc::BodyType::ABD && (dimensions == 2 || verts_per_face == 3))
     {

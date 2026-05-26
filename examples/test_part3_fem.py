@@ -2,6 +2,7 @@
 """Test part3.msh as FEM body alone (no arm) — diagnose if mesh is broken."""
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import _use_dailyv2_engine
 import numpy as np
 from pathlib import Path
 from stiff_physics.engine import Engine, Config

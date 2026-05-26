@@ -405,6 +405,8 @@ class Engine:
     def add_ground_collision_skip(self, body_id: int) -> None:
         self._engine.add_ground_collision_skip(body_id)
 
+    # ---- Hybrid ABD-FEM mesh (Phase 3) ----
+
     def add_hybrid_fem_body(self, hybrid_data, transform=None,
                             target_abd_body_offset=None):
         """Load a hybrid ABD-FEM tet mesh produced by tools/build_hybrid_mesh.py.

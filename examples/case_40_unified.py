@@ -197,7 +197,15 @@ def main():
         semi_implicit_enabled=bool(int(os.environ.get("CASE40_SEMI", "0"))),
         semi_implicit_beta_tol=5e-2,
         semi_implicit_min_iter=1, newton_tol=5e-2,
-        preconditioner_type=0, ground_offset=-1.67,   # case_39 full-scale
+        # MAS OFF (diagonal) by default: on the full cup-grab replay it's ~7-12%
+        # FASTER than MAS here (this scene is contact-bound, so MAS's per-frame
+        # metis-rebuild overhead exceeds its linear-solve savings). MAS-on now
+        # WORKS correctly (engine stitch-index metis-remap fix in sim_engine.cu
+        # do_upload_to_gpu) — set CASE40_PRECOND=1 to try it; useful for
+        # solve-bound (big-FEM/light-contact) scenes, not this one.
+        preconditioner_type=int(os.environ.get("CASE40_PRECOND", "0")),
+        pcg_tol=float(os.environ.get("CASE40_PCG_TOL", "1e-4")),
+        ground_offset=-1.67,   # case_39 full-scale
         assets_dir=_ASSETS_DIR + "",
     )
     cfg._cfg.collision_detection_buff_scale = float(
@@ -417,6 +425,8 @@ def main():
     # 3 passes — load all hybrid rigid ABDs, then all hybrid FEM bodies,
     # then wire stitch springs + fixed joints.
     grippers = []  # list of dicts populated across passes
+    _SKIP_CUP   = os.environ.get("CASE40_SKIP_CUP")   == "1"  # DIAG tear-down
+    _SKIP_CLOTH = os.environ.get("CASE40_SKIP_CLOTH") == "1"  # DIAG tear-down
 
     # Pass 1: load 4 hybrid rigid sub-meshes (ABD)
     for label in FINGER_LABELS:
@@ -446,12 +456,16 @@ def main():
     cup_T = np.eye(4)
     cup_T[:3, :3] *= cup_scale
     cup_T[:3, 3] = cup_xyz
-    eng.load_mesh(CUP_MSH, dimensions=3, body_type="ABD",
-                  transform=cup_T, young_modulus=1e8, boundary_type="Free")
-    cup_rec = eng.get_load_records()[-1]
-    cup_id = cup_rec.body_offset
-    print(f"[case38] cup body_id={cup_id} verts={cup_rec.vertex_count} "
-          f"scale={cup_scale} at {cup_xyz}", flush=True)
+    cup_id = None
+    if not _SKIP_CUP:
+        eng.load_mesh(CUP_MSH, dimensions=3, body_type="ABD",
+                      transform=cup_T, young_modulus=1e8, boundary_type="Free")
+        cup_rec = eng.get_load_records()[-1]
+        cup_id = cup_rec.body_offset
+        print(f"[case38] cup body_id={cup_id} verts={cup_rec.vertex_count} "
+              f"scale={cup_scale} at {cup_xyz}", flush=True)
+    else:
+        print("[case40 DIAG] CASE40_SKIP_CUP=1 — cup NOT loaded", flush=True)
 
     # Pass 2: load 4 hybrid FEM unified meshes
     for g in grippers:
@@ -469,13 +483,17 @@ def main():
     shirt_T = np.eye(4)
     shirt_T[:3, :3] *= shirt_scale
     shirt_T[:3, 3] = shirt_xyz
-    eng.load_mesh(SHIRT_OBJ, dimensions=2, body_type="FEM",
-                  transform=shirt_T,
-                  young_modulus=float(os.environ.get("CASE38_SHIRT_YOUNG", "1e2")))
-    shirt_rec = eng.get_load_records()[-1]
-    print(f"[case38] shirt fem_local_id={shirt_rec.body_offset} "
-          f"verts={shirt_rec.vertex_count} scale={shirt_scale} at {shirt_xyz}",
-          flush=True)
+    if not _SKIP_CLOTH:
+        eng.load_mesh(SHIRT_OBJ, dimensions=2, body_type="FEM",
+                      transform=shirt_T,
+                      young_modulus=float(os.environ.get("CASE38_SHIRT_YOUNG", "1e2")))
+        shirt_rec = eng.get_load_records()[-1]
+        print(f"[case38] shirt fem_local_id={shirt_rec.body_offset} "
+              f"verts={shirt_rec.vertex_count} scale={shirt_scale} at {shirt_xyz}",
+              flush=True)
+    else:
+        shirt_rec = None
+        print("[case40 DIAG] CASE40_SKIP_CLOTH=1 — shirt NOT loaded", flush=True)
 
     # Compute FEM global ids now (n_abd_total stable after all ABD loaded)
     n_abd_total = sum(1 for r in eng.get_load_records() if r.body_type == 0)
@@ -552,26 +570,28 @@ def main():
     # Exclude non-finger arm bodies from cup (don't bash the cup with arm
     # link/hand collision OBBs — only the finger gripper should touch it).
     finger_offsets = {g['finger_id'] for g in grippers}
-    for arm_id in arm_ids:
-        if arm_id in finger_offsets:
-            continue
-        eng.native.add_collision_exclusion(arm_id, cup_id)
+    if cup_id is not None:
+        for arm_id in arm_ids:
+            if arm_id in finger_offsets:
+                continue
+            eng.native.add_collision_exclusion(arm_id, cup_id)
 
     # SHIRT collision policy (case_27 fast-path style): exclude EVERY
     # URDF arm body (links + finger ABDs) from shirt collision detection.
     # Only the hybrid gripper components (rigid ABD + FEM softpad) collide
     # with the shirt.  This avoids costly contact processing against the
     # blocky OBB arm geometry — shirt only "sees" the soft gripper.
-    n_abd_total_for_shirt = sum(1 for r in eng.get_load_records() if r.body_type == 0)
-    shirt_global_id = n_abd_total_for_shirt + shirt_rec.body_offset
-    for arm_id in arm_ids:
-        eng.native.add_collision_exclusion(arm_id, shirt_global_id)
-    # Hybrid rigid ABD ↔ shirt KEPT (gripper closes on the shirt).
-    # Hybrid FEM ↔ shirt KEPT (softpad presses the shirt).
-    # Cup ↔ shirt: shirt may settle on cup — keep collision (default).
-    print(f"[case38] shirt global_id={shirt_global_id}: excluded vs all "
-          f"{len(arm_ids)} arm ABD bodies; collides only with hybrid grippers + cup",
-          flush=True)
+    if shirt_rec is not None:
+        n_abd_total_for_shirt = sum(1 for r in eng.get_load_records() if r.body_type == 0)
+        shirt_global_id = n_abd_total_for_shirt + shirt_rec.body_offset
+        for arm_id in arm_ids:
+            eng.native.add_collision_exclusion(arm_id, shirt_global_id)
+        # Hybrid rigid ABD ↔ shirt KEPT (gripper closes on the shirt).
+        # Hybrid FEM ↔ shirt KEPT (softpad presses the shirt).
+        # Cup ↔ shirt: shirt may settle on cup — keep collision (default).
+        print(f"[case38] shirt global_id={shirt_global_id}: excluded vs all "
+              f"{len(arm_ids)} arm ABD bodies; collides only with hybrid grippers + cup",
+              flush=True)
 
     # Hybrid FEM ↔ ground half-plane: default SKIP (env=0).  Set
     # CASE38_FEM_GROUND_COLLISION=1 to enable hybrid softpad ↔ ground
@@ -682,7 +702,7 @@ def main():
     finger_id_set = {g['finger_id'] for g in grippers}
     abd_id_set    = {g['abd_id']    for g in grippers}
     fem_local_id_set = {g['fem_rec'].body_offset for g in grippers}
-    shirt_local_id = shirt_rec.body_offset
+    shirt_local_id = shirt_rec.body_offset if shirt_rec is not None else -999
 
     body_meshes = []
     for r in recs:

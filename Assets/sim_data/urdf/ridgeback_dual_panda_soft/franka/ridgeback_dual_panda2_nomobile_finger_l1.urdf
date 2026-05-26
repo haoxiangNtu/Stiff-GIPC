@@ -1,0 +1,1124 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="bot">
+  
+  <material name="dark_grey">
+    <color rgba="0.2 0.2 0.2 1.0" />
+  </material>
+  <material name="light_grey">
+    <color rgba="0.4 0.4 0.4 1.0" />
+  </material>
+  <material name="red">
+    <color rgba="0.8 0.0 0.0 1.0" />
+  </material>
+  <material name="white">
+    <color rgba="0.9 0.9 0.9 1.0" />
+  </material>
+  <material name="yellow">
+    <color rgba="0.8 0.8 0.0 1.0" />
+  </material>
+  <material name="black">
+    <color rgba="0.15 0.15 0.15 1.0" />
+  </material>
+  <link name="front_rocker_link">
+    <visual>
+      <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/rocker.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <inertial>
+      <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0 0 0" />
+      <mass value="10.267" />
+      <inertia ixx="0.0288" ixy="2.20484e-6" ixz="-1.3145e-5" iyy="0.4324" iyz="1.8944e-3" izz="0.4130" />
+    </inertial>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/front_rocker_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="front_rocker" type="fixed">
+    <parent link="axle_link" />
+    <child link="front_rocker_link" />
+    <origin rpy="0 0 0" xyz="0.319 0 0" />
+  </joint>
+  <link name="front_left_wheel_link">
+    <visual>
+      <origin rpy="1.5707963267948966 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/wheel.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/front_left_wheel_link_obb.obj" /></geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <mass value="2.3" />
+      <inertia ixx="3.3212e-3" ixy="0" ixz="0" iyy="6.6424e-3" iyz="0" izz="3.3212e-3" />
+    </inertial>
+  </link>
+  <joint name="front_left_wheel" type="fixed">
+    <parent link="front_rocker_link" />
+    <child link="front_left_wheel_link" />
+    <origin rpy="0 0 0" xyz="0 0.27549999999999997 0" />
+  </joint>
+  <link name="front_right_wheel_link">
+    <visual>
+      <origin rpy="1.5707963267948966 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/wheel.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/front_right_wheel_link_obb.obj" /></geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <mass value="2.3" />
+      <inertia ixx="3.3212e-3" ixy="0" ixz="0" iyy="6.6424e-3" iyz="0" izz="3.3212e-3" />
+    </inertial>
+  </link>
+  <joint name="front_right_wheel" type="fixed">
+    <parent link="front_rocker_link" />
+    <child link="front_right_wheel_link" />
+    <origin rpy="0 0 0" xyz="0 -0.27549999999999997 0" />
+  </joint>
+  <link name="rear_rocker_link">
+    <visual>
+      <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/rocker.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <inertial>
+      <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0 0 0" />
+      <mass value="10.267" />
+      <inertia ixx="0.0288" ixy="2.20484e-6" ixz="-1.3145e-5" iyy="0.4324" iyz="1.8944e-3" izz="0.4130" />
+    </inertial>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/rear_rocker_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="rear_rocker" type="fixed">
+    <parent link="axle_link" />
+    <child link="rear_rocker_link" />
+    <origin rpy="0 0 0" xyz="-0.319 0 0" />
+    <axis xyz="1 0 0" />
+    <limit effort="0" velocity="0" />
+  </joint>
+  <link name="rear_left_wheel_link">
+    <visual>
+      <origin rpy="1.5707963267948966 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/wheel.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/rear_left_wheel_link_obb.obj" /></geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <mass value="2.3" />
+      <inertia ixx="3.3212e-3" ixy="0" ixz="0" iyy="6.6424e-3" iyz="0" izz="3.3212e-3" />
+    </inertial>
+  </link>
+  <joint name="rear_left_wheel" type="fixed">
+    <parent link="rear_rocker_link" />
+    <child link="rear_left_wheel_link" />
+    <origin rpy="0 0 0" xyz="0 0.27549999999999997 0" />
+  </joint>
+  <link name="rear_right_wheel_link">
+    <visual>
+      <origin rpy="1.5707963267948966 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/wheel.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/rear_right_wheel_link_obb.obj" /></geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <mass value="2.3" />
+      <inertia ixx="3.3212e-3" ixy="0" ixz="0" iyy="6.6424e-3" iyz="0" izz="3.3212e-3" />
+    </inertial>
+  </link>
+  <joint name="rear_right_wheel" type="fixed">
+    <parent link="rear_rocker_link" />
+    <child link="rear_right_wheel_link" />
+    <origin rpy="0 0 0" xyz="0 -0.27549999999999997 0" />
+  </joint>
+  <link name="chassis_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/body.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/chassis_link_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0.012 0.002 0.067" />
+      <mass value="165.304" />
+      <inertia ixx="4.4744" ixy="0.03098" ixz="0.003647" iyy="7.1624" iyz="0.1228" izz="4.6155" />
+    </inertial>
+  </link>
+  <link name="riser_link">
+    <visual>
+      <origin rpy="0 0 0.7853981633974483" xyz="0 0 0.0275" />
+      <geometry>
+        <box size="0.493 0.493 0.055" />
+      </geometry>
+      <material name="light_grey" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/riser_link_obb.obj" /></geometry>
+    </collision>
+  </link>
+  <joint name="riser_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.22" />
+    <parent link="chassis_link" />
+    <child link="riser_link" />
+  </joint>
+  <joint name="right_side_cover_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="chassis_link" />
+    <child link="right_side_cover_link" />
+  </joint>
+  <joint name="left_side_cover_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="chassis_link" />
+    <child link="left_side_cover_link" />
+  </joint>
+  <link name="left_side_cover_link">
+    <visual>
+      <origin rpy="0 0 3.141592653589793" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/side-cover.stl" />
+      </geometry>
+      <material name="yellow" />
+    </visual>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_side_cover_link_placeholder.obj" /></geometry></collision></link>
+  <link name="right_side_cover_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/side-cover.stl" />
+      </geometry>
+      <material name="yellow" />
+    </visual>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_side_cover_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="front_cover_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="chassis_link" />
+    <child link="front_cover_link" />
+  </joint>
+  <link name="front_cover_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/end-cover.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/front_cover_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="rear_cover_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="chassis_link" />
+    <child link="rear_cover_link" />
+  </joint>
+  <link name="rear_cover_link">
+    <visual>
+      <origin rpy="0 0 3.141592653589793" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/end-cover.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/rear_cover_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="front_lights_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="chassis_link" />
+    <child link="front_lights_link" />
+  </joint>
+  <joint name="rear_lights_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="chassis_link" />
+    <child link="rear_lights_link" />
+  </joint>
+  <link name="front_lights_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/lights.stl" />
+      </geometry>
+      <material name="white" />
+    </visual>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/front_lights_link_placeholder.obj" /></geometry></collision></link>
+  <link name="rear_lights_link">
+    <visual>
+      <origin rpy="0 0 3.141592653589793" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/lights.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/rear_lights_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="top_link_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 -0.22000000000000003" />
+    <parent link="riser_link" />
+    <child link="top_link" />
+  </joint>
+  <link name="top_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/top.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/top_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="axle_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.05" />
+    <parent link="chassis_link" />
+    <child link="axle_link" />
+  </joint>
+  <link name="axle_link">
+    <visual>
+      <origin rpy="0 1.5707963267948966 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/ridgeback/axle.stl" />
+      </geometry>
+      <material name="black" />
+    </visual>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/axle_link_placeholder.obj" /></geometry></collision></link>
+  <link name="imu_link">
+    <inertial>
+      <mass value="0.001" />
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <inertia ixx="1e-09" ixy="0.0" ixz="0.0" iyy="1e-09" iyz="0.0" izz="1e-09" />
+    </inertial>
+  <collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/imu_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="imu_joint" type="fixed">
+    <parent link="chassis_link" />
+    <child link="imu_link" />
+    <origin rpy="0 0 0" xyz="0.2085 -0.2902 0.1681" />
+  </joint>
+  <link name="mid_mount"><collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/mid_mount_placeholder.obj" /></geometry></collision></link>
+  <joint name="mid_mount_joint" type="fixed">
+    <parent link="riser_link" />
+    <child link="mid_mount" />
+    <origin rpy="0 0 0" xyz="0 0 0.06" />
+  </joint>
+  <joint name="plate_joint_chassis_link" type="fixed">
+    <parent link="chassis_link" />
+    <child link="plate_link" />
+    <origin rpy="0 0 0" xyz="-0.000336134062427291 0 0.27635" />
+  </joint>
+  <link name="plate_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0558085027287502 -0.00192096044152704 0.173567629143533" />
+      <mass value="90.0312362620102" />
+      <inertia ixx="1.6570676534357" ixy="-0.00706186252873891" ixz="0.00361796016253129" iyy="1.61130155448647" iyz="-0.000348185679179579" izz="2.77846224960089" />
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/visual/plate_link.dae" />
+      </geometry>
+      <material name="dark_grey" />
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/plate_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="arm_mount_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.00107003289882809 2.17207080822171E-16 0.190491726134412" />
+      <mass value="14.6496607420397" />
+      <inertia ixx="0.236587930280655" ixy="-2.02070009988041E-17" ixz="0.000149015705234439" iyy="0.0821539122931519" iyz="7.53396792749364E-17" izz="0.250238591682975" />
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/visual/arm_mount_link.dae" />
+      </geometry>
+      <material name="dark_grey" />
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/arm_mount_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="arm_mount_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.213183008906351 0 0.4105" />
+    <parent link="plate_link" />
+    <child link="arm_mount_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+  
+  
+  
+  
+ <link name="camera_connect_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.038 -0.055 0" />
+      <mass value="14.6496607420397" />
+      <inertia ixx="0.236587930280655" ixy="-2.02070009988041E-17" ixz="0.000149015705234439" iyy="0.0821539122931519" iyz="7.53396792749364E-17" izz="0.250238591682975" />
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="-0.038 -0.055 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/visual/camera_connect_link.stl" />
+      </geometry>
+      <material name="dark_grey" />
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="-0.038 -0.055 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/camera_connect_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  
+  <joint name="camera_connect_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.00138842854386301 0 0.288" />
+    <parent link="arm_mount_link" />
+    <child link="camera_connect_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+  
+  
+  
+  
+  
+  
+  
+  <link name="camera_plate_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 -1.49694193241289E-18 0.00899334012579966" />
+      <mass value="0.00388902652413027" />
+      <inertia ixx="1.9663179236296E-06" ixy="3.83468143048894E-22" ixz="8.34767800444982E-23" iyy="4.80508728013243E-07" iyz="-1.36579299329078E-22" izz="1.7394122918064E-06" />
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/visual/camera_plate_link.dae" />
+      </geometry>
+      <material name="dark_grey" />
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/camera_plate_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="camera_plate_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.16" />
+    <parent link="camera_connect_link" />
+    <child link="camera_plate_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <link name="camera_v_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-2.49809751381447E-05 0.0249999999999961 0.0231885974546207" />
+      <mass value="0.0160961981947474" />
+      <inertia ixx="2.97117876479573E-05" ixy="1.31356252051074E-20" ixz="-2.34125548013746E-09" iyy="3.74755039055115E-06" iyz="2.21289165304718E-20" izz="2.98395555615597E-05" />
+    </inertial>
+    
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/camera_v_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="camera_v_joint" type="fixed">
+    <origin rpy="0 0.23517 0" xyz="0 -0.025 0.022" />
+    <parent link="camera_plate_link" />
+    <child link="camera_v_link" />
+    <axis xyz="0 1 0" />
+    <limit effort="0" lower="0" upper="3.14" velocity="0" />
+  </joint>
+  <link name="camera_base_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0157074916299545 -1.38958220189502E-05 0.0198077154563125" />
+      <mass value="0.235698299101959" />
+      <inertia ixx="0.000258769084077323" ixy="-2.62931621224485E-08" ixz="-1.58157157408714E-07" iyy="4.73204226939045E-05" iyz="-1.99295983591576E-08" izz="0.000246405415827245" />
+    </inertial>
+    
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/camera_base_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="camera_base_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.001632 0.025 0.022" />
+    <parent link="camera_v_link" />
+    <child link="camera_base_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="mind360_joint_chassis_link" type="fixed">
+    <parent link="chassis_link" />
+    <child link="mid360_mount_link" />
+    <origin rpy="0 0 -3.141592653589793" xyz="-0.425673211996052 5.42129062934641E-05 0.189999999999992" />
+  </joint>
+  <link name="mid360_mount_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000213077173333742 5.43564421433E-05 0.0221378856564563" />
+      <mass value="0.139980956129377" />
+      <inertia ixx="4.17035885590201E-05" ixy="-5.70390862976962E-09" ixz="3.05652236052174E-07" iyy="4.5018546901597E-05" iyz="-6.55071715111406E-10" izz="6.87174847144556E-05" />
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/visual/mid_mount_link.dae" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/mid360_mount_link_obb.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_arm_joint_arm_mount_link" type="fixed">
+    <parent link="arm_mount_link" />
+    <child link="left_arm_mount_link" />
+    <origin rpy="-0.7853981633974483 0 0" xyz="0.0443794207848724 0.146939232757262 0.254808752455336" />
+  </joint>
+  <link name="left_arm_mount_link"><collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_mount_link_placeholder.obj" /></geometry></collision></link>
+  <joint name="left_arm_joint_visual_link" type="fixed">
+    <parent link="left_arm_mount_link" />
+    <child link="left_arm_link0" />
+    <origin rpy="0 0 0" xyz="0 0 0" />
+  </joint>
+  
+  <link name="left_arm_link0">
+    <visual name="left_arm_link0_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link0.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link0_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link0_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0172 0.0004 0.0745" />
+      <mass value="2.3966" />
+      <inertia ixx="0.009" ixy="0.0" ixz="0.002" iyy="0.0115" iyz="0.0" izz="0.0085" />
+    </inertial>
+  </link>
+  
+  <link name="left_arm_link1">
+    <visual name="left_arm_link1_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link1.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link1_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link1_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0000004128 -0.0181251324 -0.0386035970" />
+      <mass value="2.9274653454" />
+      <inertia ixx="0.023927316485107913" ixy="1.3317903455714081e-05" ixz="-0.00011404774918616684" iyy="0.0224821613275756" iyz="-0.0019950320628240115" izz="0.006350098258530016" />
+    </inertial>
+  </link>
+  <joint name="left_arm_joint1" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.333" />
+    <parent link="left_arm_link0" />
+    <child link="left_arm_link1" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-2.7437" upper="2.7437" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.7437" soft_upper_limit="2.7437" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="left_arm_link2">
+    <visual name="left_arm_link2_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link2.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link2_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link2_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0031828864 -0.0743221644 0.0088146084" />
+      <mass value="2.9355370338" />
+      <inertia ixx="0.041938946257609425" ixy="0.00020257331521090626" ixz="0.004077784227179924" iyy="0.02514514885014724" iyz="-0.0042252158006570156" izz="0.06170214472888839" />
+    </inertial>
+  </link>
+  <joint name="left_arm_joint2" type="revolute">
+    <origin rpy="-1.570796326794897 0 0" xyz="0 0 0" />
+    <parent link="left_arm_link1" />
+    <child link="left_arm_link2" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-1.7837" upper="1.7837" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-1.7837" soft_upper_limit="1.7837" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="left_arm_link3">
+    <visual name="left_arm_link3_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link3.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link3_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link3_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0407015686 -0.0048200565 -0.0289730823" />
+      <mass value="2.2449013699" />
+      <inertia ixx="0.02410142547240885" ixy="0.002404694559042109" ixz="-0.002856269270114313" iyy="0.01974053266708178" iyz="-0.002104212683891874" izz="0.019044494482244823" />
+    </inertial>
+  </link>
+  <joint name="left_arm_joint3" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0 -0.316 0" />
+    <parent link="left_arm_link2" />
+    <child link="left_arm_link3" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-2.9007" upper="2.9007" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.9007" soft_upper_limit="2.9007" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="left_arm_link4">
+    <visual name="left_arm_link4_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link4.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link4_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link4_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0459100965 0.0630492960 -0.0085187868" />
+      <mass value="2.6155955791" />
+      <inertia ixx="0.03452998321913202" ixy="0.01322552265982813" ixz="0.01015142998484113" iyy="0.028881621933049058" iyz="-0.0009762833870704552" izz="0.04125471171146641" />
+    </inertial>
+  </link>
+  <joint name="left_arm_joint4" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0.0825 0 0" />
+    <parent link="left_arm_link3" />
+    <child link="left_arm_link4" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-3.0421" upper="-0.1518" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-3.0421" soft_upper_limit="-0.1518" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="left_arm_link5">
+    <visual name="left_arm_link5_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link5.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link5_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link5_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0016039605 0.0292536262 -0.0972965990" />
+      <mass value="2.3271207594" />
+      <inertia ixx="0.051610278463662895" ixy="-0.005715173387783472" ixz="-0.0035673167625872135" iyy="0.04787729713371481" iyz="0.010673985108535986" izz="0.016423625579357254" />
+    </inertial>
+  </link>
+  <joint name="left_arm_joint5" type="revolute">
+    <origin rpy="-1.570796326794897 0 0" xyz="-0.0825 0.384 0" />
+    <parent link="left_arm_link4" />
+    <child link="left_arm_link5" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="-2.8065" upper="2.8065" velocity="5.26" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.8065" soft_upper_limit="2.8065" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="left_arm_link6">
+    <visual name="left_arm_link6_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link6.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link6_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link6_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0597131221 -0.0410294666 -0.0101692726" />
+      <mass value="1.8170376524" />
+      <inertia ixx="0.005412333594383447" ixy="0.006193456360285834" ixz="0.0014219289306117652" iyy="0.014058329545509979" iyz="-0.0013140753741120031" izz="0.016080817924212554" />
+    </inertial>
+  </link>
+  <joint name="left_arm_joint6" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0 0 0" />
+    <parent link="left_arm_link5" />
+    <child link="left_arm_link6" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="0.5445" upper="4.5169" velocity="4.18" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="0.5445" soft_upper_limit="4.5169" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="left_arm_link7">
+    <visual name="left_arm_link7_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link7.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_arm_link7_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link7_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0045225817 0.0086261921 -0.0161633251" />
+      <mass value="0.6271432862" />
+      <inertia ixx="0.00021092389150104718" ixy="-2.433299114461931e-05" ixz="4.564480393778983e-05" iyy="0.00017718568002411474" iyz="8.744070223226438e-05" izz="5.993190599659971e-05" />
+    </inertial>
+  </link>
+  <joint name="left_arm_joint7" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0.088 0 0" />
+    <parent link="left_arm_link6" />
+    <child link="left_arm_link7" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="-3.0159" upper="3.0159" velocity="5.26" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-3.0159" soft_upper_limit="3.0159" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="left_arm_link8"><collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_link8_placeholder.obj" /></geometry></collision></link>
+  <joint name="left_arm_joint8" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.107" />
+    <parent link="left_arm_link7" />
+    <child link="left_arm_link8" />
+  </joint>
+  <joint name="left_hand_joint_left_arm_link8" type="fixed">
+    <parent link="left_arm_link8" />
+    <child link="left_arm_hand" />
+    <origin rpy="0 0 -0.7853981633974483" xyz="0 0 0" />
+  </joint>
+  <link name="left_arm_hand">
+    <visual name="left_hand_hand_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/franka_hand/visual/hand.dae" />
+      </geometry>
+    </visual>
+    <collision name="left_hand_hand_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_arm_hand_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0000376 0.0119128 0.0207260" />
+      <mass value="0.6544" />
+      <inertia ixx="0.00186" ixy="0.0" ixz="0.0" iyy="0.0003" iyz="-2e-05" izz="0.00174" />
+    </inertial>
+  </link>
+  
+  <link name="left_hand_hand_tcp"><collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/left_hand_hand_tcp_placeholder.obj" /></geometry></collision></link>
+  <joint name="left_hand_hand_tcp_joint" type="fixed">
+    
+    <origin rpy="0 0 0" xyz="0 0 0.176" />
+    <parent link="left_arm_hand" />
+    <child link="left_hand_hand_tcp" />
+  </joint>
+  <link name="left_arm_leftfinger">
+    <visual name="left_hand_leftfinger_visual">
+    <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/collision/flex_griper_connect.stl" />
+      </geometry>
+    </visual>
+    
+    <collision name="left_hand_leftfinger_collision">
+    <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes_finger_l1/left_arm_leftfinger_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0.0145644 0.0227941" />
+      <mass value="0.1" />
+      <inertia ixx="3.01220925051e-05" ixy="0.0" ixz="0.0" iyy="2.95873808038e-05" iyz="0.0" izz="6.95125211657e-06" />
+    </inertial>
+  </link>
+  <link name="left_arm_rightfinger">
+    <visual name="left_hand_rightfinger_visual">
+      <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/collision/flex_griper_connect.stl" />
+      </geometry>
+    </visual>
+    <collision name="left_hand_rightfinger_collision">
+      <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes_finger_l1/left_arm_rightfinger_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 3.141592653589793" xyz="0 0.0145644 0.0227941" />
+      <mass value="0.1" />
+      <inertia ixx="3.01220925051e-05" ixy="0.0" ixz="0.0" iyy="2.95873808038e-05" iyz="0.0" izz="6.95125211657e-06" />
+    </inertial>
+  </link>
+  <joint name="left_arm_finger_joint1" type="prismatic">
+    <parent link="left_arm_hand" />
+    <child link="left_arm_leftfinger" />
+    <origin rpy="0 0 0" xyz="0 0 0.0584" />
+    <axis xyz="0 1 0" />
+    <limit effort="100" lower="0.0" upper="0.04" velocity="0.2" />
+    <dynamics damping="0.3" />
+  </joint>
+  <joint name="left_arm_finger_joint2" type="prismatic">
+    <parent link="left_arm_hand" />
+    <child link="left_arm_rightfinger" />
+    <origin rpy="0 0 3.141592653589793" xyz="0 0 0.0584" />
+    <axis xyz="0 1 0" />
+    <limit effort="100" lower="0.0" upper="0.04" velocity="0.2" />
+    
+    <dynamics damping="0.3" />
+  </joint>
+  <joint name="right_arm_joint_arm_mount_link" type="fixed">
+    <parent link="arm_mount_link" />
+    <child link="right_arm_link0" />
+    <origin rpy="0.7853981633974483 0 0" xyz="0.0443794207848722 -0.146808752455336 0.254939232757261" />
+  </joint>
+  
+  <link name="right_arm_link0">
+    <visual name="right_arm_link0_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link0.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link0_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link0_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0172 0.0004 0.0745" />
+      <mass value="2.3966" />
+      <inertia ixx="0.009" ixy="0.0" ixz="0.002" iyy="0.0115" iyz="0.0" izz="0.0085" />
+    </inertial>
+  </link>
+  
+  <link name="right_arm_link1">
+    <visual name="right_arm_link1_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link1.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link1_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link1_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0000004128 -0.0181251324 -0.0386035970" />
+      <mass value="2.9274653454" />
+      <inertia ixx="0.023927316485107913" ixy="1.3317903455714081e-05" ixz="-0.00011404774918616684" iyy="0.0224821613275756" iyz="-0.0019950320628240115" izz="0.006350098258530016" />
+    </inertial>
+  </link>
+  <joint name="right_arm_joint1" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.333" />
+    <parent link="right_arm_link0" />
+    <child link="right_arm_link1" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-2.7437" upper="2.7437" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.7437" soft_upper_limit="2.7437" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="right_arm_link2">
+    <visual name="right_arm_link2_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link2.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link2_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link2_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0031828864 -0.0743221644 0.0088146084" />
+      <mass value="2.9355370338" />
+      <inertia ixx="0.041938946257609425" ixy="0.00020257331521090626" ixz="0.004077784227179924" iyy="0.02514514885014724" iyz="-0.0042252158006570156" izz="0.06170214472888839" />
+    </inertial>
+  </link>
+  <joint name="right_arm_joint2" type="revolute">
+    <origin rpy="-1.570796326794897 0 0" xyz="0 0 0" />
+    <parent link="right_arm_link1" />
+    <child link="right_arm_link2" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-1.7837" upper="1.7837" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-1.7837" soft_upper_limit="1.7837" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="right_arm_link3">
+    <visual name="right_arm_link3_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link3.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link3_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link3_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0407015686 -0.0048200565 -0.0289730823" />
+      <mass value="2.2449013699" />
+      <inertia ixx="0.02410142547240885" ixy="0.002404694559042109" ixz="-0.002856269270114313" iyy="0.01974053266708178" iyz="-0.002104212683891874" izz="0.019044494482244823" />
+    </inertial>
+  </link>
+  <joint name="right_arm_joint3" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0 -0.316 0" />
+    <parent link="right_arm_link2" />
+    <child link="right_arm_link3" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-2.9007" upper="2.9007" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.9007" soft_upper_limit="2.9007" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="right_arm_link4">
+    <visual name="right_arm_link4_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link4.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link4_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link4_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0459100965 0.0630492960 -0.0085187868" />
+      <mass value="2.6155955791" />
+      <inertia ixx="0.03452998321913202" ixy="0.01322552265982813" ixz="0.01015142998484113" iyy="0.028881621933049058" iyz="-0.0009762833870704552" izz="0.04125471171146641" />
+    </inertial>
+  </link>
+  <joint name="right_arm_joint4" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0.0825 0 0" />
+    <parent link="right_arm_link3" />
+    <child link="right_arm_link4" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-3.0421" upper="-0.1518" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-3.0421" soft_upper_limit="-0.1518" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="right_arm_link5">
+    <visual name="right_arm_link5_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link5.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link5_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link5_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0016039605 0.0292536262 -0.0972965990" />
+      <mass value="2.3271207594" />
+      <inertia ixx="0.051610278463662895" ixy="-0.005715173387783472" ixz="-0.0035673167625872135" iyy="0.04787729713371481" iyz="0.010673985108535986" izz="0.016423625579357254" />
+    </inertial>
+  </link>
+  <joint name="right_arm_joint5" type="revolute">
+    <origin rpy="-1.570796326794897 0 0" xyz="-0.0825 0.384 0" />
+    <parent link="right_arm_link4" />
+    <child link="right_arm_link5" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="-2.8065" upper="2.8065" velocity="5.26" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.8065" soft_upper_limit="2.8065" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="right_arm_link6">
+    <visual name="right_arm_link6_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link6.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link6_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link6_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0597131221 -0.0410294666 -0.0101692726" />
+      <mass value="1.8170376524" />
+      <inertia ixx="0.005412333594383447" ixy="0.006193456360285834" ixz="0.0014219289306117652" iyy="0.014058329545509979" iyz="-0.0013140753741120031" izz="0.016080817924212554" />
+    </inertial>
+  </link>
+  <joint name="right_arm_joint6" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0 0 0" />
+    <parent link="right_arm_link5" />
+    <child link="right_arm_link6" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="0.5445" upper="4.5169" velocity="4.18" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="0.5445" soft_upper_limit="4.5169" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  
+  <link name="right_arm_link7">
+    <visual name="right_arm_link7_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/fr3/visual/link7.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_arm_link7_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link7_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0045225817 0.0086261921 -0.0161633251" />
+      <mass value="0.6271432862" />
+      <inertia ixx="0.00021092389150104718" ixy="-2.433299114461931e-05" ixz="4.564480393778983e-05" iyy="0.00017718568002411474" iyz="8.744070223226438e-05" izz="5.993190599659971e-05" />
+    </inertial>
+  </link>
+  <joint name="right_arm_joint7" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0.088 0 0" />
+    <parent link="right_arm_link6" />
+    <child link="right_arm_link7" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="-3.0159" upper="3.0159" velocity="5.26" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-3.0159" soft_upper_limit="3.0159" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="right_arm_link8"><collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_link8_placeholder.obj" /></geometry></collision></link>
+  <joint name="right_arm_joint8" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.107" />
+    <parent link="right_arm_link7" />
+    <child link="right_arm_link8" />
+  </joint>
+  <joint name="right_hand_joint_right_arm_link8" type="fixed">
+    <parent link="right_arm_link8" />
+    <child link="right_arm_hand" />
+    <origin rpy="0 0 -0.7853981633974483" xyz="0 0 0" />
+  </joint>
+  <link name="right_arm_hand">
+    <visual name="right_hand_hand_visual">
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/franka_hand/visual/hand.dae" />
+      </geometry>
+    </visual>
+    <collision name="right_hand_hand_collision">
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_arm_hand_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0000376 0.0119128 0.0207260" />
+      <mass value="0.6544" />
+      <inertia ixx="0.00186" ixy="0.0" ixz="0.0" iyy="0.0003" iyz="-2e-05" izz="0.00174" />
+    </inertial>
+  </link>
+  
+  <link name="right_hand_hand_tcp"><collision><geometry><mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes/right_hand_hand_tcp_placeholder.obj" /></geometry></collision></link>
+  <joint name="right_hand_hand_tcp_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.176" />
+    <parent link="right_arm_hand" />
+    <child link="right_hand_hand_tcp" />
+  </joint>
+  <link name="right_arm_leftfinger">
+    <visual name="right_hand_leftfinger_visual">
+      <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/collision/flex_griper_connect.stl" />
+      </geometry>
+    </visual>
+    
+    <collision name="right_hand_leftfinger_collision">
+      <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes_finger_l1/right_arm_leftfinger_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0.0145644 0.0227941" />
+      <mass value="0.1" />
+      <inertia ixx="3.01220925051e-05" ixy="0.0" ixz="0.0" iyy="2.95873808038e-05" iyz="0.0" izz="6.95125211657e-06" />
+    </inertial>
+  </link>
+  <link name="right_arm_rightfinger">
+    <visual name="right_hand_rightfinger_visual">
+      <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/data/imitation/IRMV_R2S2R/assets/robot/ridgeback_dual_panda_soft/meshes/plate/collision/flex_griper_connect.stl" />
+      </geometry>
+    </visual>
+    <collision name="right_hand_rightfinger_collision">
+      <origin rpy="-1.57079632679 0.20245819348 -1.57079632679" xyz="-0.0165 0.0165 0.12773331296" />
+      <geometry>
+        <mesh filename="/home/ps/Downloads/Stiff-GIPC-dailyv2/assets/sim_data/urdf/ridgeback_dual_panda_soft/franka/obb_meshes_finger_l1/right_arm_rightfinger_obb.obj" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 1.57079632679" xyz="0 0.0145644 0.0227941" />
+      <mass value="0.1" />
+      <inertia ixx="3.01220925051e-05" ixy="0.0" ixz="0.0" iyy="2.95873808038e-05" iyz="0.0" izz="6.95125211657e-06" />
+    </inertial>
+  </link>
+  <joint name="right_arm_finger_joint1" type="prismatic">
+    <parent link="right_arm_hand" />
+    <child link="right_arm_leftfinger" />
+    <origin rpy="0 0 0" xyz="00 0 0.0584" />
+    <axis xyz="0 1 0" />
+    <limit effort="100" lower="0.0" upper="0.04" velocity="0.2" />
+    <dynamics damping="0.3" />
+  </joint>
+  <joint name="right_arm_finger_joint2" type="prismatic">
+    <parent link="right_arm_hand" />
+    <child link="right_arm_rightfinger" />
+    <origin rpy="0 0 3.141592653589793" xyz=" 0 0 0.0584" />
+    <axis xyz="0 1 0" />
+    <limit effort="100" lower="0.0" upper="0.04" velocity="0.2" />
+    
+    <dynamics damping="0.3" />
+  </joint>
+</robot>

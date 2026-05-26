@@ -27,6 +27,7 @@ for arg in sys.argv[1:]:
 
 # Ensure dailyv2 engine resolves
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import _use_dailyv2_engine  # noqa
 
 # ------ Monkey-patch polyscope so case_27 doesn't open a window --------
 class _FakePsShow(Exception):
@@ -108,6 +109,7 @@ print(f"[m5] driving joint[{joint_idx}] {joint_obj.name} : "
       f"cur={cur_deg:.1f}°  range=[{lo_deg:.1f}, {hi_deg:.1f}]  delta_per_step={DELTA_DEG:.2f}°",
       flush=True)
 print(f"[m5] USE_HARD_PIN={os.environ.get('USE_HARD_PIN','0')}  "
+      f"USE_HYBRID={os.environ.get('USE_HYBRID','0')}  "
       f"FEM_BLOBAL={os.environ.get('FEM_BLOBAL','0')}  STEPS={N}",
       flush=True)
 

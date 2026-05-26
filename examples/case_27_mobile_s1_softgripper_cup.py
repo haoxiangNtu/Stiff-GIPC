@@ -17,6 +17,7 @@ or softgriper_part2.msh (12k tet/finger).
 """
 import sys, os, math, re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import _use_dailyv2_engine  # noqa: F401
 
 import numpy as np
 import polyscope as ps
@@ -241,8 +242,18 @@ def main():
 
     fem_records = []
     finger_to_fem = []  # parallel to finger_records
+    USE_HYBRID_D = os.environ.get("USE_HYBRID_D", "0") == "1"
     if os.environ.get("NO_FEM") != "1":
         n_fem_load = int(os.environ.get("FEM_N", "4"))
+        if USE_HYBRID_D:
+            # Strategy D: skip the standard softpad load.  We will build a
+            # NEW merged tet mesh per finger (finger volume + soft envelope)
+            # and load it later, in the hybrid_d branch.  Setting n=0 here
+            # avoids loading the original softpad (which would be
+            # geometrically duplicated by the merged mesh's rigid region).
+            n_fem_load = 0
+            print(f"[softgripper] USE_HYBRID_D=1, skipping standard softpad "
+                  f"load (will build merged meshes per finger below)", flush=True)
         offset_y = float(os.environ.get("FEM_OFFSET_Y", "0"))
         for fr in finger_records[:n_fem_load]:
             soft_name = fr.label + '_soft_material'
@@ -280,57 +291,268 @@ def main():
     all_verts = all_host_vertices(eng)
     total_pairs = 0
     stitch_viz_pairs = []  # list of (fem_global, abd_global) for GUI viz
-    # [pin scope tuning] STITCH_THRESH (meters): NN distance cutoff.  Default
-    # 20mm matches even FEM tip vertices to the small ABD finger backbone,
-    # which over-constrains the softpad: under fast joint rotation, near-pin
-    # and far-pin radii differ → arc-length difference imposes >mesh-edge
-    # internal stretching → guaranteed self-intersection (see HANDOVER).
-    # Tighten to e.g. 0.003 (3mm) to keep pins only where FEM and ABD
-    # vertices are physically near-touching.
-    pin_thresh = float(os.environ.get('STITCH_THRESH', '0.020'))
-    # [pin scope tuning] STITCH_TOP_FRACTION (0..1]: keep only the top
-    # fraction of pinned FEM verts ranked by Y-coordinate (proxy for
-    # closeness to the rigid finger backbone in URDF coords; finger axis
-    # is along Y).  Default 1.0 = no Y-filtering.  E.g. 0.5 keeps only
-    # the upper half — pins concentrate near the rigid backbone, tip is
-    # left elastically free.
-    top_frac = float(os.environ.get('STITCH_TOP_FRACTION', '1.0'))
-    for f_rec, e_rec in finger_to_fem:
+
+    USE_HYBRID = os.environ.get("USE_HYBRID", "0") == "1"
+
+    if USE_HYBRID_D:
+        # [Strategy D — true hybrid mesh path]
+        # For each finger ABD body, build a merged tet mesh (finger convex
+        # hull + spherical soft envelope) using TetGen with region attrs.
+        # Load it as a NEW FEM body and pin its rigid region to the finger
+        # ABD body via add_fem_pin_to_abd (auto local_pos via finalize).
+        # This is "Strategy D" per the hybrid mesh design notes — clean
+        # interface, no overlapping geometry, substantial rigid region.
+        import sys as _sys, tempfile as _tf
+        from pathlib import Path as _P
+        _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+        import trimesh as _tm
+        from tools.build_hybrid_mesh_d import build_hybrid_d as _build_d
+
+        # Tunable: TetGen volume targets.  Default tuned for ~5k tets/finger
+        # → 20k tets total.  Larger max_vol / coarser quality = fewer tets.
+        # WARNING: total tets cap ~ 30k with current engine triplet buffer
+        # (Phase 4 makes EVERY tet contribute 10 triplets, then M3.5
+        # extension uses 16× as ext_capacity, easily overflowing GPU buffer
+        # above ~30-50k total tets).  Use very coarse defaults; refine
+        # once Phase 4 is upgraded to skip triplet writes for rigid tets.
+        d_rigid_max = float(os.environ.get("HYBRID_D_RIGID_MAX_VOL", "5e-6"))
+        d_soft_max  = float(os.environ.get("HYBRID_D_SOFT_MAX_VOL",  "1e-5"))
+        d_quality   = float(os.environ.get("HYBRID_D_QUALITY", "2.5"))
+        d_envelope_factor = float(os.environ.get("HYBRID_D_ENV_FACTOR", "0.55"))
+
+        d_tmp = _P(_tf.mkdtemp(prefix="hybrid_d_"))
+        d_total_pins = 0
+        d_total_tets = 0
+        d_finger_count = int(os.environ.get("HYBRID_D_FINGER_COUNT", "4"))
+        d_use_sphere_env = os.environ.get("HYBRID_D_SPHERE_ENV", "0") == "1"
+
+        # Pre-load softpad outer surface ONCE (shared across fingers, in
+        # softpad's local frame).  Real softpad geometry beats a sphere.
+        import meshio as _meshio0
+        _softpad_msh = _meshio0.read(SOFT_FEM_MESH if SOFT_FEM_MESH.startswith('/')
+                                     else assets_dir + SOFT_FEM_MESH)
+        _softpad_local_verts = np.asarray(_softpad_msh.points, dtype=np.float64)
+        _tet_blocks = [c for c in _softpad_msh.cells if c.type == "tetra"]
+        _softpad_local_tets = np.vstack([c.data for c in _tet_blocks])
+        # Extract softpad boundary surface
+        from tools.build_hybrid_mesh_d import _extract_boundary_faces as _extract_bdry
+        _softpad_local_faces = _extract_bdry(_softpad_local_tets)
+        _softpad_local_mesh = _tm.Trimesh(vertices=_softpad_local_verts,
+                                          faces=_softpad_local_faces,
+                                          process=True)
+        print(f"[hybrid_d] softpad outer surface extracted: "
+              f"V={len(_softpad_local_mesh.vertices)} "
+              f"F={len(_softpad_local_mesh.faces)} "
+              f"watertight={_softpad_local_mesh.is_watertight}", flush=True)
+
+        for fr in finger_records[:d_finger_count]:
+            f_world_verts = all_verts[fr.vertex_offset:
+                                      fr.vertex_offset + fr.vertex_count]
+            f_tris = eng.native.get_abd_surface_body_triangles(fr.body_offset)
+            finger_world = _tm.Trimesh(vertices=f_world_verts, faces=f_tris,
+                                       process=True)
+
+            # Soft envelope: real softpad mesh transformed to current
+            # finger's world position.  The softpad is much SHORTER than
+            # finger (case_27: finger Z=54mm, softpad Z=16mm) — softpad
+            # only covers the fingertip region.  So we CLIP finger to the
+            # softpad's bbox before convex-hulling — gives a reasonable
+            # "rigid region" that fits inside softpad.
+            soft_name = fr.label + '_soft_material'
+            soft_T = soft_tfs_by_name[soft_name]
+            softpad_world = _softpad_local_mesh.copy()
+            softpad_world.apply_transform(soft_T)
+
+            if d_use_sphere_env:
+                # Override: use sphere envelope (debug)
+                finger_hull = finger_world.convex_hull
+                center = finger_hull.centroid
+                diag = float(np.linalg.norm(finger_hull.bounds[1] - finger_hull.bounds[0]))
+                radius = diag * d_envelope_factor
+                env = _tm.creation.icosphere(subdivisions=2, radius=radius)
+                env.apply_translation(center)
+                print(f"  [hybrid_d] {fr.label}: SPHERE envelope (debug)", flush=True)
+            else:
+                # Use real softpad as envelope; clip finger to softpad bbox
+                # so rigid region fits inside soft region.
+                env = softpad_world
+                pad_min = softpad_world.bounds[0]
+                pad_max = softpad_world.bounds[1]
+                # Shrink bbox slightly so we don't end up with rigid verts
+                # exactly on softpad surface
+                shrink = 0.001  # 1mm inset
+                inner_min = pad_min + shrink
+                inner_max = pad_max - shrink
+                # Keep only finger verts inside this shrunk bbox
+                fv = finger_world.vertices
+                inside_box = ((fv >= inner_min) & (fv <= inner_max)).all(axis=1)
+                n_in = int(inside_box.sum())
+                if n_in < 4:
+                    print(f"  [hybrid_d] {fr.label}: only {n_in}/<{len(fv)}> "
+                          f"finger verts inside softpad bbox; FALLBACK to sphere",
+                          flush=True)
+                    finger_hull = finger_world.convex_hull
+                    center = finger_hull.centroid
+                    diag = float(np.linalg.norm(finger_hull.bounds[1] - finger_hull.bounds[0]))
+                    radius = diag * d_envelope_factor
+                    env = _tm.creation.icosphere(subdivisions=2, radius=radius)
+                    env.apply_translation(center)
+                else:
+                    finger_hull = _tm.Trimesh(
+                        vertices=fv[inside_box],
+                        faces=None,  # convex_hull
+                    ).convex_hull
+                    print(f"  [hybrid_d] {fr.label}: using REAL softpad envelope; "
+                          f"clipped finger to {n_in}/{len(fv)} verts inside softpad bbox; "
+                          f"clipped hull V={len(finger_hull.vertices)} "
+                          f"F={len(finger_hull.faces)}", flush=True)
+
+            hull_path = d_tmp / f"hull_{fr.label}.stl"
+            env_path  = d_tmp / f"env_{fr.label}.stl"
+            finger_hull.export(str(hull_path))
+            env.export(str(env_path))
+
+            fields = _build_d(
+                abd_surface_path=str(hull_path),
+                soft_mesh_path=str(env_path),
+                abd_body_id=fr.body_offset,
+                rigid_max_vol=d_rigid_max,
+                soft_max_vol=d_soft_max,
+                quality=d_quality,
+                young_modulus=1e6,
+                verbose=False,
+            )
+
+            verts = fields["vertices"]
+            tets  = fields["tets"]
+            d_total_tets += len(tets)
+
+            # Write merged mesh to a temp .msh and use load_mesh path
+            # (load_mesh_from_data has multi-body issues — see HANDOVER).
+            import meshio as _meshio
+            msh_path = d_tmp / f"merged_{fr.label}.msh"
+            _meshio.write(
+                str(msh_path),
+                _meshio.Mesh(
+                    points=np.asarray(verts, dtype=np.float64),
+                    cells=[("tetra", np.asarray(tets, dtype=np.int32))],
+                ),
+                file_format="gmsh22",
+                binary=False,
+            )
+            eng.load_mesh(str(msh_path), dimensions=3, body_type="FEM",
+                          transform=np.eye(4), young_modulus=1e6)
+            new_fem_rec = eng.get_load_records()[-1]
+            new_fem_offset = new_fem_rec.vertex_offset
+
+            # Pin rigid verts to finger ABD body.  Use legacy add_fem_pin_to_abd
+            # (anchor=fem_global) so finalize auto-derives local_pos from each
+            # vertex's current world position vs finger ABD body's q at finalize.
+            rigid_mask = fields["vertex_region"] == 1
+            for i in np.nonzero(rigid_mask)[0]:
+                fem_global = new_fem_offset + int(i)
+                eng.native.add_fem_pin_to_abd(
+                    fem_global, fem_global, fr.body_offset,
+                    rest_offset_world=(0.0, 0.0, 0.0),
+                )
+            n_rigid = int(rigid_mask.sum())
+            n_iface = int((fields['tet_region'] == 0).sum() -
+                          ((rigid_mask[tets].sum(axis=1) == 0) &
+                           (fields['tet_region'] == 0)).sum())
+            n_pure_rigid_t = int((fields['tet_region'] == 2).sum())
+            n_pure_fem_t = int((rigid_mask[tets].sum(axis=1) == 0).sum())
+            d_total_pins += n_rigid
+
+            # Make sure finger ABD body and this new FEM body don't IPC-collide
+            # (their geometries overlap by design).  Disable via env if buggy.
+            if os.environ.get("HYBRID_D_NO_EXCL", "0") != "1":
+                try:
+                    eng.native.add_collision_exclusion(fr.body_offset, new_fem_rec.body_offset)
+                except Exception as _e:
+                    print(f"  [hybrid_d] WARN add_collision_exclusion failed: {_e}", flush=True)
+
+            print(f"[hybrid_d] {fr.label}: built merged mesh "
+                  f"V={verts.shape[0]} T={tets.shape[0]} "
+                  f"(rigid_t={n_pure_rigid_t}, FEM_t={n_pure_fem_t}, "
+                  f"interface_t={n_iface}); pinned {n_rigid} rigid verts",
+                  flush=True)
+        print(f"[hybrid_d] TOTAL: {d_total_tets} tets, {d_total_pins} pins "
+              f"across {len(finger_records[:4])} fingers", flush=True)
+        # Skip the regular stitch / hard-pin / hybrid-B loop
+        finger_to_fem_loop = []
+    elif USE_HYBRID:
+        # [Hybrid mesh path]  Replaces stitch / hard-pin: every FEM softpad
+        # vertex inside the ABD finger surface is bulk-pinned to that finger.
+        # The M3.5 chain-rule kernel routes the rigid region's FEM Hessian to
+        # ABD body DOFs; Phase 4 skips elasticity for all-rigid tets.  This
+        # gives true continuous elastic coupling at the ABD↔FEM interface,
+        # avoiding the discrete-pin mesh-resolution issues that bottleneck
+        # USE_HARD_PIN=1 under joint motion.
+        import trimesh as _tm
+        for f_rec, e_rec in finger_to_fem:
+            f_world_verts = all_verts[f_rec.vertex_offset:
+                                      f_rec.vertex_offset + f_rec.vertex_count]
+            f_tris = eng.native.get_abd_surface_body_triangles(f_rec.body_offset)
+            finger_world = _tm.Trimesh(vertices=f_world_verts, faces=f_tris,
+                                       process=False)
+            # process=False to keep vertex order matching f_world_verts;
+            # is_watertight checks the topology, which doesn't need processing.
+            e_verts = all_verts[e_rec.vertex_offset:
+                                e_rec.vertex_offset + e_rec.vertex_count]
+            if not finger_world.is_watertight:
+                # Try repaired copy for the contains test (still need rtree)
+                finger_for_test = finger_world.copy()
+                finger_for_test.process(validate=True)
+            else:
+                finger_for_test = finger_world
+            inside = finger_for_test.contains(e_verts)
+            n_rigid = int(inside.sum())
+            # Pass anchor = fem_global (any positive value works — anchor_vec
+            # is stored but unused in finalize's local_pos computation, which
+            # reads fem_world_pos from the FEM vertex itself.  The -1
+            # sentinel branch I added in Phase 3 is reserved for the
+            # add_fem_pins_with_local_pos bulk API, NOT this per-pin call.)
+            for i in np.nonzero(inside)[0]:
+                fem_global = e_rec.vertex_offset + int(i)
+                eng.native.add_fem_pin_to_abd(
+                    fem_global, fem_global, f_rec.body_offset,
+                    rest_offset_world=(0.0, 0.0, 0.0),
+                )
+                stitch_viz_pairs.append((fem_global, f_rec.vertex_offset))
+            total_pairs += n_rigid
+            print(f"[hybrid] {f_rec.label}: {n_rigid}/{len(e_verts)} verts "
+                  f"pinned (inside finger surface, watertight={finger_world.is_watertight})",
+                  flush=True)
+        print(f"[hybrid] total {total_pairs} hybrid pins across "
+              f"{len(finger_to_fem)} fingers", flush=True)
+        # Skip the regular stitch/hard-pin loop below
+        finger_to_fem_loop = []
+    else:
+        finger_to_fem_loop = finger_to_fem
+
+    for f_rec, e_rec in finger_to_fem_loop:
         f_verts = all_verts[f_rec.vertex_offset:f_rec.vertex_offset + f_rec.vertex_count]
         e_verts = all_verts[e_rec.vertex_offset:e_rec.vertex_offset + e_rec.vertex_count]
-        # Sub-sample FEM verts (every Nth) — STITCH_SUB env, default 128.
+        # One-way NN: every FEM vertex finds its nearest ABD vertex (within
+        # thresh). Multiple FEM verts can share an ABD anchor — physically
+        # OK (multiple springs anchored at one ABD point). Sub-sampling
+        # FEM verts (every Nth) keeps stitch_count bounded — too many
+        # springs makes the Hessian condition number balloon and the
+        # solver becomes slow.
+        # Sub-sampling stride: smaller -> more stitches -> better tracking
+        # but slower PCG (Hessian condition number grows). FEM_BLOBAL has
+        # 8029 verts/finger; sub=128 gives ~60 stitch/finger spread along
+        # the full length, step ~200ms. Use STITCH_SUB env to override.
         sub_n = int(os.environ.get('STITCH_SUB', '128'))
         e_idx_local = np.arange(0, len(e_verts), sub_n)
         e_sub = e_verts[e_idx_local]
         f_tree = cKDTree(f_verts)
         d_e2f, idx_e2f = f_tree.query(e_sub)
-        thresh = pin_thresh
-        # Y-fraction filter: rank candidates within thresh by Y desc, keep top fraction.
-        if top_frac < 1.0:
-            within = np.where(d_e2f < thresh)[0]
-            if len(within) > 0:
-                ys_within = e_sub[within, 1]
-                # finger axis along URDF Y; "top" near rigid finger = larger Y in URDF
-                # frame, but post-arm_tf the global Y-direction may be flipped.
-                # Use ABD finger backbone's mean Y as anchor: keep candidates
-                # whose Y is in the top fraction relative to f_verts' Y range.
-                f_y_min, f_y_max = f_verts[:, 1].min(), f_verts[:, 1].max()
-                f_y_root = f_y_max  # ABD top of finger (root) — closest to wrist
-                # Distance from finger root, smaller = closer to root
-                dist_from_root = np.abs(ys_within - f_y_root)
-                cutoff_idx = max(1, int(len(within) * top_frac))
-                # keep `cutoff_idx` candidates with smallest dist_from_root
-                keep_local = np.argsort(dist_from_root)[:cutoff_idx]
-                keep_set = set(within[keep_local].tolist())
-            else:
-                keep_set = set()
-        else:
-            keep_set = None  # accept all within thresh
+        thresh = 0.020  # 20mm — generous; FEM tip can be ~10mm from ABD
         n_pairs = 0
         used_fem_y = []
         for k in range(len(e_sub)):
             if d_e2f[k] >= thresh: continue
-            if keep_set is not None and k not in keep_set: continue
             i_e = int(e_idx_local[k])
             j_f = int(idx_e2f[k])
             fem_global = e_rec.vertex_offset + i_e
@@ -367,13 +589,11 @@ def main():
             uy = np.asarray(used_fem_y)
             print(f"[softgripper] stitch {f_rec.label} -> FEM#{fem_records.index(e_rec)}: "
                   f"{n_pairs} pairs  Y-extent=[{uy.min():.4f}, {uy.max():.4f}] "
-                  f"(spread={1000*(uy.max()-uy.min()):.1f}mm, sub={sub_n}, "
-                  f"thresh={1000*thresh:.1f}mm, top_frac={top_frac:.2f})  "
+                  f"(spread={1000*(uy.max()-uy.min()):.1f}mm, sub={sub_n})  "
                   f"d_min={d_e2f.min()*1000:.2f}mm  d_mean(used)={1000*d_e2f[d_e2f<thresh].mean():.2f}mm",
                   flush=True)
         else:
-            print(f"[softgripper] no stitch matches for {f_rec.label} "
-                  f"(thresh={thresh*1000:.1f}mm, top_frac={top_frac:.2f})", flush=True)
+            print(f"[softgripper] no stitch matches for {f_rec.label} (thresh={thresh*1000:.0f}mm)", flush=True)
         total_pairs += n_pairs
     print(f"[softgripper] total stitch pairs: {total_pairs}", flush=True)
 
