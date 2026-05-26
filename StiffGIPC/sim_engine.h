@@ -198,6 +198,18 @@ class SimEngine
                            int abd_body_id,
                            const Eigen::Vector3d& rest_offset_world);
 
+    /// [Per-region Young's modulus] Override per-tet Young's modulus for one
+    /// FEM body. `body_offset` = index into get_load_records().  The array
+    /// length must equal the number of tets owned by that body (a tet is
+    /// "owned" if all 4 of its vertices lie inside the body's vertex range).
+    /// Tets are matched in their loaded order.
+    ///
+    /// Must be called BEFORE finalize() — vert_youngth_modules[] is read at
+    /// finalize-time to compute per-tet Lame parameters which then go to GPU.
+    /// After finalize, changes here have no effect (data is on device).
+    void set_per_tet_young_for_body(int body_offset,
+                                    const std::vector<double>& per_tet_young);
+
     /// [FEM-pin] Hard-constraint pin: forces a FEM vertex's world position
     /// to follow an ABD anchor vertex by a fixed offset, EXACTLY (no soft
     /// spring error). Acts like a stitch spring with infinite stiffness —

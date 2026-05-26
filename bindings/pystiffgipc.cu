@@ -212,6 +212,17 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("fem_vertex_id"), py::arg("abd_anchor_vertex_id"),
              py::arg("abd_body_id"),
              py::arg("rest_offset_world") = std::array<double, 3>{0.0, 0.0, 0.0})
+        .def("set_per_tet_young_for_body",
+             [](SimEngine& e, int body_offset, py::array_t<double> per_tet_young) {
+                 auto b = per_tet_young.request();
+                 const double* p = static_cast<const double*>(b.ptr);
+                 std::vector<double> vec(p, p + b.size);
+                 e.set_per_tet_young_for_body(body_offset, vec);
+             },
+             py::arg("body_offset"), py::arg("per_tet_young"),
+             "Override per-tet Young's modulus for one FEM body. Must call "
+             "BEFORE finalize(). Array length must equal the body's tet count "
+             "(tets all of whose 4 vertices lie in the body's vertex range).")
         .def("add_fem_pin_to_abd",
              [](SimEngine& e, int fem_v, int abd_anchor_v, int abd_body_id,
                 std::array<double, 3> rest_off) {

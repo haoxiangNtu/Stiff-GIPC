@@ -11,6 +11,7 @@
 #include <sstream>
 #include <filesystem>
 #include <map>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 #include "GIPC.cuh"
@@ -343,6 +344,43 @@ void SimEngine::add_stitch_spring(int fem_vertex_global_id,
         rest_offset_world.x(), rest_offset_world.y(), rest_offset_world.z()));
     dtm.stitch_abd_body_id.push_back(abd_body_id);
     tm.softNum = static_cast<int>(tm.targetIndex.size());
+}
+
+void SimEngine::set_per_tet_young_for_body(int body_offset,
+                                            const std::vector<double>& per_tet_young)
+{
+    auto& tm = m_impl->tetMesh;
+    if(body_offset < 0 || body_offset >= (int)m_impl->load_records.size())
+        throw std::runtime_error("set_per_tet_young_for_body: invalid body_offset "
+                                 + std::to_string(body_offset));
+    const auto& r = m_impl->load_records[body_offset];
+    int v_off = r.vertex_offset;
+    int v_end = v_off + r.vertex_count;
+    // Find tets owned by this body: all 4 verts in [v_off, v_end).  Sequential
+    // scan over tetrahedras (called once per body at setup, O(n_tets)).
+    std::vector<int> tet_indices;
+    tet_indices.reserve(per_tet_young.size());
+    for(int t = 0; t < tm.tetrahedraNum; ++t)
+    {
+        const auto& te = tm.tetrahedras[t];
+        if((int)te.x >= v_off && (int)te.x < v_end &&
+           (int)te.y >= v_off && (int)te.y < v_end &&
+           (int)te.z >= v_off && (int)te.z < v_end &&
+           (int)te.w >= v_off && (int)te.w < v_end)
+            tet_indices.push_back(t);
+    }
+    if(per_tet_young.size() != tet_indices.size())
+        throw std::runtime_error(
+            "set_per_tet_young_for_body: per_tet_young size " +
+            std::to_string(per_tet_young.size()) + " != body tet count " +
+            std::to_string(tet_indices.size()));
+    for(size_t k = 0; k < tet_indices.size(); ++k)
+        tm.vert_youngth_modules[tet_indices[k]] = per_tet_young[k];
+    if(g_gipc_log_level >= 1)
+        printf("[per-tet-young] body %d: %zu tets, young range [%.3g, %.3g]\n",
+               body_offset, tet_indices.size(),
+               *std::min_element(per_tet_young.begin(), per_tet_young.end()),
+               *std::max_element(per_tet_young.begin(), per_tet_young.end()));
 }
 
 void SimEngine::add_fem_pin_to_abd(int fem_vertex_global_id,
@@ -799,6 +837,33 @@ void SimEngine::Impl::do_upload_to_gpu()
               tetMesh.vertexNum * sizeof(int), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.velocities, tetMesh.velocities.data(),
               tetMesh.vertexNum * sizeof(double3), cudaMemcpyHostToDevice);
+    // [MAS stitch index fix] When MAS is active (preconditioner_type != 0), FEM
+    // bodies are loaded in metis-SORTED order: engine vertex (off+i) holds INPUT
+    // vertex (off + sort_index[i]); vertex_metis_to_input[engine] = input.
+    // Stitch springs are added by the user in INPUT-vertex order, so without
+    // this translation they pull the WRONG engine vertices -> garbage forces ->
+    // Newton never converges (the case_40 MAS-on bug). P_type==0 => perm is
+    // identity => skipped (no-op).
+    if(cfg.preconditioner_type != 0 && tetMesh.softNum > 0
+       && !tetMesh.vertex_metis_to_input.empty())
+    {
+        const auto& m2i = tetMesh.vertex_metis_to_input;  // engine_idx -> input_idx
+        std::vector<int> i2m(m2i.size(), -1);             // input_idx -> engine_idx
+        for(int e = 0; e < (int)m2i.size(); e++)
+            if(m2i[e] >= 0 && m2i[e] < (int)i2m.size())
+                i2m[m2i[e]] = e;
+        auto to_engine = [&](int input_id) -> int {
+            return (input_id >= 0 && input_id < (int)i2m.size() && i2m[input_id] >= 0)
+                       ? i2m[input_id] : input_id;
+        };
+        for(auto& v : tetMesh.targetIndex)
+            v = static_cast<uint32_t>(to_engine(static_cast<int>(v)));
+        for(auto& v : d_tetMesh.stitch_paired_vertex)  // ABD anchors: identity, safe
+            v = to_engine(v);
+        if(g_gipc_log_level >= 1)
+            printf("[MAS-fix] remapped %d stitch FEM indices input->engine (metis) order\n",
+                   tetMesh.softNum);
+    }
     safe_copy(d_tetMesh.targetIndex, tetMesh.targetIndex.data(),
               tetMesh.softNum * sizeof(uint32_t), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.targetVert, tetMesh.targetPos.data(),
