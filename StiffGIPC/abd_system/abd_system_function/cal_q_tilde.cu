@@ -12,7 +12,8 @@ void ABDSystem::cal_q_tilde(ABDSimData& sim_data)
     auto  dt             = parms.dt;
     auto  boundary_type  = sim_data.body_id_to_boundary_type();
 
-    ParallelFor()
+    // ncu: N=574 bodies, was grid=1 block=768 -> use 32/block for SM coverage.
+    ParallelFor(32)
         .kernel_name(__FUNCTION__)
         .apply(abd_body_count,
                [boundary_type = boundary_type.cviewer().name("btype"),

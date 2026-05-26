@@ -14,7 +14,8 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
     auto  boundry_type   = sim_data.body_id_to_boundary_type();
     if(!abd_count)
         return 0;
-    ParallelFor()
+    // ncu: N=574 bodies w/ default block -> grid=2 on 114 SMs. 32/block (1 warp).
+    ParallelFor(32)
         .kernel_name(__FUNCTION__)
         .apply(abd_count,
                [kinetic_energies = m_kinetic_energy_per_affine_body.viewer().name("kinetic_energies"),
@@ -173,7 +174,8 @@ Float ABDSystem::cal_abd_shape_energy(ABDSimData& sim_data)
         return 0;
     m_shape_energy_per_affine_body.resize(abd_count);
 
-    ParallelFor()
+    // ncu: N=574 bodies, was grid=1 block=768 -> use 32/block.
+    ParallelFor(32)
         .kernel_name(__FUNCTION__)
         .apply(abd_count,
                [shape_energies = m_shape_energy_per_affine_body.viewer().name("abd_shape_energy"),
