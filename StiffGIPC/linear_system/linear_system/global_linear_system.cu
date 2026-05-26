@@ -2,7 +2,9 @@
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <gipc/utils/timer.h>
+#include <gipc/utils/parallel_algorithm/fast_segmental_reduce.h>
 #include <cuda_tools/cuda_device_buffer.h>
+#include <Eigen/Eigen>
 #include <cstdio>
 #include <cstdlib>
 
@@ -267,15 +269,159 @@ void GlobalLinearSystem::apply_preconditioner(muda::DenseVectorView<Float>  z,
 
 
 
+// ============================================================================
+// ① Sparsity-cache fingerprint kernel + helpers
+// ============================================================================
+namespace
+{
+__global__ void __compute_input_fingerprint(const int* rows,
+                                            const int* cols,
+                                            int        n,
+                                            unsigned long long* out)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    unsigned long long key =
+        (static_cast<unsigned long long>(static_cast<unsigned int>(rows[idx])) << 32)
+        | static_cast<unsigned long long>(static_cast<unsigned int>(cols[idx]));
+    // Mix to spread bits (so trivial swaps don't collide). Splittable-mix.
+    key ^= key >> 33; key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33; key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
+    atomicXor(out, key);
+}
+
+// Skip-path gather: dst_val[i] = src_val[cached_perm[i]]
+// In-place safe — same pattern the original _radix_sort_indices_and_blocks uses.
+__global__ void __gather_values_by_perm(Eigen::Matrix3d*       dst_val,
+                                        const Eigen::Matrix3d* src_val,
+                                        const uint32_t*        perm,
+                                        int                    n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    dst_val[idx] = src_val[perm[idx]];
+}
+}  // namespace
+
 void GlobalLinearSystem::convert_new()
 {
-    m_converter.convert(*gipc_global_triplet,
-                        0,
-                        gipc_global_triplet->global_triplet_offset,
-                        gipc_global_triplet->global_triplet_offset);
-//#ifndef SymGH
-//    m_converter.ge2sym(*gipc_global_triplet);
-//#endif
+    auto*    gt        = gipc_global_triplet;
+    const int length   = gt->global_triplet_offset;
+    if(length < 1)
+        return;
+
+    // ───────────────────────────────────────────────────────────────────
+    // Compute input fingerprint (XOR-fold of mixed (row,col) keys).
+    // One D2H of 8 bytes at end. Cheap vs. the radix sort it might skip.
+    // ───────────────────────────────────────────────────────────────────
+    static unsigned long long* d_fp = nullptr;
+    if(d_fp == nullptr) CUDA_SAFE_CALL(cudaMalloc(&d_fp, sizeof(unsigned long long)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_fp, 0, sizeof(unsigned long long)));
+    {
+        int blocks = (length + 255) / 256;
+        __compute_input_fingerprint<<<blocks, 256>>>(
+            gt->block_row_indices(), gt->block_col_indices(), length, d_fp);
+    }
+    unsigned long long h_fp = 0;
+    CUDA_SAFE_CALL(cudaMemcpy(&h_fp, d_fp, sizeof(h_fp), cudaMemcpyDeviceToHost));
+
+    const bool use_skip = gt->m_cache_valid
+                          && gt->m_cache_length == length
+                          && gt->m_cache_input_fingerprint == h_fp;
+
+    if(use_skip)
+    {
+        // ─── SKIP PATH ─── pattern matches cache. Skip radix sort + RLE +
+        // scatter; only gather new values and segmental-reduce them.
+        // Memory layout matches the full path's: input values live at
+        // block_values[0:length); gather writes sorted-permuted values to
+        // block_values[length:2*length); segmental-reduce reads from there
+        // and writes aggregated unique values back to block_values[0:N_unique).
+        // (Buffer capacity covers this — total_max_global_triplet_num*32 in
+        // GIPC::build_gipc_system.)
+        const int N_unique = gt->m_cache_unique_count;
+
+        // Restore pattern arrays into their canonical positions (downstream
+        // consumers read block_row_indices/col_indices/hash_value[0:N_unique]).
+        CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_row_indices(),
+                                       gt->m_cache_unique_row.data(),
+                                       N_unique * sizeof(int),
+                                       cudaMemcpyDeviceToDevice));
+        CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_col_indices(),
+                                       gt->m_cache_unique_col.data(),
+                                       N_unique * sizeof(int),
+                                       cudaMemcpyDeviceToDevice));
+        CUDA_SAFE_CALL(cudaMemcpyAsync(gt->block_hash_value(),
+                                       gt->m_cache_unique_hash.data(),
+                                       N_unique * sizeof(uint64_t),
+                                       cudaMemcpyDeviceToDevice));
+
+        // Gather new values through the cached permutation. Write to scratch
+        // region [length:2*length) (NOT in-place — avoids the same race the
+        // original sort path also avoids by using out_start_id=length).
+        {
+            int blocks = (length + 255) / 256;
+            __gather_values_by_perm<<<blocks, 256>>>(
+                gt->block_values() + length,  // dst (sorted values scratch)
+                gt->block_values(),           // src (new input values)
+                gt->m_cache_sort_index.data(), length);
+        }
+
+        // Zero the aggregation range [0:N_unique), then segmental-reduce
+        // from the scratch sorted values into it.
+        CUDA_SAFE_CALL(cudaMemsetAsync(gt->block_values(),
+                                       0,
+                                       N_unique * sizeof(Eigen::Matrix3d)));
+        muda::FastSegmentalReduce()
+            .kernel_name("convert_new_skip")
+            .reduce(length,
+                    gt->m_cache_partition_output.data(),
+                    gt->block_values() + length,  // INPUT (sorted scratch)
+                    gt->block_values());          // OUTPUT (aggregated)
+
+        gt->h_unique_key_number = N_unique;
+        return;
+    }
+
+    // ─── FULL PATH ─── pattern changed (or first call). Run normal convert
+    // (original signature: out_start_id = length so sort writes to
+    // [length:2*length) scratch), then save the result into the cache.
+    m_converter.convert(*gt, 0, length, length);
+
+    // Save cache (post-convert): permutation, partition, unique pattern arrays.
+    const int N_unique = gt->h_unique_key_number;
+    gt->m_cache_sort_index.resize(length);
+    gt->m_cache_partition_output.resize(length);
+    gt->m_cache_unique_row.resize(N_unique);
+    gt->m_cache_unique_col.resize(N_unique);
+    gt->m_cache_unique_hash.resize(N_unique);
+
+    CUDA_SAFE_CALL(cudaMemcpyAsync(gt->m_cache_sort_index.data(),
+                                   gt->block_sort_index(),
+                                   length * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(gt->m_cache_partition_output.data(),
+                                   gt->block_index(),
+                                   length * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(gt->m_cache_unique_row.data(),
+                                   gt->block_row_indices(),
+                                   N_unique * sizeof(int),
+                                   cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(gt->m_cache_unique_col.data(),
+                                   gt->block_col_indices(),
+                                   N_unique * sizeof(int),
+                                   cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(gt->m_cache_unique_hash.data(),
+                                   gt->block_hash_value(),
+                                   N_unique * sizeof(uint64_t),
+                                   cudaMemcpyDeviceToDevice));
+
+    gt->m_cache_unique_count      = N_unique;
+    gt->m_cache_length            = length;
+    gt->m_cache_input_fingerprint = h_fp;
+    gt->m_cache_valid             = true;
 }
 
 
