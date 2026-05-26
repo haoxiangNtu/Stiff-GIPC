@@ -77,6 +77,12 @@ class GIPC
     void*     m_cub_sort_temp    = nullptr;  // CUB sort scratch
     size_t    m_cub_sort_temp_bytes = 0;
 
+    // Friction-pair sort temp buffers (separate types: pair int4 above, plus
+    // double2 distCoord, Matrix3x2d tanBasis, double lambda_lastH_scalar).
+    void*     m_distCoord_sorted = nullptr;  // double2 (16 bytes)
+    void*     m_tanBasis_sorted  = nullptr;  // Matrix3x2d (48 bytes)
+    double*   m_lambda_sorted    = nullptr;
+
     uint32_t* _environment_collisionPair = nullptr;
 
     uint32_t* _closeConstraintID  = nullptr;
@@ -232,6 +238,8 @@ class GIPC
     // a single branch path → eliminates the 5.56/32 active threads/warp
     // divergence ncu found in _calBarrierGradientAndHessian.
     void sort_collision_pairs_by_type();
+    // Same warp-divergence treatment for friction pair set.
+    void sort_friction_pairs_by_type();
 
     // ③ assembly graph: pre-allocated events + cached graph for buildCP body.
     // Per-call cudaEventCreate/Destroy is capture-hostile, so events are
