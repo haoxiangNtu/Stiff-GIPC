@@ -228,7 +228,13 @@ void ABDSystem::_cal_abd_body_gradient_and_hessian(ABDSimData& sim_data)
 
     auto boundary_type = sim_data.body_id_to_boundary_type();
 
-    ParallelFor(256)
+    // ncu finding: with N=574 bodies and block size 256, only ceil(574/256)=3
+    // blocks launch -> ~3 SMs occupied out of 114 (Compute Throughput 1.4%,
+    // 97% No-Eligible cycles). Each thread does an entire body's work
+    // (shape_energy_gradient/hessian + make_pd eigen-decomp), so 256-thread
+    // blocks waste warp slots on idle threads. Use 32 threads/block (=1 warp)
+    // so ceil(574/32)=18 blocks distribute across ~18 SMs (6x SM coverage).
+    ParallelFor(32)
         .kernel_name(__FUNCTION__)
         .apply(N,
                [boundary_type = boundary_type.cviewer().name("btype"),
