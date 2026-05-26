@@ -8734,6 +8734,7 @@ void GIPC::FREE_DEVICE_MEM()
 
     // ②-D2H: free energy slots
     if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
+    if(m_alpha_slots)  { CUDA_SAFE_CALL(cudaFree(m_alpha_slots));  m_alpha_slots  = nullptr; }
 
     pcg_data.FREE_DEVICE_MEM();
 
@@ -8796,6 +8797,8 @@ void GIPC::MALLOC_DEVICE_MEM()
 
     // ②-D2H: 9-slot device buffer for batched energy reductions in computeEnergy.
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
+    // ②-D2H: 2-slot buffer for ground+self largestFeasibleStepSize batching.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_alpha_slots, 2 * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -9321,6 +9324,55 @@ double GIPC::ground_largestFeasibleStepSize(double slackness, double* mqueue)
     //CUDA_SAFE_CALL(cudaFree(_minSteps));
     return 1.0 / minValue;
 }
+
+// ②-D2H batched variants for the two CCD step-size reductions that fire
+// back-to-back at the top of each line search. Each writes minValue to
+// out_slot via D2D (no blocking sync). Caller does host-side 1.0/x and the
+// m_skip_all_collision / numbers<1 guards (we don't queue any kernels when
+// the early-return condition holds).
+
+void GIPC::ground_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, double* out_slot)
+{
+    int numbers = surf_vertexNum;
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_min_groundTimeStep_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir, mqueue, slackness, numbers,
+        _point_body_id, _ground_skip_body, _ground_body_count);
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, int numbers, double* out_slot)
+{
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_min_selfTimeStep_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes, _ccd_collisonPairs, _moveDir, mqueue, slackness, numbers);
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
 
 double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueue, uint4* tets)
 {
@@ -11776,11 +11828,30 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         cudaEventRecord(end1);
         double alpha = 1.0, slackness_a = 0.8, slackness_m = 0.8;
 
-        alpha =
-            std::min(alpha, ground_largestFeasibleStepSize(slackness_a, pcg_data.squeue));
+        // ②-D2H: batch the two back-to-back CCD step-size reductions (ground +
+        // self) into one D2H of 2 doubles. Preserves original early-return
+        // semantics: m_skip_all_collision skips ALL reductions; surf_vertexNum<1
+        // skips ground; h_cpNum[0]<1 skips self. Each "did" branch only queues
+        // kernels when its preconditions are met.
+        if(m_skip_all_collision)
+        {
+            // both functions short-circuit to 1.0 -> no change to alpha
+        }
+        else
+        {
+            bool g_did = (surf_vertexNum >= 1);
+            bool s_did = (h_cpNum[0]     >= 1);
+            if(g_did) ground_largestFeasibleStepSize_DeviceOut(slackness_a, pcg_data.squeue, m_alpha_slots + 0);
+            if(s_did) self_largestFeasibleStepSize_DeviceOut  (slackness_m, pcg_data.squeue, h_cpNum[0], m_alpha_slots + 1);
+            if(g_did || s_did)
+            {
+                double h_alpha[2] = {1.0, 1.0};
+                CUDA_SAFE_CALL(cudaMemcpy(h_alpha, m_alpha_slots, 2 * sizeof(double), cudaMemcpyDeviceToHost));
+                if(g_did) alpha = std::min(alpha, 1.0 / h_alpha[0]);
+                if(s_did) alpha = std::min(alpha, 1.0 / h_alpha[1]);
+            }
+        }
         //alpha = std::min(alpha, InjectiveStepSize(0.2, 1e-6, pcg_data.squeue, TetMesh.tetrahedras));
-        alpha = std::min(
-            alpha, self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_cpNum[0]));
         double temp_alpha = alpha;
         double alpha_CFL  = alpha;
 
