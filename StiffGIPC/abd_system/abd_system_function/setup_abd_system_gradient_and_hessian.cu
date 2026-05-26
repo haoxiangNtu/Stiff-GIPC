@@ -1912,7 +1912,9 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
     {
         using namespace muda;
         auto Ms = sim_data.device.body_id_to_abd_mass.cviewer().name("M");
-        ParallelFor(256)
+        // ncu finding: N=574 bodies with block 256 -> 3 blocks total -> only
+        // 3 of 114 SMs busy. Use 32 (1 warp/block) -> 18 blocks across 18 SMs.
+        ParallelFor(32)
             .kernel_name("seed_preconditioner_with_mass")
             .apply(body_hessian_size,
                    [P = abd_system_diag_preconditioner.viewer().name("P"),
@@ -1944,7 +1946,9 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
                        }
                    });
         int count = sim_data.abd_fem_count_info().abd_body_num;
-                ParallelFor(256)
+        // ncu finding: 12x12 matrix inverse per body. N=574 with block 256 ->
+        // 3 blocks -> SM-starved. Use 32 -> 18 blocks across 18 SMs.
+        ParallelFor(32)
             .kernel_name(__FUNCTION__)
             .apply(count,
                    [P = abd_system_diag_preconditioner.viewer().name("P")] __device__(int i) mutable
