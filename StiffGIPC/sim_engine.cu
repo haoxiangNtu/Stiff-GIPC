@@ -28,6 +28,10 @@
 #include "abd_system/abd_system.h"
 #include <Eigen/Geometry>
 
+// Defined at GLOBAL scope in GIPC.cu (the GIPC class is not in namespace gipc).
+// Declared here outside `namespace gipc` so it resolves to ::g_gipc_log_level.
+extern int g_gipc_log_level;
+
 namespace gipc
 {
 
@@ -93,6 +97,45 @@ SimEngine::SimEngine()
 SimEngine::~SimEngine()
 {
     delete m_impl;
+}
+
+// Null sink to fully silence std::cout when log_level <= 0.  This catches every
+// std::cout-based engine print in one shot ([SimEngine]/[ABDSystem]/
+// [UrdfSceneImporter]/solve_subIP banner) without gating each call site.
+// printf-based prints are gated separately by g_gipc_log_level.  Python's
+// print() goes through Python's own sys.stdout (not C++ std::cout) so user
+// output is unaffected.
+namespace {
+struct NullStreambuf : std::streambuf { int overflow(int c) override { return c; } };
+NullStreambuf  g_null_streambuf;
+std::streambuf* g_saved_cout_buf = nullptr;
+}  // namespace
+
+void SimEngine::set_log_level(int level)
+{
+    ::g_gipc_log_level = level;   // global, extern'd before `namespace gipc`
+    if(level <= 0)
+    {
+        if(!g_saved_cout_buf)               // redirect once
+            g_saved_cout_buf = std::cout.rdbuf(&g_null_streambuf);
+    }
+    else if(g_saved_cout_buf)               // restore
+    {
+        std::cout.rdbuf(g_saved_cout_buf);
+        g_saved_cout_buf = nullptr;
+    }
+}
+
+void SimEngine::reset()
+{
+    // Recreate the whole Impl: ~Impl runs ~GIPC and ~device_TetraData which
+    // free their GPU buffers (no leak), and a fresh Impl gives an empty world.
+    // Preserve the current config across the rebuild.
+    SimEngineConfig saved_cfg = m_impl->cfg;
+    delete m_impl;
+    m_impl = new Impl;
+    m_impl->cfg = saved_cfg;
+    init_cuda();   // re-resolve assets dir + cudaSetDevice on the fresh Impl
 }
 
 void SimEngine::set_config(const SimEngineConfig& cfg)
@@ -768,6 +811,34 @@ void SimEngine::Impl::do_upload_to_gpu()
               tetMesh.vertexNum * sizeof(int), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.velocities, tetMesh.velocities.data(),
               tetMesh.vertexNum * sizeof(double3), cudaMemcpyHostToDevice);
+    // [MAS stitch index fix] When MAS is active (preconditioner_type != 0), FEM
+    // bodies are loaded in metis-SORTED order: engine vertex (off+i) holds INPUT
+    // vertex (off + sort_index[i]); vertex_metis_to_input[engine] = input.
+    // Stitch springs are added by the user in INPUT-vertex order, so without
+    // this translation they pull the WRONG engine vertices -> garbage forces ->
+    // Newton never converges (the case_40 MAS-on bug). P_type==0 => perm is
+    // identity => skipped (no-op).
+    if(cfg.preconditioner_type != 0 && tetMesh.softNum > 0
+       && !tetMesh.vertex_metis_to_input.empty())
+    {
+        const auto& m2i = tetMesh.vertex_metis_to_input;  // engine_idx -> input_idx
+        std::vector<int> i2m(m2i.size(), -1);             // input_idx -> engine_idx
+        for(int e = 0; e < (int)m2i.size(); e++)
+            if(m2i[e] >= 0 && m2i[e] < (int)i2m.size())
+                i2m[m2i[e]] = e;
+        auto to_engine = [&](int input_id) -> int {
+            return (input_id >= 0 && input_id < (int)i2m.size() && i2m[input_id] >= 0)
+                       ? i2m[input_id] : input_id;
+        };
+        for(auto& v : tetMesh.targetIndex)
+            v = static_cast<uint32_t>(to_engine(static_cast<int>(v)));
+        for(auto& v : d_tetMesh.stitch_paired_vertex)  // ABD anchors: identity, safe
+            v = to_engine(v);
+        if(g_gipc_log_level >= 1)
+            printf("[MAS-fix] remapped %d stitch FEM indices input->engine (metis) order\n",
+                   tetMesh.softNum);
+    }
+
     safe_copy(d_tetMesh.targetIndex, tetMesh.targetIndex.data(),
               tetMesh.softNum * sizeof(uint32_t), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.targetVert, tetMesh.targetPos.data(),
@@ -819,7 +890,7 @@ void SimEngine::Impl::do_upload_to_gpu()
     }
 
     // Collision exclusion matrix
-    printf("[CollisionExclusion] pairs=%d, collision_body_num=%d\n",
+    if(::g_gipc_log_level >= 1) printf("[CollisionExclusion] pairs=%d, collision_body_num=%d\n",
            (int)tetMesh.collision_exclusion_pairs.size(), d_tetMesh.collision_body_num);
     if(!tetMesh.collision_exclusion_pairs.empty() && d_tetMesh.collision_body_num > 0)
     {
@@ -835,7 +906,7 @@ void SimEngine::Impl::do_upload_to_gpu()
         }
         safe_copy(d_tetMesh.collision_skip_matrix, host_matrix.data(),
                   N * N * sizeof(int), cudaMemcpyHostToDevice);
-        printf("[CollisionExclusion] Uploaded %dx%d exclusion matrix (%d pairs)\n",
+        if(::g_gipc_log_level >= 1) printf("[CollisionExclusion] Uploaded %dx%d exclusion matrix (%d pairs)\n",
                N, N, (int)tetMesh.collision_exclusion_pairs.size());
     }
 
@@ -865,7 +936,7 @@ void SimEngine::Impl::do_upload_to_gpu()
     const char* bvhskip2_env_local = std::getenv("BVHSKIP2");
     bool bvhskip2_enabled_local = (bvhskip2_env_local == nullptr) || (std::string(bvhskip2_env_local) != "0");
     if(!bvhskip2_enabled_local) {
-        printf("[BVHSkip#2] DISABLED via BVHSKIP2=0 (kernels see no isolated diag bits)\n");
+        if(::g_gipc_log_level >= 1) printf("[BVHSkip#2] DISABLED via BVHSKIP2=0 (kernels see no isolated diag bits)\n");
     }
     if(bvhskip2_enabled_local && d_tetMesh.collision_body_num > 0)
     {
@@ -893,7 +964,7 @@ void SimEngine::Impl::do_upload_to_gpu()
                 n_iso++;
             }
         }
-        printf("[BVHSkip] %d/%d bodies fully isolated → diag[i][i]=1 short-circuit set\n",
+        if(::g_gipc_log_level >= 1) printf("[BVHSkip] %d/%d bodies fully isolated → diag[i][i]=1 short-circuit set\n",
                n_iso, N);
     }
 
@@ -976,7 +1047,7 @@ void SimEngine::Impl::do_init_bvh_and_solver()
                 * 3 * cfg.collision_detection_buff_scale);
     }
 
-    printf("[SimEngine] collision_detection_buff_scale=%.1f  MAX_CCD_PAIRS=%d  MAX_PAIRS=%d\n",
+    if(::g_gipc_log_level >= 1) printf("[SimEngine] collision_detection_buff_scale=%.1f  MAX_CCD_PAIRS=%d  MAX_PAIRS=%d\n",
            cfg.collision_detection_buff_scale,
            ipc.MAX_CCD_COLLITION_PAIRS_NUM,
            ipc.MAX_COLLITION_PAIRS_NUM);
@@ -1109,9 +1180,9 @@ void SimEngine::Impl::do_init_bvh_and_solver()
         const char* bvhskip2_env = std::getenv("BVHSKIP2");
         bool bvhskip2_enabled = (bvhskip2_env == nullptr) || (std::string(bvhskip2_env) != "0");
         if(!bvhskip3_enabled) {
-            printf("[BVHSkip#3] DISABLED via BVHSKIP3=0\n");
+            if(::g_gipc_log_level >= 1) printf("[BVHSkip#3] DISABLED via BVHSKIP3=0\n");
         } else if(!bvhskip2_enabled) {
-            printf("[BVHSkip#3] AUTO-DISABLED (BVHSKIP2=0 — #3 requires #2's isolation set)\n");
+            if(::g_gipc_log_level >= 1) printf("[BVHSkip#3] AUTO-DISABLED (BVHSKIP2=0 — #3 requires #2's isolation set)\n");
         } else if(d_tetMesh.collision_body_num > 0
                   && (!tetMesh.collision_exclusion_pairs.empty()
                       || !tetMesh.ground_collision_skip_body_ids.empty()))
@@ -1184,7 +1255,7 @@ void SimEngine::Impl::do_init_bvh_and_solver()
                 ipc.bvh_e._active_idx         = d_tetMesh.bvh_active_edge_idx;
                 ipc.bvh_e.face_number_active  = n_ae;
             }
-            printf("[BVHSkip#3] %d/%d isolated  active faces=%d/%zu  active edges=%d/%zu\n",
+            if(::g_gipc_log_level >= 1) printf("[BVHSkip#3] %d/%d isolated  active faces=%d/%zu  active edges=%d/%zu\n",
                    n_iso, N, n_af, tetMesh.surface.size(),
                    n_ae, tetMesh.surfEdges.size());
             // Re-build BVH so it transitions from default (full) to indirect
