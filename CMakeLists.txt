@@ -51,11 +51,17 @@ set(GIPC_PHYSICS_DEFS
 
 # Common CUDA compile options
 set(GIPC_CUDA_PRIVATE_OPTS
-    ${CMAKE_CUDA_FLAGS} 
-    --use_fast_math 
-    -lineinfo 
-    --ptxas-options=-allow-expensive-optimizations=true 
-    -Xcudafe 
+    ${CMAKE_CUDA_FLAGS}
+    --use_fast_math
+    -lineinfo
+    --ptxas-options=-allow-expensive-optimizations=true
+    # ncu finding (May 2026): _calBarrierGradient/_calBarrierGradientAndHessian
+    # used 254 reg/thread → only 1 block/SM (Achieved Occupancy 13.36%, Active
+    # Warps/SM=6, 96.89% No-Eligible cycles → latency NOT hidden). Cap at 128
+    # registers globally so 2+ blocks fit per SM. Spillage to local memory is
+    # accepted in exchange for 2x active warps → much better latency hiding.
+    --maxrregcount=128
+    -Xcudafe
     "--display_error_number --diag_suppress=implicit_return_from_non_void_function --diag_suppress=2642"
 )
 set(GIPC_CUDA_PUBLIC_OPTS
