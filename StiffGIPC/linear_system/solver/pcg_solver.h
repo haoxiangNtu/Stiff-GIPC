@@ -51,6 +51,20 @@ class PCGSolver : public IterativeSolver
     void*      cub_temp_ptr   = nullptr;
     size_t     cub_temp_bytes = 0;
 
+    // ③ CUDA Graph PoC: capture one PCG iteration body and replay it for
+    // iter 2..max_iter (iter 1 runs normally so cub_temp gets allocated first
+    // and the captured topology is stable). Rebuilt whenever dof changes
+    // across solves (matrix sparsity changes per Newton iteration).
+    cudaGraph_t      m_pcg_graph      = nullptr;
+    cudaGraphExec_t  m_pcg_graph_exec = nullptr;
+    size_t           m_graph_dof      = 0;
+    // BLOCKER: capture fails because muda has an internal cudaStreamSynchronize
+    // somewhere in the PCG body path (spmv / preconditioner / CUB) that throws
+    // cudaErrorStreamCaptureUnsupported even in Relaxed mode. Until that sync
+    // is located and eliminated (muda surgery), keep the graph dormant.
+    // Flip to true to retry once the muda block is fixed.
+    bool             m_graph_enabled  = true;  // unlocked after muda capture-guard fix
+
     PCGSolverConfig   m_config;
 
   protected:
