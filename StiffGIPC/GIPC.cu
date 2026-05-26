@@ -9442,7 +9442,15 @@ void GIPC::buildCP()
     bvh_f.SelfCollitionDetect(dHat);
     bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
     GroundCollisionDetect();
-    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+    // ②-D2H + ③-graph prep: replace host-side sync with device-side event
+    // join. PTDS now waits on aux's completion via cudaStreamWaitEvent
+    // (capture-friendly) instead of cudaStreamSynchronize (capture-hostile,
+    // host blocks). Same dependency, no host stall.
+    cudaEvent_t end_evt;
+    cudaEventCreateWithFlags(&end_evt, cudaEventDisableTiming);
+    cudaEventRecord(end_evt, m_aux_stream);
+    cudaStreamWaitEvent(0, end_evt, 0);
+    cudaEventDestroy(end_evt);
     cudaEventDestroy(reset_evt);
 
     // ②-D2H batch: _cpNum [0:5] and _gpNum [5] are contiguous; one 6-uint32 D2H.
@@ -9470,10 +9478,14 @@ void GIPC::buildFullCP(const double& alpha)
     cudaEventRecord(reset_evt, 0);
     cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
 
-    // Same overlap pattern as buildCP.
+    // Same overlap pattern as buildCP, including the event-based aux join.
     bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
     bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, m_aux_stream);
-    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+    cudaEvent_t end_evt;
+    cudaEventCreateWithFlags(&end_evt, cudaEventDisableTiming);
+    cudaEventRecord(end_evt, m_aux_stream);
+    cudaStreamWaitEvent(0, end_evt, 0);
+    cudaEventDestroy(end_evt);
     cudaEventDestroy(reset_evt);
 
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
