@@ -279,16 +279,45 @@ __global__ void __compute_input_fingerprint(const int* rows,
                                             int        n,
                                             unsigned long long* out)
 {
+    // Hierarchical XOR reduction (warp-shuffle → block-shared → one atomic
+    // per block).  Previous version did `atomicXor(out, key)` per thread →
+    // tens of thousands of atomics serialized on one L2 line (was 6% of
+    // case39 GPU time / 376 µs avg).  This pattern keeps the same XOR-fold
+    // semantics (XOR is associative + commutative) at fraction of the cost.
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= n) return;
-    unsigned long long key =
-        (static_cast<unsigned long long>(static_cast<unsigned int>(rows[idx])) << 32)
-        | static_cast<unsigned long long>(static_cast<unsigned int>(cols[idx]));
-    // Mix to spread bits (so trivial swaps don't collide). Splittable-mix.
-    key ^= key >> 33; key *= 0xff51afd7ed558ccdULL;
-    key ^= key >> 33; key *= 0xc4ceb9fe1a85ec53ULL;
-    key ^= key >> 33;
-    atomicXor(out, key);
+    unsigned long long key = 0ULL;
+    if(idx < n)
+    {
+        key = (static_cast<unsigned long long>(static_cast<unsigned int>(rows[idx])) << 32)
+            | static_cast<unsigned long long>(static_cast<unsigned int>(cols[idx]));
+        // Splittable-mix so trivial (row,col) swaps don't collide.
+        key ^= key >> 33; key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33; key *= 0xc4ceb9fe1a85ec53ULL;
+        key ^= key >> 33;
+    }
+    // Warp-level XOR reduction (32 → 1 lane via butterfly shuffle).
+    #pragma unroll
+    for(int offset = 16; offset > 0; offset >>= 1)
+        key ^= __shfl_xor_sync(0xFFFFFFFFu, key, offset);
+    // Each warp's lane 0 now holds the warp-XOR.  Combine warps in shared mem.
+    constexpr int MAX_WARPS = 32;  // block size capped at 1024 = 32 warps
+    __shared__ unsigned long long s_warp[MAX_WARPS];
+    int laneId = threadIdx.x & 31;
+    int warpId = threadIdx.x >> 5;
+    if(laneId == 0)
+        s_warp[warpId] = key;
+    __syncthreads();
+    // Final reduction by warp 0 (max blockDim/32 warps).
+    if(warpId == 0)
+    {
+        int    nWarps = (blockDim.x + 31) >> 5;
+        unsigned long long acc = (laneId < nWarps) ? s_warp[laneId] : 0ULL;
+        #pragma unroll
+        for(int offset = 16; offset > 0; offset >>= 1)
+            acc ^= __shfl_xor_sync(0xFFFFFFFFu, acc, offset);
+        if(laneId == 0)
+            atomicXor(out, acc);   // one atomic per block, not per thread
+    }
 }
 
 // Skip-path gather: dst_val[i] = src_val[cached_perm[i]]
