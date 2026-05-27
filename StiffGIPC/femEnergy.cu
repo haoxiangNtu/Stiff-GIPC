@@ -2164,10 +2164,10 @@ __global__ void _calculate_triangle_fem_deformationF(__GEIGEN__::Matrix2x2d* tri
     F3x2[idx] = F;
 }
 
-__global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* trimInverses,
-                                                         const double3* vertexes,
-                                                         const uint3* triangles,
-                                                         const double* area,
+__global__ void _calculate_triangle_fem_gradient_hessian(const __GEIGEN__::Matrix2x2d* __restrict__ trimInverses,
+                                                         const double3* __restrict__ vertexes,
+                                                         const uint3*   __restrict__ triangles,
+                                                         const double*  __restrict__ area,
                                                          double3*      gradient,
                                                          int    triangleNum,
                                                          double stretchStiff,
@@ -2184,11 +2184,17 @@ __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d*
     if(idx >= triangleNum)
         return;
 
-    __GEIGEN__::Matrix6x9d PFPX = __computePFDsPX3D_6x9_double(trimInverses[idx]);
+    // Cache loads of read-only inputs (compiler will route through read-only cache
+    // via __restrict__ + const).  Was 72% DRAM bound — reduce redundant reloads.
+    const __GEIGEN__::Matrix2x2d Ti = trimInverses[idx];
+    const uint3                  tri = triangles[idx];
+    const double                 ar = area[idx];
+
+    __GEIGEN__::Matrix6x9d PFPX = __computePFDsPX3D_6x9_double(Ti);
 
     __GEIGEN__::Matrix3x2d Ds;
-    __calculateDs2D_double(vertexes, triangles[idx], Ds);
-    __GEIGEN__::Matrix3x2d F = __GEIGEN__::__M3x2_M2x2_Multiply(Ds, trimInverses[idx]);
+    __calculateDs2D_double(vertexes, tri, Ds);
+    __GEIGEN__::Matrix3x2d F = __GEIGEN__::__M3x2_M2x2_Multiply(Ds, Ti);
 
     __GEIGEN__::Matrix3x2d PEPF =
         __computePEPF_BaraffWitkinStretch_double(F, stretchStiff, shearhStiff, strainRate);
@@ -2200,19 +2206,18 @@ __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d*
     __GEIGEN__::Matrix9x6d PFPXTranspose = __GEIGEN__::__Transpose6x9(PFPX);
     __GEIGEN__::Vector9    f =
         __GEIGEN__::__s_vec9_multiply(__GEIGEN__::__M9x6_v6_multiply(PFPXTranspose, pepf),
-                                      IPC_dt * IPC_dt * area[idx]);
-    //printf("%f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f\n", f.v[0], f.v[1], f.v[2], f.v[3], f.v[4], f.v[5], f.v[6], f.v[7], f.v[8], f.v[9], f.v[10], f.v[11]);
+                                      IPC_dt * IPC_dt * ar);
 
     {
-        atomicAdd(&(gradient[triangles[idx].x].x), f.v[0]);
-        atomicAdd(&(gradient[triangles[idx].x].y), f.v[1]);
-        atomicAdd(&(gradient[triangles[idx].x].z), f.v[2]);
-        atomicAdd(&(gradient[triangles[idx].y].x), f.v[3]);
-        atomicAdd(&(gradient[triangles[idx].y].y), f.v[4]);
-        atomicAdd(&(gradient[triangles[idx].y].z), f.v[5]);
-        atomicAdd(&(gradient[triangles[idx].z].x), f.v[6]);
-        atomicAdd(&(gradient[triangles[idx].z].y), f.v[7]);
-        atomicAdd(&(gradient[triangles[idx].z].z), f.v[8]);
+        atomicAdd(&(gradient[tri.x].x), f.v[0]);
+        atomicAdd(&(gradient[tri.x].y), f.v[1]);
+        atomicAdd(&(gradient[tri.x].z), f.v[2]);
+        atomicAdd(&(gradient[tri.y].x), f.v[3]);
+        atomicAdd(&(gradient[tri.y].y), f.v[4]);
+        atomicAdd(&(gradient[tri.y].z), f.v[5]);
+        atomicAdd(&(gradient[tri.z].x), f.v[6]);
+        atomicAdd(&(gradient[tri.z].y), f.v[7]);
+        atomicAdd(&(gradient[tri.z].z), f.v[8]);
     }
 
     __GEIGEN__::Matrix6x6d Hq = __GEIGEN__::__s_M6x6_Multiply(
@@ -2224,12 +2229,11 @@ __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d*
     __GEIGEN__::Matrix9x6d M9x6_temp =
         __GEIGEN__::__M9x6_M6x6_Multiply(PFPXTranspose, Hq);
     __GEIGEN__::Matrix9x9d H = __GEIGEN__::__M9x6_M6x9_Multiply(M9x6_temp, PFPX);
-    H = __GEIGEN__::__s_M9x9_Multiply(H, area[idx] * IPC_dt * IPC_dt);
-    //Hessians[idx + offset] = H;
+    H = __GEIGEN__::__s_M9x9_Multiply(H, ar * IPC_dt * IPC_dt);
 
-    unsigned int global_fem_offset[3] = {triangles[idx].x + global_hessian_fem_offset,
-                                         triangles[idx].y + global_hessian_fem_offset,
-                                         triangles[idx].z + global_hessian_fem_offset};
+    unsigned int global_fem_offset[3] = {tri.x + global_hessian_fem_offset,
+                                         tri.y + global_hessian_fem_offset,
+                                         tri.z + global_hessian_fem_offset};
 
     write_triplet_fem<9, 9>(
         triplet_values, row_ids, col_ids, global_fem_offset, H.m, global_offset + idx * 6);
