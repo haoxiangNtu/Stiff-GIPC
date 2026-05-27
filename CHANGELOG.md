@@ -4,6 +4,69 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-05-28
+
+### Performance — major
+
+End-to-end speed-up on `replay_case_39` (1018-frame headless, RTX 4090 D,
+`STIFF_SKIP_CCD_SANITY=1`): **53 → 32 ms / step** (~18.9 → 31.3 fps, +40%)
+vs. v0.6.1 default configuration.
+
+Cumulative changes vs v0.6.1:
+
+- **CUDA Graph capture**: PCG inner loop (commit `958e15e`), `buildCP` body
+  (`e2981df`), sparsity-cache skip path (`3d883df`).  Reduces per-step
+  kernel-launch overhead.
+- **Sparsity-cache for global Hessian assembly** (`c398e62`, `d8bbeec`):
+  detect when (row, col) pattern is unchanged across Newton iters and skip
+  the radix sort.  XOR-fold fingerprint kernel rewritten with hierarchical
+  reduction (warp-shuffle + per-block atomic) to avoid global-atomic
+  serialization (`9a20fe1`).
+- **D2H batching** (`4d72d8a`, `86a281b`, `3986bd5`, `7046398`): coalesce
+  multiple blocking D2H reads into single transfers (3 sites) and defer
+  `_cpNum`/`_gpNum` D2H past `buildCP` so the kernel sequence stays
+  capture-friendly.
+- **Hot-path scratch preallocation** (`46727ba`): eliminate per-step
+  `cudaMalloc`/`cudaFree` for collision-pair sort temp + reduction buffer.
+- **Warp-divergence elimination** via pair-type sort: barrier
+  gradient+Hessian (`590968a`), friction Hessian (`9d7693e`), CCD time-step
+  reduction (`2b7b5a6`).
+- **ABD block-size retuning** (`e6fcefe`, `2e8c22c`, `170eaa4`): per-body
+  ABD kernels were launched with `block_size = 256-768`; for typical body
+  counts (≤ 4 per scene) those grids underfilled the GPU.  Reduced to 32
+  so the grid spans more SMs per launch.
+- **`-maxrregcount=128`** (`3617aca`): cap register use so heavy compute
+  kernels (`_edgeTriIntersectionQuery`, `_calBarrierGradientAndHessian`)
+  reach 2 blocks/SM instead of 1.
+- **FEM tri gradient/Hessian: `__restrict__` + cached loads** (`2d5570e`).
+
+### Performance — opt-in (env-gated)
+
+- **`STIFF_SKIP_CCD_SANITY=1`** (`8b4ad07`): skip the paranoid post-line-
+  search `isIntersected()` check (re-runs full `_edgeTriIntersectionQuery`
+  BVH for every line-search α bisection — 42% of GPU time on `case_39`).
+  CCD line-search already guarantees a non-intersecting step on smooth
+  contact, so the recheck never fires on those scenes.  Default off;
+  opt-in for smooth-contact scenes (`case_39`, etc.) wins ~15%.
+
+### Fixed
+
+- **MAS preconditioner now graph-capturable** (`01879ba`): two synchronous
+  `cudaMemset` calls in `MASPreconditioner::preconditioning` errored with
+  CUDA[900] *"operation not permitted when stream is capturing"* when run
+  inside the new PCG CUDA graph (above).  Switched to `cudaMemsetAsync` on
+  `cudaStreamPerThread`.  Without this, any FEM scene with
+  `preconditioner_type=1` would crash on v0.6.1's optimization path.
+
+### Changed
+
+- **`case_39` / `case_40` examples revert to `preconditioner_type=0`**:
+  measurements on the v0.7.0 code show MAS is now *slower* than diagonal
+  preconditioning on these scenes (cudagraph PCG made each iter cheap
+  enough that MAS's per-call setup overhead exceeds its iter-count
+  savings).  `case_39`: MAS 41.2 ms vs diagonal 32.0 ms (n=3 paired).
+  Users wanting MAS can still set `CASE39_PRECOND=1`.
+
 ## [0.6.1] — 2026-05-27
 
 ### Fixed
