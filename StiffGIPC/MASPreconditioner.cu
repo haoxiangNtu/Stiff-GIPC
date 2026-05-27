@@ -2222,11 +2222,18 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
 {
     if(totalNodes < 1)
         return;
-    CUDA_SAFE_CALL(cudaMemset(d_multiLevelR + totalMapNodes,
-                              0,
-                              (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f)));
+    // cudagraph capture: PCG's apply_preconditioner lambda gets captured at
+    // iter 2; sync cudaMemset errors with "operation not permitted when stream
+    // is capturing".  Use Async variant on the per-thread default stream so it
+    // becomes a normal node in the captured graph.
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelR + totalMapNodes,
+                                   0,
+                                   (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f),
+                                   cudaStreamPerThread));
 
-    CUDA_SAFE_CALL(cudaMemset(d_multiLevelZ, 0, (totalNumberClusters) * sizeof(Precision_T3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelZ, 0,
+                                   (totalNumberClusters) * sizeof(Precision_T3),
+                                   cudaStreamPerThread));
 
     //cudaEvent_t start, end0, end1, end2;
     //cudaEventCreate(&start);
