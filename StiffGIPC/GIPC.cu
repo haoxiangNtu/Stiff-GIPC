@@ -12112,6 +12112,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         cudaEventRecord(start);
         timemakePd += computeGradientAndHessian(TetMesh);
+        GIPC_CUDA_CHECKPOINT("computeGradientAndHessian");
 
 
         double distToOpt_PN = calcMinMovement(_moveDir, pcg_data.squeue, vertexNum);
@@ -12137,6 +12138,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         cudaEventRecord(end0);
 
         auto cg_count = calculateMovingDirection(TetMesh, h_cpNum[0], pcg_data.P_type);
+        GIPC_CUDA_CHECKPOINT("calculateMovingDirection (PCG)");
         //std::cout << "[" << k << "]"
         //          << "cg_count = " << cg_count << std::endl;
         total_Cg_count += cg_count;
@@ -12177,6 +12179,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         buildBVH_FULLCCD(temp_alpha);
         buildFullCP(temp_alpha);
+        GIPC_CUDA_CHECKPOINT("buildBVH_FULLCCD + buildFullCP");
         sync_ccd_cpNum();  // ②-D2H elim
         sort_ccd_pairs_by_type();  // warp-div fix
         if(h_ccd_cpNum > 0)
@@ -12200,6 +12203,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         //printf("alpha:  %f\n", alpha);
 
         bool isStop = lineSearch(TetMesh, alpha, alpha_CFL);
+        GIPC_CUDA_CHECKPOINT("lineSearch");
 
         cudaEventRecord(end3);
         postLineSearch(TetMesh, alpha);
