@@ -53,3 +53,6 @@ Assets/sorted_mesh/*.part
 
 # Demo media — too large for git
 *.mp4
+
+# CUDA profiling captures (large, regenerated locally)
+ncu_reports/
