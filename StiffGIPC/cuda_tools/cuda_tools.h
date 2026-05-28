@@ -37,6 +37,14 @@ inline void cuda_safe_call_(cudaError err, const char* file_name, const int num_
 {
     if(cudaSuccess != err)
     {
+        // CUDA runtime teardown at process / Python-interpreter exit: the driver
+        // is already unloading, so cudaFree() (and friends) in static / global
+        // object destructors return cudaErrorCudartUnloading. The allocations are
+        // reclaimed by the driver anyway, so swallow this instead of aborting —
+        // otherwise every clean exit ends in "Aborted (core dumped)".
+        if(err == cudaErrorCudartUnloading)
+            return;
+
         std::cerr << file_name << "[" << num_line << "]: "
                   << "CUDA Running API error[" << (int)err
                   << "]: " << cudaGetErrorString(err) << std::endl;
