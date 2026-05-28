@@ -38,3 +38,9 @@ timeCost.txt
 
 # Demo media — too large for git
 *.mp4
+
+# NCU profiling artifacts (large binaries)
+ncu_reports/
+*.ncu-rep
+*.nsys-rep
+*.sqlite
