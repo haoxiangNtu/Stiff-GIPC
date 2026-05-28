@@ -623,8 +623,25 @@ int SimEngine::add_prismatic_joint(int parent_body, int child_body,
 
 void SimEngine::set_vertex_boundary(int vertex_index, int boundary_type)
 {
-    if(vertex_index >= 0 && vertex_index < static_cast<int>(m_impl->tetMesh.boundaryTypies.size()))
-        m_impl->tetMesh.boundaryTypies[vertex_index] = boundary_type;
+    // [MAS-perm] vertex_index is INPUT-mesh order (the order the user sees via
+    // get_vertex_position_host). boundaryTypies is engine (metis) order, so we
+    // must translate input -> engine through the inverse permutation, exactly
+    // like get_vertex_position_host does. Without this, set_vertex_boundary
+    // flags the WRONG engine vertex whenever the mesh is metis-reordered, so
+    // pinned cloth corners are not actually held and the sheet collapses.
+    // Without a perm, engine == input (identity).
+    const int vnum = m_impl->tetMesh.vertexNum;
+    if(vertex_index < 0 || vertex_index >= vnum)
+        return;
+    int engine_idx = vertex_index;
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;  // engine_idx -> input_idx
+    if(!perm.empty() && static_cast<int>(perm.size()) >= vnum)
+    {
+        for(int e = 0; e < vnum; e++)
+            if(perm[e] == vertex_index) { engine_idx = e; break; }
+    }
+    if(engine_idx >= 0 && engine_idx < static_cast<int>(m_impl->tetMesh.boundaryTypies.size()))
+        m_impl->tetMesh.boundaryTypies[engine_idx] = boundary_type;
 }
 
 int SimEngine::get_abd_body_count() const
