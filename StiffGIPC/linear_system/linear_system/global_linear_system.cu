@@ -8,6 +8,10 @@
 #include <cstdio>
 #include <cstdlib>
 
+// [cp-stats] global-scope (not gipc::) trackers defined in GIPC.cu
+extern uint32_t g_peak_triplet_used;
+extern uint32_t g_triplet_reserved;
+
 namespace gipc
 {
 
@@ -395,6 +399,14 @@ void GlobalLinearSystem::convert_new()
     const int length   = gt->global_triplet_offset;
     if(length < 1)
         return;
+
+    // [cp-stats] realized global-Hessian triplet count this build vs reserved
+    // capacity (the buffer is sized total_internal*32 + collision_max; see the
+    // ×32 chain-rule margin). Tracked for STIFF_CP_STATS buffer-utilization report.
+    {
+        if((uint32_t)length > ::g_peak_triplet_used) ::g_peak_triplet_used = (uint32_t)length;
+        ::g_triplet_reserved = (uint32_t)gt->triplet_count();
+    }
 
     // ───────────────────────────────────────────────────────────────────
     // Compute input fingerprint (XOR-fold of mixed (row,col) keys).

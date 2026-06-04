@@ -9697,6 +9697,15 @@ void GIPC::buildCP()
     run_body();
 }
 
+// [cp-stats] peak realized collision-pair counts this frame, for measuring how
+// much of the worst-case-preallocated CCD/contact buffers is actually used.
+// Gated by env var STIFF_CP_STATS; reset + printed per frame in IPC_Solver.
+uint32_t g_peak_contact_cp = 0;   // peak narrow-phase contact pairs (Hessian)
+uint32_t g_peak_ground_gp  = 0;   // peak ground pairs
+uint32_t g_peak_ccd_cp     = 0;   // peak CCD pairs (line search)
+uint32_t g_peak_triplet_used = 0; // peak realized global-Hessian triplets / frame
+uint32_t g_triplet_reserved  = 0; // reserved triplet capacity (= alloc size)
+
 void GIPC::sync_cpNum()
 {
     uint32_t cp_gp_buf[6];
@@ -9704,12 +9713,16 @@ void GIPC::sync_cpNum()
                               cudaMemcpyDeviceToHost));
     memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
     h_gpNum = cp_gp_buf[5];
+    uint32_t cp_total = h_cpNum[2] + h_cpNum[3] + h_cpNum[4];
+    if(cp_total > g_peak_contact_cp) g_peak_contact_cp = cp_total;
+    if(h_gpNum   > g_peak_ground_gp) g_peak_ground_gp  = h_gpNum;
 }
 
 void GIPC::sync_ccd_cpNum()
 {
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum,
                               sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    if(h_ccd_cpNum > g_peak_ccd_cp) g_peak_ccd_cp = h_ccd_cpNum;
 }
 
 void GIPC::buildFullCP(const double& alpha)
@@ -12442,6 +12455,31 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     total_Frames++;
     if(g_gipc_log_level >= 1)
         printf("average time cost:     %f,    frame id:   %d\n", totalTime / totalNT, total_Frames);
+
+    // [cp-stats] report realized vs reserved collision-pair buffer usage.
+    extern uint32_t g_peak_contact_cp, g_peak_ground_gp, g_peak_ccd_cp;
+    extern uint32_t g_peak_triplet_used, g_triplet_reserved;
+    if(getenv("STIFF_CP_STATS"))
+    {
+        double ccd_pct = MAX_CCD_COLLITION_PAIRS_NUM > 0
+            ? 100.0 * g_peak_ccd_cp / MAX_CCD_COLLITION_PAIRS_NUM : 0.0;
+        double cp_pct = MAX_COLLITION_PAIRS_NUM > 0
+            ? 100.0 * g_peak_contact_cp / MAX_COLLITION_PAIRS_NUM : 0.0;
+        double tri_pct = g_triplet_reserved > 0
+            ? 100.0 * g_peak_triplet_used / g_triplet_reserved : 0.0;
+        printf("[cp-stats] frame %d | CCD used %u / reserved %d (%.3f%%) | "
+               "contact-cp used %u / reserved %d (%.3f%%) | ground-gp used %u | "
+               "triplet used %u / reserved %u (%.3f%%)\n",
+               total_Frames,
+               g_peak_ccd_cp, MAX_CCD_COLLITION_PAIRS_NUM, ccd_pct,
+               g_peak_contact_cp, MAX_COLLITION_PAIRS_NUM, cp_pct,
+               g_peak_ground_gp,
+               g_peak_triplet_used, g_triplet_reserved, tri_pct);
+        g_peak_contact_cp = 0;
+        g_peak_ground_gp  = 0;
+        g_peak_ccd_cp     = 0;
+        g_peak_triplet_used = 0;
+    }
 
 
     ttime0 += time0;
