@@ -1219,6 +1219,7 @@ void SimEngine::Impl::do_init_bvh_and_solver()
 
     ipc.buildBVH();
     ipc.setup_surface_mesh_bodies(tetMesh);
+    ipc.m_triplet_internal_margin = cfg.triplet_internal_margin;
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer,
              cfg.linear_system_buff_scale);
 

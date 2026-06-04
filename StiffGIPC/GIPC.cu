@@ -8851,7 +8851,9 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     // allocation → CUDA illegal memory access.  Use 32× to give margin
     // (the actual ext_count is usually < 16× but allocation math conservative).
     long long unsigned total_max_global_triplet_num =
-        total_internal_triplet_num * 32 + total_max_collision_triplet_num;
+        total_internal_triplet_num
+            * static_cast<long long unsigned>(m_triplet_internal_margin)
+        + total_max_collision_triplet_num;
     if(::g_gipc_log_level >= 1) printf("[buffer] total_internal_triplet_num=%llu, total_max=%llu (3x3 doubles ~ %llu MB)\n",
            total_internal_triplet_num, total_max_global_triplet_num,
            total_max_global_triplet_num * 80 / 1024 / 1024);

@@ -133,6 +133,9 @@ class GIPC
     AABB     SceneSize;
     int      MAX_COLLITION_PAIRS_NUM     = 0;
     int      MAX_CCD_COLLITION_PAIRS_NUM = 0;
+    // internal Hessian-triplet margin (set from cfg.triplet_internal_margin; 32
+    // = historical hardcoded value). The dominant per-env triplet over-reserve.
+    double   m_triplet_internal_margin   = 32.0;
 
     double RestNHEnergy       = 0.0;
     double animation_subRate  = 0.0;

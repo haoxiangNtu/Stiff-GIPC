@@ -39,6 +39,13 @@ struct SimEngineConfig
 
     double collision_detection_buff_scale = 1.0;
     double linear_system_buff_scale       = 1.0;
+    // Margin multiplier on the INTERNAL (FEM/ABD/joint) Hessian-triplet buffer,
+    // reserved for the Strategy-D chain-rule pin-pin expansion range. Hardcoded
+    // 32 historically; measured ~0 extension for non-rigid-heavy scenes, so it
+    // is the dominant per-env over-reservation and the wall for scaling envs.
+    // Lower it (e.g. 4) for multi-env; keep 32 for Strategy-D hybrid meshes
+    // that actually expand.
+    double triplet_internal_margin        = 32.0;
     int    preconditioner_type            = 1;  // 1 = MAS
     int    cuda_device                    = 0;
 
