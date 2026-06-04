@@ -967,6 +967,38 @@ void SimEngine::Impl::do_upload_to_gpu()
                N, N, (int)tetMesh.collision_exclusion_pairs.size(), n_xgrp);
     }
 
+    // [multi-env P2a] upload the group-id substrate (d_body_to_group +
+    // d_point_to_group). Foundation for per-group contact segmentation (P2b) and
+    // the per-env block-diagonal solve (P3). Default stays -1 (wildcard) when no
+    // groups set -> single-env behaviour unchanged.
+    if(have_groups && d_tetMesh.collision_body_num > 0)
+    {
+        int N = d_tetMesh.collision_body_num;
+        std::vector<int> bg(N, -1);
+        for(int i = 0; i < N && i < (int)tetMesh.body_groups.size(); ++i)
+            bg[i] = tetMesh.body_groups[i];
+        safe_copy(d_tetMesh.d_body_to_group, bg.data(),
+                  N * sizeof(int), cudaMemcpyHostToDevice);
+        const auto& pt2body = tetMesh.point_id_to_body_id;
+        std::vector<int> pg(pt2body.size(), -1);
+        std::map<int,int> grp_vcount;
+        for(size_t v = 0; v < pt2body.size(); ++v)
+        {
+            int b = pt2body[v];
+            int g = (b >= 0 && b < N) ? bg[b] : -1;
+            pg[v] = g; grp_vcount[g]++;
+        }
+        safe_copy(d_tetMesh.d_point_to_group, pg.data(),
+                  pg.size() * sizeof(int), cudaMemcpyHostToDevice);
+        if(::g_gipc_log_level >= 1)
+        {
+            printf("[multi-env P2a] group substrate uploaded: %d bodies, %zu verts; per-group vert counts:",
+                   N, pt2body.size());
+            for(auto& [g, c] : grp_vcount) printf(" g%d=%d", g, c);
+            printf("\n");
+        }
+    }
+
     // Ground skip
     if(!tetMesh.ground_collision_skip_body_ids.empty() && d_tetMesh.collision_body_num > 0)
     {

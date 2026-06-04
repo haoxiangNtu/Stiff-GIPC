@@ -67,6 +67,13 @@ class device_TetraData
     int*    collision_skip_matrix = nullptr;
     int     collision_body_num    = 0;
 
+    // [multi-env P2a] group (environment) id substrate. -1 = wildcard.
+    // d_body_to_group[body] (size collision_body_num); d_point_to_group[vert]
+    // (size vertexNum) = d_body_to_group[point_id_to_body_id[vert]]. Foundation
+    // for per-group contact segmentation + per-env block-diagonal solve (P2b/P3).
+    int*    d_body_to_group  = nullptr;
+    int*    d_point_to_group = nullptr;
+
     // [multi-FEM-bodyid] Per-body flag (size = collision_body_num).
     //   body_id_to_is_fem[i] = 1 -> body i is FEM (self-collision allowed)
     //   body_id_to_is_fem[i] = 0 -> body i is ABD (skip same-body checks)

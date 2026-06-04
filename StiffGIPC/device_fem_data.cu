@@ -83,6 +83,11 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
         // [multi-FEM-bodyid] per-body FEM flag table
         CUDA_SAFE_CALL(cudaMalloc((void**)&body_id_to_is_fem, bodyNum * sizeof(int)));
         CUDA_SAFE_CALL(cudaMemset(body_id_to_is_fem, 0, bodyNum * sizeof(int)));
+        // [multi-env P2a] group id substrate (default -1 = wildcard)
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_body_to_group, bodyNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(d_body_to_group, 0xFF, bodyNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_point_to_group, vertex_num * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(d_point_to_group, 0xFF, vertex_num * sizeof(int)));
     }
 
     // Stitch spring GPU arrays (bilateral coupling)
