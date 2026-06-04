@@ -12436,6 +12436,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     float tttime;
     cudaEventElapsedTime(&tttime, start, end0);
+    cudaEventDestroy(start);
+    cudaEventDestroy(end0);
     totalTime += tttime;
     total_Frames++;
     if(g_gipc_log_level >= 1)
