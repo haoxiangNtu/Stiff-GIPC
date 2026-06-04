@@ -261,19 +261,24 @@ def main():
     import polyscope as ps, polyscope.imgui as psim
     v = eng.get_vertices(); fa = eng.get_surface_faces()
     ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("shadow_only")
-    st = dict(idx=0, run=False, ms=0., mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6,0.7,0.8)), v=v, f=fa)
+    st = dict(idx=0, run=False, ms=0., fps=0., mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6,0.7,0.8)), v=v, f=fa)
     def cb():
         if st['run']:
             if psim.Button("Pause"): st['run']=False
         else:
             if psim.Button("Start" if st['idx']==0 else "Resume"): st['run']=True
         psim.SameLine()
-        if psim.Button("Reset"): st['idx']=0; st['run']=False
-        psim.Text(f"frame {st['idx']}/{len(actions)}  envs {num_envs}  {st['ms']:.0f}ms")
+        if psim.Button("Reset"): st['idx']=0; st['run']=False; st['fps']=0.
+        eqms = st['ms']/num_envs if num_envs else st['ms']
+        psim.Text(f"frame {st['idx']}/{len(actions)}   envs {num_envs}")
+        psim.Text(f"step {st['ms']:6.1f} ms    FPS {st['fps']:5.2f}")
+        psim.Text(f"per-env-equiv {eqms:6.1f} ms  ({(1000.0/eqms) if eqms>0 else 0:5.1f} env-steps/s)")
         if not st['run'] or st['idx']>=len(actions): return
         raw = actions[st['idx']]
         for ej in ejs: apply_frame(robot, ej, raw, close_r)
         t=time.perf_counter(); eng.step(); st['ms']=(time.perf_counter()-t)*1000.0
+        inst = 1000.0/st['ms'] if st['ms']>0 else 0.0
+        st['fps'] = inst if st['fps']==0. else 0.9*st['fps'] + 0.1*inst
         v=eng.get_vertices(); fa=eng.get_surface_faces()
         if v.shape[0]!=st['v'].shape[0] or fa.shape!=st['f'].shape:
             st['mesh']=ps.register_surface_mesh("scene", v, fa, color=(0.6,0.7,0.8)); st['v'],st['f']=v,fa
