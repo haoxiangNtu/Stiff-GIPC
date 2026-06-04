@@ -402,6 +402,17 @@ class Engine:
     def add_collision_exclusion(self, body_a: int, body_b: int) -> None:
         self._engine.add_collision_exclusion(body_a, body_b)
 
+    def set_body_groups(self, groups) -> None:
+        """Set per-collision-body group (environment) id, length collision_body_num
+        (ABD bodies first [0,n_abd), then FEM [n_abd, n_abd+n_fem)).
+
+        Bodies in different groups (both >= 0) never collide — folded into the
+        collision-skip matrix at finalize(), so spatially-tiled environments are
+        guaranteed isolated regardless of spacing. group < 0 = wildcard (collides
+        with everything). Call before finalize().
+        """
+        self._engine.set_body_groups([int(g) for g in groups])
+
     def add_ground_collision_skip(self, body_id: int) -> None:
         self._engine.add_ground_collision_skip(body_id)
 

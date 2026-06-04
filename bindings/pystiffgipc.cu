@@ -201,6 +201,8 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("add_collision_exclusion", &SimEngine::add_collision_exclusion,
              py::arg("body_a"), py::arg("body_b"))
+        .def("set_body_groups", &SimEngine::set_body_groups,
+             py::arg("groups"))
         .def("add_ground_collision_skip", &SimEngine::add_ground_collision_skip,
              py::arg("body_id"))
         .def("add_stitch_spring",
