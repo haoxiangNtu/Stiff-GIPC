@@ -8865,12 +8865,25 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     }
     bboxDiagSize2 = __GEIGEN__::__squaredNorm(
         __GEIGEN__::__minus(SceneSize.upper, SceneSize.lower));
-    dTol         = 1e-18 * bboxDiagSize2;
+    // [absolute-dhat fix] The scene-bbox diagonal grows with env count / spacing,
+    // which inflates the bbox-derived dHat (contact thickness) — a physics bug
+    // and the root cause of super-linear contact growth in multi-env. When
+    // absolute_dhat>0, derive an EFFECTIVE bbox so dHat == absolute_dhat^2 and
+    // dTol/fDhat stay consistent with a single-env scene of that contact scale.
+    double eff_bboxDiagSize2 = bboxDiagSize2;
+    if(absolute_dhat > 0.0 && relative_dhat > 0.0)
+        eff_bboxDiagSize2 = (absolute_dhat * absolute_dhat)
+                            / (relative_dhat * relative_dhat);
+    dTol         = 1e-18 * eff_bboxDiagSize2;
     minKappaCoef = 1e11;
     meanMass     = m_meanMass;
     meanVolumn   = m_meanVolumn;
-    dHat = relative_dhat * relative_dhat * bboxDiagSize2;  //__GEIGEN__::__squaredNorm(__GEIGEN__::__minus(maxConer, minConer));
-    fDhat = 1e-4 * bboxDiagSize2;
+    dHat = relative_dhat * relative_dhat * eff_bboxDiagSize2;  // = absolute_dhat^2 when set
+    fDhat = 1e-4 * eff_bboxDiagSize2;
+    if(::g_gipc_log_level >= 1)
+        printf("[dhat] bboxDiagSize2=%.6g (eff=%.6g)  relative_dhat=%.3g  abs_dhat=%.3g  dHat_sqrt=%.6g%s\n",
+               bboxDiagSize2, eff_bboxDiagSize2, relative_dhat, absolute_dhat,
+               sqrt(dHat), absolute_dhat > 0.0 ? " (ABSOLUTE)" : " (scene-bbox)");
 
 
     int global_matrix_block3_size =
@@ -9707,6 +9720,9 @@ uint32_t g_peak_ground_gp  = 0;   // peak ground pairs
 uint32_t g_peak_ccd_cp     = 0;   // peak CCD pairs (line search)
 uint32_t g_peak_triplet_used = 0; // peak realized global-Hessian triplets / frame
 uint32_t g_triplet_reserved  = 0; // reserved triplet capacity (= alloc size)
+uint32_t g_peak_ext_count    = 0; // peak M3.5 chain-rule extension triplets/frame
+uint32_t g_ext_capacity      = 0; // reserved extension capacity (fem_triplet_num*16)
+uint32_t g_fem_triplet_num   = 0; // FEM internal triplet count (per frame)
 
 void GIPC::sync_cpNum()
 {
@@ -11248,6 +11264,13 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                        "Newton instability)\n", h_ext_count, ext_capacity);
                 h_ext_count = ext_capacity;
             }
+            // [cp-stats] track realized chain-rule extension vs its reserved cap
+            {
+                extern uint32_t g_peak_ext_count, g_ext_capacity, g_fem_triplet_num;
+                if((uint32_t)h_ext_count > g_peak_ext_count) g_peak_ext_count = h_ext_count;
+                g_ext_capacity    = (uint32_t)ext_capacity;
+                g_fem_triplet_num = (uint32_t)fem_triplet_num;
+            }
             gipc_global_triplet.global_triplet_offset += h_ext_count;
         }
         else
@@ -12461,6 +12484,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     // [cp-stats] report realized vs reserved collision-pair buffer usage.
     extern uint32_t g_peak_contact_cp, g_peak_ground_gp, g_peak_ccd_cp;
     extern uint32_t g_peak_triplet_used, g_triplet_reserved;
+    extern uint32_t g_peak_ext_count, g_ext_capacity, g_fem_triplet_num;
     if(getenv("STIFF_CP_STATS"))
     {
         double ccd_pct = MAX_CCD_COLLITION_PAIRS_NUM > 0
@@ -12469,18 +12493,23 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
             ? 100.0 * g_peak_contact_cp / MAX_COLLITION_PAIRS_NUM : 0.0;
         double tri_pct = g_triplet_reserved > 0
             ? 100.0 * g_peak_triplet_used / g_triplet_reserved : 0.0;
+        double ext_pct = g_ext_capacity > 0
+            ? 100.0 * g_peak_ext_count / g_ext_capacity : 0.0;
         printf("[cp-stats] frame %d | CCD used %u / reserved %d (%.3f%%) | "
                "contact-cp used %u / reserved %d (%.3f%%) | ground-gp used %u | "
-               "triplet used %u / reserved %u (%.3f%%)\n",
+               "triplet used %u / reserved %u (%.3f%%) | "
+               "fem_triplets %u ext used %u / cap %u (%.3f%%)\n",
                total_Frames,
                g_peak_ccd_cp, MAX_CCD_COLLITION_PAIRS_NUM, ccd_pct,
                g_peak_contact_cp, MAX_COLLITION_PAIRS_NUM, cp_pct,
                g_peak_ground_gp,
-               g_peak_triplet_used, g_triplet_reserved, tri_pct);
+               g_peak_triplet_used, g_triplet_reserved, tri_pct,
+               g_fem_triplet_num, g_peak_ext_count, g_ext_capacity, ext_pct);
         g_peak_contact_cp = 0;
         g_peak_ground_gp  = 0;
         g_peak_ccd_cp     = 0;
         g_peak_triplet_used = 0;
+        g_peak_ext_count  = 0;
     }
 
 

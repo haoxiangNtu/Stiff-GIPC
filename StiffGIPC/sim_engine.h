@@ -46,6 +46,11 @@ struct SimEngineConfig
     // Lower it (e.g. 4) for multi-env; keep 32 for Strategy-D hybrid meshes
     // that actually expand.
     double triplet_internal_margin        = 32.0;
+    // Absolute contact distance (meters). >0 pins dHat to this value instead of
+    // deriving it from the merged-scene bbox diagonal (which inflates with env
+    // count/spacing -> super-linear contact). Set to the single-env dHat_sqrt
+    // for multi-env. 0 = legacy bbox-derived behavior (no change for single-env).
+    double absolute_dhat                  = 0.0;
     int    preconditioner_type            = 1;  // 1 = MAS
     int    cuda_device                    = 0;
 
