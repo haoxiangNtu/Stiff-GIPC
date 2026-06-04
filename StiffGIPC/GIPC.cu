@@ -8717,6 +8717,10 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_edges));
     CUDA_SAFE_CALL(cudaFree(_surfVerts));
 
+    // [multi-env S1] free per-env line-search substrate
+    if(m_env_alpha)    { CUDA_SAFE_CALL(cudaFree(m_env_alpha));    m_env_alpha    = nullptr; }
+    if(m_env_scratch)  { CUDA_SAFE_CALL(cudaFree(m_env_scratch));  m_env_scratch  = nullptr; }
+
     pcg_data.FREE_DEVICE_MEM();
 
     bvh_e.FREE_DEVICE_MEM();
@@ -8757,6 +8761,11 @@ void GIPC::MALLOC_DEVICE_MEM()
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_cpNum, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_gpNum, sizeof(uint32_t)));
+
+    // [multi-env S1] per-env feasible-alpha substrate (physics-neutral until S2).
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_alpha, kEnvAlphaSlots * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_scratch, 4 * kEnvAlphaSlots * sizeof(double)));
+    h_env_alpha.assign(kEnvAlphaSlots, 1.0);
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -9428,6 +9437,110 @@ __global__ void _per_env_sqnorm_accum(const int* p2g, const double3* vec,
         double3 v = vec[i];
         atomicAdd(&per_env_sq[g], v.x * v.x + v.y * v.y + v.z * v.z);
     }
+}
+
+// [multi-env P3a] per-env max CFL speed = max over an env's SURFACE verts of
+// |moveDir[v]| (same metric as _reduct_max_cfl_to_double). Used by a read-only
+// diagnostic to see whether the global alpha_CFL = sqrt(dHat)/maxSpeed*0.5 is
+// being dragged down by ONE env (=> per-env line-search would decouple them).
+// atomicMax on double via bit-twiddling (positive doubles only -> monotone bits).
+__device__ inline void _atomicMaxPosDouble(double* addr, double val)
+{
+    unsigned long long* a = (unsigned long long*)addr;
+    unsigned long long  old = *a, assumed;
+    do { assumed = old;
+         double cur = __longlong_as_double((long long)assumed);
+         if(cur >= val) break;
+         old = atomicCAS(a, assumed, (unsigned long long)__double_as_longlong(val));
+    } while(assumed != old);
+}
+__global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir,
+                                 const uint32_t* mSVI, double* per_env_max,
+                                 int n_surf, int ng)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n_surf) return;
+    int v = mSVI[i];
+    int g = p2g[v];
+    if(g < 0 || g >= ng) return;
+    _atomicMaxPosDouble(&per_env_max[g], __GEIGEN__::__norm(moveDir[v]));
+}
+
+// [multi-env S1] per-env CCD feasible-step reductions. Same per-element 1/timestep
+// as _reduct_min_groundTimeStep_to_double / _reduct_min_selfTimeStep_to_double, but
+// accumulated into per-env MAX(1/step) buckets (env = group of the element's vertex;
+// intra-env after P1) instead of one global max. per-env feasible step = 1/bucket.
+// per_env_inv must be pre-zeroed by caller.
+__global__ void _per_env_groundTimeStep_max(const double3* vertexes,
+                                            const uint32_t* surfVertIds,
+                                            const double* g_offset, const double3* g_normal,
+                                            const double3* moveDir, const int* p2g,
+                                            double* per_env_inv, double slackness, int number,
+                                            const int* _point_body_id,
+                                            const int* _ground_skip_body, int _ground_body_count,
+                                            int ng)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number) return;
+    int svI = surfVertIds[idx];
+    int g   = p2g[svI];
+    if(g < 0 || g >= ng) return;
+    double temp = 0.0;
+    bool   skip = false;
+    if(_point_body_id && _ground_skip_body && _ground_body_count > 0)
+    {
+        int bid = _point_body_id[svI];
+        if(bid >= 0 && bid < _ground_body_count && _ground_skip_body[bid]) skip = true;
+    }
+    if(!skip)
+    {
+        double3 normal = *g_normal;
+        double  coef   = __GEIGEN__::__v_vec_dot(normal, moveDir[svI]);
+        if(coef > 0.0)
+        {
+            double dist = __GEIGEN__::__v_vec_dot(normal, vertexes[svI]) - *g_offset;
+            temp        = coef / (dist * slackness);
+        }
+    }
+    if(temp > 0.0) _atomicMaxPosDouble(&per_env_inv[g], temp);
+}
+
+__global__ void _per_env_selfTimeStep_max(const double3* vertexes, const int4* pairs,
+                                          const double3* moveDir, const int* p2g,
+                                          double* per_env_inv, double slackness, int number, int ng)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number) return;
+    double CCDDistRatio = 1.0 - slackness;
+    int4   MMCVIDI      = pairs[idx];
+    double temp;
+    int    v0;
+    if(MMCVIDI.x < 0)
+    {
+        MMCVIDI.x = -MMCVIDI.x - 1;
+        v0        = MMCVIDI.x;
+        temp = 1.0 / point_triangle_ccd(vertexes[MMCVIDI.x], vertexes[MMCVIDI.y],
+                                        vertexes[MMCVIDI.z], vertexes[MMCVIDI.w],
+                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.x], -1),
+                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.y], -1),
+                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.z], -1),
+                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.w], -1),
+                                        CCDDistRatio, 0);
+    }
+    else
+    {
+        v0   = MMCVIDI.x;
+        temp = 1.0 / edge_edge_ccd(vertexes[MMCVIDI.x], vertexes[MMCVIDI.y],
+                                   vertexes[MMCVIDI.z], vertexes[MMCVIDI.w],
+                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.x], -1),
+                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.y], -1),
+                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.z], -1),
+                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.w], -1),
+                                   CCDDistRatio, 0);
+    }
+    int g = p2g[v0];
+    if(g < 0 || g >= ng) return;
+    if(temp > 0.0) _atomicMaxPosDouble(&per_env_inv[g], temp);
 }
 
 void GIPC::buildFullCP(const double& alpha)
@@ -11752,6 +11865,27 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         //        ccd_size = 0.6;
         //#endif
 
+        // [multi-env S1 Phase A] per-env temp_alpha terms (ground + narrow-self),
+        // computed HERE because buildFullCP below overwrites _ccd_collisonPairs.
+        // Mirrors the engine's temp_alpha reductions (lines above) but per-env.
+        // Regions: m_env_scratch[0*NG]=ground invstep, [1*NG]=narrow-self invstep.
+        const bool s1_on = (m_env_scratch && TetMesh.d_point_to_group
+                            && surf_vertexNum >= 1 && !m_skip_all_collision
+                            && getenv("STIFF_PERENV_ALPHA"));
+        if(s1_on)
+        {
+            const int NG = kEnvAlphaSlots, bs = 256;
+            cudaMemset(m_env_scratch, 0, 2 * NG * sizeof(double));  // ground+self regions
+            _per_env_groundTimeStep_max<<<(surf_vertexNum+bs-1)/bs, bs>>>(
+                _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir,
+                TetMesh.d_point_to_group, m_env_scratch + 0*NG, slackness_a,
+                surf_vertexNum, _point_body_id, _ground_skip_body, _ground_body_count, NG);
+            if(h_cpNum[0] >= 1)  // narrow-self over OLD _ccd_collisonPairs[0..h_cpNum[0])
+                _per_env_selfTimeStep_max<<<(h_cpNum[0]+bs-1)/bs, bs>>>(
+                    _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
+                    m_env_scratch + 1*NG, slackness_m, h_cpNum[0], NG);
+        }
+
         buildBVH_FULLCCD(temp_alpha);
         buildFullCP(temp_alpha);
         if(h_ccd_cpNum > 0)
@@ -11773,6 +11907,108 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         cudaEventRecord(end2);
         //printf("alpha:  %f\n", alpha);
+
+        // [multi-env P3a] read-only: per-env alpha_CFL spread. The global alpha
+        // above is ONE scalar (= min over ALL envs of CCD/CFL feasible step). If
+        // per-env maxSpeed differs a lot, the global alpha is dragged by the
+        // fastest env -> slower envs forced to over-small steps -> per-env
+        // line-search would decouple them. Decides whether per-env alpha is worth
+        // building. Gated STIFF_PENV_STATS.
+        if(TetMesh.d_point_to_group && surf_vertexNum >= 1 && getenv("STIFF_PENV_STATS"))
+        {
+            const int NG = 256;
+            static double* d_mx = nullptr;
+            if(!d_mx) cudaMalloc((void**)&d_mx, NG * sizeof(double));
+            cudaMemset(d_mx, 0, NG * sizeof(double));
+            int bs = 256, gs = (surf_vertexNum + bs - 1) / bs;
+            _per_env_max_cfl<<<gs, bs>>>(TetMesh.d_point_to_group, _moveDir,
+                                         _surfVerts, d_mx, surf_vertexNum, NG);
+            cudaDeviceSynchronize();
+            std::vector<double> hmx(NG);
+            cudaMemcpy(hmx.data(), d_mx, NG * sizeof(double), cudaMemcpyDeviceToHost);
+            double sq = sqrt(dHat);
+            printf("[P3a-cfl] k=%d global_alpha=%.3e per-env alpha_CFL=", k, alpha);
+            for(int g = 0; g < NG; ++g) if(hmx[g] > 0.0)
+                printf(" g%d=%.3e", g, sq / hmx[g] * 0.5);
+            printf("\n");
+        }
+
+        // [multi-env S1 Phase B] per-env feasible-alpha substrate (PHYSICS-NEUTRAL).
+        // Phase A filled ground+narrow-self; here add refined-self (over the NEW
+        // _ccd_collisonPairs) + CFL, then combine per the engine's exact logic:
+        //   temp_alpha_env = min(1, ground_env, narrowSelf_env)
+        //   if ccd pairs: alpha_env = min(temp_alpha_env, alpha_CFL_env);
+        //                 if temp_alpha_env > 2*alpha_CFL_env:
+        //                     alpha_env = max(min(temp_alpha_env, refinedSelf_env*ccd_size), alpha_CFL_env)
+        // Each CCD term = per-env segmented MAX of (1/timestep) -> step = 1/max.
+        // The global scalar `alpha` applied below is UNCHANGED -> identical to
+        // baseline; this only fills the substrate S2 will consume. Invariant
+        // (validated): min_g(m_env_alpha) == global feasibility alpha; N=1 -> one
+        // group -> m_env_alpha[g0] == global alpha.
+        if(s1_on)
+        {
+            const int NG = kEnvAlphaSlots, bs = 256;
+            cudaMemset(m_env_scratch + 2*NG, 0, 2 * NG * sizeof(double));  // ref+cfl regions
+            if(h_ccd_cpNum > 0)  // refined-self over NEW _ccd_collisonPairs[0..h_ccd_cpNum)
+                _per_env_selfTimeStep_max<<<(h_ccd_cpNum+bs-1)/bs, bs>>>(
+                    _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
+                    m_env_scratch + 2*NG, slackness_m, h_ccd_cpNum, NG);
+            _per_env_max_cfl<<<(surf_vertexNum+bs-1)/bs, bs>>>(
+                TetMesh.d_point_to_group, _moveDir, _surfVerts, m_env_scratch + 3*NG,
+                surf_vertexNum, NG);
+            cudaDeviceSynchronize();
+            std::vector<double> hg(NG), hs(NG), hr(NG), hmx(NG);
+            cudaMemcpy(hg.data(),  m_env_scratch + 0*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hs.data(),  m_env_scratch + 1*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hr.data(),  m_env_scratch + 2*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hmx.data(), m_env_scratch + 3*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
+            const double sq       = sqrt(dHat);
+            const double ccd_size = 1.0;
+            const bool   have_ccd = (h_ccd_cpNum > 0);
+            double       min_env  = 1e30, max_env = 0.0;
+            int          n_env    = 0;
+            for(int g = 0; g < NG; ++g)
+            {
+                if(hmx[g] <= 0.0) continue;  // env g has no surface verts -> absent
+                double ta = 1.0;             // temp_alpha_env (1/max(invstep))
+                if(hg[g] > 0.0) ta = std::min(ta, 1.0 / hg[g]);
+                if(hs[g] > 0.0) ta = std::min(ta, 1.0 / hs[g]);
+                double a = ta;
+                if(have_ccd)
+                {
+                    double acfl = sq / hmx[g] * 0.5;
+                    a = std::min(ta, acfl);
+                    // The refinement GATE is a global algorithmic choice (engine
+                    // gates on the GLOBAL temp_alpha/alpha_CFL, not per-env) — only
+                    // the VALUES are per-env. Using the per-env acfl in the gate
+                    // diverges from the engine (it skips the accurate refined CCD
+                    // when per-env acfl is looser). Gate globally, value per-env.
+                    if(temp_alpha > 2.0 * alpha_CFL)
+                    {
+                        double refined = (hr[g] > 0.0) ? 1.0 / hr[g] : 1.0;
+                        a = std::min(ta, refined * ccd_size);
+                        a = std::max(a, acfl);
+                    }
+                }
+                h_env_alpha[g] = a;
+                min_env = std::min(min_env, a);
+                max_env = std::max(max_env, a);
+                ++n_env;
+                if(getenv("STIFF_S1_DEBUG") && alpha > 0.99 && a < 0.9)
+                    printf("  [S1-dbg] g%d a=%.4e ta=%.4e ground=%.4e narrow=%.4e "
+                           "refined=%.4e acfl=%.4e ccdN=%d alphaCFLglob=%.4e (global=%.4e)\n",
+                           g, a, ta, hg[g]>0?1.0/hg[g]:9.99, hs[g]>0?1.0/hs[g]:9.99,
+                           hr[g]>0?1.0/hr[g]:9.99, have_ccd?sq/hmx[g]*0.5:9.99,
+                           (int)h_ccd_cpNum, alpha_CFL, alpha);
+            }
+            CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
+                                      NG * sizeof(double), cudaMemcpyHostToDevice));
+            if(getenv("STIFF_PENV_STATS"))
+                printf("[S1-envalpha] k=%d global_alpha=%.6e min_env=%.6e max_env=%.6e "
+                       "n_env=%d rel=%.2e (neutral-check; headroom=max_env/global)\n",
+                       k, alpha, min_env, max_env, n_env,
+                       fabs(alpha - min_env) / std::max(alpha, 1e-30));
+        }
 
         bool isStop = lineSearch(TetMesh, alpha, alpha_CFL);
 

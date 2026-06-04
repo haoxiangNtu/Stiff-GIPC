@@ -125,6 +125,21 @@ class GIPC
     uint32_t* _collisonPairs_lastH_gd = nullptr;
     uint32_t  h_gpNum_last;
 
+    // [multi-env S1] per-env (per-group) feasible line-search step substrate.
+    // d_env_alpha[g] = the largest feasible alpha for env g this Newton iter
+    // (per-env CFL + per-env CCD min). NG fixed slots; envs are dense 0..ng-1.
+    // PHYSICS-NEUTRAL until S2: computed + validated only, the actual step still
+    // uses the global scalar alpha. Gated by env STIFF_PERENV_ALPHA. h_env_alpha
+    // is the host mirror S2 will read to drive per-env step_forward.
+    static constexpr int kEnvAlphaSlots = 256;
+    double*             m_env_alpha   = nullptr;   // device, size kEnvAlphaSlots
+    std::vector<double> h_env_alpha;               // host mirror
+    // scratch for the per-env feasibility reductions split across two phases of
+    // one Newton iter: regions [0]=ground [1]=self-narrow [2]=refined-self
+    // [3]=cfl-maxspeed, each kEnvAlphaSlots wide. Phase A (pre-buildFullCP)
+    // fills ground+self-narrow; Phase B fills refined+cfl and combines.
+    double*             m_env_scratch = nullptr;   // device, size 4*kEnvAlphaSlots
+
     uint32_t vertexNum      = 0;
     uint32_t surf_vertexNum = 0;
     uint32_t edge_Num       = 0;
