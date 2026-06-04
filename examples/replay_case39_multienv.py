@@ -435,6 +435,20 @@ def main():
                 g['fem_global_id'] = n_abd_total + g['fem_body_offset']
             env['shirt_global_id'] = n_abd_total + env['shirt_rec'].body_offset
 
+    # [P1 env isolation] Tag each collision body with its env group so that
+    # cross-env pairs are guaranteed excluded (independent of spacing). Bodies
+    # are loaded env-by-env, so ABD ids [0,n_abd) and FEM ids [n_abd,n_abd+n_fem)
+    # are contiguous per env -> group = id // (count_per_env). Default ON for N>1;
+    # CASE39ME_ISOLATE=0 falls back to spacing-only (for A/B testing).
+    if num_envs > 1 and int(os.environ.get("CASE39ME_ISOLATE", "1")):
+        n_fem_total = sum(1 for r in eng.get_load_records() if r.body_type == 1)
+        m_abd, m_fem = n_abd_total // num_envs, n_fem_total // num_envs
+        groups = [cid // m_abd for cid in range(n_abd_total)] + \
+                 [f // m_fem for f in range(n_fem_total)]
+        eng.native.set_body_groups(groups)
+        print(f"[me] env isolation ON: {n_abd_total} ABD + {n_fem_total} FEM bodies "
+              f"-> {num_envs} groups ({m_abd} ABD + {m_fem} FEM each)", flush=True)
+
     fgrav = int(os.environ.get("CASE36_DISABLE_GRAVITY", "1"))
     eng.finalize()
     print(f"[me] finalized {num_envs} envs in {time.perf_counter()-t_build:.1f}s "

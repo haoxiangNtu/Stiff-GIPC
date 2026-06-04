@@ -320,6 +320,13 @@ void SimEngine::add_collision_exclusion(int body_a, int body_b)
     m_impl->tetMesh.collision_exclusion_pairs.emplace_back(body_a, body_b);
 }
 
+void SimEngine::set_body_groups(const std::vector<int>& groups)
+{
+    // [multi-env] group id per collision-body (ABD ids first, then FEM). Bodies
+    // in different groups (both >=0) are excluded from collision at finalize.
+    m_impl->tetMesh.body_groups = groups;
+}
+
 void SimEngine::add_ground_collision_skip(int body_id)
 {
     m_impl->tetMesh.ground_collision_skip_body_ids.push_back(body_id);
@@ -935,7 +942,9 @@ void SimEngine::Impl::do_upload_to_gpu()
     // Collision exclusion matrix
     if(::g_gipc_log_level >= 1) printf("[CollisionExclusion] pairs=%d, collision_body_num=%d\n",
            (int)tetMesh.collision_exclusion_pairs.size(), d_tetMesh.collision_body_num);
-    if(!tetMesh.collision_exclusion_pairs.empty() && d_tetMesh.collision_body_num > 0)
+    const bool have_groups = !tetMesh.body_groups.empty();
+    if((!tetMesh.collision_exclusion_pairs.empty() || have_groups)
+       && d_tetMesh.collision_body_num > 0)
     {
         int N = d_tetMesh.collision_body_num;
         std::vector<int> host_matrix(N * N, 0);
@@ -947,10 +956,32 @@ void SimEngine::Impl::do_upload_to_gpu()
                 host_matrix[b * N + a] = 1;
             }
         }
+        // [multi-env] Exclude all cross-group body pairs (both groups >= 0).
+        // Guarantees envs never interact regardless of spatial proximity; the
+        // existing _is_collision_excluded reads this matrix in every narrow-phase
+        // pair-build path, so cross-env candidates are dropped before buffering.
+        int n_xgrp = 0;
+        if(have_groups)
+        {
+            const auto& grp = tetMesh.body_groups;
+            for(int i = 0; i < N; ++i)
+            {
+                int gi = (i < (int)grp.size()) ? grp[i] : -1;
+                if(gi < 0) continue;
+                for(int j = i + 1; j < N; ++j)
+                {
+                    int gj = (j < (int)grp.size()) ? grp[j] : -1;
+                    if(gj < 0 || gj == gi) continue;
+                    host_matrix[i * N + j] = 1;
+                    host_matrix[j * N + i] = 1;
+                    ++n_xgrp;
+                }
+            }
+        }
         safe_copy(d_tetMesh.collision_skip_matrix, host_matrix.data(),
                   N * N * sizeof(int), cudaMemcpyHostToDevice);
-        if(::g_gipc_log_level >= 1) printf("[CollisionExclusion] Uploaded %dx%d exclusion matrix (%d pairs)\n",
-               N, N, (int)tetMesh.collision_exclusion_pairs.size());
+        if(::g_gipc_log_level >= 1) printf("[CollisionExclusion] Uploaded %dx%d exclusion matrix (%d pairs + %d cross-group)\n",
+               N, N, (int)tetMesh.collision_exclusion_pairs.size(), n_xgrp);
     }
 
     // Ground skip

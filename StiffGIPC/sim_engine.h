@@ -191,6 +191,7 @@ class SimEngine
     void add_ground(double height = 0.0);
 
     void add_collision_exclusion(int body_a, int body_b);
+    void set_body_groups(const std::vector<int>& groups);
     void add_ground_collision_skip(int body_id);
 
     /// Stitch a FEM vertex to an ABD body via a soft spring constraint.

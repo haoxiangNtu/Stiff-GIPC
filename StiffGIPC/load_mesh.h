@@ -130,6 +130,13 @@ class tetrahedra_obj
     // Typically populated from URDF joint adjacency (parent-child link pairs).
     std::vector<std::pair<int, int>> collision_exclusion_pairs;
 
+    // [multi-env] Per-collision-body GROUP (environment) id, length =
+    // collision_body_num (ABD ids [0,n_abd), FEM ids [n_abd, n_abd+n_fem)).
+    // Bodies in different groups (both >= 0) never collide — folded into the
+    // collision_skip_matrix at finalize. group < 0 = wildcard (collides with all).
+    // Empty = single group (legacy behaviour).
+    std::vector<int> body_groups;
+
     // Per-body ground collision skip flags: body IDs listed here skip ground collision.
     std::vector<int> ground_collision_skip_body_ids;
 
