@@ -121,6 +121,15 @@ bool tetrahedra_obj::load_triMesh(const std::string&     filename,
 
     begin_load_body(filename, gipc::BodyType::FEM, boundaryType);
 
+    // [multi-FEM-body fix] `triangles` is a cumulative member shared by every
+    // FEM cloth body loaded so far.  The bending-edge extraction below must run
+    // over THIS body's triangles only — otherwise each subsequent load_triMesh
+    // re-extracts and re-appends edges for all previously loaded cloths, blowing
+    // up tri_edges / tri_edges_adj_points (host heap corruption / segfault at
+    // finalize once >~2 cloth bodies exist).  Record where this body's triangles
+    // begin so the edge loop can iterate just [tri_begin, triangles.size()).
+    const size_t tri_begin = triangles.size();
+
     ifstream ifs(filename);
     if(!ifs)
     {
@@ -299,7 +308,15 @@ bool tetrahedra_obj::load_triMesh(const std::string&     filename,
 
     triangleNum = triangles.size();
     set_body_tri_num(gipc::BodyType::FEM, elementNumber);
-    vertexOffset += vertexNum;
+    // [multi-FEM-body fix] vertexNum is the cumulative vertex count (a member
+    // that keeps incrementing across loads), so the running base offset for the
+    // NEXT body must be set to it, not accumulated.  Every other loader
+    // (load_tetMesh / load_surfaceMesh_ABD / importer) uses `= vertexNum`;
+    // load_triMesh alone used `+= vertexNum`, which made the 3rd+ cloth body's
+    // triangle indices overshoot vertexNum and write out of bounds in
+    // getVertNeighbors() -> heap corruption at finalize.  (2 cloths survived by
+    // luck; 3+ always crashed.)
+    vertexOffset = vertexNum;
     set_body_point_num(gipc::BodyType::FEM, nodeNumber);
 
     softNum   = targetIndex.size();
@@ -320,8 +337,9 @@ bool tetrahedra_obj::load_triMesh(const std::string&     filename,
     std::set<std::pair<int, int>>                   edge_set;
     std::map<std::pair<int, int>, std::vector<int>> edge_map;
     std::vector<Eigen::Vector2i>                    my_edges;
-    for(auto tri : triangles)
+    for(size_t _ti = tri_begin; _ti < triangles.size(); _ti++)
     {
+        const auto& tri = triangles[_ti];
         auto x = tri.x;
         auto y = tri.y;
         auto z = tri.z;
