@@ -997,6 +997,36 @@ void SimEngine::Impl::do_upload_to_gpu()
             for(auto& [g, c] : grp_vcount) printf(" g%d=%d", g, c);
             printf("\n");
         }
+        // [multi-env P2a] block-level group map (the per-env PCG-reduction key).
+        // Block layout: [0, abd_body_num*4) ABD (block b -> body b/4); then
+        // fem_point_num FEM blocks (block abd_dofs+j -> vertex fem_point_offset+j).
+        const auto& ci = tetMesh.abd_fem_count_info;
+        int abd_dofs = (int)ci.abd_body_num * 4;
+        int nblk = abd_dofs + (int)ci.fem_point_num;
+        std::vector<int> dg(nblk, -1);
+        std::map<int,int> grp_bcount;
+        for(int b = 0; b < abd_dofs; ++b)
+        {
+            int body = b / 4;
+            int g = (body >= 0 && body < N) ? bg[body] : -1;
+            dg[b] = g; grp_bcount[g]++;
+        }
+        for(int j = 0; j < (int)ci.fem_point_num; ++j)
+        {
+            int v = (int)ci.fem_point_offset + j;
+            int g = (v >= 0 && v < (int)pg.size()) ? pg[v] : -1;
+            dg[abd_dofs + j] = g; grp_bcount[g]++;
+        }
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_tetMesh.d_dof_to_group, nblk * sizeof(int)));
+        safe_copy(d_tetMesh.d_dof_to_group, dg.data(), nblk * sizeof(int), cudaMemcpyHostToDevice);
+        d_tetMesh.dof_block_count = nblk;
+        if(::g_gipc_log_level >= 1)
+        {
+            printf("[multi-env P2a] dof_to_group: %d blocks (%d ABD + %d FEM); per-group block counts:",
+                   nblk, abd_dofs, (int)ci.fem_point_num);
+            for(auto& [g, c] : grp_bcount) printf(" g%d=%d", g, c);
+            printf("\n");
+        }
     }
 
     // Ground skip

@@ -73,6 +73,11 @@ class device_TetraData
     // for per-group contact segmentation + per-env block-diagonal solve (P2b/P3).
     int*    d_body_to_group  = nullptr;
     int*    d_point_to_group = nullptr;
+    // [multi-env P2a] group id per linear-system BLOCK (size = abd_body_num*4 +
+    // fem_point_num): ABD block b -> body b/4; FEM block -> its vertex. This is
+    // what the per-env PCG reductions (P3a) key off. Allocated in sim_engine.
+    int*    d_dof_to_group   = nullptr;
+    int     dof_block_count  = 0;
 
     // [multi-FEM-bodyid] Per-body flag (size = collision_body_num).
     //   body_id_to_is_fem[i] = 1 -> body i is FEM (self-collision allowed)
