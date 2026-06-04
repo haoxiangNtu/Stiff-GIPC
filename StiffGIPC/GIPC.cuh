@@ -240,9 +240,6 @@ class GIPC
     void sort_collision_pairs_by_type();
     // Same warp-divergence treatment for friction pair set.
     void sort_friction_pairs_by_type();
-    // Same warp-divergence treatment for CCD pair set (used by line-search
-    // _reduct_min_selfTimeStep_to_double, etc.). Single int4 array, no sidecars.
-    void sort_ccd_pairs_by_type();
 
     // ③ assembly graph: pre-allocated events + cached graph for buildCP body.
     // Per-call cudaEventCreate/Destroy is capture-hostile, so events are

@@ -9611,33 +9611,6 @@ void GIPC::sort_friction_pairs_by_type()
                                    N * sizeof(double), cudaMemcpyDeviceToDevice));
 }
 
-// CCD-pair sort: simpler than friction — no sidecar arrays. The CCD set
-// (_ccd_collitionPairs) is read by _reduct_min_selfTimeStep_to_double (8.2%
-// GPU, Avg Active Threads 10.26/32) and other CCD-time-step kernels with
-// the same MMCVIDI branching. Single gather suffices.
-void GIPC::sort_ccd_pairs_by_type()
-{
-    int N = h_ccd_cpNum;
-    if(N <= 0) return;
-    // Pre-allocs from sort_collision_pairs_by_type cover buffers we need.
-    if(!m_pair_type) return;  // (sort_collision_pairs_by_type was never called → skip)
-
-    int blocks = (N + 255) / 256;
-    __classify_pair_type_k<<<blocks, 256>>>(_ccd_collisonPairs, m_pair_type, N);
-    __iota_uint32_k       <<<blocks, 256>>>(m_pair_perm_in, N);
-
-    size_t tb = m_cub_sort_temp_bytes;
-    cub::DeviceRadixSort::SortPairs(
-        m_cub_sort_temp, tb,
-        m_pair_type, m_pair_type_out,
-        m_pair_perm_in, m_pair_perm_out,
-        N, 0, 4);
-
-    __gather_int4_by_perm_k<<<blocks, 256>>>(m_collisionPair_sorted, _ccd_collisonPairs, m_pair_perm_out, N);
-    CUDA_SAFE_CALL(cudaMemcpyAsync(_ccd_collisonPairs, m_collisionPair_sorted,
-                                   N * sizeof(int4), cudaMemcpyDeviceToDevice));
-}
-
 void GIPC::buildCP()
 {
     if(m_skip_all_collision)
@@ -12181,7 +12154,6 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         buildFullCP(temp_alpha);
         GIPC_CUDA_CHECKPOINT("buildBVH_FULLCCD + buildFullCP");
         sync_ccd_cpNum();  // ②-D2H elim
-        sort_ccd_pairs_by_type();  // warp-div fix
         if(h_ccd_cpNum > 0)
         {
             double maxSpeed = cfl_largestSpeed(pcg_data.squeue);
@@ -12349,7 +12321,6 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         buildBVH_FULLCCD(alpha);
         buildFullCP(alpha);
         sync_ccd_cpNum();  // ②-D2H elim
-        sort_ccd_pairs_by_type();  // warp-div fix
         if(h_ccd_cpNum > 0)
         {
             double slackness_m = 0.8;
