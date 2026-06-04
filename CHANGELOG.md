@@ -4,6 +4,68 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] — 2026-06-05
+
+### Fixed
+
+- **Newton non-convergence on long contact-dense trajectories** — reverts
+  the v0.7.0 `perf(warp-div): CCD-pair sort` commit (98ac3dc).  Users
+  reported "frozen frame" stutter on cloth-fold replays where one frame
+  occasionally took 1–2 seconds (vs ~25 ms median).  Root cause:
+  `cub::DeviceRadixSort::SortPairs` is unstable, so reordering
+  `_ccd_collisonPairs` by warp-divergence type permutes equal-key elements
+  non-deterministically across runs.  Downstream
+  `_reduct_min_selfTimeStep_to_double` is reduce-order sensitive at ε level,
+  so line-search α decisions occasionally diverge, causing Newton to spend
+  +5–25 extra outer iterations or hit the 50-iter cap.
+
+  Paired n=20 bench on `episode_00000.hdf5` fold-shirt (1551 frames):
+
+  | Version          | runs hitting Newton cap | total cap-hits | worst run |
+  |------------------|------------------------:|---------------:|----------:|
+  | v0.6.1           | 3 / 20                  | 3              | 1         |
+  | v0.7.0           | 10 / 20                 | 18             | 9         |
+  | v0.7.1 (this)    | 3 / 20                  | 12             | 8         |
+
+  After this revert the "runs-with-cap %" is statistically indistinguishable
+  from v0.6.1 (Mann-Whitney p=0.913).  Wall stays within 1% of v0.7.0
+  (the +1.10% the original commit claimed turned out negligible vs. the
+  other v0.7.0 perf work).  Other v0.7.0 pair-sort commits
+  (`199ac1e` barrier-sort, `8ead1f0` friction-sort) were tested
+  individually and found innocent (p=0.236 NS) — kept.
+
+- **`cudaEventDestroy` leak in `IPC_Solver`** (`GIPC.cu`): per-step timing
+  events `start`/`end0` were created but never destroyed.  1551 steps ×
+  10 replays = ~31000 dangling driver event handles per process.  Not a
+  perf bug (micro-bench confirms cudaEventCreate cost is constant past
+  30 K leaked events), but long-running RL collection processes can
+  eventually exhaust the driver's event pool.  Resource-hygiene fix.
+
+### Performance
+
+- **`Statistics` system env-gated** (`gipc/statistics.{h,cpp}`):
+  `Statistics::write_to_file` was called every step and serialized the
+  entire accumulated `m_json["frames"]` array (4-space indent) to disk
+  → O(N²) cumulative writes (~800 MB per 1551-step run).  Plus
+  `m_json["frames"][m_frame]` grew ~50 KB/step in RAM (~8.5 GB after
+  100 episodes → eventual OOM on long RL data collection).
+
+  Gated both behaviors behind `GIPC_STATS_ENABLED` env var (default off).
+  Disabled mode uses a per-frame scratch `Json` for writes so caller code
+  is unchanged.  Measured effects on fold-shirt 1551-step replay:
+
+  - Wall standard deviation across n=20 runs: **10.2 s → 5.7 s** (halved
+    — disk-IO jitter was the dominant variance source).
+  - Mean wall: ~-2 % on this trajectory.  Larger gains on longer trajectories
+    where O(N²) dominates (a friend reports −17 % on a 17000-step bench).
+  - Steady-state Newton cap-hit rate unchanged (the bug only affected
+    wall time, not solver behavior).
+
+  To re-enable full stats.json dumping (debug mode):
+  ```bash
+  GIPC_STATS_ENABLED=1 python your_script.py
+  ```
+
 ## [0.7.0] — 2026-05-28
 
 ### Performance — major
