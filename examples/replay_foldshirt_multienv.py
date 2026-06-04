@@ -241,14 +241,24 @@ def main():
     ejs = slice_env_joints(robot, num_envs)
     print(f"[fs] {len(robot.revolute_joints)} rev + {len(robot.prismatic_joints)} pri\n", flush=True)
 
+    # [multi-env] CASE39ME_PHASE: drive env e from frame (fr + e*phase) so the envs
+    # sit at DIFFERENT points of the trajectory simultaneously (heterogeneous
+    # difficulty). phase=0 -> all envs same frame (identical envs, default). This is
+    # the condition under which per-env line-search (STIFF_PERENV_ALPHA) helps.
+    phase = int(os.environ.get("CASE39ME_PHASE", "0"))
+    L = len(actions)
+    if phase:
+        print(f"[fs] CASE39ME_PHASE={phase} -> envs offset across trajectory "
+              f"(env e at frame fr+{phase}*e); heterogeneous difficulty", flush=True)
+
     if int(os.environ.get("CASE39ME_HEADLESS","0")):
         f0 = int(os.environ.get("CASE39_FRAME_START","0"))
         f1 = min(int(os.environ.get("CASE39_FRAME_END", str(len(actions)))), len(actions))
         cloth_ranges = [(env['cloth_rec'].vertex_offset, env['cloth_rec'].vertex_count) for env in envs]
         ms = []
         for fr in range(f0, f1):
-            raw = actions[fr]
-            for ej in ejs: apply_frame(robot, ej, raw, close_r)
+            for e, ej in enumerate(ejs):
+                apply_frame(robot, ej, actions[(fr + e*phase) % L], close_r)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter()-t)*1000.0)
             if fr % 20 == 0:
                 v = eng.get_vertices()
@@ -274,8 +284,8 @@ def main():
         psim.Text(f"step {st['ms']:6.1f} ms    FPS {st['fps']:5.2f}")
         psim.Text(f"per-env-equiv {eqms:6.1f} ms  ({(1000.0/eqms) if eqms>0 else 0:5.1f} env-steps/s)")
         if not st['run'] or st['idx']>=len(actions): return
-        raw = actions[st['idx']]
-        for ej in ejs: apply_frame(robot, ej, raw, close_r)
+        for e, ej in enumerate(ejs):
+            apply_frame(robot, ej, actions[(st['idx'] + e*phase) % L], close_r)
         t=time.perf_counter(); eng.step(); st['ms']=(time.perf_counter()-t)*1000.0
         inst = 1000.0/st['ms'] if st['ms']>0 else 0.0
         st['fps'] = inst if st['fps']==0. else 0.9*st['fps'] + 0.1*inst
