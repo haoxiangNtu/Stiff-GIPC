@@ -6821,6 +6821,18 @@ __global__ void _checkGroundIntersection(const double3* vertexes,
         *_isIntersect = -1;
 }
 
+// [multi-env S3] per-env energy accumulation helper. Element's env = group of one
+// of its vertices (intra-env after P1). atomicAdd the per-element energy `e` into
+// the env bucket. penv==nullptr -> no-op (global-only callers stay byte-identical).
+// vid is a GLOBAL vertex id (p2g is the full point_to_group), except the kinetic
+// caller passes p2g already offset to the FEM region and vid local.
+__device__ inline void _penv_energy_accum(double* penv, const int* p2g, int vid, int ng, double e)
+{
+    if(!penv || !p2g) return;
+    int g = p2g[vid];
+    if(g >= 0 && g < ng) atomicAdd(&penv[g], e);
+}
+
 __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
                                                 const double3* vertexes,
                                                 const double3* o_vertexes,
@@ -6831,7 +6843,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
                                                 const __GEIGEN__::Matrix3x2d* tanBasis,
                                                 const double* lastH,
                                                 double        fricDHat,
-                                                double        eps
+                                                double        eps,
+                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0
 
 )
 {
@@ -6845,6 +6858,9 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
 
     double temp = __cal_Friction_energy(
         vertexes, o_vertexes, _collisionPair[idx], dt, distCoord[idx], tanBasis[idx], lastH[idx], fricDHat, eps);
+
+    { int v0 = _collisionPair[idx].x; if(v0 < 0) v0 = -v0 - 1;  // [S3] friction pair env
+      _penv_energy_accum(penv, p2g, v0, ng, temp); }
 
     int    warpTid = threadIdx.x % 32;
     int    warpId  = (threadIdx.x >> 5);
@@ -6895,7 +6911,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
                                                    int           gpNum,
                                                    double        dt,
                                                    const double* lastH,
-                                                   double        eps
+                                                   double        eps,
+                                                   double* penv = nullptr, const int* p2g = nullptr, int ng = 0
 
 )
 {
@@ -6909,6 +6926,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
 
     double temp = __cal_Friction_gd_energy(
         vertexes, o_vertexes, _normal, _collisionPair_gd[idx], dt, lastH[idx], eps);
+
+    _penv_energy_accum(penv, p2g, _collisionPair_gd[idx], ng, temp);  // [S3] gd friction env
 
     int    warpTid = threadIdx.x % 32;
     int    warpId  = (threadIdx.x >> 5);
@@ -6958,7 +6977,8 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
                                                const uint32_t* _environment_collisionPair,
                                                double dHat,
                                                double Kappa,
-                                               int    number)
+                                               int    number,
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -6973,6 +6993,8 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
     double  temp  = -(dist2 - dHat) * (dist2 - dHat) * log(dist2 / dHat);
+
+    _penv_energy_accum(penv, p2g, gidx, ng, temp);  // [S3] ground pair's vertex env
 
     int    warpTid = threadIdx.x % 32;
     int    warpId  = (threadIdx.x >> 5);
@@ -7457,7 +7479,8 @@ __global__ void _reduct_double3Dot_to_double(const double3* A, const double3* B,
 
 
 __global__ void _getKineticEnergy_Reduction_3D(
-    double3* _vertexes, double3* _xTilta, double* _energy, double* _masses, int number)
+    double3* _vertexes, double3* _xTilta, double* _energy, double* _masses, int number,
+    double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7470,6 +7493,8 @@ __global__ void _getKineticEnergy_Reduction_3D(
     double temp =
         __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_vertexes[idx], _xTilta[idx]))
         * _masses[idx] * 0.5;
+
+    _penv_energy_accum(penv, p2g, idx, ng, temp);  // [S3] caller offsets p2g to FEM region
 
     int    warpTid = threadIdx.x % 32;
     int    warpId  = (threadIdx.x >> 5);
@@ -7521,7 +7546,8 @@ __global__ void _getQuadBendingEnergy_Reduction(double*        squeue,
                                                 const uint2*   edge_adj_vertex,
                                                 const Eigen::Matrix4d* quad_bending_Q,
                                                 int    edgesNum,
-                                                double bendStiff)
+                                                double bendStiff,
+                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7534,6 +7560,8 @@ __global__ void _getQuadBendingEnergy_Reduction(double*        squeue,
     uint2  adj  = edge_adj_vertex[idx];
     double temp = __cal_quad_bending_energy(
         vertexes, rest_vertexex, edges[idx], adj, quad_bending_Q[idx], bendStiff);
+
+    _penv_energy_accum(penv, p2g, edges[idx].x, ng, temp);  // [S3] quad bending edge env
 
     int    warpTid = threadIdx.x % 32;
     int    warpId  = (threadIdx.x >> 5);
@@ -7579,7 +7607,8 @@ __global__ void _getBendingEnergy_Reduction(double*        squeue,
                                             const uint2*   edges,
                                             const uint2*   edge_adj_vertex,
                                             int            edgesNum,
-                                            double         bendStiff)
+                                            double         bendStiff,
+                                            double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7597,6 +7626,7 @@ __global__ void _getBendingEnergy_Reduction(double*        squeue,
     double  length  = __GEIGEN__::__norm(__GEIGEN__::__minus(rest_x0, rest_x1));
     double  temp =
         __cal_bending_energy(vertexes, rest_vertexex, edges[idx], adj, length, bendStiff);
+    _penv_energy_accum(penv, p2g, edges[idx].x, ng, temp);  // [S3] bending edge's env
     //double temp = 0;
     //printf("%f    %f\n\n\n", lenRate, volRate);
     int    warpTid = threadIdx.x % 32;
@@ -7648,7 +7678,8 @@ __global__ void _getFEMEnergy_Reduction_3D(double*        squeue,
                                            const double* volume,
                                            int           tetrahedraNum,
                                            double*       lenRate,
-                                           double*       volRate)
+                                           double*       volRate,
+                                           double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7668,6 +7699,8 @@ __global__ void _getFEMEnergy_Reduction_3D(double*        squeue,
     double temp = __cal_ARAP_energy_3D(
         vertexes, tetrahedras[idx], DmInverses[idx], volume[idx], lenRate[idx]);
 #endif
+
+    _penv_energy_accum(penv, p2g, tetrahedras[idx].x, ng, temp);  // [S3] tet's env
 
     //printf("%f    %f\n\n\n", lenRate, volRate);
     int    warpTid = threadIdx.x % 32;
@@ -7718,7 +7751,8 @@ __global__ void _computeSoftConstraintEnergy_Reduction(double*        squeue,
                                                        double rate,
                                                        const int*     stitch_paired_vertex,
                                                        const double3* stitch_rest_offset,
-                                                       int    number)
+                                                       int    number,
+                                                       double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7745,6 +7779,8 @@ __global__ void _computeSoftConstraintEnergy_Reduction(double*        squeue,
         __GEIGEN__::__minus(vertexes[vInd], target), rate));
     double   d    = motionRate;
     double   temp = d * dis * 0.5;
+
+    _penv_energy_accum(penv, p2g, vInd, ng, temp);  // [S3] soft-constraint vertex env
 
     int    warpTid = threadIdx.x % 32;
     int    warpId  = (threadIdx.x >> 5);
@@ -7795,7 +7831,8 @@ __global__ void _get_triangleFEMEnergy_Reduction_3D(double*        squeue,
                                                     int           trianglesNum,
                                                     double        stretchStiff,
                                                     double        shearStiff,
-                                                    double        strainRate)
+                                                    double        strainRate,
+                                                    double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7808,6 +7845,7 @@ __global__ void _get_triangleFEMEnergy_Reduction_3D(double*        squeue,
     double temp = __cal_BaraffWitkinStretch_energy(
         vertexes, triangles[idx], triDmInverses[idx], area[idx], stretchStiff, shearStiff, strainRate);
 
+    _penv_energy_accum(penv, p2g, triangles[idx].x, ng, temp);  // [S3] triangle's env
 
     //printf("%f    %f\n\n\n", lenRate, volRate);
     int    warpTid = threadIdx.x % 32;
@@ -7915,7 +7953,8 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
                                                int4*          _collisionPair,
                                                double         _Kappa,
                                                double         _dHat,
-                                               int            cpNum)
+                                               int            cpNum,
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7927,6 +7966,9 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
 
     double temp =
         __cal_Barrier_energy(vertexes, rest_vertexes, _collisionPair[idx], _Kappa, _dHat);
+
+    { int v0 = _collisionPair[idx].x; if(v0 < 0) v0 = -v0 - 1;     // [S3] pair's env
+      _penv_energy_accum(penv, p2g, v0, ng, temp); }
 
     int    warpTid = threadIdx.x % 32;
     int    warpId  = (threadIdx.x >> 5);
@@ -11487,6 +11529,144 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
 }
 
 
+// [backport] standalone per-env energy dispatcher (from S3/4a370e5). Modeled on
+// Energy_Add_Reduction_Algorithm but writes the global scalar to a caller-provided
+// device slot (out_slot, D2D) and, when out_penv != nullptr, buckets each element's
+// energy into per-env slots via the kernels' (penv,p2g,ng) params. Used ONLY by
+// computeEnergy_perenv (the per-env line-search path); v0.6.4's computeEnergy is
+// untouched. NOTE: not the full ②-D2H batched computeEnergy rewrite — isolated here.
+void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
+                                                     device_TetraData& TetMesh,
+                                                     double*           out_slot,
+                                                     double*           out_penv)
+{
+    // [multi-env S3] per-env energy bucket for this term (size kEnvAlphaSlots) and
+    // the global point_to_group; passed to the kernels when out_penv != nullptr.
+    double*    pe  = out_penv;
+    const int* p2g = TetMesh.d_point_to_group;
+    const int  ng  = kEnvAlphaSlots;
+    if(pe) CUDA_SAFE_CALL(cudaMemsetAsync(pe, 0, ng * sizeof(double)));
+    int tet_offset   = abd_fem_count_info.fem_tet_offset;
+    int tet_count    = abd_fem_count_info.fem_tet_num;
+    int point_offset = abd_fem_count_info.fem_point_offset;
+    int point_count  = abd_fem_count_info.fem_point_num;
+
+    int numbers = tet_count;
+    if(type == 0 || type == 3)      numbers = point_count;
+    else if(type == 2)              numbers = h_cpNum[0];
+    else if(type == 4)              numbers = h_gpNum;
+    else if(type == 5)              numbers = h_cpNum_last[0];
+    else if(type == 6)              numbers = h_gpNum_last;
+    else if(type == 7 || type == 1) numbers = tet_count;
+    else if(type == 8 || type == 11)numbers = triangleNum;
+    else if(type == 9)              numbers = softNum;
+    else if(type == 10)             numbers = tri_edge_num;
+
+    if(numbers == 0)
+    {
+        // Match original `return 0;` behavior — pre-zero the slot.
+        CUDA_SAFE_CALL(cudaMemsetAsync(out_slot, 0, sizeof(double)));
+        return;
+    }
+
+    double*            queue       = pcg_data.squeue;
+    const unsigned int threadNum   = 256;
+    int                blockNum    = (numbers + threadNum - 1) / threadNum;
+    unsigned int       sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    switch(type)
+    {
+        case 0:
+            _getKineticEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                TetMesh.vertexes + point_offset, TetMesh.xTilta + point_offset,
+                queue, TetMesh.masses + point_offset, numbers,
+                pe, pe ? p2g + point_offset : nullptr, ng);
+            break;
+        case 1:
+            _getFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.tetrahedras + tet_offset,
+                TetMesh.DmInverses + tet_offset, TetMesh.volum + tet_offset,
+                numbers, TetMesh.lengthRate + tet_offset, TetMesh.volumeRate + tet_offset,
+                pe, pe ? p2g : nullptr, ng);
+            break;
+        case 2:
+            _getBarrierEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs, Kappa, dHat, numbers,
+                pe, pe ? p2g : nullptr, ng);
+            break;
+        case 3:
+            _getDeltaEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.fb + point_offset, _moveDir + point_offset, numbers);
+            break;
+        case 4:
+            _computeGroundEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, _groundOffset, _groundNormal,
+                _environment_collisionPair, dHat, Kappa, numbers,
+                pe, pe ? p2g : nullptr, ng);
+            break;
+        case 5:
+            _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
+                numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
+                fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
+                pe, pe ? p2g : nullptr, ng);
+            break;
+        case 6:
+            _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
+                _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
+                sqrt(fDhat) * IPC_dt,
+                pe, pe ? p2g : nullptr, ng);
+            break;
+        case 7:
+            _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.volum + tet_offset, numbers, lengthRate, volumeRate);
+            break;
+        case 8:
+            _get_triangleFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.triangles, TetMesh.triDmInverses,
+                TetMesh.area, numbers, stretchStiff, shearStiff, strainRate,
+                pe, pe ? p2g : nullptr, ng);
+            break;
+        case 9:
+            _computeSoftConstraintEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.targetVert, TetMesh.targetIndex,
+                softMotionRate, animation_fullRate, TetMesh.d_stitch_paired_vertex,
+                TetMesh.d_stitch_rest_offset, numbers,
+                pe, pe ? p2g : nullptr, ng);
+            break;
+        case 10:
+#ifdef USE_QUADRATIC_BENDING
+            _getQuadBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
+                TetMesh.tri_edge_adj_vertex, TetMesh.quad_bending_Q, numbers, bendStiff,
+                pe, pe ? p2g : nullptr, ng);
+#else
+            _getBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
+                TetMesh.tri_edge_adj_vertex, numbers, bendStiff,
+                pe, pe ? p2g : nullptr, ng);
+#endif
+            break;
+    }
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        __add_reduction<<<blockNum, threadNum, sharedMsize>>>(queue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+
+    // D2D copy queue[0] into the caller's slot — queued on PTDS, async.
+    // Next call's reduction kernel will not start until this D2D completes
+    // (stream ordering), so reusing `queue` for the next call is safe.
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, queue, sizeof(double),
+                                   cudaMemcpyDeviceToDevice));
+}
+
+
 double GIPC::computeEnergy(device_TetraData& TetMesh)
 {
     double Energy      = 0.0;
@@ -11558,6 +11738,71 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
 #endif
 
     return Energy;
+}
+
+// [multi-env S3] per-env total energy E_g into env_out[kEnvAlphaSlots].
+// FEM terms via the per-env-instrumented reductions (each element's energy added
+// to its env bucket); ABD terms added per-env (task #2 — currently lumped into a
+// validation-only global until per-body ABD energy lands). Returns the GLOBAL
+// energy. Built-in correctness gate (gated STIFF_PENV_STATS): Sum_g E_g(FEM) must
+// equal the global FEM energy (independent computeEnergy minus ABD).
+double GIPC::computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>& env_out)
+{
+    const int NG = kEnvAlphaSlots;
+    env_out.assign(NG, 0.0);
+    if(!TetMesh.d_point_to_group)
+        return computeEnergy(TetMesh);  // no groups -> nothing to decompose
+
+    static double* pe_buf = nullptr;
+    if(!pe_buf) CUDA_SAFE_CALL(cudaMalloc((void**)&pe_buf, NG * sizeof(double)));
+    // [backport] throwaway sink for DeviceOut's global scalar (ignored here; the
+    // per-env path uses pe_buf, and E_global is recomputed via computeEnergy below).
+    // v0.6.4 has no m_energy_slots (the ②-D2H batch member was not backported).
+    static double* g_sink = nullptr;
+    if(!g_sink) CUDA_SAFE_CALL(cudaMalloc((void**)&g_sink, sizeof(double)));
+    std::vector<double> h(NG);
+
+    auto add_term = [&](int type, double factor)
+    {
+        Energy_Add_Reduction_Algorithm_DeviceOut(type, TetMesh, g_sink, pe_buf);
+        CUDA_SAFE_CALL(cudaMemcpy(h.data(), pe_buf, NG * sizeof(double), cudaMemcpyDeviceToHost));
+        for(int g = 0; g < NG; ++g) env_out[g] += factor * h[g];
+    };
+    const double dt2 = IPC_dt * IPC_dt;
+    add_term(0, 1.0);    // kinetic
+    add_term(1, dt2);    // fem elastic
+    add_term(8, dt2);    // tri_fem
+    add_term(10, dt2);   // bend
+    add_term(9, 1.0);    // constraint
+    add_term(2, 1.0);    // barrier
+    add_term(4, Kappa);  // ground
+#ifdef USE_FRICTION
+    add_term(5, frictionRate);     // friction (self)
+    add_term(6, gd_frictionRate);  // friction (ground)
+#endif
+    // NOTE: ABD per-env pending (task #2).
+
+    double fem_sum = 0.0;
+    for(int g = 0; g < NG; ++g) fem_sum += env_out[g];
+
+    // ABD total (added to E_global; per-env split pending).
+    double abd = m_abd_system->cal_abd_kinetic_energy(*m_abd_sim_data)
+               + m_abd_system->cal_abd_shape_energy(*m_abd_sim_data)
+               + m_abd_system->cal_abd_joint_energy(*m_abd_sim_data)
+               + m_abd_system->cal_abd_revolute_driving_energy(*m_abd_sim_data)
+               + m_abd_system->cal_abd_prismatic_energy(*m_abd_sim_data)
+               + m_abd_system->cal_abd_prismatic_driving_energy(*m_abd_sim_data);
+
+    double E_global = computeEnergy(TetMesh);  // independent full energy (refills slots)
+
+    if(getenv("STIFF_PENV_STATS"))
+    {
+        double fem_global = E_global - abd;
+        printf("[S3-energy] sum_g E_g(FEM)=%.9e  global_FEM=%.9e  rel=%.2e\n",
+               fem_sum, fem_global,
+               fabs(fem_sum - fem_global) / std::max(fabs(fem_global), 1e-30));
+    }
+    return E_global;
 }
 
 int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int preconditioner_type)
@@ -11694,6 +11939,14 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     muda::wait_device();
     bool   stopped       = false;
     double lastEnergyVal = computeEnergy(TetMesh);
+
+    // [multi-env S3] validate per-env energy decomposition (Sum_g E_g(FEM) ==
+    // global FEM). Read-only; gated. Run a couple times then it's confirmed.
+    if(getenv("STIFF_S3_VALIDATE") && TetMesh.d_point_to_group)
+    {
+        std::vector<double> eg;
+        computeEnergy_perenv(TetMesh, eg);  // prints [S3-energy] when STIFF_PENV_STATS
+    }
 
     double c1m         = 0.0;
     double armijoParam = 0;

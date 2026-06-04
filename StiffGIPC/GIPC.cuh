@@ -278,6 +278,16 @@ class GIPC
     double computeEnergy(device_TetraData& TetMesh);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
+    // [backport] standalone per-env energy dispatcher: writes the reduced global
+    // scalar to a device slot (D2D) and, when out_penv != nullptr, buckets per-env.
+    // Used only by computeEnergy_perenv. (Not the full ②-D2H computeEnergy rewrite.)
+    void   Energy_Add_Reduction_Algorithm_DeviceOut(int type,
+                                                    device_TetraData& TetMesh,
+                                                    double* out_slot,
+                                                    double* out_penv = nullptr);
+    // [multi-env S3] per-env total energy E_g into env_out[kEnvAlphaSlots]
+    // (host array). Validates Sum_g E_g == global computeEnergy. Returns global E.
+    double computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>& env_out);
 
     double ground_largestFeasibleStepSize(double slackness, double* mqueue);
 
