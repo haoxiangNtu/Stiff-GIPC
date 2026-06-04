@@ -125,12 +125,31 @@ GlobalPreconditioner& GlobalLinearSystem::_create_preconditioner(U<GlobalPrecond
     return *m_global_preconditioner;
 }
 
+// [multi-env S4] zero the RHS for masked-env DOFs. DOF i -> block i/3 -> group
+// dof_to_group[i/3]; if that env is masked, b[i]=0. Makes masked envs produce 0
+// in the PCG (block-diagonal after P1 -> no pollution of the shared alpha/beta).
+__global__ void _s4_zero_masked_rhs(double* b, const int* active, const int* d2g,
+                                    int n, int ng)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    int g = d2g[i / 3];
+    if(g >= 0 && g < ng && active[g] == 0) b[i] = 0.0;
+}
+
 gipc::SizeT GlobalLinearSystem::solve_linear_system()
 {
     bool success = build_linear_system();
     if(!success)
         return 0;
     MUDA_ASSERT(m_solver, "Solver is null, call create_solver() to setup a solver.");
+    // [S4] RHS-zero for masked envs (correctness of per-env masking)
+    if(m_s4_active && m_s4_dof_to_group && m_b.size() > 0)
+    {
+        int n = (int)m_b.size(), bs = 256, gn = (n + bs - 1) / bs;
+        _s4_zero_masked_rhs<<<gn, bs>>>(m_b.view().data(), m_s4_active,
+                                        m_s4_dof_to_group, n, m_s4_ng);
+    }
     auto iter = m_solver->solve(m_x, m_b);
     distribute_solution();
     return iter;
@@ -196,6 +215,9 @@ void GlobalLinearSystem::spmv(Float                         a,
                                 gipc_global_triplet->h_unique_key_number,
                                 x,
                                 b,
-                                y);
+                                y,
+                                m_s4_active,        // [S4] skip masked envs' triplets
+                                m_s4_dof_to_group,
+                                m_s4_ng);
 }
 }  // namespace gipc

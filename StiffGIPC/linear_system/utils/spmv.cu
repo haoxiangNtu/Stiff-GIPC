@@ -12,7 +12,10 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                                 int                           triplet_count,
                                 muda::CDenseVectorView<Float> x,
                                 Float                         b,
-                                muda::DenseVectorView<Float>  y)
+                                muda::DenseVectorView<Float>  y,
+                                const int*                    s4_active,
+                                const int*                    s4_dof_to_group,
+                                int                           s4_ng)
 
 {
     using namespace muda;
@@ -47,12 +50,22 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
              triplet_count,
              x = x.viewer().name("x"),
              b = b,
+             s4_active, s4_dof_to_group, s4_ng,
              y = y.viewer().name("y")] __device__() mutable
             {
                 using WarpReduceFloat = cub::WarpReduce<Float, warp_size>;
                 auto global_thread_id = blockDim.x * blockIdx.x + threadIdx.x;
                 if(global_thread_id >= triplet_count)
                     return;
+                // [multi-env S4] skip triplets whose row env is masked. y[masked]
+                // stays 0 (pre-zeroed when b==0) and masked p is 0 -> result
+                // identical, compute saved. Row/col same env after P1.
+                if(s4_active)
+                {
+                    int rg = s4_dof_to_group[rows[global_thread_id]];
+                    if(rg >= 0 && rg < s4_ng && s4_active[rg] == 0)
+                        return;
+                }
                 auto thread_id_in_block = threadIdx.x;
                 auto warp_id            = thread_id_in_block / warp_size;
                 auto lane_id            = thread_id_in_block & (warp_size - 1);

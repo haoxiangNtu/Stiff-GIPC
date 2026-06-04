@@ -16,6 +16,12 @@ class Spmv
                               int                           triplet_count,
                               muda::CDenseVectorView<Float> x,
                               Float                         b,
-                              muda::DenseVectorView<Float>  y);
+                              muda::DenseVectorView<Float>  y,
+                              // [multi-env S4] skip triplets whose row env is
+                              // masked (null = no masking). row block -> group via
+                              // s4_dof_to_group[row]; skip if !s4_active[group].
+                              const int*                    s4_active = nullptr,
+                              const int*                    s4_dof_to_group = nullptr,
+                              int                           s4_ng = 0);
 };
 }  // namespace gipc

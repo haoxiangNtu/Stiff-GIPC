@@ -12204,6 +12204,22 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
     CUDA_SAFE_CALL(cudaMemset(_moveDir, 0, vertexNum * sizeof(double3)));
     double totalTimeStep = 0;
+
+    // [multi-env S4] inject per-env mask into the linear system: solve_linear_system
+    // zeros masked envs' RHS, spmv skips their triplets. Reset all-active at frame
+    // start (detection updates m_env_active each iter); cleared after the loop.
+    const bool s4_mask_on = (m_env_active && TetMesh.d_dof_to_group
+                             && TetMesh.d_point_to_group && getenv("STIFF_PERENV_MASK"));
+    if(s4_mask_on)
+    {
+        std::fill(h_env_active.begin(), h_env_active.end(), 1);
+        CUDA_SAFE_CALL(cudaMemcpy(m_env_active, h_env_active.data(),
+                                  kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice));
+        m_global_linear_system->set_env_mask(m_env_active, TetMesh.d_dof_to_group, kEnvAlphaSlots);
+    }
+    else
+        m_global_linear_system->set_env_mask(nullptr, nullptr, 0);
+
     for(; k < iterCap; ++k)
     {
         if(g_gipc_log_level >= 1 && k > 0 && k % 10 == 0)
@@ -12276,7 +12292,10 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // PCG/SpMV skips read m_env_active). Mask env once its Newton max-move <
         // thr*margin; every RECHECK iters unmask ALL present envs + re-check
         // (catches non-monotonic bounce-back). Self-contained; gated STIFF_PERENV_MASK.
-        if(m_env_active && TetMesh.d_point_to_group && getenv("STIFF_PERENV_MASK"))
+        // Skip detection on early Newton iters: nothing converges before ~k=MINK
+        // (measured), so the per-iter D2H+sync overhead there is pure waste.
+        if(m_env_active && TetMesh.d_point_to_group && getenv("STIFF_PERENV_MASK")
+           && k >= 4)
         {
             const int NG = kEnvAlphaSlots;
             const int RECHECK = 4;
@@ -12546,6 +12565,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             }
         }
     }
+    // [multi-env S4] clear the linear-system mask so later/other solves are unmasked
+    if(s4_mask_on) m_global_linear_system->set_env_mask(nullptr, nullptr, 0);
     //iterV.push_back(k);
     //std::ofstream outiter("iterCount.txt");
     //for(int ii = 0; ii < iterV.size(); ii++)

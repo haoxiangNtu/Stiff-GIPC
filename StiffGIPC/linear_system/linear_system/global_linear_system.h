@@ -65,6 +65,17 @@ class GlobalLinearSystem
     Json               as_json() const;
     GIPCTripletMatrix* gipc_global_triplet = nullptr;
 
+    // [multi-env S4] per-env mask injected by GIPC each Newton iter (null = off).
+    // solve_linear_system zeros m_b for masked-env DOFs (RHS-zero -> those envs
+    // produce 0, no pollution of the shared PCG alpha/beta); spmv skips masked
+    // envs' triplets (the saving). active[ng]: 1=solve,0=masked. dof_to_group
+    // is block-indexed (size = block count); a DOF i belongs to block i/3.
+    void set_env_mask(const int* active, const int* dof_to_group, int ng)
+    { m_s4_active = active; m_s4_dof_to_group = dof_to_group; m_s4_ng = ng; }
+    const int* m_s4_active       = nullptr;
+    const int* m_s4_dof_to_group = nullptr;
+    int        m_s4_ng           = 0;
+
   private:
     std::vector<U<ILinearSubsystem>> m_subsystems;
     std::vector<DiagonalSubsystem*>  m_inner_subsystems;
