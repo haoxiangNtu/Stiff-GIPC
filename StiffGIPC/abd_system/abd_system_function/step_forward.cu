@@ -12,7 +12,8 @@ void ABDSystem::copy_q_to_q_temp(ABDSimData& sim_data)
 
 void ABDSystem::step_forward(ABDSimData&                sim_data,
                              muda::BufferView<double3>  vertexes,
-                             double                     alpha)
+                             double                     alpha,
+                             const double*              per_body_alpha)
 {
     using namespace muda;
     auto& abd                       = sim_data.device;
@@ -28,11 +29,16 @@ void ABDSystem::step_forward(ABDSimData&                sim_data,
                 q_temps       = abd.body_id_to_q_temp.cviewer().name("q_temps"),
                 qs            = abd.body_id_to_q.viewer().name("qs"),
                 dqs           = abd.body_id_to_dq.cviewer().name("dqs"),
+                per_body_alpha,
                 alpha] __device__(int i) mutable
                {
                    if(boundary_type(i) == BodyBoundaryType::Fixed)
                        return;
-                   qs(i) = q_temps(i) - alpha * dqs(i);
+                   // [multi-env S2] per-body alpha (env g's bodies step uniformly
+                   // with env g's FEM verts); fall back to scalar alpha if <0.
+                   double a = alpha;
+                   if(per_body_alpha && per_body_alpha[i] >= 0.0) a = per_body_alpha[i];
+                   qs(i) = q_temps(i) - a * dqs(i);
                });
 
     ParallelFor(256)

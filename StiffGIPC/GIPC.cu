@@ -8097,6 +8097,43 @@ __global__ void _stepForward(double3* _vertexes,
     }
 }
 
+// [multi-env S2] per-env FEM step: vertex idx moves by env_alpha[p2g[idx]] instead
+// of a global scalar (env g's verts step uniformly with env g's ABD bodies).
+// p2g and env_alpha are indexed in the SAME local frame as _vertexes here (caller
+// passes p2g already offset to the FEM region). Falls back to `alpha` if group<0.
+__global__ void _stepForward_perenv(double3*       _vertexes,
+                                    const double3* _vertexesTemp,
+                                    const double3* _moveDir,
+                                    const int*     bType,
+                                    const int*     p2g,
+                                    const double*  env_alpha,
+                                    double         alpha,
+                                    bool           moveBoundary,
+                                    int            numbers)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= numbers) return;
+    if(abs(bType[idx]) == 0 || moveBoundary)
+    {
+        int    g = p2g[idx];
+        double a = (g >= 0 && env_alpha[g] >= 0.0) ? env_alpha[g] : alpha;
+        _vertexes[idx] =
+            __GEIGEN__::__minus(_vertexesTemp[idx],
+                                __GEIGEN__::__s_vec_multiply(_moveDir[idx], a));
+    }
+}
+
+// [multi-env S2] gather per-ABD-body alpha: body b (0..abd_body_num) belongs to
+// collision body b -> group body_to_group[b] -> env_alpha[group]. -1 if ungrouped.
+__global__ void _gather_abd_body_alpha(const int* body_to_group, const double* env_alpha,
+                                       double* abd_body_alpha, int abd_body_num, int ng)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if(b >= abd_body_num) return;
+    int g = body_to_group[b];
+    abd_body_alpha[b] = (g >= 0 && g < ng) ? env_alpha[g] : -1.0;
+}
+
 __global__ void _updateVelocities(double3* _vertexes,
                                   double3* _o_vertexes,
                                   double3* _velocities,
@@ -8720,6 +8757,7 @@ void GIPC::FREE_DEVICE_MEM()
     // [multi-env S1] free per-env line-search substrate
     if(m_env_alpha)    { CUDA_SAFE_CALL(cudaFree(m_env_alpha));    m_env_alpha    = nullptr; }
     if(m_env_scratch)  { CUDA_SAFE_CALL(cudaFree(m_env_scratch));  m_env_scratch  = nullptr; }
+    if(m_abd_body_alpha) { CUDA_SAFE_CALL(cudaFree(m_abd_body_alpha)); m_abd_body_alpha = nullptr; }
 
     pcg_data.FREE_DEVICE_MEM();
 
@@ -10213,13 +10251,29 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
             abd_fem_count_info.fem_point_offset, abd_fem_count_info.fem_point_num);
 
 
-        stepForward(fem_vertexes.data(),
-                    fem_vertexes_temp.data(),
-                    fem_move_dir.data(),
-                    btype.data(),
-                    alpha,
-                    move_boundary,
-                    fem_vertexes.size());
+        // [multi-env S2] per-env FEM step when active (env g's verts step by
+        // m_env_alpha[g]); else the standard uniform step.
+        if(m_perenv_apply && m_env_alpha && TetMesh.d_point_to_group
+           && abd_fem_count_info.fem_point_num > 0)
+        {
+            const unsigned int tn = default_threads;
+            int n = (int)fem_vertexes.size();
+            int bn = (n + tn - 1) / tn;
+            _stepForward_perenv<<<bn, tn>>>(
+                fem_vertexes.data(), fem_vertexes_temp.data(), fem_move_dir.data(),
+                btype.data(), TetMesh.d_point_to_group + abd_fem_count_info.fem_point_offset,
+                m_env_alpha, alpha, move_boundary, n);
+        }
+        else
+        {
+            stepForward(fem_vertexes.data(),
+                        fem_vertexes_temp.data(),
+                        fem_move_dir.data(),
+                        btype.data(),
+                        alpha,
+                        move_boundary,
+                        fem_vertexes.size());
+        }
     }
     if(abd_fem_count_info.abd_point_num <= 0)
         return;
@@ -10227,7 +10281,12 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
     auto abd_vertexes = muda::BufferView<double3>{TetMesh.vertexes, vertexNum}.subview(
         abd_fem_count_info.abd_point_offset, abd_fem_count_info.abd_point_num);
 
-    m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, alpha);
+    // [multi-env S2] per-body ABD alpha when active (gathered from m_env_alpha via
+    // body_to_group); nullptr -> uniform scalar alpha (baseline).
+    const double* abd_alpha_ptr = nullptr;
+    if(m_perenv_apply && m_abd_body_alpha && TetMesh.d_body_to_group)
+        abd_alpha_ptr = m_abd_body_alpha;
+    m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, alpha, abd_alpha_ptr);
 
     // [M1 substitution method] After ABD step_forward updates q, project
     // pinned FEM vertices to ABD-derived positions: world = q.t + R(q)*lp.
@@ -11653,6 +11712,55 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     double alpha_SL = alpha;
 
+    // [multi-env S2/S3] per-env line-search TRY: step each env by its own feasible
+    // alpha (m_env_alpha, validated CCD-safe in S1), then a GLOBAL energy SAFETY
+    // check. Accept if no intersection AND global energy did not increase (the
+    // backtrack-probe showed this holds ~100% of the time). Otherwise fall back to
+    // the standard uniform-alpha line search below (re-steps from temp). Gated.
+    bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
+                       && abd_fem_count_info.fem_point_num > 0
+                       && getenv("STIFF_PERENV_ALPHA"));
+    if(perenv_try)
+    {
+        // gather per-ABD-body alpha from env alpha
+        int abdN = (int)abd_fem_count_info.abd_body_num;
+        if(abdN > 0 && TetMesh.d_body_to_group)
+        {
+            if(!m_abd_body_alpha)
+                CUDA_SAFE_CALL(cudaMalloc((void**)&m_abd_body_alpha, abdN * sizeof(double)));
+            int tn = 256, bn = (abdN + tn - 1) / tn;
+            _gather_abd_body_alpha<<<bn, tn>>>(TetMesh.d_body_to_group, m_env_alpha,
+                                               m_abd_body_alpha, abdN, kEnvAlphaSlots);
+        }
+        m_perenv_apply = true;
+        step_forward(TetMesh, alpha, false);   // per-env step (FEM + ABD)
+        m_perenv_apply = false;                // any further step below is global
+        buildBVH();
+        bool ok = !isIntersected(TetMesh);
+        if(ok)
+        {
+            buildCP();
+            // [backport] v0.6.4 buildCP() already D2H-syncs h_cpNum/h_gpNum and the
+            // energy/gradient kernels consume unsorted pairs directly, so the perf
+            // branch's sync_cpNum()/sort_collision_pairs_by_type() are unneeded here
+            // — this per-env path now matches v0.6.4's normal lineSearch exactly.
+            double E = computeEnergy(TetMesh);
+            if(E <= lastEnergyVal)
+            {
+                if(getenv("STIFF_PENV_STATS"))
+                    printf("[S2-accept] per-env step accepted (E %.6e <= %.6e)\n",
+                           E, lastEnergyVal);
+                return false;  // accepted; collision state already rebuilt
+            }
+            if(getenv("STIFF_PENV_STATS"))
+                printf("[S2-fallback] per-env step raised energy (%.6e > %.6e) -> global\n",
+                       E, lastEnergyVal);
+        }
+        else if(getenv("STIFF_PENV_STATS"))
+            printf("[S2-fallback] per-env step intersected -> global\n");
+        // fall through to standard uniform-alpha line search (re-steps from temp)
+    }
+
     step_forward(TetMesh, alpha, false);
 
     bool rehash = true;
@@ -11869,6 +11977,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // computed HERE because buildFullCP below overwrites _ccd_collisonPairs.
         // Mirrors the engine's temp_alpha reductions (lines above) but per-env.
         // Regions: m_env_scratch[0*NG]=ground invstep, [1*NG]=narrow-self invstep.
+        m_env_alpha_valid = false;  // reset each Newton iter; S1 sets true below
         const bool s1_on = (m_env_scratch && TetMesh.d_point_to_group
                             && surf_vertexNum >= 1 && !m_skip_all_collision
                             && getenv("STIFF_PERENV_ALPHA"));
@@ -12003,6 +12112,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             }
             CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
                                       NG * sizeof(double), cudaMemcpyHostToDevice));
+            m_env_alpha_valid = true;  // m_env_alpha fresh -> lineSearch may use it
             if(getenv("STIFF_PENV_STATS"))
                 printf("[S1-envalpha] k=%d global_alpha=%.6e min_env=%.6e max_env=%.6e "
                        "n_env=%d rel=%.2e (neutral-check; headroom=max_env/global)\n",

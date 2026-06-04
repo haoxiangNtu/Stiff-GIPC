@@ -139,6 +139,18 @@ class GIPC
     // [3]=cfl-maxspeed, each kEnvAlphaSlots wide. Phase A (pre-buildFullCP)
     // fills ground+self-narrow; Phase B fills refined+cfl and combines.
     double*             m_env_scratch = nullptr;   // device, size 4*kEnvAlphaSlots
+    // [multi-env S2] per-env step apply. When m_perenv_apply is true, step_forward
+    // moves FEM vert v by m_env_alpha[point_to_group[v]] and ABD body b by
+    // m_abd_body_alpha[b] (gathered = m_env_alpha[body_to_group[b]]). The scalar
+    // alpha arg is the fallback for ungrouped DOFs / disabled mode. Gated by
+    // STIFF_PERENV_ALPHA; the caller (lineSearch) flips m_perenv_apply off to
+    // fall back to a uniform global step when the global energy safety-check fails.
+    bool                m_perenv_apply    = false;
+    double*             m_abd_body_alpha  = nullptr;  // device, size abd_body_num
+    // set true by the S1 block each Newton iter once m_env_alpha is freshly
+    // populated; lineSearch only does the per-env try when this is true (guards
+    // against applying stale per-env alpha on iters where S1 didn't run).
+    bool                m_env_alpha_valid = false;
 
     uint32_t vertexNum      = 0;
     uint32_t surf_vertexNum = 0;

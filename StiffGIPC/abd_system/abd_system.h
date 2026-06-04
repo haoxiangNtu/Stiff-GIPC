@@ -275,9 +275,14 @@ class ABDSystem
     void copy_q_to_q_temp(ABDSimData& sim_data);
 
     // move forward to test the energy
+    // [multi-env S2] per_body_alpha (optional, device, size abd_body_num): when
+    // non-null, body i steps by per_body_alpha[i] instead of the scalar alpha
+    // (env g's bodies step by alpha_g so a CCD pair's verts move uniformly).
+    // alpha is still used as fallback for bodies whose per_body_alpha[i] < 0.
     void step_forward(ABDSimData&                sim_data,
                       muda::BufferView<double3>  vertices,
-                      double                     alpha);
+                      double                     alpha,
+                      const double*              per_body_alpha = nullptr);
 
     // when doing line search, we need calculate abd energy from q
     Float cal_abd_kinetic_energy(ABDSimData& sim_data);
