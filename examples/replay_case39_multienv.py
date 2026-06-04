@@ -22,13 +22,15 @@ them all in a single ``eng.step()``*.  Consequences you must keep in mind:
     stalls together.  This is the multi-env analogue of the single-scene
     cap-hit problem — watch ``newton_iter_cap`` and per-frame ms, not just fps.
   * GPU memory is the binding limit (measured, RTX 4090 24GB), and after the
-    engine fixes it scales ~LINEARLY with N: ~6GB base + ~0.8GB/env. N=16 runs
-    the FULL grasp trajectory at ~19GB; ceiling ~20 (N>=24 OOMs). Per-env-equiv
-    step time is ~17ms (the global Newton/PCG amortizes fixed overhead, so big-N
-    is actually cheaper per env than single-env). Defaults are RIGHT-SIZED from
-    STIFF_CP_STATS: CCD/contact/triplet buffers run ~10-20% used even at N=16
-    grasp (~5x headroom). Note: geometry INSTANCING (libuipc-style) would NOT
-    help — uipc doesn't instance the shirt either.
+    engine fixes it scales ~LINEARLY with N: ~6GB base + ~0.8GB/env.
+    MEASURED MAX (through the full grasp trajectory): N=20 @ 22.4GB (369ms/step,
+    2.71fps); N=16 @ 18.9GB (278ms, 3.6fps). N=22 is the settling edge (23.7GB);
+    N>=24 OOMs. RL throughput ~55 env-steps/sec and SATURATED (serial merged
+    solve — multi-env amortizes fixed overhead, 14/s@N=1 -> ~55/s@N>=16, then
+    flat; no batch speedup). Defaults RIGHT-SIZED from STIFF_CP_STATS:
+    CCD/contact/triplet run ~10-20% used even at N=20 grasp (~5x headroom).
+    Note: geometry INSTANCING (libuipc-style) would NOT help — uipc doesn't
+    instance the shirt either.
   * Knobs (CASE39ME_BUFF_SCALE / LSYS_SCALE / TRIPLET_MARGIN / ABS_DHAT / SPACING)
     trade memory vs robustness. ABS_DHAT is the key one: it pins contact
     thickness to the single-env value (~2.4mm) so contact does NOT inflate with
