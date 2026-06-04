@@ -151,6 +151,15 @@ class GIPC
     // populated; lineSearch only does the per-env try when this is true (guards
     // against applying stale per-env alpha on iters where S1 didn't run).
     bool                m_env_alpha_valid = false;
+    // [multi-env S4] per-env active flag (1=active/solve, 0=masked/converged).
+    // An env is masked once its Newton max-move < thr*margin; periodically all
+    // are unmasked + re-checked to catch non-monotonic bounce-back. Read by the
+    // assembly/PCG/SpMV masking (RHS-zero + triplet-skip) to skip converged envs.
+    // Gated STIFF_PERENV_MASK. h_env_active mirror; m_recheck_counter drives the
+    // periodic full re-check.
+    int*                m_env_active      = nullptr;  // device, size kEnvAlphaSlots
+    std::vector<int>    h_env_active;                 // host mirror
+    int                 m_recheck_counter = 0;
 
     uint32_t vertexNum      = 0;
     uint32_t surf_vertexNum = 0;

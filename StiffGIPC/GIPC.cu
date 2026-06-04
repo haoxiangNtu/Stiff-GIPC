@@ -8800,6 +8800,7 @@ void GIPC::FREE_DEVICE_MEM()
     if(m_env_alpha)    { CUDA_SAFE_CALL(cudaFree(m_env_alpha));    m_env_alpha    = nullptr; }
     if(m_env_scratch)  { CUDA_SAFE_CALL(cudaFree(m_env_scratch));  m_env_scratch  = nullptr; }
     if(m_abd_body_alpha) { CUDA_SAFE_CALL(cudaFree(m_abd_body_alpha)); m_abd_body_alpha = nullptr; }
+    if(m_env_active)   { CUDA_SAFE_CALL(cudaFree(m_env_active));   m_env_active   = nullptr; }
 
     pcg_data.FREE_DEVICE_MEM();
 
@@ -8845,7 +8846,11 @@ void GIPC::MALLOC_DEVICE_MEM()
     // [multi-env S1] per-env feasible-alpha substrate (physics-neutral until S2).
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_alpha, kEnvAlphaSlots * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_scratch, 4 * kEnvAlphaSlots * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_active, kEnvAlphaSlots * sizeof(int)));
     h_env_alpha.assign(kEnvAlphaSlots, 1.0);
+    h_env_active.assign(kEnvAlphaSlots, 1);
+    { std::vector<int> ones(kEnvAlphaSlots, 1);
+      CUDA_SAFE_CALL(cudaMemcpy(m_env_active, ones.data(), kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice)); }
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -9544,6 +9549,19 @@ __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir,
     int g = p2g[v];
     if(g < 0 || g >= ng) return;
     _atomicMaxPosDouble(&per_env_max[g], __GEIGEN__::__norm(moveDir[v]));
+}
+
+// [multi-env S4 probe / aa17212] per-env MAX move (the real Newton-exit metric):
+// max over an env's verts of |moveDir[i]|. Used by the S4 active-mask detection
+// and the P3a-step2 per-env Newton convergence diagnostic. per_env_max pre-zeroed.
+__global__ void _per_env_max_move(const int* p2g, const double3* moveDir,
+                                  double* per_env_max, int n, int ng)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    int g = p2g[i];
+    if(g < 0 || g >= ng) return;
+    _atomicMaxPosDouble(&per_env_max[g], __GEIGEN__::__norm(moveDir[i]));
 }
 
 // [multi-env S1] per-env CCD feasible-step reductions. Same per-element 1/timestep
@@ -12213,6 +12231,86 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         bool gradVanish = (distToOpt_PN < sqrt(Newton_solver_threshold * Newton_solver_threshold
                                                * bboxDiagSize2 * IPC_dt * IPC_dt));
+
+        // [multi-env P3a step2] per-env Newton convergence tracking (precursor to
+        // mask early-exit). The merged Newton loop currently breaks on the GLOBAL
+        // move norm = the HARDEST env. Here we measure per-env move RMS each Newton
+        // iter so we can see envs converge at DIFFERENT k (the early-exit premise,
+        // on real merged-run data). Read-only diagnostic, gated STIFF_PENV_STATS.
+        if(TetMesh.d_point_to_group && getenv("STIFF_PENV_STATS"))
+        {
+            const int NG = 256;
+            static double* d_sq = nullptr; static int* d_cnt = nullptr;
+            if(!d_sq) { cudaMalloc((void**)&d_sq, NG*sizeof(double));
+                        cudaMalloc((void**)&d_cnt, NG*sizeof(int)); }
+            cudaMemset(d_sq, 0, NG*sizeof(double)); cudaMemset(d_cnt, 0, NG*sizeof(int));
+            int bs = 256, gs = (vertexNum + bs - 1) / bs;
+            _per_env_sqnorm_accum<<<gs, bs>>>(TetMesh.d_point_to_group, _moveDir,
+                                              d_sq, d_cnt, vertexNum, NG);
+            cudaDeviceSynchronize();
+            std::vector<double> hs(NG); std::vector<int> hc(NG);
+            cudaMemcpy(hs.data(), d_sq, NG*sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hc.data(), d_cnt, NG*sizeof(int), cudaMemcpyDeviceToHost);
+            double thr = sqrt(Newton_solver_threshold * Newton_solver_threshold
+                              * bboxDiagSize2 * IPC_dt * IPC_dt);
+            // [S4 probe] per-env MAX move (the real Newton-exit metric), not RMS.
+            static double* d_mxm = nullptr;
+            if(!d_mxm) cudaMalloc((void**)&d_mxm, NG*sizeof(double));
+            cudaMemset(d_mxm, 0, NG*sizeof(double));
+            _per_env_max_move<<<gs, bs>>>(TetMesh.d_point_to_group, _moveDir, d_mxm, vertexNum, NG);
+            cudaDeviceSynchronize();
+            std::vector<double> hmm(NG);
+            cudaMemcpy(hmm.data(), d_mxm, NG*sizeof(double), cudaMemcpyDeviceToHost);
+            printf("[P3a-newton] k=%d thr=%.3e per-env maxMove:", k, thr);
+            int n_conv = 0, n_present = 0;
+            for(int g = 0; g < NG; ++g) if(hc[g] > 0) {
+                ++n_present;
+                bool conv = (k && hmm[g] < thr);   // matches gradVanish (max move)
+                if(conv) ++n_conv;
+                printf(" g%d=%.2e%s", g, hmm[g], conv ? "*" : "");
+            }
+            printf("  (%d/%d done-by-maxmove)\n", n_conv, n_present);
+        }
+
+        // [multi-env S4] per-env active-mask DETECTION (foundation; the assembly/
+        // PCG/SpMV skips read m_env_active). Mask env once its Newton max-move <
+        // thr*margin; every RECHECK iters unmask ALL present envs + re-check
+        // (catches non-monotonic bounce-back). Self-contained; gated STIFF_PERENV_MASK.
+        if(m_env_active && TetMesh.d_point_to_group && getenv("STIFF_PERENV_MASK"))
+        {
+            const int NG = kEnvAlphaSlots;
+            const int RECHECK = 4;
+            const double margin = 0.5;
+            double thr = sqrt(Newton_solver_threshold * Newton_solver_threshold
+                              * bboxDiagSize2 * IPC_dt * IPC_dt);
+            static double* d_mm = nullptr; static int* d_ct = nullptr;
+            if(!d_mm) { cudaMalloc((void**)&d_mm, NG*sizeof(double));
+                        cudaMalloc((void**)&d_ct, NG*sizeof(int)); }
+            cudaMemset(d_mm, 0, NG*sizeof(double)); cudaMemset(d_ct, 0, NG*sizeof(int));
+            int bs = 256, gs = (vertexNum + bs - 1) / bs;
+            _per_env_max_move<<<gs, bs>>>(TetMesh.d_point_to_group, _moveDir, d_mm, vertexNum, NG);
+            _per_env_sqnorm_accum<<<gs, bs>>>(TetMesh.d_point_to_group, nullptr, nullptr, d_ct, vertexNum, NG);
+            cudaDeviceSynchronize();
+            std::vector<double> hmm(NG); std::vector<int> hct(NG);
+            cudaMemcpy(hmm.data(), d_mm, NG*sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hct.data(), d_ct, NG*sizeof(int), cudaMemcpyDeviceToHost);
+            const bool recheck = (k % RECHECK == 0);
+            int n_active = 0, n_present = 0;
+            for(int g = 0; g < NG; ++g)
+            {
+                if(hct[g] <= 0) { h_env_active[g] = 0; continue; }  // absent env
+                ++n_present;
+                if(recheck || k == 0) h_env_active[g] = 1;          // periodic full re-check
+                else if(h_env_active[g] && hmm[g] < thr * margin)   // deeply converged -> mask
+                    h_env_active[g] = 0;
+                if(h_env_active[g]) ++n_active;
+            }
+            CUDA_SAFE_CALL(cudaMemcpy(m_env_active, h_env_active.data(),
+                                      NG * sizeof(int), cudaMemcpyHostToDevice));
+            if(getenv("STIFF_PENV_STATS"))
+                printf("[S4-mask] k=%d active=%d/%d%s\n", k, n_active, n_present,
+                       recheck ? " (recheck)" : "");
+        }
 
         //double distToOpt_PN = calcMinMovement(TetMesh.totalForce, pcg_data.squeue, vertexNum);
         //printf("disToopt:  %f        %f\n",
