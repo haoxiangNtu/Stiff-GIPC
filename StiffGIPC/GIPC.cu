@@ -11782,26 +11782,28 @@ double GIPC::computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>
 #endif
     // NOTE: ABD per-env pending (task #2).
 
-    double fem_sum = 0.0;
-    for(int g = 0; g < NG; ++g) fem_sum += env_out[g];
+    // [S3] per-env ABD energy (segment-summed by body_to_group in the subsystem).
+    static double* abd_env = nullptr;
+    if(!abd_env) CUDA_SAFE_CALL(cudaMalloc((void**)&abd_env, NG * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemset(abd_env, 0, NG * sizeof(double)));
+    double abd_total = m_abd_system->cal_abd_energy_perenv(
+        *m_abd_sim_data, TetMesh.d_body_to_group, NG, abd_env);
+    std::vector<double> habd(NG);
+    CUDA_SAFE_CALL(cudaMemcpy(habd.data(), abd_env, NG * sizeof(double), cudaMemcpyDeviceToHost));
+    double abd_sum = 0.0;
+    for(int g = 0; g < NG; ++g) { env_out[g] += habd[g]; abd_sum += habd[g]; }
 
-    // ABD total (added to E_global; per-env split pending).
-    double abd = m_abd_system->cal_abd_kinetic_energy(*m_abd_sim_data)
-               + m_abd_system->cal_abd_shape_energy(*m_abd_sim_data)
-               + m_abd_system->cal_abd_joint_energy(*m_abd_sim_data)
-               + m_abd_system->cal_abd_revolute_driving_energy(*m_abd_sim_data)
-               + m_abd_system->cal_abd_prismatic_energy(*m_abd_sim_data)
-               + m_abd_system->cal_abd_prismatic_driving_energy(*m_abd_sim_data);
+    double full_sum = 0.0;
+    for(int g = 0; g < NG; ++g) full_sum += env_out[g];
 
     double E_global = computeEnergy(TetMesh);  // independent full energy (refills slots)
 
     if(getenv("STIFF_PENV_STATS"))
-    {
-        double fem_global = E_global - abd;
-        printf("[S3-energy] sum_g E_g(FEM)=%.9e  global_FEM=%.9e  rel=%.2e\n",
-               fem_sum, fem_global,
-               fabs(fem_sum - fem_global) / std::max(fabs(fem_global), 1e-30));
-    }
+        printf("[S3-energy] sum_g E_g=%.9e  global=%.9e  rel=%.2e  "
+               "(ABD: sum_g=%.6e total=%.6e)\n",
+               full_sum, E_global,
+               fabs(full_sum - E_global) / std::max(fabs(E_global), 1e-30),
+               abd_sum, abd_total);
     return E_global;
 }
 

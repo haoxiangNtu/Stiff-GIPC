@@ -228,4 +228,58 @@ Float ABDSystem::cal_abd_joint_energy(ABDSimData& sim_data)
     return m_joint_energy;
 }
 
+// [multi-env S3] per-env ABD energy: segment-sum each per-element energy array by
+// env. body-keyed terms (kinetic, shape) use body i; constraint terms use
+// parent_body_id. atomicAdd into env_out (raw device double*, size ng).
+double ABDSystem::cal_abd_energy_perenv(ABDSimData& sim_data, const int* body_to_group,
+                                        int ng, double* env_out)
+{
+    using namespace muda;
+    double total = 0.0;
+    total += cal_abd_kinetic_energy(sim_data);
+    total += cal_abd_shape_energy(sim_data);
+    total += cal_abd_joint_energy(sim_data);
+    total += cal_abd_revolute_driving_energy(sim_data);
+    total += cal_abd_prismatic_energy(sim_data);
+    total += cal_abd_prismatic_driving_energy(sim_data);
+
+    auto abd_count = sim_data.abd_fem_count_info().abd_body_num;
+    if(!env_out || !body_to_group) return total;
+
+    // per-body terms: kinetic, shape (element i -> body i)
+    if(abd_count > 0)
+    {
+        ParallelFor(256).apply(abd_count,
+            [E = m_kinetic_energy_per_affine_body.cviewer().name("K"),
+             body_to_group, ng, env_out] __device__(int i) mutable
+            { int g = body_to_group[i]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+        ParallelFor(256).apply(abd_count,
+            [E = m_shape_energy_per_affine_body.cviewer().name("V"),
+             body_to_group, ng, env_out] __device__(int i) mutable
+            { int g = body_to_group[i]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+    }
+    // constraint terms: keyed by parent_body_id (parent/child same env after P1)
+    if(m_num_joints > 0)
+        ParallelFor(256).apply(m_num_joints,
+            [E = m_joint_energy_per_joint.cviewer().name("J"),
+             d = m_joint_data.cviewer().name("jd"), body_to_group, ng, env_out] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+    if(m_num_revolute_driving > 0)
+        ParallelFor(256).apply(m_num_revolute_driving,
+            [E = m_revolute_driving_energy_per.cviewer().name("R"),
+             d = m_revolute_driving_data.cviewer().name("rd"), body_to_group, ng, env_out] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+    if(m_num_prismatic > 0)
+        ParallelFor(256).apply(m_num_prismatic,
+            [E = m_prismatic_energy_per.cviewer().name("P"),
+             d = m_prismatic_data.cviewer().name("pd"), body_to_group, ng, env_out] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+    if(m_num_prismatic_driving > 0)
+        ParallelFor(256).apply(m_num_prismatic_driving,
+            [E = m_prismatic_driving_energy_per.cviewer().name("PD"),
+             d = m_prismatic_driving_data.cviewer().name("pdd"), body_to_group, ng, env_out] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+    return total;
+}
+
 }  // namespace gipc

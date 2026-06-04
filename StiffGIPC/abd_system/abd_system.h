@@ -292,6 +292,14 @@ class ABDSystem
     Float cal_abd_prismatic_energy(ABDSimData& sim_data);
     Float cal_abd_prismatic_driving_energy(ABDSimData& sim_data);
 
+    // [multi-env S3] per-env ABD energy. Calls the 6 energy terms (filling their
+    // per-element arrays), then segment-sums each by env (env = body_to_group of
+    // the element's body; constraints keyed by parent_body_id) and ADDS into
+    // env_out (device, size ng; caller pre-zeros). Returns the global ABD total.
+    // body_to_group is indexed by ABD body id (== collision body id for ABD).
+    double cal_abd_energy_perenv(ABDSimData& sim_data, const int* body_to_group,
+                                 int ng, double* env_out);
+
     // Joint constraint setup: upload from host data, compute material coords
     void init_joint_constraints(ABDSimData& sim_data,
                                 const std::vector<JointConstraintHostInfo>& host_joints);
