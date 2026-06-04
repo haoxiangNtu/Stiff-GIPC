@@ -11796,15 +11796,20 @@ double GIPC::computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>
     double full_sum = 0.0;
     for(int g = 0; g < NG; ++g) full_sum += env_out[g];
 
-    double E_global = computeEnergy(TetMesh);  // independent full energy (refills slots)
-
-    if(getenv("STIFF_PENV_STATS"))
+    // full_sum == global computeEnergy (validated machine-precision). Only run the
+    // independent computeEnergy for the gated validation print (it ~doubles cost,
+    // and the per-env backtracking loop calls this repeatedly).
+    if(getenv("STIFF_S3_VALIDATE"))
+    {
+        double E_global = computeEnergy(TetMesh);
         printf("[S3-energy] sum_g E_g=%.9e  global=%.9e  rel=%.2e  "
                "(ABD: sum_g=%.6e total=%.6e)\n",
                full_sum, E_global,
                fabs(full_sum - E_global) / std::max(fabs(E_global), 1e-30),
                abd_sum, abd_total);
-    return E_global;
+        return E_global;
+    }
+    return full_sum;
 }
 
 int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int preconditioner_type)
@@ -11967,52 +11972,70 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     double alpha_SL = alpha;
 
-    // [multi-env S2/S3] per-env line-search TRY: step each env by its own feasible
-    // alpha (m_env_alpha, validated CCD-safe in S1), then a GLOBAL energy SAFETY
-    // check. Accept if no intersection AND global energy did not increase (the
-    // backtrack-probe showed this holds ~100% of the time). Otherwise fall back to
-    // the standard uniform-alpha line search below (re-steps from temp). Gated.
+    // [multi-env S2/S3] RIGOROUS per-env line search. Step each env by its own
+    // CCD-feasible alpha (m_env_alpha, S1-validated safe), then enforce PER-ENV
+    // energy DESCENT: any env whose own energy E_g rose halves its alpha_g and
+    // re-steps (independent per-env backtracking) — NOT the global-energy heuristic
+    // (which can mask one env's increase). Per-env energy is validated exact
+    // (Sum_g E_g == global, machine precision). Accept when every env satisfies
+    // E_g(alpha_g) <= E_g(0) with no intersection. Falls back to the standard
+    // uniform search only if an env can't descend within maxBT halvings. Gated.
     bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
                        && abd_fem_count_info.fem_point_num > 0
                        && getenv("STIFF_PERENV_ALPHA"));
     if(perenv_try)
     {
-        // gather per-ABD-body alpha from env alpha
-        int abdN = (int)abd_fem_count_info.abd_body_num;
-        if(abdN > 0 && TetMesh.d_body_to_group)
+        const int NG = kEnvAlphaSlots;
+        const int abdN = (int)abd_fem_count_info.abd_body_num;
+        const int maxBT = 8;
+        std::vector<double> Eg0, Eg1;
+        computeEnergy_perenv(TetMesh, Eg0);   // per-env energy at START (temp) config
+        bool accepted = false;
+        for(int bt = 0; bt <= maxBT; ++bt)
         {
-            if(!m_abd_body_alpha)
-                CUDA_SAFE_CALL(cudaMalloc((void**)&m_abd_body_alpha, abdN * sizeof(double)));
-            int tn = 256, bn = (abdN + tn - 1) / tn;
-            _gather_abd_body_alpha<<<bn, tn>>>(TetMesh.d_body_to_group, m_env_alpha,
-                                               m_abd_body_alpha, abdN, kEnvAlphaSlots);
-        }
-        m_perenv_apply = true;
-        step_forward(TetMesh, alpha, false);   // per-env step (FEM + ABD)
-        m_perenv_apply = false;                // any further step below is global
-        buildBVH();
-        bool ok = !isIntersected(TetMesh);
-        if(ok)
-        {
-            buildCP();
-            // [backport] v0.6.4 buildCP() already D2H-syncs h_cpNum/h_gpNum and the
-            // energy/gradient kernels consume unsorted pairs directly, so the perf
-            // branch's sync_cpNum()/sort_collision_pairs_by_type() are unneeded here
-            // — this per-env path now matches v0.6.4's normal lineSearch exactly.
-            double E = computeEnergy(TetMesh);
-            if(E <= lastEnergyVal)
+            if(abdN > 0 && TetMesh.d_body_to_group)   // refresh per-body ABD alpha
             {
-                if(getenv("STIFF_PENV_STATS"))
-                    printf("[S2-accept] per-env step accepted (E %.6e <= %.6e)\n",
-                           E, lastEnergyVal);
-                return false;  // accepted; collision state already rebuilt
+                if(!m_abd_body_alpha)
+                    CUDA_SAFE_CALL(cudaMalloc((void**)&m_abd_body_alpha, abdN * sizeof(double)));
+                int tn = 256, bn = (abdN + tn - 1) / tn;
+                _gather_abd_body_alpha<<<bn, tn>>>(TetMesh.d_body_to_group, m_env_alpha,
+                                                   m_abd_body_alpha, abdN, NG);
             }
-            if(getenv("STIFF_PENV_STATS"))
-                printf("[S2-fallback] per-env step raised energy (%.6e > %.6e) -> global\n",
-                       E, lastEnergyVal);
+            m_perenv_apply = true;
+            step_forward(TetMesh, alpha, false);   // per-env step from temp
+            m_perenv_apply = false;
+            buildBVH();
+            if(isIntersected(TetMesh))   // CCD-safe alpha should prevent this; safety net
+            {
+                for(int g = 0; g < NG; ++g) if(h_env_alpha[g] > 0) h_env_alpha[g] *= 0.5;
+                CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
+                                          NG * sizeof(double), cudaMemcpyHostToDevice));
+                continue;
+            }
+            buildCP();
+            // [backport] buildCP() already D2H-syncs h_cpNum/h_gpNum and the energy
+            // kernels consume unsorted pairs directly, so the perf branch's
+            // sync_cpNum()/sort_collision_pairs_by_type() are unneeded in this path.
+            computeEnergy_perenv(TetMesh, Eg1);   // per-env energy AFTER step
+            bool allok = true; int nhalve = 0;
+            for(int g = 0; g < NG; ++g)
+            {
+                if(h_env_alpha[g] <= 0) continue;   // env g absent
+                double tol = 1e-12 * (fabs(Eg0[g]) + 1.0);
+                if(Eg1[g] > Eg0[g] + tol) { h_env_alpha[g] *= 0.5; allok = false; ++nhalve; }
+            }
+            if(allok)
+            {
+                accepted = true;
+                if(getenv("STIFF_PENV_STATS")) printf("[S3-accept] per-env descent ok (bt=%d)\n", bt);
+                break;
+            }
+            CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
+                                      NG * sizeof(double), cudaMemcpyHostToDevice));
+            if(getenv("STIFF_PENV_STATS")) printf("[S3-bt] bt=%d halved %d envs\n", bt, nhalve);
         }
-        else if(getenv("STIFF_PENV_STATS"))
-            printf("[S2-fallback] per-env step intersected -> global\n");
+        if(accepted) return false;   // accepted; collision state already rebuilt
+        if(getenv("STIFF_PENV_STATS")) printf("[S3-fallback] per-env descent not reached -> global\n");
         // fall through to standard uniform-alpha line search (re-steps from temp)
     }
 
