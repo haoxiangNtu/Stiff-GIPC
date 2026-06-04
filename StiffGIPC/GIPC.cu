@@ -9408,6 +9408,28 @@ void GIPC::buildCP()
     }
 }
 
+// [multi-env P3a] segmented per-env reduction PRIMITIVE — the core machinery the
+// block-diagonal solve needs (per-env residual / dot-products). For each entry i,
+// route its |vec[i]|^2 (and a unit count) into bucket d_point_to_group[i]. Atomic
+// bucketing here is fine for the read-only diagnostic; the in-solver version (P3a
+// step2) must use fixed-order segmented reduce (cub::DeviceSegmentedReduce) so the
+// per-env sums are order-deterministic.
+__global__ void _per_env_sqnorm_accum(const int* p2g, const double3* vec,
+                                      double* per_env_sq, int* per_env_cnt,
+                                      int n, int ng)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    int g = p2g[i];
+    if(g < 0 || g >= ng) return;
+    if(per_env_cnt) atomicAdd(&per_env_cnt[g], 1);
+    if(vec)
+    {
+        double3 v = vec[i];
+        atomicAdd(&per_env_sq[g], v.x * v.x + v.y * v.y + v.z * v.z);
+    }
+}
+
 void GIPC::buildFullCP(const double& alpha)
 {
     if(m_skip_all_collision)
@@ -12046,6 +12068,34 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     if(g_gipc_log_level >= 1)
         printf("average time cost:     %f,    frame id:   %d\n", totalTime / totalNT, total_Frames);
 
+    // [multi-env P3a] validate the segmented per-env reduction primitive on real
+    // data: per-env vertex count (must match the substrate, e.g. 11433/env) and a
+    // real per-env quantity (velocity norm). Read-only diagnostic, gated.
+    if(getenv("STIFF_PENV_STATS") && TetMesh.d_point_to_group)
+    {
+        const int NG = 256;
+        static double* d_sq = nullptr;
+        static int*    d_cnt = nullptr;
+        if(!d_sq)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&d_sq, NG * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&d_cnt, NG * sizeof(int)));
+        }
+        CUDA_SAFE_CALL(cudaMemset(d_sq, 0, NG * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMemset(d_cnt, 0, NG * sizeof(int)));
+        int bs = 256, gs = (vertexNum + bs - 1) / bs;
+        _per_env_sqnorm_accum<<<gs, bs>>>(TetMesh.d_point_to_group, TetMesh.velocities,
+                                          d_sq, d_cnt, vertexNum, NG);
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        std::vector<double> h_sq(NG);
+        std::vector<int> h_cnt(NG);
+        CUDA_SAFE_CALL(cudaMemcpy(h_sq.data(), d_sq, NG * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(h_cnt.data(), d_cnt, NG * sizeof(int), cudaMemcpyDeviceToHost));
+        printf("[P3a-reduce] frame %d per-env:", total_Frames);
+        for(int g = 0; g < NG; ++g)
+            if(h_cnt[g] > 0) printf(" g%d[n=%d |v|=%.4e]", g, h_cnt[g], sqrt(h_sq[g]));
+        printf("\n");
+    }
 
     ttime0 += time0;
     ttime1 += time1;
