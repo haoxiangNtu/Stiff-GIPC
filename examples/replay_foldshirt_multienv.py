@@ -6,11 +6,15 @@ same dual-panda + hybrid soft grippers, but it GRASPS/FOLDS a shirt (no cup),
 replaying an imitation-learning episode (.hdf5 with `actions` (T,16) +
 `robot_init_pose` + `object_init_info` attrs, e.g. /tmp/replay_0528/
 episode_00000.hdf5). Cloth mesh = assets/objects/m-panda_single/scaled.obj
-(2799 verts vs case_39's 6436 shirt), but active grasping makes per-env contact
-heavier than case_39.
+(2799 verts).
 
-Measures the multi-env memory ceiling with the same engine fixes (absolute_dhat,
-right-sized buffers, STIFF_CP_STATS).
+IMPORTANT — action layout for THIS dataset is [L_arm(0:7), L_grip(7),
+R_arm(8:15), R_grip(15)] (the "7+1,7+1" convention), NOT [L_arm,R_arm,gripL,gripR]
+like qpos_case39. Grip cols 7 & 15 are binary -1(close)/+1(open). Mapping them
+wrong leaves the grippers permanently open (they approach but never close).
+
+Measured ceiling (24GB, buff=4): ~20-22 envs (N=20 @21.4GB, N=22 @23.0GB edge,
+N=24 OOM), ~40ms/env — comparable to replay_case39_multienv.
 
 Usage:
     PYTHONPATH=. CASE39ME_HEADLESS=1 CASE39ME_NUM_ENVS=8 \
@@ -150,10 +154,13 @@ def slice_env_joints(robot, n):
 
 
 def apply_frame(robot, ej, raw, close_r):
+    # This episode's action layout is [L_arm(0:7), L_grip(7), R_arm(8:15), R_grip(15)]
+    # (the "7+1, 7+1" convention) — NOT [L_arm, R_arm, gripL, gripR]. Grip cols 7
+    # and 15 are binary-ish -1(close)/+1(open); col 14 is a right-arm joint.
     for i, ri in enumerate(ej['left_rev']):  robot.set_revolute_position(ri, float(raw[i]), degree=False)
-    for i, ri in enumerate(ej['right_rev']): robot.set_revolute_position(ri, float(raw[7+i]), degree=False)
-    for grip, pris in ((float(raw[14]) if len(raw)>14 else 0., ej['left_pri']),
-                       (float(raw[15]) if len(raw)>15 else 0., ej['right_pri'])):
+    for i, ri in enumerate(ej['right_rev']): robot.set_revolute_position(ri, float(raw[8+i]), degree=False)
+    for grip, pris in ((float(raw[7]), ej['left_pri']),
+                       (float(raw[15]), ej['right_pri'])):
         if not pris: continue
         lo = robot.prismatic_joints[pris[0]].lower_limit; hi = robot.prismatic_joints[pris[0]].upper_limit
         gp = hi if grip >= 0 else (lo + close_r*(hi-lo))
@@ -188,7 +195,7 @@ def main():
         semi_implicit_beta_tol=5e-2, semi_implicit_min_iter=1, newton_tol=5e-2,
         newton_iter_cap=50, preconditioner_type=1,
         ground_offset=float(ec.get("ground_offset", 0.75)), assets_dir=_ASSETS_DIR)
-    cfg._cfg.collision_detection_buff_scale = float(os.environ.get("CASE39ME_BUFF_SCALE", "8.0"))
+    cfg._cfg.collision_detection_buff_scale = float(os.environ.get("CASE39ME_BUFF_SCALE", "4.0"))
     cfg._cfg.linear_system_buff_scale       = float(os.environ.get("CASE39ME_LSYS_SCALE", "2.0"))
     cfg._cfg.triplet_internal_margin        = float(os.environ.get("CASE39ME_TRIPLET_MARGIN", "4.0"))
     # absolute_dhat pinned to single-env value so contact does not inflate with N.
