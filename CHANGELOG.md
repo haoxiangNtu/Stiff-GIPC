@@ -4,6 +4,75 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] — 2026-06-05
+
+> **For RL data collection / long replays, this is the recommended build.**
+>
+> v0.6.2 = v0.6.1 + 3 backported fixes from the v0.7.x line + 1 small CCD
+> tweak.  It deliberately does NOT pull in the v0.7.0 perf rewrite
+> (CUDA-Graph PCG, sparsity-cache, pair-type sort) — that batch contained
+> commit `98ac3dc` (CCD-pair sort) which caused random Newton-cap stutter
+> on long contact-dense trajectories.  See [0.7.1] for the in-place fix on
+> the v0.7 line; users who can't tolerate any tail-event flakiness on long
+> trajectories should pin v0.6.2 instead.
+
+### Fixed
+
+- **Statistics overhead (long-replay perf + RAM)** — backport of v0.7.1
+  fix.  `Statistics::write_to_file` was called every step and serialized
+  the entire accumulated `m_json["frames"]` array (4-space indent) to disk
+  → O(N²) cumulative writes (~800 MB per 1551-step run).  Plus
+  `m_json["frames"][m_frame]` grew ~50 KB/step in RAM (~8.5 GB after
+  100 episodes → eventual OOM on long RL data collection).
+
+  Both behaviors now gated behind `GIPC_STATS_ENABLED` env var (default off).
+  Disabled mode uses a per-frame scratch `Json` for writes so caller code
+  is unchanged.
+
+  To re-enable full stats.json dumping:
+  ```bash
+  GIPC_STATS_ENABLED=1 python your_script.py
+  ```
+
+- **`cudaEventDestroy` leak in `IPC_Solver`** — backport of v0.7.1 fix.
+  Per-step timing events were created but never destroyed.  Long-running
+  RL collection processes could eventually exhaust the driver's
+  event-handle pool.  Resource-hygiene fix.
+
+### Performance
+
+- **`isIntersected()` post-line-search check now skipped by default.**
+  `_edgeTriIntersectionQuery` (the BVH self-intersection re-test after
+  every line-search α bisection) was 42 % of GPU time on case_39.  CCD
+  line-search already guarantees a non-intersecting step on smooth
+  contact; the recheck never fires on those scenes.  Default flipped to
+  SKIP (was opt-in via `STIFF_SKIP_CCD_SANITY=1`).
+
+  Effect on `replay_case_39` (cup grasp, smooth contact, n=3 paired):
+  ~38 ms/step → ~32 ms/step (~+15 %).
+
+  To restore the v0.6.1 behavior (e.g. on scenes with very thin tets or
+  near-coincident features):
+
+  ```bash
+  GIPC_FORCE_CCD_SANITY=1 python your_script.py
+  # or, back-compat with the v0.7.0 opt-out form:
+  STIFF_SKIP_CCD_SANITY=0 python your_script.py
+  ```
+
+### Why not just use v0.7.x?
+
+v0.7.0 introduced a ~14 % per-step speedup via a bundle of optimizations
+(CUDA-Graph PCG, sparsity-cache, pair-type sorts), but the CCD-pair sort
+in that bundle (`98ac3dc`) made Newton occasionally fail to converge
+on long contact-dense trajectories — symptom was random 1-2 s "frozen
+frames" in cloth-fold replays.  v0.7.1 reverts that single commit, but
+the other v0.7.x rewrites still change kernel timing in ways that some
+users prefer to avoid for long RL data collection.
+
+v0.6.2 is the conservative path: same numerical core as v0.6.1, only
+backports the proven-safe fixes.
+
 ## [0.6.1] — 2026-05-27
 
 ### Fixed
