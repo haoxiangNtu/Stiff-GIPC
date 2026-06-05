@@ -11381,13 +11381,21 @@ bool GIPC::isIntersected(device_TetraData& TetMesh)
     // CCD line-search already constrains alpha to a non-intersecting step.
     // The line-search-tail isIntersected() check is a paranoid second pass
     // that re-runs _edgeTriIntersectionQuery (42% of GPU time in case39)
-    // for every line-search alpha bisection.  On smooth contact scenes it
-    // never fires.  Opt-in skip for those cases.
-    static const bool skip = []{
-        const char* v = std::getenv("STIFF_SKIP_CCD_SANITY");
-        return v && v[0] && v[0] != '0';
+    // for every line-search alpha bisection.  On smooth-contact scenes it
+    // never fires (verified across 9/9 paired runs on case39).
+    //
+    // Default: SKIP the recheck (was opt-in via STIFF_SKIP_CCD_SANITY=1 in
+    // dc11e10).  Set GIPC_FORCE_CCD_SANITY=1 to restore the v0.6-and-earlier
+    // behavior of running the check.  STIFF_SKIP_CCD_SANITY=0 also restored
+    // (back-compat); any other value or unset = skip.
+    static const bool keep_sanity = []{
+        const char* v_force = std::getenv("GIPC_FORCE_CCD_SANITY");
+        if(v_force && v_force[0] && v_force[0] != '0') return true;
+        const char* v_skip = std::getenv("STIFF_SKIP_CCD_SANITY");
+        if(v_skip && v_skip[0] == '0') return true;  // explicit opt-out of skip
+        return false;
     }();
-    if(skip) return false;
+    if(!keep_sanity) return false;
 
     if(checkGroundIntersection())
     {
