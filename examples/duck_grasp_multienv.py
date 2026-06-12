@@ -44,6 +44,16 @@ def tf(pos):
     T = np.eye(4); T[:3, 3] = pos; return T
 
 
+def box_mesh(center, half):
+    """Axis-aligned box surface (8 verts, 12 tris) for a rigid table."""
+    cx, cy, cz = center; hx, hy, hz = half
+    v = np.array([[cx-hx, cy-hy, cz-hz],[cx+hx, cy-hy, cz-hz],[cx+hx, cy+hy, cz-hz],[cx-hx, cy+hy, cz-hz],
+                  [cx-hx, cy-hy, cz+hz],[cx+hx, cy-hy, cz+hz],[cx+hx, cy+hy, cz+hz],[cx-hx, cy+hy, cz+hz]], float)
+    f = np.array([[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],
+                  [1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]], np.int32)
+    return v, f
+
+
 # rbs/Newton franka URDF is Z-up; StiffGIPC world is Y-up. Rotate -90 deg about X
 # (z->y) like the fold-shirt example's make_arm_tf, so the arm stands up in Y and
 # gravity (-Y) is correct.
@@ -64,6 +74,8 @@ def main():
     q = d["q"].astype(np.float64)          # (T, 9): 7 arm + 2 finger
     franka_base = d["franka_base"].astype(np.float64)
     duck_pos    = d["duck_pos"].astype(np.float64)
+    tbl_pos     = d["table_pos"].astype(np.float64)
+    tbl_half    = d["table_half"].astype(np.float64)
     L = q.shape[0]
     f0 = int(os.environ.get("GRASP_FRAME_START", "0"))
     f1 = min(int(os.environ.get("GRASP_FRAME_END", str(L))), L)
@@ -101,26 +113,42 @@ def main():
 
     # The recorded q is for rbs's FR3 franka; StiffGIPC's Panda franka has different
     # link lengths, so the SAME joints put the gripper ~0.175m ABOVE the recorded
-    # duck_pos -> it never reaches it (proven). Place the duck where THIS franka's
-    # gripper actually is (finger midpoint + 0.05m down the approach), so the
-    # recorded finger-close (0.04->0.02) actually grasps it.
-    APPROACH_DOWN = np.array([0.0, 0.0, -0.05])  # gripper points -Z (fingers below hand)
+    # duck_pos. The recorded arm trajectory is near-static (grasp-in-place), so we
+    # LOWER the whole franka so its (static) gripper sits right at the duck ON THE
+    # TABLE -> the duck rests on the table, gripper around it, fingers close to grasp.
+    # gripper_offset = gripper(q0) - base, measured once via FK below.
+    table_v, table_f = box_mesh(tbl_pos, tbl_half)
+    # rest the duck ON the table top (table_pos.z + table_half.z), clearing the
+    # surface by its own lower extent so there's no initial penetration.
+    tbl_top = float(tbl_pos[2] + tbl_half[2])
+    duck_world = np.array([duck_pos[0], duck_pos[1],
+                           tbl_top - float(dverts[:, 2].min()) + 0.005])
+
+    # gripper(q0) sits at base + this offset (measured by FK for this Panda franka +
+    # q[0]; deterministic). Lower the franka so its static gripper reaches the table
+    # duck: base_grasp = duck - offset. (Compensates the FR3->Panda kinematic gap.)
+    gripper_off = np.array([0.495, 0.0, 0.505])
+    # finger TIPS are ~0.05m below the FK midpoint; raise the gripper so the TIPS
+    # (not the midpoint) reach the duck -> tips clear the table, no finger-table
+    # penetration (that was the slowdown), and the fingers actually wrap the duck.
+    FINGER_LEN = np.array([0.0, 0.0, 0.05])
+    base_grasp = duck_world + FINGER_LEN - gripper_off
+    print(f"[grasp] base_grasp={base_grasp.round(3)} -> gripper tips at table duck {duck_world.round(3)}", flush=True)
 
     t0 = time.perf_counter()
     for e in range(N):
         r, c = divmod(e, side)
         off = np.array([c * spacing, r * spacing, 0.0])   # grid offset (Z-up: XY plane)
-        eng.native.load_urdf(URDF, tf(franka_base + off), True, False, 1e7, init_angles)
-        lf = np.array(eng.native.get_urdf_link_transform("panda_leftfinger"))[:3, 3]
-        rf = np.array(eng.native.get_urdf_link_transform("panda_rightfinger"))[:3, 3]
-        grasp_pt = 0.5 * (lf + rf) + APPROACH_DOWN
-        if e == 0:
-            print(f"[grasp] env0 gripper FK={(0.5*(lf+rf)).round(3)} -> duck placed at {grasp_pt.round(3)}", flush=True)
+        # rigid table (Fixed) so the duck rests on it
+        eng.load_mesh_from_data(table_v, table_f, 3, 3, 0, tf(off), 1e9, 1)
+        # franka lowered so its static gripper reaches the table duck
+        eng.native.load_urdf(URDF, tf(base_grasp + off), True, False, 1e7, init_angles)
+        # duck on the table
         eng.load_mesh_from_data(dverts, dcells, 4, 3,
                                 0 if ducktype == "ABD" else 1,
-                                tf(grasp_pt),
+                                tf(duck_world + off),
                                 1e8 if ducktype == "ABD" else 3e5, 0)
-    print(f"[grasp] loaded {N} franka+duck, {eng.native.get_abd_body_count()} ABD bodies", flush=True)
+    print(f"[grasp] loaded {N} (table+franka+duck), {eng.native.get_abd_body_count()} ABD bodies", flush=True)
 
     eng.finalize()
     robot = Robot(eng)
@@ -129,30 +157,35 @@ def main():
     print(f"[grasp] {nr} revolute ({rpe}/env) + {npz} prismatic ({ppe}/env)  "
           f"load={time.perf_counter()-t0:.1f}s  GPU={gpu_mb()}MB", flush=True)
 
+    lift_dj2 = [0.0]  # shoulder (joint2) delta for the post-grasp lift phase
     def apply(fr):
         for e in range(N):
-            qi = q[(fr + e * phase) % L]
+            qi = q[(fr + e * phase) % L].copy()
+            qi[1] += lift_dj2[0]   # raise the arm by tilting the shoulder
             for i in range(min(rpe, 7)):
                 robot.set_revolute_position(e * rpe + i, float(qi[i]), degree=False)
             for j in range(min(ppe, 2)):
                 robot.set_prismatic_position(e * ppe + j, float(qi[7 + j]), millimeters=False)
 
+    LIFT = int(os.environ.get("GRASP_LIFT", "120"))   # post-grasp lift frames (0=off)
     nduck = dverts.shape[0]
     if headless:
         ms = []; z0 = None
-        for fr in range(f0, f1):
+        # phase 1: replay the recorded grasp; phase 2: lift (ramp shoulder, fingers held)
+        seq = [("grasp", fr) for fr in range(f0, f1)] + \
+              [("lift", f1 - 1)] * LIFT
+        for k, (ph, fr) in enumerate(seq):
+            if ph == "lift":
+                lift_dj2[0] = -0.6 * (k - (f1 - f0)) / max(LIFT, 1)  # ramp shoulder up
             apply(fr)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter()-t)*1000.0)
             # env-0 duck height (verts loaded as franka0,duck0,... -> env0 duck is
             # the FEM block right after franka0; track its z = grasp success signal)
             dz = float(eng.get_vertices()[-nduck:, 2].mean()) if N == 1 else None
-            if N == 1 and fr % 50 == 0:
-                dv = eng.get_vertices()[-nduck:, 2]
-                print(f"      duck z min/mean/max = {dv.min():+.2f}/{dv.mean():+.2f}/{dv.max():+.2f}", flush=True)
             if z0 is None: z0 = dz
-            if fr % 50 == 0:
+            if k % 40 == 0 or k == len(seq) - 1:
                 zs = f" duck_z={dz:+.3f}" if dz is not None else ""
-                print(f"[grasp] frame {fr:4d} step={ms[-1]:6.0f}ms GPU={gpu_mb()}MB{zs}", flush=True)
+                print(f"[grasp] {ph} k={k:4d} step={ms[-1]:6.0f}ms GPU={gpu_mb()}MB{zs}", flush=True)
         if z0 is not None:
             zf = float(eng.get_vertices()[-nduck:, 2].mean())
             print(f"[grasp] env0 duck z: start={z0:+.3f} -> end={zf:+.3f}  lift={zf-z0:+.3f}m "
