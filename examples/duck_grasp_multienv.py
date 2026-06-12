@@ -26,7 +26,12 @@ sys.path.insert(0, _ROOT)
 from stiff_physics import Engine, Config
 from stiff_physics.robot import Robot
 
-URDF = _ROOT + "/Assets/sim_data/urdf/franka_panda/panda_arm_hand_coarse.urdf"
+# Use the SAME franka as the recording: rbs's FR3 (fr3_joint*), converted for
+# StiffGIPC (finger.dae collision -> STL). GRASP_URDF=panda for the Panda variant.
+_FR3 = _ROOT + "/assets/fr3/fr3_franka_hand.urdf"
+_PANDA = _ROOT + "/Assets/sim_data/urdf/franka_panda/panda_arm_hand_coarse.urdf"
+URDF = _PANDA if os.environ.get("GRASP_URDF", "fr3") == "panda" else _FR3
+JPREFIX = "panda" if URDF == _PANDA else "fr3"
 DUCK_TET = _ROOT + "/assets/duck/duck_tet.npz"
 TRAJ = "/tmp/franka_ik_traj.npz"
 
@@ -84,6 +89,10 @@ def main():
 
     dk = np.load(DUCK_TET)
     dverts, dcells = dk["verts"].astype(np.float64), dk["cells"].astype(np.int32)
+    # duck (~60mm) is wider than the gripper opens (~43mm) -> scale it to fit
+    dscale = float(os.environ.get("GRASP_DUCK_SCALE", "1.0"))
+    dverts = dverts * dscale
+    print(f"[grasp] duck scale={dscale} -> bbox {(dverts.max(0)-dverts.min(0)).round(3)}", flush=True)
 
     # The recording is Z-up (duck height = z). StiffGIPC gravity is configurable;
     # set it to -Z so we replay in the RECORDING's native frame — no rotation, no
@@ -94,10 +103,12 @@ def main():
     # rbs table. Replay the recorded q in the recording's native Z-up frame.
     cfg = Config(dt=0.02, gravity=(0.0, 0.0, -9.8),
                  ground_normal=(0.0, 0.0, 1.0), ground_offset=0.15,
-                 poisson_rate=0.45, friction_rate=0.4, relative_dhat=1e-3,
+                 poisson_rate=0.45, friction_rate=float(os.environ.get("GRASP_FRICTION", "0.4")),
+                 relative_dhat=1e-3,
                  newton_tol=5e-2, newton_iter_cap=50, preconditioner_type=1,
                  revolute_driving_strength_ratio=100.0,
-                 prismatic_strength_ratio=2000.0, assets_dir=_ROOT + "/Assets/")
+                 prismatic_strength_ratio=float(os.environ.get("GRASP_GRIP", "2000.0")),
+                 assets_dir=_ROOT + "/Assets/")
     cfg._cfg.absolute_dhat = 0.0019
     cfg._cfg.collision_detection_buff_scale = 1.0
     cfg._cfg.linear_system_buff_scale = 1.5
@@ -105,11 +116,11 @@ def main():
     eng = Engine(cfg)
 
     side = int(math.ceil(math.sqrt(N)))
-    ANAMES = [f"panda_joint{i+1}" for i in range(7)]
+    ANAMES = [f"{JPREFIX}_joint{i+1}" for i in range(7)]
     # load at traj-start arm pose, fingers OPEN (0.04) so the duck fits between them
     init_angles = {ANAMES[i]: float(q[f0, i]) for i in range(7)}
-    init_angles["panda_finger_joint1"] = 0.04
-    init_angles["panda_finger_joint2"] = 0.04
+    init_angles[f"{JPREFIX}_finger_joint1"] = 0.04
+    init_angles[f"{JPREFIX}_finger_joint2"] = 0.04
 
     # FAITHFUL rbs layout — exact recorded positions, NO hacks: franka @ franka_base,
     # rigid table @ table_pos, duck @ duck_pos (on the table). Z-up gravity. Then
@@ -130,17 +141,26 @@ def main():
                                 0 if ducktype == "ABD" else 1,
                                 tf(duck_pos + off),
                                 1e8 if ducktype == "ABD" else 3e5, 0)
-    # env-0 franka loaded first -> its finger verts (bodies 8,9) are [303,939)
-    fv0, fv1 = 303, 939
     print(f"[grasp] loaded {N} (franka+table+duck), {eng.native.get_abd_body_count()} ABD bodies", flush=True)
 
     eng.finalize()
+    # env-0 franka loaded first; its 2 fingers (318 verts each) are the last 636
+    # verts of the franka block (table=8 verts + duck=nduck come after env-0 only
+    # for N=1). Track those as the gripper.
+    nduck = dverts.shape[0]
+    total = len(eng.get_vertices())
+    franka0_end = total - (8 + nduck) if N == 1 else total
+    fv0, fv1 = max(0, franka0_end - 636), franka0_end
     robot = Robot(eng)
     nr, npz = len(robot.revolute_joints), len(robot.prismatic_joints)
     rpe, ppe = nr // N, npz // N   # joints per env (7 rev, 2 pri for panda)
     print(f"[grasp] {nr} revolute ({rpe}/env) + {npz} prismatic ({ppe}/env)  "
           f"load={time.perf_counter()-t0:.1f}s  GPU={gpu_mb()}MB", flush=True)
 
+    # CLAMP: when the recorded finger target is in its closing range (<0.038), command
+    # fully closed (0.0) so the parallel jaws clamp the duck (position control: the
+    # duck blocks the jaws -> grip force). Faithful otherwise (open phases unchanged).
+    CLAMP = int(os.environ.get("GRASP_CLAMP", "1"))
     lift_dj2 = [0.0]  # shoulder (joint2) delta for the post-grasp lift phase
     def apply(fr):
         for e in range(N):
@@ -149,7 +169,9 @@ def main():
             for i in range(min(rpe, 7)):
                 robot.set_revolute_position(e * rpe + i, float(qi[i]), degree=False)
             for j in range(min(ppe, 2)):
-                robot.set_prismatic_position(e * ppe + j, float(qi[7 + j]), millimeters=False)
+                fj = float(qi[7 + j])
+                if CLAMP and fj < 0.038: fj = 0.0      # clamp hard when closing
+                robot.set_prismatic_position(e * ppe + j, fj, millimeters=False)
 
     LIFT = int(os.environ.get("GRASP_LIFT", "0"))   # post-grasp lift frames (0=off; faithful replay)
     nduck = dverts.shape[0]
