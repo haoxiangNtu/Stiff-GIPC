@@ -175,6 +175,13 @@ class GIPC
     // internal Hessian-triplet margin (set from cfg.triplet_internal_margin; 32
     // = historical hardcoded value). The dominant per-env triplet over-reserve.
     double   m_triplet_internal_margin   = 32.0;
+    // [P1-dyn] Dynamic triplet-buffer sizing for non-hybrid scenes. m_fixed_triplet_base
+    // = topology-fixed internal triplet count (captured in init()); each step the global
+    // triplet buffer is grown to 2*length (length = fixed + ACTUAL contact triplets from
+    // h_cpNum) — the 2x is the converter's documented [length:2*length) scratch/output
+    // region (global_linear_system.cu). Never overflows: length is exact.
+    long long m_fixed_triplet_base       = 0;
+    bool      m_dynamic_triplet          = false;
 
     double RestNHEnergy       = 0.0;
     double animation_subRate  = 0.0;

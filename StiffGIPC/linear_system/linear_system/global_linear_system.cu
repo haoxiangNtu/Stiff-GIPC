@@ -191,6 +191,30 @@ void GlobalLinearSystem::apply_preconditioner(muda::DenseVectorView<Float>  z,
 
 void GlobalLinearSystem::convert_new()
 {
+    // [P1-dyn / 9c2da9c] safety net for the dynamic (non-hybrid) triplet buffer:
+    // ensure it holds the converter's [length:2*length) scratch/output region and the
+    // hash scratch holds `length`. length here is EXACT (= assembled
+    // global_triplet_offset), so this guarantees the converter never overflows.
+    // resize_triplets(length) sets m_size so the subsequent reserve preserves the
+    // assembled triplets in [0:length). No-op when the buffer is already large
+    // (worst-case hybrid alloc) -> byte-for-byte unchanged for hybrid scenes.
+    {
+        auto*           gt     = gipc_global_triplet;
+        const long long length = gt->global_triplet_offset;
+        if(length >= 1)
+        {
+            if((long long)gt->triplet_capacity() < 2LL * length)
+            {
+                gt->resize_triplets((size_t)length);
+                gt->reserve_triplets((size_t)(2LL * length * 13 / 10));
+            }
+            if(gt->global_external_max_capcity < length)
+            {
+                gt->resize_collision_hash_size((size_t)((long long)length * 13 / 10));
+                gt->global_external_max_capcity = (int)((long long)length * 13 / 10);
+            }
+        }
+    }
     m_converter.convert(*gipc_global_triplet,
                         0,
                         gipc_global_triplet->global_triplet_offset,

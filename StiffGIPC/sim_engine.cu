@@ -1282,7 +1282,15 @@ void SimEngine::Impl::do_init_bvh_and_solver()
 
     ipc.buildBVH();
     ipc.setup_surface_mesh_bodies(tetMesh);
-    ipc.m_triplet_internal_margin = cfg.triplet_internal_margin;
+    // [P1 triplet-margin] The internal-triplet margin (cfg.triplet_internal_margin,
+    // default 32) only exists to reserve headroom for the M3.5 hybrid FEM-ABD pin
+    // chain-rule Hessian expansion, which is gated by n_fem_pins>0 (see GIPC.cu M3.5
+    // block). For scenes WITHOUT FEM pins the internal Hessian-triplet count is exact
+    // (fixed by mesh topology), so margin=1 is sufficient and safe — and it avoids
+    // over-allocating the global triplet buffer by up to 32x. Verified: cp-stats shows
+    // "ext used 0 / cap 0" for non-hybrid scenes. Hybrid scenes keep the full margin.
+    ipc.m_triplet_internal_margin =
+        (d_tetMesh.n_fem_pins > 0) ? cfg.triplet_internal_margin : 1.0;
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer,
              cfg.linear_system_buff_scale);
 

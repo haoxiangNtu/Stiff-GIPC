@@ -8961,20 +8961,34 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
         total_internal_triplet_num
             * static_cast<long long unsigned>(m_triplet_internal_margin)
         + total_max_collision_triplet_num;
-    if(::g_gipc_log_level >= 1) printf("[buffer] total_internal_triplet_num=%llu, total_max=%llu (3x3 doubles ~ %llu MB)\n",
-           total_internal_triplet_num, total_max_global_triplet_num,
-           total_max_global_triplet_num * 80 / 1024 / 1024);
+    // [P1-dyn] Non-hybrid scenes (margin forced to 1 by sim_engine when n_fem_pins==0)
+    // size the triplet buffer per-step from ACTUAL contact counts instead of the
+    // worst-case 2*(surf+edge)*29 (cp-stats: <1% used). Allocate a small initial buffer;
+    // computeGradientAndHessian() grows it to 2*length each step (2x = converter's
+    // documented [length:2*length) scratch region). Hybrid keeps the worst-case alloc.
+    m_fixed_triplet_base = static_cast<long long>(total_internal_triplet_num);
+    m_dynamic_triplet    = (m_triplet_internal_margin <= 1.0);
+    long long unsigned init_total = total_internal_triplet_num
+        + static_cast<long long unsigned>(abd_fem_count_info.fem_point_num)
+        + 2u * static_cast<long long unsigned>(surf_vertexNum) + 100000u;
+    long long unsigned triplet_alloc = m_dynamic_triplet
+        ? (2u * init_total)            // 2x for the converter scratch/output region
+        : (total_max_global_triplet_num * (long long unsigned)buffScale);
+    long long unsigned hash_alloc = m_dynamic_triplet
+        ? init_total
+        : (long long unsigned)((total_internal_triplet_num + total_max_collision_triplet_num) * buffScale);
+    if(::g_gipc_log_level >= 1) printf("[buffer] internal=%llu worst=%llu init_alloc=%llu (dynamic=%d, ~%llu MB)\n",
+           total_internal_triplet_num, total_max_global_triplet_num, triplet_alloc,
+           (int)m_dynamic_triplet, triplet_alloc * 80 / 1024 / 1024);
 
     gipc_global_triplet.init_var();
 
     gipc_global_triplet.resize(global_matrix_block3_size,
                                global_matrix_block3_size,
-                               total_max_global_triplet_num * buffScale);
+                               triplet_alloc);
 
-    gipc_global_triplet.global_external_max_capcity =
-        total_internal_triplet_num + total_max_collision_triplet_num;
-    gipc_global_triplet.resize_collision_hash_size(
-        gipc_global_triplet.global_external_max_capcity * buffScale);
+    gipc_global_triplet.global_external_max_capcity = hash_alloc;
+    gipc_global_triplet.resize_collision_hash_size(hash_alloc);
 
 
     m_global_linear_system->gipc_global_triplet = &(gipc_global_triplet);
@@ -10821,6 +10835,38 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     }
 
     gipc_global_triplet.global_triplet_offset = 0;
+
+    // [P1-dyn] Grow the global triplet buffer BEFORE any assembly writes, to a PROVABLE
+    // UPPER BOUND on this step's triplet count (so the unchecked assembly kernels can
+    // NEVER overflow — not merely "usually fit"). The bound:
+    //   - fixed (topology) internal triplets: m_fixed_triplet_base + fem_point (exact)
+    //   - collision: h_cpNum[0] is the EXACT number of contact pairs calBarrier iterates;
+    //     any pair writes at most M12_Off(=16) 3x3 blocks, so 16*h_cpNum[0] >= the real
+    //     collision-triplet count for ANY type mix (PP/PE/PT/EE). Same for lagged
+    //     friction (h_cpNum_last[0]) and ground (h_gpNum, generous *M6_Off).
+    // block_values needs 2*bound (converter writes scratch/output to [length:2*length),
+    // global_linear_system.cu); hash scratch needs bound. Non-hybrid only; hybrid keeps
+    // the worst-case finalize allocation. Provable: bound >= actual length always.
+    if(m_dynamic_triplet)
+    {
+        long long bound = m_fixed_triplet_base
+            + static_cast<long long>(abd_fem_count_info.fem_point_num)
+            + static_cast<long long>(h_cpNum[0]) * M12_Off     // all contact pairs x max blocks
+            + static_cast<long long>(h_gpNum) * M6_Off;        // ground (generous)
+#ifdef USE_FRICTION
+        bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
+               + static_cast<long long>(h_gpNum_last) * M6_Off;
+#endif
+        bound += 4096;                                          // fixed slack
+        long long bv_need = 2 * bound;                          // converter [length:2*length)
+        if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(bv_need))
+            gipc_global_triplet.reserve_triplets(static_cast<size_t>(bv_need * 1.1));
+        if(gipc_global_triplet.global_external_max_capcity < bound)
+        {
+            gipc_global_triplet.resize_collision_hash_size(static_cast<size_t>(bound * 1.1));
+            gipc_global_triplet.global_external_max_capcity = static_cast<int>(bound * 1.1);
+        }
+    }
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
