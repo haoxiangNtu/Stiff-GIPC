@@ -10858,7 +10858,12 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                + static_cast<long long>(h_gpNum_last) * M6_Off;
 #endif
         bound += 4096;                                          // fixed slack
-        long long bv_need = 2 * bound;                          // converter [length:2*length)
+        // Pre-assembly only needs capacity >= this step's length (assembly writes [0:length));
+        // bound is a provable upper bound on length, so 1*bound is assembly-safe. The
+        // converter's 2*length region is grown exactly at the convert site
+        // (global_linear_system.cu), so the peak capacity = 2*length (the irreducible
+        // out-of-place-converter floor), not 2*bound. Saves ~20% of the grasp-peak buffer.
+        long long bv_need = bound;
         if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(bv_need))
             gipc_global_triplet.reserve_triplets(static_cast<size_t>(bv_need * 1.1));
         if(gipc_global_triplet.global_external_max_capcity < bound)
