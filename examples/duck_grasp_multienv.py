@@ -41,9 +41,10 @@ for _c in _glob.glob(_ROOT + "/Assets/sorted_mesh/tmp_mesh_*"):
 # StiffGIPC (finger.dae collision -> STL). GRASP_URDF=panda for the Panda variant.
 _FR3 = _ROOT + "/Assets/fr3/fr3_franka_hand.urdf"
 _FR3_CVX = _ROOT + "/Assets/fr3/fr3_franka_hand_convex.urdf"  # convex-hull fingers (matches uipc)
+_FR3_UIPC = _ROOT + "/Assets/fr3/fr3_franka_hand_uipc.urdf"  # uipc EXACT colliders: OBB arms + convex hand/fingers
 _PANDA = _ROOT + "/Assets/sim_data/urdf/franka_panda/panda_arm_hand_coarse.urdf"
 _SEL = os.environ.get("GRASP_URDF", "fr3convex")   # uipc uses convex-hull fingers
-URDF = {"panda": _PANDA, "fr3convex": _FR3_CVX}.get(_SEL, _FR3)
+URDF = {"panda": _PANDA, "fr3convex": _FR3_CVX, "fr3uipc": _FR3_UIPC}.get(_SEL, _FR3)
 JPREFIX = "panda" if URDF == _PANDA else "fr3"
 # uipc's EXACT duck tetmesh (270v/889tet, dumped from rbs build_duck_tetmesh). Now the
 # DEFAULT — it grasps +149mm matching uipc once the METIS CACHE is cleared (see below).
@@ -144,8 +145,10 @@ def main():
                  prismatic_strength_ratio=float(os.environ.get("GRASP_GRIP", "2000.0")),
                  assets_dir=_ROOT + "/Assets/")
     cfg._cfg.absolute_dhat = float(os.environ.get("GRASP_DHAT", "0.0019"))
-    cfg._cfg.collision_detection_buff_scale = 1.0
-    cfg._cfg.linear_system_buff_scale = 1.5
+    # These pre-allocate WORST-CASE contact/linear-system buffers (per-env, x buff_scale).
+    # Smaller => more envs fit, but too small => contact/triplet OVERFLOW -> crash.
+    cfg._cfg.collision_detection_buff_scale = float(os.environ.get("GRASP_CBUF", "1.0"))
+    cfg._cfg.linear_system_buff_scale = float(os.environ.get("GRASP_LBUF", "1.5"))
     cfg._cfg.triplet_internal_margin = margin
     eng = Engine(cfg)
 
@@ -206,7 +209,7 @@ def main():
     # env-0 franka loaded first; its 2 fingers are the last (2*nfv) verts of the franka
     # block (table=8 verts + duck=nduck come after env-0 only for N=1). Finger vert count
     # depends on the collider: raw STL=318/finger, convex hull (fr3convex)=68/finger.
-    nfv = 68 if URDF == _FR3_CVX else 318
+    nfv = 68 if URDF in (_FR3_CVX, _FR3_UIPC) else 318
     nduck = dverts.shape[0]
     total = len(eng.get_vertices())
     franka0_end = total - (8 + nduck) if N == 1 else total
