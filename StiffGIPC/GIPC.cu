@@ -8725,11 +8725,14 @@ void GIPC::FREE_DEVICE_MEM()
 
 void GIPC::MALLOC_DEVICE_MEM()
 {
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex, MAX_COLLITION_PAIRS_NUM * sizeof(int)));
+    // +1 trash slot: pair-emit overflow is redirected to index==cap (see _emit_slot
+    // in mlbvh.cu) so detection never writes out of bounds; the host then grows.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex, ((size_t)MAX_COLLITION_PAIRS_NUM + 1) * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs,
-                              MAX_COLLITION_PAIRS_NUM * sizeof(int4)));
+                              ((size_t)MAX_COLLITION_PAIRS_NUM + 1) * sizeof(int4)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs,
-                              MAX_CCD_COLLITION_PAIRS_NUM * sizeof(int4)));
+                              ((size_t)MAX_CCD_COLLITION_PAIRS_NUM + 1) * sizeof(int4)));
+    set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
     CUDA_SAFE_CALL(cudaMalloc((void**)&_environment_collisionPair,
                               surf_vertexNum * sizeof(int)));
     //CUDA_SAFE_CALL(cudaMalloc((void**)&_moveDir, vertexNum * sizeof(double3)));
@@ -9363,6 +9366,31 @@ void GIPC::buildCP()
 
     CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(&h_gpNum, _gpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // Overflow → grow DCD pair buffers + redo detection (BVH unchanged, no pairs
+    // lost; emits were redirected to the trash slot so nothing was corrupted).
+    while((int)h_cpNum[0] > MAX_COLLITION_PAIRS_NUM)
+    {
+        int newcap = (int)(h_cpNum[0] + h_cpNum[0] / 2) + 1;
+        printf("[DCD-grow] h_cpNum=%u > cap=%d -> grow to %d, redo detection\n",
+               h_cpNum[0], MAX_COLLITION_PAIRS_NUM, newcap);
+        CUDA_SAFE_CALL(cudaFree(_collisonPairs));
+        CUDA_SAFE_CALL(cudaFree(_MatIndex));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex,      ((size_t)newcap + 1) * sizeof(int)));
+        MAX_COLLITION_PAIRS_NUM = newcap;
+        bvh_f._collisionPair = bvh_e._collisionPair = _collisonPairs;
+        bvh_f._MatIndex      = bvh_e._MatIndex      = _MatIndex;
+        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
+        CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
+        bvh_f.SelfCollitionDetect(dHat);
+        bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
+        GroundCollisionDetect();
+        CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+        CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(&h_gpNum, _gpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    }
 }
 
 void GIPC::buildFullCP(const double& alpha)
@@ -9389,6 +9417,29 @@ void GIPC::buildFullCP(const double& alpha)
     cudaEventDestroy(reset_evt);
 
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // Overflow → grow CCD pair buffer + redo detection. The swept BVH
+    // (ConstructFullCCD) is unchanged, so we only re-run the query into the
+    // larger buffer. Emits past the old cap went to the trash slot (no OOB), and
+    // consumers (self_largestFeasibleStepSize) run only after this returns, so
+    // they always see a fully-populated, in-bounds buffer.
+    while((int)h_ccd_cpNum > MAX_CCD_COLLITION_PAIRS_NUM)
+    {
+        int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
+        printf("[CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo detection\n",
+               h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
+        CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
+        MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        bvh_f._ccd_collisionPair = _ccd_collisonPairs;
+        bvh_e._ccd_collisionPair = _ccd_collisonPairs;
+        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
+        bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
+        bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, m_aux_stream);
+        CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+        CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    }
 }
 
 

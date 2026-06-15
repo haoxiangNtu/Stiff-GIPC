@@ -16,6 +16,27 @@
 #include <fstream>
 #include "gpu_eigen_libs.cuh"
 
+// --- Emit-overflow guard (dynamic, never out-of-bounds) ---------------------
+// Pair-emit kernels do `buf[atomicAdd(_cpNum,1)] = ...`. If detected pairs exceed
+// the allocated buffer this writes OOB and corrupts GPU memory. g_*_cp_cap are the
+// allocated logical capacities (set by GIPC::set via set_emit_caps); buffers are
+// allocated with +1 slot, and any emit whose index reaches the cap is redirected
+// to that single trash slot [cap]. _cpNum still counts the TRUE total so the host
+// can detect overflow, grow the buffer and re-run detection (no pairs lost, no OOB).
+__device__ int g_dcd_cp_cap = 0x7fffffff;
+__device__ int g_ccd_cp_cap = 0x7fffffff;
+__device__ __forceinline__ uint32_t _emit_slot(uint32_t* cnt, int cap)
+{
+    uint32_t i = atomicAdd(cnt, 1u);
+    return (i < (uint32_t)cap) ? i : (uint32_t)cap;   // overflow -> trash slot [cap]
+}
+void set_emit_caps(int dcd_cap, int ccd_cap)
+{
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_dcd_cp_cap, &dcd_cap, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ccd_cp_cap, &ccd_cap, sizeof(int)));
+}
+
+
 
 
 __device__ __host__ inline AABB merge(const AABB& lhs, const AABB& rhs) noexcept
@@ -593,7 +614,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
             if(d < dHat)
             {
                 //printf("%d   %d   %d   %d   %d   %f\n", dtype, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, d);
-                int cdp_idx = atomicAdd(_cpNum, 1);
+                int cdp_idx = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                 _ccd_collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 _collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, -1, -1);
                 _mInx[cdp_idx]          = atomicAdd(_cpNum + 2, 1);
@@ -606,7 +627,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
             if(d < dHat)
             {
                 //printf("%d   %d   %d   %d   %d   %f\n", dtype, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, d);
-                int cdp_idx = atomicAdd(_cpNum, 1);
+                int cdp_idx = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                 _ccd_collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 _collisionPair[cdp_idx] = make_int4(-id0 - 1, id2, -1, -1);
                 _mInx[cdp_idx]          = atomicAdd(_cpNum + 2, 1);
@@ -619,7 +640,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
             if(d < dHat)
             {
                 //printf("%d   %d   %d   %d   %d   %f\n", dtype, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, d);
-                int cdp_idx = atomicAdd(_cpNum, 1);
+                int cdp_idx = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                 _ccd_collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 _collisionPair[cdp_idx] = make_int4(-id0 - 1, id3, -1, -1);
                 _mInx[cdp_idx]          = atomicAdd(_cpNum + 2, 1);
@@ -632,7 +653,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
             if(d < dHat)
             {
                 //printf("%d   %d   %d   %d   %d   %f\n", dtype, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, d);
-                int cdp_idx = atomicAdd(_cpNum, 1);
+                int cdp_idx = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                 _ccd_collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 _collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, -1);
                 _mInx[cdp_idx]          = atomicAdd(_cpNum + 3, 1);
@@ -645,7 +666,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
             if(d < dHat)
             {
                 //printf("%d   %d   %d   %d   %d   %f\n", dtype, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, d);
-                int cdp_idx = atomicAdd(_cpNum, 1);
+                int cdp_idx = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                 _ccd_collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 _collisionPair[cdp_idx] = make_int4(-id0 - 1, id2, id3, -1);
                 _mInx[cdp_idx]          = atomicAdd(_cpNum + 3, 1);
@@ -658,7 +679,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
             if(d < dHat)
             {
                 //printf("%d   %d   %d   %d   %d   %f\n", dtype, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, d);
-                int cdp_idx = atomicAdd(_cpNum, 1);
+                int cdp_idx = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                 _ccd_collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 _collisionPair[cdp_idx] = make_int4(-id0 - 1, id3, id1, -1);
                 _mInx[cdp_idx]          = atomicAdd(_cpNum + 3, 1);
@@ -671,7 +692,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
             if(d < dHat)
             {
                 //printf("%d   %d   %d   %d   %d   %f\n", dtype, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, d);
-                int cdp_idx = atomicAdd(_cpNum, 1);
+                int cdp_idx = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                 _ccd_collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 _collisionPair[cdp_idx] = make_int4(-id0 - 1, id1, id2, id3);
                 //printf("ccbcbcbcbbcbcbbcbcb  %d  %d  %d  %d\n", -id0 - 1, id1, id2, id3);
@@ -714,7 +735,7 @@ __device__ inline bool _checkPTintersection_fullCCD(const double3*  _vertexes,
         return;
     }
 
-    _ccd_collisionPair[atomicAdd(_cpNum, 1)] = make_int4(-id0 - 1, id1, id2, id3);
+    _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] = make_int4(-id0 - 1, id1, id2, id3);
 }
 
 __device__ inline bool _checkEEintersection(const double3*  _vertexes,
@@ -758,7 +779,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -773,7 +794,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id0 - 1, id2, -1, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 2, 1);
@@ -797,7 +818,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -811,7 +832,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id0 - 1, id3, -1, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 2, 1);
@@ -836,7 +857,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -850,7 +871,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id0 - 1, id2, id3, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 3, 1);
@@ -874,7 +895,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -888,7 +909,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id1 - 1, id2, -1, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 2, 1);
@@ -912,7 +933,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -926,7 +947,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id1 - 1, id3, -1, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 2, 1);
@@ -950,7 +971,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -964,7 +985,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id1 - 1, id2, id3, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 3, 1);
@@ -989,7 +1010,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -1003,7 +1024,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id2 - 1, id0, id1, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 3, 1);
@@ -1028,7 +1049,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
                 if(add_e <= -2)
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
                     {
@@ -1042,7 +1063,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 }
                 else
                 {
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx] = make_int4(-id3 - 1, id0, id1, add_e);
                     MatIndex[cdp_idx] = atomicAdd(_cpNum + 3, 1);
@@ -1067,7 +1088,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 if(add_e <= -2)
                 {
                     //printf("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxxx\n");
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     MatIndex[cdp_idx]           = atomicAdd(_cpNum + 4, 1);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     if(smooth)
@@ -1080,7 +1101,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                 else
                 {
 
-                    int cdp_idx                 = atomicAdd(_cpNum, 1);
+                    int cdp_idx                 = (int)_emit_slot(_cpNum, g_dcd_cp_cap);
                     _ccd_collisionPair[cdp_idx] = make_int4(id0, id1, id2, id3);
                     _collisionPair[cdp_idx]     = make_int4(id0, id1, id2, id3);
                     MatIndex[cdp_idx]           = atomicAdd(_cpNum + 4, 1);
@@ -1649,7 +1670,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                         if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                            && idx != _faces[obj_idx].z)
                         {
-                            _ccd_collisionPair[atomicAdd(_cpNum, 1)] =
+                            _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                 make_int4(-idx - 1,
                                           _faces[obj_idx].x,
                                           _faces[obj_idx].y,
@@ -1678,7 +1699,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                         if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                            && idx != _faces[obj_idx].z)
                         {
-                            _ccd_collisionPair[atomicAdd(_cpNum, 1)] =
+                            _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                 make_int4(-idx - 1,
                                           _faces[obj_idx].x,
                                           _faces[obj_idx].y,
@@ -1904,7 +1925,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                                  || current_edge.y == _edges[obj_idx].x
                                  || current_edge.y == _edges[obj_idx].y || obj_idx < self_eid))
                             {
-                                _ccd_collisionPair[atomicAdd(_cpNum, 1)] =
+                                _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                     make_int4(current_edge.x,
                                               current_edge.y,
                                               _edges[obj_idx].x,
@@ -1938,7 +1959,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                                  || current_edge.y == _edges[obj_idx].x
                                  || current_edge.y == _edges[obj_idx].y || obj_idx < self_eid))
                             {
-                                _ccd_collisionPair[atomicAdd(_cpNum, 1)] =
+                                _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                     make_int4(current_edge.x,
                                               current_edge.y,
                                               _edges[obj_idx].x,

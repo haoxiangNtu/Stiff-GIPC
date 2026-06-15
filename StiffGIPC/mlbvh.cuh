@@ -13,6 +13,11 @@
 #include <cuda_runtime.h>
 #include "device_launch_parameters.h"
 
+// Set the pair-emit overflow caps (logical buffer capacities). Emits whose index
+// reaches the cap are redirected to a trash slot (buffers allocated with +1), so
+// detection can never write out of bounds; the host then grows + redoes.
+void set_emit_caps(int dcd_cap, int ccd_cap);
+
 struct AABB
 {
   public:
