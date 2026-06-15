@@ -64,6 +64,14 @@ class GIPC
     uint32_t* _cpNum             = nullptr;
     int*      _MatIndex          = nullptr;
     uint32_t* _close_cpNum       = nullptr;
+    // On-demand reduction scratch: reductions launch ceil(count/default_threads)
+    // blocks each writing one double. pcg_data.squeue is only sized to the mesh
+    // (max(vertexNum,tetra)), so reductions over a COLLISION/CCD PAIR count
+    // (h_cpNum / h_ccd_cpNum, up to MAX_*_PAIRS) overflow it. This buffer grows
+    // to ceil(count/default_threads) on demand so no pair-count reduction can
+    // ever overflow; after warmup the capacity stabilizes (no further realloc).
+    double*   m_reduce_scratch   = nullptr;
+    size_t    m_reduce_cap       = 0;
 
     uint32_t* _environment_collisionPair = nullptr;
 
@@ -197,6 +205,10 @@ class GIPC
     void tempFree_closeConstraint();
 
     void FREE_DEVICE_MEM();
+    // Returns a reduction scratch buffer guaranteed to hold ceil(count/default_threads)
+    // doubles. Grows on demand; use for ANY reduction whose element count is a
+    // collision/CCD pair count instead of pcg_data.squeue (which is mesh-sized).
+    double* ensure_reduce_scratch(int count);
     void initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix = nullptr, int _collision_body_count = 0);
     void init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer, double buffScale = 1);
 

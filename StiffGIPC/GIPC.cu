@@ -8702,6 +8702,7 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 void GIPC::FREE_DEVICE_MEM()
 {
     CUDA_SAFE_CALL(cudaFree(_MatIndex));
+    if(m_reduce_scratch) { CUDA_SAFE_CALL(cudaFree(m_reduce_scratch)); m_reduce_scratch=nullptr; m_reduce_cap=0; }
     CUDA_SAFE_CALL(cudaFree(_collisonPairs));
     CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
     CUDA_SAFE_CALL(cudaFree(_cpNum));
@@ -9123,6 +9124,20 @@ void GIPC::computeSoftConstraintGradient(double3* _gradient)
         m_d_stitch_abd_body_id,
         reinterpret_cast<const __GEIGEN__::Vector12*>(m_d_abd_body_q),
         softNum);
+}
+
+double* GIPC::ensure_reduce_scratch(int count)
+{
+    // ceil(count/default_threads) doubles are written by the first reduction pass.
+    size_t need = (size_t)((count + default_threads - 1) / default_threads) + 1;
+    if(need > m_reduce_cap)
+    {
+        if(m_reduce_scratch)
+            CUDA_SAFE_CALL(cudaFree(m_reduce_scratch));
+        m_reduce_cap = need + need / 2;  // 1.5x slack → no realloc churn after warmup
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_reduce_scratch, m_reduce_cap * sizeof(double)));
+    }
+    return m_reduce_scratch;
 }
 
 double GIPC::self_largestFeasibleStepSize(double slackness, double* mqueue, int numbers)
@@ -11083,7 +11098,9 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
     }
     if(numbers == 0)
         return 0;
-    double* queue = pcg_data.squeue;
+    // pair-count energy reductions (barrier/friction) need a pair-sized buffer,
+    // not the mesh-sized squeue (V2/V3 overflow fix).
+    double* queue = ensure_reduce_scratch(numbers);
     //CUDA_SAFE_CALL(cudaMalloc((void**)&queue, numbers * sizeof(double)));*/
 
     const unsigned int threadNum = 256;
@@ -11638,7 +11655,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             std::min(alpha, ground_largestFeasibleStepSize(slackness_a, pcg_data.squeue));
         //alpha = std::min(alpha, InjectiveStepSize(0.2, 1e-6, pcg_data.squeue, TetMesh.tetrahedras));
         alpha = std::min(
-            alpha, self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_cpNum[0]));
+            alpha, self_largestFeasibleStepSize(slackness_m, ensure_reduce_scratch(h_cpNum[0]), h_cpNum[0]));
         double temp_alpha = alpha;
         double alpha_CFL  = alpha;
 
@@ -11660,7 +11677,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 buildFullCP(temp_alpha);*/
                 alpha =
                     std::min(temp_alpha,
-                             self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_ccd_cpNum)
+                             self_largestFeasibleStepSize(slackness_m, ensure_reduce_scratch(h_ccd_cpNum), h_ccd_cpNum)
                                  * ccd_size);
                 alpha = std::max(alpha, alpha_CFL);
             }
@@ -11818,7 +11835,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         {
             double slackness_m = 0.8;
             alpha              = std::min(alpha,
-                             self_largestFeasibleStepSize(slackness_m, pcg_data.squeue, h_ccd_cpNum));
+                             self_largestFeasibleStepSize(slackness_m, ensure_reduce_scratch(h_ccd_cpNum), h_ccd_cpNum));
         }
         //updateBoundary(TetMesh, alpha);
 
