@@ -33,6 +33,19 @@ and [Semantic Versioning](https://semver.org/).
   pair fits — no pairs are silently dropped and overflow is impossible (it
   degrades to higher VRAM use, never corruption).
 
+- **Stale metis sort-cache corruption (mixed rigid-object + hybrid scenes).**
+  The metis sort/partition disk cache is keyed only on the input mesh's
+  basename-stem.  `load_mesh_from_data` names its temp mesh
+  `tmp_mesh_<load_count>.msh`, so the same finray mesh maps to different stems
+  depending on load order, and one stem can be reused across runs for meshes
+  of different vertex counts.  The cache-hit path trusted any matching-stem
+  file, so a stale permutation sized for a different mesh got applied to a
+  freshly written one — corrupting the hybrid finray FEM offsets (gap=0 stitch
+  wired to wrong vertices → large gaps + ~100× slowdown).  Surfaced by the new
+  beaker-grasp replay with the v800 LOD finrays (L=816, R=820 verts).  The
+  cache hit is now validated against the input mesh's actual vertex count (via
+  the `.idx` sidecar) and regenerated on any mismatch.
+
 ### Added
 
 - **UMI finray gripper example suite** (`examples/`):
@@ -43,6 +56,8 @@ and [Semantic Versioning](https://semver.org/).
     oriented-bounding-box collision geometry (faster broad phase).
   - `case_umi_finray_ui.py` / `case_umi_finray_ui_obb.py` — interactive
     slider control of the arm joints and grippers (detailed / OBB variants).
+  - `replay_case39_UMI_beaker.py` — beaker-grasp replay (the gripper picks up
+    a rigid 100 ml beaker) + the bundled beaker trajectory and collision mesh.
 - **Level-of-detail fin-ray FEM assets** (`Assets/sim_data/`):
   `umi_hybrid_sf_v800` (default, ~816 verts/finger), `_v1340`, `_v1690`.
 - **OBB-collision arm URDF variants** plus their `meshes/obb_umi/` boxes

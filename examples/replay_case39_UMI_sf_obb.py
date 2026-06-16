@@ -29,10 +29,13 @@ Everything else (URDF load, cloth FEM actors, joint mapping with UMI's mirrored
 prismatic limits, headless timing loop, polyscope GUI) matches
 replay_case39_UMI.py.
 
-Usage:
-    CASE39UMI_FEM_SRC=tri CASE39_HEADLESS=1 CASE39_FRAME_END=30 CASE39_PRECOND=0 \
-        STIFF_SKIP_CCD_SANITY=1 python examples/replay_case39_UMI_sf.py \
-        --replay /tmp/replay_0528/episode_00000.hdf5 --quiet
+Usage (GUI, uses the bundled fold-shirt trajectory by default):
+    CASE39_PRECOND=0 STIFF_SKIP_CCD_SANITY=1 \
+        python examples/replay_case39_UMI_sf_obb.py
+
+    # headless timing:
+    CASE39_HEADLESS=1 CASE39_FRAME_END=30 \
+        STIFF_SKIP_CCD_SANITY=1 python examples/replay_case39_UMI_sf_obb.py --quiet
 """
 import sys, os, math, time, re
 from pathlib import Path
@@ -142,7 +145,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--replay", type=str,
-                        default="/tmp/replay_0528/episode_00000.hdf5")
+                        default=_ASSETS_DIR + "trajectories/episode_fold_shirt_umi.hdf5")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -260,8 +263,11 @@ def main():
         g['rigid_rec'] = rigid_rec
 
     ################################################################
-    import trimesh
-    # load actors (cup ABD + cloth FEM) from the recorded init_info
+    # load actors (cup/beaker ABD + cloth FEM) from the recorded init_info.
+    # FEM actors (cloth/shirt) are loaded straight by the engine; only ABD
+    # actors (e.g. a rigid cup/beaker) need trimesh to read their surface mesh.
+    # The fold-shirt replay has no ABD actors, so trimesh is imported lazily
+    # below — keeping it off the required-dependency list for that example.
     abd_objs = []
     fem_objs = []
     for key, value in init_info.items():
@@ -282,6 +288,8 @@ def main():
             fem_objs.append([init_pose, collision_mesh])
 
     abd_records = []
+    if abd_objs:
+        import trimesh  # only needed when the replay has rigid (ABD) actor meshes
     for init_pose, collision_mesh in abd_objs:
         mesh = trimesh.load(collision_mesh)
         cube_v = np.asarray(mesh.vertices)
@@ -481,7 +489,14 @@ def main():
         print("[replay_case39_UMI] WARNING: no left prismatic joints matched!", flush=True)
 
     # ============ HEADLESS timing mode ============
-    import tqdm
+    # tqdm is an optional progress-bar nicety (not in the documented dep set);
+    # fall back to a plain range so headless runs work without it installed.
+    try:
+        import tqdm
+        _progress = tqdm.tqdm
+    except ImportError:
+        def _progress(it):
+            return it
     if int(os.environ.get("CASE39_HEADLESS", "0")):
         qpos_all = actions  # [L×7, gripL, R×7, gripR]
 
@@ -492,7 +507,7 @@ def main():
         _frame_start = int(os.environ.get("CASE39_FRAME_START", "0"))
         _frame_end = int(os.environ.get("CASE39_FRAME_END", str(len(qpos_all))))
         _frame_end = min(_frame_end, len(qpos_all))
-        for f in tqdm.tqdm(range(_frame_start, _frame_end)):
+        for f in _progress(range(_frame_start, _frame_end)):
             raw = qpos_all[f]
             for i, rev_idx in enumerate(left_rev_indices):
                 robot.set_revolute_position(rev_idx, float(raw[i]), degree=False)
