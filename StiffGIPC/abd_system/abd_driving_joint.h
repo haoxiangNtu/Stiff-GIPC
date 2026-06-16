@@ -64,6 +64,13 @@ struct RevoluteDrivingGPUData
     Float   stiffness;              // K = sr * ctrl_sr * (m_parent + m_child) * dt²
     Float   target_angle;           // theta_tgt in radians (relative to loaded config)
     Float   initial_angle_offset;   // offset from FK-loaded pose (absolute URDF target = relative target + offset)
+
+    // [force-control] external joint torque (N·m) about the joint axis.
+    // Adds the generalized force -tau * dtheta/dq to the gradient (no Hessian,
+    // treated as a constant force like libuipc's external torque). Independent
+    // of the PD term: stiffness>0 = position control, ext_torque!=0 = torque
+    // control; set stiffness=0 for pure torque control. Both can be 0.
+    Float   ext_torque = Float(0);
 };
 
 
@@ -185,6 +192,11 @@ MUDA_GENERIC inline void revolute_driving_gradient(
     Float K = drv.stiffness;
     grad_q1_out = K * (s * ds_dq1 - beta * c_err * dc_dq1);
     grad_q2_out = K * (s * ds_dq2 - beta * c_err * dc_dq2);
+    // NOTE: external joint torque (drv.ext_torque) is NOT applied here as a
+    // gradient term — that path needs the -tau*d2theta/dq2 Hessian for Newton
+    // to converge.  Instead it is folded into q_tilde as a constant generalized
+    // force each step (cal_q_tilde.cu, libuipc q_tilde path) so it stays
+    // constant within the solve and the kinetic Hessian M handles it.
 }
 
 
@@ -643,9 +655,20 @@ struct PrismaticDrivingGPUData
     Vector3 Cp_bar;    // joint center in parent material
     Vector3 Cq_bar;    // joint center in child material
     Vector3 tq_bar;    // axis direction in child material (unit)
+    // [force-control] axis direction in PARENT material (unit). At rest both
+    // bodies see the same world axis; libuipc's prismatic external force keeps
+    // a per-body tangent (Vector6 t_bar) so each rotates with its own body and
+    // symmetrizes. We store the parent copy here for the q_tilde wrench path.
+    Vector3 tp_bar = Vector3::Zero();
 
     Float stiffness;       // K
     Float target_distance; // d_tgt
+    // [force-control] external force (N) along the prismatic axis, fed through
+    // the q_tilde path (no Hessian; constant within the Newton solve). Mirrors
+    // libuipc AffineBodyPrismaticJointExternalForce: +f*t to child, -f*t to
+    // parent (translation DOF). Independent of the PD term: stiffness>0 =
+    // position control, ext_force!=0 = force control; set stiffness=0 for pure.
+    Float ext_force = Float(0);
 };
 
 

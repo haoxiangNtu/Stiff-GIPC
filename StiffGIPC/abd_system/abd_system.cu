@@ -157,6 +157,10 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
                        abd.body_id_to_abd_mass_inv,
                        abd.body_id_to_abd_gravity);
 
+    // [force-control] per-body external force buffer, zero by default.
+    abd.body_id_to_abd_ext_force.resize(abd_body_count, Vector12::Zero());
+    abd.body_id_to_abd_joint_wrench.resize(abd_body_count, Vector12::Zero());
+
     // Override body-level mass/volume/gravity for surface-mesh bodies
     if(!m_surface_mesh_bodies.empty())
         _apply_surface_mesh_body_overrides(data);

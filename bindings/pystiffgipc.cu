@@ -486,6 +486,26 @@ PYBIND11_MODULE(pystiffgipc, m)
              "Toggle gravity for all verts of body_id (global body id).  Use "
              "for ABD bodies anchored to Fixed parent via joint to avoid drift "
              "from joint penalty wrestling gravity.  Call AFTER finalize().")
+        .def("set_body_external_force", &SimEngine::set_body_external_force,
+             py::arg("body_id"), py::arg("fx"), py::arg("fy"), py::arg("fz"),
+             "[force-control] Set per-body external LINEAR force (N) on an ABD "
+             "body (global body id). Persistent until changed; (0,0,0) clears. "
+             "Applied as acceleration M^-1 F in q_tilde, like gravity. Call "
+             "AFTER finalize(). Mirrors libuipc AffineBodyExternalBodyForce.")
+        .def("set_body_external_wrench", [](SimEngine& self, int body_id,
+                                            py::array_t<double> w) {
+            auto a = w.unchecked<1>();
+            if(a.shape(0) != 12)
+                throw std::runtime_error("set_body_external_wrench expects a length-12 array");
+            double w12[12];
+            for(int i = 0; i < 12; ++i) w12[i] = a(i);
+            self.set_body_external_wrench(body_id, w12);
+        }, py::arg("body_id"), py::arg("wrench12"),
+           "[force-control] Set the FULL 12-DOF external generalized force on an "
+           "ABD body: wrench12[0:3]=linear force, wrench12[3:12]=affine force "
+           "(row-major vec(F_A)). An affine term with w[5]=+omega, w[9]=-omega is "
+           "a spin torque about Y. Mirrors libuipc's body-force test (orbiting "
+           "linear force + spinning affine term). Call AFTER finalize().")
 
         .def("get_urdf_link_transform", &SimEngine::get_urdf_link_transform,
              py::arg("link_name"),
@@ -545,10 +565,22 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("set_revolute_target",       &SimEngine::set_revolute_target,
              py::arg("idx"), py::arg("angle_rad"))
+        .def("set_revolute_torque",       &SimEngine::set_revolute_torque,
+             py::arg("idx"), py::arg("torque"),
+             "[force-control] External torque (N*m) on revolute driving joint "
+             "idx. Adds -tau*dtheta/dq to the gradient (no Hessian), like "
+             "libuipc external torque. For pure torque control also call "
+             "set_revolute_strength(idx, 0).")
         .def("set_revolute_initial_offset", &SimEngine::set_revolute_initial_offset,
              py::arg("idx"), py::arg("offset_rad"))
         .def("set_prismatic_target",      &SimEngine::set_prismatic_target,
              py::arg("idx"), py::arg("distance_m"))
+        .def("set_prismatic_force",       &SimEngine::set_prismatic_force,
+             py::arg("idx"), py::arg("force"),
+             "[force-control] External force (N) along prismatic driving joint "
+             "idx, applied via the q_tilde path (no Hessian), like libuipc "
+             "external prismatic force. +force pushes the child along +axis. For "
+             "pure force control also call set_prismatic_strength(idx, 0).")
 
         .def("set_fixed_joint_strength",  &SimEngine::set_fixed_joint_strength,
              py::arg("idx"), py::arg("kappa"),
@@ -570,6 +602,11 @@ PYBIND11_MODULE(pystiffgipc, m)
              "kinematic teleport of pinned FEM vertices does not outpace the "
              "elastic response of free neighbors and trigger softpad "
              "self-intersection.")
+        .def("set_max_prismatic_step_per_frame",
+             &SimEngine::set_max_prismatic_step_per_frame, py::arg("m"),
+             "Cap on per-step prismatic joint displacement change (meters). "
+             "Default 0.002 m. Raise (e.g. 0.02) for position-driving demos that "
+             "must reach a larger target within few frames.")
 
         .def("get_revolute_target",       &SimEngine::get_revolute_target,  py::arg("idx"))
         .def("get_prismatic_target",      &SimEngine::get_prismatic_target, py::arg("idx"))

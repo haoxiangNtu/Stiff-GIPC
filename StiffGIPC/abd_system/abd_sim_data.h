@@ -153,6 +153,20 @@ class ABDSimData
         // \mathbf{M}_i^{-1}\left( \sum_{j \in \mathcal{B}_i} \sum_{k \in \mathcal{T}_j} \mathbf{J}_k^T m_k g_k\right)
         //$$
         DeviceBuffer<Vector12> body_id_to_abd_gravity;
+
+        // [force-control] user-set per-body external generalized force (wrench),
+        // 12-DOF in the same layout as q = [p(3); vec(A) row-major(9)].
+        // force[0:3] = linear force; force[3:12] = affine-DOF force (use 0 for a
+        // pure linear force).  Enters q_tilde as an acceleration M^{-1}*F (see
+        // cal_q_tilde.cu), exactly like gravity — no extra energy/Hessian term.
+        // Mirrors libuipc AffineBodyExternalBodyForce.
+        DeviceBuffer<Vector12> body_id_to_abd_ext_force;
+
+        // [force-control] per-body generalized force from revolute joint torques,
+        // recomputed each step in cal_q_tilde (libuipc q_tilde path): each torque
+        // joint contributes F=[0; vec(+/-tau/2 [e]_x A^-T)] to its two bodies.
+        // Cleared + re-accumulated every step (depends on current A).
+        DeviceBuffer<Vector12> body_id_to_abd_joint_wrench;
     } device;
 
     muda::CBufferView<double3>          unique_point_id_to_position() const;

@@ -42,6 +42,12 @@ struct JointAngleControlInfo
     /// Actual K = parms.revolute_driving_strength_ratio * strength_ratio * (m_i+m_j) * dt².
     double strength_ratio = 1.0;
 
+    /// [force-control] External joint torque (N*m) about the joint axis.
+    /// Adds -tau*dtheta/dq to the driving gradient (no Hessian, constant force,
+    /// like libuipc external torque). Independent of strength_ratio: set
+    /// strength_ratio=0 for pure torque control. Default 0 = position control.
+    double ext_torque = 0.0;
+
     /// Joint limits from URDF (in radians).
     /// Kept away from ±180° to avoid unstable branch switching near wrap boundaries.
     static constexpr double kSafeAngleLimit = 3.12413936106985;  // 179 deg
@@ -71,6 +77,7 @@ struct PrismaticDrivingControlInfo
 
     double target_distance = 0.0;         ///< desired displacement along axis (meters)
     double strength_ratio  = 1.0;         ///< per-joint stiffness multiplier
+    double ext_force       = 0.0;         ///< [force-control] external force (N) along axis
 
     double lower_limit = 0.0;             ///< min displacement (from URDF)
     double upper_limit = 0.04;            ///< max displacement (from URDF)

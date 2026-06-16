@@ -363,6 +363,13 @@ class SimEngine
     /// finalize() (writes to GPU buffer directly).
     void set_body_apply_gravity(int body_id, bool enabled);
 
+    /// [force-control] Set a per-body external LINEAR force (N) on an ABD body
+    /// (global body id). Persistent until changed; (0,0,0) clears. Applied as an
+    /// acceleration M^{-1}F in the q_tilde prediction, like gravity. Call AFTER
+    /// finalize(). Mirrors libuipc AffineBodyExternalBodyForce (linear subset).
+    void set_body_external_force(int body_id, double fx, double fy, double fz);
+    void set_body_external_wrench(int body_id, const double* w12);  // full 12-DOF (linear+affine)
+
     /// Returns the 4×4 world transform of a URDF link, computed by the
     /// importer's forward kinematics from the link tree + joint angles.
     /// Available immediately after load_urdf() (no need to finalize).
@@ -400,8 +407,14 @@ class SimEngine
     JointInfo get_prismatic_joint_info(int idx) const;
 
     void set_revolute_target(int idx, double angle_rad);
+
+    /// [force-control] Set external torque (N*m) on revolute driving joint idx.
+    /// Adds -tau*dtheta/dq to the driving gradient (no Hessian), independent of
+    /// the PD term. For pure torque control also set_revolute_strength(idx, 0).
+    void set_revolute_torque(int idx, double torque);
     void set_revolute_initial_offset(int idx, double offset_rad);
     void set_prismatic_target(int idx, double distance_m);
+    void set_prismatic_force(int idx, double force);  // [force-control] external prismatic force (N)
 
     /// Override per-fixed-joint stiffness (kappa).  By default kappa is set
     /// at finalize as `joint_strength_ratio * (m_parent + m_child)` for ALL
@@ -431,6 +444,7 @@ class SimEngine
     /// response of free neighbors).  Lower values (e.g. 0.01 rad ≈ 0.6°)
     /// keep softpad self-collision tame.  Applied starting next step().
     void set_max_revolute_step_per_frame(double rad);
+    void set_max_prismatic_step_per_frame(double m);
 
     double get_revolute_target(int idx) const;
     double get_prismatic_target(int idx) const;

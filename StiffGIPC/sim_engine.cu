@@ -1949,6 +1949,16 @@ void SimEngine::set_revolute_target(int idx, double angle_rad)
     m_impl->tetMesh.joint_angle_controls.at(idx).target_angle = angle_rad;
 }
 
+void SimEngine::set_revolute_torque(int idx, double torque)
+{
+    // [force-control] Torque control on a revolute driving joint. Adds the
+    // generalized force -tau*dtheta/dq to the driving gradient (no Hessian),
+    // independent of the PD term. For PURE torque control, also call
+    // set_revolute_strength(idx, 0). Synced to GPU each step via
+    // update_revolute_driving_targets. Mirrors libuipc external joint torque.
+    m_impl->tetMesh.joint_angle_controls.at(idx).ext_torque = torque;
+}
+
 void SimEngine::set_revolute_initial_offset(int idx, double offset_rad)
 {
     m_impl->tetMesh.joint_angle_controls.at(idx).initial_angle_offset = offset_rad;
@@ -1957,6 +1967,16 @@ void SimEngine::set_revolute_initial_offset(int idx, double offset_rad)
 void SimEngine::set_prismatic_target(int idx, double distance_m)
 {
     m_impl->tetMesh.prismatic_drive_controls.at(idx).target_distance = distance_m;
+}
+
+void SimEngine::set_prismatic_force(int idx, double force)
+{
+    // [force-control] External force (N) along a prismatic driving joint's axis.
+    // Pushes child along +axis (parent gets the reaction) via the q_tilde path
+    // (no Hessian), independent of the PD term. For PURE force control, also
+    // call set_prismatic_strength(idx, 0). Synced to GPU each step via
+    // update_prismatic_driving_targets. Mirrors libuipc external prismatic force.
+    m_impl->tetMesh.prismatic_drive_controls.at(idx).ext_force = force;
 }
 
 void SimEngine::set_revolute_strength(int idx, double strength)
@@ -2040,6 +2060,72 @@ Eigen::Matrix4d SimEngine::get_urdf_link_transform(const std::string& link_name)
         return Eigen::Matrix4d::Identity();
     }
     return it->second;
+}
+
+void SimEngine::set_body_external_force(int body_id,
+                                       double fx, double fy, double fz)
+{
+    // [force-control] Set the per-body external LINEAR force (N) on an ABD body.
+    // Persistent until changed; pass (0,0,0) to clear. Enters the sim as an
+    // acceleration M^{-1}F in q_tilde (cal_q_tilde.cu) — same path as gravity,
+    // mirroring libuipc AffineBodyExternalBodyForce. (Prototype: linear only;
+    // the buffer is a full 12-DOF wrench, so an affine/torque term can be added
+    // by writing components [3:12].)
+    auto& impl  = *m_impl;
+    int   n_abd = static_cast<int>(impl.tetMesh.abd_fem_count_info.abd_body_num);
+    if(body_id < 0 || body_id >= n_abd)
+    {
+        std::cerr << "[set_body_external_force] body_id " << body_id
+                  << " is not an ABD body (n_abd=" << n_abd << ")" << std::endl;
+        return;
+    }
+    if(!impl.ipc.m_abd_sim_data)
+    {
+        std::cerr << "[set_body_external_force] sim not finalized" << std::endl;
+        return;
+    }
+    auto& f_buf = impl.ipc.m_abd_sim_data->device.body_id_to_abd_ext_force;
+    if(static_cast<int>(f_buf.size()) <= body_id)
+    {
+        std::cerr << "[set_body_external_force] body_id " << body_id
+                  << " out of range (size=" << f_buf.size() << ")" << std::endl;
+        return;
+    }
+    Eigen::Matrix<double, 12, 1> F = Eigen::Matrix<double, 12, 1>::Zero();
+    F[0] = fx; F[1] = fy; F[2] = fz;
+    CUDA_SAFE_CALL(cudaMemcpy(f_buf.data() + body_id, F.data(),
+                              sizeof(double) * 12, cudaMemcpyHostToDevice));
+}
+
+void SimEngine::set_body_external_wrench(int body_id, const double* w12)
+{
+    // [force-control] Set the FULL 12-DOF external generalized force on an ABD
+    // body: w[0:3] = linear force, w[3:12] = affine force (row-major vec(F_A)).
+    // An affine wrench with w[5]=+omega, w[9]=-omega is a torque about Y (the
+    // skew-symmetric part spins the body), mirroring libuipc's body-force test
+    // which combines an orbiting linear force with a spinning affine term.
+    auto& impl  = *m_impl;
+    int   n_abd = static_cast<int>(impl.tetMesh.abd_fem_count_info.abd_body_num);
+    if(body_id < 0 || body_id >= n_abd)
+    {
+        std::cerr << "[set_body_external_wrench] body_id " << body_id
+                  << " is not an ABD body (n_abd=" << n_abd << ")" << std::endl;
+        return;
+    }
+    if(!impl.ipc.m_abd_sim_data)
+    {
+        std::cerr << "[set_body_external_wrench] sim not finalized" << std::endl;
+        return;
+    }
+    auto& f_buf = impl.ipc.m_abd_sim_data->device.body_id_to_abd_ext_force;
+    if(static_cast<int>(f_buf.size()) <= body_id)
+    {
+        std::cerr << "[set_body_external_wrench] body_id " << body_id
+                  << " out of range (size=" << f_buf.size() << ")" << std::endl;
+        return;
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(f_buf.data() + body_id, w12,
+                              sizeof(double) * 12, cudaMemcpyHostToDevice));
 }
 
 void SimEngine::set_body_apply_gravity(int body_id, bool enabled)
@@ -2126,6 +2212,15 @@ void SimEngine::set_max_revolute_step_per_frame(double rad)
     if(impl.ipc.m_abd_system)
     {
         impl.ipc.m_abd_system->parms.max_revolute_step_per_frame = rad;
+    }
+}
+
+void SimEngine::set_max_prismatic_step_per_frame(double m)
+{
+    auto& impl = *m_impl;
+    if(impl.ipc.m_abd_system)
+    {
+        impl.ipc.m_abd_system->parms.max_prismatic_step_per_frame = m;
     }
 }
 

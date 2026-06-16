@@ -15,8 +15,8 @@
 namespace gipc
 {
 
-struct DrivingCtrlPacked  { Float target_angle;    Float strength_ratio; };
-struct PrisCtrlPacked     { Float target_distance; Float strength_ratio; };
+struct DrivingCtrlPacked  { Float target_angle;    Float strength_ratio; Float ext_torque; };
+struct PrisCtrlPacked     { Float target_distance; Float strength_ratio; Float ext_force; };
 
 //template <int ROWS, int COLS>
 __device__ inline void write_triplet_cv(Eigen::Matrix3d* triplet_value,
@@ -1190,6 +1190,7 @@ void ABDSystem::init_revolute_driving(
         drv.stiffness              = 0.0;  // computed on GPU using body masses
         drv.initial_angle_offset   = static_cast<Float>(ctrl.initial_angle_offset);
         drv.target_angle           = static_cast<Float>(ctrl.target_angle - ctrl.initial_angle_offset);
+        drv.ext_torque             = static_cast<Float>(ctrl.ext_torque);  // [force-control]
     }
 
     m_revolute_driving_data.resize(m_num_revolute_driving);
@@ -1282,6 +1283,7 @@ void ABDSystem::update_revolute_driving_targets(
     {
         host_ctrl[i].target_angle   = static_cast<Float>(controls[i].target_angle);
         host_ctrl[i].strength_ratio = static_cast<Float>(controls[i].strength_ratio);
+        host_ctrl[i].ext_torque     = static_cast<Float>(controls[i].ext_torque);  // [force-control]
     }
 
     muda::DeviceBuffer<DrivingCtrlPacked> d_ctrl(n);
@@ -1334,6 +1336,7 @@ void ABDSystem::update_revolute_driving_targets(
 
                    Float mass_sum = masses(pid) + masses(cid);
                    drv.stiffness = sr * ctrls(i).strength_ratio * mass_sum;
+                   drv.ext_torque = ctrls(i).ext_torque;  // [force-control] live sync
                });
 }
 
@@ -1664,9 +1667,13 @@ void ABDSystem::init_prismatic_driving(
         drv.Cp_bar = Vector3(c.x(), c.y(), c.z());
         drv.Cq_bar = drv.Cp_bar;
         drv.tq_bar = Vector3(t.x(), t.y(), t.z());
+        // [force-control] parent material axis starts as the same world axis;
+        // the kernel below maps it into parent material frame.
+        drv.tp_bar = Vector3(t.x(), t.y(), t.z());
 
         drv.stiffness       = 0.0;
         drv.target_distance = static_cast<Float>(ctrl.target_distance);
+        drv.ext_force       = static_cast<Float>(ctrl.ext_force);
     }
 
     m_prismatic_driving_data.resize(m_num_prismatic_driving);
@@ -1717,6 +1724,8 @@ void ABDSystem::init_prismatic_driving(
                    drv.Cp_bar = Ap_inv * (drv.Cp_bar - pp);
                    drv.Cq_bar = Ac_inv * (drv.Cq_bar - pc);
                    drv.tq_bar = (Ac_inv * drv.tq_bar).normalized();
+                   // [force-control] parent material axis (per-body tangent)
+                   drv.tp_bar = (Ap_inv * drv.tp_bar).normalized();
                });
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -1745,6 +1754,7 @@ void ABDSystem::update_prismatic_driving_targets(
     {
         host_ctrl[i].target_distance = static_cast<Float>(controls[i].target_distance);
         host_ctrl[i].strength_ratio  = static_cast<Float>(controls[i].strength_ratio);
+        host_ctrl[i].ext_force       = static_cast<Float>(controls[i].ext_force);
     }
 
     muda::DeviceBuffer<PrisCtrlPacked> d_ctrl(n);
@@ -1788,6 +1798,8 @@ void ABDSystem::update_prismatic_driving_targets(
 
                    Float mass_sum = masses(pid) + masses(cid);
                    drv.stiffness = sr * ctrls(i).strength_ratio * mass_sum;
+                   // [force-control] sync external prismatic force each step
+                   drv.ext_force = ctrls(i).ext_force;
                });
 }
 
