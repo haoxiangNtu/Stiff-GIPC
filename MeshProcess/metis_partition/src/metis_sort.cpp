@@ -44,6 +44,25 @@ static std::vector<int> read_sort_index_file(const std::string& path)
     return out;
 }
 
+// Helper: read just the vertex count of an input mesh, without partitioning.
+// Used to validate a disk cache hit against the actual mesh being loaded.
+// The metis cache is keyed only on the file basename-stem, so two different
+// meshes sharing a stem — or the same filename regenerated with a different
+// vertex count — would otherwise silently reuse a stale sort permutation
+// (sized for the OLD mesh), producing an out-of-bounds remap downstream.
+static size_t count_input_vertices(const std::string& obj_path, bool isTriangle)
+{
+    if(isTriangle)
+    {
+        gipc::TriMesh mesh;
+        mesh.load(obj_path);
+        return mesh.vertices().size();
+    }
+    gipc::TetMesh mesh;
+    mesh.load(obj_path);
+    return mesh.vertices().size();
+}
+
 std::vector<std::string> metis_sort(std::string obj_path,
                                     int         dimension,
                                     std::string output_folder,
@@ -80,28 +99,38 @@ std::vector<std::string> metis_sort(std::string obj_path,
     std::ifstream ifs(out_file_path);
     if(ifs)
     {
-        printf("metis files exist\n");
         ifs.close();
-        std::vector<std::string> out_paths;
-        std::string sort_part_path = output_folder + mesh_name + "_sorted."
-                                     + std::to_string(block_size) + ".part";
 
-        std::string sort_obj_path = output_folder + mesh_name + "_sorted."
-                                    + std::to_string(block_size) + extension;
+        // VALIDATE the cache before trusting it. The cache filename is keyed
+        // only on the basename-stem (no path, no content hash), so a stale
+        // entry from a same-stemmed-but-different mesh — or from an earlier
+        // version of THIS file with a different vertex count — must be
+        // detected and regenerated. The .idx sidecar's length is exactly the
+        // sorted vertex count; compare it to the actual input mesh.
+        bool   isTri        = (dimension != 3);
+        size_t n_input       = count_input_vertices(obj_path, isTri);
+        std::vector<int> cached_idx = read_sort_index_file(sort_idx_path);
+        bool   cache_valid  = (!cached_idx.empty()
+                               && cached_idx.size() == n_input);
 
-        out_paths.push_back(out_file_path);
-        out_paths.push_back(sort_part_path);
-        // Restore sort_index from sidecar .idx file if caller requested it
-        // and the sidecar is available.
-        if(out_sort_index)
+        if(cache_valid)
         {
-            *out_sort_index = read_sort_index_file(sort_idx_path);
-            if(out_sort_index->empty())
-                std::cerr << "[metis_sort] WARNING: cached sorted mesh exists but "
-                             ".idx sidecar missing; perm unavailable for "
-                          << mesh_name << ". Delete cache to regenerate.\n";
+            printf("metis files exist (validated: %zu verts)\n", n_input);
+            std::vector<std::string> out_paths;
+            std::string sort_part_path = output_folder + mesh_name + "_sorted."
+                                         + std::to_string(block_size) + ".part";
+            out_paths.push_back(out_file_path);
+            out_paths.push_back(sort_part_path);
+            if(out_sort_index)
+                *out_sort_index = cached_idx;
+            return out_paths;
         }
-        return out_paths;
+
+        // Stale or unverifiable cache -> fall through and regenerate.
+        std::cerr << "[metis_sort] STALE CACHE for '" << mesh_name
+                  << "': cached perm has " << cached_idx.size()
+                  << " entries but input mesh has " << n_input
+                  << " verts (or .idx missing). Regenerating sort.\n";
     }
     ifs.close();
 
