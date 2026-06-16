@@ -4,6 +4,52 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.6.3] — 2026-06-16
+
+> v0.6.3 = v0.6.2 + two GPU collision-buffer overflow fixes + a new UMI
+> finray gripper example suite (replay + interactive UI, detailed and
+> OBB-collision arm variants).  Stays on the conservative v0.6.x line — it
+> does **not** pull in the v0.7.x perf rewrite (CUDA-Graph PCG,
+> sparsity-cache, pair-type sort).  Recommended build for RL data collection.
+
+### Fixed
+
+- **CCD reduction-scratch overflow (the OBB-arm + soft-gripper blow-up).**
+  `pcg_data.squeue` was sized for `max(vertexNum, tetrahedraNum)` doubles but
+  reused as the scratch buffer for collision-pair-count reductions.  When the
+  number of CCD pairs exceeded that capacity (e.g. a fin-ray soft gripper
+  reaching deep into cloth behind an OBB-collision arm), the reduction wrote
+  out of bounds and corrupted adjacent GPU memory — `_moveDir` blew up to
+  ~1e29 and the sim exploded.  A dedicated, dynamically-grown reduction
+  scratch buffer (`ensure_reduce_scratch`) now sizes to the actual pair count
+  every frame.  A detailed-collision arm masked the bug only because it
+  produced fewer CCD pairs; it was never arm-specific.
+
+- **Collision pair-emission buffer overflow.**  The narrow-phase /
+  swept-CCD kernels `atomicAdd`-emit pairs into fixed-capacity buffers
+  (`_collisonPairs`, `_ccd_collisonPairs`, `_MatIndex`).  Emits past the cap
+  are now redirected to a guard ("trash") slot so they can never write out of
+  bounds, and the host grows the buffers and re-runs detection until every
+  pair fits — no pairs are silently dropped and overflow is impossible (it
+  degrades to higher VRAM use, never corruption).
+
+### Added
+
+- **UMI finray gripper example suite** (`examples/`):
+  - `replay_case39_UMI_sf.py` — replay a recorded trajectory on the
+    fold-shirt scene with a STRATEGY_F hybrid fin-ray gripper (rigid ABD
+    mounting root + FEM truss, zero-gap stitch).
+  - `replay_case39_UMI_sf_obb.py` — same, with the arm links replaced by
+    oriented-bounding-box collision geometry (faster broad phase).
+  - `case_umi_finray_ui.py` / `case_umi_finray_ui_obb.py` — interactive
+    slider control of the arm joints and grippers (detailed / OBB variants).
+- **Level-of-detail fin-ray FEM assets** (`Assets/sim_data/`):
+  `umi_hybrid_sf_v800` (default, ~816 verts/finger), `_v1340`, `_v1690`.
+- **OBB-collision arm URDF variants** plus their `meshes/obb_umi/` boxes
+  under `Assets/sim_data/urdf/ridgeback_dual_panda_UMI/`.
+- **Mesh-prep tools** (`examples/build_umi_obb_urdf.py`,
+  `examples/build_umi_finray_strategyF.py`).
+
 ## [0.6.2] — 2026-06-05
 
 > **For RL data collection / long replays, this is the recommended build.**
