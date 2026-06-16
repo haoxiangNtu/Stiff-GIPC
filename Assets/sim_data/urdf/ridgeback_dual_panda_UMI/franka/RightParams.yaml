@@ -1,0 +1,25 @@
+# The IP address of the robot
+Robot:
+  IP: 172.16.0.3
+  ResetPosition:
+  - 1.20867161
+  - 1.1605661
+  - -0.89537794
+  - -1.08406247
+  - 0.12111715
+  - 1.54733143
+  - 1.42966363
+
+# The IP address of the gripper
+Gripper:
+  IP: 172.16.0.3
+
+# The parameters for the servo controller
+# The parameters are used by the uttg interpolation algorithm
+UTTG:
+  servo_rate: 10.
+  desired_rate: 1000.
+  maxVelFactor: 0.8
+  maxAccFactor: 0.5
+  maxJerkFactor: 0.5
+  considerLimits: true

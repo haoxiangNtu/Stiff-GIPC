@@ -1,0 +1,55 @@
+{
+  "active_joints": [
+    "left_arm_joint1",
+    "left_arm_joint2",
+    "left_arm_joint3",
+    "left_arm_joint4",
+    "left_arm_joint5",
+    "left_arm_joint6",
+    "left_arm_joint7"
+  ],
+  "mimic_joints": {
+    "1": [
+      "left_arm_finger_joint1",
+      "left_arm_finger_joint2"
+    ],
+    "2": [
+      "right_arm_finger_joint1",
+      "right_arm_finger_joint2"
+    ]
+  },
+  "reference_joints": {
+    "joints": [
+      0,
+      0,
+      0,
+      -1.59695,
+      0,
+      2.5307,
+      0,
+      0,
+      0,
+      0,
+      -1.59695,
+      0,
+      2.5307,
+      0
+    ],
+    "names": [
+      "left_arm_joint1",
+      "left_arm_joint2",
+      "left_arm_joint3",
+      "left_arm_joint4",
+      "left_arm_joint5",
+      "left_arm_joint6",
+      "left_arm_joint7",
+      "right_arm_joint1",
+      "right_arm_joint2",
+      "right_arm_joint3",
+      "right_arm_joint4",
+      "right_arm_joint5",
+      "right_arm_joint6",
+      "right_arm_joint7"
+    ]
+  }
+}

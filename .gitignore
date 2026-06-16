@@ -1,5 +1,9 @@
 .vs*
 build*
+# Mesh-prep helper scripts shipped with the UMI finray examples are tracked
+# despite the build* rule above (which targets build/ output dirs).
+!examples/build_umi_obb_urdf.py
+!examples/build_umi_finray_strategyF.py
 Output/*
 
 # Internal-only handover and planning docs — never push to remote.
