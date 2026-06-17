@@ -18,7 +18,7 @@ from stiff_physics import Engine, Config
 import polyscope as ps, polyscope.imgui as psim
 
 CUBE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "Assets/sim_data/tetmesh/cube.msh")
+                    ("assets" if os.path.isdir(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")) else "Assets") + "/sim_data/tetmesh/cube.msh")
 def Tz(z):                                 # scale 0.4 + translate along Z (like uipc test 47)
     m = np.eye(4); m[0, 0] = m[1, 1] = m[2, 2] = 0.4; m[2, 3] = z; return m
 

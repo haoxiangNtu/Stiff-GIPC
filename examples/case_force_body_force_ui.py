@@ -20,7 +20,7 @@ from stiff_physics import Engine, Config
 import polyscope as ps, polyscope.imgui as psim
 
 CUBE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "Assets/sim_data/tetmesh/cube.msh")
+                    ("assets" if os.path.isdir(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")) else "Assets") + "/sim_data/tetmesh/cube.msh")
 T = np.eye(4); T[0, 0] = T[1, 1] = T[2, 2] = 0.4   # scale 0.4 (like uipc pre_transform)
 
 eng = Engine(Config(gravity=(0.0, 0.0, 0.0), dt=0.01, ground_offset=-100.0))

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stiff_physics import Engine, Config
 
 CUBE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "Assets/sim_data/tetmesh/cube.msh")
+                    ("assets" if os.path.isdir(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")) else "Assets") + "/sim_data/tetmesh/cube.msh")
 DT = 0.01
 N  = 40
 

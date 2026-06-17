@@ -15,7 +15,7 @@ import polyscope as ps
 import polyscope.imgui as psim
 
 CUBE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "Assets/sim_data/tetmesh/cube.msh")
+                    ("assets" if os.path.isdir(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")) else "Assets") + "/sim_data/tetmesh/cube.msh")
 
 eng = Engine(Config(gravity=(0.0, 0.0, 0.0), dt=0.01))
 eng.load_mesh(CUBE, dimensions=3, body_type="ABD", young_modulus=1e8, boundary_type="Free")

@@ -87,7 +87,8 @@ Usage (GUI, uses the bundled fold-shirt trajectory by default):
 import sys, os, math, time, re
 from pathlib import Path
 
-_ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+_ASSETS_ROOT = Path(__file__).resolve().parent.parent
+_ASSETS_DIR = str(_ASSETS_ROOT / ("assets" if (_ASSETS_ROOT / "assets").is_dir() else "Assets")) + "/"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
