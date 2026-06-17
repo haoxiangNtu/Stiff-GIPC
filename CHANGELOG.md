@@ -4,6 +4,31 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.6.4] — 2026-06-18
+
+> v0.6.4 = v0.6.3 + an **ABD joint force-control** layer (all new APIs are
+> default-OFF, so existing scenes are byte-identical). Stays on the conservative
+> v0.6.x line (no v0.7.x perf rewrite).
+
+### Added
+- **External force / torque / velocity on ABD joints** (libuipc-aligned, via the
+  `q_tilde` path — no Newton Hessian term): `set_revolute_torque`,
+  `set_prismatic_force`, `set_body_external_wrench`, articulation velocity control,
+  plus `get_prismatic_drive_force` / `get_prismatic_current_distance` readouts.
+- **`set_prismatic_limit_barrier(idx, cl, dir, dhat, kappa)`** — a one-sided IPC
+  log-barrier on a prismatic joint's closed limit, so the solver guarantees the
+  opening never crosses the limit under pure-force control (no overshoot). Off by
+  default (`kappa=0`).
+- **On-GPU stitch-stretch reduction** — `get_stitch_max_stretch` and
+  `get_stitch_max_stretch_batched` (one CUDA block per finger/env; scalar result,
+  no full-vertex device→host copy) for cheap soft-gripper grip sensing.
+- **Examples**: force/torque/velocity demos (`examples/case_force_*.py`,
+  `test_force_*.py`) and finray soft-gripper grip-control demos
+  (`replay_case39_UMI_obb_cup_shirt_forcegrip.py`, `case_umi_finray_force_ui.py`)
+  showing feedback-driven position vs pure-force + barrier control.
+- **Docs**: `docs/FORCE_CONTROL_DESIGN.md` (force-path design + soft-gripper
+  grip-control study).
+
 ## [0.6.3] — 2026-06-16
 
 > v0.6.3 = v0.6.2 + two GPU collision-buffer overflow fixes + a new UMI
