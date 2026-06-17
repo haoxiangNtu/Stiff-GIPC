@@ -2234,6 +2234,299 @@ double SimEngine::get_prismatic_target(int idx) const
     return m_impl->tetMesh.prismatic_drive_controls.at(idx).target_distance;
 }
 
+double SimEngine::get_prismatic_drive_force(int idx) const
+{
+    // [force-control] Current prismatic DRIVING force = K*(target - d), where
+    // d = (Cq - Cp).dot(t) is the current opening along the joint axis. Used by
+    // force-limited position control: advance the target toward closed until
+    // this force reaches the desired F_max, then hold (real-gripper behavior).
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_system || !impl.ipc.m_abd_sim_data)
+        return 0.0;
+    auto& sys = *impl.ipc.m_abd_system;
+    if(idx < 0 || idx >= sys.m_num_prismatic_driving)
+        return 0.0;
+
+    PrismaticDrivingGPUData drv;
+    CUDA_SAFE_CALL(cudaMemcpy(&drv, sys.m_prismatic_driving_data.data() + idx,
+                              sizeof(PrismaticDrivingGPUData), cudaMemcpyDeviceToHost));
+
+    using Vec12 = Eigen::Matrix<double, 12, 1>;
+    auto& q_buf = impl.ipc.m_abd_sim_data->device.body_id_to_q;
+    Vec12 qp, qc;
+    CUDA_SAFE_CALL(cudaMemcpy(&qp, q_buf.data() + drv.parent_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(&qc, q_buf.data() + drv.child_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+
+    auto worldpt = [](const Vec12& q, const Vector3& xb) -> Vector3 {
+        Matrix3x3 A;
+        A.row(0) = q.segment<3>(3).transpose();
+        A.row(1) = q.segment<3>(6).transpose();
+        A.row(2) = q.segment<3>(9).transpose();
+        return Vector3(q.segment<3>(0) + A * xb);
+    };
+    Matrix3x3 Ac;
+    Ac.row(0) = qc.segment<3>(3).transpose();
+    Ac.row(1) = qc.segment<3>(6).transpose();
+    Ac.row(2) = qc.segment<3>(9).transpose();
+
+    Vector3 Cp = worldpt(qp, drv.Cp_bar);
+    Vector3 Cq = worldpt(qc, drv.Cq_bar);
+    Vector3 t  = Ac * drv.tq_bar;
+    double  d  = (Cq - Cp).dot(t);
+    return static_cast<double>(drv.stiffness) * (static_cast<double>(drv.target_distance) - d);
+}
+
+void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,
+                                             double* out3) const
+{
+    // [force-control] Net IPC contact (barrier) force on a body, = sum over the
+    // body's vertices of the per-vertex barrier gradient (the repulsion the body
+    // feels from everything it touches). For a gripper finger this is the REAL
+    // grip force (cup reaction), regardless of finray compliance / motion — the
+    // correct signal for true force control. Uses the collision pairs from the
+    // last step(); call AFTER eng.step().
+    out3[0] = out3[1] = out3[2] = 0.0;
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    int   nv   = static_cast<int>(g.vertexNum);
+    if(nv <= 0 || vert_offset < 0 || vert_count <= 0 || vert_offset + vert_count > nv)
+        return;
+    if(g.m_skip_all_collision)
+        return;
+
+    // Re-detect contacts at the CURRENT (post-step) state: the solver clears the
+    // DCD pair count after a step, so we rebuild the BVH + collision pairs here
+    // before evaluating the barrier (contact) gradient.
+    g.buildBVH();
+    g.buildCP();
+    if(getenv("STIFF_CONTACT_DBG"))
+        fprintf(stderr, "[contact_dbg] h_cpNum0=%u h_gpNum=%u Kappa=%g dHat=%g nv=%d\n",
+                g.h_cpNum[0], g.h_gpNum, g.Kappa, g.dHat, nv);
+    if(g.h_cpNum[0] < 1)
+        return;  // nothing in contact
+
+    double3* d_grad = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc(&d_grad, nv * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemset(d_grad, 0, nv * sizeof(double3)));
+    g.calBarrierGradient(d_grad, g.Kappa);   // atomic-adds contact force per vertex
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    std::vector<double3> h(vert_count);
+    CUDA_SAFE_CALL(cudaMemcpy(h.data(), d_grad + vert_offset,
+                              vert_count * sizeof(double3), cudaMemcpyDeviceToHost));
+    double sx = 0, sy = 0, sz = 0;
+    for(int i = 0; i < vert_count; i++) { sx += h[i].x; sy += h[i].y; sz += h[i].z; }
+    out3[0] = sx; out3[1] = sy; out3[2] = sz;
+    CUDA_SAFE_CALL(cudaFree(d_grad));
+}
+
+// [force-control / GPU gate] On-device MAX stitch-spring stretch over a range of
+// stitch springs [start, start+count). stretch_j = |vert[targetInd[j]] -
+// vert[paired[j]]|. Single-block shared-memory max reduction; returns one scalar
+// — so a force-gated gripper controller can read the grip signal WITHOUT a full
+// vertex-array D2H (only 8 bytes come back). All work stays on the GPU.
+__global__ static void _stitch_max_stretch_kernel(const double3* verts,
+                                                  const uint32_t* targetInd,
+                                                  const int* paired,
+                                                  int start, int count,
+                                                  double* out)
+{
+    __shared__ double sdata[256];
+    int tid = threadIdx.x;
+    double local = 0.0;
+    for(int j = tid; j < count; j += blockDim.x)
+    {
+        int idx = start + j;
+        int ai  = paired[idx];
+        if(ai < 0) continue;                 // -1 = functor target, not a stitch pair
+        uint32_t fi = targetInd[idx];
+        double3 a = verts[fi];
+        double3 b = verts[ai];
+        double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+        double d  = sqrt(dx * dx + dy * dy + dz * dz);
+        local = fmax(local, d);
+    }
+    sdata[tid] = local;
+    __syncthreads();
+    for(int s = blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if(tid < s) sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    if(tid == 0) out[0] = sdata[0];
+}
+
+double SimEngine::get_stitch_max_stretch(int pair_start, int pair_count) const
+{
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    int   sn   = static_cast<int>(g.softNum);
+    if(pair_count <= 0 || pair_start < 0 || pair_start + pair_count > sn)
+        return 0.0;
+    if(g._vertexes == nullptr || g.targetInd == nullptr
+       || g.m_d_stitch_paired_vertex == nullptr)
+        return 0.0;
+    // tiny persistent device scalar (8 bytes); allocated once, never freed
+    static double* s_d_out = nullptr;
+    if(s_d_out == nullptr)
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_out, sizeof(double)));
+    _stitch_max_stretch_kernel<<<1, 256>>>(g._vertexes, g.targetInd,
+                                           g.m_d_stitch_paired_vertex,
+                                           pair_start, pair_count, s_d_out);
+    double h = 0.0;
+    CUDA_SAFE_CALL(cudaMemcpy(&h, s_d_out, sizeof(double), cudaMemcpyDeviceToHost));
+    return h;
+}
+
+// [force-control / GPU gate — BATCHED] One block PER segment: block s reduces the
+// stitch springs [starts[s], starts[s]+counts[s]) to one max stretch -> out[s].
+// A "segment" is one finger (and, for multi-env, one finger of one env). Blocks
+// are independent — each writes only its own out[s], with NO cross-segment shared
+// state or atomics — so different fingers/ENVS cannot interfere with each other,
+// and the whole batch is ONE kernel launch (no per-finger launch latency).
+__global__ static void _stitch_max_stretch_batched_kernel(const double3* verts,
+                                                          const uint32_t* targetInd,
+                                                          const int* paired,
+                                                          const int* starts,
+                                                          const int* counts,
+                                                          double* out)
+{
+    int seg   = blockIdx.x;
+    int start = starts[seg];
+    int count = counts[seg];
+    __shared__ double sdata[256];
+    int tid = threadIdx.x;
+    double local = 0.0;
+    for(int j = tid; j < count; j += blockDim.x)
+    {
+        int idx = start + j;
+        int ai  = paired[idx];
+        if(ai < 0) continue;
+        uint32_t fi = targetInd[idx];
+        double3 a = verts[fi];
+        double3 b = verts[ai];
+        double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+        local = fmax(local, sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    sdata[tid] = local;
+    __syncthreads();
+    for(int s = blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if(tid < s) sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    if(tid == 0) out[seg] = sdata[0];
+}
+
+void SimEngine::get_stitch_max_stretch_batched(const int* h_starts,
+                                               const int* h_counts,
+                                               int n_seg, double* h_out) const
+{
+    for(int i = 0; i < n_seg; i++) h_out[i] = 0.0;
+    if(n_seg <= 0) return;
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    if(g._vertexes == nullptr || g.targetInd == nullptr
+       || g.m_d_stitch_paired_vertex == nullptr)
+        return;
+    // persistent device buffers (grow on demand; never freed). Holding starts/
+    // counts/out for ALL segments (= all fingers of all envs).
+    static int*    s_d_starts = nullptr;
+    static int*    s_d_counts = nullptr;
+    static double* s_d_out    = nullptr;
+    static int     s_cap      = 0;
+    if(n_seg > s_cap)
+    {
+        if(s_d_starts) cudaFree(s_d_starts);
+        if(s_d_counts) cudaFree(s_d_counts);
+        if(s_d_out)    cudaFree(s_d_out);
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_starts, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_counts, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_out,    n_seg * sizeof(double)));
+        s_cap = n_seg;
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(s_d_starts, h_starts, n_seg * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(s_d_counts, h_counts, n_seg * sizeof(int), cudaMemcpyHostToDevice));
+    _stitch_max_stretch_batched_kernel<<<n_seg, 256>>>(
+        g._vertexes, g.targetInd, g.m_d_stitch_paired_vertex,
+        s_d_starts, s_d_counts, s_d_out);
+    CUDA_SAFE_CALL(cudaMemcpy(h_out, s_d_out, n_seg * sizeof(double), cudaMemcpyDeviceToHost));
+}
+
+double SimEngine::get_prismatic_current_distance(int idx) const
+{
+    // [force-control] Current opening d = (Cq - Cp).dot(t) along the joint axis.
+    // Lets a controller (or diagnostics) see the actual gripper opening — e.g.
+    // to confirm a force-limited grasp does NOT fully close (stops at the object
+    // width).
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_system || !impl.ipc.m_abd_sim_data)
+        return 0.0;
+    auto& sys = *impl.ipc.m_abd_system;
+    if(idx < 0 || idx >= sys.m_num_prismatic_driving)
+        return 0.0;
+
+    PrismaticDrivingGPUData drv;
+    CUDA_SAFE_CALL(cudaMemcpy(&drv, sys.m_prismatic_driving_data.data() + idx,
+                              sizeof(PrismaticDrivingGPUData), cudaMemcpyDeviceToHost));
+
+    using Vec12 = Eigen::Matrix<double, 12, 1>;
+    auto& q_buf = impl.ipc.m_abd_sim_data->device.body_id_to_q;
+    Vec12 qp, qc;
+    CUDA_SAFE_CALL(cudaMemcpy(&qp, q_buf.data() + drv.parent_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(&qc, q_buf.data() + drv.child_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+
+    auto worldpt = [](const Vec12& q, const Vector3& xb) -> Vector3 {
+        Matrix3x3 A;
+        A.row(0) = q.segment<3>(3).transpose();
+        A.row(1) = q.segment<3>(6).transpose();
+        A.row(2) = q.segment<3>(9).transpose();
+        return Vector3(q.segment<3>(0) + A * xb);
+    };
+    Matrix3x3 Ac;
+    Ac.row(0) = qc.segment<3>(3).transpose();
+    Ac.row(1) = qc.segment<3>(6).transpose();
+    Ac.row(2) = qc.segment<3>(9).transpose();
+    Vector3 Cp = worldpt(qp, drv.Cp_bar);
+    Vector3 Cq = worldpt(qc, drv.Cq_bar);
+    Vector3 t  = Ac * drv.tq_bar;
+    return (Cq - Cp).dot(t);
+}
+
+void SimEngine::set_prismatic_limit_barrier(int idx, double cl, double dir,
+                                            double dhat, double kappa)
+{
+    // [force-control] Arm a one-sided IPC barrier on prismatic joint idx at the
+    // CLOSED coordinate cl: the solver then NEVER lets d cross cl regardless of
+    // the (force) drive — a hard no-overshoot guarantee while staying pure-force.
+    // dir = +1 if the open end is at d>cl, else -1. kappa<=0 disarms. Written
+    // directly to the GPU struct (the per-step target sync leaves these fields).
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_system) {
+        std::cerr << "[set_prismatic_limit_barrier] sim not finalized" << std::endl;
+        return;
+    }
+    auto& sys = *impl.ipc.m_abd_system;
+    if(idx < 0 || idx >= sys.m_num_prismatic_driving) {
+        std::cerr << "[set_prismatic_limit_barrier] idx " << idx
+                  << " out of range [0," << sys.m_num_prismatic_driving << ")" << std::endl;
+        return;
+    }
+    PrismaticDrivingGPUData drv;
+    CUDA_SAFE_CALL(cudaMemcpy(&drv, sys.m_prismatic_driving_data.data() + idx,
+                              sizeof(PrismaticDrivingGPUData), cudaMemcpyDeviceToHost));
+    drv.limit_cl    = static_cast<Float>(cl);
+    drv.limit_dir   = (dir >= 0.0) ? Float(1) : Float(-1);
+    drv.limit_dhat  = static_cast<Float>(dhat);
+    drv.limit_kappa = static_cast<Float>(kappa);
+    CUDA_SAFE_CALL(cudaMemcpy(sys.m_prismatic_driving_data.data() + idx, &drv,
+                              sizeof(PrismaticDrivingGPUData), cudaMemcpyHostToDevice));
+}
+
 void SimEngine::get_revolute_current_angles(double* out, int count) const
 {
     auto& impl = *m_impl;

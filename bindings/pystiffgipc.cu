@@ -581,6 +581,14 @@ PYBIND11_MODULE(pystiffgipc, m)
              "idx, applied via the q_tilde path (no Hessian), like libuipc "
              "external prismatic force. +force pushes the child along +axis. For "
              "pure force control also call set_prismatic_strength(idx, 0).")
+        .def("set_prismatic_limit_barrier", &SimEngine::set_prismatic_limit_barrier,
+             py::arg("idx"), py::arg("cl"), py::arg("dir"), py::arg("dhat"), py::arg("kappa"),
+             "[force-control] Arm a one-sided IPC log-barrier on prismatic joint "
+             "idx at the CLOSED coordinate `cl`: the solver then never lets the "
+             "opening d cross cl no matter how large the (force) drive — a HARD "
+             "no-overshoot guarantee while the joint stays pure force-controlled. "
+             "dir=+1 if the open end is at d>cl else -1; dhat=activation band (m); "
+             "kappa=barrier stiffness (<=0 disarms). Call after finalize().")
 
         .def("set_fixed_joint_strength",  &SimEngine::set_fixed_joint_strength,
              py::arg("idx"), py::arg("kappa"),
@@ -610,6 +618,51 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("get_revolute_target",       &SimEngine::get_revolute_target,  py::arg("idx"))
         .def("get_prismatic_target",      &SimEngine::get_prismatic_target, py::arg("idx"))
+        .def("get_prismatic_drive_force", &SimEngine::get_prismatic_drive_force, py::arg("idx"),
+             "[force-control] Current prismatic driving force K*(target-d) (N). "
+             "Used by force-limited position control to cap the grip force.")
+        .def("get_prismatic_current_distance", &SimEngine::get_prismatic_current_distance,
+             py::arg("idx"),
+             "[force-control] Current prismatic opening d (m) along the joint axis. "
+             "Lets you see the actual gripper opening (e.g. confirm a force-limited "
+             "grasp does not fully close).")
+        .def("get_body_contact_force", [](const SimEngine& self, int vert_offset,
+                                          int vert_count) {
+            double f[3] = {0, 0, 0};
+            self.get_vertex_contact_force_sum(vert_offset, vert_count, f);
+            auto out = py::array_t<double>(3);
+            auto b = out.mutable_unchecked<1>();
+            b(0) = f[0]; b(1) = f[1]; b(2) = f[2];
+            return out;
+        }, py::arg("vert_offset"), py::arg("vert_count"),
+           "[force-control] Net IPC contact force (3-vector) on a body, summed over "
+           "its vertices [vert_offset, vert_offset+vert_count). For a gripper FEM "
+           "finger this is the REAL grip force (cup reaction). Call AFTER step().")
+        .def("get_stitch_max_stretch", &SimEngine::get_stitch_max_stretch,
+             py::arg("pair_start"), py::arg("pair_count"),
+             "[force-control] On-GPU MAX stitch-spring stretch (m) over springs "
+             "[pair_start, pair_start+pair_count), computed by a device reduction "
+             "that returns a single scalar — the soft-gripper grip signal WITHOUT a "
+             "full vertex-array D2H. Stitches are stored in add_stitch_spring() call "
+             "order, so each finger's pairs are a contiguous range.")
+        .def("get_stitch_max_stretch_batched",
+             [](const SimEngine& self,
+                py::array_t<int, py::array::c_style | py::array::forcecast> starts,
+                py::array_t<int, py::array::c_style | py::array::forcecast> counts) {
+                 int n = static_cast<int>(starts.size());
+                 std::vector<double> out(n > 0 ? n : 1, 0.0);
+                 self.get_stitch_max_stretch_batched(starts.data(), counts.data(), n, out.data());
+                 auto arr = py::array_t<double>(n);
+                 auto b = arr.mutable_unchecked<1>();
+                 for(int i = 0; i < n; i++) b(i) = out[i];
+                 return arr;
+             },
+             py::arg("starts"), py::arg("counts"),
+             "[force-control] BATCHED on-GPU max stitch stretch: ONE kernel launch, "
+             "one CUDA block per segment (= one finger, or one finger of one env). "
+             "Returns an array of per-segment maxes. Blocks are independent (no "
+             "cross-segment atomics) so different fingers/ENVS never interfere. "
+             "Designed for multi-env: pass every finger of every env as a segment.")
 
         .def("get_revolute_current_angles", [](const SimEngine& e) {
             int n = e.get_num_revolute_joints();

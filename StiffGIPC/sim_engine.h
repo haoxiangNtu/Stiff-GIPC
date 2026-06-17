@@ -415,6 +415,12 @@ class SimEngine
     void set_revolute_initial_offset(int idx, double offset_rad);
     void set_prismatic_target(int idx, double distance_m);
     void set_prismatic_force(int idx, double force);  // [force-control] external prismatic force (N)
+    void set_prismatic_limit_barrier(int idx, double cl, double dir, double dhat, double kappa);  // [force-control] one-sided IPC barrier at closed limit (hard no-overshoot)
+    double get_prismatic_drive_force(int idx) const;  // [force-control] current K*(target-d) drive force
+    double get_prismatic_current_distance(int idx) const;  // [force-control] current opening d along axis
+    void   get_vertex_contact_force_sum(int vert_offset, int vert_count, double* out3) const;  // [force-control] net IPC contact force on a body
+    double get_stitch_max_stretch(int pair_start, int pair_count) const;  // [force-control] on-GPU max stitch stretch over a spring range (scalar; no full-vertex D2H)
+    void   get_stitch_max_stretch_batched(const int* starts, const int* counts, int n_seg, double* out) const;  // [force-control] BATCHED: one block per segment (finger/env), one launch, per-segment maxes — multi-env isolated
 
     /// Override per-fixed-joint stiffness (kappa).  By default kappa is set
     /// at finalize as `joint_strength_ratio * (m_parent + m_child)` for ALL

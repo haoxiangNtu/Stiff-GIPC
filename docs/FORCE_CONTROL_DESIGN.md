@@ -160,3 +160,81 @@ Extra prototypes kept: `case_force_cube_ui.py`, `case_force_dualarm_ui.py`
   to before (the joint-wrench kernels early-out when `ext_torque/ext_force == 0`).
 - `set_max_prismatic_step_per_frame` only relaxes a kinematic safety clamp; leave
   it at the 0.002 default for scenes with FEM softpads pinned to ABD bodies.
+
+---
+
+## 6. Soft-gripper grip control study (finray STRATEGY_F)
+
+Built on the §1–5 force path, this section adds the engine pieces + examples for
+controlling a *compliant* finray gripper (rigid mount seat → fixed-joint → rigid
+finray root → gap-0 stitch → soft FEM truss → object).
+
+### 6.1 New engine APIs (this work)
+- `set_prismatic_limit_barrier(idx, cl, dir, dhat, kappa)` — a one-sided IPC
+  log-barrier on the prismatic coordinate `d` at the closed end `cl`. The solver
+  then **guarantees `d` never crosses `cl`** regardless of the (force) drive — a
+  hard no-overshoot guarantee while the joint stays pure force-controlled. Added
+  to `prismatic_driving_{energy,gradient_hessian}` (reuses the existing `dd/dq`
+  chain; Gauss-Newton, SPD-safe). Default `kappa=0` → OFF → zero effect on existing
+  scenes (verified: `host_data(n)` value-initialises the new fields).
+- `get_stitch_max_stretch(start, count)` and
+  `get_stitch_max_stretch_batched(starts, counts)` — on-GPU max stitch-spring
+  stretch over a spring range / many ranges. The batched form is ONE kernel,
+  block-per-segment (= one finger, or one finger of one env), returns per-segment
+  scalars with NO full-vertex D2H. Block independence ⇒ multi-env isolated.
+
+### 6.2 The grip signal (which "force" to regulate on)
+On the compliant finray the rigid-prismatic drive force/lag does NOT register the
+grasp (the rigid root keeps moving as the soft truss deforms). Measured signals,
+most-direct → cheapest:
+- soft-fingertip IPC contact force (`get_body_contact_force`): most direct, but
+  EXPENSIVE (rebuilds BVH+pairs each call, ~200 ms/frame).
+- stitch stretch at the truss base (max per-pair `‖fem−rigid‖`): one elastic layer
+  removed but clean+monotone, CHEAP (~70 ms/frame). The chosen default.
+- prismatic drive force/lag: two layers removed, noisy/non-monotone — unusable.
+
+### 6.3 Control laws (examples expose all of them)
+- `stitchgrip` / `trackgrip` — **feedback-driven POSITION** (default). Position
+  drive (anchored ⇒ stable, no slide under arm motion, provably no overshoot) with
+  a target that MARCHES toward closed but PAUSES when the grip signal (stitch
+  stretch / contact force) hits a threshold ⇒ adaptive half-close, and RESUMES if
+  the object is removed (signal drops). Gets adaptive + no-slide + resume together.
+- `forcebarrier` — **literal pure force** (`strength=0`) + the §6.1 cl-barrier. No
+  overshoot (barrier), adaptive, resumes. BUT pure force has no positional anchor,
+  so under arm motion the soft seat↔root link stretches → the finray visibly
+  *slides* off the mount. Kept as a teaching example of the trade-off.
+- `forcelock` / `truegrip` — pure-force grasp then position-LOCK (no drift, no
+  resume). `position` — plain direct-set baseline.
+
+### 6.4 The grip-control trilemma (key finding)
+For a compliant multi-body gripper, simple controllers get only TWO of
+{adaptive half-close, no-slide-under-motion, resume-on-vanish}:
+- pure force (`strength=0`): adaptive ✓, resume ✓, **slide ✗** (no anchor).
+- position locked at grip width: adaptive ✓, no-slide ✓, **resume ✗**.
+- position to `cl`: no-slide ✓, resume ✓, **crushes ✗** (no half-close).
+All three at once requires a **feedback-driven** target (§6.3 `stitchgrip`): it is
+position-anchored (no slide) yet its target is advanced by grip feedback (adaptive
++ resume). The slide is intrinsic to `strength=0`; libuipc composes joint
+constraint + driving + external force + limit as separate constitutions, but its
+grippers also avoid the extra soft seat↔root link that stretches here.
+
+### 6.5 Verification
+- cl-barrier: pure force F=20 AND F=40 both held at ~dhat from `cl`, never crossing
+  (vs +30 m runaway without the barrier); standoff ≈ `dhat`; default off = no
+  regression on stitch/position modes.
+- GPU stitch reduction numerically identical to the CPU path (half-close at
+  L_open=0.0146 m either way). Single-env perf: CPU 50.9 ms vs batched-GPU 50.4 ms
+  (within run-to-run noise — the physics step dominates; the GPU path is for the
+  multi-env case where the per-finger full-vertex D2H would serialise ×N).
+- Required pure-force magnitude scales linearly with finray Young's modulus
+  (F≈60 @1e7, F≈10 @1e6) and is ~0 in free space (F=2 fully closes an unobstructed
+  gripper at any Young) — the large force is elastic deformation against the
+  object/scene, not a units bug.
+
+### 6.6 Examples (2 files × 2 modes)
+- `examples/replay_case39_UMI_obb_cup_shirt_forcegrip.py` — OBB arm + finray +
+  cup + shirt, replays `qpos_case39.h5`. `CASE39_GRIP_MODE=stitchgrip`
+  (+`CASE39_STITCH_GPU=1`) | `forcebarrier` | trackgrip/forcelock/truegrip/position.
+- `examples/case_umi_finray_force_ui.py` — same scene, arm = imgui sliders, gripper
+  = per-arm CLOSE/OPEN buttons. `CASE_UMI_GATE=stitch` (+`CASE_UMI_STITCH_GPU=1`) |
+  `CASE_UMI_MODE=forcebarrier`.

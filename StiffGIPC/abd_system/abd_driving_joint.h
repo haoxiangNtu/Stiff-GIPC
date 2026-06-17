@@ -669,7 +669,44 @@ struct PrismaticDrivingGPUData
     // parent (translation DOF). Independent of the PD term: stiffness>0 =
     // position control, ext_force!=0 = force control; set stiffness=0 for pure.
     Float ext_force = Float(0);
+
+    // [force-control / limit barrier] One-sided IPC log-barrier on the prismatic
+    // coordinate d at the CLOSED end, so d can never cross limit_cl no matter how
+    // large the (force) drive — guaranteeing the gripper never overshoots past
+    // fully-closed while staying force-controlled. gap g = (d - limit_cl)*limit_dir
+    // is >0 while open and ->0 at the limit; barrier active for 0<g<limit_dhat.
+    // limit_kappa<=0 disables it (default — no effect on existing scenes).
+    Float limit_cl    = Float(0);
+    Float limit_dir   = Float(1);   // +1 if open end is at d>cl, else -1
+    Float limit_dhat  = Float(0);   // activation band (m)
+    Float limit_kappa = Float(0);   // barrier stiffness (<=0 = off)
 };
+
+
+/// One-sided IPC log-barrier on the prismatic coordinate at the closed limit.
+/// Returns barrier energy E and its 1st/2nd derivatives w.r.t. d. b(g) =
+/// -kappa*(g-dhat)^2*ln(g/dhat) for 0<g<dhat (g = (d-cl)*dir). Off if kappa<=0.
+MUDA_GENERIC inline void prismatic_limit_barrier(
+    Float d, const PrismaticDrivingGPUData& drv,
+    Float& E, Float& dEdd, Float& d2Edd2)
+{
+    E = Float(0); dEdd = Float(0); d2Edd2 = Float(0);
+    if(drv.limit_kappa <= Float(0) || drv.limit_dhat <= Float(0)) return;
+    Float dir = drv.limit_dir;
+    Float dh  = drv.limit_dhat;
+    Float g   = (d - drv.limit_cl) * dir;       // >0 while open
+    if(g >= dh) return;                          // outside barrier support
+    Float gc = g < Float(1e-9) ? Float(1e-9) : g;  // numerical floor (avoid log<=0)
+    Float k  = drv.limit_kappa;
+    Float t  = gc - dh;                          // <0 in support
+    Float ln = log(gc / dh);
+    E      = -k * t * t * ln;
+    Float bp  = -k * (Float(2) * t * ln + t * t / gc);             // b'(g)
+    Float bpp = -k * (Float(2) * ln + Float(4) * t / gc - (t * t) / (gc * gc)); // b''(g)
+    dEdd   = bp * dir;                           // chain dg/dd = dir
+    d2Edd2 = bpp;                                // dir^2 = 1
+    if(d2Edd2 < Float(0)) d2Edd2 = Float(0);     // SPD safety
+}
 
 
 /// Compute prismatic driving energy.
@@ -684,7 +721,9 @@ MUDA_GENERIC inline Float prismatic_driving_energy(
 
     Float d = (Cq - Cp).dot(tq);
     Float err = d - drv.target_distance;
-    return 0.5 * drv.stiffness * err * err;
+    Float Eb, dummy1, dummy2;
+    prismatic_limit_barrier(d, drv, Eb, dummy1, dummy2);
+    return 0.5 * drv.stiffness * err * err + Eb;
 }
 
 
@@ -732,14 +771,21 @@ MUDA_GENERIC inline void prismatic_driving_gradient_hessian(
     // dd/dqq: J_Cq^T * tq + J_dir(tq_bar)^T * diff
     Vector12 dd_dqq = (J_Cq.T() * tq) + JdirT(drv.tq_bar, diff);
 
-    // Gradient: K * err * dd/dq
-    grad_p_out = K * err * dd_dqp;
-    grad_q_out = K * err * dd_dqq;
+    // PD term (dE/dd = K*err, d2E/dd2 = K) + one-sided limit barrier (same chain,
+    // both depend on d only -> share dd/dq). Gauss-Newton: drop d2d/dq2.
+    Float Eb, b_dEdd, b_d2Edd2;
+    prismatic_limit_barrier(d, drv, Eb, b_dEdd, b_d2Edd2);
+    Float gscale = K * err + b_dEdd;   // total dE/dd
+    Float hscale = K + b_d2Edd2;       // total d2E/dd2 (>=0, SPD)
 
-    // Gauss-Newton Hessian: K * dd/dq * dd/dq^T
-    H_pp_out = K * dd_dqp * dd_dqp.transpose();
-    H_qq_out = K * dd_dqq * dd_dqq.transpose();
-    H_pq_out = K * dd_dqp * dd_dqq.transpose();
+    // Gradient: (dE/dd) * dd/dq
+    grad_p_out = gscale * dd_dqp;
+    grad_q_out = gscale * dd_dqq;
+
+    // Gauss-Newton Hessian: (d2E/dd2) * dd/dq * dd/dq^T
+    H_pp_out = hscale * dd_dqp * dd_dqp.transpose();
+    H_qq_out = hscale * dd_dqq * dd_dqq.transpose();
+    H_pq_out = hscale * dd_dqp * dd_dqq.transpose();
 }
 
 
