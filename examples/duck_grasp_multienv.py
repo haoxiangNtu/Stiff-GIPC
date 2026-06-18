@@ -1,9 +1,13 @@
 """Multi-env Franka-grasps-duck — faithful replica of the uipc 512-env duck video.
 
-Each env = a Franka panda (panda_arm_hand_coarse.urdf) + a rubber duck (FEM soft,
-assets/duck/duck_tet.npz) tiled in a grid. All envs replay the same Newton IK grasp
-trajectory (/tmp/franka_ik_traj.npz: q (980,9) = 7 arm joints + 2 finger joints,
-plus franka_base & duck_pos) — arm descends, fingers close on the duck, lift.
+Each env = an FR3 Franka (DEFAULT: fr3_franka_hand_uipc.urdf — uipc-exact OBB coarse
+arms + convex hand/fingers) + a rubber duck (FEM soft, assets/duck/duck_tet.npz) tiled
+in a grid. The arm is DYNAMICS-driven: each frame's recorded joint angles are pushed as
+PD set_joint_target (set_revolute_target / set_prismatic_target), NOT kinematic teleport.
+All envs replay the same Newton IK grasp trajectory (/tmp/franka_ik_traj.npz: q (980,9)
+= 7 arm joints + 2 finger joints, plus franka_base & duck_pos) — arm descends, fingers
+close on the duck, lift. GRASP_URDF picks the arm: fr3uipc (default, OBB coarse) /
+fr3convex (convex fingers) / panda (coarse panda) / fr3 (full .dae->STL, finest).
 
 Env vars:
   GRASP_N=4          number of envs (franka+duck pairs)
@@ -43,7 +47,7 @@ _FR3 = _ROOT + "/Assets/fr3/fr3_franka_hand.urdf"
 _FR3_CVX = _ROOT + "/Assets/fr3/fr3_franka_hand_convex.urdf"  # convex-hull fingers (matches uipc)
 _FR3_UIPC = _ROOT + "/Assets/fr3/fr3_franka_hand_uipc.urdf"  # uipc EXACT colliders: OBB arms + convex hand/fingers
 _PANDA = _ROOT + "/Assets/sim_data/urdf/franka_panda/panda_arm_hand_coarse.urdf"
-_SEL = os.environ.get("GRASP_URDF", "fr3convex")   # uipc uses convex-hull fingers
+_SEL = os.environ.get("GRASP_URDF", "fr3uipc")   # DEFAULT: OBB coarse arms + convex hand/fingers (uipc-exact)
 URDF = {"panda": _PANDA, "fr3convex": _FR3_CVX, "fr3uipc": _FR3_UIPC}.get(_SEL, _FR3)
 JPREFIX = "panda" if URDF == _PANDA else "fr3"
 # uipc's EXACT duck tetmesh (270v/889tet, dumped from rbs build_duck_tetmesh). Now the
