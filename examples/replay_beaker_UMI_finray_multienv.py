@@ -3,10 +3,10 @@
 
 Sibling of replay_foldshirt_UMI_finray_multienv.py: same v0.6.4 UMI finray
 STRATEGY_F hybrid soft gripper (rigid mount root + FEM fin-ray truss, gap-0
-stitch) driven by IMPEDANCE / position control (compliant prismatic spring of
-stiffness GRIP_K commanded to a position target; grip force emerges from spring
-deformation), but it GRASPS a rigid 100 ml BEAKER (ABD) instead of folding a
-shirt. No cloth.
+stitch) driven by PURE POSITION CONTROL (continuous grip command [-1,+1] mapped
+linearly to finger opening and each prismatic joint driven straight to it; POS_K
+= position-drive stiffness; grasp compliance from the FEM truss, no force-ctrl),
+but it GRASPS a rigid 100 ml BEAKER (ABD) instead of folding a shirt. No cloth.
 
   * Arm   : OBB coarse collision (ridgeback_dual_panda2_OBB.urdf) by default.
   * Grip  : 4 finray fingers (rigid ABD root young 1e8 + FEM truss young 1e7).
@@ -225,20 +225,26 @@ def slice_env_joints(robot, n):
     return out
 
 
-def apply_frame(robot, ej, raw, close_r):
+def apply_frame(robot, ej, raw, close_r=0.0):
     # action layout [L_arm(0:7), gripL(7), R_arm(8:15), gripR(15)].
     for i, ri in enumerate(ej['left_rev']):
         robot.set_revolute_position(ri, float(raw[i]), degree=False)
     for i, ri in enumerate(ej['right_rev']):
         robot.set_revolute_position(ri, float(raw[8 + i]), degree=False)
+    # PURE POSITION CONTROL. Grip command is CONTINUOUS in [-1,+1] (+1 fully open,
+    # -1 fully closed) -> map linearly to finger opening, drive each prismatic
+    # joint straight to it. UMI finray fingers have MIRRORED limits (joint1
+    # [0,+0.041], joint2 [-0.041,0]); open = end farthest from 0, close = near-0.
+    # Joint tracks position firmly; grasp compliance is from the FEM truss.
     for grip, pris in ((float(raw[7]), ej['left_pri']),
                        (float(raw[15]), ej['right_pri'])):
+        s = min(max((grip + 1.0) * 0.5, 0.0), 1.0)   # 0 = closed, 1 = open
         for pi in pris:
             lo = robot.prismatic_joints[pi].lower_limit
             hi = robot.prismatic_joints[pi].upper_limit
-            op = lo if abs(lo) > abs(hi) else hi
-            cl = hi if abs(lo) > abs(hi) else lo
-            gp = op if grip >= 0 else (op + (1.0 - close_r) * (cl - op))
+            op = lo if abs(lo) > abs(hi) else hi      # fully-open end
+            cl = hi if abs(lo) > abs(hi) else lo      # near-0 (closed) end
+            gp = cl + s * (op - cl)                   # linear close->open
             robot.set_prismatic_position(pi, gp, millimeters=False)
 
 
@@ -247,7 +253,7 @@ def main():
     num_envs = int(os.environ.get("CASE39ME_NUM_ENVS", "4"))
     spacing = float(os.environ.get("CASE39ME_SPACING", "4.0"))
     close_r = float(os.environ.get("CASE39_CLOSE_RATIO", "0.0"))
-    grip_k = float(os.environ.get("GRIP_K", "15.0"))
+    pos_k = float(os.environ.get("POS_K", os.environ.get("GRIP_K", "15.0")))  # prismatic position-drive stiffness
 
     import h5py, trimesh
     with h5py.File(ep, "r") as f:
@@ -272,7 +278,7 @@ def main():
                   T0=np.asarray(oi[bkey]["initial_pose"]).reshape(4, 4))
     print(f"[bk-umi] episode={os.path.basename(ep)} frames={len(actions)} envs={num_envs} "
           f"arm={os.path.basename(URDF_PATH)} beaker={os.path.basename(beaker_mesh)} "
-          f"({len(beaker['verts'])}v) grip_k={grip_k}", flush=True)
+          f"({len(beaker['verts'])}v) pos_k={pos_k}", flush=True)
 
     cfg = Config(
         dt=0.020, cloth_thickness=1e-3, cloth_young_modulus=1e4, bend_young_modulus=1e3,
@@ -332,8 +338,10 @@ def main():
             eng.native.set_fixed_joint_strength(g['fj_idx'], float(os.environ.get("CASE36_FJ_KAPPA", "1e3")))
     eng.native.set_max_revolute_step_per_frame(float(os.environ.get("CASE36_MAX_RAD_PER_FRAME", "0.04")))
     robot = Robot(eng)
+    # PURE POSITION CONTROL: drive every prismatic joint to its commanded opening
+    # (pos_k = position-drive stiffness). No external-force / force-limited path.
     for i in range(len(robot.prismatic_joints)):
-        eng.native.set_prismatic_strength(i, grip_k)
+        eng.native.set_prismatic_strength(i, pos_k)
     ejs = slice_env_joints(robot, num_envs)
     print(f"[bk-umi] {len(robot.revolute_joints)} rev + {len(robot.prismatic_joints)} pri\n", flush=True)
 
