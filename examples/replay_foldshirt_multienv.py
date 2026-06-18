@@ -226,6 +226,17 @@ def main():
     n_abd_total = sum(1 for r in eng.get_load_records() if r.body_type == 0)
     for env in envs:
         exclusions_for_env(eng, env, n_abd_total)
+    # [P1 env isolation] tag each collision body with its env group -> cross-env
+    # pairs guaranteed excluded regardless of spacing. Bodies loaded env-by-env
+    # so ids are contiguous per env. CASE39ME_ISOLATE=0 to disable (A/B).
+    if num_envs > 1 and int(os.environ.get("CASE39ME_ISOLATE", "1")):
+        n_fem_total = sum(1 for r in eng.get_load_records() if r.body_type == 1)
+        m_abd, m_fem = n_abd_total // num_envs, n_fem_total // num_envs
+        groups = [cid // m_abd for cid in range(n_abd_total)] + \
+                 [f // m_fem for f in range(n_fem_total)]
+        eng.native.set_body_groups(groups)
+        print(f"[fs] env isolation ON: {n_abd_total} ABD + {n_fem_total} FEM "
+              f"-> {num_envs} groups", flush=True)
     eng.finalize()
     print(f"[fs] finalized {num_envs} envs in {time.perf_counter()-t0:.1f}s ({n_abd_total} ABD)", flush=True)
 

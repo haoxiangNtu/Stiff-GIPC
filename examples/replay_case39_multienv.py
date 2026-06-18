@@ -22,13 +22,15 @@ them all in a single ``eng.step()``*.  Consequences you must keep in mind:
     stalls together.  This is the multi-env analogue of the single-scene
     cap-hit problem — watch ``newton_iter_cap`` and per-frame ms, not just fps.
   * GPU memory is the binding limit (measured, RTX 4090 24GB), and after the
-    engine fixes it scales ~LINEARLY with N: ~6GB base + ~0.8GB/env. N=16 runs
-    the FULL grasp trajectory at ~19GB; ceiling ~20 (N>=24 OOMs). Per-env-equiv
-    step time is ~17ms (the global Newton/PCG amortizes fixed overhead, so big-N
-    is actually cheaper per env than single-env). Defaults are RIGHT-SIZED from
-    STIFF_CP_STATS: CCD/contact/triplet buffers run ~10-20% used even at N=16
-    grasp (~5x headroom). Note: geometry INSTANCING (libuipc-style) would NOT
-    help — uipc doesn't instance the shirt either.
+    engine fixes it scales ~LINEARLY with N: ~6GB base + ~0.8GB/env.
+    MEASURED MAX (through the full grasp trajectory): N=20 @ 22.4GB (369ms/step,
+    2.71fps); N=16 @ 18.9GB (278ms, 3.6fps). N=22 is the settling edge (23.7GB);
+    N>=24 OOMs. RL throughput ~55 env-steps/sec and SATURATED (serial merged
+    solve — multi-env amortizes fixed overhead, 14/s@N=1 -> ~55/s@N>=16, then
+    flat; no batch speedup). Defaults RIGHT-SIZED from STIFF_CP_STATS:
+    CCD/contact/triplet run ~10-20% used even at N=20 grasp (~5x headroom).
+    Note: geometry INSTANCING (libuipc-style) would NOT help — uipc doesn't
+    instance the shirt either.
   * Knobs (CASE39ME_BUFF_SCALE / LSYS_SCALE / TRIPLET_MARGIN / ABS_DHAT / SPACING)
     trade memory vs robustness. ABS_DHAT is the key one: it pins contact
     thickness to the single-env value (~2.4mm) so contact does NOT inflate with
@@ -433,6 +435,20 @@ def main():
                 g['fem_global_id'] = n_abd_total + g['fem_body_offset']
             env['shirt_global_id'] = n_abd_total + env['shirt_rec'].body_offset
 
+    # [P1 env isolation] Tag each collision body with its env group so that
+    # cross-env pairs are guaranteed excluded (independent of spacing). Bodies
+    # are loaded env-by-env, so ABD ids [0,n_abd) and FEM ids [n_abd,n_abd+n_fem)
+    # are contiguous per env -> group = id // (count_per_env). Default ON for N>1;
+    # CASE39ME_ISOLATE=0 falls back to spacing-only (for A/B testing).
+    if num_envs > 1 and int(os.environ.get("CASE39ME_ISOLATE", "1")):
+        n_fem_total = sum(1 for r in eng.get_load_records() if r.body_type == 1)
+        m_abd, m_fem = n_abd_total // num_envs, n_fem_total // num_envs
+        groups = [cid // m_abd for cid in range(n_abd_total)] + \
+                 [f // m_fem for f in range(n_fem_total)]
+        eng.native.set_body_groups(groups)
+        print(f"[me] env isolation ON: {n_abd_total} ABD + {n_fem_total} FEM bodies "
+              f"-> {num_envs} groups ({m_abd} ABD + {m_fem} FEM each)", flush=True)
+
     fgrav = int(os.environ.get("CASE36_DISABLE_GRAVITY", "1"))
     eng.finalize()
     print(f"[me] finalized {num_envs} envs in {time.perf_counter()-t_build:.1f}s "
@@ -469,10 +485,16 @@ def main():
         cup_ranges = [(env['cup_rec'].vertex_offset, env['cup_rec'].vertex_count)
                       for env in envs]
         ms_log = []
+        # [P3a] CASE39ME_PHASE>0 makes envs HETEROGENEOUS: env e is driven from
+        # frame (fr + e*PHASE), so envs are at different trajectory points (=
+        # different convergence difficulty) — the diverse-RL-env regime where
+        # per-env early-exit pays off. 0 = identical envs (default).
+        phase = int(os.environ.get("CASE39ME_PHASE", "0"))
         for fr in range(f_start, f_end):
             raw = qpos_all[fr]
-            for ej in env_joints:
-                apply_frame(robot, ej, raw, close_r)
+            for e, ej in enumerate(env_joints):
+                r = qpos_all[(fr + e * phase) % len(qpos_all)] if phase else raw
+                apply_frame(robot, ej, r, close_r)
             t0 = time.perf_counter()
             eng.step()
             ms_log.append((time.perf_counter() - t0) * 1000.0)
