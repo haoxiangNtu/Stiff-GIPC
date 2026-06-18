@@ -96,6 +96,9 @@ class GIPC
     double   fDhat         = 0.0;
     double   bboxDiagSize2 = 0.0;
     double   relative_dhat = 0.0;
+    // Absolute contact distance (meters). >0 overrides the scene-bbox-derived
+    // dHat so the contact thickness does NOT inflate with scene/env count.
+    double   absolute_dhat = 0.0;
     double   dTol          = 0.0;
     double   minKappaCoef  = 0.0;
     double   IPC_dt        = 0.0;

@@ -702,6 +702,7 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.pcg_threshold       = cfg.pcg_tol;
     ipc.Newton_solver_threshold = cfg.newton_tol;
     ipc.relative_dhat       = cfg.relative_dhat;
+    ipc.absolute_dhat       = cfg.absolute_dhat;
     ipc.YoungModulus        = cfg.young_modulus;
     ipc.pcg_data.P_type     = cfg.preconditioner_type;
     ipc.assets_dir_cfg      = resolved_assets_dir;

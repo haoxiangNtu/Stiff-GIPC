@@ -8814,12 +8814,25 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     }
     bboxDiagSize2 = __GEIGEN__::__squaredNorm(
         __GEIGEN__::__minus(SceneSize.upper, SceneSize.lower));
-    dTol         = 1e-18 * bboxDiagSize2;
+    // [absolute-dhat fix] The scene-bbox diagonal grows with env count / spacing,
+    // which inflates the bbox-derived dHat (contact thickness) — a physics bug
+    // and the root cause of super-linear contact growth in multi-env. When
+    // absolute_dhat>0, derive an EFFECTIVE bbox so dHat == absolute_dhat^2 and
+    // dTol/fDhat stay consistent with a single-env scene of that contact scale.
+    double eff_bboxDiagSize2 = bboxDiagSize2;
+    if(absolute_dhat > 0.0 && relative_dhat > 0.0)
+        eff_bboxDiagSize2 = (absolute_dhat * absolute_dhat)
+                            / (relative_dhat * relative_dhat);
+    dTol         = 1e-18 * eff_bboxDiagSize2;
     minKappaCoef = 1e11;
     meanMass     = m_meanMass;
     meanVolumn   = m_meanVolumn;
-    dHat = relative_dhat * relative_dhat * bboxDiagSize2;  //__GEIGEN__::__squaredNorm(__GEIGEN__::__minus(maxConer, minConer));
-    fDhat = 1e-4 * bboxDiagSize2;
+    dHat = relative_dhat * relative_dhat * eff_bboxDiagSize2;  // = absolute_dhat^2 when set
+    fDhat = 1e-4 * eff_bboxDiagSize2;
+    if(::g_gipc_log_level >= 1)
+        printf("[dhat] bboxDiagSize2=%.6g (eff=%.6g)  relative_dhat=%.3g  abs_dhat=%.3g  dHat_sqrt=%.6g%s\n",
+               bboxDiagSize2, eff_bboxDiagSize2, relative_dhat, absolute_dhat,
+               sqrt(dHat), absolute_dhat > 0.0 ? " (ABSOLUTE)" : " (scene-bbox)");
 
 
     int global_matrix_block3_size =
