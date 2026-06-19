@@ -395,8 +395,13 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
         for pi in pis:
             op, cl = _open_close(robot, pi)
             cd = 1.0 if (cl - op) > 0 else -1.0
-            if grip < 0:                                   # CLOSE: pure force, barrier stops at cl
-                eng.native.set_prismatic_strength(pi, 0.0)
+            if grip < 0:                                   # CLOSE: real closing FORCE toward cl;
+                # the cl-barrier stops over-close, and a SMALL position home at cl
+                # (force_strength) keeps deformable contact from shoving the free
+                # finger out past its OPEN limit. Set force_strength=0 for pure
+                # force (fine on rigid objects; flies out on soft cloth).
+                eng.native.set_prismatic_strength(pi, P['force_strength'])
+                eng.native.set_prismatic_target(pi, cl)
                 eng.native.set_prismatic_force(pi, cd * P['barrier_force'])
             else:                                          # OPEN: position-hold to open end
                 eng.native.set_prismatic_force(pi, 0.0)
@@ -407,12 +412,15 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
     # stitch: spring-deformation-gauged POSITION drive. grip>=0 -> open & reset;
     # grip<0 -> march the opening toward closed until the finray stitch-spring
     # stretch crosses the threshold, then latch (hold, no further creep).
-    st = gstate.setdefault(grp['key'], {'s': 1.0, 'latched': False})
+    st = gstate.setdefault(grp['key'], {'s': 1.0, 'latched': False, 'over': 0})
     if grip >= 0:
-        st['s'] = 1.0; st['latched'] = False
+        st['s'] = 1.0; st['latched'] = False; st['over'] = 0
     else:
         gauge = max((all_stretch[i] for i in grp['seg_idx']), default=0.0) if all_stretch is not None else 0.0
-        if gauge >= P['stitch_thresh']:
+        # debounce: latch only after the stretch stays over threshold for several
+        # frames (a single motion spike during free closing must NOT latch it).
+        st['over'] = st['over'] + 1 if gauge >= P['stitch_thresh'] else 0
+        if st['over'] >= P['stitch_debounce']:
             st['latched'] = True
         if not st['latched']:
             st['s'] = max(0.0, st['s'] - P['close_ds'])
@@ -466,10 +474,12 @@ def make_engine(prep, num_envs):
 def _drive_params():
     return dict(
         pos_k=float(os.environ.get("POS_K", os.environ.get("GRIP_K", "15.0"))),
-        close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.03")),          # stitch: opening-fraction/frame while closing
-        stitch_thresh=float(os.environ.get("GRIP_STITCH_THRESH", "5e-6")),  # stitch: latch stretch (m)
+        close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.02")),           # stitch: opening-fraction/frame while closing
+        stitch_thresh=float(os.environ.get("GRIP_STITCH_THRESH", "2e-5")),  # stitch: latch stretch (m); below this on soft cloth -> closes fully
+        stitch_debounce=int(os.environ.get("GRIP_STITCH_DEBOUNCE", "3")),   # frames over thresh before latching (reject motion spikes)
         # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
-        barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "60.0")),  # closing force (N)
+        barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "25.0")),  # closing force (N)
+        force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "3.0")), # small position home at cl (anti fly-out on soft contact); 0 = pure force
         barrier_dhat=float(os.environ.get("GRIP_BARRIER_DHAT", "0.002")),   # barrier standoff from cl (m)
         barrier_kappa=float(os.environ.get("GRIP_BARRIER_KAPPA", "1e3")),   # barrier stiffness
     )
