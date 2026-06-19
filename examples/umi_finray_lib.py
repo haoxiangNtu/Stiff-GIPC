@@ -528,7 +528,7 @@ def run_replay(scene_name, default_envs=1):
 
     import polyscope as ps, polyscope.imgui as psim
     v = eng.get_vertices(); fa = eng.get_surface_faces()
-    ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("shadow_only")
+    ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("none")
     st = dict(idx=0, run=False, ms=0.,
               mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)), v=v, f=fa)
 
@@ -595,7 +595,7 @@ def run_ui(scene_name):
     MODES = ["pos", "stitch", "force"]
 
     v = eng.get_vertices(); fa = eng.get_surface_faces()
-    ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("shadow_only")
+    ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("none")
     ui = dict(idx=0, run_arm=False, mode_i=MODES.index(os.environ.get("GRIP_MODE", "pos")),
               grip=1.0, ms=0., mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)),
               v=v, f=fa)
