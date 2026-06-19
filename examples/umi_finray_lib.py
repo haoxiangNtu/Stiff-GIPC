@@ -417,18 +417,24 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
         st['s'] = 1.0; st['latched'] = False; st['over'] = 0
     else:
         gauge = max((all_stretch[i] for i in grp['seg_idx']), default=0.0) if all_stretch is not None else 0.0
-        # debounce: latch only after the stretch stays over threshold for several
-        # frames (a single motion spike during free closing must NOT latch it).
-        st['over'] = st['over'] + 1 if gauge >= P['stitch_thresh'] else 0
-        # Only allow latching once the gripper has closed most of the way
-        # (s < stitch_min_s): the stitch stretch spikes on closing-motion
-        # transients, so without this floor a rigid object latches a loose,
-        # half-open grip early and slips. With it, the finger closes firmly
-        # first; on soft cloth the stretch stays low so it just closes fully.
-        if st['s'] < P['stitch_min_s'] and st['over'] >= P['stitch_debounce']:
-            st['latched'] = True
         if not st['latched']:
+            # NOT gripped yet: count consecutive over-threshold frames and keep
+            # closing. Latch (freeze) only once the gripper has closed past the
+            # floor (s<stitch_min_s) AND the stretch is sustained (debounce) — the
+            # min_s floor stops a rigid object latching a loose half-open grip on a
+            # closing-motion transient; soft cloth never reaches thresh -> closes fully.
+            st['over'] = st['over'] + 1 if gauge >= P['stitch_thresh'] else 0
+            if st['s'] < P['stitch_min_s'] and st['over'] >= P['stitch_debounce']:
+                st['latched'] = True
+            else:
+                st['s'] = max(0.0, st['s'] - P['close_ds'])
+        elif gauge < P['stitch_thresh'] * P['stitch_resume_frac']:
+            # HYSTERESIS (v0.6.4 stitchgrip): gripped, but the stitch stretch
+            # dropped below thresh*resume_frac -> the object LOOSENED / FELL OUT,
+            # so un-latch and resume closing to re-grip. (Lower resume_frac = stickier.)
+            st['latched'] = False; st['over'] = 0
             st['s'] = max(0.0, st['s'] - P['close_ds'])
+        # else: latched and still gripping -> hold s frozen
     for pi in pis:
         op, cl = _open_close(robot, pi)
         robot.set_prismatic_position(pi, cl + st['s'] * (op - cl), millimeters=False)
@@ -483,6 +489,7 @@ def _drive_params():
         stitch_thresh=float(os.environ.get("GRIP_STITCH_THRESH", "2e-5")),  # stitch: latch stretch (m); below this on soft cloth -> closes fully
         stitch_debounce=int(os.environ.get("GRIP_STITCH_DEBOUNCE", "3")),   # frames over thresh before latching (reject motion spikes)
         stitch_min_s=float(os.environ.get("GRIP_STITCH_MIN_S", "0.3")),     # must close to s<this before latch (firm grip on rigid)
+        stitch_resume_frac=float(os.environ.get("GRIP_STITCH_RESUME_FRAC", "0.5")),  # un-latch + re-close if stretch drops below thresh*this (object slipped/fell)
         # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
         barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "25.0")),  # closing force (N)
         force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "3.0")), # small position home at cl (anti fly-out on soft contact); 0 = pure force
