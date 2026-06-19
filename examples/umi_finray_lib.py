@@ -155,6 +155,8 @@ def prepare_scene(name):
                                 label=os.path.basename(_resolve_mesh(oi[bk]["collision_mesh"])))
             p["fem_obj"] = None
         p["actions"] = actions; p["robot_init"] = robot_init
+        # UMI episodes: arm base from the recorded robot_init_pose.
+        p["arm_tf0"] = make_arm_tf(robot_init[:3], ARM_SCALE)
     elif name == "cupshirt":
         traj = _ASSETS_DIR + "trajectories/qpos_case39.h5"
         with h5py.File(traj, "r") as f:
@@ -162,6 +164,14 @@ def prepare_scene(name):
         # qpos_case39 layout [L_arm(0:7), R_arm(7:14), gripL(14), gripR(15)]
         p.update(arm_l=list(range(0, 7)), arm_r=list(range(7, 14)), grip_l=14, grip_r=15)
         p["robot_init"] = np.array([-0.8, 0.0, 0.0])
+        # case_39 cup-grasp scene: arm base at y=-3.0 (NOT the UMI make_arm_tf
+        # placement) so the arm reaches UP to the cup at [0.67,-0.2,-0.4] /
+        # ground -1.67 — matches replay_case39.py / forcegrip exactly. Using the
+        # UMI base here leaves the gripper ~3m above the cup (never grasps).
+        arm_tf = np.eye(4)
+        arm_tf[:3, :3] = ARM_SCALE * Rotation.from_rotvec([-math.pi / 2, 0, 0]).as_matrix()
+        arm_tf[1, 3] = -3.0
+        p["arm_tf0"] = arm_tf
         p["ground_offset"] = float(os.environ.get("CASE39_GROUND_OFFSET", "-1.67"))
         p["friction"] = float(os.environ.get("CASE39_FRICTION", "0.8"))
         p["precond"] = 1; p["abs_dhat"] = 0.00239
@@ -187,7 +197,7 @@ def prepare_scene(name):
 # ----------------------------------------------------------------------------
 def build_world(eng, prep, num_envs, spacing, sides, ge):
     offs = make_env_offsets(num_envs, spacing)
-    arm_tf0 = make_arm_tf(prep["robot_init"][:3], ARM_SCALE)
+    arm_tf0 = prep["arm_tf0"]   # per-scene arm base (UMI episode pose / case_39 y=-3.0)
     rigid_young = float(os.environ.get("CASE39UMI_RIGID_YOUNG", "1e8"))
     fem_young = float(os.environ.get("CASE36_FEM_YOUNG", "1e7"))
     up = urdf_path()
