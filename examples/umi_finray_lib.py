@@ -485,9 +485,12 @@ def make_engine(prep, num_envs):
 def _drive_params():
     return dict(
         pos_k=float(os.environ.get("POS_K", os.environ.get("GRIP_K", "15.0"))),
-        close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.02")),           # stitch: opening-fraction/frame while closing
+        close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.03")),           # stitch: opening-fraction/frame while closing
         stitch_thresh=float(os.environ.get("GRIP_STITCH_THRESH", "2e-5")),  # stitch: latch stretch (m); below this on soft cloth -> closes fully
-        stitch_debounce=int(os.environ.get("GRIP_STITCH_DEBOUNCE", "3")),   # frames over thresh before latching (reject motion spikes)
+        # The load-bearing stitch fixes are stitch_thresh + stitch_min_s + resume.
+        # debounce defaults to 1 (off): A/B testing (3 scenes x N=4) showed it (and
+        # the slower march) redundant once min_s is in. Knob kept for extra robustness.
+        stitch_debounce=int(os.environ.get("GRIP_STITCH_DEBOUNCE", "1")),   # frames over thresh before latching
         stitch_min_s=float(os.environ.get("GRIP_STITCH_MIN_S", "0.3")),     # must close to s<this before latch (firm grip on rigid)
         stitch_resume_frac=float(os.environ.get("GRIP_STITCH_RESUME_FRAC", "0.5")),  # un-latch + re-close if stretch drops below thresh*this (object slipped/fell)
         # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
