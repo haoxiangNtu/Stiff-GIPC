@@ -138,9 +138,10 @@ def prepare_scene(name):
         p.update(arm_l=list(range(0, 7)), arm_r=list(range(8, 15)), grip_l=7, grip_r=15)
         p["ground_offset"] = float(ec.get("ground_offset", 0.75))
         # friction_rate = IPC Coulomb coefficient mu for object/self contact (the
-        # gripper-finray <-> object friction). CASE39_FRICTION overrides the
-        # episode value — raise it (e.g. 1.0-1.5) if the cup/object slips.
-        p["friction"] = float(os.environ.get("CASE39_FRICTION", str(ec.get("friction_rate", 0.8))))
+        # gripper-finray <-> object friction). Default 1.0 (grippy, anti-slip) for
+        # all scenes; CASE39_FRICTION overrides. (The UMI episodes recorded 0.4,
+        # which let the object slip — 1.0 holds better.)
+        p["friction"] = float(os.environ.get("CASE39_FRICTION", "1.0"))
         p["precond"] = 0 if name == "beaker" else 1
         p["abs_dhat"] = 0.00239 if name == "beaker" else 0.0019
         if name == "foldshirt":
@@ -176,7 +177,7 @@ def prepare_scene(name):
         arm_tf[1, 3] = -3.0
         p["arm_tf0"] = arm_tf
         p["ground_offset"] = float(os.environ.get("CASE39_GROUND_OFFSET", "-1.67"))
-        p["friction"] = float(os.environ.get("CASE39_FRICTION", "0.8"))
+        p["friction"] = float(os.environ.get("CASE39_FRICTION", "1.0"))
         p["precond"] = 1; p["abs_dhat"] = 0.00239
         cup_scale = float(os.environ.get("CASE39_CUP_SCALE", "0.8"))
         cup_xyz = np.array([float(s) for s in os.environ.get("CASE39_CUP_XYZ", "0.67,-0.2,-0.4").split(",")])
