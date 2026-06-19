@@ -585,8 +585,11 @@ def _drive_one_group(eng, robot, grp, prep, raw, mode, gstate, P, stitch_seg):
 
 
 def run_ui(scene_name):
-    """Single-env UI: arm replays the trajectory; gripper open/close + GRIP_MODE are
-    live imgui controls so you can drive the grasp by hand and compare the 3 modes."""
+    """Single-env interactive UI (v0.6.4 case_umi_finray_force_ui paradigm + live
+    gripper-mode switch): every ARM revolute joint is a slider (deg); each GRIPPER
+    is driven by per-side OPEN/CLOSE BUTTONS (L / R); the gripper control mode
+    (pos / stitch / force) is a live dropdown. The arm starts at the trajectory's
+    frame-0 pose; "Reset pose" returns to it. No replay — you drive everything."""
     import polyscope as ps, polyscope.imgui as psim
     prep = prepare_scene(scene_name)
     P = _drive_params()
@@ -599,41 +602,92 @@ def run_ui(scene_name):
     eng.finalize()
     robot = _setup_after_finalize(eng, envs, P)
     ejs = slice_env_joints(robot, 1)
+    ej = ejs[0]
     groups = build_drive_groups(envs, ejs)
+    grp_by_side = {g['key'][1]: g for g in groups}
     gstate = {}
-    actions, L = prep["actions"], len(prep["actions"])
+    actions = prep["actions"]
+    a0 = actions[0]
+    _drive_arm(robot, ej, prep, a0)   # start at the trajectory's frame-0 arm pose
     MODES = ["pos", "stitch", "force"]
 
     v = eng.get_vertices(); fa = eng.get_surface_faces()
     ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("none")
-    ui = dict(idx=0, run_arm=False, mode_i=MODES.index(os.environ.get("GRIP_MODE", "pos")),
-              grip=1.0, ms=0., mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)),
-              v=v, f=fa)
+    ui = dict(run=False, mode_i=MODES.index(os.environ.get("GRIP_MODE", "pos")),
+              Lc=False, Rc=False, ms=0., show_edges=False,
+              mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)), v=v, f=fa)
 
     def cb():
-        ch, ui['run_arm'] = psim.Checkbox("replay arm trajectory", ui['run_arm'])
+        # run / pause / reset-pose
+        if ui['run']:
+            if psim.Button("Pause"):
+                ui['run'] = False
+        else:
+            if psim.Button("Run"):
+                ui['run'] = True
         psim.SameLine()
-        if psim.Button("reset arm"):
-            ui['idx'] = 0
-        cm, mi = psim.Combo("GRIP_MODE", ui['mode_i'], MODES)
+        if psim.Button("Reset pose"):
+            _drive_arm(robot, ej, prep, a0)
+            ui['Lc'] = ui['Rc'] = False; gstate.clear()
+        psim.SameLine()
+        ch_e, val_e = psim.Checkbox("show edges", ui['show_edges'])
+        if ch_e:
+            ui['show_edges'] = val_e; ui['mesh'].set_edge_width(0.5 if val_e else 0.0)
+        psim.Text(f"{scene_name}   step {ui['ms']:6.1f} ms")
+
+        # gripper control MODE (live)
+        cm, mi = psim.Combo("gripper mode", ui['mode_i'], MODES)
         if cm:
             ui['mode_i'] = mi; gstate.clear()
-        cg, gv = psim.SliderFloat("grip (+1 open / -1 close)", ui['grip'], -1.0, 1.0)
-        if cg:
-            ui['grip'] = gv
-        psim.Text(f"{scene_name}  mode={MODES[ui['mode_i']]}  frame {ui['idx']}/{L}  step {ui['ms']:.1f}ms")
 
-        if ui['run_arm'] and ui['idx'] < L:
-            _drive_arm(robot, ejs[0], prep, actions[ui['idx']]); ui['idx'] += 1
+        # per-arm OPEN/CLOSE buttons (the prismatic gripper, L / R separate)
+        psim.Separator()
+        psim.Text("Grippers (per arm)")
+        if psim.Button("L CLOSE"):
+            ui['Lc'] = True
+        psim.SameLine()
+        if psim.Button("L OPEN"):
+            ui['Lc'] = False; gstate.pop((0, 'L'), None)
+        psim.SameLine()
+        psim.TextUnformatted("left [CLOSED]" if ui['Lc'] else "left [open]")
+        if psim.Button("R CLOSE"):
+            ui['Rc'] = True
+        psim.SameLine()
+        if psim.Button("R OPEN"):
+            ui['Rc'] = False; gstate.pop((0, 'R'), None)
+        psim.SameLine()
+        psim.TextUnformatted("right [CLOSED]" if ui['Rc'] else "right [open]")
+
+        # arm joint sliders (read live target, push on change), in degrees
+        psim.Separator(); psim.Text("Left arm joints (deg)")
+        for ri in ej['left_rev']:
+            ji = robot.revolute_joints[ri]
+            chg, val = psim.SliderFloat(ji.name, robot.get_revolute_target_deg(ri),
+                                        ji.lower_limit_deg, ji.upper_limit_deg)
+            if chg:
+                robot.set_revolute_position(ri, val, degree=True)
+        psim.Separator(); psim.Text("Right arm joints (deg)")
+        for ri in ej['right_rev']:
+            ji = robot.revolute_joints[ri]
+            chg, val = psim.SliderFloat(ji.name, robot.get_revolute_target_deg(ri),
+                                        ji.lower_limit_deg, ji.upper_limit_deg)
+            if chg:
+                robot.set_revolute_position(ri, val, degree=True)
+
+        if not ui['run']:
+            return
+        # re-assert the per-side grippers every step (force/stitch are continuous):
+        # closed -> grip=-1, open -> grip=+1, via the selected mode.
         mode = MODES[ui['mode_i']]
         all_stretch = (eng.native.get_stitch_max_stretch_batched(stitch_seg[0], stitch_seg[1])
                        if mode == "stitch" else None)
-        for grp in groups:
-            drive_side(eng, robot, grp, ui['grip'], prep["binary"], mode, gstate, P, all_stretch)
+        drive_side(eng, robot, grp_by_side['L'], -1.0 if ui['Lc'] else 1.0, prep["binary"], mode, gstate, P, all_stretch)
+        drive_side(eng, robot, grp_by_side['R'], -1.0 if ui['Rc'] else 1.0, prep["binary"], mode, gstate, P, all_stretch)
         t = time.perf_counter(); eng.step(); ui['ms'] = (time.perf_counter() - t) * 1000.0
         v = eng.get_vertices(); fa = eng.get_surface_faces()
         if v.shape[0] != ui['v'].shape[0] or fa.shape != ui['f'].shape:
-            ui['mesh'] = ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)); ui['v'], ui['f'] = v, fa
+            ui['mesh'] = ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8))
+            ui['mesh'].set_edge_width(0.5 if ui['show_edges'] else 0.0); ui['v'], ui['f'] = v, fa
         else:
             ui['mesh'].update_vertex_positions(v)
 
