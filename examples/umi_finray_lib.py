@@ -420,7 +420,12 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
         # debounce: latch only after the stretch stays over threshold for several
         # frames (a single motion spike during free closing must NOT latch it).
         st['over'] = st['over'] + 1 if gauge >= P['stitch_thresh'] else 0
-        if st['over'] >= P['stitch_debounce']:
+        # Only allow latching once the gripper has closed most of the way
+        # (s < stitch_min_s): the stitch stretch spikes on closing-motion
+        # transients, so without this floor a rigid object latches a loose,
+        # half-open grip early and slips. With it, the finger closes firmly
+        # first; on soft cloth the stretch stays low so it just closes fully.
+        if st['s'] < P['stitch_min_s'] and st['over'] >= P['stitch_debounce']:
             st['latched'] = True
         if not st['latched']:
             st['s'] = max(0.0, st['s'] - P['close_ds'])
@@ -477,6 +482,7 @@ def _drive_params():
         close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.02")),           # stitch: opening-fraction/frame while closing
         stitch_thresh=float(os.environ.get("GRIP_STITCH_THRESH", "2e-5")),  # stitch: latch stretch (m); below this on soft cloth -> closes fully
         stitch_debounce=int(os.environ.get("GRIP_STITCH_DEBOUNCE", "3")),   # frames over thresh before latching (reject motion spikes)
+        stitch_min_s=float(os.environ.get("GRIP_STITCH_MIN_S", "0.3")),     # must close to s<this before latch (firm grip on rigid)
         # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
         barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "25.0")),  # closing force (N)
         force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "3.0")), # small position home at cl (anti fly-out on soft contact); 0 = pure force
