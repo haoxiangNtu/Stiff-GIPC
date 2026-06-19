@@ -137,7 +137,10 @@ def prepare_scene(name):
         # action layout [L_arm(0:7), gripL(7), R_arm(8:15), gripR(15)]
         p.update(arm_l=list(range(0, 7)), arm_r=list(range(8, 15)), grip_l=7, grip_r=15)
         p["ground_offset"] = float(ec.get("ground_offset", 0.75))
-        p["friction"] = float(ec.get("friction_rate", 0.8))
+        # friction_rate = IPC Coulomb coefficient mu for object/self contact (the
+        # gripper-finray <-> object friction). CASE39_FRICTION overrides the
+        # episode value — raise it (e.g. 1.0-1.5) if the cup/object slips.
+        p["friction"] = float(os.environ.get("CASE39_FRICTION", str(ec.get("friction_rate", 0.8))))
         p["precond"] = 0 if name == "beaker" else 1
         p["abs_dhat"] = 0.00239 if name == "beaker" else 0.0019
         if name == "foldshirt":
