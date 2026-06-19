@@ -383,22 +383,32 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
             robot.set_prismatic_position(pi, cl + s * (op - cl), millimeters=False)
         return
 
-    # gauge modes (stitch / force): grip>=0 -> open & reset; grip<0 -> march closed
-    # until the gauge crosses its threshold, then latch the opening fraction.
+    if mode == "force":
+        # forcebarrier (v0.6.4 final force scheme): REAL force drive — close with a
+        # constant prismatic FORCE (strength=0), and a one-sided IPC barrier armed
+        # at the closed limit cl (arm_force_barrier, once) guarantees the opening
+        # never overshoots past cl no matter the force. Open = position-hold.
+        for pi in pis:
+            op, cl = _open_close(robot, pi)
+            cd = 1.0 if (cl - op) > 0 else -1.0
+            if grip < 0:                                   # CLOSE: pure force, barrier stops at cl
+                eng.native.set_prismatic_strength(pi, 0.0)
+                eng.native.set_prismatic_force(pi, cd * P['barrier_force'])
+            else:                                          # OPEN: position-hold to open end
+                eng.native.set_prismatic_force(pi, 0.0)
+                eng.native.set_prismatic_strength(pi, P['pos_k'])
+                eng.native.set_prismatic_target(pi, op)
+        return
+
+    # stitch: spring-deformation-gauged POSITION drive. grip>=0 -> open & reset;
+    # grip<0 -> march the opening toward closed until the finray stitch-spring
+    # stretch crosses the threshold, then latch (hold, no further creep).
     st = gstate.setdefault(grp['key'], {'s': 1.0, 'latched': False})
     if grip >= 0:
         st['s'] = 1.0; st['latched'] = False
     else:
-        if mode == "stitch":
-            gauge = max((all_stretch[i] for i in grp['seg_idx']), default=0.0)
-            thresh = P['stitch_thresh']
-        else:  # force
-            gauge = 0.0
-            for (off, cnt) in grp['fems']:
-                cf = eng.native.get_body_contact_force(off, cnt)
-                gauge = max(gauge, float((cf[0]**2 + cf[1]**2 + cf[2]**2) ** 0.5))
-            thresh = P['force_target']
-        if gauge >= thresh:
+        gauge = max((all_stretch[i] for i in grp['seg_idx']), default=0.0) if all_stretch is not None else 0.0
+        if gauge >= P['stitch_thresh']:
             st['latched'] = True
         if not st['latched']:
             st['s'] = max(0.0, st['s'] - P['close_ds'])
@@ -452,10 +462,33 @@ def make_engine(prep, num_envs):
 def _drive_params():
     return dict(
         pos_k=float(os.environ.get("POS_K", os.environ.get("GRIP_K", "15.0"))),
-        close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.03")),          # opening-fraction/frame while closing
-        stitch_thresh=float(os.environ.get("GRIP_STITCH_THRESH", "5e-6")),  # m
-        force_target=float(os.environ.get("GRIP_FORCE_TARGET", "0.02")),    # N
+        close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.03")),          # stitch: opening-fraction/frame while closing
+        stitch_thresh=float(os.environ.get("GRIP_STITCH_THRESH", "5e-6")),  # stitch: latch stretch (m)
+        # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
+        barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "60.0")),  # closing force (N)
+        barrier_dhat=float(os.environ.get("GRIP_BARRIER_DHAT", "0.002")),   # barrier standoff from cl (m)
+        barrier_kappa=float(os.environ.get("GRIP_BARRIER_KAPPA", "1e3")),   # barrier stiffness
     )
+
+
+def arm_force_barrier(eng, robot, P, arm=True):
+    """forcebarrier: arm (or disarm, kappa<=0) the one-sided IPC barrier at each
+    prismatic joint's CLOSED limit cl, so a pure-force close can never overshoot
+    past cl. Call once after finalize (or on mode switch). Needs the force-control
+    engine build (set_prismatic_limit_barrier)."""
+    kappa = P['barrier_kappa'] if arm else 0.0
+    for pi in range(len(robot.prismatic_joints)):
+        op, cl = _open_close(robot, pi)
+        bdir = 1.0 if (op - cl) > 0 else -1.0      # gap = (d-cl)*bdir > 0 while open
+        eng.native.set_prismatic_limit_barrier(pi, cl, bdir, P['barrier_dhat'], kappa)
+
+
+def reset_prismatic_drive(eng, robot, P):
+    """Return every prismatic joint to plain position drive (force off, strength
+    pos_k) — used when switching AWAY from force mode in the UI."""
+    for pi in range(len(robot.prismatic_joints)):
+        eng.native.set_prismatic_force(pi, 0.0)
+        eng.native.set_prismatic_strength(pi, P['pos_k'])
 
 
 def _setup_after_finalize(eng, envs, P):
@@ -505,6 +538,8 @@ def run_replay(scene_name, default_envs=1):
     eng.finalize()
     print(f"[umi:{scene_name}] built {num_envs} envs in {time.perf_counter()-t0:.1f}s ({n_abd} ABD)", flush=True)
     robot = _setup_after_finalize(eng, envs, P)
+    if mode == "force":
+        arm_force_barrier(eng, robot, P)   # no-overshoot IPC barrier at the closed limit
     ejs = slice_env_joints(robot, num_envs)
     groups = build_drive_groups(envs, ejs)
     gstate = {}
@@ -610,6 +645,8 @@ def run_ui(scene_name):
     a0 = actions[0]
     _drive_arm(robot, ej, prep, a0)   # start at the trajectory's frame-0 arm pose
     MODES = ["pos", "stitch", "force"]
+    if MODES[MODES.index(os.environ.get("GRIP_MODE", "pos"))] == "force":
+        arm_force_barrier(eng, robot, P)
 
     v = eng.get_vertices(); fa = eng.get_surface_faces()
     ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("none")
@@ -635,10 +672,13 @@ def run_ui(scene_name):
             ui['show_edges'] = val_e; ui['mesh'].set_edge_width(0.5 if val_e else 0.0)
         psim.Text(f"{scene_name}   step {ui['ms']:6.1f} ms")
 
-        # gripper control MODE (live)
+        # gripper control MODE (live switch). Switching resets latch state, returns
+        # the joints to plain position drive, and arms/disarms the forcebarrier.
         cm, mi = psim.Combo("gripper mode", ui['mode_i'], MODES)
         if cm:
             ui['mode_i'] = mi; gstate.clear()
+            reset_prismatic_drive(eng, robot, P)
+            arm_force_barrier(eng, robot, P, arm=(MODES[mi] == "force"))
 
         # per-arm OPEN/CLOSE buttons (the prismatic gripper, L / R separate)
         psim.Separator()
