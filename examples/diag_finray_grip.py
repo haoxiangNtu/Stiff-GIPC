@@ -22,6 +22,8 @@ N = int(os.environ.get("CASE39ME_NUM_ENVS", "4"))
 END = {"beaker": 94, "cupshirt": 950, "foldshirt": 640}[scene]
 
 prep = L.prepare_scene(scene); P = L._drive_params()
+if "GRIP_FORCE_LOCK" not in os.environ:   # lock for rigid grasps; pure-force close for cloth-only
+    P['force_lock'] = 1 if prep['abd_obj'] else 0
 eng = L.make_engine(prep, N); sides = L.load_finray_sides()
 envs, _ = L.build_world(eng, prep, N, 4.0, sides, dict(abd_cursor=0))
 seg = L._stitch_seg_arrays(envs); eng.finalize()

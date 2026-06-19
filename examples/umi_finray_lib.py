@@ -388,25 +388,47 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
         return
 
     if mode == "force":
-        # forcebarrier (v0.6.4 final force scheme): REAL force drive — close with a
-        # constant prismatic FORCE (strength=0), and a one-sided IPC barrier armed
-        # at the closed limit cl (arm_force_barrier, once) guarantees the opening
-        # never overshoots past cl no matter the force. Open = position-hold.
-        for pi in pis:
-            op, cl = _open_close(robot, pi)
-            cd = 1.0 if (cl - op) > 0 else -1.0
-            if grip < 0:                                   # CLOSE: real closing FORCE toward cl;
-                # the cl-barrier stops over-close, and a SMALL position home at cl
-                # (force_strength) keeps deformable contact from shoving the free
-                # finger out past its OPEN limit. Set force_strength=0 for pure
-                # force (fine on rigid objects; flies out on soft cloth).
-                eng.native.set_prismatic_strength(pi, P['force_strength'])
-                eng.native.set_prismatic_target(pi, cl)
-                eng.native.set_prismatic_force(pi, cd * P['barrier_force'])
-            else:                                          # OPEN: position-hold to open end
+        # forcelock (v0.6.4 truegrip pattern): REAL force drive to CLOSE+grip, then
+        # once the finger STALLS against the object (gripped) LOCK to position so the
+        # grip is held rigidly and KEEPS UP with arm motion (a pure-force hold would
+        # lag/slip when the arm transports the object). Both-end IPC barriers prevent
+        # over-close / fly-out during the force phase.
+        st = gstate.setdefault(grp['key'], {'phase': 'close', 'dlock': {}, 'stall': 0, 'lastd': None})
+        if grip >= 0:                                      # OPEN -> reset + position-hold open
+            st['phase'] = 'close'; st['dlock'] = {}; st['stall'] = 0; st['lastd'] = None
+            for pi in pis:
+                op, cl = _open_close(robot, pi)
                 eng.native.set_prismatic_force(pi, 0.0)
                 eng.native.set_prismatic_strength(pi, P['pos_k'])
                 eng.native.set_prismatic_target(pi, op)
+            return
+        # CLOSE: detect stall (finger stopped advancing = gripped, or hit cl-barrier)
+        if st['phase'] == 'close':
+            d = eng.native.get_prismatic_current_distance(pis[0])
+            op0, cl0 = _open_close(robot, pis[0])
+            s_act = (d - cl0) / (op0 - cl0) if (op0 - cl0) != 0 else 0.0   # 1 open, 0 closed
+            st['stall'] = (st['stall'] + 1) if (st['lastd'] is not None
+                            and abs(d - st['lastd']) < P['force_stall_eps']) else 0
+            st['lastd'] = d
+            # Lock only once the finger has CLOSED past force_lock_max_s — otherwise
+            # the momentary no-motion while the force ramps up at the start latches
+            # the lock at the OPEN position (gripper never closes).
+            if (P['force_lock'] and s_act < P['force_lock_max_s']
+                    and st['stall'] >= P['force_stall_frames']):
+                st['phase'] = 'locked'
+                st['dlock'] = {pi: eng.native.get_prismatic_current_distance(pi) for pi in pis}
+        if st['phase'] == 'locked':                        # GRIPPED -> position-LOCK the grip
+            for pi in pis:
+                eng.native.set_prismatic_force(pi, 0.0)
+                eng.native.set_prismatic_strength(pi, P['lock_k'])
+                eng.native.set_prismatic_target(pi, st['dlock'][pi])
+        else:                                              # still closing -> real force drive
+            for pi in pis:
+                op, cl = _open_close(robot, pi)
+                cd = 1.0 if (cl - op) > 0 else -1.0
+                eng.native.set_prismatic_strength(pi, P['force_strength'])
+                eng.native.set_prismatic_target(pi, cl)
+                eng.native.set_prismatic_force(pi, cd * P['barrier_force'])
         return
 
     # stitch: spring-deformation-gauged POSITION drive. grip>=0 -> open & reset;
@@ -495,7 +517,12 @@ def _drive_params():
         stitch_resume_frac=float(os.environ.get("GRIP_STITCH_RESUME_FRAC", "0.5")),  # un-latch + re-close if stretch drops below thresh*this (object slipped/fell)
         # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
         barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "25.0")),  # closing force (N)
-        force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "0.0")), # 0 = PURE force (both-end hard barriers now prevent fly-out); >0 adds a soft position home
+        force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "0.0")), # 0 = PURE force during the close phase (both-end barriers prevent fly-out)
+        force_lock=int(os.environ.get("GRIP_FORCE_LOCK", "1")),             # 1 = lock to position once gripped (holds during arm motion); 0 = stay pure force
+        lock_k=float(os.environ.get("GRIP_LOCK_K", "15.0")),               # position stiffness of the post-grip lock
+        force_stall_eps=float(os.environ.get("GRIP_FORCE_STALL_EPS", "1e-4")),  # |Δd|/frame below this = finger stalled (gripped)
+        force_stall_frames=int(os.environ.get("GRIP_FORCE_STALL_FRAMES", "3")), # consecutive stalled frames before locking
+        force_lock_max_s=float(os.environ.get("GRIP_FORCE_LOCK_MAX_S", "0.7")), # only lock once closed past this opening-fraction (no lock-open at force-ramp start)
         barrier_dhat=float(os.environ.get("GRIP_BARRIER_DHAT", "0.002")),   # barrier standoff from cl (m)
         barrier_kappa=float(os.environ.get("GRIP_BARRIER_KAPPA", "1e3")),   # barrier stiffness
     )
@@ -559,6 +586,8 @@ def run_replay(scene_name, default_envs=1):
     spacing = float(os.environ.get("CASE39ME_SPACING", "4.0"))
     prep = prepare_scene(scene_name)
     P = _drive_params()
+    if "GRIP_FORCE_LOCK" not in os.environ:   # lock for rigid grasps; pure-force close for cloth-only
+        P['force_lock'] = 1 if prep['abd_obj'] else 0
     print(f"[umi:{scene_name}] mode={mode} envs={num_envs} frames={len(prep['actions'])} "
           f"grip={'binary' if prep['binary'] else 'continuous'} arm={os.path.basename(urdf_path())} "
           f"pos_k={P['pos_k']}", flush=True)
@@ -661,6 +690,8 @@ def run_ui(scene_name):
     import polyscope as ps, polyscope.imgui as psim
     prep = prepare_scene(scene_name)
     P = _drive_params()
+    if "GRIP_FORCE_LOCK" not in os.environ:   # lock for rigid grasps; pure-force close for cloth-only
+        P['force_lock'] = 1 if prep['abd_obj'] else 0
     print(f"[umi-ui:{scene_name}] grip={'binary' if prep['binary'] else 'continuous'} "
           f"arm={os.path.basename(urdf_path())}", flush=True)
     eng = make_engine(prep, 1)
