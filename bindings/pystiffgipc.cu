@@ -587,12 +587,15 @@ PYBIND11_MODULE(pystiffgipc, m)
              "pure force control also call set_prismatic_strength(idx, 0).")
         .def("set_prismatic_limit_barrier", &SimEngine::set_prismatic_limit_barrier,
              py::arg("idx"), py::arg("cl"), py::arg("dir"), py::arg("dhat"), py::arg("kappa"),
+             py::arg("slot") = 0,
              "[force-control] Arm a one-sided IPC log-barrier on prismatic joint "
-             "idx at the CLOSED coordinate `cl`: the solver then never lets the "
-             "opening d cross cl no matter how large the (force) drive — a HARD "
-             "no-overshoot guarantee while the joint stays pure force-controlled. "
-             "dir=+1 if the open end is at d>cl else -1; dhat=activation band (m); "
-             "kappa=barrier stiffness (<=0 disarms). Call after finalize().")
+             "idx at coordinate `cl`: the solver then never lets the opening d cross "
+             "cl no matter how large the (force) drive — a HARD no-overshoot "
+             "guarantee while the joint stays force-controlled. dir=+1 if the "
+             "allowed side is at d>cl else -1; dhat=activation band (m); "
+             "kappa=barrier stiffness (<=0 disarms). slot 0 = closed-end barrier, "
+             "slot 1 = open-end barrier (arm both for hard limits on BOTH ends). "
+             "Call after finalize().")
 
         .def("set_fixed_joint_strength",  &SimEngine::set_fixed_joint_strength,
              py::arg("idx"), py::arg("kappa"),

@@ -2601,7 +2601,7 @@ double SimEngine::get_prismatic_current_distance(int idx) const
 }
 
 void SimEngine::set_prismatic_limit_barrier(int idx, double cl, double dir,
-                                            double dhat, double kappa)
+                                            double dhat, double kappa, int slot)
 {
     // [force-control] Arm a one-sided IPC barrier on prismatic joint idx at the
     // CLOSED coordinate cl: the solver then NEVER lets d cross cl regardless of
@@ -2622,10 +2622,17 @@ void SimEngine::set_prismatic_limit_barrier(int idx, double cl, double dir,
     PrismaticDrivingGPUData drv;
     CUDA_SAFE_CALL(cudaMemcpy(&drv, sys.m_prismatic_driving_data.data() + idx,
                               sizeof(PrismaticDrivingGPUData), cudaMemcpyDeviceToHost));
-    drv.limit_cl    = static_cast<Float>(cl);
-    drv.limit_dir   = (dir >= 0.0) ? Float(1) : Float(-1);
-    drv.limit_dhat  = static_cast<Float>(dhat);
-    drv.limit_kappa = static_cast<Float>(kappa);
+    if(slot == 0) {                              // slot 0 = closed-end barrier
+        drv.limit_cl    = static_cast<Float>(cl);
+        drv.limit_dir   = (dir >= 0.0) ? Float(1) : Float(-1);
+        drv.limit_dhat  = static_cast<Float>(dhat);
+        drv.limit_kappa = static_cast<Float>(kappa);
+    } else {                                     // slot 1 = open-end barrier
+        drv.limit_cl2    = static_cast<Float>(cl);
+        drv.limit_dir2   = (dir >= 0.0) ? Float(1) : Float(-1);
+        drv.limit_dhat2  = static_cast<Float>(dhat);
+        drv.limit_kappa2 = static_cast<Float>(kappa);
+    }
     CUDA_SAFE_CALL(cudaMemcpy(sys.m_prismatic_driving_data.data() + idx, &drv,
                               sizeof(PrismaticDrivingGPUData), cudaMemcpyHostToDevice));
 }

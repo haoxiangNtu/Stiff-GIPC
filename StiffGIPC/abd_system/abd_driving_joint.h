@@ -680,24 +680,29 @@ struct PrismaticDrivingGPUData
     Float limit_dir   = Float(1);   // +1 if open end is at d>cl, else -1
     Float limit_dhat  = Float(0);   // activation band (m)
     Float limit_kappa = Float(0);   // barrier stiffness (<=0 = off)
+    // [force-control] SECOND one-sided barrier (slot 1), used for the OPEN end so a
+    // pure-force grip cannot overshoot past either limit. Same semantics as the
+    // first set; gap g2 = (d - limit_cl2)*limit_dir2. limit_kappa2<=0 = off.
+    Float limit_cl2    = Float(0);
+    Float limit_dir2   = Float(1);
+    Float limit_dhat2  = Float(0);
+    Float limit_kappa2 = Float(0);
 };
 
 
 /// One-sided IPC log-barrier on the prismatic coordinate at the closed limit.
 /// Returns barrier energy E and its 1st/2nd derivatives w.r.t. d. b(g) =
 /// -kappa*(g-dhat)^2*ln(g/dhat) for 0<g<dhat (g = (d-cl)*dir). Off if kappa<=0.
-MUDA_GENERIC inline void prismatic_limit_barrier(
-    Float d, const PrismaticDrivingGPUData& drv,
+// Core: ONE one-sided barrier given explicit (cl, dir, dhat, kappa).
+MUDA_GENERIC inline void _prismatic_one_barrier(
+    Float d, Float cl, Float dir, Float dh, Float k,
     Float& E, Float& dEdd, Float& d2Edd2)
 {
     E = Float(0); dEdd = Float(0); d2Edd2 = Float(0);
-    if(drv.limit_kappa <= Float(0) || drv.limit_dhat <= Float(0)) return;
-    Float dir = drv.limit_dir;
-    Float dh  = drv.limit_dhat;
-    Float g   = (d - drv.limit_cl) * dir;       // >0 while open
+    if(k <= Float(0) || dh <= Float(0)) return;
+    Float g   = (d - cl) * dir;                  // >0 on the allowed side
     if(g >= dh) return;                          // outside barrier support
     Float gc = g < Float(1e-9) ? Float(1e-9) : g;  // numerical floor (avoid log<=0)
-    Float k  = drv.limit_kappa;
     Float t  = gc - dh;                          // <0 in support
     Float ln = log(gc / dh);
     E      = -k * t * t * ln;
@@ -706,6 +711,18 @@ MUDA_GENERIC inline void prismatic_limit_barrier(
     dEdd   = bp * dir;                           // chain dg/dd = dir
     d2Edd2 = bpp;                                // dir^2 = 1
     if(d2Edd2 < Float(0)) d2Edd2 = Float(0);     // SPD safety
+}
+
+// Sum of BOTH one-sided barriers (slot 0 = closed end, slot 1 = open end). Either
+// is off when its kappa<=0, so single-barrier and no-barrier scenes are unchanged.
+MUDA_GENERIC inline void prismatic_limit_barrier(
+    Float d, const PrismaticDrivingGPUData& drv,
+    Float& E, Float& dEdd, Float& d2Edd2)
+{
+    Float E1, g1, h1, E2, g2, h2;
+    _prismatic_one_barrier(d, drv.limit_cl,  drv.limit_dir,  drv.limit_dhat,  drv.limit_kappa,  E1, g1, h1);
+    _prismatic_one_barrier(d, drv.limit_cl2, drv.limit_dir2, drv.limit_dhat2, drv.limit_kappa2, E2, g2, h2);
+    E = E1 + E2; dEdd = g1 + g2; d2Edd2 = h1 + h2;
 }
 
 

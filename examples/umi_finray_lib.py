@@ -495,22 +495,25 @@ def _drive_params():
         stitch_resume_frac=float(os.environ.get("GRIP_STITCH_RESUME_FRAC", "0.5")),  # un-latch + re-close if stretch drops below thresh*this (object slipped/fell)
         # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
         barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "25.0")),  # closing force (N)
-        force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "3.0")), # small position home at cl (anti fly-out on soft contact); 0 = pure force
+        force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "0.0")), # 0 = PURE force (both-end hard barriers now prevent fly-out); >0 adds a soft position home
         barrier_dhat=float(os.environ.get("GRIP_BARRIER_DHAT", "0.002")),   # barrier standoff from cl (m)
         barrier_kappa=float(os.environ.get("GRIP_BARRIER_KAPPA", "1e3")),   # barrier stiffness
     )
 
 
 def arm_force_barrier(eng, robot, P, arm=True):
-    """forcebarrier: arm (or disarm, kappa<=0) the one-sided IPC barrier at each
-    prismatic joint's CLOSED limit cl, so a pure-force close can never overshoot
-    past cl. Call once after finalize (or on mode switch). Needs the force-control
-    engine build (set_prismatic_limit_barrier)."""
+    """forcebarrier: arm (or disarm, kappa<=0) HARD IPC barriers at BOTH ends of
+    each prismatic joint — slot 0 at the CLOSED limit cl (no over-close) and slot 1
+    at the OPEN limit op (no over-open / fly-out). So a pure-force grip can never
+    overshoot past either limit even when deformable contact shoves the free finger.
+    Call once after finalize (or on mode switch). Needs the force-control engine
+    build (set_prismatic_limit_barrier with slot)."""
     kappa = P['barrier_kappa'] if arm else 0.0
     for pi in range(len(robot.prismatic_joints)):
         op, cl = _open_close(robot, pi)
-        bdir = 1.0 if (op - cl) > 0 else -1.0      # gap = (d-cl)*bdir > 0 while open
-        eng.native.set_prismatic_limit_barrier(pi, cl, bdir, P['barrier_dhat'], kappa)
+        bdir = 1.0 if (op - cl) > 0 else -1.0      # closed-end gap = (d-cl)*bdir > 0 while open
+        eng.native.set_prismatic_limit_barrier(pi, cl, bdir, P['barrier_dhat'], kappa, 0)
+        eng.native.set_prismatic_limit_barrier(pi, op, -bdir, P['barrier_dhat'], kappa, 1)  # open-end gap = (d-op)*(-bdir) > 0 while inside
 
 
 def reset_prismatic_drive(eng, robot, P):

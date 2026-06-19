@@ -428,7 +428,7 @@ class SimEngine
     void set_revolute_initial_offset(int idx, double offset_rad);
     void set_prismatic_target(int idx, double distance_m);
     void set_prismatic_force(int idx, double force);  // [force-control] external prismatic force (N)
-    void set_prismatic_limit_barrier(int idx, double cl, double dir, double dhat, double kappa);  // [force-control] one-sided IPC barrier at closed limit (hard no-overshoot)
+    void set_prismatic_limit_barrier(int idx, double cl, double dir, double dhat, double kappa, int slot = 0);  // [force-control] one-sided IPC barrier; slot 0=closed end, 1=open end (hard no-overshoot both ways)
     double get_prismatic_drive_force(int idx) const;  // [force-control] current K*(target-d) drive force
     double get_prismatic_current_distance(int idx) const;  // [force-control] current opening d along axis
     void   get_vertex_contact_force_sum(int vert_offset, int vert_count, double* out3) const;  // [force-control] net IPC contact force on a body
