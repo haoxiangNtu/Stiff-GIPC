@@ -22,9 +22,9 @@ the grasp compliance):
   stitch  spring-deformation-gauged: on a close command, march the opening toward
           closed until the finray STITCH-spring stretch (get_stitch_max_stretch)
           exceeds a threshold = "deformed enough, gripping", then latch.
-  force   force-combined position: on a close command, march toward closed until
-          the REAL IPC contact force on the finger (get_body_contact_force) reaches
-          a target, then latch the opening. (tactile-style closed loop)
+  force   force-limited impedance close: ramp a low-stiffness prismatic target
+          toward closed, stop/hold when the drive effort reaches a limit, and use
+          barriers only as mechanical end-stops. This is gripper-type agnostic.
 
 Arm revolute joints are always position-controlled. Per-env line-search (S1-S4)
 is available via STIFF_PERENV_ALPHA=1 (+ STIFF_PERENV_MASK=1) at run time.
@@ -75,6 +75,48 @@ def make_env_offsets(n, spacing):
         o[2, 3] = (r - (rows - 1) / 2.0) * spacing
         offs.append(o)
     return offs
+
+
+def _load_urdf_capture_joint_indices(eng, urdf_path, transform, *args):
+    """Load one URDF and return local joint-constraint indices by URDF joint name."""
+    import tempfile
+
+    quiet = int(os.environ.get("CASE39_QUIET", "1"))
+    if quiet:
+        eng.native.set_log_level(1)
+
+    log_path = tempfile.mktemp(prefix="umi_urdf_load_", suffix=".txt")
+    saved_fd1 = os.dup(1)
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.dup2(fd, 1)
+    os.close(fd)
+    try:
+        eng.native.load_urdf(urdf_path, transform, *args)
+        sys.stdout.flush()
+        try:
+            os.fsync(1)
+        except OSError:
+            pass
+    finally:
+        os.dup2(saved_fd1, 1)
+        os.close(saved_fd1)
+        if quiet:
+            eng.native.set_log_level(0)
+
+    try:
+        log = open(log_path).read()
+    finally:
+        try:
+            os.unlink(log_path)
+        except OSError:
+            pass
+
+    out = {}
+    for idx, m in enumerate(re.finditer(
+            r"\[UrdfSceneImporter\] Joint constraint '([^']+)' \((Fixed|Revolute)\):",
+            log)):
+        out[m.group(1)] = idx
+    return out
 
 
 def link_visual_origin(urdf, link_name):
@@ -207,9 +249,18 @@ def build_world(eng, prep, num_envs, spacing, sides, ge):
     up = urdf_path()
     envs = []
 
+    # Load the arm at joint-0 (initial_joint_angles={}); the per-frame drive slews it
+    # to the trajectory. We do NOT use load_urdf initial_joint_angles to "born it at
+    # frame-0": that has a load-pose-dependent FK issue in this engine (same commanded
+    # angles settle at a different arm pose, ~630mm, which made the short beaker grasp
+    # miss). The UI's "open static" is handled by a pre-settle step instead (run_ui).
     # Phase A: per env: URDF + 4 finray rigid roots + optional rigid (ABD) object
+    joint_cursor = 0
     for env_tf in offs:
-        eng.native.load_urdf(up, env_tf @ arm_tf0, True, False, 1e7, {})
+        local_joint_idx = _load_urdf_capture_joint_indices(
+            eng, up, env_tf @ arm_tf0, True, False, 1e7, {})
+        urdf_joint_indices = {name: joint_cursor + idx for name, idx in local_joint_idx.items()}
+        joint_cursor += len(local_joint_idx)
         env_abd = [r for r in eng.get_load_records() if r.body_type == 0]
         finger_recs = {}
         for r in reversed(env_abd):
@@ -244,6 +295,7 @@ def build_world(eng, prep, num_envs, spacing, sides, ge):
                                         young_modulus=ao["young"], boundary_type="Free")
             env["abd_obj_rec"] = eng.get_load_records()[-1]
         ge['abd_cursor'] = max(r.body_offset for r in eng.get_load_records() if r.body_type == 0) + 1
+        env["urdf_joint_indices"] = urdf_joint_indices
         envs.append(env)
 
     # Phase B: per env: 4 finray FEM trusses + optional cloth (FEM) + stitch + fixed joints
@@ -266,9 +318,13 @@ def build_world(eng, prep, num_envs, spacing, sides, ge):
                 eng.add_stitch_spring(g['fem_v_off'] + int(rvidx[i]), g['rigid_abd_v_off'] + i,
                                       g['rigid_abd_id'], rest_offset_world=(0., 0., 0.))
             stitch_cursor += len(rvidx)
-            anchor = g['gripper_T'][:3, 3]
+            # Fixed joint: pin each finray rigid root to its URDF finger seat. A
+            # SINGLE anchor is fully rigid (translation AND rotation) because the
+            # engine's fixed-joint energy penalizes all 3 affine basis axes t,n,b
+            # (matches libuipc). No multi-anchor workaround needed.
             g['fj_idx'] = eng.native.add_fixed_joint(
-                parent_body=g['finger_id'], child_body=g['rigid_abd_id'], world_anchor=anchor,
+                parent_body=g['finger_id'], child_body=g['rigid_abd_id'],
+                world_anchor=g['gripper_T'][:3, 3],
                 world_normal=np.array([1., 0., 0.]), world_bitangent=np.array([0., 0., 1.]))
 
     # exclusions
@@ -368,6 +424,21 @@ def _open_close(robot, pi):
     return op, cl
 
 
+def _prismatic_frame(robot, pi, d=None):
+    """Return (op, cl, bdir, gap, span), where gap is signed-open distance from cl."""
+    op, cl = _open_close(robot, pi)
+    bdir = 1.0 if (op - cl) > 0 else -1.0
+    span = max(abs(op - cl), 1e-9)
+    if d is None:
+        d = cl
+    gap = max(0.0, min(span, (d - cl) * bdir))
+    return op, cl, bdir, gap, span
+
+
+def _target_from_gap(cl, bdir, gap, span):
+    return cl + bdir * max(0.0, min(span, gap))
+
+
 def map_grip(grip, binary):
     """grip [-1,+1] -> opening fraction s in [0,1] (0 closed, 1 open)."""
     if binary:
@@ -388,56 +459,67 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
         return
 
     if mode == "force":
-        # DEFAULT: PURE force drive + both-end hard IPC barriers (no lock/stall/
-        # scene tricks). grip<0 -> constant closing FORCE (the cl-barrier stops
-        # over-close, the op-barrier stops fly-out); grip>=0 -> position-hold open.
-        if not P['force_lock']:
-            for pi in pis:
-                op, cl = _open_close(robot, pi)
-                cd = 1.0 if (cl - op) > 0 else -1.0
-                if grip < 0:
-                    eng.native.set_prismatic_strength(pi, 0.0)
-                    eng.native.set_prismatic_force(pi, cd * P['barrier_force'])
-                else:
-                    eng.native.set_prismatic_force(pi, 0.0)
-                    eng.native.set_prismatic_strength(pi, P['pos_k'])
-                    eng.native.set_prismatic_target(pi, op)
-            return
-        # OPT-IN (GRIP_FORCE_LOCK=1): force-close then position-LOCK once the finger
-        # STALLS (gripped). NOTE: stall-based lock is heuristic (LOCK_MAX_S guards
-        # the force-ramp false-stall). User intent is "lock only when FULLY closed"
-        # — revisit that semantics here. Kept off by default.
-        st = gstate.setdefault(grp['key'], {'phase': 'close', 'dlock': {}, 'stall': 0, 'lastd': None})
-        if grip >= 0:                                      # OPEN -> reset + position-hold open
-            st['phase'] = 'close'; st['dlock'] = {}; st['stall'] = 0; st['lastd'] = None
+        # IMPEDANCE (soft-K) grasp = "force control through position drive".
+        # A position-drive prismatic joint is a penalty spring F = K*(target - q).
+        # Command the target to the CLOSED limit cl with a SOFT stiffness k_grip:
+        #   - cloth: nothing stops the jaw, q -> cl, deflection ~0, F ~0 -> closes
+        #     gently to the mechanical stop, held shut by geometry + friction.
+        #   - rigid: the object stops the jaw at its surface, leaving a deflection
+        #     (cl - q_obj); the spring holds it with a BOUNDED grip force
+        #     F = k_grip*(cl - q_obj) (linear in penetration, capped by geometry).
+        # The spring always pulls toward cl, so a slipping object is followed
+        # automatically (free re-grasp); being pure position drive it is stiff in
+        # transport (a jaw pushed open develops MORE force -> anti-slip). One rule
+        # covers cloth AND rigid: no latch / grip-detection / rigid-vs-cloth branch.
+        # No IPC limit barrier needed: pure position drive settles AT its target
+        # (cl / op / latched), it cannot overshoot a limit the way the old naked
+        # force did. The real grip force is observable via get_prismatic_drive_force.
+        st = gstate.setdefault(grp['key'], {'latch': {}, 'on': {}, 'off': {}})
+        for k in ('latch', 'on', 'off'):
+            st.setdefault(k, {})
+        if grip >= 0:                                  # OPEN: stiff drive to op
+            st['latch'].clear(); st['on'].clear(); st['off'].clear()
             for pi in pis:
                 op, cl = _open_close(robot, pi)
                 eng.native.set_prismatic_force(pi, 0.0)
                 eng.native.set_prismatic_strength(pi, P['pos_k'])
                 eng.native.set_prismatic_target(pi, op)
             return
-        if st['phase'] == 'close':
-            d = eng.native.get_prismatic_current_distance(pis[0])
-            op0, cl0 = _open_close(robot, pis[0])
-            s_act = (d - cl0) / (op0 - cl0) if (op0 - cl0) != 0 else 0.0
-            st['stall'] = (st['stall'] + 1) if (st['lastd'] is not None
-                            and abs(d - st['lastd']) < P['force_stall_eps']) else 0
-            st['lastd'] = d
-            if s_act < P['force_lock_max_s'] and st['stall'] >= P['force_stall_frames']:
-                st['phase'] = 'locked'
-                st['dlock'] = {pi: eng.native.get_prismatic_current_distance(pi) for pi in pis}
-        if st['phase'] == 'locked':
-            for pi in pis:
-                eng.native.set_prismatic_force(pi, 0.0)
-                eng.native.set_prismatic_strength(pi, P['lock_k'])
-                eng.native.set_prismatic_target(pi, st['dlock'][pi])
-        else:
+        # CLOSE. Plain soft-K impedance unless GRIP_PINCH -> contact-stop latch.
+        if not P['grip_pinch']:
             for pi in pis:
                 op, cl = _open_close(robot, pi)
-                cd = 1.0 if (cl - op) > 0 else -1.0
-                eng.native.set_prismatic_strength(pi, P['force_strength'])
+                eng.native.set_prismatic_force(pi, 0.0)
+                eng.native.set_prismatic_strength(pi, P['k_grip'])
                 eng.native.set_prismatic_target(pi, cl)
-                eng.native.set_prismatic_force(pi, cd * P['barrier_force'])
+            return
+        # PINCH: soft-spring close, but freeze the joint when the finray contact
+        # force (this hand, summed over its fingers; read from the previous step)
+        # crosses grip_target -> stops at the object surface. Cloth (fc~0) never
+        # latches -> closes fully. Hysteresis: contact collapse -> unlatch+reclose.
+        fc = sum(float(np.linalg.norm(eng.native.get_body_contact_force(vo, vc)))
+                 for (vo, vc) in grp['fems'])
+        for pi in pis:
+            op, cl = _open_close(robot, pi)
+            eng.native.set_prismatic_force(pi, 0.0)
+            if pi in st['latch']:                      # HELD at frozen opening
+                st['off'][pi] = (st['off'].get(pi, 0) + 1
+                                 if fc < P['grip_target'] * P['pinch_resume_frac'] else 0)
+                if st['off'][pi] >= P['pinch_frames']:  # object dropped -> reclose
+                    st['latch'].pop(pi, None); st['off'][pi] = 0; st['on'][pi] = 0
+                else:
+                    eng.native.set_prismatic_strength(pi, P['lock_k'])
+                    eng.native.set_prismatic_target(pi, st['latch'][pi])
+                    continue
+            st['on'][pi] = st['on'].get(pi, 0) + 1 if fc >= P['grip_target'] else 0
+            if st['on'][pi] >= P['pinch_frames']:      # firm contact -> pinch here
+                d = eng.native.get_prismatic_current_distance(pi)
+                st['latch'][pi] = d; st['on'][pi] = 0
+                eng.native.set_prismatic_strength(pi, P['lock_k'])
+                eng.native.set_prismatic_target(pi, d)
+                continue
+            eng.native.set_prismatic_strength(pi, P['k_grip'])  # still closing
+            eng.native.set_prismatic_target(pi, cl)
         return
 
     # stitch: spring-deformation-gauged POSITION drive. grip>=0 -> open & reset;
@@ -513,7 +595,7 @@ def make_engine(prep, num_envs):
     return eng
 
 
-def _drive_params():
+def _drive_params(num_envs=1):
     return dict(
         pos_k=float(os.environ.get("POS_K", os.environ.get("GRIP_K", "15.0"))),
         close_ds=float(os.environ.get("GRIP_CLOSE_DS", "0.03")),           # stitch: opening-fraction/frame while closing
@@ -524,32 +606,39 @@ def _drive_params():
         stitch_debounce=int(os.environ.get("GRIP_STITCH_DEBOUNCE", "1")),   # frames over thresh before latching
         stitch_min_s=float(os.environ.get("GRIP_STITCH_MIN_S", "0.3")),     # must close to s<this before latch (firm grip on rigid)
         stitch_resume_frac=float(os.environ.get("GRIP_STITCH_RESUME_FRAC", "0.5")),  # un-latch + re-close if stretch drops below thresh*this (object slipped/fell)
-        # forcebarrier (real force drive + no-overshoot IPC barrier at the closed limit)
-        barrier_force=float(os.environ.get("GRIP_BARRIER_FORCE", "25.0")),  # closing force (N)
-        force_strength=float(os.environ.get("GRIP_FORCE_STRENGTH", "0.0")), # 0 = PURE force during the close phase (both-end barriers prevent fly-out)
-        force_lock=int(os.environ.get("GRIP_FORCE_LOCK", "0")),             # DEFAULT 0 = pure force + both-end barriers; 1 = opt-in stall-lock (heuristic, see drive_side)
-        lock_k=float(os.environ.get("GRIP_LOCK_K", "15.0")),               # position stiffness of the post-grip lock
-        force_stall_eps=float(os.environ.get("GRIP_FORCE_STALL_EPS", "1e-4")),  # |Δd|/frame below this = finger stalled (gripped)
-        force_stall_frames=int(os.environ.get("GRIP_FORCE_STALL_FRAMES", "3")), # consecutive stalled frames before locking
-        force_lock_max_s=float(os.environ.get("GRIP_FORCE_LOCK_MAX_S", "0.7")), # only lock once closed past this opening-fraction (no lock-open at force-ramp start)
-        barrier_dhat=float(os.environ.get("GRIP_BARRIER_DHAT", "0.002")),   # barrier standoff from cl (m)
-        barrier_kappa=float(os.environ.get("GRIP_BARRIER_KAPPA", "1e3")),   # barrier stiffness
+        # force mode: soft-K IMPEDANCE close (target=cl, soft spring). k_grip is
+        # the ONE control knob -> grip force = k_grip*(cl-q_obj) on rigid; cloth
+        # closes gently (deflection~0). pos_k (stiff) is reused for the OPEN drive.
+        k_grip=float(os.environ.get("GRIP_K_GRIP", "3.0")),
+        # PINCH variant (GRIP_PINCH=1): soft-spring close BUT freeze the joint the
+        # moment the finray CONTACT force (get_body_contact_force, the only signal
+        # that feels the object before full close) reaches grip_target -> stops/holds
+        # at the object surface (pinch at diameter) instead of closing dead. Cloth
+        # (contact force ~0) never triggers -> falls through to full close. No
+        # rigid/cloth classification needed. lock_k holds the frozen opening.
+        grip_pinch=int(os.environ.get("GRIP_PINCH", "1")),   # DEFAULT pinch (stop at object); GRIP_PINCH=0 = plain soft-K impedance (closes dead + wrap)
+        grip_target=float(os.environ.get("GRIP_TARGET", "0.03")),       # finray contact force (N) that latches the pinch. LOWER = wider pinch (latches earlier). Object-dependent ramp steepness; 0.03 gives ~17-18mm pinch on beaker+cup at the default step cap. 0.10 was above the cup's force peak -> latched near-closed.
+        pinch_frames=int(os.environ.get("GRIP_PINCH_FRAMES", "1")),     # debounce frames for latch / unlatch (1 = latch ASAP, needed so the faster close doesn't overshoot the pinch point)
+        pinch_resume_frac=float(os.environ.get("GRIP_PINCH_RESUME_FRAC", "0.4")),  # unlatch+reclose if held contact drops below grip_target*this (object dropped)
+        # force mode (impedance / pinch) engine setup:
+        lock_k=float(os.environ.get("GRIP_LOCK_K", "15.0")),               # position-hold stiffness for the pinch latch
+        force_step_cap=float(os.environ.get("GRIP_FORCE_STEP_CAP", "0.012")), # engine-side max prismatic step/frame (m). Sets CLOSE SPEED: 41mm span / step = frames to close (0.012 -> ~4 frames; was 0.006 -> 7, felt slow). Higher = faster but erodes pinch width unless the latch keeps up (pinch_frames=1).
     )
 
 
+def setup_force_mode(eng, robot, P):
+    """Engine setup for force (impedance / pinch) mode: cap the per-frame prismatic
+    step for stability. Call once after finalize (or on UI mode switch into force).
+    No IPC limit barrier any more — pure position drive can't overshoot a limit, so
+    the old arm_force_barrier (and the multi-env barrier-conditioning it caused) is
+    gone. Needs the force-control engine build."""
+    eng.native.set_max_prismatic_step_per_frame(P['force_step_cap'])
+
+
+# Back-compat alias for older diag/entry scripts that call arm_force_barrier.
 def arm_force_barrier(eng, robot, P, arm=True):
-    """forcebarrier: arm (or disarm, kappa<=0) HARD IPC barriers at BOTH ends of
-    each prismatic joint — slot 0 at the CLOSED limit cl (no over-close) and slot 1
-    at the OPEN limit op (no over-open / fly-out). So a pure-force grip can never
-    overshoot past either limit even when deformable contact shoves the free finger.
-    Call once after finalize (or on mode switch). Needs the force-control engine
-    build (set_prismatic_limit_barrier with slot)."""
-    kappa = P['barrier_kappa'] if arm else 0.0
-    for pi in range(len(robot.prismatic_joints)):
-        op, cl = _open_close(robot, pi)
-        bdir = 1.0 if (op - cl) > 0 else -1.0      # closed-end gap = (d-cl)*bdir > 0 while open
-        eng.native.set_prismatic_limit_barrier(pi, cl, bdir, P['barrier_dhat'], kappa, 0)
-        eng.native.set_prismatic_limit_barrier(pi, op, -bdir, P['barrier_dhat'], kappa, 1)  # open-end gap = (d-op)*(-bdir) > 0 while inside
+    if arm:
+        setup_force_mode(eng, robot, P)
 
 
 def reset_prismatic_drive(eng, robot, P):
@@ -567,9 +656,20 @@ def _setup_after_finalize(eng, envs, P):
                 eng.native.set_body_apply_gravity(a, False)
             for g in env['grippers']:
                 eng.native.set_body_apply_gravity(g['rigid_abd_id'], False)
+    fjk = float(os.environ.get("CASE36_FJ_KAPPA", "1e3"))
     for env in envs:
         for g in env['grippers']:
-            eng.native.set_fixed_joint_strength(g['fj_idx'], float(os.environ.get("CASE36_FJ_KAPPA", "1e3")))
+            eng.native.set_fixed_joint_strength(g['fj_idx'], fjk)
+    hand_link8_k = float(os.environ.get("CASE39_HAND_LINK8_K", "1000"))
+    bumped = 0
+    for env in envs:
+        for jname, jidx in env.get("urdf_joint_indices", {}).items():
+            if "_arm_link8" in jname and "hand_joint" in jname:
+                eng.native.set_fixed_joint_strength(jidx, hand_link8_k)
+                bumped += 1
+    if bumped == 0:
+        print("[umi] WARN: no URDF *_hand_joint_*_arm_link8 fixed joints found to bump",
+              flush=True)
     eng.native.set_max_revolute_step_per_frame(float(os.environ.get("CASE36_MAX_RAD_PER_FRAME", "0.04")))
     robot = Robot(eng)
     for i in range(len(robot.prismatic_joints)):
@@ -594,7 +694,7 @@ def run_replay(scene_name, default_envs=1):
     num_envs = int(os.environ.get("CASE39ME_NUM_ENVS", str(default_envs)))
     spacing = float(os.environ.get("CASE39ME_SPACING", "4.0"))
     prep = prepare_scene(scene_name)
-    P = _drive_params()
+    P = _drive_params(num_envs)
     print(f"[umi:{scene_name}] mode={mode} envs={num_envs} frames={len(prep['actions'])} "
           f"grip={'binary' if prep['binary'] else 'continuous'} arm={os.path.basename(urdf_path())} "
           f"pos_k={P['pos_k']}", flush=True)
@@ -608,7 +708,7 @@ def run_replay(scene_name, default_envs=1):
     print(f"[umi:{scene_name}] built {num_envs} envs in {time.perf_counter()-t0:.1f}s ({n_abd} ABD)", flush=True)
     robot = _setup_after_finalize(eng, envs, P)
     if mode == "force":
-        arm_force_barrier(eng, robot, P)   # no-overshoot IPC barrier at the closed limit
+        setup_force_mode(eng, robot, P)   # per-frame prismatic step cap (no barrier)
     ejs = slice_env_joints(robot, num_envs)
     groups = build_drive_groups(envs, ejs)
     gstate = {}
@@ -658,16 +758,21 @@ def run_replay(scene_name, default_envs=1):
             st['idx'] = 0; st['run'] = False
         psim.Text(f"{scene_name}  mode={mode}  envs={num_envs}  frame {st['idx']}/{L}")
         psim.Text(f"step {st['ms']:6.1f} ms")
-        if not st['run'] or st['idx'] >= L:
+        if not st['run']:
             return
-        drive_frame(eng, robot, ejs, groups, prep, actions[st['idx']], mode, gstate, P, stitch_seg)
+        # After the trajectory ends, KEEP simulating but hold the last frame's
+        # action (arm pose + grip command frozen) so the grasp can be observed /
+        # settle instead of the sim halting at frame L.
+        fr = min(st['idx'], L - 1)
+        drive_frame(eng, robot, ejs, groups, prep, actions[fr], mode, gstate, P, stitch_seg)
         t = time.perf_counter(); eng.step(); st['ms'] = (time.perf_counter() - t) * 1000.0
         v = eng.get_vertices(); fa = eng.get_surface_faces()
         if v.shape[0] != st['v'].shape[0] or fa.shape != st['f'].shape:
             st['mesh'] = ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)); st['v'], st['f'] = v, fa
         else:
             st['mesh'].update_vertex_positions(v)
-        st['idx'] += 1
+        if st['idx'] < L:
+            st['idx'] += 1
 
     ps.set_user_callback(cb); ps.show()
 
@@ -712,10 +817,33 @@ def run_ui(scene_name):
     gstate = {}
     actions = prep["actions"]
     a0 = actions[0]
-    _drive_arm(robot, ej, prep, a0)   # start at the trajectory's frame-0 arm pose
+    _drive_arm(robot, ej, prep, a0)   # target = the trajectory's frame-0 arm pose
     MODES = ["pos", "stitch", "force"]
-    if MODES[MODES.index(os.environ.get("GRIP_MODE", "pos"))] == "force":
-        arm_force_barrier(eng, robot, P)
+    mode0 = os.environ.get("GRIP_MODE", "pos")
+    if mode0 == "force":
+        setup_force_mode(eng, robot, P)
+
+    # PRE-SETTLE: the arm is loaded at joint-0 and would visibly slew to the frame-0
+    # pose over the first ~100 steps once the user hits Run. Slew it here FIRST (so the
+    # UI opens with the arm already at its start pose, static), with the OBJECT's
+    # gravity frozen so it doesn't fall during the slew. Uses the (faithful, joint-0)
+    # drive -- no initial_joint_angles, so no FK load-pose shift.
+    obj_ids = []
+    for env in envs:
+        if env.get("abd_obj_rec") is not None:
+            obj_ids.append(env["abd_obj_rec"].body_offset)
+        if env.get("fem_obj_rec") is not None:
+            obj_ids.append(n_abd + env["fem_obj_rec"].body_offset)
+    for bid in obj_ids:
+        eng.native.set_body_apply_gravity(bid, False)
+    for _ in range(int(os.environ.get("UI_PRESETTLE_FRAMES", "150"))):
+        _drive_arm(robot, ej, prep, a0)
+        drive_side(eng, robot, grp_by_side['L'], 1.0, prep["binary"], mode0, gstate, P, None)
+        drive_side(eng, robot, grp_by_side['R'], 1.0, prep["binary"], mode0, gstate, P, None)
+        eng.step()
+    for bid in obj_ids:
+        eng.native.set_body_apply_gravity(bid, True)
+    gstate.clear()   # forget the pre-settle's gripper state
 
     v = eng.get_vertices(); fa = eng.get_surface_faces()
     ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("none")
@@ -741,13 +869,14 @@ def run_ui(scene_name):
             ui['show_edges'] = val_e; ui['mesh'].set_edge_width(0.5 if val_e else 0.0)
         psim.Text(f"{scene_name}   step {ui['ms']:6.1f} ms")
 
-        # gripper control MODE (live switch). Switching resets latch state, returns
-        # the joints to plain position drive, and arms/disarms the forcebarrier.
+        # gripper control MODE (live switch). Switching resets latch state and
+        # returns the joints to plain position drive; force mode caps the step.
         cm, mi = psim.Combo("gripper mode", ui['mode_i'], MODES)
         if cm:
             ui['mode_i'] = mi; gstate.clear()
             reset_prismatic_drive(eng, robot, P)
-            arm_force_barrier(eng, robot, P, arm=(MODES[mi] == "force"))
+            if MODES[mi] == "force":
+                setup_force_mode(eng, robot, P)
 
         # per-arm OPEN/CLOSE buttons (the prismatic gripper, L / R separate)
         psim.Separator()
