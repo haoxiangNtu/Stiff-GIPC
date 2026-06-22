@@ -573,14 +573,22 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch, all_
         robot.set_prismatic_position(pi, cl + st['s'] * (op - cl), millimeters=False)
 
 
-def drive_frame(eng, robot, ejs, groups, prep, raw, mode, gstate, P, stitch_seg):
-    """Apply one trajectory frame to all envs: arm revolutes + grippers."""
+def drive_frame(eng, robot, ejs, groups, prep, raw, mode, gstate, P, stitch_seg, per_env_raw=None):
+    """Apply one trajectory frame to all envs: arm revolutes + grippers.
+
+    per_env_raw (optional): list of per-env action vectors (one per env, already
+    frame-indexed for that env's OWN trajectory) -> HETEROGENEOUS multi-env, each
+    env on a different arm/gripper trajectory (like loading N episodes). If None,
+    all envs share `raw`. Batched stitch/contact reads stay once-per-frame either
+    way (the speed win is preserved)."""
     al, ar, gl, gr = prep["arm_l"], prep["arm_r"], prep["grip_l"], prep["grip_r"]
-    for ej in ejs:
+    rfor = (lambda e: per_env_raw[e]) if per_env_raw is not None else (lambda e: raw)
+    for e, ej in enumerate(ejs):
+        r = rfor(e)
         for i, ri in enumerate(ej['left_rev']):
-            robot.set_revolute_position(ri, float(raw[al[i]]), degree=False)
+            robot.set_revolute_position(ri, float(r[al[i]]), degree=False)
         for i, ri in enumerate(ej['right_rev']):
-            robot.set_revolute_position(ri, float(raw[ar[i]]), degree=False)
+            robot.set_revolute_position(ri, float(r[ar[i]]), degree=False)
     all_stretch = None
     if mode == "stitch" and stitch_seg is not None:
         all_stretch = eng.native.get_stitch_max_stretch_batched(stitch_seg[0], stitch_seg[1])
@@ -590,7 +598,8 @@ def drive_frame(eng, robot, ejs, groups, prep, raw, mode, gstate, P, stitch_seg)
         if cf is not None:
             all_contact = eng.native.get_body_contact_force_batched(cf[0], cf[1])  # ONE D2H for all envs
     for grp in groups:
-        grip = float(raw[gl]) if grp['key'][1] == 'L' else float(raw[gr])
+        r = rfor(grp['key'][0])
+        grip = float(r[gl]) if grp['key'][1] == 'L' else float(r[gr])
         drive_side(eng, robot, grp, grip, prep["binary"], mode, gstate, P, all_stretch, all_contact)
 
 
@@ -732,6 +741,57 @@ def _contact_seg_arrays(groups, gstate):
 
 
 # ----------------------------------------------------------------------------
+# Per-env trajectories (HETEROGENEOUS multi-env).
+# ----------------------------------------------------------------------------
+def _load_traj_pool(prep, num_envs):
+    """Per-env arm/gripper trajectories so each env runs a DIFFERENT motion (like
+    loading N episodes), not all envs in lockstep on one recording. Returns
+    (per_env_actions, max_len) or (None, L) for the homogeneous fast path.
+    Sources, first that applies:
+      CASE39ME_TRAJ_GLOB=<glob>   load matching .hdf5 episodes, round-robin to envs
+                                  (TRUE N-trajectory case; episodes may differ in length)
+      CASE39ME_TRAJ_JITTER=<rad>  synthetic: per-env constant arm-joint offset
+      CASE39ME_PHASE=<frames>     per-env time-phase offset of the one recording
+      else                        None -> all envs identical (fast path)"""
+    import glob as _glob
+    base = prep["actions"]; L = len(base)
+    if num_envs <= 1:
+        return None, L
+    g = os.environ.get("CASE39ME_TRAJ_GLOB", "")
+    if g:
+        import h5py
+        files = sorted(_glob.glob(g))
+        if not files:
+            raise FileNotFoundError(f"CASE39ME_TRAJ_GLOB matched no files: {g}")
+        pool = []
+        for fp in files:
+            with h5py.File(fp, "r") as h:
+                pool.append(np.ascontiguousarray(h["actions"][:]))
+        per_env = [pool[e % len(pool)] for e in range(num_envs)]
+        names = [os.path.basename(f) for f in files]
+        print(f"[traj] {len(files)} episodes -> {num_envs} envs (round-robin); "
+              f"lengths {[len(a) for a in pool][:6]}{'...' if len(pool)>6 else ''}", flush=True)
+        return per_env, max(len(a) for a in per_env)
+    jit = float(os.environ.get("CASE39ME_TRAJ_JITTER", "0"))
+    if jit > 0.0:
+        cols = prep["arm_l"] + prep["arm_r"]
+        per_env = []
+        for e in range(num_envs):
+            a = base.copy()
+            for j, c in enumerate(cols):                       # deterministic per-env offset
+                a[:, c] = a[:, c] + jit * math.sin(0.7 * (e + 1) + 1.3 * j)
+            per_env.append(a)
+        print(f"[traj] synthetic per-env arm jitter +/-{jit} rad over {num_envs} envs", flush=True)
+        return per_env, L
+    phase = int(os.environ.get("CASE39ME_PHASE", "0"))
+    if phase:
+        per_env = [np.roll(base, -e * phase, axis=0) for e in range(num_envs)]
+        print(f"[traj] per-env time-phase offset {phase} frames over {num_envs} envs", flush=True)
+        return per_env, L
+    return None, L
+
+
+# ----------------------------------------------------------------------------
 # Harnesses.
 # ----------------------------------------------------------------------------
 def run_replay(scene_name, default_envs=1):
@@ -758,23 +818,19 @@ def run_replay(scene_name, default_envs=1):
     groups = build_drive_groups(envs, ejs)
     gstate = {}
     actions, L = prep["actions"], len(prep["actions"])
-    phase = int(os.environ.get("CASE39ME_PHASE", "0"))
+    per_env_actions, Lmax = _load_traj_pool(prep, num_envs)   # heterogeneous multi-env if not None
+    hetero = per_env_actions is not None
 
     if int(os.environ.get("CASE39ME_HEADLESS", "0")):
         f0 = int(os.environ.get("CASE39_FRAME_START", "0"))
-        f1 = min(int(os.environ.get("CASE39_FRAME_END", str(L))), L)
+        f1 = min(int(os.environ.get("CASE39_FRAME_END", str(Lmax))), Lmax)
         ms = []
         for fr in range(f0, f1):
-            # per-env trajectory phase offset: drive each group's env from its own frame
-            if phase:
-                for grp in groups:
-                    e = grp['key'][0]
-                    raw = actions[(fr + e * phase) % L]
-                    _drive_one_group(eng, robot, grp, prep, raw, mode, gstate, P, stitch_seg)
-                # arms per env
-                for e, ej in enumerate(ejs):
-                    raw = actions[(fr + e * phase) % L]
-                    _drive_arm(robot, ej, prep, raw)
+            if hetero:   # each env on its OWN trajectory (clamped to that traj's end)
+                per_env_raw = [per_env_actions[e][min(fr, len(per_env_actions[e]) - 1)]
+                               for e in range(num_envs)]
+                drive_frame(eng, robot, ejs, groups, prep, per_env_raw[0], mode, gstate, P,
+                            stitch_seg, per_env_raw=per_env_raw)
             else:
                 drive_frame(eng, robot, ejs, groups, prep, actions[fr], mode, gstate, P, stitch_seg)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter() - t) * 1000.0)
@@ -801,22 +857,28 @@ def run_replay(scene_name, default_envs=1):
         psim.SameLine()
         if psim.Button("Reset"):
             st['idx'] = 0; st['run'] = False
-        psim.Text(f"{scene_name}  mode={mode}  envs={num_envs}  frame {st['idx']}/{L}")
+        psim.Text(f"{scene_name}  mode={mode}  envs={num_envs}{'  [hetero]' if hetero else ''}  frame {st['idx']}/{Lmax}")
         psim.Text(f"step {st['ms']:6.1f} ms")
         if not st['run']:
             return
         # After the trajectory ends, KEEP simulating but hold the last frame's
         # action (arm pose + grip command frozen) so the grasp can be observed /
-        # settle instead of the sim halting at frame L.
-        fr = min(st['idx'], L - 1)
-        drive_frame(eng, robot, ejs, groups, prep, actions[fr], mode, gstate, P, stitch_seg)
+        # settle instead of the sim halting at the end.
+        fr = min(st['idx'], Lmax - 1)
+        if hetero:
+            per_env_raw = [per_env_actions[e][min(fr, len(per_env_actions[e]) - 1)]
+                           for e in range(num_envs)]
+            drive_frame(eng, robot, ejs, groups, prep, per_env_raw[0], mode, gstate, P,
+                        stitch_seg, per_env_raw=per_env_raw)
+        else:
+            drive_frame(eng, robot, ejs, groups, prep, actions[min(fr, L - 1)], mode, gstate, P, stitch_seg)
         t = time.perf_counter(); eng.step(); st['ms'] = (time.perf_counter() - t) * 1000.0
         v = eng.get_vertices(); fa = eng.get_surface_faces()
         if v.shape[0] != st['v'].shape[0] or fa.shape != st['f'].shape:
             st['mesh'] = ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)); st['v'], st['f'] = v, fa
         else:
             st['mesh'].update_vertex_positions(v)
-        if st['idx'] < L:
+        if st['idx'] < Lmax:
             st['idx'] += 1
 
     ps.set_user_callback(cb); ps.show()
