@@ -22,6 +22,11 @@ and [Semantic Versioning](https://semver.org/).
   pos / stitch / force × single-replay / multi-env / interactive-UI
   (`examples/umi_finray_lib.py` + thin entry scripts).
 - **Duck multi-env scaling example** (rigid grasp → 512 envs).
+- **Batched contact-force readback** `get_body_contact_force_batched(offsets, counts)`
+  — rebuilds contacts ONCE and sums every finger in one kernel + one D2H, vs the
+  per-body `get_body_contact_force` which rebuilt contacts on every call. Used by
+  the finray pinch latch; ~2.1× faster multi-env force replay (foldshirt N=10:
+  795s → 374s, approaching the pos/stitch ~322s solve floor).
 
 ### Changed
 - **`force` gripper mode** rewritten to *force-control-through-position-drive*:

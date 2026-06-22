@@ -670,6 +670,24 @@ PYBIND11_MODULE(pystiffgipc, m)
              "Returns an array of per-segment maxes. Blocks are independent (no "
              "cross-segment atomics) so different fingers/ENVS never interfere. "
              "Designed for multi-env: pass every finger of every env as a segment.")
+        .def("get_body_contact_force_batched",
+             [](const SimEngine& self,
+                py::array_t<int, py::array::c_style | py::array::forcecast> offsets,
+                py::array_t<int, py::array::c_style | py::array::forcecast> counts) {
+                 int n = static_cast<int>(offsets.size());
+                 std::vector<double> out(n > 0 ? n * 3 : 3, 0.0);
+                 self.get_body_contact_force_batched(offsets.data(), counts.data(), n, out.data());
+                 auto arr = py::array_t<double>({n, 3});
+                 auto b = arr.mutable_unchecked<2>();
+                 for(int i = 0; i < n; i++) { b(i, 0) = out[i*3+0]; b(i, 1) = out[i*3+1]; b(i, 2) = out[i*3+2]; }
+                 return arr;
+             },
+             py::arg("offsets"), py::arg("counts"),
+             "[force-control] BATCHED net IPC contact force: rebuilds contacts ONCE, "
+             "then sums each segment's vertices in ONE kernel launch with ONE D2H -> "
+             "an (n_seg, 3) array of per-finger grip forces. Replaces N serial "
+             "get_body_contact_force calls (each of which rebuilt contacts) at scale. "
+             "Pass every finger of every env as a segment. Call AFTER step().")
 
         .def("get_revolute_current_angles", [](const SimEngine& e) {
             int n = e.get_num_revolute_joints();

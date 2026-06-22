@@ -832,6 +832,14 @@ class Engine:
     def get_prismatic_current_distance(self, idx: int) -> float:
         return self._engine.get_prismatic_current_distance(idx)
 
+    def get_body_contact_force_batched(self, offsets, counts) -> np.ndarray:
+        """BATCHED net IPC contact force: one contact rebuild + one D2H for all
+        segments. `offsets`/`counts` are per-finger vertex ranges; returns an
+        (n_seg, 3) array of per-finger grip forces. Call AFTER step()."""
+        return self._engine.get_body_contact_force_batched(
+            np.ascontiguousarray(offsets, dtype=np.int32),
+            np.ascontiguousarray(counts, dtype=np.int32))
+
     def get_revolute_current_angles(self) -> np.ndarray:
         """Read actual joint angles from GPU state.
 

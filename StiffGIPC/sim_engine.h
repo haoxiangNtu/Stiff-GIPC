@@ -432,6 +432,7 @@ class SimEngine
     double get_prismatic_drive_force(int idx) const;  // [force-control] current K*(target-d) drive force
     double get_prismatic_current_distance(int idx) const;  // [force-control] current opening d along axis
     void   get_vertex_contact_force_sum(int vert_offset, int vert_count, double* out3) const;  // [force-control] net IPC contact force on a body
+    void   get_body_contact_force_batched(const int* offsets, const int* counts, int n_seg, double* out3) const;  // [force-control] BATCHED: rebuild contacts ONCE, sum per segment (finger/env) -> n_seg 3-vectors, ONE D2H
     double get_stitch_max_stretch(int pair_start, int pair_count) const;  // [force-control] on-GPU max stitch stretch over a spring range (scalar; no full-vertex D2H)
     void   get_stitch_max_stretch_batched(const int* starts, const int* counts, int n_seg, double* out) const;  // [force-control] BATCHED: one block per segment (finger/env), one launch, per-segment maxes — multi-env isolated
 

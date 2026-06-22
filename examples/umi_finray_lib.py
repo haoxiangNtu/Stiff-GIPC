@@ -446,8 +446,13 @@ def map_grip(grip, binary):
     return min(max((grip + 1.0) * 0.5, 0.0), 1.0)
 
 
-def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
-    """Drive one hand's prismatic joints per the selected gripper mode."""
+def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch, all_contact=None):
+    """Drive one hand's prismatic joints per the selected gripper mode.
+
+    all_contact (optional): a pre-computed (n_finger, 3) batched contact-force
+    array (one D2H for ALL envs); if given, the pinch path indexes it via
+    grp['_cf_idx'] instead of doing per-finger get_body_contact_force calls (which
+    each rebuild contacts -> N serial D2H syncs/frame at scale)."""
     pis = grp['pris']
     if not pis:
         return
@@ -497,8 +502,11 @@ def drive_side(eng, robot, grp, grip, binary, mode, gstate, P, all_stretch):
         # force (this hand, summed over its fingers; read from the previous step)
         # crosses grip_target -> stops at the object surface. Cloth (fc~0) never
         # latches -> closes fully. Hysteresis: contact collapse -> unlatch+reclose.
-        fc = sum(float(np.linalg.norm(eng.native.get_body_contact_force(vo, vc)))
-                 for (vo, vc) in grp['fems'])
+        if all_contact is not None and '_cf_idx' in grp:   # BATCHED (one D2H/frame)
+            fc = sum(float(np.linalg.norm(all_contact[i])) for i in grp['_cf_idx'])
+        else:                                               # fallback: per-finger (N=1/UI)
+            fc = sum(float(np.linalg.norm(eng.native.get_body_contact_force(vo, vc)))
+                     for (vo, vc) in grp['fems'])
         for pi in pis:
             op, cl = _open_close(robot, pi)
             eng.native.set_prismatic_force(pi, 0.0)
@@ -564,9 +572,14 @@ def drive_frame(eng, robot, ejs, groups, prep, raw, mode, gstate, P, stitch_seg)
     all_stretch = None
     if mode == "stitch" and stitch_seg is not None:
         all_stretch = eng.native.get_stitch_max_stretch_batched(stitch_seg[0], stitch_seg[1])
+    all_contact = None
+    if mode == "force" and P['grip_pinch']:
+        cf = _contact_seg_arrays(groups, gstate)   # build once (cached), per-group _cf_idx
+        if cf is not None:
+            all_contact = eng.native.get_body_contact_force_batched(cf[0], cf[1])  # ONE D2H for all envs
     for grp in groups:
         grip = float(raw[gl]) if grp['key'][1] == 'L' else float(raw[gr])
-        drive_side(eng, robot, grp, grip, prep["binary"], mode, gstate, P, all_stretch)
+        drive_side(eng, robot, grp, grip, prep["binary"], mode, gstate, P, all_stretch, all_contact)
 
 
 # ----------------------------------------------------------------------------
@@ -684,6 +697,26 @@ def _stitch_seg_arrays(envs):
             g['_seg_idx'] = idx
             starts.append(g['stitch_start']); counts.append(g['n_stitch']); idx += 1
     return (np.array(starts, np.int32), np.array(counts, np.int32))
+
+
+def _contact_seg_arrays(groups, gstate):
+    """Flatten every hand's finray finger vertex-ranges into one (offsets, counts)
+    for get_body_contact_force_batched, and tag each group with _cf_idx (its
+    fingers' indices into the batched (n_finger,3) result). Built once per run,
+    cached in gstate['__cf_seg__']. Returns None if no fingers."""
+    cached = gstate.get('__cf_seg__', 0)
+    if cached != 0:
+        return cached
+    offsets, counts = [], []
+    for grp in groups:
+        grp['_cf_idx'] = []
+        for (vo, vc) in grp.get('fems', []):
+            grp['_cf_idx'].append(len(offsets))
+            offsets.append(vo); counts.append(vc)
+    cached = ((np.asarray(offsets, np.int32), np.asarray(counts, np.int32))
+              if offsets else None)
+    gstate['__cf_seg__'] = cached
+    return cached
 
 
 # ----------------------------------------------------------------------------

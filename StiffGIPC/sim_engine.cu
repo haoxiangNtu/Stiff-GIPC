@@ -2562,6 +2562,93 @@ void SimEngine::get_stitch_max_stretch_batched(const int* h_starts,
     CUDA_SAFE_CALL(cudaMemcpy(h_out, s_d_out, n_seg * sizeof(double), cudaMemcpyDeviceToHost));
 }
 
+// [force-control — BATCHED] One block PER segment (= one gripper finger, and for
+// multi-env one finger of one env): block s sums the per-vertex contact force over
+// [offsets[s], offsets[s]+counts[s]) -> out[s*3 .. s*3+2]. Blocks are independent
+// (each writes only its own out), so envs cannot interfere. The expensive contact
+// rebuild (buildBVH+buildCP+calBarrierGradient) is done ONCE by the caller, then
+// ALL segments are summed in this ONE launch with ONE D2H — vs the single-body
+// get_vertex_contact_force_sum which rebuilds contacts on EVERY call (N D2H syncs +
+// N full contact rebuilds per frame at scale).
+__global__ static void _contact_force_sum_batched_kernel(const double3* grad, int nv,
+                                                         const int* offsets,
+                                                         const int* counts,
+                                                         double* out /* n_seg*3 */)
+{
+    int seg = blockIdx.x;
+    int off = offsets[seg];
+    int cnt = counts[seg];
+    __shared__ double sx[256];
+    __shared__ double sy[256];
+    __shared__ double sz[256];
+    int tid = threadIdx.x;
+    double lx = 0.0, ly = 0.0, lz = 0.0;
+    for(int j = tid; j < cnt; j += blockDim.x)
+    {
+        int vi = off + j;
+        if(vi < 0 || vi >= nv) continue;
+        double3 v = grad[vi];
+        lx += v.x; ly += v.y; lz += v.z;
+    }
+    sx[tid] = lx; sy[tid] = ly; sz[tid] = lz;
+    __syncthreads();
+    for(int s = blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if(tid < s) { sx[tid] += sx[tid + s]; sy[tid] += sy[tid + s]; sz[tid] += sz[tid + s]; }
+        __syncthreads();
+    }
+    if(tid == 0) { out[seg * 3 + 0] = sx[0]; out[seg * 3 + 1] = sy[0]; out[seg * 3 + 2] = sz[0]; }
+}
+
+void SimEngine::get_body_contact_force_batched(const int* h_offsets,
+                                               const int* h_counts,
+                                               int n_seg, double* h_out3) const
+{
+    // h_out3 holds n_seg 3-vectors (net IPC contact force per segment/finger).
+    for(int i = 0; i < n_seg * 3; i++) h_out3[i] = 0.0;
+    if(n_seg <= 0) return;
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    int   nv   = static_cast<int>(g.vertexNum);
+    if(nv <= 0 || g.m_skip_all_collision) return;
+
+    // Rebuild contacts ONCE at the current (post-step) state, then sum every
+    // segment from the single barrier-gradient buffer.
+    g.buildBVH();
+    g.buildCP();
+    if(g.h_cpNum[0] < 1) return;   // nothing in contact -> all zeros
+
+    static double3* s_d_grad = nullptr;
+    static int      s_grad_cap = 0;
+    if(nv > s_grad_cap)
+    {
+        if(s_d_grad) cudaFree(s_d_grad);
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_grad, nv * sizeof(double3)));
+        s_grad_cap = nv;
+    }
+    CUDA_SAFE_CALL(cudaMemset(s_d_grad, 0, nv * sizeof(double3)));
+    g.calBarrierGradient(s_d_grad, g.Kappa);   // atomic-adds contact force per vertex
+
+    static int*    s_d_off = nullptr;
+    static int*    s_d_cnt = nullptr;
+    static double* s_d_out = nullptr;
+    static int     s_cap   = 0;
+    if(n_seg > s_cap)
+    {
+        if(s_d_off) cudaFree(s_d_off);
+        if(s_d_cnt) cudaFree(s_d_cnt);
+        if(s_d_out) cudaFree(s_d_out);
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_off, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_cnt, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_out, n_seg * 3 * sizeof(double)));
+        s_cap = n_seg;
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(s_d_off, h_offsets, n_seg * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(s_d_cnt, h_counts, n_seg * sizeof(int), cudaMemcpyHostToDevice));
+    _contact_force_sum_batched_kernel<<<n_seg, 256>>>(s_d_grad, nv, s_d_off, s_d_cnt, s_d_out);
+    CUDA_SAFE_CALL(cudaMemcpy(h_out3, s_d_out, n_seg * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+}
+
 double SimEngine::get_prismatic_current_distance(int idx) const
 {
     // [force-control] Current opening d = (Cq - Cp).dot(t) along the joint axis.
