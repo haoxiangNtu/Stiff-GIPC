@@ -401,9 +401,9 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
 
         if(jinfo.type == UrdfJointInfo::Type::Fixed)
         {
-            // Fixed joint (rbs-uipc Method 2):
-            //   1 position point (joint center) + 2 direction vectors (normal, bitangent)
-            //   E = 0.5*K*||Cp-Cq||^2 + 0.5*K*||np-nq||^2 + 0.5*K*||bp-bq||^2
+            // Fixed joint (libuipc affine_body_fixed_joint):
+            //   1 position point (joint center) + 3 direction vectors (tangent, normal, bitangent)
+            //   E = 0.5*K*||Cp-Cq||^2 + 0.5*K*(||tp-tq||^2 + ||np-nq||^2 + ||bp-bq||^2)
             jc.type       = JointConstraintHostInfo::Type::Fixed;
             jc.num_points = 1;
             jc.world_anchor[0] = joint_pos;
@@ -414,8 +414,11 @@ bool UrdfSceneImporter::import_scene(tetrahedra_obj& tetras, int preconditionerT
             Eigen::Vector3d col0 = R.col(0).normalized();
             Eigen::Vector3d col1 = R.col(1).normalized();
             Eigen::Vector3d col2 = R.col(2).normalized();
-            // Use the joint frame's Y and Z axes as normal and bitangent
+            // Penalize all 3 joint-frame axes (X=tangent, Y=normal, Z=bitangent) so
+            // the relative rotation is fully constrained (matches libuipc; X was the
+            // dropped axis that left a rotational soft mode).
             jc.has_direction_constraint = true;
+            jc.world_tangent   = col0;
             jc.world_normal    = col1;
             jc.world_bitangent = col2;
         }

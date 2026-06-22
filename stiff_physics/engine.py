@@ -826,6 +826,12 @@ class Engine:
     def set_prismatic_strength(self, idx: int, strength: float) -> None:
         self._engine.set_prismatic_strength(idx, strength)
 
+    def get_prismatic_drive_force(self, idx: int) -> float:
+        return self._engine.get_prismatic_drive_force(idx)
+
+    def get_prismatic_current_distance(self, idx: int) -> float:
+        return self._engine.get_prismatic_current_distance(idx)
+
     def get_revolute_current_angles(self) -> np.ndarray:
         """Read actual joint angles from GPU state.
 

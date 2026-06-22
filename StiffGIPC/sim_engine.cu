@@ -523,6 +523,10 @@ int SimEngine::add_fixed_joint(int parent_body, int child_body,
     jc.has_direction_constraint = true;
     jc.world_normal    = world_normal.normalized();
     jc.world_bitangent = world_bitangent.normalized();
+    // Third affine basis axis (libuipc penalizes all of t,n,b). Derive it as the
+    // orthogonal complement so the three directions are an orthonormal frame even if
+    // the caller passes only normal/bitangent.
+    jc.world_tangent   = jc.world_normal.cross(jc.world_bitangent).normalized();
 
     int idx = static_cast<int>(m_impl->tetMesh.joint_constraints.size());
     m_impl->tetMesh.joint_constraints.push_back(jc);

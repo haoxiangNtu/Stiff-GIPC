@@ -13,9 +13,11 @@ struct JointConstraintHostInfo
     Eigen::Vector3d world_anchor[4];  // world-space positions at t=0
     double          point_weight[4] = {1.0, 1.0, 1.0, 1.0};
 
-    // Direction constraints for fixed joints (rbs-uipc Method 2).
-    // Normal and bitangent in world space at t=0; converted to material coords at init.
+    // Direction constraints for fixed joints (libuipc affine_body_fixed_joint:
+    // penalize all 3 affine basis axes t,n,b so rotation is fully constrained).
+    // World space at t=0; converted to material coords at init.
     bool            has_direction_constraint = false;
+    Eigen::Vector3d world_tangent;    // world-space tangent direction (3rd axis = normal x bitangent)
     Eigen::Vector3d world_normal;     // world-space normal direction
     Eigen::Vector3d world_bitangent;  // world-space bitangent direction
 };

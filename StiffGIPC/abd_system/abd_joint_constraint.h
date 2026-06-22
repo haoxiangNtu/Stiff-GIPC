@@ -14,13 +14,18 @@ constexpr int kMaxJointConstraintPoints = 4;
 /// Stiffness is mass-based (rbs-uipc style): kappa = sr * (m_parent + m_child).
 /// No dt^2 factor -- joint energies act as stiff penalty terms in the IP.
 ///
-/// For fixed joints (rbs-uipc Method 2):
+/// For fixed joints (rbs-uipc / libuipc affine_body_fixed_joint):
 ///   num_points = 1 (joint center for position constraint)
 ///   has_direction_constraint = true
-///   n_bar / b_bar store normal and bitangent in each body's material frame
+///   t_bar / n_bar / b_bar store the THREE affine basis axes (tangent, normal,
+///   bitangent = the 3 columns of A) in each body's material frame. All three are
+///   penalized so the relative rotation is fully constrained (rank-9 rotation
+///   Hessian, matching libuipc). Constraining only n+b (the old port) left rotation
+///   about the dropped t axis a soft mode -> single-anchor rotational slack.
 ///
-/// Energy = E_pos + E_n + E_b
+/// Energy = E_pos + E_t + E_n + E_b
 ///   E_pos = 0.5*K * ||J(cp)*qp - J(cq)*qq||^2
+///   E_t   = 0.5*K * ||Ap*tp_bar - Aq*tq_bar||^2
 ///   E_n   = 0.5*K * ||Ap*np_bar - Aq*nq_bar||^2
 ///   E_b   = 0.5*K * ||Ap*bp_bar - Aq*bq_bar||^2
 struct JointConstraintGPUData
@@ -34,6 +39,8 @@ struct JointConstraintGPUData
     Float   kappa;
 
     int     has_direction_constraint;  // 1 for fixed joints, 0 otherwise
+    Vector3 parent_t_bar;   // tangent in parent material frame
+    Vector3 child_t_bar;    // tangent in child material frame
     Vector3 parent_n_bar;   // normal in parent material frame
     Vector3 child_n_bar;    // normal in child material frame
     Vector3 parent_b_bar;   // bitangent in parent material frame
@@ -110,10 +117,13 @@ MUDA_GENERIC inline Float joint_constraint_energy(const JointConstraintGPUData& 
 
     if(joint.has_direction_constraint)
     {
+        Vector3 t_err = dir_jacobi_mul(joint.parent_t_bar, q_parent)
+                      - dir_jacobi_mul(joint.child_t_bar, q_child);
         Vector3 n_err = dir_jacobi_mul(joint.parent_n_bar, q_parent)
                       - dir_jacobi_mul(joint.child_n_bar, q_child);
         Vector3 b_err = dir_jacobi_mul(joint.parent_b_bar, q_parent)
                       - dir_jacobi_mul(joint.child_b_bar, q_child);
+        energy += 0.5 * K * t_err.squaredNorm();
         energy += 0.5 * K * n_err.squaredNorm();
         energy += 0.5 * K * b_err.squaredNorm();
     }
@@ -145,11 +155,15 @@ MUDA_GENERIC inline void joint_constraint_gradient(const JointConstraintGPUData&
 
     if(joint.has_direction_constraint)
     {
+        Vector3 t_err = dir_jacobi_mul(joint.parent_t_bar, q_parent)
+                      - dir_jacobi_mul(joint.child_t_bar, q_child);
         Vector3 n_err = dir_jacobi_mul(joint.parent_n_bar, q_parent)
                       - dir_jacobi_mul(joint.child_n_bar, q_child);
         Vector3 b_err = dir_jacobi_mul(joint.parent_b_bar, q_parent)
                       - dir_jacobi_mul(joint.child_b_bar, q_child);
 
+        grad_parent_out += K * dir_jacobi_T_mul(joint.parent_t_bar, t_err);
+        grad_child_out  -= K * dir_jacobi_T_mul(joint.child_t_bar, t_err);
         grad_parent_out += K * dir_jacobi_T_mul(joint.parent_n_bar, n_err);
         grad_child_out  -= K * dir_jacobi_T_mul(joint.child_n_bar, n_err);
         grad_parent_out += K * dir_jacobi_T_mul(joint.parent_b_bar, b_err);
@@ -185,6 +199,11 @@ MUDA_GENERIC inline void joint_constraint_hessian(const JointConstraintGPUData& 
     if(joint.has_direction_constraint)
     {
         Matrix12x12 tmp;
+
+        // Tangent: DirJ(tp)^T * K*I * DirJ(tp), etc. (the 3rd axis libuipc keeps)
+        dir_JT_K_J(joint.parent_t_bar,  K, joint.parent_t_bar, tmp);  H_pp_out += tmp;
+        dir_JT_K_J(joint.child_t_bar,   K, joint.child_t_bar,  tmp);  H_cc_out += tmp;
+        dir_JT_K_J(joint.parent_t_bar, -K, joint.child_t_bar,  tmp);  H_pc_out += tmp;
 
         // Normal: DirJ(np)^T * K*I * DirJ(np), etc.
         dir_JT_K_J(joint.parent_n_bar,  K, joint.parent_n_bar, tmp);  H_pp_out += tmp;

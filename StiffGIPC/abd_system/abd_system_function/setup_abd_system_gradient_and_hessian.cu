@@ -1062,6 +1062,8 @@ void ABDSystem::init_joint_constraints(
         if(hj.has_direction_constraint)
         {
             // Store world-space directions temporarily; converted to material below
+            gj.parent_t_bar = Vector3(hj.world_tangent.x(), hj.world_tangent.y(), hj.world_tangent.z());
+            gj.child_t_bar  = gj.parent_t_bar;
             gj.parent_n_bar = Vector3(hj.world_normal.x(), hj.world_normal.y(), hj.world_normal.z());
             gj.child_n_bar  = gj.parent_n_bar;
             gj.parent_b_bar = Vector3(hj.world_bitangent.x(), hj.world_bitangent.y(), hj.world_bitangent.z());
@@ -1069,6 +1071,7 @@ void ABDSystem::init_joint_constraints(
         }
         else
         {
+            gj.parent_t_bar = gj.child_t_bar = Vector3::Zero();
             gj.parent_n_bar = gj.child_n_bar = Vector3::Zero();
             gj.parent_b_bar = gj.child_b_bar = Vector3::Zero();
         }
@@ -1126,6 +1129,8 @@ void ABDSystem::init_joint_constraints(
                    if(joint.has_direction_constraint)
                    {
                        // Direction vectors: d_bar = A_inv * d_world (rotation only)
+                       joint.parent_t_bar = A_parent_inv * joint.parent_t_bar;
+                       joint.child_t_bar  = A_child_inv  * joint.child_t_bar;
                        joint.parent_n_bar = A_parent_inv * joint.parent_n_bar;
                        joint.child_n_bar  = A_child_inv  * joint.child_n_bar;
                        joint.parent_b_bar = A_parent_inv * joint.parent_b_bar;
