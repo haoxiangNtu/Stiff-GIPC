@@ -46,6 +46,9 @@ and [Semantic Versioning](https://semver.org/).
 - **`load_triMesh`**: multi-cloth vertex offset + per-body bending edges.
 - Expose `get_prismatic_drive_force` / `get_prismatic_current_distance` on the
   Python `Engine` (C++ bindings shipped in 0.6.4; Engine wrappers were missing).
+- finray examples resolve the assets dir **case-robustly** (`assets/` → `Assets/`
+  fallback) so a fresh clone of the tag — which only tracks capital `Assets/` —
+  finds them instead of 404-ing on the gitignored lowercase symlink.
 
 ## [0.6.4] — 2026-06-18
 

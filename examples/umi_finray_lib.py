@@ -32,7 +32,19 @@ is available via STIFF_PERENV_ALPHA=1 (+ STIFF_PERENV_MASK=1) at run time.
 import sys, os, math, time, json, re
 from pathlib import Path
 
-_ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+def _resolve_assets_dir():
+    # Case-robust: the private repo tracks `Assets/` (capital) while the public
+    # repo / a working tree may expose lowercase `assets/` (symlink, gitignored).
+    # A `git archive` of the tag only has `Assets/`, so a fresh clone must fall
+    # back to it — else the examples 404 on every asset.
+    root = Path(__file__).resolve().parent.parent
+    for name in ("assets", "Assets"):
+        if (root / name).exists():
+            return str(root / name) + "/"
+    return str(root / "assets") + "/"
+
+
+_ASSETS_DIR = _resolve_assets_dir()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
