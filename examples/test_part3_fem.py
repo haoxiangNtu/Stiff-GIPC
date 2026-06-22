@@ -6,7 +6,7 @@ import numpy as np
 from pathlib import Path
 from stiff_physics.engine import Engine, Config
 
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 cfg = Config(dt=0.020, ground_offset=-0.5, assets_dir=ASSETS_DIR,
              preconditioner_type=0,
              skip_all_collision=os.environ.get("SKIP_COL")=="1")

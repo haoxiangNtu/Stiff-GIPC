@@ -27,7 +27,7 @@ import polyscope.imgui as psim
 from pathlib import Path
 from stiff_physics.engine import Engine, Config
 
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 BUNNY_OBJ  = "triMesh/bunny_surface.obj"
 
 

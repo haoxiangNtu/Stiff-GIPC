@@ -19,7 +19,7 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation
 from stiff_physics.engine import Engine, Config
 
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 URDF_RELPATH = "sim_data/urdf/ridgeback_dual_panda_soft/ridgeback_dual_panda2_mobile_s1_hybrid.urdf"
 
 

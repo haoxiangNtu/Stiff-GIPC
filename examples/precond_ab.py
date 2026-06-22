@@ -21,7 +21,7 @@ import numpy as np
 from stiff_physics.engine import Engine, Config
 
 
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 
 
 def _arm_tf(scale: float = 0.3) -> np.ndarray:

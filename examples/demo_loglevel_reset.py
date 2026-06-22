@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from stiff_physics.engine import Engine, Config
 
-ASSETS = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 
 
 def build_world(eng, fem_y=1e6):

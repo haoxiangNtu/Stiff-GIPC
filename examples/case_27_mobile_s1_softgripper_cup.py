@@ -27,7 +27,7 @@ from scipy.spatial import cKDTree
 from stiff_physics.engine import Engine, Config
 from stiff_physics.robot import Robot
 
-ASSETS_DIR    = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR    = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 URDF_RELPATH  = "sim_data/urdf/ridgeback_dual_panda_soft/ridgeback_dual_panda2_mobile_s1_softgripper.urdf"
 ORIGINAL_URDF = "sim_data/urdf/ridgeback_dual_panda_soft/ridgeback_dual_panda2_mobile.urdf"
 # Use SOFT_FEM=part3 (7.5k tet/finger=30k total, fast) by default;

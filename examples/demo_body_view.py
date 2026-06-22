@@ -28,7 +28,7 @@ import polyscope.imgui as psim
 from stiff_physics.engine import Engine, Config, BodyView
 from stiff_physics.robot import Robot
 
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 DEFAULT_QPOS = "/tmp/replay_user/qpos.h5"
 
 

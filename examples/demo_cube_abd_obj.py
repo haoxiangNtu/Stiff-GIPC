@@ -36,7 +36,7 @@ from stiff_physics.engine import Engine, Config
 # Per release handbook §5.1: scripts MUST set ASSETS_DIR explicitly and pass
 # it to Config(assets_dir=...).  Don't rely on engine default — that breaks
 # in wheel-install mode.
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 CUBE_OBJ   = "triMesh/cube_outward.obj"   # relative to ASSETS_DIR
 
 

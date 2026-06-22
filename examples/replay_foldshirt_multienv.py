@@ -23,7 +23,7 @@ Usage:
 import sys, os, math, time, json
 from pathlib import Path
 
-_ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+_ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np

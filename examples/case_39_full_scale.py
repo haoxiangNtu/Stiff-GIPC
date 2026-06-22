@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from pathlib import Path
-_ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+_ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 from scipy.spatial.transform import Rotation
 import polyscope as ps
 import polyscope.imgui as psim

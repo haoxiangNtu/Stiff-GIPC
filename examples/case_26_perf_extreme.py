@@ -79,7 +79,7 @@ from pathlib import Path
 from stiff_physics.engine import Engine, Config
 from stiff_physics.robot import Robot
 
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 
 
 def _make_arm_transform(scale: float = 0.3) -> np.ndarray:

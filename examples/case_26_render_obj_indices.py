@@ -96,7 +96,7 @@ def main():
     # ~/Downloads/test-stiff-physics/assets/). The wheel-shipped data dir
     # only contains scene/abd_system_config.json — it does NOT carry the
     # URDF + mesh assets, which live in the public-repo's assets/ dir.
-    ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+    ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 
     config = Config(
         dt=0.01,

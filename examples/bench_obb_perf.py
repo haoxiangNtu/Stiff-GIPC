@@ -18,7 +18,7 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation
 from stiff_physics.engine import Engine, Config
 
-ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "assets") + "/"
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 USE_CLEAN = os.environ.get("CLEAN") == "1"
 URDF_NAME = ("ridgeback_dual_panda2_mobile_s1_clean.urdf" if USE_CLEAN
              else "ridgeback_dual_panda2_mobile_s1.urdf")
