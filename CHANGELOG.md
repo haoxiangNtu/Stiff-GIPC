@@ -4,6 +4,44 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.6.5] — 2026-06-22
+
+> v0.6.5 = v0.6.4 + the full multi-env backport (engine + examples) and the
+> UMI finray soft-gripper suite, plus a fixed-joint correctness fix. Stays on
+> the conservative 0.6.x line (no v0.7.x perf rewrite). The wheel delta over
+> 0.6.4 is the engine multi-env layer + the fixed-joint fix; everything else is
+> example code.
+
+### Added
+- **Multi-env (block-structured)**: per-env group/collision isolation
+  (`set_body_groups`), block-structured DOF layout + segmented per-env
+  reduction (P2a/P3a), per-env line-search (S1–S4, validated EXACT vs the
+  global solve), dynamic global-triplet buffer (~3× smaller per-env memory,
+  never-overflow), configurable `triplet_internal_margin`.
+- **UMI finray soft-gripper example suite**: beaker / cupshirt / foldshirt ×
+  pos / stitch / force × single-replay / multi-env / interactive-UI
+  (`examples/umi_finray_lib.py` + thin entry scripts).
+- **Duck multi-env scaling example** (rigid grasp → 512 envs).
+
+### Changed
+- **`force` gripper mode** rewritten to *force-control-through-position-drive*:
+  soft-K impedance close, with an optional contact-stop **pinch** (default on,
+  `GRIP_PINCH=1`) that latches on the finray IPC contact force so the jaw stops
+  at the object surface instead of closing dead. Cloth (contact≈0) falls through
+  to a full close — no rigid/cloth classification. The IPC limit barrier is no
+  longer used (pure position drive cannot overshoot a limit), which also removes
+  the multi-env merged-solve barrier ill-conditioning.
+
+### Fixed
+- **Fixed joint** now penalizes all 3 affine basis axes (t, n, b), matching
+  libuipc `affine_body_fixed_joint` — removes single-anchor rotational slack
+  (rank-6 → rank-9 constraint Hessian).
+- **`absolute_dhat`**: contact thickness no longer inflates with scene size
+  (was making contact super-linear in multi-env).
+- **`load_triMesh`**: multi-cloth vertex offset + per-body bending edges.
+- Expose `get_prismatic_drive_force` / `get_prismatic_current_distance` on the
+  Python `Engine` (C++ bindings shipped in 0.6.4; Engine wrappers were missing).
+
 ## [0.6.4] — 2026-06-18
 
 > v0.6.4 = v0.6.3 + an **ABD joint force-control** layer (all new APIs are
