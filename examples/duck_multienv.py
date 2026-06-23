@@ -25,7 +25,7 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _ROOT)
 from stiff_physics import Engine, Config
 
-DUCK_TET = os.path.join(_ROOT, "assets", "duck",
+DUCK_TET = os.path.join(_ROOT, "Assets", "duck",
                         "duck_tet_light.npz" if int(os.environ.get("DUCK_LIGHT", "0"))
                         else "duck_tet.npz")
 

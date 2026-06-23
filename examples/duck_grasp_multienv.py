@@ -58,7 +58,8 @@ JPREFIX = "panda" if URDF == _PANDA else "fr3"
 # un-permuted with the wrong perm -> scrambled positions -> false penetration + broken
 # contact. NOT a mesh-quality problem.)
 DUCK_TET = os.environ.get("GRASP_DUCK_MESH", _ROOT + "/Assets/duck/duck_tet_uipc.npz")
-TRAJ = "/tmp/franka_ik_traj.npz"
+TRAJ = os.environ.get("GRASP_TRAJ", os.path.join(_ROOT, "Assets", "trajectories", "franka_ik_traj.npz"))
+if not os.path.exists(TRAJ): TRAJ = "/tmp/franka_ik_traj.npz"  # dev fallback
 
 
 def gpu_mb():
