@@ -741,7 +741,10 @@ def main():
     def callback():
         psim.SetNextWindowPos((10, 10), psim.ImGuiCond_Once)
         psim.SetNextWindowSize((520, 0), psim.ImGuiCond_Once)
-        psim.Begin("case_40_unified — coarse softpad (ARM=1.0) A variant")
+        try:  # polyscope>=2.6 dropped the single-string Begin overload (imgui upstream)
+            psim.Begin("case_40_unified — coarse softpad (ARM=1.0) A variant")
+        except TypeError:
+            psim.Begin("case_40_unified — coarse softpad (ARM=1.0) A variant", 0)
         psim.Text(f"step #{state['step_count']}: {state['last_step_ms']:.1f} ms")
         psim.Text(f"URDF bodies: {n_urdf}, hybrid: {len(grippers)} ABD + {len(grippers)} FEM")
         psim.Separator()
