@@ -281,6 +281,10 @@ def main():
             collision_mesh = collision_mesh.replace(
                 "/data/stiff-physics/franka_sim/assets/", _ASSETS_DIR)
             print(f"remapped collision mesh path to {collision_mesh}")
+        # bare relative 'assets/...' (Linux is case-sensitive; the bundled dir is 'Assets/')
+        if collision_mesh.startswith("assets/"):
+            collision_mesh = _ASSETS_DIR + collision_mesh[len("assets/"):]
+            print(f"remapped collision mesh path to {collision_mesh}")
         body_type = value["body_type"]
         if body_type == "ABD":
             abd_objs.append([init_pose, collision_mesh])
