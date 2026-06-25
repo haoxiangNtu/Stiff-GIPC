@@ -11,6 +11,10 @@ import umi_finray_lib as L
 
 BAR = int(os.environ.get("BAR", "1"))
 prep = L.prepare_scene("foldshirt"); P = L._drive_params()
+# The IPC end-stop barrier was removed from _drive_params() (pure position drive
+# can't overshoot a limit). This diag still wants a close-force magnitude, so map
+# the old 'barrier_force' knob onto the current grip-force knob k_grip.
+CLOSE_FORCE = P.get('barrier_force', P.get('k_grip', 3.0))
 eng = L.make_engine(prep, 1); sides = L.load_finray_sides()
 envs, _ = L.build_world(eng, prep, 1, 4.0, sides, dict(abd_cursor=0))
 seg = L._stitch_seg_arrays(envs); eng.finalize()
@@ -37,7 +41,7 @@ def cmd_close():
         op, cl = L._open_close(robot, pi)
         cd = 1.0 if (cl - op) > 0 else -1.0
         eng.native.set_prismatic_strength(pi, 0.0)
-        eng.native.set_prismatic_force(pi, cd * P['barrier_force'])
+        eng.native.set_prismatic_force(pi, cd * CLOSE_FORCE)
 
 print("\n-- phase 1: command CLOSE (pure force) and step --")
 for fr in range(40):

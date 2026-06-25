@@ -18,6 +18,9 @@ dependencies = [
 # Lower bound 2.4 = first version with the imgui binding subset we use.
 vis = ["polyscope>=2.4,<2.6"]
 usd = ["usd-core"]
+# Extra Python deps used only by some example scripts (mesh authoring /
+# replay / USD pipeline). Install with: pip install stiff-physics[examples]
+examples = ["trimesh", "meshio", "usd-core"]
 dev = ["pytest", "black", "ruff"]
 
 [tool.scikit-build]

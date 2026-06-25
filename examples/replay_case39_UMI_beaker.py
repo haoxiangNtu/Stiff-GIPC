@@ -24,7 +24,9 @@ import sys
 import runpy
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ASSETS_DIR = os.path.join(os.path.dirname(_HERE), "assets")
+# Bundled assets live under the repo-root "Assets/" dir (capital A); match the
+# pattern used by replay_case39_UMI_sf.py and the other examples.
+_ASSETS_DIR = os.path.join(os.path.dirname(_HERE), "Assets")
 
 # Contact-light rigid-object scene -> no MAS by default (also how it was recorded).
 os.environ.setdefault("CASE39_PRECOND", "0")

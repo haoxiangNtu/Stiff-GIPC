@@ -29,7 +29,10 @@ from stiff_physics.robot import Robot
 
 ASSETS_DIR    = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
 URDF_RELPATH  = "sim_data/urdf/ridgeback_dual_panda_soft/ridgeback_dual_panda2_mobile_s1_softgripper.urdf"
-ORIGINAL_URDF = "sim_data/urdf/ridgeback_dual_panda_soft/ridgeback_dual_panda2_mobile.urdf"
+# Source of the 4 *_soft_material link world-TFs (parse_soft_material_world_tfs).
+# The legacy ridgeback_dual_panda2_mobile.urdf is superseded in-tree by
+# ..._mobile_s1_full.urdf, which carries the same soft_material links/joints.
+ORIGINAL_URDF = "sim_data/urdf/ridgeback_dual_panda_soft/ridgeback_dual_panda2_mobile_s1_full.urdf"
 # Use SOFT_FEM=part3 (7.5k tet/finger=30k total, fast) by default;
 # set FEM_BLOBAL=1 env to switch to part2_blobal (30k/finger=120k total, slow but full geometry).
 if os.environ.get("FEM_TINY") == "1":

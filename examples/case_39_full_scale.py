@@ -29,6 +29,24 @@ from scipy.spatial.transform import Rotation
 import polyscope as ps
 import polyscope.imgui as psim
 
+
+def _ps_begin(name):
+    """Version-tolerant psim.Begin().
+
+    polyscope >=2.6 follows imgui upstream where Begin's bindings changed: the
+    single-string overload was dropped in favour of (name, open, flags) /
+    (name, flags) and the return type became a tuple.  Call the plain form
+    first (works on 2.4/2.5) and fall back to the flags overload on 2.6+.
+    Always returns True so the caller's matching End() stays balanced (we never
+    pass an `open` bool, so the window is never collapsible-away).
+    """
+    try:
+        psim.Begin(name)
+    except TypeError:
+        psim.Begin(name, 0)
+    return True
+
+
 from stiff_physics import Engine, Config
 from stiff_physics.robot import Robot
 
@@ -654,7 +672,7 @@ def main():
     def callback():
         psim.SetNextWindowPos((10, 10), psim.ImGuiCond_Once)
         psim.SetNextWindowSize((520, 0), psim.ImGuiCond_Once)
-        psim.Begin("case_39 — full scale (ARM=1.0) A variant")
+        _ps_begin("case_39 — full scale (ARM=1.0) A variant")
         psim.Text(f"step #{state['step_count']}: {state['last_step_ms']:.1f} ms")
         # FPS row: instantaneous (last frame) + sliding avg over last 30 frames
         last_ms = state['last_step_ms']

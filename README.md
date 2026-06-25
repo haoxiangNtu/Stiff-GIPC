@@ -33,6 +33,16 @@ pip install polyscope scipy
 pip install usd-core
 ```
 
+### 4. (Optional) Extra deps for mesh-authoring / replay examples
+
+Some example scripts (e.g. `build_umi_finray_strategyF.py`, the finray replay
+demos, `fix_obj_winding.py`) need `trimesh` / `meshio` / `usd-core`. Install
+them all via the `examples` extra:
+
+```bash
+pip install stiff-physics[examples]
+```
+
 ## Quick Start
 
 ```bash

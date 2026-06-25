@@ -57,7 +57,11 @@ fr, d0, d1, cupy, gripy, rx, ry, rz = (R[:, i] for i in range(8))
 lift_start = int(np.argmin(cupy))
 close = slice(0, lift_start); lift = slice(lift_start, END)
 
-print(f"\n[{scene}/{mode}]  barrier_force={P['barrier_force']} anchor={P['force_anchor']}  friction={prep['friction']}")
+# NOTE: the IPC end-stop barrier + explicit force anchor were removed from the
+# drive params (pure position/impedance drive now). Report the current grip-force
+# knob instead, falling back gracefully if an older param dict is in use.
+_grip_force = P.get('barrier_force', P.get('k_grip', 'n/a'))
+print(f"\n[{scene}/{mode}]  grip_force(k_grip)={_grip_force}  friction={prep['friction']}")
 print(f"  lift/transport = frame {lift_start} (cup lowest, just grasped) -> {END}")
 print(f"  opening d0 at grasp={d0[lift_start]:.4f}  at end={d0[-1]:.4f}")
 def rng(a, s): return f"{a[s].min():+.4f}..{a[s].max():+.4f}  (drift {a[s].max()-a[s].min():.4f})"
