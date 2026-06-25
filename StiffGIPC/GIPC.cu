@@ -5304,13 +5304,45 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
 }
 
 
+// [Step B] optional per-contact export hook. When _ec_out_pair != nullptr, each
+// contact also writes (bodyA,bodyB) and the physical contact force on bodyA
+// (N) = -(sum of this contact's gradient over bodyA's verts)/dt^2. bodyA = body
+// of the first vertex; same-body (self) contacts get bodyB==bodyA (consumer
+// skips). nullptr -> no-op (solve path unchanged).
+__device__ inline void _ec_emit(int idx, int2* op, double3* of, const int* pbid,
+                                double inv_dt2, int va, int vb, int vc, int vd,
+                                int nv, const double* g)
+{
+    if(!op)
+        return;
+    int    vs[4] = {va, vb, vc, vd};
+    int    bA = pbid[va], bB = pbid[va];
+    double fx = 0, fy = 0, fz = 0;
+    for(int k = 0; k < nv; k++)
+    {
+        int b = pbid[vs[k]];
+        if(b == bA)
+        {
+            fx += g[3 * k]; fy += g[3 * k + 1]; fz += g[3 * k + 2];
+        }
+        else
+            bB = b;
+    }
+    op[idx] = make_int2(bA, bB);
+    of[idx] = make_double3(-fx * inv_dt2, -fy * inv_dt2, -fz * inv_dt2);
+}
+
 __global__ void _calBarrierGradient(const double3*    _vertexes,
                                     const double3*    _rest_vertexes,
                                     const const int4* _collisionPair,
                                     double3*          _gradient,
                                     double            dHat,
                                     double            Kappa,
-                                    int               number)
+                                    int               number,
+                                    int2*             _ec_out_pair,
+                                    double3*          _ec_out_force,
+                                    const int*        _ec_pbid,
+                                    double            _ec_inv_dt2)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -5475,6 +5507,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                 atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
                 atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
                 atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
             }
         }
         else
@@ -5584,6 +5617,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                 atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
                 atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
                 atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
             }
         }
     }
@@ -5694,6 +5728,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                     atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
                     atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
                     atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
                 }
             }
             else
@@ -5870,6 +5905,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                     atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
                     atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
                     atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
+                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, 0, 0, 2, gradient_vec.v);
                 }
             }
         }
@@ -5980,6 +6016,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                     atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
                     atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
                     atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
                 }
             }
             else
@@ -6198,6 +6235,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                     atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
                     atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
                     atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
+                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, MMCVIDI.z, 0, 3, gradient_vec.v);
                 }
             }
         }
@@ -6367,6 +6405,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
             atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
             atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
             atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
         }
     }
 }
@@ -6598,6 +6637,12 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
     unsigned int gidx   = _environment_collisionPair[idx];
     double dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double dist2 = dist * dist;
+    // [d=0 guard] a vertex sitting EXACTLY on the ground (dist2==0) makes
+    // log(dist2/dHat) and 1/dist2 below blow up to +-inf -> NaN in the gradient,
+    // which poisons the whole global RHS and zeros the Newton search direction
+    // (everything freezes). Clamp to a tiny positive value so d=0 yields a
+    // large-but-finite push-out instead of NaN.
+    dist2 = fmax(dist2, 1e-12);
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -6647,6 +6692,7 @@ __global__ void _computeGroundGradient(const double3* vertexes,
     int     gidx   = _environment_collisionPair[idx];
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
+    dist2 = fmax(dist2, 1e-12);  // [d=0 guard] avoid ground-barrier NaN (see _computeGroundGradientAndHessian)
 
     double t   = dist2 - dHat;
     double g_b = t * std::log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -6992,6 +7038,7 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
     int     gidx   = _environment_collisionPair[idx];
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
+    dist2 = fmax(dist2, 1e-12);  // [d=0 guard] avoid ground-barrier energy NaN at d=0
     double  temp  = -(dist2 - dHat) * (dist2 - dHat) * log(dist2 / dHat);
 
     _penv_energy_accum(penv, p2g, gidx, ng, temp);  // [S3] ground pair's vertex env
@@ -8654,6 +8701,7 @@ __global__ void _calFrictionLastH_gd(const double3* _vertexes,
     int     gidx   = _collisionPair_environment[idx];
     double  dist = __GEIGEN__::__v_vec_dot(normal, _vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
+    dist2 = fmax(dist2, 1e-12);  // [d=0 guard] avoid ground-friction lambda NaN at d=0
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -8773,6 +8821,71 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 #endif
         _collisionPair_last[last_index] = _collisionPair[idx];
     }
+}
+
+// ===================== per-contact force export (Step B) =====================
+// Ground contacts use the simple distance barrier (lambda * ground_normal).
+// Body-body & FEM-coupled contacts reuse the exact I5/NEWF barrier gradient
+// via the _calBarrierGradient per-contact hook (see _ec_emit).
+
+__global__ void _exportGroundContactForces(const double3*   _vertexes,
+                                           const uint32_t*  envPair,
+                                           const double3*   g_normal,
+                                           const double*    g_offset,
+                                           const int*       _point_body_id,
+                                           double Kappa, double dHat, double dt,
+                                           int number, int base,
+                                           int2* out_pair, double3* out_force)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    int    gidx = (int)envPair[idx];
+    double3 nrm = g_normal[0];
+    double  dist = __GEIGEN__::__v_vec_dot(nrm, _vertexes[gidx]) - g_offset[0];
+    double  dis  = dist * dist;
+    if(dis < 1e-12)
+        dis = 1e-12;  // [d=0 guard]
+    double t      = dis - dHat;
+    double g_b    = t * log(dis / dHat) * -2.0 - (t * t) / dis;
+    double lambda = -Kappa * 2.0 * sqrt(dis) * g_b;
+    double c      = lambda / (dt * dt);
+    out_force[base + idx] = make_double3(c * nrm.x, c * nrm.y, c * nrm.z);
+    out_pair[base + idx]  = make_int2(_point_body_id[gidx], -1);
+}
+
+int GIPC::exportContacts(int2* out_pair, double3* out_force)
+{
+    int ncp = (int)h_cpNum[0];
+    int ngp = (int)h_gpNum;
+    const unsigned int threads = 256;
+    double inv_dt2 = (IPC_dt > 0.0) ? 1.0 / (IPC_dt * IPC_dt) : 0.0;
+    // body-body: reuse the EXACT I5/NEWF barrier gradient (calBarrierGradient)
+    // with the per-contact export hook. Needs a per-vertex scratch gradient.
+    if(ncp > 0)
+    {
+        if(vertexNum > _ec_scratch_cap)
+        {
+            if(_ec_grad_scratch) CUDA_SAFE_CALL(cudaFree(_ec_grad_scratch));
+            _ec_scratch_cap = vertexNum;
+            CUDA_SAFE_CALL(cudaMalloc((void**)&_ec_grad_scratch, _ec_scratch_cap * sizeof(double3)));
+        }
+        CUDA_SAFE_CALL(cudaMemset(_ec_grad_scratch, 0, vertexNum * sizeof(double3)));
+        // default body-body entries to "skip" (bodyA<0); _ec_emit overwrites
+        // the ones it attributes.
+        CUDA_SAFE_CALL(cudaMemset(out_pair, 0xFF, ncp * sizeof(int2)));   // -1,-1
+        CUDA_SAFE_CALL(cudaMemset(out_force, 0, ncp * sizeof(double3)));
+        calBarrierGradient(_ec_grad_scratch, Kappa, out_pair, out_force, _point_body_id, inv_dt2);
+    }
+    // ground: simple distance barrier (lambda * ground_normal)
+    if(ngp > 0)
+    {
+        int blocks = (ngp + threads - 1) / threads;
+        _exportGroundContactForces<<<blocks, threads>>>(
+            _vertexes, _environment_collisionPair, _groundNormal, _groundOffset,
+            _point_body_id, Kappa, dHat, IPC_dt, ngp, ncp, out_pair, out_force);
+    }
+    return ncp + ngp;
 }
 
 /// <summary>
@@ -9907,7 +10020,9 @@ double2 GIPC::minMaxSelfDist()
 //     _calBarrierGradient << <blockNum, threadNum >> > (_vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, numbers);
 // }
 
-void GIPC::calBarrierGradient(double3* _gradient, double mKappa)
+void GIPC::calBarrierGradient(double3* _gradient, double mKappa,
+                              int2* ec_pair, double3* ec_force,
+                              const int* ec_pbid, double ec_inv_dt2)
 {
     int numbers = h_cpNum[0];
     if(numbers < 1)
@@ -9917,7 +10032,8 @@ void GIPC::calBarrierGradient(double3* _gradient, double mKappa)
 
 
     _calBarrierGradient<<<blockNum, threadNum>>>(
-        _vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, numbers);
+        _vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, numbers,
+        ec_pair, ec_force, ec_pbid, ec_inv_dt2);
 }
 
 void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)

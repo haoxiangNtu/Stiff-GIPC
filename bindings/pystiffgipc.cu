@@ -33,6 +33,8 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readwrite("revolute_driving_strength_ratio",  &SimEngineConfig::revolute_driving_strength_ratio)
         .def_readwrite("prismatic_strength_ratio",         &SimEngineConfig::prismatic_strength_ratio)
         .def_readwrite("prismatic_driving_strength_ratio", &SimEngineConfig::prismatic_driving_strength_ratio)
+        .def_readwrite("max_revolute_step_per_frame",      &SimEngineConfig::max_revolute_step_per_frame)
+        .def_readwrite("max_prismatic_step_per_frame",     &SimEngineConfig::max_prismatic_step_per_frame)
         .def_readwrite("collision_detection_buff_scale",   &SimEngineConfig::collision_detection_buff_scale)
         .def_readwrite("linear_system_buff_scale",         &SimEngineConfig::linear_system_buff_scale)
         .def_readwrite("triplet_internal_margin",          &SimEngineConfig::triplet_internal_margin)
@@ -417,6 +419,25 @@ PYBIND11_MODULE(pystiffgipc, m)
                                          static_cast<int>(buf.shape[0]));
         }, py::arg("velocities"))
 
+        // Teleport FEM vertices: writes _vertexes, o_vertexes, xTilta and
+        // (optionally) velocities. See sim_engine.h for rationale.
+        .def("teleport_fem_vertices", [](SimEngine& e,
+                py::array_t<double, py::array::c_style | py::array::forcecast> positions,
+                py::object velocities) {
+            auto pbuf = positions.request();
+            const double* vptr = nullptr;
+            py::buffer_info vbuf;
+            if(!velocities.is_none()) {
+                py::array_t<double, py::array::c_style | py::array::forcecast>
+                    vel_arr(velocities);
+                vbuf = vel_arr.request();
+                vptr = static_cast<const double*>(vbuf.ptr);
+            }
+            e.teleport_fem_vertices(static_cast<const double*>(pbuf.ptr),
+                                    static_cast<int>(pbuf.shape[0]),
+                                    vptr);
+        }, py::arg("positions"), py::arg("velocities") = py::none())
+
         // ABD body transforms: get (count, 4, 4) float64
         .def("get_abd_body_transforms", [](const SimEngine& e,
                 py::array_t<int, py::array::c_style | py::array::forcecast> offsets) {
@@ -490,6 +511,22 @@ PYBIND11_MODULE(pystiffgipc, m)
              "Toggle gravity for all verts of body_id (global body id).  Use "
              "for ABD bodies anchored to Fixed parent via joint to avoid drift "
              "from joint penalty wrestling gravity.  Call AFTER finalize().")
+        .def("set_abd_body_density", &SimEngine::set_abd_body_density,
+             py::arg("body_id"), py::arg("density"),
+             "Override one ABD body's density (mass = density * volume). Lets a "
+             "scene mix per-body densities. Call AFTER loading the body and "
+             "BEFORE finalize().")
+        .def("set_abd_body_inertia", [](SimEngine& self, int body_id, double mass,
+                py::array_t<double, py::array::c_style | py::array::forcecast> com,
+                py::array_t<double, py::array::c_style | py::array::forcecast> inertia) {
+            auto c = com.request(); auto in = inertia.request();
+            self.set_abd_body_inertia(body_id, mass,
+                static_cast<const double*>(c.ptr), static_cast<const double*>(in.ptr));
+        }, py::arg("body_id"), py::arg("mass"), py::arg("com"), py::arg("inertia"),
+           "Override one ABD body's inertial props: mass (scalar), com (3,), "
+           "inertia (9, row-major 3x3 about COM), in the load frame. Use authored "
+           "URDF inertia instead of welded-mesh geometry. "
+           "Call BEFORE finalize().")
         .def("set_body_external_force", &SimEngine::set_body_external_force,
              py::arg("body_id"), py::arg("fx"), py::arg("fy"), py::arg("fz"),
              "[force-control] Set per-body external LINEAR force (N) on an ABD "
@@ -546,6 +583,9 @@ PYBIND11_MODULE(pystiffgipc, m)
         })
 
         .def("get_vertex_count",          &SimEngine::get_vertex_count)
+        .def("get_vertices_device_ptr",   &SimEngine::get_vertices_device_ptr,
+             "[gpu-direct] Raw device pointer (int) to the double3 vertex buffer "
+             "(length get_vertex_count()). For zero-copy GPU readback via Warp.")
         .def("get_surface_face_count",    &SimEngine::get_surface_face_count)
         .def("get_surface_vertex_count",  &SimEngine::get_surface_vertex_count)
 
@@ -645,6 +685,51 @@ PYBIND11_MODULE(pystiffgipc, m)
            "[force-control] Net IPC contact force (3-vector) on a body, summed over "
            "its vertices [vert_offset, vert_offset+vert_count). For a gripper FEM "
            "finger this is the REAL grip force (cup reaction). Call AFTER step().")
+        .def("get_pair_contact_force", [](const SimEngine& self, int a_off, int a_cnt,
+                                          int b_off, int b_cnt) {
+            double f[3] = {0, 0, 0};
+            self.get_pair_contact_force(a_off, a_cnt, b_off, b_cnt, f);
+            auto out = py::array_t<double>(3);
+            auto b = out.mutable_unchecked<1>();
+            b(0) = f[0]; b(1) = f[1]; b(2) = f[2];
+            return out;
+        }, py::arg("a_off"), py::arg("a_cnt"), py::arg("b_off"), py::arg("b_cnt"),
+           "Net IPC contact force (3-vector) on body A FROM body B: barrier "
+           "gradient on A's vertex range, restricted to pairs connecting A and B. "
+           "For the contact sensor's per-partner force_matrix. Call AFTER step().")
+        .def("get_collision_pairs_clean", [](const SimEngine& self) {
+            int n = self.get_collision_pairs_clean(nullptr);
+            auto out = py::array_t<int>({n, 4});
+            if(n > 0)
+                self.get_collision_pairs_clean(static_cast<int*>(out.request().ptr));
+            return out;
+        }, "Clean export of the current body-body collision pairs as an (N,4) "
+           "array of plain vertex indices (-1 padded for PP/PE), UIPC-style. The "
+           "solver keeps its MMCVID packing; this is a read-only decoded view. "
+           "Call AFTER step().")
+        .def("get_contacts_device", [](SimEngine& self) {
+            int n = self.compute_contacts();
+            return py::make_tuple(n, self.contacts_pair_ptr(), self.contacts_force_ptr());
+        }, "[Step B] GPU-resident per-contact export. Returns (count, pair_ptr, "
+           "force_ptr): device pointers (uintptr) to an int2 (bodyA,bodyB; bodyB=-1 "
+           "for ground) and a double3 (world contact force on bodyA, N). Wrap with "
+           "warp.array(ptr=..., copy=False). Read-only, valid until next call. "
+           "Call AFTER step().")
+        .def("get_contacts", [](SimEngine& self) {
+            int n = self.compute_contacts();
+            auto pair  = py::array_t<int>({n > 0 ? n : 0, 2});
+            auto force = py::array_t<double>({n > 0 ? n : 0, 3});
+            if(n > 0)
+            {
+                cudaMemcpy(pair.request().ptr, reinterpret_cast<void*>(self.contacts_pair_ptr()),
+                           n * sizeof(int2), cudaMemcpyDeviceToHost);
+                cudaMemcpy(force.request().ptr, reinterpret_cast<void*>(self.contacts_force_ptr()),
+                           n * sizeof(double3), cudaMemcpyDeviceToHost);
+            }
+            return py::make_tuple(pair, force);
+        }, "[Step B] Host readback of the per-contact export: (pair (N,2) int "
+           "(bodyA,bodyB), force (N,3) double world N on bodyA). For validation; "
+           "the GPU-direct path uses get_contacts_device(). Call AFTER step().")
         .def("get_stitch_max_stretch", &SimEngine::get_stitch_max_stretch,
              py::arg("pair_start"), py::arg("pair_count"),
              "[force-control] On-GPU MAX stitch-spring stretch (m) over springs "

@@ -37,6 +37,12 @@ struct SimEngineConfig
     double prismatic_strength_ratio        = 100.0;
     double prismatic_driving_strength_ratio = 100.0;
 
+    // Per-frame driving target slew limits. These are part of solver semantics:
+    // interactive soft-FEM demos often use small limits, while Newton/IsaacLab
+    // articulation position targets expect much larger immediate target motion.
+    double max_revolute_step_per_frame  = 0.1;    // rad
+    double max_prismatic_step_per_frame = 0.002;  // m
+
     double collision_detection_buff_scale = 1.0;
     double linear_system_buff_scale       = 1.0;
     // Margin multiplier on the INTERNAL (FEM/ABD/joint) Hessian-triplet buffer,
@@ -330,6 +336,7 @@ class SimEngine
 
     // ---- State queries ----
     int      get_vertex_count() const;
+    uintptr_t get_vertices_device_ptr() const;  // [gpu-direct] double3* device ptr to vertex buffer
     int      get_surface_face_count() const;
     int      get_surface_vertex_count() const;
 
@@ -376,6 +383,16 @@ class SimEngine
     /// finalize() (writes to GPU buffer directly).
     void set_body_apply_gravity(int body_id, bool enabled);
 
+    /// Override one ABD body's density (mass = density * volume). Call after
+    /// loading the body and before finalize().
+    void set_abd_body_density(int body_id, double density);
+
+    /// Override one ABD body's inertial props (mass, COM[3], inertia[9] row-major
+    /// 3x3 about COM, all in the load/world frame). Call after loading the body
+    /// and before finalize(). Use authored URDF inertia instead of welded-mesh.
+    void set_abd_body_inertia(int body_id, double mass,
+                              const double* com3, const double* inertia9);
+
     /// [force-control] Set a per-body external LINEAR force (N) on an ABD body
     /// (global body id). Persistent until changed; (0,0,0) clears. Applied as an
     /// acceleration M^{-1}F in the q_tilde prediction, like gravity. Call AFTER
@@ -408,6 +425,17 @@ class SimEngine
     void set_vertex_velocities_gpu(const double* xyz, int count);
     void get_fem_body_vertex_range(int fem_body_idx, int* out_start, int* out_count) const;
 
+    // Teleport FEM vertices to new positions: writes _vertexes (current),
+    // o_vertexes (previous-step committed), and xTilta (predictor) so that
+    // the next engine.step() does NOT revert to the stale previous position.
+    //
+    // If ``velocities`` is non-null, it also writes velocities and extends
+    // xTilta to x + v*dt + g*dt^2, preserving inertia across the handoff.
+    // Pass nullptr to zero velocities (matches teleport_abd_bodies default
+    // semantics).
+    void teleport_fem_vertices(const double* xyz, int count,
+                               const double* velocities = nullptr);
+
     // ---- Load record tracking ----
     int  get_load_record_count() const;
     const BodyLoadRecord& get_load_record(int idx) const;
@@ -433,6 +461,25 @@ class SimEngine
     double get_prismatic_current_distance(int idx) const;  // [force-control] current opening d along axis
     void   get_vertex_contact_force_sum(int vert_offset, int vert_count, double* out3) const;  // [force-control] net IPC contact force on a body
     void   get_body_contact_force_batched(const int* offsets, const int* counts, int n_seg, double* out3) const;  // [force-control] BATCHED: rebuild contacts ONCE, sum per segment (finger/env) -> n_seg 3-vectors, ONE D2H
+
+    /// Net IPC contact force on body A FROM body B (barrier gradient on A's
+    /// vertices, restricted to pairs connecting ranges A and B). For the
+    /// contact sensor's per-partner force_matrix. Call AFTER step().
+    void   get_pair_contact_force(int a_off, int a_cnt, int b_off, int b_cnt, double* out3) const;
+
+    /// "Clean export layer": decode the current body-body collision pairs into
+    /// clean vertex-index 4-tuples (out_flat[4*i..], -1 padded). Returns the
+    /// pair count. Pass out_flat=nullptr to just get the count. Read-only path.
+    int    get_collision_pairs_clean(int* out_flat) const;
+
+    /// [Step B] GPU-resident per-contact force export for the Newton ContactSensor.
+    /// compute_contacts() fills grow-only device buffers and returns the contact
+    /// count; contacts_pair_ptr()/contacts_force_ptr() return raw device pointers
+    /// (int2 (bodyA,bodyB); double3 world force on bodyA, N). Call AFTER step();
+    /// the buffers are valid until the next compute_contacts() call.
+    int       compute_contacts(bool rebuild = false);
+    uintptr_t contacts_pair_ptr() const;
+    uintptr_t contacts_force_ptr() const;
     double get_stitch_max_stretch(int pair_start, int pair_count) const;  // [force-control] on-GPU max stitch stretch over a spring range (scalar; no full-vertex D2H)
     void   get_stitch_max_stretch_batched(const int* starts, const int* counts, int n_seg, double* out) const;  // [force-control] BATCHED: one block per segment (finger/env), one launch, per-segment maxes — multi-env isolated
 

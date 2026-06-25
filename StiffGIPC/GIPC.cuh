@@ -10,6 +10,7 @@
 #ifndef _GIPC_H_
 #define _GIPC_H_
 #include <memory>
+#include <unordered_map>
 #include "mlbvh.cuh"
 #include "device_fem_data.cuh"
 
@@ -30,6 +31,10 @@ class GIPC
     double3*  _rest_vertexes = nullptr;
     uint3*    _faces         = nullptr;
     uint2*    _edges         = nullptr;
+
+    // [Step B] grow-only per-vertex scratch for the contact-force export hook
+    double3*  _ec_grad_scratch = nullptr;
+    int       _ec_scratch_cap  = 0;
     uint32_t* _surfVerts     = nullptr;
 
 
@@ -274,7 +279,15 @@ class GIPC
     void GroundCollisionDetect();
     void calBarrierGradientAndHessian(double3* _gradient, double mKappa);
     void calBarrierHessian();
-    void calBarrierGradient(double3* _gradient, double mKap);
+    void calBarrierGradient(double3* _gradient, double mKap,
+                            int2* ec_pair = nullptr, double3* ec_force = nullptr,
+                            const int* ec_pbid = nullptr, double ec_inv_dt2 = 0.0);
+
+    // [Step B] per-contact force export for the Newton ContactSensor. Fills
+    // out_pair[i]=(bodyA,bodyB) (bodyB=-1 for ground) and out_force[i]=world
+    // contact force (N) on bodyA. Returns count = h_cpNum[0] + h_gpNum.
+    int exportContacts(int2* out_pair, double3* out_force);
+
     void calFrictionHessian(device_TetraData& TetMesh);
     void calFrictionGradient(double3* _gradient, device_TetraData& TetMesh);
 
@@ -362,6 +375,19 @@ class GIPC
     std::unique_ptr<gipc::ABDSimData>         m_abd_sim_data;
     std::unique_ptr<gipc::ABDSystem>          m_abd_system;
     std::unique_ptr<gipc::GlobalLinearSystem> m_global_linear_system;
+
+    // Pending per-body density overrides (body_id -> density), stashed by
+    // SimEngine::set_abd_body_density before finalize. build_gipc_system
+    // transfers these into m_abd_system right after it is created and before
+    // the per-body mass setup runs.
+    std::unordered_map<int, double>           m_pending_abd_density;
+
+    // Pending per-body inertial overrides (body_id -> {mass, com(9 doubles:
+    // com[3] + inertia[3x3 row-major 6 unique? no, 9])}). Stashed by
+    // SimEngine::set_abd_body_inertia before finalize; transferred to
+    // m_abd_system right after it is created.
+    struct PendingInertia { double mass; double com[3]; double inertia[9]; };
+    std::unordered_map<int, PendingInertia>   m_pending_abd_inertia;
 };
 
 #endif

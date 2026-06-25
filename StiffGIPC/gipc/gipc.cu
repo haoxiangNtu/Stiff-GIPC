@@ -18,6 +18,32 @@ void GIPC::build_gipc_system(device_TetraData& tet)
     m_abd_system              = std::make_unique<gipc::ABDSystem>();
     m_abd_system->parms.kappa = 1e8;
     m_abd_system->parms.dt    = IPC_dt;
+    // FIX: the ABD per-body gravity is PRECOMPUTED in init_system() below using
+    // parms.gravity, but SimEngine::finalize() only sets parms.gravity AFTER this
+    // build returns. So without this line the precompute uses the default
+    // Vector3{0,-9.8,0} (Y-up) instead of the scene's real (Z-up) gravity, and
+    // free articulated ABD bodies (e.g. a cartpole pole) never fall. Use the
+    // GIPC-level `gravity`, already set from cfg by apply_config_to_ipc() pre-build.
+    m_abd_system->parms.gravity[0] = gravity.x;
+    m_abd_system->parms.gravity[1] = gravity.y;
+    m_abd_system->parms.gravity[2] = gravity.z;
+
+    // Transfer per-body density overrides (stashed before finalize) into the
+    // freshly-created ABD system, BEFORE its per-body mass setup runs.
+    for(const auto& kv : m_pending_abd_density)
+        m_abd_system->set_body_density_override(kv.first, kv.second);
+
+    // Transfer per-body inertial overrides (mass / COM / inertia) likewise.
+    for(const auto& kv : m_pending_abd_inertia)
+    {
+        const auto& pi = kv.second;
+        Eigen::Vector3d com(pi.com[0], pi.com[1], pi.com[2]);
+        Eigen::Matrix3d I;
+        I << pi.inertia[0], pi.inertia[1], pi.inertia[2],
+             pi.inertia[3], pi.inertia[4], pi.inertia[5],
+             pi.inertia[6], pi.inertia[7], pi.inertia[8];
+        m_abd_system->set_body_inertia_override(kv.first, pi.mass, com, I);
+    }
 
     std::string config_dir = assets_dir_cfg.empty()
         ? std::string(GIPC_ASSETS_DIR) + "scene/abd_system_config.json"

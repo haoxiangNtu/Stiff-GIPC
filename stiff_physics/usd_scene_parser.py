@@ -244,8 +244,17 @@ class StiffGipcUsdParser:
                 if ke:
                     boundary = 1
 
+            # Per-body density (UsdPhysics MassAPI 'physics:density'); -1 = use
+            # the global Config.density. Lets a scene mix per-body densities.
+            density = -1.0
+            for dp in (prim, mesh_prim):
+                da = dp.GetAttribute("physics:density")
+                if da and da.HasAuthoredValue() and da.Get():
+                    density = float(da.Get())
+                    break
+
             if self.debug_verbose:
-                print(f"[UsdParser]   Found rigid body: {path}, boundary={boundary}", flush=True)
+                print(f"[UsdParser]   Found rigid body: {path}, boundary={boundary}, density={density}", flush=True)
             results.append({
                 "prim_path": path,
                 "prim": prim,
@@ -253,6 +262,7 @@ class StiffGipcUsdParser:
                 "mesh_prim": mesh_prim,
                 "mesh_prim_path": str(mesh_prim.GetPath()),
                 "boundary_type": boundary,
+                "density": density,
                 "transform": self._get_transform(mesh_prim),
             })
         if self.debug_verbose:
@@ -1193,9 +1203,13 @@ class StiffGipcUsdParser:
             boundary_type=rb["boundary_type"],
         )
 
+        rb_density = rb.get("density", -1.0)
         for env_idx in range(len(offsets)):
             body_offset = result["body_offsets"][env_idx]
             info.rigid_body_map[prim_path].append(body_offset)
+            # per-body density override (before finalize); -1 keeps the global default
+            if rb_density and rb_density > 0.0:
+                self.engine.set_abd_body_density(body_offset, rb_density)
             info.body_init_transforms[body_offset] = transforms[env_idx]
             info.body_meshes[body_offset] = {
                 "vertices": mesh["vertices"].copy(),

@@ -96,7 +96,7 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
                          abd.body_id_to_dq);
 
         // DIAG: verify F=I after _setup_abd_state
-        if(abd_body_count > 0)
+        if(getenv("STIFF_ABD_DBG") && abd_body_count > 0)
         {
             using Vec12 = Eigen::Matrix<double, 12, 1>;
             int n = std::min((size_t)3, abd_body_count);
@@ -741,7 +741,10 @@ void ABDSystem::_fix_surface_mesh_vertex_masses(muda::DeviceBuffer<Float>& uniqu
     {
         const std::vector<int>* orient_ptr = smb.orient.empty() ? nullptr : &smb.orient;
         double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles, orient_ptr);
-        double total_mass = std::abs(volume) * parms.mass_density;
+        auto   d_it   = m_body_density_override.find(smb.body_id);
+        double body_density = (d_it != m_body_density_override.end()) ? d_it->second
+                                                                      : parms.mass_density;
+        double total_mass = std::abs(volume) * body_density;
         double mass_per_vertex = total_mass / static_cast<double>(smb.point_count);
 
         std::vector<Float> h_masses(smb.point_count, static_cast<Float>(mass_per_vertex));
@@ -770,6 +773,11 @@ void ABDSystem::_fix_surface_mesh_mass_centers()
                                           orient_ptr);
 
         Eigen::Vector3d center = m_x / m;
+        // Inertial override: the ABD body frame origin is the COM, which drives
+        // the revolute torque arm. Use the authored COM when provided.
+        auto inertia_it = m_body_inertia_override.find(smb.body_id);
+        if(inertia_it != m_body_inertia_override.end())
+            center = inertia_it->second.com;
         Vector3 h_center = center;
         cudaMemcpy(body_mass_center.data() + smb.body_id,
                    &h_center,
@@ -788,8 +796,11 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
         Eigen::Vector3d out_m_x = Eigen::Vector3d::Zero();
         Eigen::Matrix3d out_m_xx = Eigen::Matrix3d::Zero();
         const std::vector<int>* orient_ptr = smb.orient.empty() ? nullptr : &smb.orient;
+        auto   d_it2 = m_body_density_override.find(smb.body_id);
+        double body_density = (d_it2 != m_body_density_override.end()) ? d_it2->second
+                                                                       : parms.mass_density;
         gipc::compute_trimesh_dyadic_mass(smb.vertices, smb.triangles,
-                                          parms.mass_density,
+                                          body_density,
                                           out_m, out_m_x, out_m_xx,
                                           orient_ptr);
 
@@ -797,6 +808,20 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
 
         // Centered second moment: m_xx_bar = m_xx - (1/m) * m_x * m_x^T
         Eigen::Matrix3d m_xx_centered = out_m_xx - (1.0 / out_m) * out_m_x * out_m_x.transpose();
+
+        // Inertial override: replace the mesh-derived mass / COM / centered
+        // second moment with authored values (URDF / Newton). The centered
+        // second moment M relates to the inertia tensor I (about the COM) by
+        //   I = trace(M) * Identity - M   =>   M = trace(I)/2 * Identity - I.
+        auto inertia_it = m_body_inertia_override.find(smb.body_id);
+        if(inertia_it != m_body_inertia_override.end())
+        {
+            const auto& ov = inertia_it->second;
+            out_m  = ov.mass;
+            center = ov.com;
+            double trI = ov.inertia.trace();
+            m_xx_centered = (0.5 * trI) * Eigen::Matrix3d::Identity() - ov.inertia;
+        }
 
         // Build ABDJacobiDyadicMass in body-centered frame
         ABDJacobiDyadicMass dyadic = ABDJacobiDyadicMass::from_dyadic_mass(
@@ -824,7 +849,6 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
                    sizeof(Float),
                    cudaMemcpyHostToDevice);
 
-        // Gravity: in body-centered frame, first moment is zero so
         // f_gravity = [m*g; 0; 0; 0] and gravity_acc = M^-1 * f_gravity
         Vector12 gravity_force = Vector12::Zero();
         gravity_force.segment<3>(0) = out_m * parms.gravity;

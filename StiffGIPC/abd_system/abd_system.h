@@ -10,6 +10,7 @@
 #include <linear_system/utils/converter.h>
 #include "linear_system/linear_system/global_matrix.h"
 #include <Eigen/Dense>
+#include <unordered_map>
 namespace gipc
 {
 
@@ -106,6 +107,20 @@ class ABDSystem
     // ---- Surface Mesh Bodies (for native surface integral path) ----
     std::vector<ABDSurfaceMeshBody> m_surface_mesh_bodies;
 
+    // Per-body density overrides (body_id -> density). When a body_id is
+    // present, _fix_surface_mesh_vertex_masses uses this density instead of
+    // the global parms.mass_density, so a scene can mix densities.
+    std::unordered_map<int, double> m_body_density_override;
+
+    // Per-body inertial overrides (body_id -> {mass, com (world, at load time),
+    // inertia 3x3 about com}). When present, _apply_surface_mesh_body_overrides
+    // builds the ABD dyadic mass from THESE authored values (e.g. URDF inertial
+    // tags via Newton body_mass/body_com/body_inertia) instead of from the
+    // welded collision-mesh geometry — whose centroid can be far off for a
+    // multi-shape link, skewing the revolute driving torque arm.
+    struct InertiaOverride { double mass; Eigen::Vector3d com; Eigen::Matrix3d inertia; };
+    std::unordered_map<int, InertiaOverride> m_body_inertia_override;
+
     // ---- Bilateral Stitch Constraint Data ----
     // Set from GIPC before each call to setup_abd_system_gradient_hessian.
     // These are GPU pointers owned by device_TetraData (not managed here).
@@ -120,6 +135,23 @@ class ABDSystem
 
   public:
     ABDSystemParms parms;
+
+    /// Override the density of one ABD body (by body_id). Call before finalize.
+    void set_body_density_override(int body_id, double density)
+    {
+        m_body_density_override[body_id] = density;
+    }
+
+    /// Override the inertial properties (mass, COM in world/load frame, 3x3
+    /// inertia about the COM) of one ABD body. Call before finalize. Used to
+    /// take mass/COM/inertia from authored values (URDF) instead of the welded
+    /// collision-mesh geometry.
+    void set_body_inertia_override(int body_id, double mass,
+                                   const Eigen::Vector3d& com,
+                                   const Eigen::Matrix3d& inertia)
+    {
+        m_body_inertia_override[body_id] = InertiaOverride{mass, com, inertia};
+    }
 
     /******************************************************************************
     *                             build function

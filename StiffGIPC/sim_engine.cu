@@ -46,6 +46,12 @@ struct SimEngine::Impl
     int              step_count       = 0;
     std::string      resolved_assets_dir;
 
+    // [Step B] grow-only device buffers for per-contact force export
+    int2*    d_contact_pair  = nullptr;
+    double3* d_contact_force = nullptr;
+    int      contact_cap     = 0;
+    int      contact_count   = 0;
+
     std::vector<BodyLoadRecord> load_records;
 
     // Per-FEM-body vertex ranges (populated during load)
@@ -1426,6 +1432,8 @@ void SimEngine::finalize()
         impl.ipc.m_abd_system->parms.revolute_driving_strength_ratio = impl.cfg.revolute_driving_strength_ratio;
         impl.ipc.m_abd_system->parms.prismatic_strength_ratio        = impl.cfg.prismatic_strength_ratio;
         impl.ipc.m_abd_system->parms.prismatic_driving_strength_ratio = impl.cfg.prismatic_driving_strength_ratio;
+        impl.ipc.m_abd_system->parms.max_revolute_step_per_frame     = impl.cfg.max_revolute_step_per_frame;
+        impl.ipc.m_abd_system->parms.max_prismatic_step_per_frame    = impl.cfg.max_prismatic_step_per_frame;
         impl.ipc.m_abd_system->parms.dt = impl.cfg.dt;
         impl.ipc.m_abd_system->parms.gravity = impl.cfg.gravity;
         impl.ipc.m_abd_system->parms.velocity_damping = impl.cfg.velocity_damping;
@@ -1496,6 +1504,7 @@ void SimEngine::finalize()
     }
 
     // DIAG: dump q for first 3 bodies after full finalize
+    if(getenv("STIFF_ABD_DBG"))
     {
         int nb = impl.ipc.abd_fem_count_info.abd_body_num;
         int n = std::min(nb, 3);
@@ -1920,6 +1929,15 @@ int SimEngine::get_vertex_count() const
     return m_impl->ipc.vertexNum;
 }
 
+uintptr_t SimEngine::get_vertices_device_ptr() const
+{
+    // [gpu-direct] Raw device pointer to the global vertex buffer (double3*,
+    // length vertexNum). Lets an external GPU framework (Warp) read FEM vertex
+    // positions straight from device memory without a host round-trip. Valid
+    // after finalize(); contents update after each step().
+    return reinterpret_cast<uintptr_t>(m_impl->ipc._vertexes);
+}
+
 int SimEngine::get_surface_face_count() const
 {
     return static_cast<int>(m_impl->tetMesh.surface.size());
@@ -2169,6 +2187,32 @@ Eigen::Matrix4d SimEngine::get_urdf_link_transform(const std::string& link_name)
     return it->second;
 }
 
+void SimEngine::set_abd_body_density(int body_id, double density)
+{
+    // Override one ABD body's density (mass = density * volume). Must be called
+    // AFTER the body is loaded and BEFORE finalize(). The ABDSystem does not
+    // exist yet at this point (it is created inside build_gipc_system during
+    // finalize), so we stash the override on GIPC; build_gipc_system transfers
+    // it to the ABDSystem right before the per-body mass setup runs.
+    m_impl->ipc.m_pending_abd_density[body_id] = density;
+}
+
+void SimEngine::set_abd_body_inertia(int body_id, double mass,
+                                     const double* com3, const double* inertia9)
+{
+    // Override one ABD body's inertial properties (mass, COM, 3x3 inertia about
+    // the COM) — e.g. from URDF inertial tags via Newton body_mass/body_com/
+    // body_inertia — instead of deriving them from the welded collision mesh,
+    // whose centroid can be far off for a multi-shape link and skew the joint
+    // driving torque. Stashed on GIPC (ABDSystem not built yet); transferred at
+    // finalize. com/inertia are in the SAME world/load frame as the mesh verts.
+    GIPC::PendingInertia pi;
+    pi.mass = mass;
+    for(int i = 0; i < 3; i++) pi.com[i] = com3[i];
+    for(int i = 0; i < 9; i++) pi.inertia[i] = inertia9[i];
+    m_impl->ipc.m_pending_abd_inertia[body_id] = pi;
+}
+
 void SimEngine::set_body_external_force(int body_id,
                                        double fx, double fy, double fz)
 {
@@ -2411,13 +2455,14 @@ void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,
     if(getenv("STIFF_CONTACT_DBG"))
         fprintf(stderr, "[contact_dbg] h_cpNum0=%u h_gpNum=%u Kappa=%g dHat=%g nv=%d\n",
                 g.h_cpNum[0], g.h_gpNum, g.Kappa, g.dHat, nv);
-    if(g.h_cpNum[0] < 1)
-        return;  // nothing in contact
+    if(g.h_cpNum[0] < 1 && g.h_gpNum < 1)
+        return;  // nothing in contact (neither body-body nor ground)
 
     double3* d_grad = nullptr;
     CUDA_SAFE_CALL(cudaMalloc(&d_grad, nv * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMemset(d_grad, 0, nv * sizeof(double3)));
-    g.calBarrierGradient(d_grad, g.Kappa);   // atomic-adds contact force per vertex
+    g.calBarrierGradient(d_grad, g.Kappa);    // body-body (DCD) contact force per vertex
+    g.computeGroundGradient(d_grad, g.Kappa); // ground half-plane contact force per vertex
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     std::vector<double3> h(vert_count);
@@ -2426,6 +2471,211 @@ void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,
     double sx = 0, sy = 0, sz = 0;
     for(int i = 0; i < vert_count; i++) { sx += h[i].x; sy += h[i].y; sz += h[i].z; }
     out3[0] = sx; out3[1] = sy; out3[2] = sz;
+    CUDA_SAFE_CALL(cudaFree(d_grad));
+}
+
+// ============================================================================
+// Contact-pair "clean export layer"
+// ----------------------------------------------------------------------------
+// The solver stores collision pairs as MMCVID int4 (sign-packed {type,
+// degeneracy} state, inherited from GIPC). That packing is load-bearing inside
+// the contact kernels, so we DON'T touch it. Instead, anything OUTSIDE the
+// solver (contact sensor, per-pair force, debug viz) goes through this single
+// decode into a clean int4 of plain vertex indices ({v0,v1,v2,v3}, -1 padded
+// for PP/PE), UIPC-style. The decode runs ON the readback path only — never in
+// engine.step() — so it adds zero cost to training / batched solves.
+//
+// Sign-encoding decoded here (mirrors the barrier-gradient kernels):
+//   .x >= 0            -> EE: {.x, .y, .z, (.w>=0? .w : -.w-1)}
+//   .x <  0 (v0=-.x-1) -> .z<0: (.y<0 ? {v0,-.y-1,-.z-1,-.w-1} : PP {v0,.y,-1,-1})
+//                         .w<0: (.y<0 ? {v0,-.y-1,.z,-.w-1}    : PE {v0,.y,.z,-1})
+//                         else: PT {v0,.y,.z,.w}
+__host__ __device__ static int4 _decode_pair_clean(int4 m)
+{
+    int v0, v1, v2, v3;
+    v0 = v1 = v2 = v3 = -1;
+    if(m.x >= 0)
+    {
+        v0 = m.x; v1 = m.y; v2 = m.z; v3 = (m.w >= 0) ? m.w : (-m.w - 1);
+    }
+    else
+    {
+        int p0 = -m.x - 1;
+        if(m.z < 0)
+        {
+            if(m.y < 0) { v0 = p0; v1 = -m.y - 1; v2 = -m.z - 1; v3 = -m.w - 1; }
+            else        { v0 = p0; v1 = m.y; }
+        }
+        else if(m.w < 0)
+        {
+            if(m.y < 0) { v0 = p0; v1 = -m.y - 1; v2 = m.z; v3 = -m.w - 1; }
+            else        { v0 = p0; v1 = m.y; v2 = m.z; }
+        }
+        else { v0 = p0; v1 = m.y; v2 = m.z; v3 = m.w; }
+    }
+    return make_int4(v0, v1, v2, v3);
+}
+
+__global__ static void _decodeCleanContactPairs(const int4* mmcvid, int4* clean, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n)
+        return;
+    clean[idx] = _decode_pair_clean(mmcvid[idx]);
+}
+
+int SimEngine::get_collision_pairs_clean(int* out_flat) const
+{
+    // Decode the current body-body collision pairs into clean vertex-index
+    // 4-tuples (row-major int4 -> out_flat[4*i .. 4*i+3], -1 padded). Returns
+    // the pair count. Rebuilds contacts at the current (post-step) state.
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    if(g.m_skip_all_collision)
+        return 0;
+    g.buildBVH();
+    g.buildCP();
+    int ncp = static_cast<int>(g.h_cpNum[0]);
+    if(ncp < 1)
+        return 0;
+
+    int4* d_clean = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc(&d_clean, ncp * sizeof(int4)));
+    int threads = 256, blocks = (ncp + threads - 1) / threads;
+    _decodeCleanContactPairs<<<blocks, threads>>>(g._collisonPairs, d_clean, ncp);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    if(out_flat != nullptr)
+        CUDA_SAFE_CALL(cudaMemcpy(out_flat, d_clean, ncp * sizeof(int4), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaFree(d_clean));
+    return ncp;
+}
+
+// [Step B] Compute per-contact forces into grow-only device buffers. Returns the
+// contact count (h_cpNum + h_gpNum). Buffers are read-only views valid until the
+// next call; fetch device pointers via contacts_pair_ptr()/contacts_force_ptr().
+// Call AFTER step().
+int SimEngine::compute_contacts(bool rebuild)
+{
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    impl.contact_count = 0;
+    if(g.m_skip_all_collision || g.vertexNum <= 0)
+        return 0;
+    // By default REUSE the contact set the solver already built during the last
+    // step() (BVH + collision pairs persist in _collisonPairs / _environment_
+    // collisionPair with counts h_cpNum/h_gpNum) — like UIPC, where contacts are
+    // queryable after world.advance() without a rebuild. Pass rebuild=true only
+    // when calling outside the post-step window.
+    if(rebuild)
+    {
+        g.buildBVH();
+        g.buildCP();
+    }
+    int n = (int)g.h_cpNum[0] + (int)g.h_gpNum;
+    if(n <= 0)
+        return 0;
+    if(n > impl.contact_cap)
+    {
+        if(impl.d_contact_pair)  CUDA_SAFE_CALL(cudaFree(impl.d_contact_pair));
+        if(impl.d_contact_force) CUDA_SAFE_CALL(cudaFree(impl.d_contact_force));
+        impl.contact_cap = n + n / 2 + 64;  // grow with slack
+        CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_contact_pair, impl.contact_cap * sizeof(int2)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&impl.d_contact_force, impl.contact_cap * sizeof(double3)));
+    }
+    impl.contact_count = g.exportContacts(impl.d_contact_pair, impl.d_contact_force);
+    return impl.contact_count;
+}
+
+uintptr_t SimEngine::contacts_pair_ptr() const
+{
+    return reinterpret_cast<uintptr_t>(m_impl->d_contact_pair);
+}
+
+uintptr_t SimEngine::contacts_force_ptr() const
+{
+    return reinterpret_cast<uintptr_t>(m_impl->d_contact_force);
+}
+
+void SimEngine::get_pair_contact_force(int a_off, int a_cnt, int b_off, int b_cnt,
+                                       double* out3) const
+{
+    // Net IPC contact (barrier) force on body A FROM body B: the barrier
+    // gradient summed over A's vertices, restricted to collision pairs that
+    // connect A's vertex range [a_off, a_off+a_cnt) and B's [b_off, b_off+b_cnt).
+    // Used to populate the contact sensor's per-partner force_matrix_w. Call
+    // AFTER step(). Returns the raw IP-scaled gradient (apply -1/dt^2 + sign on
+    // the Python side, same convention as get_body_contact_force).
+    out3[0] = out3[1] = out3[2] = 0.0;
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    int   nv   = static_cast<int>(g.vertexNum);
+    if(nv <= 0 || a_off < 0 || a_cnt <= 0 || b_off < 0 || b_cnt <= 0)
+        return;
+    if(a_off + a_cnt > nv || b_off + b_cnt > nv)
+        return;
+    if(g.m_skip_all_collision)
+        return;
+
+    g.buildBVH();
+    g.buildCP();
+    int ncp = static_cast<int>(g.h_cpNum[0]);
+    if(ncp < 1)
+        return;  // no body-body pairs (ground-only contact has no partner body)
+
+    std::vector<int4> h_pairs(ncp);
+    CUDA_SAFE_CALL(cudaMemcpy(h_pairs.data(), g._collisonPairs,
+                              ncp * sizeof(int4), cudaMemcpyDeviceToHost));
+
+    // Membership test on the CLEAN decode (plain vertex indices); the gradient
+    // re-run below keeps the ORIGINAL MMCVID so its {type,degeneracy} flags are
+    // preserved. Clean decode is the single source of truth (_decode_pair_clean).
+    std::vector<int4> filtered;
+    filtered.reserve(ncp);
+    for(int i = 0; i < ncp; i++)
+    {
+        int4 c = _decode_pair_clean(h_pairs[i]);
+        int  verts[4] = {c.x, c.y, c.z, c.w};
+        bool inA = false, inB = false;
+        for(int k = 0; k < 4; k++)
+        {
+            int vv = verts[k];
+            if(vv < 0) continue;  // -1 padding (PP/PE unused slots)
+            if(vv >= a_off && vv < a_off + a_cnt) inA = true;
+            if(vv >= b_off && vv < b_off + b_cnt) inB = true;
+        }
+        if(inA && inB)
+            filtered.push_back(h_pairs[i]);
+    }
+    if(filtered.empty())
+        return;
+
+    int4* d_filtered = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc(&d_filtered, filtered.size() * sizeof(int4)));
+    CUDA_SAFE_CALL(cudaMemcpy(d_filtered, filtered.data(),
+                              filtered.size() * sizeof(int4), cudaMemcpyHostToDevice));
+
+    double3* d_grad = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc(&d_grad, nv * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemset(d_grad, 0, nv * sizeof(double3)));
+
+    // Reuse the existing barrier-gradient kernel on just the filtered pairs by
+    // temporarily pointing GIPC at our subset (synchronous readback context).
+    int4*    saved_pairs = g._collisonPairs;
+    uint32_t saved_cpNum = g.h_cpNum[0];
+    g._collisonPairs = d_filtered;
+    g.h_cpNum[0]     = static_cast<uint32_t>(filtered.size());
+    g.calBarrierGradient(d_grad, g.Kappa);
+    g._collisonPairs = saved_pairs;
+    g.h_cpNum[0]     = saved_cpNum;
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+    std::vector<double3> hg(a_cnt);
+    CUDA_SAFE_CALL(cudaMemcpy(hg.data(), d_grad + a_off,
+                              a_cnt * sizeof(double3), cudaMemcpyDeviceToHost));
+    double sx = 0, sy = 0, sz = 0;
+    for(int i = 0; i < a_cnt; i++) { sx += hg[i].x; sy += hg[i].y; sz += hg[i].z; }
+    out3[0] = sx; out3[1] = sy; out3[2] = sz;
+    CUDA_SAFE_CALL(cudaFree(d_filtered));
     CUDA_SAFE_CALL(cudaFree(d_grad));
 }
 
@@ -3332,6 +3582,47 @@ void SimEngine::set_vertex_velocities_gpu(const double* xyz, int count)
     }
     CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.velocities, tmp.data(),
                               n * sizeof(double3), cudaMemcpyHostToDevice));
+}
+
+void SimEngine::teleport_fem_vertices(const double* xyz, int count,
+                                      const double* velocities)
+{
+    int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum));
+    if(n <= 0) return;
+    // Write _vertexes (current) and o_vertexes (committed previous-step).
+    CUDA_SAFE_CALL(cudaMemcpy(m_impl->ipc._vertexes, xyz,
+                              n * sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.o_vertexes, xyz,
+                              n * sizeof(double3), cudaMemcpyHostToDevice));
+
+    if(velocities != nullptr)
+    {
+        // Preserve inertia: write v and build xTilta = x + v*dt + g*dt^2
+        // on the host, then upload.
+        CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.velocities, velocities,
+                                  n * sizeof(double3), cudaMemcpyHostToDevice));
+        double dt = m_impl->ipc.IPC_dt;
+        double3 g = m_impl->ipc.gravity;
+        double dt2 = dt * dt;
+        std::vector<double> xTilta_host(3 * n);
+        for(int i = 0; i < n; i++)
+        {
+            xTilta_host[3*i+0] = xyz[3*i+0] + velocities[3*i+0] * dt + g.x * dt2;
+            xTilta_host[3*i+1] = xyz[3*i+1] + velocities[3*i+1] * dt + g.y * dt2;
+            xTilta_host[3*i+2] = xyz[3*i+2] + velocities[3*i+2] * dt + g.z * dt2;
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.xTilta, xTilta_host.data(),
+                                  n * sizeof(double3), cudaMemcpyHostToDevice));
+    }
+    else
+    {
+        // Zero velocity, xTilta = new_pos (caller declines to preserve
+        // inertia; matches teleport_abd_bodies semantics).
+        CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.xTilta, xyz,
+                                  n * sizeof(double3), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemset(m_impl->d_tetMesh.velocities, 0,
+                                  n * sizeof(double3)));
+    }
 }
 
 void SimEngine::get_fem_body_vertex_range(int fem_body_idx, int* out_start, int* out_count) const

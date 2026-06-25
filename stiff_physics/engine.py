@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import sysconfig
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -42,18 +43,36 @@ def _import_native():
     except ImportError:
         pass
 
-    # 2. Fallback: dev build directory next to the project root
+    # 2. Fallback: dev build directory next to the project root.
+    #
+    # Keep ABI-specific build dirs ahead of the generic "build/" dir.  This
+    # worktree may contain both py3.11 and py3.12 extension modules; loading a
+    # stale py3.12 module from build/ against a freshly rebuilt core library can
+    # corrupt SimEngineConfig layout (e.g. cuda_device is read from the wrong
+    # offset).  Newton/IsaacLab py3.12 should therefore resolve build_312 first.
     _project_root = Path(__file__).resolve().parent.parent
-    _build_dir = _project_root / "build"
-    if _build_dir.is_dir():
+    py_tag = f"{sys.version_info.major}{sys.version_info.minor}"
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
+    build_dirs = [
+        _project_root / f"build_{py_tag}",
+        _project_root / "build",
+    ]
+    for _build_dir in build_dirs:
+        if not _build_dir.is_dir():
+            continue
+        if ext_suffix and not any(_build_dir.glob(f"pystiffgipc*{ext_suffix}")):
+            continue
         bd = str(_build_dir)
         if bd not in sys.path:
             sys.path.insert(0, bd)
-    try:
-        import pystiffgipc
-        return pystiffgipc
-    except ImportError:
-        pass
+        try:
+            import pystiffgipc
+            return pystiffgipc
+        except ImportError:
+            try:
+                sys.path.remove(bd)
+            except ValueError:
+                pass
 
     raise ImportError(
         "pystiffgipc C++ module not found. "
@@ -180,6 +199,8 @@ class Config:
         assets_dir: str = "",
         prismatic_strength_ratio: float = 100.0,
         prismatic_driving_strength_ratio: float = 100.0,
+        max_revolute_step_per_frame: float = 0.1,
+        max_prismatic_step_per_frame: float = 0.002,
         gravity: tuple[float, float, float] = (0.0, -9.8, 0.0),
         ground_normal: tuple[float, float, float] = (0.0, 1.0, 0.0),
         ground_offset: float = -1.0,
@@ -200,6 +221,10 @@ class Config:
         self._cfg.revolute_driving_strength_ratio = revolute_driving_strength_ratio
         self._cfg.prismatic_strength_ratio = prismatic_strength_ratio
         self._cfg.prismatic_driving_strength_ratio = prismatic_driving_strength_ratio
+        if hasattr(self._cfg, "max_revolute_step_per_frame"):
+            self._cfg.max_revolute_step_per_frame = max_revolute_step_per_frame
+        if hasattr(self._cfg, "max_prismatic_step_per_frame"):
+            self._cfg.max_prismatic_step_per_frame = max_prismatic_step_per_frame
         self._cfg.semi_implicit_enabled = semi_implicit_enabled
         self._cfg.semi_implicit_beta_tol = semi_implicit_beta_tol
         self._cfg.semi_implicit_min_iter = semi_implicit_min_iter
@@ -668,6 +693,13 @@ class Engine:
         """Return vertex positions as (N, 3) float64 array."""
         return self._engine.get_vertices()
 
+    def get_vertices_device_ptr(self) -> int:
+        """[gpu-direct] Raw CUDA device pointer (int) to the (N,3) float64 vertex
+        buffer, N = :meth:`get_vertex_count`. Wrap with a zero-copy GPU array
+        (e.g. ``warp.array(ptr=..., dtype=wp.vec3d, length=N)``) to read FEM
+        vertex positions without a host round-trip. Valid after finalize()."""
+        return self._engine.get_vertices_device_ptr()
+
     def get_vertex_velocities(self) -> np.ndarray:
         """Return vertex velocities as (N, 3) float64 array."""
         return self._engine.get_vertex_velocities()
@@ -681,6 +713,25 @@ class Engine:
         """Write vertex velocities to GPU from (N, 3) float64."""
         self._engine.set_vertex_velocities_gpu(
             np.ascontiguousarray(velocities, dtype=np.float64))
+
+    def teleport_fem_vertices(self, positions: np.ndarray,
+                              velocities: Optional[np.ndarray] = None) -> None:
+        """Teleport FEM vertices: writes new positions to _vertexes (current),
+        o_vertexes (previous-step committed), and xTilta (predictor). Use this
+        instead of set_vertex_positions_gpu for handoff/reset, otherwise the
+        next engine.step() reverts to the stale rest pose via xTilta.
+
+        If ``velocities`` is provided, also writes velocities and extends
+        xTilta = x + v*dt + g*dt^2 so inertia is preserved across handoff.
+        Default (None) zeros velocities per teleport_abd_bodies semantics.
+        """
+        pos = np.ascontiguousarray(positions, dtype=np.float64)
+        if velocities is None:
+            self._engine.teleport_fem_vertices(pos)
+        else:
+            self._engine.teleport_fem_vertices(
+                pos,
+                np.ascontiguousarray(velocities, dtype=np.float64))
 
     def get_surface_faces(self) -> np.ndarray:
         """Return surface triangle indices as (F, 3) uint32 array."""
@@ -789,6 +840,77 @@ class Engine:
             ids[s:e, 1] = r.body_offset
         return ids
 
+    def get_body_contact_force(self, vertex_offset: int, vertex_count: int) -> np.ndarray:
+        """Net IPC contact force (world frame, N) on a body.
+
+        Sums the per-vertex contact forces over the contiguous global vertex
+        range ``[vertex_offset, vertex_offset + vertex_count)``.  Returns a
+        ``(3,)`` float64 array.  Must be called AFTER :meth:`step` so the
+        contact solver state is current.
+
+        The vertex range for a given body can be looked up from
+        :meth:`get_all_load_records` (``vertex_offset`` / ``vertex_count`` per
+        record) or, for FEM bodies, from the USD-parser ``geometry_dict``.
+        """
+        return self._engine.get_body_contact_force(int(vertex_offset), int(vertex_count))
+
+    def get_pair_contact_force(self, a_off: int, a_cnt: int, b_off: int, b_cnt: int) -> np.ndarray:
+        """Net IPC contact force (world frame, raw IP scaling) on body A FROM body B.
+
+        Barrier gradient summed over A's vertex range ``[a_off, a_off+a_cnt)``,
+        restricted to collision pairs that connect A and B's vertex range
+        ``[b_off, b_off+b_cnt)``.  Apply the same ``-1/dt**2`` + sign convention
+        as :meth:`get_body_contact_force` to get Newtons.  Call AFTER :meth:`step`.
+        """
+        return self._engine.get_pair_contact_force(int(a_off), int(a_cnt), int(b_off), int(b_cnt))
+
+    def get_collision_pairs_clean(self) -> np.ndarray:
+        """Current body-body collision pairs as an ``(N, 4)`` int array of plain
+        vertex indices (``-1`` padded for PP/PE), UIPC-style — the "clean export
+        layer".  The solver keeps its MMCVID packing internally; this is a
+        read-only decoded view for sensors / inspection.  Call AFTER :meth:`step`.
+        """
+        return self._engine.get_collision_pairs_clean()
+
+    def get_contacts_device(self):
+        """[Step B] GPU-resident per-contact export. Returns
+        ``(count, pair_ptr, force_ptr)`` — device pointers (uintptr) to an int2
+        ``(bodyA, bodyB)`` (bodyB=-1 for ground) and a double3 world contact force
+        (N) on bodyA. Wrap with ``warp.array(ptr=..., copy=False)``. Read-only,
+        valid until the next call. Call AFTER :meth:`step`.
+        """
+        return self._engine.get_contacts_device()
+
+    def get_contacts(self):
+        """[Step B] Host readback of the per-contact export: ``(pair (N,2) int,
+        force (N,3) double world N on bodyA)``. For validation; the GPU-direct
+        path uses :meth:`get_contacts_device`. Call AFTER :meth:`step`.
+        """
+        return self._engine.get_contacts()
+
+    def set_abd_body_density(self, body_id: int, density: float) -> None:
+        """Override one ABD body's density (mass = density × volume).
+
+        Lets a scene mix per-body densities (the global ``Config.density`` is
+        the default for bodies without an override).  Must be called AFTER the
+        body is loaded and BEFORE :meth:`finalize`.
+        """
+        self._engine.set_abd_body_density(int(body_id), float(density))
+
+    def set_abd_body_inertia(self, body_id: int, mass: float,
+                             com, inertia) -> None:
+        """Override an ABD body's mass / COM / inertia (load frame).
+
+        ``com`` is a length-3 array (world/load frame), ``inertia`` a 3x3 (about
+        the COM). Uses authored values (e.g. URDF inertial tags via Newton
+        body_mass/body_com/body_inertia) instead of the welded collision-mesh
+        geometry. Must be called AFTER loading the body and BEFORE finalize().
+        """
+        import numpy as _np
+        c = _np.ascontiguousarray(com, dtype=_np.float64).reshape(3)
+        I = _np.ascontiguousarray(inertia, dtype=_np.float64).reshape(9)
+        self._engine.set_abd_body_inertia(int(body_id), float(mass), c, I)
+
     # ---- Joint control ----
 
     @property
@@ -839,6 +961,14 @@ class Engine:
         return self._engine.get_body_contact_force_batched(
             np.ascontiguousarray(offsets, dtype=np.int32),
             np.ascontiguousarray(counts, dtype=np.int32))
+
+    def set_max_revolute_step_per_frame(self, rad: float) -> None:
+        """Set the per-step revolute target slew limit in radians."""
+        self._engine.set_max_revolute_step_per_frame(float(rad))
+
+    def set_max_prismatic_step_per_frame(self, meters: float) -> None:
+        """Set the per-step prismatic target slew limit in meters."""
+        self._engine.set_max_prismatic_step_per_frame(float(meters))
 
     def get_revolute_current_angles(self) -> np.ndarray:
         """Read actual joint angles from GPU state.
