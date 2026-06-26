@@ -244,7 +244,10 @@ bool tetrahedra_obj::load_triMesh(const std::string&     filename,
                 memset(buffer, 0, sizeof(char) * 1024);
                 std::copy(f.begin(), f.end(), buffer);
 
-                uint3 faceVertIndex;
+                // faceVertIndex is initialised so an unmatched face format can never push
+                // uninitialised/garbage indices into `surface` (root of the `f v//vn` bug:
+                // broken connectivity / CUDA out-of-bounds).
+                uint3 faceVertIndex  = make_uint3(0u, 0u, 0u);
                 uint3 faceNormalIndex;
 
                 if(sscanf(buffer,
@@ -266,6 +269,21 @@ bool tetrahedra_obj::load_triMesh(const std::string&     filename,
                     faceVertIndex.z -= (1 - vertexOffset);
                     //triangles.push_back(faceVertIndex);
                     //facenormals.push_back(faceNormalIndex);
+                }
+                else if(sscanf(buffer,
+                               "f %d//%d %d//%d %d//%d",
+                               &faceVertIndex.x,
+                               &faceNormalIndex.x,
+                               &faceVertIndex.y,
+                               &faceNormalIndex.y,
+                               &faceVertIndex.z,
+                               &faceNormalIndex.z)
+                        == 6)
+                {
+                    // f v//vn : normal present, texture coord empty (very common export).
+                    faceVertIndex.x -= (1 - vertexOffset);
+                    faceVertIndex.y -= (1 - vertexOffset);
+                    faceVertIndex.z -= (1 - vertexOffset);
                 }
                 else if(sscanf(buffer,
                                "f %d %d %d",
