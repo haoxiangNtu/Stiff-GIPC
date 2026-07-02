@@ -7,6 +7,7 @@
 //
 
 #include "mlbvh.cuh"
+#include <cub/device/device_radix_sort.cuh>   // [perenv-parallel #2] malloc-free Morton sort
 #include <cmath>
 #include "cuda_tools/cuda_tools.h"
 #include <thrust/sort.h>
@@ -25,6 +26,117 @@
 // can detect overflow, grow the buffer and re-run detection (no pairs lost, no OOB).
 __device__ int g_dcd_cp_cap = 0x7fffffff;
 __device__ int g_ccd_cp_cap = 0x7fffffff;
+// [xenv pin] when 1, drop the EE once-only dedup (obj_idx<self_eid) → emit BOTH directions.
+// If counts become env-symmetric ⇒ the dedup line is the asymmetry; if still asymmetric ⇒
+// the edge-tree candidate enumeration (Morton) is.
+__device__ int g_ee_nodedup = 0;
+void set_ee_nodedup(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_nodedup, &v, sizeof(int))); }
+// [xenv pin/fix] when 1, canonicalize each EE edge's endpoint order by POSITION before _dType_EE
+// (env-invariant since geometry is bit-identical) → kills the flipped-edge-order asymmetry.
+__device__ int g_ee_canon = 0;
+void set_ee_canon(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_canon, &v, sizeof(int))); }
+__device__ __forceinline__ bool _pos_lt(const double3& a, const double3& b)
+{ if(a.x != b.x) return a.x < b.x; if(a.y != b.y) return a.y < b.y; return a.z < b.z; }
+// [env-det] global→env-local vertex id (mirror across identical envs); FINAL tie-break in canon.
+__device__ const int* g_vloc = nullptr;
+void set_ee_vloc(const int* p) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_vloc, &p, sizeof(int*))); }
+// [env-det] TOTAL env-invariant vertex order: position lexicographic, ties broken by env-local id.
+__device__ __forceinline__ bool _vless(const double3& a, uint32_t ia, const double3& b, uint32_t ib)
+{ if(a.x != b.x) return a.x < b.x; if(a.y != b.y) return a.y < b.y; if(a.z != b.z) return a.z < b.z;
+  return g_vloc ? (g_vloc[ia] < g_vloc[ib]) : (ia < ib); }
+// [xenv crack] exact clamped segment-segment distance (geometric, order-invariant) for the trace.
+__device__ __forceinline__ double _seg_seg_d(double3 p1,double3 q1,double3 p2,double3 q2)
+{
+    double3 d1=__GEIGEN__::__minus(q1,p1), d2=__GEIGEN__::__minus(q2,p2), r=__GEIGEN__::__minus(p1,p2);
+    double a=__GEIGEN__::__v_vec_dot(d1,d1), e=__GEIGEN__::__v_vec_dot(d2,d2), f=__GEIGEN__::__v_vec_dot(d2,r);
+    double s,t;
+    if(a<=1e-30 && e<=1e-30) return __GEIGEN__::__norm(r);
+    if(a<=1e-30){ s=0; t=f/e; t=t<0?0:(t>1?1:t); }
+    else { double c=__GEIGEN__::__v_vec_dot(d1,r);
+        if(e<=1e-30){ t=0; s=-c/a; s=s<0?0:(s>1?1:s); }
+        else { double b=__GEIGEN__::__v_vec_dot(d1,d2); double den=a*e-b*b;
+            s = den>1e-30 ? (b*f-c*e)/den : 0; s=s<0?0:(s>1?1:s);
+            t=(b*s+f)/e;
+            if(t<0){t=0; s=-c/a; s=s<0?0:(s>1?1:s);}
+            else if(t>1){t=1; s=(b-c)/a; s=s<0?0:(s>1?1:s);} } }
+    double3 c1=__GEIGEN__::__add(p1,__GEIGEN__::__s_vec_multiply(d1,s));
+    double3 c2=__GEIGEN__::__add(p2,__GEIGEN__::__s_vec_multiply(d2,t));
+    return __GEIGEN__::__norm(__GEIGEN__::__minus(c1,c2));
+}
+// [xenv pin] when 1, force the near-parallel EE mollifier OFF (add_e=-1) → drops the -obj_idx-2
+// global-edge-index encoding. Tests whether the residual barrier-gradient asymmetry is the mollifier.
+__device__ int g_ee_nomollify = 0;
+void set_ee_nomollify(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_nomollify, &v, sizeof(int))); }
+// [xenv crack] log near-threshold EE candidate TESTS (full 4 ids = both edges) to localize the
+// membership residual: did env1 TEST a candidate env0 emitted? (enumeration vs classification)
+__device__ int g_ee_trace = 0;
+__device__ int g_max_stack = 0;  // [ovf] max traversal stack depth reached
+void reset_max_stack(){ int z=0; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_max_stack,&z,sizeof(int))); }
+int get_max_stack(){ int v=0; CUDA_SAFE_CALL(cudaMemcpyFromSymbol(&v,g_max_stack,sizeof(int))); return v; }
+void set_ee_trace(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); }
+__device__ int g_ee_tgt0 = -1; __device__ int g_ee_tgt1 = -1;
+void set_ee_tgt(int a, int b){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt0,&a,sizeof(int))); CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt1,&b,sizeof(int))); }
+// [env-det] env-LOCAL EE dedup: the once-only ownership `obj < self` uses GLOBAL edge indices, which
+// are not env-mirror ⇒ co-located envs keep different directed instances. Compare the two edges by
+// their env-local vertex-id key instead (mirror-invariant). g_ee_canon gates; needs g_vloc.
+__device__ __forceinline__ uint64_t _edge_lkey(const uint2& e)
+{   // sorted (env-local vert id) pair packed; falls back to global ids if g_vloc unset
+    uint32_t a = g_vloc ? (uint32_t)g_vloc[e.x] : e.x;
+    uint32_t b = g_vloc ? (uint32_t)g_vloc[e.y] : e.y;
+    uint32_t lo = a<b?a:b, hi = a<b?b:a;
+    return ((uint64_t)lo<<32) | hi;
+}
+// [env-det] deterministic EE emit gate: decide d<dHat on the ORDER-INVARIANT true segment-segment
+// distance (geometric) instead of the order-sensitive dtype-selected sub-distance ⇒ identical-geometry
+// envs make the SAME emit decision for near-dHat-threshold contacts (the last bit-identity layer).
+__device__ int g_ee_detgate = 0;
+void set_ee_detgate(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_detgate, &v, sizeof(int))); }
+// [env-det BVH] Morton sort for the per-env (active) build. Default = thrust::sort_by_key (unstable:
+// equal-Morton ties resolved by index VALUE ⇒ env-asymmetric for co-located near-degenerate geometry).
+// STIFF_BVH_ENVDET ⇒ stable_sort_by_key: equal-Morton ties keep the (env-local-canonical) active-list
+// order ⇒ identical envs build identical trees ⇒ identical traversal ⇒ identical candidate sets.
+// [perenv-parallel #2] iota on an explicit stream (replaces thrust::sequence in the active paths —
+// keeps the whole per-env build submission stream-pure).
+__global__ void _iota_u32(uint32_t* a, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n) a[i] = (uint32_t)i;
+}
+void lbvh::ensure_sort_scratch(int N)
+{
+    if(_sort_tmp && N <= _sort_cap) return;
+    int cap = N + N / 4 + 64;
+    if(_sort_tmp) cudaFree(_sort_tmp);
+    if(_mch_alt)  cudaFree(_mch_alt);
+    if(_idx_alt)  cudaFree(_idx_alt);
+    size_t bytes = 0;   // cub size query (host-only)
+    cub::DeviceRadixSort::SortPairs((void*)nullptr, bytes, (const uint64_t*)nullptr, (uint64_t*)nullptr,
+                                    (const uint32_t*)nullptr, (uint32_t*)nullptr, cap, 0, 64);
+    CUDA_SAFE_CALL(cudaMalloc(&_sort_tmp, bytes));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_mch_alt, (size_t)cap * sizeof(uint64_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_idx_alt, (size_t)cap * sizeof(uint32_t)));
+    _sort_tmp_bytes = bytes;
+    _sort_cap       = cap;
+}
+// [env-det BVH → perenv-parallel #2] per-env (active) Morton sort. cub radix SortPairs on the
+// instance's PRE-ALLOCATED scratch: (a) NO cudaMalloc/cudaFree inside (thrust's internal alloc/free
+// are device-wide syncs — they serialized the per-env pool streams, so the expensive per-env detect
+// kernels could never overlap); (b) LSD radix is STABLE — bit-identical to the previous
+// thrust::stable_sort_by_key (STIFF_BVH_ENVDET path: equal-Morton ties keep the canonical
+// active-list order ⇒ identical envs build identical trees). The old non-ENVDET unstable variant is
+// subsumed by the stable sort (only reachable via manual flag combos; stable is a determinism
+// superset).
+static inline void _mc_sort_active(lbvh& b, uint64_t* mc, uint32_t* idx, int N, cudaStream_t stream = 0)
+{
+    b.ensure_sort_scratch(N);   // no-op when pre-sized (pool slots are sized at allocPerEnvPool)
+    size_t bytes = b._sort_tmp_bytes;
+    cub::DeviceRadixSort::SortPairs(b._sort_tmp, bytes, mc, b._mch_alt, idx, b._idx_alt,
+                                    N, 0, 64, stream);
+    CUDA_SAFE_CALL(cudaMemcpyAsync(mc,  b._mch_alt, (size_t)N * sizeof(uint64_t),
+                                   cudaMemcpyDeviceToDevice, stream));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(idx, b._idx_alt, (size_t)N * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice, stream));
+}
 __device__ __forceinline__ uint32_t _emit_slot(uint32_t* cnt, int cap)
 {
     uint32_t i = atomicAdd(cnt, 1u);
@@ -78,33 +190,6 @@ __device__ inline bool _is_collision_excluded(int bodyA, int bodyB,
     if(bodyA < 0 || bodyB < 0 || bodyA >= _collision_body_count || bodyB >= _collision_body_count)
         return false;
     return _collision_skip_matrix[bodyA * _collision_body_count + bodyB] != 0;
-}
-
-// [multi-env subscene] Per-vertex env id, pointed at a device array by the solver
-// via mlbvh_set_vertex_env_id(). The broad-phase skips any contact pair whose two
-// vertices belong to different (real, >=0) envs — cross-env isolation WITHOUT
-// spatial separation, applied uniformly to FEM particles and ABD-body vertices
-// (a FEM body spans many envs, so this MUST be per-vertex, not per-body).
-//   nullptr, or both env ids equal -> allowed (backward compatible: unset = 0 for
-//   all vertices = one env = no exclusion).
-//   env id < 0 -> "shared" geometry that collides with every env.
-__device__ const int* g_vertex_env_id = nullptr;
-
-__device__ inline bool _same_env(int vA, int vB)
-{
-    if(g_vertex_env_id == nullptr)
-        return true;
-    int ea = g_vertex_env_id[vA];
-    int eb = g_vertex_env_id[vB];
-    return ea < 0 || eb < 0 || ea == eb;
-}
-
-// Host: point the broad-phase env filter at a device array of per-vertex env ids
-// (length = engine vertex count). Pass nullptr to disable. Copies the POINTER
-// value into the __device__ symbol (must live in this TU alongside the kernels).
-void mlbvh_set_vertex_env_id(const int* d_vertex_env_id)
-{
-    cudaMemcpyToSymbol(g_vertex_env_id, &d_vertex_env_id, sizeof(const int*));
 }
 
 // [multi-FEM-bodyid] Should we run narrow-phase contact / sanity check
@@ -767,10 +852,10 @@ __device__ inline bool _checkPTintersection_fullCCD(const double3*  _vertexes,
 
 __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                             const double3*  _rest_vertexes,
-                                            const uint32_t& id0,
-                                            const uint32_t& id1,
-                                            const uint32_t& id2,
-                                            const uint32_t& id3,
+                                            uint32_t        id0,
+                                            uint32_t        id1,
+                                            uint32_t        id2,
+                                            uint32_t        id3,
                                             const uint32_t& obj_idx,
                                             const double&   dHat,
                                             uint32_t*       _cpNum,
@@ -783,9 +868,34 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
     double3 v1 = _vertexes[id1];
     double3 v2 = _vertexes[id2];
     double3 v3 = _vertexes[id3];
+    if(g_ee_trace) {
+        double ssd = _seg_seg_d(v0,v1,v2,v3);
+        if(ssd < 1.5*sqrt(dHat)) printf("EE %u %u %u %u %.17e\n", id0,id1,id2,id3, ssd);
+    }
 
+    // [xenv pin/fix] canonicalize each edge's endpoint order by POSITION (env-invariant) so
+    // _dType_EE is order-independent → identical envs classify identically.
+    if(g_ee_canon)
+    {
+        // (1) internal endpoint order within each edge — TOTAL order (position, env-local id)
+        if(_vless(v1, id1, v0, id0)) { double3 t=v0; v0=v1; v1=t; uint32_t s=id0; id0=id1; id1=s; }
+        if(_vless(v3, id3, v2, id2)) { double3 t=v2; v2=v3; v3=t; uint32_t s=id2; id2=id3; id3=s; }
+        // (2) edge-pair order (which edge is self vs obj) — by smaller endpoint, TOTAL order
+        if(_vless(v2, id2, v0, id0))
+        {
+            double3 t0=v0,t1=v1; v0=v2; v1=v3; v2=t0; v3=t1;
+            uint32_t s0=id0,s1=id1; id0=id2; id1=id3; id2=s0; id3=s1;
+        }
+    }
 
     int    dtype  = _dType_EE(v0, v1, v2, v3);
+    if(g_ee_trace && (id0==(uint32_t)g_ee_tgt0||id1==(uint32_t)g_ee_tgt0||id2==(uint32_t)g_ee_tgt0||id3==(uint32_t)g_ee_tgt0
+                    ||id0==(uint32_t)g_ee_tgt1||id1==(uint32_t)g_ee_tgt1||id2==(uint32_t)g_ee_tgt1||id3==(uint32_t)g_ee_tgt1))
+        printf("DT ids %u %u %u %u dtype %d pos %.15e %.15e %.15e | %.15e %.15e %.15e | %.15e %.15e %.15e | %.15e %.15e %.15e\n",
+               id0,id1,id2,id3,dtype, v0.x,v0.y,v0.z, v1.x,v1.y,v1.z, v2.x,v2.y,v2.z, v3.x,v3.y,v3.z);
+    // [env-det] order-invariant true seg-seg squared distance for the deterministic emit gate.
+    double dsg2_ = 0.0;
+    if(g_ee_detgate) { double sd_ = _seg_seg_d(v0,v1,v2,v3); dsg2_ = sd_*sd_; }
     int    add_e  = -1;
     double d      = 100.0;
     bool   smooth = false;
@@ -793,7 +903,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
     {
         case 0: {
             _d_PP(v0, v2, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -802,7 +912,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id1],
                                                _rest_vertexes[id2],
                                                _rest_vertexes[id3]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
                 if(add_e <= -2)
                 {
@@ -832,7 +942,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
         case 1: {
             _d_PP(v0, v3, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -841,7 +951,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id1],
                                                _rest_vertexes[id2],
                                                _rest_vertexes[id3]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
                 if(add_e <= -2)
                 {
@@ -870,7 +980,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
         case 2: {
             _d_PE(v0, v2, v3, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -879,7 +989,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id1],
                                                _rest_vertexes[id2],
                                                _rest_vertexes[id3]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
 
                 if(add_e <= -2)
@@ -909,7 +1019,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
         case 3: {
             _d_PP(v1, v2, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -918,7 +1028,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id1],
                                                _rest_vertexes[id2],
                                                _rest_vertexes[id3]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
                 if(add_e <= -2)
                 {
@@ -947,7 +1057,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
         case 4: {
             _d_PP(v1, v3, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -956,7 +1066,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id1],
                                                _rest_vertexes[id2],
                                                _rest_vertexes[id3]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
                 if(add_e <= -2)
                 {
@@ -985,7 +1095,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
         case 5: {
             _d_PE(v1, v2, v3, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -994,7 +1104,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id1],
                                                _rest_vertexes[id2],
                                                _rest_vertexes[id3]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
                 if(add_e <= -2)
                 {
@@ -1023,7 +1133,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
         case 6: {
             _d_PE(v2, v0, v1, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -1032,7 +1142,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id3],
                                                _rest_vertexes[id0],
                                                _rest_vertexes[id1]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
 
                 if(add_e <= -2)
@@ -1062,7 +1172,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
         case 7: {
             _d_PE(v3, v0, v1, d);
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
 
                 double eeSqureNCross = __GEIGEN__::__squaredNorm(__GEIGEN__::__v_vec_cross(
@@ -1071,7 +1181,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                                _rest_vertexes[id3],
                                                _rest_vertexes[id0],
                                                _rest_vertexes[id1]);
-                add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+                add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
 
                 if(add_e <= -2)
@@ -1108,9 +1218,9 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                            _rest_vertexes[id1],
                                            _rest_vertexes[id2],
                                            _rest_vertexes[id3]);
-            add_e        = (eeSqureNCross < eps_x) ? -obj_idx - 2 : -1;
+            add_e        = g_ee_nomollify ? -1 : ((eeSqureNCross < eps_x) ? -obj_idx - 2 : -1);
 
-            if(d < dHat)
+            if((g_ee_detgate ? dsg2_ : d) < dHat)
             {
                 if(add_e <= -2)
                 {
@@ -1357,11 +1467,13 @@ __global__ void _calcLeafBvs_ccd_indirect(const double3*      _vertexes,
                                           const int*          _active_idx,
                                           AABB*               _bvs,
                                           int                 n_active,
-                                          int                 type)
+                                          int                 type,
+                                          const double*       alpha_dev = nullptr)
 {
     int t = threadIdx.x + blockIdx.x * blockDim.x;
     if(t >= n_active)
         return;
+    if(alpha_dev) alpha = *alpha_dev;   // [de-CPU] per-env CCD search alpha read on device
     int          orig = _active_idx[t];
     element_type _e   = _elements[orig];
     AABB         _bv;
@@ -1408,7 +1520,14 @@ __global__ void _calcLeafNodes_indirect(Node*           _nodes,
     _nodes[l_idx].element_idx = _active_idx[_indices[idx]];
 }
 
-__global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number)
+// [env-det] env-major Morton: put the prim's env id in the HIGH bits so co-located identical envs
+// sort into separate contiguous blocks (env-symmetric tree), instead of the default global-index
+// tie-break that interleaves equal-Morton co-located prims non-deterministically. STIFF_BVH_ENVDET.
+__device__ int g_bvh_envmajor = 0;
+void set_bvh_envmajor(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envmajor, &v, sizeof(int))); }
+__global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int* prim_env,
+                            const int* prim_localid, const double3* env_offset,
+                            const uint32_t* prim_v0)
 {
     uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= number)
@@ -1418,6 +1537,11 @@ __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number)
                                      maxBv.upper.y - maxBv.lower.y,
                                      maxBv.upper.z - maxBv.lower.z);
     double3 centerP   = _bvs[idx + number - 1].center();
+    // [env-det] subtract the per-env world offset so the Morton code is computed in the LOCAL frame
+    // ⇒ co-located identical envs get MIRROR morton ⇒ identical intra-env tree structure. The offset
+    // AABBs are kept for traversal efficiency / env separation; only the sort key is localized.
+    if(g_bvh_envmajor && env_offset && prim_v0)
+    { double3 o = env_offset[prim_v0[idx]]; centerP.x -= o.x; centerP.y -= o.y; centerP.z -= o.z; }
     double3 offset    = make_double3(centerP.x - maxBv.lower.x,
                                   centerP.y - maxBv.lower.y,
                                   centerP.z - maxBv.lower.z);
@@ -1425,7 +1549,20 @@ __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number)
     //printf("%d   %f     %f     %f\n", offset.x, offset.y, offset.z);
     uint64_t mc32 = morton_code(
         offset.x / SceneSize.x, offset.y / SceneSize.y, offset.z / SceneSize.z);
-    uint64_t mc64 = ((mc32 << 32) | idx);
+    uint64_t mc64;
+    if(g_bvh_envmajor && prim_env)
+    {   // [env(high), morton(30), ENV-LOCAL-prim-id(20 low)] — env-blocked AND the low-bits tie-break
+        // is ENV-LOCAL (mirror across identical envs) so find_split/determine_range give IDENTICAL
+        // subtree structure for co-located envs (global idx in the low bits made them differ → the
+        // 5th hidden global-index dependence).
+        uint64_t env = (uint64_t)(prim_env[idx] < 0 ? 1023 : prim_env[idx]);
+        // localid MUST be derived from env-local VERTEX ids (mirror), not global prim rank (NOT
+        // mirror — edge/face global numbering is env-asymmetric). 26-bit slot (0-25).
+        uint64_t loc = prim_localid ? ((uint64_t)prim_localid[idx] & 0x3FFFFFFULL) : ((uint64_t)idx & 0x3FFFFFFULL);
+        mc64 = (env << 56) | ((mc32 & 0x3FFFFFFFULL) << 26) | loc;
+    }
+    else
+        mc64 = ((mc32 << 32) | idx);
     _MChash[idx]  = mc64;
 }
 
@@ -1508,6 +1645,84 @@ __global__ void _sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, 
     _bvs[idx] = _temp_bvs[_indices[idx]];
 }
 
+// [env-part B] traversal pruning gate: skip other-env subtrees by env-id (no cross-env candidates).
+__device__ int g_bvh_envpart = 0;
+void set_bvh_envpart(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envpart, &v, sizeof(int))); }
+
+// [perenv-par] per-vertex env id (= d_point_to_group); cross-env self-collision pairs skipped at
+// emission when set. -1 = ungrouped/static (never skipped). Null = gate off (byte-for-byte legacy).
+__device__ const int* g_self_p2g = nullptr;
+__device__ unsigned long long g_xskip = 0;   // [debug] count of cross-env pairs skipped
+void set_self_p2g(const int* p){
+    if(getenv("STIFF_XSKIP_DBG")) fprintf(stderr, "[self_p2g] set to %p\n", (const void*)p);
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_self_p2g, &p, sizeof(const int*)));
+}
+unsigned long long get_xskip(){ unsigned long long h=0; cudaMemcpyFromSymbol(&h, g_xskip, sizeof(h)); return h; }
+
+// [v0.6.7 API compat] public name for the per-vertex env broad-phase filter
+// (SimEngine::set_vertex_env_ids). Identical semantics to set_self_p2g: a pair
+// is skipped iff both endpoint env ids are >=0 and different; -1 = shared
+// (collides with every env); nullptr disables. Both names drive g_self_p2g.
+void mlbvh_set_vertex_env_id(const int* d_vertex_env_id) { set_self_p2g(d_vertex_env_id); }
+
+// [perenv-par] skip a self-collision pair iff both representative verts are in DIFFERENT non-negative
+// envs. Gate-off (g_self_p2g==null) or any static (-1) endpoint => never skip.
+__device__ inline bool _cross_env_skip(int va, int vb)
+{
+    if(!g_self_p2g) return false;
+    int ga = g_self_p2g[va], gb = g_self_p2g[vb];
+    bool sk = (ga >= 0 && gb >= 0 && ga != gb);
+    if(sk) atomicAdd(&g_xskip, 1ULL);
+    return sk;
+}
+
+// [env-part B] node_env[leaf] = prim env (via the leaf's element_idx). Internal init to -2 (unset);
+// _propagateNodeEnv fills them bottom-up.
+__global__ void _setLeafEnv(int* node_env, const Node* _nodes, const int* prim_env, int number)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= number) return;
+    if(idx < number - 1) node_env[idx] = -2;
+    int l = idx + number - 1;
+    uint32_t e = _nodes[l].element_idx;
+    node_env[l] = (e != 0xFFFFFFFF && prim_env) ? prim_env[e] : -1;
+}
+
+// [env-part B] bottom-up env propagation (mirrors _calcInternalAABB's atomicCAS climb): a parent's
+// env = its children's common env, or -1 (MIXED) if they differ. Only the 2nd child to reach a parent
+// proceeds (both children's env are then known). Leaves must be set (via _setLeafEnv) first.
+__global__ void _propagateNodeEnv(int* node_env, const Node* _nodes, uint32_t* flags, int number)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number) return;
+    idx = idx + number - 1;
+    uint32_t parent = _nodes[idx].parent_idx;
+    while(parent != 0xFFFFFFFF)
+    {
+        const int old = atomicCAS(flags + parent, 0xFFFFFFFF, 0);
+        if(old == 0xFFFFFFFF) return;  // first child arrives -> wait for sibling
+        const uint32_t l = _nodes[parent].left_idx;
+        const uint32_t r = _nodes[parent].right_idx;
+        int le = node_env[l], re = node_env[r];
+        node_env[parent] = (le == re) ? le : -1;  // uniform env, or MIXED
+        __threadfence();
+        parent = _nodes[parent].parent_idx;
+    }
+}
+
+void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint32_t* flags, int number, cudaStream_t stream)
+{
+    if(number < 1 || !node_env || !prim_env) return;
+    const unsigned int tn = default_threads;
+    int bn = (number + tn - 1) / tn;
+    _setLeafEnv<<<bn, tn, 0, stream>>>(node_env, _nodes, prim_env, number);
+    if(number > 1)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(flags, 0xFFFFFFFF, sizeof(uint32_t) * (number - 1), stream));
+        _propagateNodeEnv<<<bn, tn, 0, stream>>>(node_env, _nodes, flags, number);
+    }
+}
+
 __global__ void _selfQuery_vf(const int*      _bodyID,
                               const int*      _btype,
                               const double3*  _vertexes,
@@ -1529,7 +1744,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     if(idx >= number)
         return;
 
-    uint32_t  stack[64];
+    uint32_t  stack[2048];
     uint32_t* stack_ptr = stack;
     *stack_ptr++        = 0;
 
@@ -1555,6 +1770,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
+        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
@@ -1566,7 +1782,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && _same_env(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x))
                 {
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
@@ -1600,7 +1816,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && _same_env(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x))
                 {
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
@@ -1644,13 +1860,15 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                   int             number,
                                   const int*      _collision_skip_matrix,
                                   int             _collision_body_count,
-                                  const int*      _body_id_to_is_fem)
+                                  const int*      _body_id_to_is_fem,
+                                  const double*   alpha_dev = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
+    if(alpha_dev) alpha = *alpha_dev;   // [de-CPU] per-env CCD search alpha read on device
 
-    uint32_t  stack[64];
+    uint32_t  stack[2048];
     uint32_t* stack_ptr = stack;
     *stack_ptr++        = 0;
 
@@ -1680,6 +1898,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
+        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
@@ -1691,7 +1910,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && _same_env(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x))
                 {
 
                     if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
@@ -1722,7 +1941,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && _same_env(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x))
                 {
                     if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
                          && _btype[_faces[obj_idx].y] >= 2
@@ -1763,19 +1982,21 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                               int            number,
                               const int*     _collision_skip_matrix,
                               int            _collision_body_count,
-                              const int*     _body_id_to_is_fem)
+                              const int*     _body_id_to_is_fem,
+                              const int* node_env)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
 
-    uint32_t  stack[64];
+    uint32_t  stack[2048];
     uint32_t* stack_ptr = stack;
     *stack_ptr++        = 0;
 
     idx               = idx + number - 1;
     AABB     _bv      = _bvs[idx];
     uint32_t self_eid = _nodes[idx].element_idx;
+    int qenv = (g_bvh_envpart && node_env) ? node_env[idx] : -1;  // [env-part B] query edge env
 
     // BVH-skip (audit/perf-bvh-skip-isolated): if both edge endpoints' body
     // is isolated, no collision is possible — exit early.
@@ -1794,10 +2015,11 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
+        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
-        if(overlap(_bv, _bvs[L_idx], gapl))
+        if((qenv < 0 || node_env[L_idx] < 0 || node_env[L_idx] == qenv) && overlap(_bv, _bvs[L_idx], gapl))
         {
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
@@ -1807,14 +2029,14 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
                     {
 
 
                         if(!(_edges[self_eid].x == _edges[obj_idx].x
                              || _edges[self_eid].x == _edges[obj_idx].y
                              || _edges[self_eid].y == _edges[obj_idx].x
-                             || _edges[self_eid].y == _edges[obj_idx].y || obj_idx < self_eid))
+                             || _edges[self_eid].y == _edges[obj_idx].y || (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_edges[obj_idx]) < _edge_lkey(_edges[self_eid])) : (obj_idx < self_eid)))))
                         {
                             //printf("%d   %d   %d   %d\n", _edges[self_eid].x, _edges[self_eid].y, _edges[obj_idx].x, _edges[obj_idx].y);
                             if(!(_btype[_edges[self_eid].x] >= 2
@@ -1843,7 +2065,7 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                 *stack_ptr++ = L_idx;
             }
         }
-        if(overlap(_bv, _bvs[R_idx], gapl))
+        if((qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv) && overlap(_bv, _bvs[R_idx], gapl))
         {
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
@@ -1853,12 +2075,12 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
                     {
                         if(!(_edges[self_eid].x == _edges[obj_idx].x
                              || _edges[self_eid].x == _edges[obj_idx].y
                              || _edges[self_eid].y == _edges[obj_idx].x
-                             || _edges[self_eid].y == _edges[obj_idx].y || obj_idx < self_eid))
+                             || _edges[self_eid].y == _edges[obj_idx].y || (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_edges[obj_idx]) < _edge_lkey(_edges[self_eid])) : (obj_idx < self_eid)))))
                         {
                             //printf("%d   %d   %d   %d\n", _edges[self_eid].x, _edges[self_eid].y, _edges[obj_idx].x, _edges[obj_idx].y);
                             if(!(_btype[_edges[self_eid].x] >= 2
@@ -1904,18 +2126,22 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                                   int            number,
                                   const int*     _collision_skip_matrix,
                                   int            _collision_body_count,
-                                  const int*     _body_id_to_is_fem)
+                                  const int*     _body_id_to_is_fem,
+                              const int* node_env,
+                                  const double*  alpha_dev = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
+    if(alpha_dev) alpha = *alpha_dev;   // [de-CPU] per-env CCD search alpha read on device
 
-    uint32_t  stack[64];
+    uint32_t  stack[2048];
     uint32_t* stack_ptr   = stack;
     *stack_ptr++          = 0;
     idx                   = idx + number - 1;
     AABB     _bv          = _bvs[idx];
     uint32_t self_eid     = _nodes[idx].element_idx;
+    int qenv = (g_bvh_envpart && node_env) ? node_env[idx] : -1;  // [env-part B] query edge env
     uint2    current_edge = _edges[self_eid];
 
     // BVH-skip (audit/perf-bvh-skip-isolated)
@@ -1935,10 +2161,11 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
+        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
-        if(overlap(_bv, _bvs[L_idx], gapl))
+        if((qenv < 0 || node_env[L_idx] < 0 || node_env[L_idx] == qenv) && overlap(_bv, _bvs[L_idx], gapl))
         {
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
@@ -1948,7 +2175,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
                     {
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
@@ -1957,7 +2184,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                             if(!(current_edge.x == _edges[obj_idx].x
                                  || current_edge.x == _edges[obj_idx].y
                                  || current_edge.y == _edges[obj_idx].x
-                                 || current_edge.y == _edges[obj_idx].y || obj_idx < self_eid))
+                                 || current_edge.y == _edges[obj_idx].y || (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_edges[obj_idx]) < _edge_lkey(current_edge)) : (obj_idx < self_eid)))))
                             {
                                 _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                     make_int4(current_edge.x,
@@ -1973,7 +2200,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                 *stack_ptr++ = L_idx;
             }
         }
-        if(overlap(_bv, _bvs[R_idx], gapl))
+        if((qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv) && overlap(_bv, _bvs[R_idx], gapl))
         {
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
@@ -1983,7 +2210,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
                     {
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
@@ -1992,7 +2219,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                             if(!(current_edge.x == _edges[obj_idx].x
                                  || current_edge.x == _edges[obj_idx].y
                                  || current_edge.y == _edges[obj_idx].x
-                                 || current_edge.y == _edges[obj_idx].y || obj_idx < self_eid))
+                                 || current_edge.y == _edges[obj_idx].y || (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_edges[obj_idx]) < _edge_lkey(current_edge)) : (obj_idx < self_eid)))))
                             {
                                 _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                     make_int4(current_edge.x,
@@ -2046,6 +2273,27 @@ AABB calcMaxBV(AABB* _leafBoxes, AABB* _tempLeafBox, const int& number)
     return h_bv;
 }
 
+// [perenv-parallel #1] async, no-host-sync scene bbox: reduces on `stream`, writes _leafBoxes[0]
+// (device, read by calcMChash on the same stream) — NO D2H. Used by the per-env Construct so the
+// per-env loop never syncs the host. (Host `scene`/getSceneSize is not needed mid per-env build.)
+void calcMaxBV_async(AABB* _leafBoxes, AABB* _tempLeafBox, int number, cudaStream_t stream)
+{
+    int numbers = number;
+    const unsigned int threadNum = default_threads;
+    int blockNum = (numbers + threadNum - 1) / threadNum;
+    unsigned int sharedMsize = sizeof(AABB) * (threadNum >> 5);
+    cudaMemcpyAsync(_tempLeafBox, _leafBoxes + number - 1, number * sizeof(AABB),
+                    cudaMemcpyDeviceToDevice, stream);
+    _reduct_max_box<<<blockNum, threadNum, sharedMsize, stream>>>(_tempLeafBox, numbers);
+    numbers = blockNum; blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_box<<<blockNum, threadNum, sharedMsize, stream>>>(_tempLeafBox, numbers);
+        numbers = blockNum; blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    cudaMemcpyAsync(_leafBoxes, _tempLeafBox, sizeof(AABB), cudaMemcpyDeviceToDevice, stream);
+}
+
 template <class element_type>
 void calcLeafBvs(const double3*      _vertexes,
                  const element_type* _faces,
@@ -2095,13 +2343,14 @@ void calcLeafBvs_indirect(const double3*      _vertexes,
                           const int*          _active_idx,
                           AABB*               _bvs,
                           int                 n_active,
-                          int                 type)
+                          int                 type,
+                          cudaStream_t        stream = 0)
 {
     if(n_active < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (n_active + threadNum - 1) / threadNum;
-    _calcLeafBvs_indirect<<<blockNum, threadNum>>>(
+    _calcLeafBvs_indirect<<<blockNum, threadNum, 0, stream>>>(
         _vertexes, _faces, _active_idx, _bvs + n_active - 1, n_active, type);
 }
 
@@ -2113,36 +2362,41 @@ void calcLeafBvs_fullCCD_indirect(const double3*      _vertexes,
                                   const int*          _active_idx,
                                   AABB*               _bvs,
                                   int                 n_active,
-                                  int                 type)
+                                  int                 type,
+                                  cudaStream_t        stream = 0,
+                                  const double*       alpha_dev = nullptr)
 {
     if(n_active < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (n_active + threadNum - 1) / threadNum;
-    _calcLeafBvs_ccd_indirect<<<blockNum, threadNum>>>(
-        _vertexes, _moveDir, alpha, _faces, _active_idx, _bvs + n_active - 1, n_active, type);
+    _calcLeafBvs_ccd_indirect<<<blockNum, threadNum, 0, stream>>>(
+        _vertexes, _moveDir, alpha, _faces, _active_idx, _bvs + n_active - 1, n_active, type, alpha_dev);
 }
 
 void calcLeafNodes_indirect(Node*           _nodes,
                             const uint32_t* _indices,
                             const int*      _active_idx,
-                            int             n_active)
+                            int             n_active,
+                            cudaStream_t    stream = 0)
 {
     if(n_active < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (n_active + threadNum - 1) / threadNum;
-    _calcLeafNodes_indirect<<<blockNum, threadNum>>>(_nodes, _indices, _active_idx, n_active);
+    _calcLeafNodes_indirect<<<blockNum, threadNum, 0, stream>>>(_nodes, _indices, _active_idx, n_active);
 }
 
-void calcMChash(uint64_t* _MChash, AABB* _bvs, int number)
+void calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int* prim_env = nullptr,
+                const int* prim_localid = nullptr, const double3* env_offset = nullptr,
+                const uint32_t* prim_v0 = nullptr, cudaStream_t stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calcMChash<<<blockNum, threadNum>>>(_MChash, _bvs, number);
+    _calcMChash<<<blockNum, threadNum, 0, stream>>>(_MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
 }
 
 void calcLeafNodes(Node* _nodes, const uint32_t* _indices, int number)
@@ -2155,17 +2409,17 @@ void calcLeafNodes(Node* _nodes, const uint32_t* _indices, int number)
     _calcLeafNodes<<<blockNum, threadNum>>>(_nodes, _indices, number);
 }
 
-void calcInternalNodes(Node* _nodes, const uint64_t* _MChash, int number)
+void calcInternalNodes(Node* _nodes, const uint64_t* _MChash, int number, cudaStream_t stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calcInternalNodes<<<blockNum, threadNum>>>(_nodes, _MChash, number);
+    _calcInternalNodes<<<blockNum, threadNum, 0, stream>>>(_nodes, _MChash, number);
 }
 
-void calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flags, int number)
+void calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flags, int number, cudaStream_t stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
@@ -2174,12 +2428,12 @@ void calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flags, int numbe
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     //uint32_t* flags;
     //CUDA_SAFE_CALL(cudaMalloc((void**)&flags, (numbers-1) * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMemset(flags, 0xFFFFFFFF, sizeof(uint32_t) * (numbers - 1)));
-    _calcInternalAABB<<<blockNum, threadNum>>>(_nodes, _bvs, flags, numbers);
+    CUDA_SAFE_CALL(cudaMemsetAsync(flags, 0xFFFFFFFF, sizeof(uint32_t) * (numbers - 1), stream));
+    _calcInternalAABB<<<blockNum, threadNum, 0, stream>>>(_nodes, _bvs, flags, numbers);
     //CUDA_SAFE_CALL(cudaFree(flags));
 }
 
-void sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number)
+void sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number, cudaStream_t stream = 0)
 {
     int numbers = number;
     if(numbers < 1)
@@ -2188,8 +2442,8 @@ void sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number)
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     //AABB* _temp_bvs = _tempLeafBox;
     // CUDA_SAFE_CALL(cudaMalloc((void**)&_temp_bvs, (number) * sizeof(AABB)));
-    cudaMemcpy(_temp_bvs, _bvs + number - 1, sizeof(AABB) * number, cudaMemcpyDeviceToDevice);
-    _sortBvs<<<blockNum, threadNum>>>(_indices, _bvs + number - 1, _temp_bvs, number);
+    cudaMemcpyAsync(_temp_bvs, _bvs + number - 1, sizeof(AABB) * number, cudaMemcpyDeviceToDevice, stream);
+    _sortBvs<<<blockNum, threadNum, 0, stream>>>(_indices, _bvs + number - 1, _temp_bvs, number);
     //CUDA_SAFE_CALL(cudaFree(_temp_bvs));
 }
 
@@ -2210,6 +2464,7 @@ void selfQuery_ee(const int*     _bodyID,
                   const int*     _collision_skip_matrix,
                   int            _collision_body_count,
                   const int*     _body_id_to_is_fem,
+                  const int* node_env,
                   cudaStream_t   stream = 0)
 {
     int numbers = number;
@@ -2233,7 +2488,7 @@ void selfQuery_ee(const int*     _bodyID,
                                            numbers,
                                            _collision_skip_matrix,
                                            _collision_body_count,
-                                           _body_id_to_is_fem);
+                                           _body_id_to_is_fem, node_env);
 }
 
 void fullCCDselfQuery_ee(const int*     _bodyID,
@@ -2251,7 +2506,9 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
                          const int*     _collision_skip_matrix,
                          int            _collision_body_count,
                          const int*     _body_id_to_is_fem,
-                         cudaStream_t   stream = 0)
+                         const int* node_env,
+                         cudaStream_t   stream = 0,
+                         const double*  alpha_dev = nullptr)
 {
     int numbers = number;
     if(numbers < 1)
@@ -2261,7 +2518,7 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
 
     _selfQuery_ee_ccd<<<blockNum, threadNum, 0, stream>>>(
         _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, node_env, alpha_dev);
 }
 
 void selfQuery_vf(const int*      _bodyID,
@@ -2322,7 +2579,8 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
                          const int*      _collision_skip_matrix,
                          int             _collision_body_count,
                          const int*      _body_id_to_is_fem,
-                         cudaStream_t    stream = 0)
+                         cudaStream_t    stream = 0,
+                         const double*   alpha_dev = nullptr)
 {
     int numbers = number;
     if(numbers < 1)
@@ -2332,7 +2590,7 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
 
     _selfQuery_vf_ccd<<<blockNum, threadNum, 0, stream>>>(
         _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, alpha_dev);
 }
 
 void lbvh::FREE_DEVICE_MEM()
@@ -2350,6 +2608,7 @@ void lbvh::MALLOC_DEVICE_MEM(const int& number)
     CUDA_SAFE_CALL(cudaMalloc((void**)&_indices, (number) * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_MChash, (number) * sizeof(uint64_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_nodes, (2 * number - 1) * sizeof(Node)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_node_env, (2 * number - 1) * sizeof(int)));  // [env-part B]
     CUDA_SAFE_CALL(cudaMalloc((void**)&_bvs, (2 * number - 1) * sizeof(AABB)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_tempLeafBox, number * sizeof(AABB)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_flags, (number - 1) * sizeof(uint32_t)));
@@ -2432,7 +2691,7 @@ AABB* lbvh_f::getSceneSize()
     return _bvs;
 }
 
-double lbvh_f::Construct()
+double lbvh_f::Construct(cudaStream_t stream)
 {
     // BVH-skip #3: when _active_idx is set and shrinks the input, build BVH on
     // n_active leaves instead of full face_number — saves work in calcMaxBV,
@@ -2441,25 +2700,23 @@ double lbvh_f::Construct()
        && face_number_active <= (int)face_number)
     {
         const int N = face_number_active;
-        calcLeafBvs_indirect(_vertexes, _faces, _active_idx, _bvs, N, 0);
-        scene = calcMaxBV(_bvs, _tempLeafBox, N);
-        calcMChash(_MChash, _bvs, N);
-        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                         thrust::device_ptr<uint32_t>(_indices) + N);
-        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                            thrust::device_ptr<uint64_t>(_MChash) + N,
-                            thrust::device_ptr<uint32_t>(_indices));
-        sortBvs(_indices, _bvs, _tempLeafBox, N);
-        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
-        calcInternalNodes(_nodes, _MChash, N);
-        calcInternalAABB(_nodes, _bvs, _flags, N);
+        // [perenv-parallel #1] fully async on `stream` (no host sync) so per-env builds overlap.
+        calcLeafBvs_indirect(_vertexes, _faces, _active_idx, _bvs, N, 0, stream);
+        calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
+        calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
+        _mc_sort_active(*this, _MChash, _indices, N, stream);
+        sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
+        calcInternalNodes(_nodes, _MChash, N, stream);
+        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
         return 0;
     }
     calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
-    calcMChash(_MChash, _bvs, face_number);
+    calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + face_number);
     thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
@@ -2470,34 +2727,36 @@ double lbvh_f::Construct()
     calcInternalNodes(_nodes, _MChash, face_number);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
     return 0;  //time0 + time1 + time2;
 }
 
-double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha)
+double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cudaStream_t stream,
+                                const double* alpha_dev)
 {
     if(_active_idx != nullptr && face_number_active > 0
        && face_number_active <= (int)face_number)
     {
         const int N = face_number_active;
+        // [perenv-parallel #2] fully async on `stream` (mirrors the DCD active path): swept-leaf
+        // build -> async max-BV -> Morton -> cub sort (pre-alloc scratch) -> tree. No host sync,
+        // no malloc/free -> concurrent per-env swept builds+queries actually overlap.
         calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _faces,
-                                     _active_idx, _bvs, N, 0);
-        scene = calcMaxBV(_bvs, _tempLeafBox, N);
-        calcMChash(_MChash, _bvs, N);
-        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                         thrust::device_ptr<uint32_t>(_indices) + N);
-        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                            thrust::device_ptr<uint64_t>(_MChash) + N,
-                            thrust::device_ptr<uint32_t>(_indices));
-        sortBvs(_indices, _bvs, _tempLeafBox, N);
-        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
-        calcInternalNodes(_nodes, _MChash, N);
-        calcInternalAABB(_nodes, _bvs, _flags, N);
+                                     _active_idx, _bvs, N, 0, stream, alpha_dev);
+        calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
+        calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
+        _mc_sort_active(*this, _MChash, _indices, N, stream);
+        sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
+        calcInternalNodes(_nodes, _MChash, N, stream);
+        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
                         _bodyId, _collision_skip_matrix, _collision_body_count);
     scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
-    calcMChash(_MChash, _bvs, face_number);
+    calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + face_number);
 
@@ -2510,29 +2769,28 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha)
 
     calcInternalNodes(_nodes, _MChash, face_number);
     calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
 
     return 0;
 }
 
-double lbvh_e::Construct()
+double lbvh_e::Construct(cudaStream_t stream)
 {
     // BVH-skip #3: when _active_idx is set (face_number_active reused as edge active count)
     if(_active_idx != nullptr && face_number_active > 0
        && face_number_active <= (int)edge_number)
     {
         const int N = face_number_active;
-        calcLeafBvs_indirect(_vertexes, _edges, _active_idx, _bvs, N, 1);
-        scene = calcMaxBV(_bvs, _tempLeafBox, N);
-        calcMChash(_MChash, _bvs, N);
-        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                         thrust::device_ptr<uint32_t>(_indices) + N);
-        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                            thrust::device_ptr<uint64_t>(_MChash) + N,
-                            thrust::device_ptr<uint32_t>(_indices));
-        sortBvs(_indices, _bvs, _tempLeafBox, N);
-        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
-        calcInternalNodes(_nodes, _MChash, N);
-        calcInternalAABB(_nodes, _bvs, _flags, N);
+        // [perenv-parallel #1] fully async on `stream` (no host sync) so per-env builds overlap.
+        calcLeafBvs_indirect(_vertexes, _edges, _active_idx, _bvs, N, 1, stream);
+        calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
+        calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
+        _mc_sort_active(*this, _MChash, _indices, N, stream);
+        sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
+        calcInternalNodes(_nodes, _MChash, N, stream);
+        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
         return 0;
     }
 
@@ -2546,7 +2804,7 @@ double lbvh_e::Construct()
     calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
     scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
-    calcMChash(_MChash, _bvs, edge_number);
+    calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + edge_number);
     //cudaEventRecord(end0);
@@ -2563,6 +2821,7 @@ double lbvh_e::Construct()
     calcInternalNodes(_nodes, _MChash, edge_number);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     calcInternalAABB(_nodes, _bvs, _flags, edge_number);
+    computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
     //selfQuery(_vertexes, _edges, _bvs, _nodes, _collisionPair, _cpNum, edge_number);
     //cudaEventRecord(end2);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -2579,31 +2838,30 @@ double lbvh_e::Construct()
     //std::cout << "generation done: " << time0 + time1 + time2 << std::endl;
 }
 
-double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha)
+double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cudaStream_t stream,
+                                const double* alpha_dev)
 {
     if(_active_idx != nullptr && face_number_active > 0
        && face_number_active <= (int)edge_number)
     {
         const int N = face_number_active;
+        // [perenv-parallel #2] fully async on `stream` (mirrors the DCD active path).
         calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _edges,
-                                     _active_idx, _bvs, N, 1);
-        scene = calcMaxBV(_bvs, _tempLeafBox, N);
-        calcMChash(_MChash, _bvs, N);
-        thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                         thrust::device_ptr<uint32_t>(_indices) + N);
-        thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                            thrust::device_ptr<uint64_t>(_MChash) + N,
-                            thrust::device_ptr<uint32_t>(_indices));
-        sortBvs(_indices, _bvs, _tempLeafBox, N);
-        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N);
-        calcInternalNodes(_nodes, _MChash, N);
-        calcInternalAABB(_nodes, _bvs, _flags, N);
+                                     _active_idx, _bvs, N, 1, stream, alpha_dev);
+        calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
+        calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
+        _mc_sort_active(*this, _MChash, _indices, N, stream);
+        sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
+        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
+        calcInternalNodes(_nodes, _MChash, N, stream);
+        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
                         _bodyId, _collision_skip_matrix, _collision_body_count);
     scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
-    calcMChash(_MChash, _bvs, edge_number);
+    calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + edge_number);
 
@@ -2617,6 +2875,7 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha)
     calcInternalNodes(_nodes, _MChash, edge_number);
 
     calcInternalAABB(_nodes, _bvs, _flags, edge_number);
+    computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
 
     return 0;
 }
@@ -2669,18 +2928,21 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  _collision_skip_matrix,
                  _collision_body_count,
                  _body_id_to_is_fem,
+                 m_node_env,
                  stream);
 }
 
-void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream)
+void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
+                                     cudaStream_t stream, const double* alpha_dev)
 {
 
     fullCCDselfQuery_vf(
         _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, stream);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, stream, alpha_dev);
 }
 
-void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream)
+void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
+                                     cudaStream_t stream, const double* alpha_dev)
 {
     // Same fix as SelfCollitionDetect: launch count must match leaf count.
     int N = (_active_idx != nullptr && face_number_active > 0
@@ -2689,7 +2951,7 @@ void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
                 : (int)edge_number;
     fullCCDselfQuery_ee(
         _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, N,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, stream);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, m_node_env, stream, alpha_dev);
 }
 
 

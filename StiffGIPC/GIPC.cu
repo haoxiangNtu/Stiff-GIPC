@@ -26,6 +26,7 @@
 #include <gipc/utils/timer.h>
 
 #include <muda/cub/device/device_radix_sort.h>
+#include <cub/device/device_radix_sort.cuh>   // [perenv-parallel #2] pool sort-scratch sizing
 using namespace Eigen;
 
 // Global log verbosity for the per-frame + one-time solver prints.  0 = silent
@@ -3138,6 +3139,99 @@ __global__ void _calBarrierHessian(const double3*   _vertexes,
     }
 }
 
+// [multi-env determinism 4.3] BINNED (reproducible) FP gradient scatter — see GIPC.cuh.
+// K exponent bins, width W, top anchor 2^E0. Each deposit splits x across bins; each bin's
+// adds are EXACT (anchor-aligned) so atomic accumulation is order-independent ⇒ bit-identical.
+// __dadd_rn/__dsub_rn block compiler reassociation (survives --use_fast_math). Verified with a
+// standalone unit test (order-independent across permutations + atomic + vs reference).
+#define BINNED_K 4
+#define BINNED_W 30
+#define BINNED_E0 60
+__device__ double* g_gbin = nullptr;
+// [multienv-mode] binned (Demmel-Nguyen order-free) gradient is a DETERMINISM feature (strict mode).
+// merged/isolated don't need bit-identical gradients → fast plain-atomic path (bin 0 as a raw
+// accumulator, full precision, non-deterministic order). g_binned_on=1 default (back-compat / strict).
+__device__ int g_binned_on = 1;
+static void set_binned_on(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_binned_on, &v, sizeof(int))); }
+// [xenv crack] target verts for the reliable (low-volume) deposit trace — set via env.
+__device__ int g_bar_trace = 0;
+__device__ int g_tgt0 = -1;
+__device__ int g_tgt1 = -1;
+static void set_bar_targets(int t, int a, int b){
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bar_trace, &t, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt0, &a, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt1, &b, sizeof(int))); }
+__device__ inline void _gfxAdd(int v, int comp, double val)
+{
+    if(g_bar_trace && (v == g_tgt0 || v == g_tgt1))
+        printf("DEP %d %d %.17e\n", v, comp, val);
+    double x    = val;
+    size_t base = ((size_t)v * 3 + comp) * BINNED_K;
+    if(!g_binned_on)
+    {
+        atomicAdd(&g_gbin[base], val);   // fast path: raw plain-atomic into bin 0 (correct, non-det order)
+        return;
+    }
+#pragma unroll
+    for(int k = 0; k < BINNED_K; ++k)
+    {
+        double M  = ldexp(1.5, BINNED_E0 - k * BINNED_W);   // constant args → folded
+        double q  = __dadd_rn(M, x);
+        double hi = __dsub_rn(q, M);
+        atomicAdd(&g_gbin[base + k], hi);                   // same-grid exact ⇒ order-free
+        x         = __dsub_rn(x, hi);
+    }
+}
+// [4.3] base-pointer binned deposit (for the ABD FEM-pin coupling into g_abd_sysbin).
+extern __device__ double* g_abd_sysbin;
+__device__ inline void _binDepBase(double* bins, double val)
+{
+    double x = val;
+#pragma unroll
+    for(int k = 0; k < BINNED_K; ++k)
+    { double M = ldexp(1.5, BINNED_E0 - k * BINNED_W); double q = __dadd_rn(M, x);
+      double hi = __dsub_rn(q, M); atomicAdd(&bins[k], hi); x = __dsub_rn(x, hi); }
+}
+// combine the K bins per vertex back into the (double3) contact gradient (+= onto ground grad).
+__global__ void _gfxToGrad(double3* _grad, const double* gbin, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    double gx = 0, gy = 0, gz = 0;
+    if(!g_binned_on)
+    {   // fast path: bin 0 holds the raw plain-atomic sum
+        gx = gbin[((size_t)i * 3 + 0) * BINNED_K];
+        gy = gbin[((size_t)i * 3 + 1) * BINNED_K];
+        gz = gbin[((size_t)i * 3 + 2) * BINNED_K];
+        _grad[i].x += gx; _grad[i].y += gy; _grad[i].z += gz;
+        return;
+    }
+#pragma unroll
+    for(int k = BINNED_K - 1; k >= 0; --k)   // finest bin first, fixed order
+    {
+        gx += gbin[((size_t)i * 3 + 0) * BINNED_K + k];
+        gy += gbin[((size_t)i * 3 + 1) * BINNED_K + k];
+        gz += gbin[((size_t)i * 3 + 2) * BINNED_K + k];
+    }
+    _grad[i].x += gx;
+    _grad[i].y += gy;
+    _grad[i].z += gz;
+}
+// [4.3] zero / combine the binned accumulator. ANY path that calls a barrier/friction
+// gradient kernel must zero before and combine after (the kernels scatter to g_grad_binned,
+// not to their _gradient arg). Used by computeGradientAndHessian, the kappa path, and the
+// contact-force getters (get_*_contact_force_*).
+void GIPC::zeroBinnedGrad()
+{
+    CUDA_SAFE_CALL(cudaMemset(g_grad_binned, 0,
+                              3 * (size_t)vertexNum * BINNED_K * sizeof(double)));
+}
+void GIPC::combineBinnedGrad(double3* out)
+{
+    int bs = 256, gs = (vertexNum + bs - 1) / bs;
+    _gfxToGrad<<<gs, bs>>>(out, g_grad_binned, vertexNum);
+}
+
 __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                               const double3*   _rest_vertexes,
                                               const int4*      _collisionPair,
@@ -3148,16 +3242,31 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                               uint32_t*        _cpNum,
                                               int*             matIndex,
                                               double           dHat,
-                                              double           Kappa,
+                                              double           Kappa_scalar,
                                               int              offset4,
                                               int              offset3,
                                               int              offset2,
-                                              int              number)
+                                              int              number,
+                                              const double*    kappa_grp = nullptr,
+                                              const int*       p2g       = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     int4   MMCVIDI   = _collisionPair[idx];
+    if(g_bar_trace) {
+        int dx = MMCVIDI.x>=0?MMCVIDI.x:(-MMCVIDI.x-1);
+        bool hit = (dx==g_tgt0||dx==g_tgt1)
+                 || (MMCVIDI.y>=0 && (MMCVIDI.y==g_tgt0||MMCVIDI.y==g_tgt1))
+                 || (MMCVIDI.z>=0 && (MMCVIDI.z==g_tgt0||MMCVIDI.z==g_tgt1))
+                 || (MMCVIDI.w>=0 && (MMCVIDI.w==g_tgt0||MMCVIDI.w==g_tgt1));
+        if(hit) printf("CT %d %d %d %d\n", MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+    }
+    // [multi-env per-group κ] pair's env via its first (decoded) vertex; intra-env after P1.
+    // nullptr → scalar (baseline, bit-identical). Computed BEFORE MMCVIDI is mutated below.
+    double Kappa = Kappa_scalar;
+    if(kappa_grp && p2g)
+    { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); Kappa = kappa_grp[p2g[_gv]]; }
     double dHat_sqrt = sqrt(dHat);
     //double dHat = dHat_sqrt * dHat_sqrt;
     //double Kappa = 1;
@@ -3385,18 +3494,18 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
 #endif
 
             {
-                atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
             }
             int Hidx = matIndex[idx];  //atomicAdd(_cpNum + 4, 1);
 
@@ -3499,18 +3608,18 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                 __GEIGEN__::__M12x9_v9_multiply(PFPx, flatten_pk1);
 
             {
-                atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
             }
 
 #if (RANK == 1)
@@ -3758,18 +3867,18 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                     __GEIGEN__::__M12x9_v9_multiply(PFPx, flatten_pk1);
 
                 {
-                    atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                    _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                    _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                    _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                    _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                    _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                    _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                    _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                    _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                    _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
                 }
 
 #if (RANK == 1)
@@ -4064,12 +4173,12 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
 
 
                 {
-                    atomicAdd(&(_gradient[v0I].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[v0I].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[v0I].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
+                    _gfxAdd(v0I, 0, gradient_vec.v[0]);
+                    _gfxAdd(v0I, 1, gradient_vec.v[1]);
+                    _gfxAdd(v0I, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
                 }
 
 #if (RANK == 1)
@@ -4261,18 +4370,18 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                     __GEIGEN__::__M12x9_v9_multiply(PFPx, flatten_pk1);
 
                 {
-                    atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                    _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                    _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                    _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                    _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                    _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                    _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                    _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                    _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                    _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
                 }
 
 #if (RANK == 1)
@@ -4608,15 +4717,15 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
 #endif
 
                 {
-                    atomicAdd(&(_gradient[v0I].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[v0I].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[v0I].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
+                    _gfxAdd(v0I, 0, gradient_vec.v[0]);
+                    _gfxAdd(v0I, 1, gradient_vec.v[1]);
+                    _gfxAdd(v0I, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                    _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                    _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                    _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
                 }
 
 #if (RANK == 1)
@@ -4924,18 +5033,18 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                 __GEIGEN__::__M12x9_v9_multiply(__GEIGEN__::__Transpose9x12(PFPx), flatten_pk1);
 #endif
 
-            atomicAdd(&(_gradient[v0I].x), gradient_vec.v[0]);
-            atomicAdd(&(_gradient[v0I].y), gradient_vec.v[1]);
-            atomicAdd(&(_gradient[v0I].z), gradient_vec.v[2]);
-            atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-            atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-            atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-            atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-            atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-            atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-            atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-            atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-            atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+            _gfxAdd(v0I, 0, gradient_vec.v[0]);
+            _gfxAdd(v0I, 1, gradient_vec.v[1]);
+            _gfxAdd(v0I, 2, gradient_vec.v[2]);
+            _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+            _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+            _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+            _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+            _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+            _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+            _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+            _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+            _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
 
 #ifdef NEWF
 
@@ -5003,7 +5112,9 @@ __global__ void _checkSelfCloseVal(const double3* _vertexes,
                                    int*           _isChange,
                                    int4*          _close_collisionPair,
                                    double*        _close_collisionVal,
-                                   int            number)
+                                   int            number,
+                                   int*           _isChange_grp = nullptr,
+                                   const int*     p2g           = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -5013,6 +5124,9 @@ __global__ void _checkSelfCloseVal(const double3* _vertexes,
     if(dist2 < _close_collisionVal[idx])
     {
         *_isChange = 1;
+        // [multi-env per-group κ] flag only THIS pair's env (intra-env after P1).
+        if(_isChange_grp && p2g)
+        { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); _isChange_grp[p2g[_gv]] = 1; }
     }
 }
 
@@ -5104,17 +5218,17 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
     {
         double3 gdf =
             __GEIGEN__::__s_vec_multiply(VProj, coef * lastH[idx] / sqrt(VProjMag2));
-        /*atomicAdd(&(_gradient[gidx].x), gdf.x);
-        atomicAdd(&(_gradient[gidx].y), gdf.y);
-        atomicAdd(&(_gradient[gidx].z), gdf.z);*/
+        /*_gfxAdd(gidx, 0, gdf.x);
+        _gfxAdd(gidx, 1, gdf.y);
+        _gfxAdd(gidx, 2, gdf.z);*/
         _gradient[gidx] = __GEIGEN__::__add(_gradient[gidx], gdf);
     }
     else
     {
         double3 gdf = __GEIGEN__::__s_vec_multiply(VProj, coef * lastH[idx] / eps);
-        /*atomicAdd(&(_gradient[gidx].x), gdf.x);
-        atomicAdd(&(_gradient[gidx].y), gdf.y);
-        atomicAdd(&(_gradient[gidx].z), gdf.z);*/
+        /*_gfxAdd(gidx, 0, gdf.x);
+        _gfxAdd(gidx, 1, gdf.y);
+        _gfxAdd(gidx, 2, gdf.z);*/
         _gradient[gidx] = __GEIGEN__::__add(_gradient[gidx], gdf);
     }
 }
@@ -5166,18 +5280,18 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
             relDX, tanBasis[idx], distCoord[idx].x, distCoord[idx].y, TTTDX);
         TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * coef);
         {
-            atomicAdd(&(_gradient[MMCVIDI.x].x), TTTDX.v[0]);
-            atomicAdd(&(_gradient[MMCVIDI.x].y), TTTDX.v[1]);
-            atomicAdd(&(_gradient[MMCVIDI.x].z), TTTDX.v[2]);
-            atomicAdd(&(_gradient[MMCVIDI.y].x), TTTDX.v[3]);
-            atomicAdd(&(_gradient[MMCVIDI.y].y), TTTDX.v[4]);
-            atomicAdd(&(_gradient[MMCVIDI.y].z), TTTDX.v[5]);
-            atomicAdd(&(_gradient[MMCVIDI.z].x), TTTDX.v[6]);
-            atomicAdd(&(_gradient[MMCVIDI.z].y), TTTDX.v[7]);
-            atomicAdd(&(_gradient[MMCVIDI.z].z), TTTDX.v[8]);
-            atomicAdd(&(_gradient[MMCVIDI.w].x), TTTDX.v[9]);
-            atomicAdd(&(_gradient[MMCVIDI.w].y), TTTDX.v[10]);
-            atomicAdd(&(_gradient[MMCVIDI.w].z), TTTDX.v[11]);
+            _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+            _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+            _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+            _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+            _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+            _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
+            _gfxAdd(MMCVIDI.z, 0, TTTDX.v[6]);
+            _gfxAdd(MMCVIDI.z, 1, TTTDX.v[7]);
+            _gfxAdd(MMCVIDI.z, 2, TTTDX.v[8]);
+            _gfxAdd(MMCVIDI.w, 0, TTTDX.v[9]);
+            _gfxAdd(MMCVIDI.w, 1, TTTDX.v[10]);
+            _gfxAdd(MMCVIDI.w, 2, TTTDX.v[11]);
         }
     }
     else
@@ -5210,12 +5324,12 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
             Friction::liftRelDXTanToMesh_PP(relDX, tanBasis[idx], TTTDX);
             TTTDX = __GEIGEN__::__s_vec6_multiply(TTTDX, lastH[idx] * coef);
             {
-                atomicAdd(&(_gradient[MMCVIDI.x].x), TTTDX.v[0]);
-                atomicAdd(&(_gradient[MMCVIDI.x].y), TTTDX.v[1]);
-                atomicAdd(&(_gradient[MMCVIDI.x].z), TTTDX.v[2]);
-                atomicAdd(&(_gradient[MMCVIDI.y].x), TTTDX.v[3]);
-                atomicAdd(&(_gradient[MMCVIDI.y].y), TTTDX.v[4]);
-                atomicAdd(&(_gradient[MMCVIDI.y].z), TTTDX.v[5]);
+                _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
             }
         }
         else if(MMCVIDI.w < 0)
@@ -5245,15 +5359,15 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
             Friction::liftRelDXTanToMesh_PE(relDX, tanBasis[idx], distCoord[idx].x, TTTDX);
             TTTDX = __GEIGEN__::__s_vec9_multiply(TTTDX, lastH[idx] * coef);
             {
-                atomicAdd(&(_gradient[MMCVIDI.x].x), TTTDX.v[0]);
-                atomicAdd(&(_gradient[MMCVIDI.x].y), TTTDX.v[1]);
-                atomicAdd(&(_gradient[MMCVIDI.x].z), TTTDX.v[2]);
-                atomicAdd(&(_gradient[MMCVIDI.y].x), TTTDX.v[3]);
-                atomicAdd(&(_gradient[MMCVIDI.y].y), TTTDX.v[4]);
-                atomicAdd(&(_gradient[MMCVIDI.y].z), TTTDX.v[5]);
-                atomicAdd(&(_gradient[MMCVIDI.z].x), TTTDX.v[6]);
-                atomicAdd(&(_gradient[MMCVIDI.z].y), TTTDX.v[7]);
-                atomicAdd(&(_gradient[MMCVIDI.z].z), TTTDX.v[8]);
+                _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
+                _gfxAdd(MMCVIDI.z, 0, TTTDX.v[6]);
+                _gfxAdd(MMCVIDI.z, 1, TTTDX.v[7]);
+                _gfxAdd(MMCVIDI.z, 2, TTTDX.v[8]);
             }
         }
         else
@@ -5287,18 +5401,18 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                 relDX, tanBasis[idx], distCoord[idx].x, distCoord[idx].y, TTTDX);
             TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * coef);
 
-            atomicAdd(&(_gradient[MMCVIDI.x].x), TTTDX.v[0]);
-            atomicAdd(&(_gradient[MMCVIDI.x].y), TTTDX.v[1]);
-            atomicAdd(&(_gradient[MMCVIDI.x].z), TTTDX.v[2]);
-            atomicAdd(&(_gradient[MMCVIDI.y].x), TTTDX.v[3]);
-            atomicAdd(&(_gradient[MMCVIDI.y].y), TTTDX.v[4]);
-            atomicAdd(&(_gradient[MMCVIDI.y].z), TTTDX.v[5]);
-            atomicAdd(&(_gradient[MMCVIDI.z].x), TTTDX.v[6]);
-            atomicAdd(&(_gradient[MMCVIDI.z].y), TTTDX.v[7]);
-            atomicAdd(&(_gradient[MMCVIDI.z].z), TTTDX.v[8]);
-            atomicAdd(&(_gradient[MMCVIDI.w].x), TTTDX.v[9]);
-            atomicAdd(&(_gradient[MMCVIDI.w].y), TTTDX.v[10]);
-            atomicAdd(&(_gradient[MMCVIDI.w].z), TTTDX.v[11]);
+            _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+            _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+            _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+            _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+            _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+            _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
+            _gfxAdd(MMCVIDI.z, 0, TTTDX.v[6]);
+            _gfxAdd(MMCVIDI.z, 1, TTTDX.v[7]);
+            _gfxAdd(MMCVIDI.z, 2, TTTDX.v[8]);
+            _gfxAdd(MMCVIDI.w, 0, TTTDX.v[9]);
+            _gfxAdd(MMCVIDI.w, 1, TTTDX.v[10]);
+            _gfxAdd(MMCVIDI.w, 2, TTTDX.v[11]);
         }
     }
 }
@@ -5337,17 +5451,23 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                                     const const int4* _collisionPair,
                                     double3*          _gradient,
                                     double            dHat,
-                                    double            Kappa,
+                                    double            Kappa_scalar,
                                     int               number,
-                                    int2*             _ec_out_pair,
-                                    double3*          _ec_out_force,
-                                    const int*        _ec_pbid,
-                                    double            _ec_inv_dt2)
+                                    const double*     kappa_grp = nullptr,
+                                    const int*        p2g       = nullptr,
+                                    int2*             _ec_out_pair  = nullptr,
+                                    double3*          _ec_out_force = nullptr,
+                                    const int*        _ec_pbid      = nullptr,
+                                    double            _ec_inv_dt2   = 0.0)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     int4   MMCVIDI   = _collisionPair[idx];
+    // [multi-env per-group κ] nullptr → scalar (baseline). Before MMCVIDI mutation.
+    double Kappa = Kappa_scalar;
+    if(kappa_grp && p2g)
+    { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); Kappa = kappa_grp[p2g[_gv]]; }
     double dHat_sqrt = sqrt(dHat);
     //double dHat = dHat_sqrt * dHat_sqrt;
     //double Kappa = 1;
@@ -5495,18 +5615,18 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
 #endif
 
             {
-                atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
                 _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
             }
         }
@@ -5605,18 +5725,18 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                 __GEIGEN__::__M12x9_v9_multiply(PFPx, flatten_pk1);
 
             {
-                atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
+                _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
                 _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
             }
         }
@@ -5716,19 +5836,19 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                     __GEIGEN__::__M12x9_v9_multiply(PFPx, flatten_pk1);
 
                 {
-                    atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
-                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
+                    _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                    _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                    _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                    _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                    _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                    _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                    _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                    _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                    _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
+                    _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
                 }
             }
             else
@@ -5899,13 +6019,13 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
 
 
                 {
-                    atomicAdd(&(_gradient[v0I].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[v0I].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[v0I].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, 0, 0, 2, gradient_vec.v);
+                    _gfxAdd(v0I, 0, gradient_vec.v[0]);
+                    _gfxAdd(v0I, 1, gradient_vec.v[1]);
+                    _gfxAdd(v0I, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                    _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, 0, 0, 2, gradient_vec.v);
                 }
             }
         }
@@ -6004,19 +6124,19 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                     __GEIGEN__::__M12x9_v9_multiply(PFPx, flatten_pk1);
 
                 {
-                    atomicAdd(&(_gradient[MMCVIDI.x].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[MMCVIDI.x].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-                    atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
-                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
+                    _gfxAdd(MMCVIDI.x, 0, gradient_vec.v[0]);
+                    _gfxAdd(MMCVIDI.x, 1, gradient_vec.v[1]);
+                    _gfxAdd(MMCVIDI.x, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                    _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                    _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                    _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                    _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+                    _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+                    _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
+                    _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
                 }
             }
             else
@@ -6226,16 +6346,16 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
 #endif
 
                 {
-                    atomicAdd(&(_gradient[v0I].x), gradient_vec.v[0]);
-                    atomicAdd(&(_gradient[v0I].y), gradient_vec.v[1]);
-                    atomicAdd(&(_gradient[v0I].z), gradient_vec.v[2]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-                    atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-                    atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, MMCVIDI.z, 0, 3, gradient_vec.v);
+                    _gfxAdd(v0I, 0, gradient_vec.v[0]);
+                    _gfxAdd(v0I, 1, gradient_vec.v[1]);
+                    _gfxAdd(v0I, 2, gradient_vec.v[2]);
+                    _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+                    _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+                    _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+                    _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+                    _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+                    _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+                    _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, MMCVIDI.z, 0, 3, gradient_vec.v);
                 }
             }
         }
@@ -6393,19 +6513,19 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                 __GEIGEN__::__M12x9_v9_multiply(__GEIGEN__::__Transpose9x12(PFPx), flatten_pk1);
 #endif
 
-            atomicAdd(&(_gradient[v0I].x), gradient_vec.v[0]);
-            atomicAdd(&(_gradient[v0I].y), gradient_vec.v[1]);
-            atomicAdd(&(_gradient[v0I].z), gradient_vec.v[2]);
-            atomicAdd(&(_gradient[MMCVIDI.y].x), gradient_vec.v[3]);
-            atomicAdd(&(_gradient[MMCVIDI.y].y), gradient_vec.v[4]);
-            atomicAdd(&(_gradient[MMCVIDI.y].z), gradient_vec.v[5]);
-            atomicAdd(&(_gradient[MMCVIDI.z].x), gradient_vec.v[6]);
-            atomicAdd(&(_gradient[MMCVIDI.z].y), gradient_vec.v[7]);
-            atomicAdd(&(_gradient[MMCVIDI.z].z), gradient_vec.v[8]);
-            atomicAdd(&(_gradient[MMCVIDI.w].x), gradient_vec.v[9]);
-            atomicAdd(&(_gradient[MMCVIDI.w].y), gradient_vec.v[10]);
-            atomicAdd(&(_gradient[MMCVIDI.w].z), gradient_vec.v[11]);
-                _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, v0I, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
+            _gfxAdd(v0I, 0, gradient_vec.v[0]);
+            _gfxAdd(v0I, 1, gradient_vec.v[1]);
+            _gfxAdd(v0I, 2, gradient_vec.v[2]);
+            _gfxAdd(MMCVIDI.y, 0, gradient_vec.v[3]);
+            _gfxAdd(MMCVIDI.y, 1, gradient_vec.v[4]);
+            _gfxAdd(MMCVIDI.y, 2, gradient_vec.v[5]);
+            _gfxAdd(MMCVIDI.z, 0, gradient_vec.v[6]);
+            _gfxAdd(MMCVIDI.z, 1, gradient_vec.v[7]);
+            _gfxAdd(MMCVIDI.z, 2, gradient_vec.v[8]);
+            _gfxAdd(MMCVIDI.w, 0, gradient_vec.v[9]);
+            _gfxAdd(MMCVIDI.w, 1, gradient_vec.v[10]);
+            _gfxAdd(MMCVIDI.w, 2, gradient_vec.v[11]);
+            _ec_emit(idx, _ec_out_pair, _ec_out_force, _ec_pbid, _ec_inv_dt2, MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w, 4, gradient_vec.v);
         }
     }
 }
@@ -6499,9 +6619,9 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
     //printf("%f\n", dis);
     double d = motionRate;
     {
-        atomicAdd(&(gradient[vInd].x), d * rate * rate * (x - a));
-        atomicAdd(&(gradient[vInd].y), d * rate * rate * (y - b));
-        atomicAdd(&(gradient[vInd].z), d * rate * rate * (z - c));
+        _gfxAdd(vInd, 0, d * rate * rate * (x - a));
+        _gfxAdd(vInd, 1, d * rate * rate * (y - b));
+        _gfxAdd(vInd, 2, d * rate * rate * (z - c));
     }
     __GEIGEN__::Matrix3x3d Hpg;
     Hpg.m[0][0] = rate * rate * d;
@@ -6570,9 +6690,9 @@ __global__ void _computeSoftConstraintGradient(const double3*  vertexes,
     //printf("%f\n", dis);
     double d = motionRate;
     {
-        atomicAdd(&(gradient[vInd].x), d * rate * rate * (x - a));
-        atomicAdd(&(gradient[vInd].y), d * rate * rate * (y - b));
-        atomicAdd(&(gradient[vInd].z), d * rate * rate * (z - c));
+        _gfxAdd(vInd, 0, d * rate * rate * (x - a));
+        _gfxAdd(vInd, 1, d * rate * rate * (y - b));
+        _gfxAdd(vInd, 2, d * rate * rate * (z - c));
     }
 }
 
@@ -6626,15 +6746,19 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  int*   row_ids,
                                                  int*   col_ids,
                                                  double dHat,
-                                                 double Kappa,
+                                                 double Kappa_scalar,
                                                  int    global_offset,
-                                                 int    number)
+                                                 int    number,
+                                                 const double* kappa_grp = nullptr,
+                                                 const int*    p2g       = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     double3      normal = *g_normal;
     unsigned int gidx   = _environment_collisionPair[idx];
+    // [multi-env per-group κ] ground pair is a single vertex; nullptr → scalar (baseline).
+    double Kappa = (kappa_grp && p2g) ? kappa_grp[p2g[gidx]] : Kappa_scalar;
     double dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double dist2 = dist * dist;
     // [d=0 guard] a vertex sitting EXACTLY on the ground (dist2==0) makes
@@ -6655,9 +6779,9 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
     double3 grad = __GEIGEN__::__s_vec_multiply(normal, Kappa * g_b * 2 * dist);
 
     {
-        atomicAdd(&(gradient[gidx].x), grad.x);
-        atomicAdd(&(gradient[gidx].y), grad.y);
-        atomicAdd(&(gradient[gidx].z), grad.z);
+        _gfxAdd(gidx, 0, grad.x);
+        _gfxAdd(gidx, 1, grad.y);
+        _gfxAdd(gidx, 2, grad.z);
     }
 
     double param = 4.0 * H_b * dist2 + 2.0 * g_b;
@@ -6682,14 +6806,18 @@ __global__ void _computeGroundGradient(const double3* vertexes,
                                        double3*  gradient,
                                        uint32_t* _gpNum,
                                        double    dHat,
-                                       double    Kappa,
-                                       int       number)
+                                       double    Kappa_scalar,
+                                       int       number,
+                                       const double* kappa_grp = nullptr,
+                                       const int*    p2g       = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     double3 normal = *g_normal;
     int     gidx   = _environment_collisionPair[idx];
+    // [multi-env per-group κ] nullptr → scalar (baseline).
+    double  Kappa = (kappa_grp && p2g) ? kappa_grp[p2g[gidx]] : Kappa_scalar;
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
     dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-barrier NaN (see _computeGroundGradientAndHessian)
@@ -6701,9 +6829,9 @@ __global__ void _computeGroundGradient(const double3* vertexes,
     double3 grad = __GEIGEN__::__s_vec_multiply(normal, Kappa * g_b * 2 * dist);
 
     {
-        atomicAdd(&(gradient[gidx].x), grad.x);
-        atomicAdd(&(gradient[gidx].y), grad.y);
-        atomicAdd(&(gradient[gidx].z), grad.z);
+        _gfxAdd(gidx, 0, grad.x);
+        _gfxAdd(gidx, 1, grad.y);
+        _gfxAdd(gidx, 2, grad.z);
     }
 }
 
@@ -6739,7 +6867,9 @@ __global__ void _checkGroundCloseVal(const double3* vertexes,
                                      int*           _isChange,
                                      uint32_t*      _closeConstraintID,
                                      double*        _closeConstraintVal,
-                                     int            number)
+                                     int            number,
+                                     int*           _isChange_grp = nullptr,
+                                     const int*     p2g           = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -6752,6 +6882,7 @@ __global__ void _checkGroundCloseVal(const double3* vertexes,
     if(dist2 < _closeConstraintVal[idx])
     {
         *_isChange = 1;
+        if(_isChange_grp && p2g) _isChange_grp[p2g[gidx]] = 1;   // [per-group κ]
     }
 }
 
@@ -8691,7 +8822,9 @@ __global__ void _calFrictionLastH_gd(const double3* _vertexes,
                                      uint32_t* _collisionPair_last_gd,
                                      double    dHat,
                                      double    Kappa,
-                                     int       number)
+                                     int       number,
+                                     const double* kappa_grp = nullptr,
+                                     const int*    p2g = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -8706,7 +8839,10 @@ __global__ void _calFrictionLastH_gd(const double3* _vertexes,
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
 
-    lambda_lastH_gd[idx]        = -Kappa * 2.0 * sqrt(dist2) * g_b;
+    // [decouple] per-group κ so env0's friction normal-force is batch-invariant (global Kappa is a
+    // reduction over ALL envs ⇒ batch-dependent; friction Hessian ∝ λ exposes it even at zero sliding).
+    double Kp = (kappa_grp && p2g) ? kappa_grp[p2g[gidx]] : Kappa;
+    lambda_lastH_gd[idx]        = -Kp * 2.0 * sqrt(dist2) * g_b;
     _collisionPair_last_gd[idx] = gidx;
 }
 
@@ -8719,7 +8855,9 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
                                              double    dHat,
                                              double    Kappa,
                                              uint32_t* _cpNum_last,
-                                             int       number)
+                                             int       number,
+                                             const double* kappa_grp = nullptr,
+                                             const int*    p2g = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -8727,6 +8865,11 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
     int4   MMCVIDI = _collisionPair[idx];
     double dis;
     int    last_index = -1;
+    // [decouple] per-group κ for the lagged friction normal-force λ (batch-invariant). gv = pair's
+    // representative vertex (same convention as the barrier, GIPC.cu:3250).
+    double Kappa_eff = Kappa;
+    if(kappa_grp && p2g)
+    { int gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); if(gv >= 0) Kappa_eff = kappa_grp[p2g[gv]]; }
     if(MMCVIDI.x >= 0)
     {
         if(MMCVIDI.w >= 0)
@@ -8812,80 +8955,15 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 #if (RANK == 1)
         double t = dis - dHat;
         lambda_lastH[last_index] =
-            -Kappa * 2.0 * sqrt(dis) * (t * log(dis / dHat) * -2.0 - (t * t) / dis);
+            -Kappa_eff * 2.0 * sqrt(dis) * (t * log(dis / dHat) * -2.0 - (t * t) / dis);
 #elif (RANK == 2)
         lambda_lastH[last_index] =
-            -Kappa * 2.0 * sqrt(dis)
+            -Kappa_eff * 2.0 * sqrt(dis)
             * (log(dis / dHat) * log(dis / dHat) * (2 * dis - 2 * dHat)
                + (2 * log(dis / dHat) * (dis - dHat) * (dis - dHat)) / dis);
 #endif
         _collisionPair_last[last_index] = _collisionPair[idx];
     }
-}
-
-// ===================== per-contact force export (Step B) =====================
-// Ground contacts use the simple distance barrier (lambda * ground_normal).
-// Body-body & FEM-coupled contacts reuse the exact I5/NEWF barrier gradient
-// via the _calBarrierGradient per-contact hook (see _ec_emit).
-
-__global__ void _exportGroundContactForces(const double3*   _vertexes,
-                                           const uint32_t*  envPair,
-                                           const double3*   g_normal,
-                                           const double*    g_offset,
-                                           const int*       _point_body_id,
-                                           double Kappa, double dHat, double dt,
-                                           int number, int base,
-                                           int2* out_pair, double3* out_force)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= number)
-        return;
-    int    gidx = (int)envPair[idx];
-    double3 nrm = g_normal[0];
-    double  dist = __GEIGEN__::__v_vec_dot(nrm, _vertexes[gidx]) - g_offset[0];
-    double  dis  = dist * dist;
-    if(dis < 1e-12)
-        dis = 1e-12;  // [d=0 guard]
-    double t      = dis - dHat;
-    double g_b    = t * log(dis / dHat) * -2.0 - (t * t) / dis;
-    double lambda = -Kappa * 2.0 * sqrt(dis) * g_b;
-    double c      = lambda / (dt * dt);
-    out_force[base + idx] = make_double3(c * nrm.x, c * nrm.y, c * nrm.z);
-    out_pair[base + idx]  = make_int2(_point_body_id[gidx], -1);
-}
-
-int GIPC::exportContacts(int2* out_pair, double3* out_force)
-{
-    int ncp = (int)h_cpNum[0];
-    int ngp = (int)h_gpNum;
-    const unsigned int threads = 256;
-    double inv_dt2 = (IPC_dt > 0.0) ? 1.0 / (IPC_dt * IPC_dt) : 0.0;
-    // body-body: reuse the EXACT I5/NEWF barrier gradient (calBarrierGradient)
-    // with the per-contact export hook. Needs a per-vertex scratch gradient.
-    if(ncp > 0)
-    {
-        if(vertexNum > _ec_scratch_cap)
-        {
-            if(_ec_grad_scratch) CUDA_SAFE_CALL(cudaFree(_ec_grad_scratch));
-            _ec_scratch_cap = vertexNum;
-            CUDA_SAFE_CALL(cudaMalloc((void**)&_ec_grad_scratch, _ec_scratch_cap * sizeof(double3)));
-        }
-        CUDA_SAFE_CALL(cudaMemset(_ec_grad_scratch, 0, vertexNum * sizeof(double3)));
-        // default body-body entries to "skip" (bodyA<0); _ec_emit overwrites
-        // the ones it attributes.
-        CUDA_SAFE_CALL(cudaMemset(out_pair, 0xFF, ncp * sizeof(int2)));   // -1,-1
-        CUDA_SAFE_CALL(cudaMemset(out_force, 0, ncp * sizeof(double3)));
-        calBarrierGradient(_ec_grad_scratch, Kappa, out_pair, out_force, _point_body_id, inv_dt2);
-    }
-    // ground: simple distance barrier (lambda * ground_normal)
-    if(ngp > 0)
-    {
-        int blocks = (ngp + threads - 1) / threads;
-        _exportGroundContactForces<<<blocks, threads>>>(
-            _vertexes, _environment_collisionPair, _groundNormal, _groundOffset,
-            _point_body_id, Kappa, dHat, IPC_dt, ngp, ncp, out_pair, out_force);
-    }
-    return ncp + ngp;
 }
 
 /// <summary>
@@ -8901,7 +8979,8 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_close_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_gpNum));
     CUDA_SAFE_CALL(cudaFree(_environment_collisionPair));
-    CUDA_SAFE_CALL(cudaFree(_gpNum));
+    // [9d28824-port] _gpNum aliases (_cpNum + 5) — freed above with _cpNum.
+    _gpNum = nullptr;
     CUDA_SAFE_CALL(cudaFree(_groundNormal));
     CUDA_SAFE_CALL(cudaFree(_groundOffset));
 
@@ -8914,6 +8993,42 @@ void GIPC::FREE_DEVICE_MEM()
     if(m_env_scratch)  { CUDA_SAFE_CALL(cudaFree(m_env_scratch));  m_env_scratch  = nullptr; }
     if(m_abd_body_alpha) { CUDA_SAFE_CALL(cudaFree(m_abd_body_alpha)); m_abd_body_alpha = nullptr; }
     if(m_env_active)   { CUDA_SAFE_CALL(cudaFree(m_env_active));   m_env_active   = nullptr; }
+
+    // [0be8da3-port] free the persistent (grow-only) friction/close buffers and
+    // reset capacities so engine.reset() starts clean.
+    if(lambda_lastH_scalar)
+    {
+        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
+        CUDA_SAFE_CALL(cudaFree(distCoord));
+        CUDA_SAFE_CALL(cudaFree(tanBasis));
+        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
+        CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
+        lambda_lastH_scalar = nullptr; distCoord = nullptr; tanBasis = nullptr;
+        _collisonPairs_lastH = nullptr; _MatIndex_last = nullptr;
+    }
+    if(lambda_lastH_scalar_gd)
+    {
+        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
+        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
+        lambda_lastH_scalar_gd = nullptr; _collisonPairs_lastH_gd = nullptr;
+    }
+    if(_closeConstraintID)
+    {
+        CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
+        CUDA_SAFE_CALL(cudaFree(_closeConstraintVal));
+        _closeConstraintID = nullptr; _closeConstraintVal = nullptr;
+    }
+    if(_closeMConstraintID)
+    {
+        CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
+        CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
+        _closeMConstraintID = nullptr; _closeMConstraintVal = nullptr;
+    }
+    m_fric_cp_cap = 0; m_fric_gd_cap = 0; m_close_gp_cap = 0; m_close_cp_cap = 0;
+
+    // ②-D2H: free energy slots
+    if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
+    if(m_alpha_slots)  { CUDA_SAFE_CALL(cudaFree(m_alpha_slots));  m_alpha_slots  = nullptr; }
 
     pcg_data.FREE_DEVICE_MEM();
 
@@ -8934,8 +9049,11 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&_environment_collisionPair,
                               surf_vertexNum * sizeof(int)));
     //CUDA_SAFE_CALL(cudaMalloc((void**)&_moveDir, vertexNum * sizeof(double3)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_cpNum, 5 * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_gpNum, sizeof(uint32_t)));
+    // [9d28824-port] one contiguous [6]-uint32 block: _cpNum aliases [0:5],
+    // _gpNum aliases [5]. Kernel-side code unchanged (takes uint32_t*); the
+    // paired cpNum+gpNum reads become ONE 6-int D2H.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_cpNum, 6 * sizeof(uint32_t)));
+    _gpNum = _cpNum + 5;
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundNormal, 5 * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundOffset, 5 * sizeof(double)));
     double  h_offset[5] = {ground_offset_cfg, -1, 1, -1, 1};
@@ -8962,11 +9080,30 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_active, kEnvAlphaSlots * sizeof(int)));
     h_env_alpha.assign(kEnvAlphaSlots, 1.0);
     h_env_active.assign(kEnvAlphaSlots, 1);
+    // [batch-size hygiene] m_env_alpha starts at 1.0 like the host mirror: the device fast path
+    // (2262b33) writes only PRESENT envs' slots — absent slots must not hold cudaMalloc garbage.
+    CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
+                              kEnvAlphaSlots * sizeof(double), cudaMemcpyHostToDevice));
     { std::vector<int> ones(kEnvAlphaSlots, 1);
       CUDA_SAFE_CALL(cudaMemcpy(m_env_active, ones.data(), kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice)); }
 
+    // ②-D2H: 9-slot device buffer for batched energy reductions in computeEnergy.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
+    // ②-D2H: 2-slot buffer for ground+self largestFeasibleStepSize batching.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_alpha_slots, 2 * sizeof(double)));
+
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
+
+    // [multi-env determinism] per-vertex env offset (0 by default = no-op) + BVH vertex buffer.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_env_offset, vertexNum * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_bvh_vertexes, vertexNum * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemset(d_env_offset, 0, vertexNum * sizeof(double3)));
+
+    // [multi-env determinism 4.3] binned gradient accumulator (BINNED_K bins per vert*comp).
+    CUDA_SAFE_CALL(cudaMalloc((void**)&g_grad_binned,
+                              3 * (size_t)vertexNum * BINNED_K * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_gbin, &g_grad_binned, sizeof(double*)));
 
     pcg_data.Malloc_DEVICE_MEM(vertexNum, tetrahedraNum);
 }
@@ -8977,7 +9114,7 @@ void GIPC::initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix, int _
 
     bvh_e.init(_bodyId,
                _btype,
-               _vertexes,
+               d_bvh_vertexes,   // [multi-env] BVH on offset-separated verts; narrow-phase uses local _vertexes
                _rest_vertexes,
                _edges,
                _collisonPairs,
@@ -8990,7 +9127,7 @@ void GIPC::initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix, int _
                _collision_body_count);
     bvh_f.init(_bodyId,
                _btype,
-               _vertexes,
+               d_bvh_vertexes,   // [multi-env] BVH on offset-separated verts; narrow-phase uses local _vertexes
                _faces,
                _surfVerts,
                _collisonPairs,
@@ -9026,7 +9163,7 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     // and the root cause of super-linear contact growth in multi-env. When
     // absolute_dhat>0, derive an EFFECTIVE bbox so dHat == absolute_dhat^2 and
     // dTol/fDhat stay consistent with a single-env scene of that contact scale.
-    eff_bboxDiagSize2 = bboxDiagSize2;  // member: reused by the Newton convergence threshold
+    double eff_bboxDiagSize2 = bboxDiagSize2;
     if(absolute_dhat > 0.0 && relative_dhat > 0.0)
         eff_bboxDiagSize2 = (absolute_dhat * absolute_dhat)
                             / (relative_dhat * relative_dhat);
@@ -9040,6 +9177,11 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
         printf("[dhat] bboxDiagSize2=%.6g (eff=%.6g)  relative_dhat=%.3g  abs_dhat=%.3g  dHat_sqrt=%.6g%s\n",
                bboxDiagSize2, eff_bboxDiagSize2, relative_dhat, absolute_dhat,
                sqrt(dHat), absolute_dhat > 0.0 ? " (ABSOLUTE)" : " (scene-bbox)");
+    if(getenv("STIFF_SEED_DIAG"))
+        printf("[seed-diag] bboxDiagSize2=%.17g eff=%.17g meanMass=%.17g meanVolumn=%.17g dHat=%.17g fDhat=%.17g dTol=%.17g scene=[%.17g,%.17g,%.17g]-[%.17g,%.17g,%.17g]\n",
+               bboxDiagSize2, eff_bboxDiagSize2, meanMass, meanVolumn, dHat, fDhat, dTol,
+               SceneSize.lower.x, SceneSize.lower.y, SceneSize.lower.z,
+               SceneSize.upper.x, SceneSize.upper.y, SceneSize.upper.z);
 
 
     int global_matrix_block3_size =
@@ -9132,14 +9274,27 @@ GIPC::GIPC()
     h_cpNum_last[4] = 0;
 }
 
+static void _dbg_ksum(const char*, const void*, size_t);  // [4.3 fwd]
 void GIPC::buildFrictionSets()
 {
     CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
     int                numbers   = h_cpNum[0];
+    if(getenv("STIFF_KSUM"))
+    {
+        cudaDeviceSynchronize();
+        _dbg_ksum("prep_verts", _vertexes, (size_t)vertexNum * sizeof(double3));
+    }
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     if(numbers > 0)
     {
+        // [multi-env determinism 4.3] zero distCoord first: PP (point-point) lagged pairs write
+        // tanBasis but NOT distCoord (no barycentric coords), leaving GARBAGE in their slots.
+        // Those slots sit at non-deterministic positions (atomicAdd last_index) → the lagged
+        // friction data is non-deterministic run-to-run → the friction Hessian (frame 0) → the
+        // whole solve. Zeroing makes PP distCoord deterministically 0 (the friction Hessian for
+        // PP doesn't use it; EE/PE/PT overwrite it). THIS is the residual non-atomic source.
+        CUDA_SAFE_CALL(cudaMemset(distCoord, 0, (size_t)h_cpNum[0] * sizeof(double2)));
         _calFrictionLastH_DistAndTan<<<blockNum, threadNum>>>(_vertexes,
                                                               _collisonPairs,
                                                               lambda_lastH_scalar,
@@ -9149,7 +9304,9 @@ void GIPC::buildFrictionSets()
                                                               dHat,
                                                               Kappa,
                                                               _cpNum,
-                                                              h_cpNum[0]);
+                                                              h_cpNum[0],
+                                                              m_pergroup_kappa ? m_kappa_group : nullptr,
+                                                              m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     CUDA_SAFE_CALL(cudaMemcpy(h_cpNum_last, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     numbers = h_gpNum;
@@ -9165,7 +9322,9 @@ void GIPC::buildFrictionSets()
                                                       _collisonPairs_lastH_gd,
                                                       dHat,
                                                       Kappa,
-                                                      h_gpNum);
+                                                      h_gpNum,
+                                                      m_pergroup_kappa ? m_kappa_group : nullptr,
+                                                      m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     h_gpNum_last = h_gpNum;
 }
@@ -9250,7 +9409,9 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         dHat,
         Kappa,
         gipc_global_triplet.global_triplet_offset,
-        numbers);
+        numbers,
+        m_pergroup_kappa ? m_kappa_group : nullptr,
+        m_pergroup_kappa ? m_d_p2g : nullptr);
 }
 
 void GIPC::computeCloseGroundVal()
@@ -9286,7 +9447,8 @@ bool GIPC::checkCloseGroundVal()
     CUDA_SAFE_CALL(cudaMalloc((void**)&_isChange, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemset(_isChange, 0, sizeof(int)));
     _checkGroundCloseVal<<<blockNum, threadNum>>>(
-        _vertexes, _groundOffset, _groundNormal, _isChange, _closeConstraintID, _closeConstraintVal, numbers);
+        _vertexes, _groundOffset, _groundNormal, _isChange, _closeConstraintID, _closeConstraintVal, numbers,
+        m_pergroup_kappa ? m_d_close_grp : nullptr, m_pergroup_kappa ? m_d_p2g : nullptr);
     int isChange;
     CUDA_SAFE_CALL(cudaMemcpy(&isChange, _isChange, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaFree(_isChange));
@@ -9346,7 +9508,9 @@ void GIPC::computeGroundGradient(double3* _gradient, double mKappa)
                                                     _gpNum,
                                                     dHat,
                                                     mKappa,
-                                                    numbers);
+                                                    numbers,
+                                                    m_pergroup_kappa ? m_kappa_group : nullptr,
+                                                    m_pergroup_kappa ? m_d_p2g : nullptr);
 }
 
 void GIPC::computeSoftConstraintGradient(double3* _gradient)
@@ -9533,6 +9697,55 @@ double GIPC::ground_largestFeasibleStepSize(double slackness, double* mqueue)
     return 1.0 / minValue;
 }
 
+// ②-D2H batched variants for the two CCD step-size reductions that fire
+// back-to-back at the top of each line search. Each writes minValue to
+// out_slot via D2D (no blocking sync). Caller does host-side 1.0/x and the
+// m_skip_all_collision / numbers<1 guards (we don't queue any kernels when
+// the early-return condition holds).
+
+void GIPC::ground_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, double* out_slot)
+{
+    int numbers = surf_vertexNum;
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_min_groundTimeStep_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir, mqueue, slackness, numbers,
+        _point_body_id, _ground_skip_body, _ground_body_count);
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, int numbers, double* out_slot)
+{
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_min_selfTimeStep_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes, _ccd_collisonPairs, _moveDir, mqueue, slackness, numbers);
+
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+
 double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueue, uint4* tets)
 {
 
@@ -9578,6 +9791,37 @@ void GIPC::buildCP()
         return;
     }
 
+    // [env-det] EE detection settings + env-local vertex map MUST be set BEFORE the per-env branch,
+    // else the per-env path (which returns early) runs the EE dedup with GLOBAL edge indices (not
+    // env-local) → cross-env asymmetric. Idempotent; the merged path below re-runs harmlessly.
+    set_ee_nodedup(getenv("STIFF_EE_NODEDUP") ? 1 : 0);
+    set_ee_detgate(getenv("STIFF_EE_DETGATE") ? 1 : 0);
+    set_bvh_envpart(getenv("STIFF_BVH_ENVPART") ? 1 : 0);
+    // [perenv-par] per-vertex cross-env skip at self-collision emission (robust where BVH env-part is
+    // bypassed by env-MIXED co-located nodes). Gated STIFF_DECOUPLE_THRESH; null = off (legacy path).
+    set_self_p2g((getenv("STIFF_DECOUPLE_THRESH") && m_d_p2g) ? m_d_p2g : nullptr);
+    set_ee_canon(getenv("STIFF_EE_CANON") ? 1 : 0);
+    set_ee_nomollify(getenv("STIFF_EE_NOMOLLIFY") ? 1 : 0);
+    if(getenv("STIFF_EE_CANON") && m_d_p2g && !m_vloc_built)
+    {
+        std::vector<int> hp(vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(hp.data(), m_d_p2g, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost));
+        std::vector<int> vloc(vertexNum, 0); std::vector<int> ec;
+        for(int v=0; v<vertexNum; v++){ int g=hp[v]; if(g<0) continue; if(g>=(int)ec.size()) ec.resize(g+1,0); vloc[v]=ec[g]++; }
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_vloc, (size_t)vertexNum*sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemcpy(m_d_vloc, vloc.data(), (size_t)vertexNum*sizeof(int), cudaMemcpyHostToDevice));
+        set_ee_vloc(m_d_vloc); m_vloc_built = true;
+    }
+
+    // [multi-env P2] per-env BVH path: build each env's tree on LOCAL verts + detect, looped.
+    if(m_perenv_bvh && m_d_p2g)
+    {
+        if(m_perenv_bvh_groups == 0)
+            buildPerEnvBVHIndex(kEnvAlphaSlots, m_d_p2g);
+        buildBVH_and_CP_perenv(dHat);
+        return;
+    }
+
     if(!m_aux_stream)
         cudaStreamCreate(&m_aux_stream);
 
@@ -9594,14 +9838,58 @@ void GIPC::buildCP()
     // Both atomicAdd into _cpNum & _collisionPair; CUDA atomics handle
     // cross-stream contention correctly. Pair-set order doesn't matter
     // to consumers (they iterate 0..h_cpNum[0]).
-    bvh_f.SelfCollitionDetect(dHat);
-    bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
+    // [xenv pin] isolate the two detection passes to localize the asymmetry:
+    //   STIFF_SKIP_F=1 → only edge-edge (tests EE ownership obj_idx<self_eid)
+    //   STIFF_SKIP_E=1 → only point-triangle (tests Morton/candidate; PT has no index dedup)
+    set_ee_nodedup(getenv("STIFF_EE_NODEDUP") ? 1 : 0);
+    set_ee_detgate(getenv("STIFF_EE_DETGATE") ? 1 : 0);
+    set_bvh_envpart(getenv("STIFF_BVH_ENVPART") ? 1 : 0);  // [env-part B]
+    // [perenv-par] per-vertex cross-env skip at self-collision emission (see note above). null = off.
+    set_self_p2g((getenv("STIFF_DECOUPLE_THRESH") && m_d_p2g) ? m_d_p2g : nullptr);
+    set_ee_canon(getenv("STIFF_EE_CANON") ? 1 : 0);
+    set_ee_nomollify(getenv("STIFF_EE_NOMOLLIFY") ? 1 : 0);
+    { static int _tc = 0; set_ee_trace((getenv("STIFF_EE_TRACE") && _tc++ == 0) ? 1 : 0); }  // first buildCP (iter0) only
+    set_ee_tgt(getenv("STIFF_BAR_TGT0")?atoi(getenv("STIFF_BAR_TGT0")):-1, getenv("STIFF_BAR_TGT1")?atoi(getenv("STIFF_BAR_TGT1")):-1);
+    // [env-det] build the global→env-local vertex id map once (canon total-order tie-break).
+    if(getenv("STIFF_EE_CANON") && m_d_p2g && !m_vloc_built)
+    {
+        std::vector<int> hp(vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(hp.data(), m_d_p2g, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost));
+        std::vector<int> vloc(vertexNum, 0); std::vector<int> ec;
+        for(int v=0; v<vertexNum; v++){ int g=hp[v]; if(g<0) continue; if(g>=(int)ec.size()) ec.resize(g+1,0); vloc[v]=ec[g]++; }
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_vloc, (size_t)vertexNum*sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemcpy(m_d_vloc, vloc.data(), (size_t)vertexNum*sizeof(int), cudaMemcpyHostToDevice));
+        set_ee_vloc(m_d_vloc); m_vloc_built = true;
+    }
+    if(getenv("STIFF_STACK_DIAG")) reset_max_stack();
+    // [env-det dump] one-shot dump of the edge BVH Morton hashes + edges to verify env0/env1 trees
+    // are byte-identical modulo the env bit. STIFF_MCDUMP.
+    { static int _mdc=0;
+      if(getenv("STIFF_MCDUMP") && _mdc++==1){   // fire on 2nd buildCP (frame-0 pre-solve, still mirror)
+        int nE=(int)bvh_e.edge_number;
+        std::vector<uint64_t> hm(nE); std::vector<uint2> he(nE);
+        CUDA_SAFE_CALL(cudaMemcpy(hm.data(), bvh_e._MChash, (size_t)nE*sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(he.data(), bvh_e._edges, (size_t)nE*sizeof(uint2), cudaMemcpyDeviceToHost));
+        std::vector<uint32_t> hi(nE);
+        CUDA_SAFE_CALL(cudaMemcpy(hi.data(), bvh_e._indices, (size_t)nE*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        FILE*f=fopen("/tmp/xd_mch.bin","wb"); fwrite(hm.data(),sizeof(uint64_t),nE,f); fclose(f);
+        f=fopen("/tmp/xd_edges2.bin","wb"); fwrite(he.data(),sizeof(uint2),nE,f); fclose(f);
+        f=fopen("/tmp/xd_idx.bin","wb"); fwrite(hi.data(),sizeof(uint32_t),nE,f); fclose(f);
+        printf("[mcdump] dumped %d edge MChash + edges + indices\n", nE); } }
+    if(!getenv("STIFF_SKIP_F")) bvh_f.SelfCollitionDetect(dHat);
+    if(!getenv("STIFF_SKIP_E")) bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
+    if(getenv("STIFF_STACK_DIAG")) { CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        static int _sd=0; if(_sd++<3) printf("[stack] max traversal depth = %d (cap 2048)\n", get_max_stack()); }
     GroundCollisionDetect();
     CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
     cudaEventDestroy(reset_evt);
 
-    CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_SAFE_CALL(cudaMemcpy(&h_gpNum, _gpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    {   // [9d28824-port] contiguous _cpNum[0:5]+_gpNum[5]: one 6-int D2H.
+        uint32_t cp_gp_buf[6];
+        CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
+        h_gpNum = cp_gp_buf[5];
+    }
 
     // Overflow → grow DCD pair buffers + redo detection (BVH unchanged, no pairs
     // lost; emits were redirected to the trash slot so nothing was corrupted).
@@ -9624,8 +9912,12 @@ void GIPC::buildCP()
         bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
         GroundCollisionDetect();
         CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-        CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_SAFE_CALL(cudaMemcpy(&h_gpNum, _gpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        {   // [9d28824-port] one 6-int D2H
+            uint32_t cp_gp_buf[6];
+            CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
+            h_gpNum = cp_gp_buf[5];
+        }
     }
 }
 
@@ -9649,6 +9941,31 @@ __global__ void _per_env_sqnorm_accum(const int* p2g, const double3* vec,
         double3 v = vec[i];
         atomicAdd(&per_env_sq[g], v.x * v.x + v.y * v.y + v.z * v.z);
     }
+}
+
+// [decouple] per-env binned reduction for kappa: gsum_g = Σ_{v∈g} gc·GE, gsnorm_g = Σ_{v∈g} |gc|².
+// Binned (exact, order-independent) ⇒ env_g's value depends ONLY on env_g's verts → batch-invariant
+// (env_0's kappa no longer depends on its batch-mates' contact state). bins: [ng*BINNED_K] each.
+__global__ void _per_env_kappa_deposit(const int* p2g, const double3* gc, const double3* GE,
+                                       double* gsum_bin, double* gsnorm_bin, int n, int ng)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    int g = p2g[i];
+    if(g < 0 || g >= ng) return;
+    double3 a = gc[i], b = GE[i];
+    _binDepBase(gsum_bin   + (size_t)g * BINNED_K, a.x * b.x + a.y * b.y + a.z * b.z);
+    _binDepBase(gsnorm_bin + (size_t)g * BINNED_K, a.x * a.x + a.y * a.y + a.z * a.z);
+}
+__global__ void _per_env_kappa_combine(double* gsum_g, double* gsnorm_g,
+                                       const double* gsum_bin, const double* gsnorm_bin, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    double s = 0.0, q = 0.0;
+    for(int k = BINNED_K - 1; k >= 0; --k)   // finest bin first, fixed order
+    { s += gsum_bin[(size_t)g * BINNED_K + k]; q += gsnorm_bin[(size_t)g * BINNED_K + k]; }
+    gsum_g[g] = s; gsnorm_g[g] = q;
 }
 
 // [multi-env P3a] per-env max CFL speed = max over an env's SURFACE verts of
@@ -9676,6 +9993,111 @@ __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir,
     int g = p2g[v];
     if(g < 0 || g >= ng) return;
     _atomicMaxPosDouble(&per_env_max[g], __GEIGEN__::__norm(moveDir[v]));
+}
+
+// [perf] DEVICE-SIDE per-env feasible alpha + freeze — replaces the per-Newton-iter host round-trip
+// (cudaDeviceSynchronize + 4x256-double D2H + 256-env host loop + H2D) that made the per-env path
+// host-bound. scratch layout: [0*ng)=ground, [1*ng)=narrow-self, [2*ng)=refined-self, [3*ng)=cfl-max.
+// Writes env_alpha[g] directly (device), atomics n_env/n_frozen into cnt[2]. Math is bit-identical to
+// the host loop (same per-env formulas, no reduction) → preserves strict cross-env bit-identity.
+__global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng,
+                                       double sq, double ccd_size, int have_ccd,
+                                       double temp_alpha, double alpha_CFL, int decouple,
+                                       int no_refine, double thr_cv, int* cnt)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    double hmx = scratch[3 * ng + g];
+    if(hmx <= 0.0) return;   // absent env → leave env_alpha[g] unchanged (matches host `continue`)
+    double hg = scratch[0 * ng + g], hs = scratch[1 * ng + g], hr = scratch[2 * ng + g];
+    double ta = 1.0;
+    if(hg > 0.0) ta = fmin(ta, 1.0 / hg);
+    if(hs > 0.0) ta = fmin(ta, 1.0 / hs);
+    double a = ta;
+    if(have_ccd)
+    {
+        double acfl     = sq / hmx * 0.5;
+        a               = fmin(ta, acfl);
+        double gate_lhs = decouple ? ta : temp_alpha;
+        double gate_rhs = decouple ? acfl : alpha_CFL;
+        if(!no_refine && gate_lhs > 2.0 * gate_rhs)
+        {
+            double refined = (hr > 0.0) ? 1.0 / hr : 1.0;
+            a              = fmin(ta, refined * ccd_size);
+            a              = fmax(a, acfl);
+        }
+    }
+    if(decouple && hmx < thr_cv) a = 0.0;   // freeze converged env
+    env_alpha[g] = a;
+    atomicAdd(&cnt[0], 1);                   // n_env (present)
+    if(a == 0.0) atomicAdd(&cnt[1], 1);      // n_frozen
+}
+
+// [de-CPU] per-env CCD search-inflation alpha ta_e = min(1, 1/ground_e, 1/narrowSelf_e), computed
+// ON DEVICE from m_env_scratch (filled by S1 Phase A) — replaces the per-Newton D2H(2*NG doubles) +
+// host ta[] loop in buildFullCP. Math identical to the removed host loop (IEEE div/min → bit-exact).
+__global__ void _compute_perenv_ta(const double* scratch, double* ta, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    double t  = 1.0;
+    double gs = scratch[0 * ng + g];
+    double ns = scratch[1 * ng + g];
+    if(gs > 0.0) t = fmin(t, 1.0 / gs);
+    if(ns > 0.0) t = fmin(t, 1.0 / ns);
+    ta[g] = t;
+}
+
+// [S4-dev] device-derived per-env active mask — replaces the S4 host detection (own max-move
+// kernel + D2H + host loop + H2D per iter) with ZERO added D2H: the freeze decision is already on
+// device in m_env_alpha (set by _per_env_alpha_compute from a REAL solve). active = (alpha != 0).
+// A masked env's next moveDir is 0 (RHS zeroed) -> hmx=0 -> _per_env_alpha_compute treats it as
+// absent and leaves env_alpha unchanged (stays 0) -> stays masked until the periodic all-active
+// recheck (top of loop) re-solves it for bounce-back detection. Deterministic (fixed cadence,
+// per-env decision) -> strict/batch-invariance safe.
+__global__ void _mask_fill(int* m, int v, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n) m[i] = v;
+}
+__global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    env_active[g] = (env_alpha[g] == 0.0) ? 0 : 1;
+}
+
+// [perf] DEVICE-SIDE per-group κ doubling (postLineSearch) — replaces the per-Newton host round-trip
+// (D2H close flags + 256-env host loop + H2D). Doubles m_kappa_group[g] in place for groups that hit a
+// close contact (capped at kappaMax, host scalar), and atomicMax's the envelope into maxK_out (init =
+// current Kappa). Bit-identical to the host loop (same double+cap; max is order-free) → strict OK.
+__global__ void _per_group_kappa_double(double* kappa_group, const int* close_grp, int ng,
+                                        double kappaMax, double* maxK_out)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    if(close_grp[g])
+    {
+        double k = kappa_group[g] * 2.0;
+        if(k > kappaMax) k = kappaMax;
+        kappa_group[g] = k;
+        _atomicMaxPosDouble(maxK_out, k);
+    }
+}
+
+// [perf] DEVICE-SIDE per-env initKappa finalize — replaces the per-frame D2H(gsum_g/gsnorm_g) +
+// NG-env host loop + H2D(kappa_group). Kg = clamp(max(-gsum/gsnorm, suggested), 0, kmax), where
+// suggested/kmax are env-independent host scalars. Bit-identical to the host loop → strict OK.
+__global__ void _per_env_kappa_finalize(const double* gsum_g, const double* gsnorm_g,
+                                        double* kappa_group, int ng, double suggested, double kmax)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    double mk = (gsnorm_g[g] > 0.0) ? (-gsum_g[g] / gsnorm_g[g]) : 0.0;
+    if(mk < 0.0) mk = 0.0;
+    double Kg = (mk > suggested) ? mk : suggested;
+    if(Kg > kmax) Kg = kmax;
+    kappa_group[g] = Kg;
 }
 
 // [multi-env S4 probe / aa17212] per-env MAX move (the real Newton-exit metric):
@@ -9732,7 +10154,8 @@ __global__ void _per_env_groundTimeStep_max(const double3* vertexes,
 
 __global__ void _per_env_selfTimeStep_max(const double3* vertexes, const int4* pairs,
                                           const double3* moveDir, const int* p2g,
-                                          double* per_env_inv, double slackness, int number, int ng)
+                                          double* per_env_inv, double slackness, int number, int ng,
+                                          const int* vloc)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number) return;
@@ -9744,23 +10167,37 @@ __global__ void _per_env_selfTimeStep_max(const double3* vertexes, const int4* p
     {
         MMCVIDI.x = -MMCVIDI.x - 1;
         v0        = MMCVIDI.x;
-        temp = 1.0 / point_triangle_ccd(vertexes[MMCVIDI.x], vertexes[MMCVIDI.y],
-                                        vertexes[MMCVIDI.z], vertexes[MMCVIDI.w],
-                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.x], -1),
-                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.y], -1),
-                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.z], -1),
-                                        __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.w], -1),
+        int p = MMCVIDI.x, t0 = MMCVIDI.y, t1 = MMCVIDI.z, t2 = MMCVIDI.w;
+        // [env-det] canonicalize the triangle vertex order by env-local id so mirror PT pairs feed
+        // point_triangle_ccd in an identical order ⇒ bit-identical TOI cross-env.
+        if(vloc) { int a=t0,b=t1,c=t2;
+            if(vloc[b]<vloc[a]){int t=a;a=b;b=t;} if(vloc[c]<vloc[b]){int t=b;b=c;c=t;}
+            if(vloc[b]<vloc[a]){int t=a;a=b;b=t;} t0=a; t1=b; t2=c; }
+        temp = 1.0 / point_triangle_ccd(vertexes[p], vertexes[t0],
+                                        vertexes[t1], vertexes[t2],
+                                        __GEIGEN__::__s_vec_multiply(moveDir[p], -1),
+                                        __GEIGEN__::__s_vec_multiply(moveDir[t0], -1),
+                                        __GEIGEN__::__s_vec_multiply(moveDir[t1], -1),
+                                        __GEIGEN__::__s_vec_multiply(moveDir[t2], -1),
                                         CCDDistRatio, 0);
     }
     else
     {
         v0   = MMCVIDI.x;
-        temp = 1.0 / edge_edge_ccd(vertexes[MMCVIDI.x], vertexes[MMCVIDI.y],
-                                   vertexes[MMCVIDI.z], vertexes[MMCVIDI.w],
-                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.x], -1),
-                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.y], -1),
-                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.z], -1),
-                                   __GEIGEN__::__s_vec_multiply(moveDir[MMCVIDI.w], -1),
+        int e0a=MMCVIDI.x, e0b=MMCVIDI.y, e1a=MMCVIDI.z, e1b=MMCVIDI.w;
+        // [env-det] canonicalize edge endpoints + edge order by env-local id ⇒ mirror EE pairs feed
+        // edge_edge_ccd identically ⇒ bit-identical TOI cross-env (the refined-CCD `hr` 1-ULP seed).
+        if(vloc) {
+            if(vloc[e0b]<vloc[e0a]){int t=e0a;e0a=e0b;e0b=t;}
+            if(vloc[e1b]<vloc[e1a]){int t=e1a;e1a=e1b;e1b=t;}
+            if(vloc[e1a]<vloc[e0a]){int t=e0a;e0a=e1a;e1a=t; t=e0b;e0b=e1b;e1b=t;}
+        }
+        temp = 1.0 / edge_edge_ccd(vertexes[e0a], vertexes[e0b],
+                                   vertexes[e1a], vertexes[e1b],
+                                   __GEIGEN__::__s_vec_multiply(moveDir[e0a], -1),
+                                   __GEIGEN__::__s_vec_multiply(moveDir[e0b], -1),
+                                   __GEIGEN__::__s_vec_multiply(moveDir[e1a], -1),
+                                   __GEIGEN__::__s_vec_multiply(moveDir[e1b], -1),
                                    CCDDistRatio, 0);
     }
     int g = p2g[v0];
@@ -9768,11 +10205,119 @@ __global__ void _per_env_selfTimeStep_max(const double3* vertexes, const int4* p
     if(temp > 0.0) _atomicMaxPosDouble(&per_env_inv[g], temp);
 }
 
+// [multi-env P2] per-env CCD: build each env's swept tree on LOCAL verts + full-detect, looped.
+void GIPC::buildBVH_and_CP_perenv_CCD(double alpha)
+{
+    if(m_skip_all_collision) { h_ccd_cpNum = 0; return; }
+    int NG = m_perenv_bvh_groups;
+    double3* sf = bvh_f._vertexes;
+    double3* se = bvh_e._vertexes;
+    bvh_f._vertexes = _vertexes;
+    bvh_e._vertexes = _vertexes;
+    (void)NG;
+    // [decouple] PER-ENV CCD search inflation. The global `alpha` (=temp_alpha=min over ALL envs)
+    // makes env e's swept-BVH search — and thus its refined-self CCD pair set + hr (refined-self
+    // timestep) — depend on the MATES → batch-coupling (the confirmed root: frame0 k=3 hr diverged
+    // 5.48 vs 4.93 when global temp_alpha diverged 0.272 vs 0.033). Here each env e searches with its
+    // OWN feasible alpha ta_e = min(1, 1/ground_e, 1/narrowSelf_e) (from m_env_scratch, filled by S1
+    // Phase A; depends only on env e → batch-invariant). ta_e ≥ global alpha → conservative superset
+    // of pairs → hr is the true most-constraining value → refinement KEPT (unlike STIFF_NO_REFINE,
+    // which skipped it and caused excessive backtracking). Gated STIFF_DECOUPLE_THRESH.
+    const int KNG = kEnvAlphaSlots;
+    bool perenv_ta = (getenv("STIFF_DECOUPLE_THRESH") && m_env_scratch && getenv("STIFF_PERENV_ALPHA"));
+    // [de-CPU] ta computed on device (see _compute_perenv_ta) — the per-env launches below read
+    // their env's slot via the kernels' alpha_dev param; NO D2H / host loop.
+    static double* d_perenv_ta = nullptr;
+    if(perenv_ta)
+    {
+        if(!d_perenv_ta) CUDA_SAFE_CALL(cudaMalloc((void**)&d_perenv_ta, KNG * sizeof(double)));
+        _compute_perenv_ta<<<(KNG + 255) / 256, 256>>>(m_env_scratch, d_perenv_ta, KNG);
+    }
+    // scalar fallback (kernels use it when alpha_dev == nullptr)
+    auto env_alpha_dev = [&](int e) -> const double* { return perenv_ta ? d_perenv_ta + e : nullptr; };
+    // [perenv-parallel #2] STIFF_PERENV_PAR: run the per-env SWEPT (CCD) builds+queries concurrently
+    // on the K-stream scratch pool — mirrors the DCD loop. The 6-7ms _selfQuery_*_ccd kernels are
+    // occupancy-starved at 1-env size (~25 blocks); overlapping K envs fills the GPU.
+    const char* _ccd_pe_par = getenv("STIFF_PERENV_PAR");   // value-aware (=0 disables)
+    bool ccd_par = _ccd_pe_par && atoi(_ccd_pe_par) != 0;
+    int  ccd_K   = 1;
+    if(ccd_par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;
+                  ccd_K = (int)h_perenv_active.size(); if(ccd_K > cap) ccd_K = cap; if(ccd_K < 1) ccd_K = 1;
+                  allocPerEnvPool(ccd_K); }
+    BvhScratch cof{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,
+                   bvh_f._sort_tmp,bvh_f._sort_tmp_bytes,bvh_f._mch_alt,bvh_f._idx_alt,bvh_f._sort_cap};
+    BvhScratch coe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,
+                   bvh_e._sort_tmp,bvh_e._sort_tmp_bytes,bvh_e._mch_alt,bvh_e._idx_alt,bvh_e._sort_cap};
+    auto cswapIn = [](lbvh& b, BvhScratch& s){ b._nodes=s.nodes; b._bvs=s.bvs; b._MChash=s.mch;
+        b._indices=s.idx; b._tempLeafBox=s.tmp; b._flags=s.flags; b.m_node_env=s.node_env;
+        b._sort_tmp=s.sort_tmp; b._sort_tmp_bytes=s.sort_bytes;
+        b._mch_alt=s.mch_alt; b._idx_alt=s.idx_alt; b._sort_cap=s.sort_cap; };
+  ccd_redo:
+    CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, sizeof(uint32_t)));
+    // memset is on the DEFAULT stream; pool-stream detects atomicAdd _cpNum → make the zero globally
+    // visible before any pool-stream work (same fix as the DCD loop).
+    if(ccd_par) CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    {
+        int ci = 0;
+        for(int e : h_perenv_active)
+        {
+            const double* aedev = env_alpha_dev(e);   // [de-CPU] device slot (nullptr -> scalar alpha)
+            cudaStream_t st = ccd_par ? m_pool_streams[ci % ccd_K] : (cudaStream_t)0;
+            if(h_perenv_face_cnt[e] > 0)
+            {
+                if(ccd_par) cswapIn(bvh_f, m_pool_f[ci % ccd_K]);
+                bvh_f._active_idx        = d_perenv_face_idx + h_perenv_face_off[e];
+                bvh_f.face_number_active = h_perenv_face_cnt[e];
+                bvh_f.ConstructFullCCD(_moveDir, alpha, st, aedev);
+                bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha, st, aedev);
+            }
+            if(h_perenv_edge_cnt[e] > 0)
+            {
+                if(ccd_par) cswapIn(bvh_e, m_pool_e[ci % ccd_K]);
+                bvh_e._active_idx        = d_perenv_edge_idx + h_perenv_edge_off[e];
+                bvh_e.face_number_active = h_perenv_edge_cnt[e];
+                bvh_e.ConstructFullCCD(_moveDir, alpha, st, aedev);
+                bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, st, aedev);
+            }
+            ++ci;
+        }
+    }
+    if(ccd_par) { for(int k2 = 0; k2 < ccd_K; ++k2) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k2]));
+                  cswapIn(bvh_f, cof); cswapIn(bvh_e, coe); }  // restore original scratch
+    CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // [perenv-parallel #1 FIX] the per-env CCD path (like the merged buildFullCP) MUST grow + redo on
+    // overflow — else at the grasp h_ccd_cpNum exceeds the cap and the line-search per-env alpha reads
+    // _ccd_collisonPairs OOB → illegal access (the N>4 crash). Emits past cap went to the trash slot.
+    if((int)h_ccd_cpNum > MAX_CCD_COLLITION_PAIRS_NUM)
+    {
+        int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
+        printf("[perenv CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo\n",
+               h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
+        CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
+        MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
+        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
+        goto ccd_redo;
+    }
+    bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;
+    bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
+    bvh_f._vertexes = sf;
+    bvh_e._vertexes = se;
+}
+
 void GIPC::buildFullCP(const double& alpha)
 {
     if(m_skip_all_collision)
     {
         h_ccd_cpNum = 0;
+        return;
+    }
+
+    // [multi-env P2] per-env CCD path (the swept-BVH equivalent of the per-env DCD path).
+    if(m_perenv_bvh && m_d_p2g && m_perenv_bvh_groups > 0)
+    {
+        buildBVH_and_CP_perenv_CCD(alpha);
         return;
     }
 
@@ -9818,12 +10363,400 @@ void GIPC::buildFullCP(const double& alpha)
 }
 
 
+// [multi-env determinism] d_bvh_vertexes = _vertexes + d_env_offset (no-op when offset=0).
+__global__ void _addEnvOffset(double3* out, const double3* v, const double3* off, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    out[i].x = v[i].x + off[i].x;
+    out[i].y = v[i].y + off[i].y;
+    out[i].z = v[i].z + off[i].z;
+}
+
 void GIPC::buildBVH()
 {
     if(m_skip_all_collision)
         return;
+    // [multi-env P2] per-env mode builds trees inside buildCP (per-env loop); skip the merged build.
+    if(m_perenv_bvh && m_perenv_bvh_groups > 0)
+        return;
+    { int bs = 256, gs = (vertexNum + bs - 1) / bs;
+      _addEnvOffset<<<gs, bs>>>(d_bvh_vertexes, _vertexes, d_env_offset, vertexNum); }
     bvh_f.Construct();
     bvh_e.Construct();
+}
+
+// [multi-env cross-env DIAGNOSTIC] scatter a per-vertex buffer into [env*maxL + localid] for
+// env0/env1, so the host can compare corresponding entries (identical envs ⇒ should be equal).
+__global__ void _xenv_scatter(const double3* buf, const int* p2g, const int* lid,
+                              double* out, int maxL, int n)
+{
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if(v >= n) return;
+    int g = p2g[v];
+    if(g < 0 || g > 1) return;
+    int L = lid[v];
+    if(L < 0 || L >= maxL) return;
+    out[((size_t)g * maxL + L) * 3 + 0] = buf[v].x;
+    out[((size_t)g * maxL + L) * 3 + 1] = buf[v].y;
+    out[((size_t)g * maxL + L) * 3 + 2] = buf[v].z;
+}
+// [xenv] classify each contact pair: intra-env0 / intra-env1 / cross-env / other. Decodes the
+// first two vertices of the int4 pair (gv = c>=0 ? c : -c-1) and compares their groups.
+__global__ void _xenv_paircount(const int4* pairs, const int* p2g, int n,
+                                int* cnt_g0, int* cnt_g1, int* cross, int* other)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    int4 p = pairs[i];
+    int gv0 = (p.x >= 0) ? p.x : (-p.x - 1);
+    int gv1 = (p.y >= 0) ? p.y : (-p.y - 1);
+    int g0 = p2g[gv0];
+    int g1 = p2g[gv1];
+    if(g0 != g1)        atomicAdd(cross, 1);
+    else if(g0 == 0)    atomicAdd(cnt_g0, 1);
+    else if(g0 == 1)    atomicAdd(cnt_g1, 1);
+    else                atomicAdd(other, 1);
+}
+void GIPC::xenvPairClassify(const int4* pairs, int n, const char* label)
+{
+    if(!getenv("STIFF_XENV") || !m_d_p2g || n <= 0) return;
+    static int* d4 = nullptr;
+    if(!d4) CUDA_SAFE_CALL(cudaMalloc((void**)&d4, 4 * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(d4, 0, 4 * sizeof(int)));
+    int bs = 256, gs = (n + bs - 1) / bs;
+    _xenv_paircount<<<gs, bs>>>(pairs, m_d_p2g, n, d4 + 0, d4 + 1, d4 + 2, d4 + 3);
+    int h[4]; CUDA_SAFE_CALL(cudaMemcpy(h, d4, 4 * sizeof(int), cudaMemcpyDeviceToHost));
+    printf("[xenv]   %s: intra-env0=%d intra-env1=%d CROSS-env=%d other=%d (total=%d)\n",
+           label, h[0], h[1], h[2], h[3], n);
+}
+// max |env0[k]-env1[k]| over corresponding (local-id) vertices. Builds the local-id map once.
+double GIPC::xenvDiff(const double3* buf, const char* label)
+{
+    if(!getenv("STIFF_XENV") || !m_d_p2g) return -1.0;
+    if(!m_xenv_ready)
+    {
+        std::vector<int> p2g(vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(p2g.data(), m_d_p2g, vertexNum * sizeof(int), cudaMemcpyDeviceToHost));
+        std::vector<int> lid(vertexNum, -1), cnt(2, 0);
+        for(int v = 0; v < vertexNum; v++)
+        { int g = p2g[v]; if(g == 0 || g == 1) lid[v] = cnt[g]++; }
+        m_xenv_maxlocal = (cnt[0] > cnt[1]) ? cnt[0] : cnt[1];
+        printf("[xenv] env0=%d env1=%d verts (maxlocal=%d)\n", cnt[0], cnt[1], m_xenv_maxlocal);
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_xenv_lid, vertexNum * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemcpy(d_xenv_lid, lid.data(), vertexNum * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_xenv_buf, (size_t)2 * m_xenv_maxlocal * 3 * sizeof(double)));
+        m_xenv_ready = true;
+    }
+    CUDA_SAFE_CALL(cudaMemset(d_xenv_buf, 0, (size_t)2 * m_xenv_maxlocal * 3 * sizeof(double)));
+    { int bs = 256, gs = (vertexNum + bs - 1) / bs;
+      _xenv_scatter<<<gs, bs>>>(buf, m_d_p2g, d_xenv_lid, d_xenv_buf, m_xenv_maxlocal, vertexNum); }
+    std::vector<double> h((size_t)2 * m_xenv_maxlocal * 3);
+    CUDA_SAFE_CALL(cudaMemcpy(h.data(), d_xenv_buf, h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    double mx = 0.0; int worst = -1;
+    for(int L = 0; L < m_xenv_maxlocal; L++)
+        for(int c = 0; c < 3; c++)
+        { double d = fabs(h[((size_t)0 * m_xenv_maxlocal + L) * 3 + c] - h[((size_t)1 * m_xenv_maxlocal + L) * 3 + c]);
+          if(d > mx) { mx = d; worst = L; } }
+    // [env-det dbg] identify the worst lid: env0 global vert + btype (boundary/driven vs free).
+    // STIFF_XENV_ID: build env0 lid→vert inverse once, report on first nonzero diff.
+    if(getenv("STIFF_XENV_ID") && worst >= 0 && mx > 0.0)
+    {
+        static std::vector<int> inv;
+        if(inv.empty())
+        {
+            inv.assign(m_xenv_maxlocal, -1);
+            std::vector<int> hp(vertexNum), hl(vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(hp.data(), m_d_p2g, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(hl.data(), d_xenv_lid, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost));
+            for(int v=0; v<vertexNum; v++) if(hp[v]==0 && hl[v]>=0 && hl[v]<m_xenv_maxlocal) inv[hl[v]]=v;
+        }
+        printf("[xenv-id] %-20s worst lid=%d -> env0 global vert=%d (vertexNum=%d)\n",
+               label, worst, inv[worst], vertexNum);
+    }
+    printf("[xenv] %-22s maxdiff %.6e  (worst lid=%d)\n", label, mx, worst);
+    return mx;
+}
+
+// [multi-env P2 / per-env BVH] primitive→env via the first vertex's group.
+__global__ void _prim_env_f(const uint3* faces, const int* p2g, int* env, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    env[i] = p2g[faces[i].x];
+}
+__global__ void _prim_env_e(const uint2* edges, const int* p2g, int* env, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    env[i] = p2g[edges[i].x];
+}
+// P1: group faces/edges by env (host, one-time; topology static) → env-contiguous _active_idx.
+static void _build_perenv_list(const int* d_env, int n, int NG,
+                               int*& d_idx, std::vector<int>& off, std::vector<int>& cnt,
+                               const std::vector<uint64_t>* key = nullptr)
+{
+    std::vector<int> h_env(n);
+    CUDA_SAFE_CALL(cudaMemcpy(h_env.data(), d_env, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
+    off.assign(NG, 0);
+    cnt.assign(NG, 0);
+    int ungrouped = 0;
+    for(int i = 0; i < n; i++) { int e = h_env[i]; if(e >= 0 && e < NG) cnt[e]++; else ungrouped++; }
+    int acc = 0;
+    for(int e = 0; e < NG; e++) { off[e] = acc; acc += cnt[e]; }
+    std::vector<int> idx(acc), cur(off);
+    for(int i = 0; i < n; i++) { int e = h_env[i]; if(e >= 0 && e < NG) idx[cur[e]++] = i; }
+    // [env-det BVH] order each env's active list by an ENV-LOCAL key so ALL envs share an identical
+    // local prim ordering (mirror) ⇒ the per-env Construct sees identical inputs ⇒ identical trees.
+    // (default builds in ascending global-prim order, which is NOT env-mirror for co-located envs.)
+    if(key && getenv("STIFF_BVH_ENVDET"))
+        for(int e = 0; e < NG; e++)
+        { int s = off[e], c = cnt[e];
+          std::sort(idx.begin() + s, idx.begin() + s + c,
+                    [&](int a, int b){ return (*key)[a] < (*key)[b]; }); }
+    if(ungrouped) printf("[perenv-bvh] WARNING %d/%d prims ungrouped (env<0) — excluded from per-env BVH\n", ungrouped, n);
+    if(d_idx) CUDA_SAFE_CALL(cudaFree(d_idx));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_idx, (size_t)(acc > 0 ? acc : 1) * sizeof(int)));
+    if(acc) CUDA_SAFE_CALL(cudaMemcpy(d_idx, idx.data(), (size_t)acc * sizeof(int), cudaMemcpyHostToDevice));
+}
+// [env-det] enable env-major Morton on the MERGED BVH: compute per-prim env id (p2g of the prim's
+// first vertex) once, point the BVHs at it, and turn on the env-major sort key. Co-located identical
+// envs then build env-blocked (mirror) trees ⇒ env-symmetric broad-phase enumeration.
+void GIPC::enableEnvMajorBVH(const int* p2g)
+{
+    if(!p2g || d_face_env) return;   // once
+    m_d_p2g = p2g;
+    int nF = (int)bvh_f.face_number, nE = (int)bvh_e.edge_number;
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_face_env, (size_t)nF * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_edge_env, (size_t)nE * sizeof(int)));
+    { int bs=256, gs=(nF+bs-1)/bs; _prim_env_f<<<gs,bs>>>(bvh_f._faces, p2g, d_face_env, nF); }
+    { int bs=256, gs=(nE+bs-1)/bs; _prim_env_e<<<gs,bs>>>(bvh_e._edges, p2g, d_edge_env, nE); }
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    bvh_f.m_prim_env = d_face_env;
+    bvh_e.m_prim_env = d_edge_env;
+    // [env-det] Morton low-bits tie-break = a MIRROR key derived from the prim's env-LOCAL VERTEX ids
+    // (the env-local vertex id IS mirror across identical envs; the global prim/edge numbering is NOT).
+    // env-local vert id = rank of a vertex among its env's verts by ascending global index.
+    std::vector<int> hp2(vertexNum);
+    CUDA_SAFE_CALL(cudaMemcpy(hp2.data(), p2g, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<int> vloc(vertexNum, 0); { std::vector<int> ec;
+        for(int v=0;v<vertexNum;v++){ int g=hp2[v]; if(g<0) continue; if(g>=(int)ec.size()) ec.resize(g+1,0); vloc[v]=ec[g]++; } }
+    std::vector<uint3> hf(nF); std::vector<uint2> he(nE);
+    CUDA_SAFE_CALL(cudaMemcpy(hf.data(), bvh_f._faces, (size_t)nF*sizeof(uint3), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(he.data(), bvh_e._edges, (size_t)nE*sizeof(uint2), cudaMemcpyDeviceToHost));
+    std::vector<int> floc(nF), eloc(nE);
+    for(int i=0;i<nE;i++){ int a=vloc[he[i].x], b=vloc[he[i].y]; int lo=a<b?a:b, hi=a<b?b:a;
+        eloc[i] = (lo<<13)|hi; }                              // 2×13-bit env-local vert ids (verts/env<8192)
+    for(int i=0;i<nF;i++){ int a=vloc[hf[i].x],b=vloc[hf[i].y],c=vloc[hf[i].z];
+        if(a>b){int t=a;a=b;b=t;} if(b>c){int t=b;b=c;c=t;} if(a>b){int t=a;a=b;b=t;}
+        floc[i] = (int)((((uint64_t)a*9973u + b)*9973u + c) & 0x3FFFFFFu); }  // mirror hash (26-bit)
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_face_localid,(size_t)nF*sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_edge_localid,(size_t)nE*sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemcpy(d_face_localid,floc.data(),(size_t)nF*sizeof(int),cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_edge_localid,eloc.data(),(size_t)nE*sizeof(int),cudaMemcpyHostToDevice));
+    bvh_f.m_prim_localid = d_face_localid;
+    bvh_e.m_prim_localid = d_edge_localid;
+    // [env-det] static per-prim first-vertex index so _calcMChash can subtract the LIVE per-env world
+    // offset (d_env_offset is populated per-frame, AFTER this once-call) ⇒ Morton computed in the
+    // local frame ⇒ mirror trees, while spacing>0 is kept for broad-phase efficiency.
+    std::vector<uint32_t> fv0(nF), ev0(nE);
+    for(int i=0;i<nF;i++) fv0[i]=hf[i].x;
+    for(int i=0;i<nE;i++) ev0[i]=he[i].x;
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_face_v0,(size_t)nF*sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_edge_v0,(size_t)nE*sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemcpy(d_face_v0,fv0.data(),(size_t)nF*sizeof(uint32_t),cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_edge_v0,ev0.data(),(size_t)nE*sizeof(uint32_t),cudaMemcpyHostToDevice));
+    bvh_f.m_env_offset = d_env_offset; bvh_f.m_prim_v0 = d_face_v0;
+    bvh_e.m_env_offset = d_env_offset; bvh_e.m_prim_v0 = d_edge_v0;
+    set_bvh_envmajor(1);
+    printf("[env-major-bvh] enabled: %d faces, %d edges\n", nF, nE);
+}
+void GIPC::buildPerEnvBVHIndex(int NG, const int* p2g)
+{
+    m_perenv_bvh_groups = NG;
+    int nF = (int)bvh_f.face_number, nE = (int)bvh_e.edge_number;
+    int *d_fenv = nullptr, *d_eenv = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_fenv, (size_t)nF * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_eenv, (size_t)nE * sizeof(int)));
+    { int bs = 256, gs = (nF + bs - 1) / bs; _prim_env_f<<<gs, bs>>>(bvh_f._faces, p2g, d_fenv, nF); }
+    { int bs = 256, gs = (nE + bs - 1) / bs; _prim_env_e<<<gs, bs>>>(bvh_e._edges, p2g, d_eenv, nE); }
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // [env-det BVH] per-prim ENV-LOCAL sort key = packed sorted env-local vertex ids. Env-local id =
+    // rank of a vertex among its env's vertices by ascending GLOBAL index (mirror across identical
+    // envs, proven by xenvDiff call#0==0). Used to canonicalize the per-env active-list ordering.
+    std::vector<uint64_t> fkey, ekey;
+    if(getenv("STIFF_BVH_ENVDET"))
+    {
+        std::vector<int> hp2g(vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(hp2g.data(), p2g, (size_t)vertexNum * sizeof(int), cudaMemcpyDeviceToHost));
+        std::vector<int> vloc(vertexNum, 0); std::vector<int> ec(NG, 0);
+        for(int v = 0; v < vertexNum; v++){ int g = hp2g[v]; if(g >= 0 && g < NG) vloc[v] = ec[g]++; }
+        auto pack3 = [](uint64_t a, uint64_t b, uint64_t c){
+            uint64_t lo=a<b?a:b, hi=a<b?b:a; if(c<lo){uint64_t t=lo;lo=c;c=t;} if(c<hi){uint64_t t=hi;hi=c;c=t;}
+            return (lo<<40)|(hi<<20)|c; };
+        std::vector<uint3> hf(nF); std::vector<uint2> he(nE);
+        CUDA_SAFE_CALL(cudaMemcpy(hf.data(), bvh_f._faces, (size_t)nF*sizeof(uint3), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(he.data(), bvh_e._edges, (size_t)nE*sizeof(uint2), cudaMemcpyDeviceToHost));
+        fkey.resize(nF); ekey.resize(nE);
+        for(int i=0;i<nF;i++) fkey[i]=pack3(vloc[hf[i].x],vloc[hf[i].y],vloc[hf[i].z]);
+        for(int i=0;i<nE;i++){ uint64_t a=vloc[he[i].x],b=vloc[he[i].y]; ekey[i]=(a<b)?((a<<20)|b):((b<<20)|a); }
+    }
+    _build_perenv_list(d_fenv, nF, NG, d_perenv_face_idx, h_perenv_face_off, h_perenv_face_cnt, fkey.empty()?nullptr:&fkey);
+    _build_perenv_list(d_eenv, nE, NG, d_perenv_edge_idx, h_perenv_edge_off, h_perenv_edge_cnt, ekey.empty()?nullptr:&ekey);
+    CUDA_SAFE_CALL(cudaFree(d_fenv));
+    CUDA_SAFE_CALL(cudaFree(d_eenv));
+    int tf = 0, te = 0;
+    h_perenv_active.clear();
+    for(int e = 0; e < NG; e++)
+    {
+        tf += h_perenv_face_cnt[e]; te += h_perenv_edge_cnt[e];
+        if(h_perenv_face_cnt[e] > 0 || h_perenv_edge_cnt[e] > 0) h_perenv_active.push_back(e);
+    }
+    printf("[perenv-bvh] built per-env index: NG=%d active=%zu faces %d/%d edges %d/%d\n",
+           NG, h_perenv_active.size(), tf, nF, te, nE);
+}
+
+// P2: per-env Construct+Detect on LOCAL _vertexes (full precision, per-env identical, no cross-
+// env candidates) — replaces buildBVH()+buildCP() when m_perenv_bvh. Pairs append to the shared
+// _collisonPairs via the atomic _cpNum (env-order-independent, consumers iterate 0..h_cpNum[0]).
+// [perenv-parallel #1] allocate K scratch sets (face + edge sized) + K streams (once).
+void GIPC::allocPerEnvPool(int K)
+{
+    if(m_pool_K >= K) return;
+    int nF = (int)bvh_f.face_number, nE = (int)bvh_e.edge_number;
+    m_pool_f.resize(K); m_pool_e.resize(K);
+    // [perenv-parallel #2] per-slot cub sort scratch, pre-sized to the FULL prim count so the
+    // in-loop ensure_sort_scratch never reallocates (pointer stability across swapIn/restore).
+    auto allocSort = [](GIPC::BvhScratch& s, int cap)
+    {
+        if(s.sort_tmp) return;
+        size_t bytes = 0;
+        cub::DeviceRadixSort::SortPairs((void*)nullptr, bytes, (const uint64_t*)nullptr,
+                                        (uint64_t*)nullptr, (const uint32_t*)nullptr,
+                                        (uint32_t*)nullptr, cap, 0, 64);
+        CUDA_SAFE_CALL(cudaMalloc(&s.sort_tmp, bytes));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&s.mch_alt, (size_t)cap * sizeof(uint64_t)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&s.idx_alt, (size_t)cap * sizeof(uint32_t)));
+        s.sort_bytes = bytes; s.sort_cap = cap;
+    };
+    for(int k = 0; k < K; ++k)
+    {
+        if(!m_pool_f[k].nodes) { BvhScratch& s = m_pool_f[k];
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.nodes,(2*nF-1)*sizeof(Node)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.bvs,(2*nF-1)*sizeof(AABB)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.mch,nF*sizeof(uint64_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.idx,nF*sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.tmp,nF*sizeof(AABB)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.flags,(nF-1)*sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.node_env,(2*nF-1)*sizeof(int)));
+            allocSort(s, nF); }
+        if(!m_pool_e[k].nodes) { BvhScratch& s = m_pool_e[k];
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.nodes,(2*nE-1)*sizeof(Node)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.bvs,(2*nE-1)*sizeof(AABB)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.mch,nE*sizeof(uint64_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.idx,nE*sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.tmp,nE*sizeof(AABB)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.flags,(nE-1)*sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s.node_env,(2*nE-1)*sizeof(int)));
+            allocSort(s, nE); }
+    }
+    m_pool_streams.resize(K);
+    for(int k = 0; k < K; ++k) CUDA_SAFE_CALL(cudaStreamCreate(&m_pool_streams[k]));
+    m_pool_K = K;
+}
+
+void GIPC::buildBVH_and_CP_perenv(double dHat)
+{
+    if(m_skip_all_collision) return;
+    int NG = m_perenv_bvh_groups;
+    // point the BVH at LOCAL verts (the whole reason this kills cross-env divergence)
+    double3* saved_f = bvh_f._vertexes;
+    double3* saved_e = bvh_e._vertexes;
+    bvh_f._vertexes = _vertexes;
+    bvh_e._vertexes = _vertexes;
+    (void)NG;
+    bool skipF = getenv("STIFF_SKIP_F"), skipE = getenv("STIFF_SKIP_E");  // [decomp] per-env skips
+    // [perenv-parallel #1] STIFF_PERENV_PAR: run envs concurrently on a K-stream scratch pool.
+    // Value-aware (=0 disables) — isolated mode defaults it ON via the Python resolver.
+    const char* _pe_par = getenv("STIFF_PERENV_PAR");
+    bool par = _pe_par && atoi(_pe_par) != 0;
+    int  K   = 1;
+    if(par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;  // concurrency cap
+              K = (int)h_perenv_active.size(); if(K > cap) K = cap; if(K < 1) K = 1; allocPerEnvPool(K); }
+    // snapshot bvh scratch so we can point-swap per env + restore at the end.
+    BvhScratch of{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,
+                  bvh_f._sort_tmp,bvh_f._sort_tmp_bytes,bvh_f._mch_alt,bvh_f._idx_alt,bvh_f._sort_cap};
+    BvhScratch oe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,
+                  bvh_e._sort_tmp,bvh_e._sort_tmp_bytes,bvh_e._mch_alt,bvh_e._idx_alt,bvh_e._sort_cap};
+    auto swapIn = [](lbvh& b, BvhScratch& s){ b._nodes=s.nodes; b._bvs=s.bvs; b._MChash=s.mch;
+        b._indices=s.idx; b._tempLeafBox=s.tmp; b._flags=s.flags; b.m_node_env=s.node_env;
+        b._sort_tmp=s.sort_tmp; b._sort_tmp_bytes=s.sort_bytes;   // [perenv-parallel #2]
+        b._mch_alt=s.mch_alt; b._idx_alt=s.idx_alt; b._sort_cap=s.sort_cap; };
+  perenv_redo:
+    CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemset(_gpNum, 0, sizeof(uint32_t)));
+    // [FIX] memsets are on DEFAULT stream; per-env detects on POOL streams. Sync once so the zero is
+    // globally visible before any pool-stream detect atomicAdds to _cpNum (else garbage slot -> OOB).
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    int i = 0;
+    for(int e : h_perenv_active)
+    {
+        cudaStream_t st = par ? m_pool_streams[i % K] : (cudaStream_t)0;
+        if(h_perenv_face_cnt[e] > 0 && !skipF)
+        {
+            if(par) swapIn(bvh_f, m_pool_f[i % K]);
+            bvh_f._active_idx        = d_perenv_face_idx + h_perenv_face_off[e];
+            bvh_f.face_number_active = h_perenv_face_cnt[e];
+            bvh_f.Construct(st);
+            bvh_f.SelfCollitionDetect(dHat, st);
+        }
+        if(h_perenv_edge_cnt[e] > 0 && !skipE)
+        {
+            if(par) swapIn(bvh_e, m_pool_e[i % K]);
+            bvh_e._active_idx        = d_perenv_edge_idx + h_perenv_edge_off[e];
+            bvh_e.face_number_active = h_perenv_edge_cnt[e];  // base member reused as edge active count
+            bvh_e.Construct(st);
+            bvh_e.SelfCollitionDetect(dHat, st);
+        }
+        ++i;
+    }
+    if(par) { for(int k = 0; k < K; ++k) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k]));
+              swapIn(bvh_f, of); swapIn(bvh_e, oe); }  // restore original scratch
+    CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // [perenv-parallel #1 FIX] the per-env path (like the merged path) MUST grow the pair buffers on
+    // overflow + redo — else at large N the pair count exceeds the cap and consumers (line-search,
+    // gradient) read OOB → illegal access. Per-env DCD fills BOTH _collisonPairs and _ccd_collisonPairs
+    // (1:1), so grow both. Emits past cap went to the trash slot, so nothing was corrupted.
+    if((int)h_cpNum[0] > MAX_COLLITION_PAIRS_NUM || (int)h_cpNum[0] > MAX_CCD_COLLITION_PAIRS_NUM)
+    {
+        int newcap = (int)(h_cpNum[0] + h_cpNum[0] / 2) + 1;
+        printf("[perenv DCD-grow] h_cpNum=%u > cap(dcd=%d,ccd=%d) -> grow to %d, redo\n",
+               h_cpNum[0], MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
+        CUDA_SAFE_CALL(cudaFree(_collisonPairs));
+        CUDA_SAFE_CALL(cudaFree(_MatIndex));
+        CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs,     ((size_t)newcap + 1) * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex,          ((size_t)newcap + 1) * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
+        MAX_COLLITION_PAIRS_NUM     = newcap;
+        if(newcap > MAX_CCD_COLLITION_PAIRS_NUM) MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        bvh_f._collisionPair     = bvh_e._collisionPair     = _collisonPairs;
+        bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
+        bvh_f._MatIndex          = bvh_e._MatIndex          = _MatIndex;
+        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
+        goto perenv_redo;
+    }
+    bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;
+    bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
+    bvh_f._vertexes = saved_f;
+    bvh_e._vertexes = saved_e;
+    if(!getenv("STIFF_SKIP_GRND")) GroundCollisionDetect();
+    {   // [9d28824-port] one 6-int D2H
+        uint32_t cp_gp_buf[6];
+        CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
+        h_gpNum = cp_gp_buf[5];
+    }
 }
 
 AABB* GIPC::calcuMaxSceneSize()
@@ -9835,6 +10768,11 @@ void GIPC::buildBVH_FULLCCD(const double& alpha)
 {
     if(m_skip_all_collision)
         return;
+    // [multi-env P2] per-env mode builds swept trees inside buildFullCP; skip merged build.
+    if(m_perenv_bvh && m_perenv_bvh_groups > 0)
+        return;
+    { int bs = 256, gs = (vertexNum + bs - 1) / bs;
+      _addEnvOffset<<<gs, bs>>>(d_bvh_vertexes, _vertexes, d_env_offset, vertexNum); }
     bvh_f.ConstructFullCCD(_moveDir, alpha);
     bvh_e.ConstructFullCCD(_moveDir, alpha);
 }
@@ -9862,7 +10800,9 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
         h_cpNum[4],
         h_cpNum[3],
         h_cpNum[2],
-        numbers);
+        numbers,
+        m_pergroup_kappa ? m_kappa_group : nullptr,   // [per-group κ] nullptr → scalar
+        m_pergroup_kappa ? m_d_p2g : nullptr);
 }
 
 
@@ -9891,6 +10831,9 @@ void GIPC::calBarrierHessian()
                                                 numbers);
 }
 
+static void _dbg_ksum(const char*, const void*, size_t);            // [4.3 fwd]
+static void _dbg_ksum_comm(const char*, const void*, size_t);       // [4.3 fwd]
+
 void GIPC::calFrictionHessian(device_TetraData& TetMesh)
 {
     int numbers = h_cpNum_last[0];
@@ -9899,6 +10842,16 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
     if(numbers > 0)
     {
+        if(getenv("STIFF_KSUM"))
+        {
+            cudaDeviceSynchronize();
+            _dbg_ksum("fric_o_verts", TetMesh.o_vertexes, (size_t)vertexNum * sizeof(double3));
+            _dbg_ksum("fric_cur_verts", _vertexes, (size_t)vertexNum * sizeof(double3));
+            _dbg_ksum_comm("fric_distCoord", distCoord, (size_t)numbers * sizeof(double2));
+            _dbg_ksum_comm("fric_tanBasis", tanBasis, (size_t)numbers * sizeof(__GEIGEN__::Matrix3x2d));
+            _dbg_ksum_comm("fric_lambdaH", lambda_lastH_scalar, (size_t)numbers * sizeof(double));
+            _dbg_ksum_comm("fric_pairs", _collisonPairs_lastH, (size_t)numbers * sizeof(int4));
+        }
         _calFrictionHessian<<<blockNum, threadNum>>>(
             _vertexes,
             TetMesh.o_vertexes,
@@ -9969,7 +10922,8 @@ bool GIPC::checkSelfCloseVal()
     CUDA_SAFE_CALL(cudaMalloc((void**)&_isChange, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemset(_isChange, 0, sizeof(int)));
     _checkSelfCloseVal<<<blockNum, threadNum>>>(
-        _vertexes, _isChange, _closeMConstraintID, _closeMConstraintVal, numbers);
+        _vertexes, _isChange, _closeMConstraintID, _closeMConstraintVal, numbers,
+        m_pergroup_kappa ? m_d_close_grp : nullptr, m_pergroup_kappa ? m_d_p2g : nullptr);
     int isChange;
     CUDA_SAFE_CALL(cudaMemcpy(&isChange, _isChange, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaFree(_isChange));
@@ -10020,6 +10974,71 @@ double2 GIPC::minMaxSelfDist()
 //     _calBarrierGradient << <blockNum, threadNum >> > (_vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, numbers);
 // }
 
+// ===================== per-contact force export (Step B) =====================
+// Ground contacts use the simple distance barrier (lambda * ground_normal).
+// Body-body & FEM-coupled contacts reuse the exact I5/NEWF barrier gradient
+// via the _calBarrierGradient per-contact hook (see _ec_emit).
+
+__global__ void _exportGroundContactForces(const double3*   _vertexes,
+                                           const uint32_t*  envPair,
+                                           const double3*   g_normal,
+                                           const double*    g_offset,
+                                           const int*       _point_body_id,
+                                           double Kappa, double dHat, double dt,
+                                           int number, int base,
+                                           int2* out_pair, double3* out_force)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    int    gidx = (int)envPair[idx];
+    double3 nrm = g_normal[0];
+    double  dist = __GEIGEN__::__v_vec_dot(nrm, _vertexes[gidx]) - g_offset[0];
+    double  dis  = dist * dist;
+    if(dis < 1e-12)
+        dis = 1e-12;  // [d=0 guard]
+    double t      = dis - dHat;
+    double g_b    = t * log(dis / dHat) * -2.0 - (t * t) / dis;
+    double lambda = -Kappa * 2.0 * sqrt(dis) * g_b;
+    double c      = lambda / (dt * dt);
+    out_force[base + idx] = make_double3(c * nrm.x, c * nrm.y, c * nrm.z);
+    out_pair[base + idx]  = make_int2(_point_body_id[gidx], -1);
+}
+
+int GIPC::exportContacts(int2* out_pair, double3* out_force)
+{
+    int ncp = (int)h_cpNum[0];
+    int ngp = (int)h_gpNum;
+    const unsigned int threads = 256;
+    double inv_dt2 = (IPC_dt > 0.0) ? 1.0 / (IPC_dt * IPC_dt) : 0.0;
+    // body-body: reuse the EXACT I5/NEWF barrier gradient (calBarrierGradient)
+    // with the per-contact export hook. Needs a per-vertex scratch gradient.
+    if(ncp > 0)
+    {
+        if(vertexNum > _ec_scratch_cap)
+        {
+            if(_ec_grad_scratch) CUDA_SAFE_CALL(cudaFree(_ec_grad_scratch));
+            _ec_scratch_cap = vertexNum;
+            CUDA_SAFE_CALL(cudaMalloc((void**)&_ec_grad_scratch, _ec_scratch_cap * sizeof(double3)));
+        }
+        CUDA_SAFE_CALL(cudaMemset(_ec_grad_scratch, 0, vertexNum * sizeof(double3)));
+        // default body-body entries to "skip" (bodyA<0); _ec_emit overwrites
+        // the ones it attributes.
+        CUDA_SAFE_CALL(cudaMemset(out_pair, 0xFF, ncp * sizeof(int2)));   // -1,-1
+        CUDA_SAFE_CALL(cudaMemset(out_force, 0, ncp * sizeof(double3)));
+        calBarrierGradient(_ec_grad_scratch, Kappa, out_pair, out_force, _point_body_id, inv_dt2);
+    }
+    // ground: simple distance barrier (lambda * ground_normal)
+    if(ngp > 0)
+    {
+        int blocks = (ngp + threads - 1) / threads;
+        _exportGroundContactForces<<<blocks, threads>>>(
+            _vertexes, _environment_collisionPair, _groundNormal, _groundOffset,
+            _point_body_id, Kappa, dHat, IPC_dt, ngp, ncp, out_pair, out_force);
+    }
+    return ncp + ngp;
+}
+
 void GIPC::calBarrierGradient(double3* _gradient, double mKappa,
                               int2* ec_pair, double3* ec_force,
                               const int* ec_pbid, double ec_inv_dt2)
@@ -10033,6 +11052,7 @@ void GIPC::calBarrierGradient(double3* _gradient, double mKappa,
 
     _calBarrierGradient<<<blockNum, threadNum>>>(
         _vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, numbers,
+        m_pergroup_kappa ? m_kappa_group : nullptr, m_pergroup_kappa ? m_d_p2g : nullptr,
         ec_pair, ec_force, ec_pbid, ec_inv_dt2);
 }
 
@@ -10675,15 +11695,28 @@ void compute_H_b(double d, double dHat, double& H)
 void GIPC::suggestKappa(double& kappa)
 {
     double H_b;
-    //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(bvh_f.scene.upper, bvh_f.scene.lower));
-    compute_H_b(1.0e-16 * bboxDiagSize2, dHat, H_b);
+    // [decouple] kappa's only batch-dependent input is the MERGED bboxDiagSize2 (dHat is already
+    // abs_dhat-fixed). STIFF_DECOUPLE_THRESH uses the abs_dhat-fixed eff bbox → kappa batch-invariant
+    // → env_0's barrier stiffness no longer depends on its batch-mates' contact state.
+    double bb = bboxDiagSize2;
+    // [abs-kappa consistency] when the user declares an ABSOLUTE contact scale (absolute_dhat>0),
+    // κ's scale MUST follow it in ALL modes — deriving κ from the merged scene bbox dilutes the
+    // barrier super-linearly with env count/spacing (softer, batch-dependent physics; ablation C2:
+    // 258 vs 489 Newton was ENTIRELY this). Same consistency rule as the Newton-exit fix (c1d4d78)
+    // and dHat/dTol/fDhat (init). uipc-style: stiffness from a physical contact scale, no bbox.
+    // Scenes without absolute_dhat keep the classic bbox derivation.
+    // [ablation diag] STIFF_DIAG_KAPPA_MERGEDBB forces the old merged-bbox κ (DIAGNOSTIC ONLY).
+    if(!getenv("STIFF_DIAG_KAPPA_MERGEDBB")
+       && absolute_dhat > 0.0 && relative_dhat > 0.0)
+        bb = (absolute_dhat * absolute_dhat) / (relative_dhat * relative_dhat);
+    compute_H_b(1.0e-16 * bb, dHat, H_b);
     if(meanMass == 0.0)
     {
-        kappa = minKappaCoef / (4.0e-16 * bboxDiagSize2 * H_b);
+        kappa = minKappaCoef / (4.0e-16 * bb * H_b);
     }
     else
     {
-        kappa = minKappaCoef * meanMass / (4.0e-16 * bboxDiagSize2 * H_b);
+        kappa = minKappaCoef * meanMass / (4.0e-16 * bb * H_b);
     }
     //    printf("bboxDiagSize2: %f\n", bboxDiagSize2);
     //    printf("H_b: %f\n", H_b);
@@ -10693,13 +11726,16 @@ void GIPC::suggestKappa(double& kappa)
 void GIPC::upperBoundKappa(double& kappa)
 {
     double H_b;
-    //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(bvh_f.scene.upper, bvh_f.scene.lower));//(maxConer - minConer).squaredNorm();
-    compute_H_b(1.0e-16 * bboxDiagSize2, dHat, H_b);
-    double kappaMax = 100 * minKappaCoef * meanMass / (4.0e-16 * bboxDiagSize2 * H_b);
+    double bb = bboxDiagSize2;   // [abs-kappa consistency] absolute_dhat ⇒ absolute κ scale
+    if(!getenv("STIFF_DIAG_KAPPA_MERGEDBB")   // (see suggestKappa; diag = old-bbox escape)
+       && absolute_dhat > 0.0 && relative_dhat > 0.0)
+        bb = (absolute_dhat * absolute_dhat) / (relative_dhat * relative_dhat);
+    compute_H_b(1.0e-16 * bb, dHat, H_b);
+    double kappaMax = 100 * minKappaCoef * meanMass / (4.0e-16 * bb * H_b);
     //printf("max Kappa: %f\n", kappaMax);
     if(meanMass == 0.0)
     {
-        kappaMax = 100 * minKappaCoef / (4.0e-16 * bboxDiagSize2 * H_b);
+        kappaMax = 100 * minKappaCoef / (4.0e-16 * bb * H_b);
     }
 
     if(kappa > kappaMax)
@@ -10711,6 +11747,22 @@ void GIPC::upperBoundKappa(double& kappa)
 
 void GIPC::initKappa(device_TetraData& TetMesh)
 {
+    // [batch-size fix] IPC_Solver calls initKappa() BEFORE the first computeGradientAndHessian(),
+    // where per-group κ is normally enabled. On frame 0 that left m_pergroup_kappa=false, so env_0
+    // fell back to the GLOBAL Kappa (= -gsum/gsnorm, a reduction over ALL envs' verts → N-dependent)
+    // → the batch-SIZE divergence seed. Enable per-group κ here too so env_0 uses its OWN per-env κ
+    // (binned over d_point_to_group) from the very first step → N-independent.
+    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group && !m_pergroup_kappa)
+    {
+        m_pergroup_kappa = true;
+        m_d_p2g          = TetMesh.d_point_to_group;
+        int NG           = kEnvAlphaSlots;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_kappa_group, NG * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_close_grp, NG * sizeof(int)));
+        h_kappa_group.assign(NG, 0.0);
+        printf("[pergroup-kappa] enabled (early, in initKappa) NG=%d\n", NG);
+    }
+    bool perenv_kappa_filled = false;   // [decouple] set when per-env κ replaces the stub broadcast
     if(h_cpNum[0] > 0)
     {
         double3* _GE = TetMesh.fb;
@@ -10720,6 +11772,9 @@ void GIPC::initKappa(device_TetraData& TetMesh)
         CUDA_SAFE_CALL(cudaMemset(_gc, 0, vertexNum * sizeof(double3)));
         CUDA_SAFE_CALL(cudaMemset(_GE, 0, vertexNum * sizeof(double3)));
         calKineticGradient(TetMesh.vertexes, TetMesh.xTilta, _GE, TetMesh.masses, vertexNum);
+        // [multi-env determinism 4.3] elastic-side binned bracket: FEM + soft → g_gbin → _GE
+        // (kinetic already written directly to _GE above).
+        zeroBinnedGrad();
         calculate_fem_gradient(TetMesh.DmInverses,
                                TetMesh.vertexes,
                                TetMesh.tetrahedras,
@@ -10730,9 +11785,14 @@ void GIPC::initKappa(device_TetraData& TetMesh)
                                TetMesh.volumeRate,
                                IPC_dt);
         //calculate_triangle_fem_gradient(TetMesh.triDmInverses, TetMesh.vertexes, TetMesh.triangles, TetMesh.area, _GE, triangleNum, stretchStiff, shearStiff, IPC_dt);
+        // soft constraint is the last elastic-side gradient → g_gbin; close the bracket → _GE:
         computeSoftConstraintGradient(_GE);
+        combineBinnedGrad(_GE);
+        // ground + barrier → _gc:
+        zeroBinnedGrad();
         computeGroundGradient(_gc, 1);
         calBarrierGradient(_gc, 1);
+        combineBinnedGrad(_gc);
         double gsum = reduction2Kappa(0, _gc, _GE, pcg_data.squeue, vertexNum);
         double gsnorm = reduction2Kappa(1, _gc, _GE, pcg_data.squeue, vertexNum);
         //CUDA_SAFE_CALL(cudaFree(_gc));
@@ -10748,9 +11808,66 @@ void GIPC::initKappa(device_TetraData& TetMesh)
             Kappa = minKappa;
         }
         upperBoundKappa(Kappa);
+
+        // [decouple] PER-ENV initKappa: the global minKappa = -gsum/gsnorm above is a GLOBAL
+        // reduction over ALL envs' verts → batch-dependent, and it overrides the batch-invariant
+        // suggestKappa. Here we instead set each env's κ from ITS OWN gradient ratio (binned per-env
+        // reduction over d_point_to_group) → env_0's κ depends only on env_0 → batch-invariant.
+        // suggested (=minKappa after suggestKappa, eff-bbox) is the batch-invariant floor; kmax the cap.
+        if(getenv("STIFF_DECOUPLE_THRESH") && m_pergroup_kappa && m_kappa_group
+           && TetMesh.d_point_to_group)
+        {
+            const int NG = kEnvAlphaSlots;
+            static double* d_gsum_bin = nullptr; static double* d_gsnorm_bin = nullptr;
+            static double* d_gsum_g = nullptr;   static double* d_gsnorm_g = nullptr;
+            if(!d_gsum_bin) {
+                cudaMalloc((void**)&d_gsum_bin,   (size_t)NG * BINNED_K * sizeof(double));
+                cudaMalloc((void**)&d_gsnorm_bin, (size_t)NG * BINNED_K * sizeof(double));
+                cudaMalloc((void**)&d_gsum_g,     NG * sizeof(double));
+                cudaMalloc((void**)&d_gsnorm_g,   NG * sizeof(double));
+            }
+            cudaMemset(d_gsum_bin,   0, (size_t)NG * BINNED_K * sizeof(double));
+            cudaMemset(d_gsnorm_bin, 0, (size_t)NG * BINNED_K * sizeof(double));
+            int bs = 256, gs = (vertexNum + bs - 1) / bs;
+            _per_env_kappa_deposit<<<gs, bs>>>(TetMesh.d_point_to_group, _gc, _GE,
+                                               d_gsum_bin, d_gsnorm_bin, vertexNum, NG);
+            _per_env_kappa_combine<<<(NG + bs - 1) / bs, bs>>>(d_gsum_g, d_gsnorm_g,
+                                                               d_gsum_bin, d_gsnorm_bin, NG);
+            double suggested = minKappa;   // batch-invariant (suggestKappa wrote it, eff bbox)
+            double H_b, bb = (absolute_dhat > 0.0 && relative_dhat > 0.0)
+                             ? (absolute_dhat * absolute_dhat) / (relative_dhat * relative_dhat)
+                             : bboxDiagSize2;
+            compute_H_b(1.0e-16 * bb, dHat, H_b);
+            double kmax = 100.0 * minKappaCoef * (meanMass == 0.0 ? 1.0 : meanMass)
+                          / (4.0e-16 * bb * H_b);
+            // [perf/device-residence] finalize κ per env ON DEVICE (in m_kappa_group) — no D2H(gsum/gsnorm)
+            // + host loop + H2D. suggested/kmax are env-independent scalars → bit-identical → strict OK.
+            _per_env_kappa_finalize<<<(NG + bs - 1) / bs, bs>>>(d_gsum_g, d_gsnorm_g,
+                                                               m_kappa_group, NG, suggested, kmax);
+            if(getenv("STIFF_SEED_DIAG"))   // diag only: mirror first entries back for the print below
+            {
+                if((int)h_kappa_group.size() < NG) h_kappa_group.resize(NG, Kappa);
+                CUDA_SAFE_CALL(cudaMemcpy(h_kappa_group.data(), m_kappa_group,
+                                          NG * sizeof(double), cudaMemcpyDeviceToHost));
+            }
+            perenv_kappa_filled = true;
+        }
     }
 
+    // [multi-env per-group κ] broadcast the init κ to all groups (STUB: all groups = global κ).
+    // SKIPPED when the per-env initKappa above filled m_kappa_group with true per-env values.
+    if(m_pergroup_kappa && m_kappa_group && !perenv_kappa_filled)
+    {
+        int NG = kEnvAlphaSlots;
+        if((int)h_kappa_group.size() < NG) h_kappa_group.resize(NG, Kappa);
+        for(int g = 0; g < NG; g++) h_kappa_group[g] = Kappa;
+        CUDA_SAFE_CALL(cudaMemcpy(m_kappa_group, h_kappa_group.data(), NG * sizeof(double), cudaMemcpyHostToDevice));
+    }
     //printf("Kappa ====== %f\n", Kappa);
+    if(getenv("STIFF_SEED_DIAG"))
+        printf("[seed-kappa] Kappa=%.17g kappa_group[0]=%.17g kappa_group[1]=%.17g h_cpNum0=%u perenv_filled=%d\n",
+               Kappa, (h_kappa_group.size() > 0 ? h_kappa_group[0] : -1.0),
+               (h_kappa_group.size() > 1 ? h_kappa_group[1] : -1.0), h_cpNum[0], (int)perenv_kappa_filled);
 }
 
 
@@ -10812,25 +11929,17 @@ void GIPC::partitionContactHessian()
     //gipc_global_triplet.h_fem_fem_contact_start_id =
     //    gipc_global_triplet.d_fem_fem_contact_start_id;
 
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_abd_abd_contact_start_id),
+    // ②-D2H: single batched copy of the 4 contiguous start-ids (block[0..3])
+    // replaces 4 separate blocking D2H (each of which drains the GPU).
+    int h_csb[4];
+    CUDA_SAFE_CALL(cudaMemcpy(h_csb,
                               gipc_global_triplet.d_abd_abd_contact_start_id,
-                              sizeof(int),
+                              4 * sizeof(int),
                               cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_abd_fem_contact_start_id),
-                              gipc_global_triplet.d_abd_fem_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_fem_abd_contact_start_id),
-                              gipc_global_triplet.d_fem_abd_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(gipc_global_triplet.h_fem_fem_contact_start_id),
-                              gipc_global_triplet.d_fem_fem_contact_start_id,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
+    gipc_global_triplet.h_abd_abd_contact_start_id = h_csb[0];
+    gipc_global_triplet.h_abd_fem_contact_start_id = h_csb[1];
+    gipc_global_triplet.h_fem_abd_contact_start_id = h_csb[2];
+    gipc_global_triplet.h_fem_fem_contact_start_id = h_csb[3];
 
 
     if(gipc_global_triplet.h_fem_fem_contact_start_id >= 0)
@@ -10932,12 +12041,74 @@ void GIPC::partitionContactHessian()
         cudaMemcpyDeviceToDevice));
 }
 
+static void _dbg_ksum_comm(const char* name, const void* dptr, size_t nbytes);  // [4.3 fwd]
+#define KSEG(nm) if(getenv("STIFF_KSUM")) { cudaDeviceSynchronize(); \
+    _dbg_ksum_comm(nm, gipc_global_triplet.block_values(), \
+        (size_t)gipc_global_triplet.global_triplet_offset * 9 * sizeof(double)); }
+
+// [decouple probe] file-scope frame/k counters so computeGradientAndHessian can gate per-stage
+// shape-gradient dumps (set by solve_subIP). STIFF_SHAPE_STAGE dumps shape_grads after kinetic
+// (.s1) and after the elastic bracket (.s2) → cross-batch compare splits kinetic vs elastic.
+int g_dec_frame = -1;   // [decouple probe] non-static so other TUs (pcg_solver) can gate dumps by frame/k
+int g_dec_k     = -1;
+
 float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 {
     gipc::Timer timer{"cal_gradient_hessian"};
 
+    // [multienv-mode] one-time: fast plain-atomic gradient for merged/isolated (STIFF_FAST_GRAD),
+    // binned order-free gradient for strict/default. Set once (device symbol).
+    static bool s_binned_set = false;
+    if(!s_binned_set) { set_binned_on(getenv("STIFF_FAST_GRAD") ? 0 : 1); s_binned_set = true; }
+
+    // [multi-env P2] capture d_point_to_group + enable per-env BVH (once). buildCP uses these
+    // lazily (it has no TetMesh). STIFF_PERENV_BVH gates; needs grouped envs (d_point_to_group).
+    if(getenv("STIFF_PERENV_BVH") && TetMesh.d_point_to_group)
+    {
+        m_perenv_bvh = true;
+        m_d_p2g      = TetMesh.d_point_to_group;
+    }
+    // [multi-env cross-env diagnostic] capture p2g + report env0-vs-env1 vertex divergence at the
+    // START of each gradient/Hessian (= verts from the previous step's line search). STIFF_XENV.
+    if(getenv("STIFF_XENV") && TetMesh.d_point_to_group)
+    {
+        m_d_p2g = TetMesh.d_point_to_group;
+        static int _xc = 0;
+        char lbl[48]; snprintf(lbl, sizeof(lbl), "verts call#%d", _xc++);
+        xenvDiff(_vertexes, lbl);
+    }
+    // [multi-env per-group κ] enable + allocate (once). STIFF_PERGROUP_KAPPA gates; needs groups.
+    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group && !m_pergroup_kappa)
+    {
+        m_pergroup_kappa = true;
+        m_d_p2g          = TetMesh.d_point_to_group;
+        int NG           = kEnvAlphaSlots;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_kappa_group, NG * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_close_grp, NG * sizeof(int)));
+        h_kappa_group.assign(NG, 0.0);
+        printf("[pergroup-kappa] enabled, NG=%d\n", NG);
+    }
+
     CUDA_SAFE_CALL(cudaMemset(TetMesh.fb, 0, vertexNum * sizeof(double3)));
+    // [multi-env determinism 4.3] zero the binned contact/friction gradient accumulator
+    // (bins start at 0; deposits add exactly). Combined back into contact_grads after ground.
+    CUDA_SAFE_CALL(cudaMemset(g_grad_binned, 0,
+                              3 * (size_t)vertexNum * BINNED_K * sizeof(double)));
     CUDA_SAFE_CALL(cudaMemset(TetMesh.shape_grads, 0, vertexNum * sizeof(double3)));
+
+    // [multi-env determinism 4.3] zero the WHOLE triplet buffer (block values + row/col) to the
+    // reserved capacity. The triplet count is a provable UPPER BOUND (16 slots/pair, but PP/PE/PT
+    // write fewer) → reserved-but-unwritten slots otherwise hold GARBAGE that the converter
+    // processes → non-deterministic matrix. Zeroing makes them (0,0)=0 (benign + deterministic).
+    {
+        size_t cap = gipc_global_triplet.triplet_capacity();
+        if(cap > 0)
+        {
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int)));
+        }
+    }
 
     //muda::BufferView<double3>{TetMesh.shape_grads, vertexNum}.fill(double3{0, 0, 0});
 
@@ -10948,6 +12119,19 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         gipc::Timer timer{"cal_kinetic_gradient"};
         calKineticGradient(
             TetMesh.vertexes, TetMesh.xTilta, shape_grads, TetMesh.masses, vertexNum);
+    }
+    if(getenv("STIFF_XENV") && m_d_p2g) xenvDiff(shape_grads, "  a.kinetic");
+
+    // [decouple probe] sub-stage 1: shape_grads = kinetic only (per-vertex-local, expect clean).
+    if(getenv("STIFF_SHAPE_STAGE") && getenv("STIFF_GRAD_PRE") && TetMesh.d_point_to_group
+       && g_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))
+       && g_dec_k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 0))
+    {
+        std::vector<double3> h(vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(h.data(), shape_grads, vertexNum*sizeof(double3), cudaMemcpyDeviceToHost));
+        FILE* a=fopen((std::string(getenv("STIFF_GRAD_PRE"))+".s1").c_str(),"wb");
+        if(a){fwrite(h.data(),sizeof(double3),vertexNum,a);fclose(a);}
+        printf("[shape-stage] s1 (kinetic) dumped @frame %d k=%d\n", g_dec_frame, g_dec_k);
     }
 
     gipc_global_triplet.global_triplet_offset = 0;
@@ -10995,10 +12179,17 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         //calBarrierHessian();
         //calBarrierGradient(contact_grads, Kappa);
 
+        { static int _bc = 0;
+          int on = (_bc++ == 0 && getenv("STIFF_BAR_TRACE")) ? 1 : 0;
+          int t0 = getenv("STIFF_BAR_TGT0") ? atoi(getenv("STIFF_BAR_TGT0")) : -1;
+          int t1 = getenv("STIFF_BAR_TGT1") ? atoi(getenv("STIFF_BAR_TGT1")) : -1;
+          set_bar_targets(on, t0, t1); }
         calBarrierGradientAndHessian(contact_grads, Kappa);
+        set_bar_targets(0, -1, -1);
         gipc_global_triplet.global_triplet_offset +=
             h_cpNum[4] * M12_Off + h_cpNum[3] * M9_Off + h_cpNum[2] * M6_Off;
     }
+    KSEG("seg_contact")
 
     float time00 = 0;
 
@@ -11006,18 +12197,64 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     {
 
         gipc::Timer timer{"cal_friction_gradient_hessian"};
+        if(!getenv("STIFF_SKIP_FRIC")) {   // [xenv pin] isolate friction's contribution to b
         calFrictionGradient(contact_grads, TetMesh);
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
         calFrictionHessian(TetMesh);
+        }
         gipc_global_triplet.global_triplet_offset +=
             h_cpNum_last[4] * M12_Off + h_cpNum_last[3] * M9_Off
             + h_cpNum_last[2] * M6_Off + h_gpNum_last;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     }
 #endif
+    KSEG("seg_thru_friction")
+    if(getenv("STIFF_KSUM")) printf("[ksum] cpNumLast=%u gpNumLast=%u\n", h_cpNum_last[0], h_gpNum_last);
 
     computeGroundGradientAndHessian(contact_grads);
+    // [multi-env determinism 4.3] combine the binned contact+friction gradient into
+    // contact_grads (holds the ground gradient). Order-independent ⇒ bit-identical.
+    { int bs = 256, gs = (vertexNum + bs - 1) / bs;
+      _gfxToGrad<<<gs, bs>>>(contact_grads, g_grad_binned, vertexNum); }
+    if(getenv("STIFF_XENV") && m_d_p2g) {
+        printf("[xenv]   (counts: cpNum=%u cpNumLast=%u gpNum=%u gpNumLast=%u)\n",
+               h_cpNum[0], h_cpNum_last[0], (unsigned)h_gpNum, (unsigned)h_gpNum_last);
+        xenvPairClassify(_collisonPairs, h_cpNum[0], "pairs");
+        // [xenv dump] one-shot raw dump of pairs + p2g + verts to localize the differing pair.
+        static bool _xdumped = false;
+        if(getenv("STIFF_XENV_DUMP") && !_xdumped) {
+            _xdumped = true;
+            int n = h_cpNum[0];
+            std::vector<int4> hp(n); std::vector<int> hg(vertexNum); std::vector<double3> hv(vertexNum);
+            cudaMemcpy(hp.data(), _collisonPairs, (size_t)n*sizeof(int4), cudaMemcpyDeviceToHost);
+            // [xenv] full-4-vert CCD pairs (no encoding loss) for clean env-local membership compare
+            { std::vector<int4> hc(n);
+              cudaMemcpy(hc.data(), _ccd_collisonPairs, (size_t)n*sizeof(int4), cudaMemcpyDeviceToHost);
+              FILE* fc=fopen("/tmp/xd_ccd.bin","wb"); fwrite(hc.data(),sizeof(int4),n,fc); fclose(fc); }
+            cudaMemcpy(hg.data(), m_d_p2g, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hv.data(), _vertexes, (size_t)vertexNum*sizeof(double3), cudaMemcpyDeviceToHost);
+            FILE* f;
+            f=fopen("/tmp/xd_pairs.bin","wb"); fwrite(hp.data(),sizeof(int4),n,f); fclose(f);
+            f=fopen("/tmp/xd_p2g.bin","wb");   fwrite(hg.data(),sizeof(int),vertexNum,f); fclose(f);
+            f=fopen("/tmp/xd_verts.bin","wb"); fwrite(hv.data(),sizeof(double3),vertexNum,f); fclose(f);
+            f=fopen("/tmp/xd_meta.txt","w");   fprintf(f,"%d %d %.17g\n",n,vertexNum,dHat); fclose(f);
+            // [xenv] dump the EDGE list too — to check if env0/env1 edge sets are mirror-identical
+            int nE = (int)bvh_e.edge_number;
+            std::vector<uint2> he(nE);
+            cudaMemcpy(he.data(), bvh_e._edges, (size_t)nE*sizeof(uint2), cudaMemcpyDeviceToHost);
+            f=fopen("/tmp/xd_edges.bin","wb"); fwrite(he.data(),sizeof(uint2),nE,f); fclose(f);
+            std::vector<double3> hfb(vertexNum);
+            cudaMemcpy(hfb.data(), contact_grads, (size_t)vertexNum*sizeof(double3), cudaMemcpyDeviceToHost);
+            f=fopen("/tmp/xd_fb.bin","wb"); fwrite(hfb.data(),sizeof(double3),vertexNum,f); fclose(f);
+            // per-env edge count (by group of edge.x)
+            int e0=0,e1=0; for(auto&e:he){ int g=hg[e.x]; if(g==0)e0++; else if(g==1)e1++; }
+            printf("[xenv]   DUMPED %d pairs, %d verts, %d edges (env0=%d env1=%d), dHat=%.17g\n",
+                   n, vertexNum, nE, e0, e1, dHat);
+        }
+        xenvDiff(contact_grads, "  b.barrier+fric+grnd");
+    }
     gipc_global_triplet.global_triplet_offset += h_gpNum;
+    KSEG("seg_thru_ground")
     gipc_global_triplet.global_collision_triplet_offset =
         gipc_global_triplet.global_triplet_offset;
 
@@ -11051,6 +12288,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                 abd_fem_count_info.abd_point_offset, abd_fem_count_info.abd_point_num),
             gipc_global_triplet);
     }
+    if(getenv("STIFF_XENV") && m_d_p2g) xenvDiff(TetMesh.fb, "  c.+abd");
 
     int abd_dofs = abd_fem_count_info.abd_body_num * 4;
     int fem_global_hessian_index_offset = -abd_fem_count_info.abd_point_num + abd_dofs;
@@ -11093,6 +12331,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         gipc::Timer timer{"cal_fem_gradient_hessian"};
         int fem_triplet_start = gipc_global_triplet.global_triplet_offset;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        // [multi-env determinism 4.3] open the elastic-gradient binned bracket: FEM, bending,
+        // triangle-FEM, strain-limiting AND soft-constraint all scatter to g_gbin; combined
+        // into shape_grads after soft (kinetic is already in shape_grads, written directly).
+        zeroBinnedGrad();
         calculate_fem_gradient_hessian(TetMesh.DmInverses,
                                        TetMesh.vertexes,
                                        TetMesh.tetrahedras,
@@ -11164,8 +12406,41 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         gipc_global_triplet.global_triplet_offset += triangleNum * 6;
 
 
+        // [decouple probe] sub-stage e_presoft: kinetic+FEM+bending+triangle (NO soft yet).
+        // Combine current bins into a scratch copy (does NOT disturb shape_grads or the bins).
+        if(getenv("STIFF_SHAPE_STAGE") && getenv("STIFF_GRAD_PRE") && TetMesh.d_point_to_group
+           && g_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))
+           && g_dec_k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 0))
+        {
+            double3* scratch = TetMesh.temp_double3Mem;
+            CUDA_SAFE_CALL(cudaMemcpy(scratch, shape_grads, vertexNum*sizeof(double3), cudaMemcpyDeviceToDevice));
+            combineBinnedGrad(scratch);   // scratch = kinetic + FEM+bending+triangle (bins so far)
+            std::vector<double3> h(vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(h.data(), scratch, vertexNum*sizeof(double3), cudaMemcpyDeviceToHost));
+            FILE* a=fopen((std::string(getenv("STIFF_GRAD_PRE"))+".epresoft").c_str(),"wb");
+            if(a){fwrite(h.data(),sizeof(double3),vertexNum,a);fclose(a);}
+            printf("[shape-stage] e_presoft (kin+fem+bend+tri, NO soft) dumped @frame %d k=%d\n", g_dec_frame, g_dec_k);
+        }
+
+        // [multi-env determinism 4.3] soft constraint is the LAST elastic-side gradient; it
+        // also scatters to g_gbin. Close the bracket: combine all of FEM+bending+triangle+
+        // strain+soft into shape_grads (deterministic).
         computeSoftConstraintGradientAndHessian(shape_grads, fem_global_hessian_index_offset);
+        combineBinnedGrad(shape_grads);
+        if(getenv("STIFF_XENV") && m_d_p2g) xenvDiff(shape_grads, "  d.elastic(fem+bend+tri+soft)");
+        // [decouple probe] sub-stage 2: shape_grads = kinetic + elastic-bracket (FEM+bend+tri+strain+soft).
+        if(getenv("STIFF_SHAPE_STAGE") && getenv("STIFF_GRAD_PRE") && TetMesh.d_point_to_group
+           && g_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))
+           && g_dec_k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 0))
+        {
+            std::vector<double3> h(vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(h.data(), shape_grads, vertexNum*sizeof(double3), cudaMemcpyDeviceToHost));
+            FILE* a=fopen((std::string(getenv("STIFF_GRAD_PRE"))+".s2").c_str(),"wb");
+            if(a){fwrite(h.data(),sizeof(double3),vertexNum,a);fclose(a);}
+            printf("[shape-stage] s2 (kinetic+elastic) dumped @frame %d k=%d\n", g_dec_frame, g_dec_k);
+        }
         gipc_global_triplet.global_triplet_offset += softNum;
+        KSEG("seg_end_soft")
 
         int fem_triplet_num = gipc_global_triplet.global_triplet_offset - fem_triplet_start;
 
@@ -11438,6 +12713,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // BoundaryType check, so no double-counting occurs.
     if(TetMesh.n_fem_pins > 0 && m_abd_system && m_d_abd_body_q != nullptr)
     {
+        m_abd_system->couple_bin_open((int)m_abd_system->system_gradient.size());  // [4.3] bin the coupling
         muda::ParallelFor(256)
             .file_line(__FILE__, __LINE__)
             .apply(TetMesh.n_fem_pins,
@@ -11467,8 +12743,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                        g12(6)  = lo.x * gy; g12(7)  = lo.y * gy; g12(8)  = lo.z * gy;
                        g12(9)  = lo.x * gz; g12(10) = lo.y * gz; g12(11) = lo.z * gz;
 
-                       sys_grad.segment<12>(body_id * 12).atomic_add(g12);
+                       for(int c = 0; c < 12; ++c)
+                           _binDepBase(g_abd_sysbin + ((size_t)body_id * 12 + c) * BINNED_K, g12(c));
                    });
+        m_abd_system->couple_bin_close((int)m_abd_system->system_gradient.size());  // [4.3] combine
     }
 
     // [M3 substitution method] Add J^T * (m * I) * J to the global Hessian at
@@ -11754,7 +13032,10 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
         return;
     }
 
-    double*            queue       = pcg_data.squeue;
+    // Pair-count types (2/5) can exceed the mesh-sized squeue block capacity —
+    // use the growable pair-capacity scratch (V2/V3 overflow fix), like the
+    // blocking variant.
+    double*            queue       = ensure_reduce_scratch(numbers);
     const unsigned int threadNum   = 256;
     int                blockNum    = (numbers + threadNum - 1) / threadNum;
     unsigned int       sharedMsize = sizeof(double) * (threadNum >> 5);
@@ -11854,17 +13135,49 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
 
 double GIPC::computeEnergy(device_TetraData& TetMesh)
 {
+    // ②-D2H: batch the 9 Energy_Add_Reduction_Algorithm calls (types
+    // 0,1,2,4,5,6,8,9,10) into a single D2H. Each reduction writes its scalar
+    // to a device slot via D2D (queued, async); ONE blocking D2H grabs all 9
+    // at the end. Saves 8 blocking syncs per energy evaluation (called every
+    // line-search trial).
+    //
+    // ABD energies (m_abd_system->cal_abd_*) are NOT batched here — they have
+    // their own internal scratch + D2H. Future refactor target. We KEEP the
+    // ORIGINAL host-side summation ORDER below so vertex checksum stays
+    // bit-identical (FP add is non-associative).
+    //
+    // slot indices: 0=fem_kinetic 1=fem 2=tri_fem 3=bend 4=constraint
+    //               5=barrier   6=ground 7=fric  8=fric_ground
+
+    Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, m_energy_slots + 0);
+    Energy_Add_Reduction_Algorithm_DeviceOut(1,  TetMesh, m_energy_slots + 1);
+    Energy_Add_Reduction_Algorithm_DeviceOut(8,  TetMesh, m_energy_slots + 2);
+    Energy_Add_Reduction_Algorithm_DeviceOut(10, TetMesh, m_energy_slots + 3);
+    Energy_Add_Reduction_Algorithm_DeviceOut(9,  TetMesh, m_energy_slots + 4);
+    Energy_Add_Reduction_Algorithm_DeviceOut(2,  TetMesh, m_energy_slots + 5);
+    Energy_Add_Reduction_Algorithm_DeviceOut(4,  TetMesh, m_energy_slots + 6);
+#ifdef USE_FRICTION
+    Energy_Add_Reduction_Algorithm_DeviceOut(5,  TetMesh, m_energy_slots + 7);
+    Energy_Add_Reduction_Algorithm_DeviceOut(6,  TetMesh, m_energy_slots + 8);
+#endif
+
+    double h_slots[9] = {0,0,0,0,0,0,0,0,0};
+#ifdef USE_FRICTION
+    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 9 * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+#else
+    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 7 * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+#endif
+
     double Energy      = 0.0;
-    auto   fem_kinetic = Energy_Add_Reduction_Algorithm(0, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto   fem_kinetic = h_slots[0];
     Energy += fem_kinetic;
 
     auto abd_kinetic = m_abd_system->cal_abd_kinetic_energy(*m_abd_sim_data);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += abd_kinetic;
 
     auto abd_shape = m_abd_system->cal_abd_shape_energy(*m_abd_sim_data);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     Energy += abd_shape;
 
     auto abd_joint = m_abd_system->cal_abd_joint_energy(*m_abd_sim_data);
@@ -11879,46 +13192,28 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
     auto abd_prismatic_driving = m_abd_system->cal_abd_prismatic_driving_energy(*m_abd_sim_data);
     Energy += abd_prismatic_driving;
 
-    auto fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(1, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto fem = IPC_dt * IPC_dt * h_slots[1];
     Energy += fem;
 
-    auto tri_fem = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(8, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto tri_fem = IPC_dt * IPC_dt * h_slots[2];
     Energy += tri_fem;
 
-    auto bend = IPC_dt * IPC_dt * Energy_Add_Reduction_Algorithm(10, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto bend = IPC_dt * IPC_dt * h_slots[3];
     Energy += bend;
 
-    auto constraint = Energy_Add_Reduction_Algorithm(9, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto constraint = h_slots[4];
     Energy += constraint;
 
-    auto barrier = Energy_Add_Reduction_Algorithm(2, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto barrier = h_slots[5];
     Energy += barrier;
 
-    auto ground = Kappa * Energy_Add_Reduction_Algorithm(4, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto ground = Kappa * h_slots[6];
     Energy += ground;
 
-    //std::cout << "fem_kinetic: " << fem_kinetic << std::endl;
-    //std::cout << "abd_kinetic: " << abd_kinetic << std::endl;
-    //std::cout << "abd_shape: " << abd_shape << std::endl;
-    //std::cout << "fem: " << fem << std::endl;
-    //std::cout << "tri_fem: " << tri_fem << std::endl;
-    //std::cout << "bend: " << bend << std::endl;
-    //std::cout << "constraint: " << constraint << std::endl;
-    //std::cout << "barrier: " << barrier << std::endl;
-    //std::cout << "ground: " << ground << std::endl;
-
 #ifdef USE_FRICTION
-    auto fric = frictionRate * Energy_Add_Reduction_Algorithm(5, TetMesh);
+    auto fric = frictionRate * h_slots[7];
     Energy += fric;
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    auto fric_ground = gd_frictionRate * Energy_Add_Reduction_Algorithm(6, TetMesh);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    auto fric_ground = gd_frictionRate * h_slots[8];
     Energy += fric_ground;
 #endif
 
@@ -11931,52 +13226,145 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
 // validation-only global until per-body ABD energy lands). Returns the GLOBAL
 // energy. Built-in correctness gate (gated STIFF_PENV_STATS): Sum_g E_g(FEM) must
 // equal the global FEM energy (independent computeEnergy minus ABD).
+// [de-CPU S3] device combine of the pe_all slices -> per-env energy E_g. One thread per env;
+// accumulation ORDER AND FACTORS replicate the host combine exactly (kinetic, dt2*fem, dt2*tri,
+// dt2*bend, constraint, barrier(kappa-rescaled), ground(kappa-scaled), friction, ABD) -> E_g is
+// bit-identical to the host env_out. Slices: 0=kin 1=fem 2=tri 3=bend 4=cons 5=barrier 6=fricS
+// 7=fricGd 8=ground 9=kappa_group 10=abd.
+__global__ void _perenv_energy_combine(const double* pe, double* out, double Kappa, double dt2,
+                                       double fr, double gfr, int perenv_k, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    double kg = perenv_k ? pe[(size_t)9 * ng + g] : Kappa;
+    double e  = 0.0;
+    e += pe[(size_t)0 * ng + g];
+    e += dt2 * pe[(size_t)1 * ng + g];
+    e += dt2 * pe[(size_t)2 * ng + g];
+    e += dt2 * pe[(size_t)3 * ng + g];
+    e += pe[(size_t)4 * ng + g];
+    e += (perenv_k ? kg / Kappa : 1.0) * pe[(size_t)5 * ng + g];
+    e += (perenv_k ? kg : Kappa) * pe[(size_t)8 * ng + g];
+#ifdef USE_FRICTION
+    e += fr * pe[(size_t)6 * ng + g];
+    e += gfr * pe[(size_t)7 * ng + g];
+#endif
+    e += pe[(size_t)10 * ng + g];
+    out[g] = e;
+}
+// [de-CPU S3] per-env backtrack decision ON DEVICE, operating on the TRUE in-frame alpha state
+// m_env_alpha (the old host loop read the h_env_alpha MIRROR, which is STALE in the fast S1 path —
+// its failure branch would have H2D'd stale alphas over the device state; dormant only because S3
+// virtually always accepts at bt=0). Same tolerance band and halving as the host loop.
+__global__ void _s3_decide(const double* Eg0, const double* Eg1, double* env_alpha, int* nfail, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    if(env_alpha[g] <= 0.0) return;               // absent (or frozen) env
+    double tol = 1e-12 * (fabs(Eg0[g]) + 1.0);
+    if(Eg1[g] > Eg0[g] + tol)
+    {
+        env_alpha[g] *= 0.5;
+        atomicAdd(nfail, 1);
+    }
+}
+// [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
+__global__ void _s3_halve_all(double* env_alpha, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    if(env_alpha[g] > 0.0) env_alpha[g] *= 0.5;
+}
+
+// [de-CPU S3] shared term-launcher for the per-env energy: fills the pe_all slice block on device
+// (see slice layout below) and reports whether per-env kappa rescale applies. Used by BOTH the
+// host-combine (validation) and the device-combine (S3 decision) variants.
+double* GIPC::_launch_perenv_energy_terms(device_TetraData& TetMesh, bool& perenv_k_out)
+{
+    const int NG = kEnvAlphaSlots;
+    // [perf/de-CPU] SINGLE-D2H layout: every term's per-env bucket goes to its own NG-slice of one
+    // device block; the κ-group + ABD arrays are staged into slices too; then ONE blocking D2H of
+    // the whole block replaces the previous 12 per-term blocking D2H round-trips (the dominant
+    // lineSearch host-mixing). The term kernels/launch order/host combine order+factors are
+    // UNCHANGED → every env_out[g] is bit-identical to the per-term-D2H version.
+    // slices: 0=kinetic 1=fem 2=tri_fem 3=bend 4=constraint 5=barrier 6=fricS 7=fricGd
+    //         8=ground 9=kappa_group 10=abd
+    constexpr int PE_SLOTS = 11;
+    static double* pe_all = nullptr;
+    if(!pe_all) CUDA_SAFE_CALL(cudaMalloc((void**)&pe_all, (size_t)PE_SLOTS * NG * sizeof(double)));
+    // [backport] throwaway sink for DeviceOut's global scalar (ignored here; the
+    // per-env path uses the pe slices, and full_sum is assembled on host below).
+    static double* g_sink = nullptr;
+    if(!g_sink) CUDA_SAFE_CALL(cudaMalloc((void**)&g_sink, sizeof(double)));
+
+    auto slice = [&](int s) { return pe_all + (size_t)s * NG; };
+    Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, g_sink, slice(0));   // kinetic
+    Energy_Add_Reduction_Algorithm_DeviceOut(1,  TetMesh, g_sink, slice(1));   // fem elastic
+    Energy_Add_Reduction_Algorithm_DeviceOut(8,  TetMesh, g_sink, slice(2));   // tri_fem
+    Energy_Add_Reduction_Algorithm_DeviceOut(10, TetMesh, g_sink, slice(3));   // bend
+    Energy_Add_Reduction_Algorithm_DeviceOut(9,  TetMesh, g_sink, slice(4));   // constraint
+    // [decouple] barrier + ground energy must use PER-ENV kappa (m_kappa_group), matching the
+    // gradient. The global `Kappa` is a batch-dependent global reduction (initKappa), so scaling
+    // env_0's barrier/ground energy by it makes env_0's per-env energy — and thus the per-env
+    // line-search backtrack decision (h_env_alpha*=0.5 if Eg1>Eg0) — batch-dependent → env_0
+    // drifts → chaos amplifies. Both energies are LINEAR in kappa (barrier: kernel applies global
+    // Kappa → h=Kappa*raw; ground: kernel emits raw, host applies Kappa). Rescale to kappa_g.
+    bool perenv_k = (getenv("STIFF_DECOUPLE_THRESH") && m_pergroup_kappa && m_kappa_group && Kappa > 0.0);
+    Energy_Add_Reduction_Algorithm_DeviceOut(2,  TetMesh, g_sink, slice(5));   // barrier (Kappa-scaled)
+    Energy_Add_Reduction_Algorithm_DeviceOut(4,  TetMesh, g_sink, slice(8));   // ground (raw)
+#ifdef USE_FRICTION
+    Energy_Add_Reduction_Algorithm_DeviceOut(5,  TetMesh, g_sink, slice(6));   // friction (self)
+    Energy_Add_Reduction_Algorithm_DeviceOut(6,  TetMesh, g_sink, slice(7));   // friction (ground)
+#endif
+    if(perenv_k)   // κ-group staged into the block (D2D) — read back with the same single D2H
+        CUDA_SAFE_CALL(cudaMemcpyAsync(slice(9), m_kappa_group, NG * sizeof(double),
+                                       cudaMemcpyDeviceToDevice));
+    // [S3] per-env ABD energy (segment-summed by body_to_group in the subsystem) → slice 10.
+    CUDA_SAFE_CALL(cudaMemsetAsync(slice(10), 0, NG * sizeof(double)));
+    double abd_total = m_abd_system->cal_abd_energy_perenv(
+        *m_abd_sim_data, TetMesh.d_body_to_group, NG, slice(10));
+
+    (void)abd_total;
+    perenv_k_out = perenv_k;
+    return pe_all;
+}
+
 double GIPC::computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>& env_out)
 {
     const int NG = kEnvAlphaSlots;
     env_out.assign(NG, 0.0);
     if(!TetMesh.d_point_to_group)
         return computeEnergy(TetMesh);  // no groups -> nothing to decompose
+    constexpr int PE_SLOTS = 11;
+    bool    perenv_k = false;
+    double* pe_all   = _launch_perenv_energy_terms(TetMesh, perenv_k);
 
-    static double* pe_buf = nullptr;
-    if(!pe_buf) CUDA_SAFE_CALL(cudaMalloc((void**)&pe_buf, NG * sizeof(double)));
-    // [backport] throwaway sink for DeviceOut's global scalar (ignored here; the
-    // per-env path uses pe_buf, and E_global is recomputed via computeEnergy below).
-    // v0.6.4 has no m_energy_slots (the ②-D2H batch member was not backported).
-    static double* g_sink = nullptr;
-    if(!g_sink) CUDA_SAFE_CALL(cudaMalloc((void**)&g_sink, sizeof(double)));
-    std::vector<double> h(NG);
+    // THE one blocking D2H of everything.
+    static std::vector<double> hb;
+    hb.resize((size_t)PE_SLOTS * NG);
+    CUDA_SAFE_CALL(cudaMemcpy(hb.data(), pe_all, (size_t)PE_SLOTS * NG * sizeof(double),
+                              cudaMemcpyDeviceToHost));
 
-    auto add_term = [&](int type, double factor)
-    {
-        Energy_Add_Reduction_Algorithm_DeviceOut(type, TetMesh, g_sink, pe_buf);
-        CUDA_SAFE_CALL(cudaMemcpy(h.data(), pe_buf, NG * sizeof(double), cudaMemcpyDeviceToHost));
-        for(int g = 0; g < NG; ++g) env_out[g] += factor * h[g];
-    };
+    // Host combine — SAME order and factors as the per-term version (bit-identical env_out).
     const double dt2 = IPC_dt * IPC_dt;
-    add_term(0, 1.0);    // kinetic
-    add_term(1, dt2);    // fem elastic
-    add_term(8, dt2);    // tri_fem
-    add_term(10, dt2);   // bend
-    add_term(9, 1.0);    // constraint
-    add_term(2, 1.0);    // barrier
-    add_term(4, Kappa);  // ground
+    auto hs = [&](int s) { return hb.data() + (size_t)s * NG; };
+    for(int g = 0; g < NG; ++g) env_out[g] += 1.0 * hs(0)[g];   // kinetic
+    for(int g = 0; g < NG; ++g) env_out[g] += dt2 * hs(1)[g];   // fem elastic
+    for(int g = 0; g < NG; ++g) env_out[g] += dt2 * hs(2)[g];   // tri_fem
+    for(int g = 0; g < NG; ++g) env_out[g] += dt2 * hs(3)[g];   // bend
+    for(int g = 0; g < NG; ++g) env_out[g] += 1.0 * hs(4)[g];   // constraint
+    // barrier (h[g] = Kappa_global * raw_g): per-env → (kappa_g/Kappa_global)*h = kappa_g*raw_g
+    for(int g = 0; g < NG; ++g)
+        env_out[g] += (perenv_k ? hs(9)[g] / Kappa : 1.0) * hs(5)[g];
+    // ground (h[g] = raw_g, kernel does not apply Kappa): per-env → kappa_g*raw_g
+    for(int g = 0; g < NG; ++g)
+        env_out[g] += (perenv_k ? hs(9)[g] : Kappa) * hs(8)[g];
 #ifdef USE_FRICTION
-    add_term(5, frictionRate);     // friction (self)
-    add_term(6, gd_frictionRate);  // friction (ground)
+    for(int g = 0; g < NG; ++g) env_out[g] += frictionRate * hs(6)[g];      // friction (self)
+    for(int g = 0; g < NG; ++g) env_out[g] += gd_frictionRate * hs(7)[g];   // friction (ground)
 #endif
-    // NOTE: ABD per-env pending (task #2).
-
-    // [S3] per-env ABD energy (segment-summed by body_to_group in the subsystem).
-    static double* abd_env = nullptr;
-    if(!abd_env) CUDA_SAFE_CALL(cudaMalloc((void**)&abd_env, NG * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMemset(abd_env, 0, NG * sizeof(double)));
-    double abd_total = m_abd_system->cal_abd_energy_perenv(
-        *m_abd_sim_data, TetMesh.d_body_to_group, NG, abd_env);
-    std::vector<double> habd(NG);
-    CUDA_SAFE_CALL(cudaMemcpy(habd.data(), abd_env, NG * sizeof(double), cudaMemcpyDeviceToHost));
     double abd_sum = 0.0;
-    for(int g = 0; g < NG; ++g) { env_out[g] += habd[g]; abd_sum += habd[g]; }
+    for(int g = 0; g < NG; ++g) { env_out[g] += hs(10)[g]; abd_sum += hs(10)[g]; }
 
     double full_sum = 0.0;
     for(int g = 0; g < NG; ++g) full_sum += env_out[g];
@@ -11987,14 +13375,89 @@ double GIPC::computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>
     if(getenv("STIFF_S3_VALIDATE"))
     {
         double E_global = computeEnergy(TetMesh);
-        printf("[S3-energy] sum_g E_g=%.9e  global=%.9e  rel=%.2e  "
-               "(ABD: sum_g=%.6e total=%.6e)\n",
+        printf("[S3-energy] sum_g E_g=%.9e  global=%.9e  rel=%.2e  (ABD sum_g=%.6e)\n",
                full_sum, E_global,
-               fabs(full_sum - E_global) / std::max(fabs(E_global), 1e-30),
-               abd_sum, abd_total);
+               fabs(full_sum - E_global) / std::max(fabs(E_global), 1e-30), abd_sum);
         return E_global;
     }
     return full_sum;
+}
+
+void GIPC::computeEnergy_perenv_dev(device_TetraData& TetMesh, double* d_Eg)
+{
+    const int NG = kEnvAlphaSlots;
+    bool    perenv_k = false;
+    double* pe_all   = _launch_perenv_energy_terms(TetMesh, perenv_k);
+    _perenv_energy_combine<<<(NG + 255) / 256, 256>>>(
+        pe_all, d_Eg, Kappa, IPC_dt * IPC_dt, frictionRate, gd_frictionRate, perenv_k ? 1 : 0, NG);
+}
+
+// [4.3 debug] FNV-1a hash of a device buffer (host-copy, deterministic) to bisect the residual
+// non-atomic non-determinism. STIFF_KSUM=1 prints checksums; run twice + diff to localize.
+static void _dbg_ksum(const char* name, const void* dptr, size_t nbytes)
+{
+    if(!getenv("STIFF_KSUM") || !dptr || nbytes == 0) return;
+    std::vector<uint64_t> h((nbytes + 7) / 8, 0);
+    cudaMemcpy(h.data(), dptr, nbytes, cudaMemcpyDeviceToHost);
+    uint64_t acc = 1469598103934665603ULL;
+    for(uint64_t v : h) { acc ^= v; acc *= 1099511628211ULL; }
+    printf("[ksum] %-14s %016llx\n", name, (unsigned long long)acc);
+}
+// COMMUTATIVE checksum (order-independent): sum+xor of bit-patterns. Tells value-non-det from
+// order-non-det on the raw triplets (which sit at non-deterministic slots).
+static void _dbg_ksum_comm(const char* name, const void* dptr, size_t nbytes)
+{
+    if(!getenv("STIFF_KSUM") || !dptr || nbytes == 0) return;
+    std::vector<uint64_t> h((nbytes + 7) / 8, 0);
+    cudaMemcpy(h.data(), dptr, nbytes, cudaMemcpyDeviceToHost);
+    uint64_t s = 0, x = 0;
+    for(uint64_t v : h) { s += v; x ^= v; }
+    printf("[ksum] %-14s sum=%016llx xor=%016llx\n", name, (unsigned long long)s, (unsigned long long)x);
+}
+
+// [decouple probe] env0-masked COMMUTATIVE (order-free) hash of the RAW Hessian triplet VALUES.
+// Masks triplets whose row block is a FEM vertex in env0 (p2g[row]==0). Order-free integer
+// bit-sum ⇒ batch-dependent triplet ORDER is irrelevant; only the env0 VALUE multiset + COUNT
+// matter. Compare A-vs-B: ntrip differs⇒contact-pair SET differs; count same+hash differs⇒a
+// per-pair value differs; both same⇒merge/preconditioner is the seed (values are bit-exact).
+static void _dbg_hess_env0(const void* vals9, const int* rows, const int* cols, long ntrip, const int* p2g_dev, int vN,
+                           long b_end = -1, long f_end = -1, long g_end = -1)
+{
+    std::vector<double> hv((size_t)ntrip * 9);
+    std::vector<int>    hr(ntrip), hc(ntrip), hp(vN);
+    cudaMemcpy(hv.data(), vals9, (size_t)ntrip * 9 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hr.data(), rows, (size_t)ntrip * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hc.data(), cols, (size_t)ntrip * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hp.data(), p2g_dev, (size_t)vN * sizeof(int), cudaMemcpyDeviceToHost);
+    uint64_t src_sum[4] = {0,0,0,0}; long src_cnt[4] = {0,0,0,0};  // 0=BARRIER 1=FRICTION 2=GROUND 3=FEM
+    // split: INTRA = row∈env0 AND col∈env0 ; CROSS = row∈env0 AND col∉env0 (cross-env leak)
+    uint64_t si = 0, xi = 0, sc = 0, xc = 0; long ci = 0, cc = 0;
+    long col_neg1 = 0, col_oob = 0, col_mate = 0;  // CROSS col classification
+    long mate_min = (long)ntrip + 1, mate_max = -1;  // triplet-index range of cross-env-mate triplets
+    for(long t = 0; t < ntrip; ++t)
+    {
+        int r = hr[t], c = hc[t];
+        bool re = (r >= 0 && r < vN && hp[r] == 0);
+        if(!re) continue;
+        bool ce = (c >= 0 && c < vN && hp[c] == 0);
+        uint64_t hh = 0, hx = 0;
+        for(int e = 0; e < 9; ++e) { uint64_t b; memcpy(&b, &hv[(size_t)t * 9 + e], 8); hh += b; hx ^= b; }
+        if(ce) { ++ci; si += hh; xi ^= hx;
+                 if(b_end >= 0) { int s = (t < b_end) ? 0 : (t < f_end) ? 1 : (t < g_end) ? 2 : 3;
+                                  src_sum[s] += hh; ++src_cnt[s]; } }
+        else
+        {
+            ++cc; sc += hh; xc ^= hx;
+            if(c < 0 || c >= vN) ++col_oob;        // col out-of-range (ABD body dof? ground?)
+            else if(hp[c] < 0) ++col_neg1;          // col ungrouped (-1): env0 gripper/static
+            else { ++col_mate;                       // col in a DIFFERENT env (1/2/3): TRUE cross-env
+                   if(t < mate_min) mate_min = t; if(t > mate_max) mate_max = t; }
+        }
+    }
+    printf("[ksum-env0] INTRA: ntrip=%ld sum=%016llx | CROSS: ntrip=%ld | by-src BARRIER(n=%ld,s=%016llx) FRICTION(n=%ld,s=%016llx) GROUND(n=%ld,s=%016llx) FEM(n=%ld,s=%016llx)\n",
+           ci, (unsigned long long)si, cc,
+           src_cnt[0], (unsigned long long)src_sum[0], src_cnt[1], (unsigned long long)src_sum[1],
+           src_cnt[2], (unsigned long long)src_sum[2], src_cnt[3], (unsigned long long)src_sum[3]);
 }
 
 int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int preconditioner_type)
@@ -12002,7 +13465,59 @@ int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int pre
     gipc::Timer timer{"solve_linear_system"};
     auto        iter = 0;
 
+    if(getenv("STIFF_HESS_ENV0") && TetMesh.d_point_to_group
+       && g_dec_frame == (getenv("STIFF_DUMP_FRAME") ? atoi(getenv("STIFF_DUMP_FRAME")) : -1)
+       && g_dec_k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 0))
+    {
+        cudaDeviceSynchronize();
+        { extern unsigned long long get_xskip(); printf("[xskip] cross-env pairs skipped so far = %llu\n", get_xskip());
+          long Bb = (long)h_cpNum[4]*M12_Off + (long)h_cpNum[3]*M9_Off + (long)h_cpNum[2]*M6_Off;
+          long Ff = (long)h_cpNum_last[4]*M12_Off + (long)h_cpNum_last[3]*M9_Off + (long)h_cpNum_last[2]*M6_Off + (long)h_gpNum_last;
+          printf("[tri-bounds] BARRIER=[0,%ld) FRICTION=[%ld,%ld) GROUND=[%ld,%ld) FEM=[%ld,end) total=%lld\n",
+                 Bb, Bb, Bb+Ff, Bb+Ff, Bb+Ff+(long)h_gpNum, Bb+Ff+(long)h_gpNum, (long long)gipc_global_triplet.global_triplet_offset); }
+        // [corrected] mask by d_dof_to_group (the BLOCK index space the triplet row/col live in:
+        // ABD blocks first, then FEM vertex blocks), NOT d_point_to_group (per-vertex, no ABD prefix).
+        { long Bb = (long)h_cpNum[4]*M12_Off + (long)h_cpNum[3]*M9_Off + (long)h_cpNum[2]*M6_Off;
+          long Ff = (long)h_cpNum_last[4]*M12_Off + (long)h_cpNum_last[3]*M9_Off + (long)h_cpNum_last[2]*M6_Off + (long)h_gpNum_last;
+          _dbg_hess_env0(gipc_global_triplet.block_values(), gipc_global_triplet.block_row_indices(),
+                       gipc_global_triplet.block_col_indices(),
+                       (long)gipc_global_triplet.global_triplet_offset, TetMesh.d_dof_to_group, TetMesh.dof_block_count,
+                       Bb, Bb+Ff, Bb+Ff+(long)h_gpNum); }
+    }
+
+    if(getenv("STIFF_KSUM"))
+    {
+        cudaDeviceSynchronize();
+        _dbg_ksum("fb_in",      TetMesh.fb,          (size_t)vertexNum * sizeof(double3));
+        _dbg_ksum("shapegrad_in", TetMesh.shape_grads, (size_t)vertexNum * sizeof(double3));
+        // COMMUTATIVE hash of the RAW triplets (block values + row/col), order-independent →
+        // tells if the Hessian VALUE-multiset is deterministic (vs just non-det slot order).
+        _dbg_ksum_comm("rawHess_comm", gipc_global_triplet.block_values(),
+                       (size_t)gipc_global_triplet.global_triplet_offset * 9 * sizeof(double));
+        _dbg_ksum_comm("rawRow_comm", gipc_global_triplet.block_row_indices(),
+                       (size_t)gipc_global_triplet.global_triplet_offset * sizeof(int));
+        printf("[ksum] cpNum=%d Kappa=%.17g toff=%lld\n",
+               h_cpNum[0], Kappa, (long long)gipc_global_triplet.global_triplet_offset);
+    }
+
+    // [xenv] gradient RHS asymmetry — is fb already env-asymmetric BEFORE the solve?
+    // (fb is assembled by computeGradientAndHessian from identical co-located verts.)
+    if(getenv("STIFF_XENV") && m_d_p2g) xenvDiff(TetMesh.fb, "fb(grad) pre-solve");
+
     iter = m_global_linear_system->solve_linear_system();
+
+    // [xenv] search-direction asymmetry — did the SOLVE (SpMV/dot/precond) introduce it?
+    if(getenv("STIFF_XENV") && m_d_p2g) xenvDiff(_moveDir, "moveDir post-solve");
+
+    if(getenv("STIFF_KSUM"))
+    {
+        cudaDeviceSynchronize();
+        // merged matrix (converter output, what the spmv used) + the solve result
+        _dbg_ksum("matrix_merged", gipc_global_triplet.block_values(),
+                  (size_t)gipc_global_triplet.h_unique_key_number * 9 * sizeof(double));
+        printf("[ksum] nuniq_merged=%d\n", gipc_global_triplet.h_unique_key_number);
+        _dbg_ksum("moveDir_out", _moveDir, (size_t)vertexNum * sizeof(double3));
+    }
 
 
     auto& json = gipc::Statistics::instance().at_current_frame();
@@ -12126,11 +13641,34 @@ bool GIPC::isIntersected(device_TetraData& TetMesh)
 
 
 
+// [phase-time] lineSearch inner split (per frame): energy evals vs buildBVH+intersect vs buildCP vs step.
+static double g_ls_e_ms = 0.0, g_ls_bvh_ms = 0.0, g_ls_cp_ms = 0.0, g_ls_step_ms = 0.0;
+// gated event-pair stopwatch (STIFF_PHASE_TIME only; events are stream-ordered, no extra syncs —
+// callers place it around ops that already end host-synchronous).
+struct _LsTimer {
+    bool on; cudaEvent_t a, b; double* acc;
+    _LsTimer(double* accum) : on(getenv("STIFF_PHASE_TIME") != nullptr), acc(accum)
+    { if(on){ cudaEventCreate(&a); cudaEventCreate(&b); cudaEventRecord(a); } }
+    void stop()
+    { if(on){ cudaEventRecord(b); cudaEventSynchronize(b); float m=0; cudaEventElapsedTime(&m,a,b);
+              *acc += m; cudaEventDestroy(a); cudaEventDestroy(b); on=false; } }
+};
+
 bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha)
 {
     muda::wait_device();
     bool   stopped       = false;
+    // NOTE(perf, rejected): a "lazy" variant skipped this global entry energy on the per-env (S3)
+    // path (it is only read by the rare uniform FALLBACK) and used full_sum(Eg0) there instead —
+    // mathematically the same quantity (per-env decomposition is a partition; S3-validated equal to
+    // machine precision) but its atomicAdd summation is bit-wobbly run-to-run and the fallback
+    // compare has no tolerance band (unlike S3's 1e-12 band) → a theoretical knife-edge risk to
+    // strict bit-identity for ~1ms/iter (ls-inner: energy is ~6% of lineSearch; buildCP is 94%).
+    // Not worth it: keep the eager entry energy = bit-exact original semantics on ALL paths.
     double lastEnergyVal = computeEnergy(TetMesh);
+    bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
+                       && abd_fem_count_info.fem_point_num > 0
+                       && getenv("STIFF_PERENV_ALPHA"));
 
     // [multi-env S3] validate per-env energy decomposition (Sum_g E_g(FEM) ==
     // global FEM). Read-only; gated. Run a couple times then it's confirmed.
@@ -12165,16 +13703,25 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     // (Sum_g E_g == global, machine precision). Accept when every env satisfies
     // E_g(alpha_g) <= E_g(0) with no intersection. Falls back to the standard
     // uniform search only if an env can't descend within maxBT halvings. Gated.
-    bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
-                       && abd_fem_count_info.fem_point_num > 0
-                       && getenv("STIFF_PERENV_ALPHA"));
-    if(perenv_try)
+    if(perenv_try)   // (perenv_try hoisted to the top — see the lazy lastEnergyVal comment)
     {
         const int NG = kEnvAlphaSlots;
         const int abdN = (int)abd_fem_count_info.abd_body_num;
         const int maxBT = 8;
-        std::vector<double> Eg0, Eg1;
-        computeEnergy_perenv(TetMesh, Eg0);   // per-env energy at START (temp) config
+        // [de-CPU S3] energies + decision fully DEVICE-resident: computeEnergy_perenv_dev fills
+        // d_Eg0/d_Eg1 (no 22KB D2H), _s3_decide halves m_env_alpha IN PLACE (the true state; the
+        // old host loop operated on the stale h_env_alpha mirror). Host reads ONE int per round —
+        // required: it decides whether to re-run the step/rebuild/energy round (host loop control).
+        static double* d_Eg0 = nullptr; static double* d_Eg1 = nullptr; static int* d_nfail = nullptr;
+        if(!d_Eg0)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&d_Eg0, NG * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&d_Eg1, NG * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&d_nfail, sizeof(int)));
+        }
+        _LsTimer _t0(&g_ls_e_ms);
+        computeEnergy_perenv_dev(TetMesh, d_Eg0);   // per-env energy at START (temp) config
+        _t0.stop();
         bool accepted = false;
         for(int bt = 0; bt <= maxBT; ++bt)
         {
@@ -12186,42 +13733,46 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                 _gather_abd_body_alpha<<<bn, tn>>>(TetMesh.d_body_to_group, m_env_alpha,
                                                    m_abd_body_alpha, abdN, NG);
             }
+            _LsTimer _ts(&g_ls_step_ms);
             m_perenv_apply = true;
             step_forward(TetMesh, alpha, false);   // per-env step from temp
             m_perenv_apply = false;
+            _ts.stop();
+            _LsTimer _tb(&g_ls_bvh_ms);
             buildBVH();
-            if(isIntersected(TetMesh))   // CCD-safe alpha should prevent this; safety net
+            bool _isect = isIntersected(TetMesh);
+            _tb.stop();
+            if(_isect)   // CCD-safe alpha should prevent this; safety net
             {
-                for(int g = 0; g < NG; ++g) if(h_env_alpha[g] > 0) h_env_alpha[g] *= 0.5;
-                CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
-                                          NG * sizeof(double), cudaMemcpyHostToDevice));
+                _s3_halve_all<<<(NG + 255) / 256, 256>>>(m_env_alpha, NG);
                 continue;
             }
+            _LsTimer _tc(&g_ls_cp_ms);
             buildCP();
+            _tc.stop();
             // [backport] buildCP() already D2H-syncs h_cpNum/h_gpNum and the energy
             // kernels consume unsorted pairs directly, so the perf branch's
             // sync_cpNum()/sort_collision_pairs_by_type() are unneeded in this path.
-            computeEnergy_perenv(TetMesh, Eg1);   // per-env energy AFTER step
-            bool allok = true; int nhalve = 0;
-            for(int g = 0; g < NG; ++g)
-            {
-                if(h_env_alpha[g] <= 0) continue;   // env g absent
-                double tol = 1e-12 * (fabs(Eg0[g]) + 1.0);
-                if(Eg1[g] > Eg0[g] + tol) { h_env_alpha[g] *= 0.5; allok = false; ++nhalve; }
-            }
-            if(allok)
+            _LsTimer _t1(&g_ls_e_ms);
+            computeEnergy_perenv_dev(TetMesh, d_Eg1);   // per-env energy AFTER step
+            _t1.stop();
+            CUDA_SAFE_CALL(cudaMemsetAsync(d_nfail, 0, sizeof(int)));
+            _s3_decide<<<(NG + 255) / 256, 256>>>(d_Eg0, d_Eg1, m_env_alpha, d_nfail, NG);
+            int nfail = 0;
+            CUDA_SAFE_CALL(cudaMemcpy(&nfail, d_nfail, sizeof(int), cudaMemcpyDeviceToHost));
+            if(nfail == 0)
             {
                 accepted = true;
                 if(getenv("STIFF_PENV_STATS")) printf("[S3-accept] per-env descent ok (bt=%d)\n", bt);
                 break;
             }
-            CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
-                                      NG * sizeof(double), cudaMemcpyHostToDevice));
-            if(getenv("STIFF_PENV_STATS")) printf("[S3-bt] bt=%d halved %d envs\n", bt, nhalve);
+            // (m_env_alpha already halved in place on device — no H2D)
+            if(getenv("STIFF_PENV_STATS")) printf("[S3-bt] bt=%d halved %d envs\n", bt, nfail);
         }
         if(accepted) return false;   // accepted; collision state already rebuilt
         if(getenv("STIFF_PENV_STATS")) printf("[S3-fallback] per-env descent not reached -> global\n");
-        // fall through to standard uniform-alpha line search (re-steps from temp)
+        // fall through to standard uniform-alpha line search (re-steps from temp); the Armijo
+        // reference lastEnergyVal is the eager entry computeEnergy (bit-exact original semantics).
     }
 
     step_forward(TetMesh, alpha, false);
@@ -12307,6 +13858,38 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
     }
     else
     {
+        if(m_pergroup_kappa && m_kappa_group && m_d_close_grp)
+        {
+            // [multi-env per-group κ] run BOTH close-val checks (no short-circuit) to populate the
+            // per-group flags, then double ONLY the groups that hit a close contact. This decouples
+            // the cross-env bifurcation (a global κ doubling was the dominant cross-env coupling).
+            int NG = m_perenv_bvh_groups > 0 ? m_perenv_bvh_groups : kEnvAlphaSlots;
+            CUDA_SAFE_CALL(cudaMemset(m_d_close_grp, 0, NG * sizeof(int)));
+            (void)checkCloseGroundVal();   // populates m_d_close_grp (global bool ignored)
+            (void)checkSelfCloseVal();
+            // [perf/device-residence] double the close groups' κ ON DEVICE (in m_kappa_group), taking the
+            // envelope via atomicMax — replaces the per-Newton D2H(close flags) + 256-env host loop +
+            // H2D(κ). kappaMax is a host scalar (env-independent), the doubling+cap+max are all order-free
+            // → strict bit-identical. h_kappa_group is NOT touched here (it is re-seeded by initKappa each
+            // frame and read nowhere else during the frame; device m_kappa_group is the in-frame truth).
+            double kappaMax = 1e300;
+            upperBoundKappa(kappaMax);     // kappaMax = env-independent cap (was recomputed per group)
+            static double* d_maxK = nullptr;
+            if(!d_maxK) CUDA_SAFE_CALL(cudaMalloc(&d_maxK, sizeof(double)));
+            CUDA_SAFE_CALL(cudaMemcpy(d_maxK, &Kappa, sizeof(double), cudaMemcpyHostToDevice));  // envelope init
+            {
+                int bs = 256;
+                _per_group_kappa_double<<<(NG + bs - 1) / bs, bs>>>(m_kappa_group, m_d_close_grp, NG, kappaMax, d_maxK);
+            }
+            CUDA_SAFE_CALL(cudaMemcpy(&Kappa, d_maxK, sizeof(double), cudaMemcpyDeviceToHost));  // scalar envelope
+            tempFree_closeConstraint();
+            tempMalloc_closeConstraint();
+            CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
+            computeCloseGroundVal();
+            computeSelfCloseVal();
+            return;
+        }
 
         bool updateKappa = checkCloseGroundVal();
         if(!updateKappa)
@@ -12331,18 +13914,77 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
 
 void GIPC::tempMalloc_closeConstraint()
 {
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintID, h_gpNum * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintVal, h_gpNum * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintID, h_cpNum[0] * sizeof(int4)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintVal, h_cpNum[0] * sizeof(double)));
+    // [0be8da3-port, grow-only] buffers persist across sub-iterations/frames;
+    // (re)allocate only on growth. Kernels touch [0, h_gpNum)/[0, h_cpNum[0]).
+    if((size_t)h_gpNum > m_close_gp_cap)
+    {
+        if(_closeConstraintID)
+        {
+            CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
+            CUDA_SAFE_CALL(cudaFree(_closeConstraintVal));
+        }
+        size_t n = (size_t)h_gpNum + h_gpNum / 4;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintID, n * sizeof(uint32_t)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintVal, n * sizeof(double)));
+        m_close_gp_cap = n;
+    }
+    if((size_t)h_cpNum[0] > m_close_cp_cap)
+    {
+        if(_closeMConstraintID)
+        {
+            CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
+            CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
+        }
+        size_t n = (size_t)h_cpNum[0] + h_cpNum[0] / 4;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintID, n * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintVal, n * sizeof(double)));
+        m_close_cp_cap = n;
+    }
 }
 
 void GIPC::tempFree_closeConstraint()
 {
-    CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
-    CUDA_SAFE_CALL(cudaFree(_closeConstraintVal));
-    CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
-    CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
+    // [0be8da3-port] no-op — buffers persist; freed in FREE_DEVICE_MEM.
+}
+
+void GIPC::ensure_frictionBuffers()
+{
+    // [0be8da3-port, grow-only] replaces the per-frame/per-sub-iter free+malloc
+    // of the 7 friction lastH buffers. distCoord's live range [0, h_cpNum[0])
+    // is re-zeroed on EVERY call (a fresh cudaMalloc'd buffer was memset the
+    // same way), keeping the [4.3] frame-0 lag fix value-identical.
+    if((size_t)h_cpNum[0] > m_fric_cp_cap)
+    {
+        if(lambda_lastH_scalar)
+        {
+            CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
+            CUDA_SAFE_CALL(cudaFree(distCoord));
+            CUDA_SAFE_CALL(cudaFree(tanBasis));
+            CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
+            CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
+        }
+        size_t n = (size_t)h_cpNum[0] + h_cpNum[0] / 4;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, n * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, n * sizeof(double2)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&tanBasis, n * sizeof(__GEIGEN__::Matrix3x2d)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, n * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex_last, n * sizeof(int)));
+        m_fric_cp_cap = n;
+    }
+    if((size_t)h_gpNum > m_fric_gd_cap)
+    {
+        if(lambda_lastH_scalar_gd)
+        {
+            CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
+            CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
+        }
+        size_t n = (size_t)h_gpNum + h_gpNum / 4;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, n * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd, n * sizeof(uint32_t)));
+        m_fric_gd_cap = n;
+    }
+    if(h_cpNum[0])
+        CUDA_SAFE_CALL(cudaMemset(distCoord, 0, h_cpNum[0] * sizeof(double2)));  // [4.3] frame-0 lag uninit
 }
 double maxCOllisionPairNum = 0;
 double totalCollisionPairs = 0;
@@ -12351,6 +13993,9 @@ double timemakePd          = 0;
 #include <vector>
 #include <fstream>
 std::vector<int> iterV;
+
+// [phase-time] time3 sub-split (per frame): S1 per-env-alpha block vs lineSearch proper.
+static double g_t3_s1_ms = 0.0, g_t3_ls_ms = 0.0;
 
 int              GIPC::solve_subIP(device_TetraData& TetMesh,
                       double&           time0,
@@ -12365,6 +14010,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                   << std::endl;
 
     stats_at_current_frame["newton"] = gipc::Json::array();
+    g_t3_s1_ms = 0.0; g_t3_ls_ms = 0.0;   // [phase-time] time3 sub-split, per frame
+    g_ls_e_ms = 0.0; g_ls_bvh_ms = 0.0; g_ls_cp_ms = 0.0; g_ls_step_ms = 0.0;
+    // [env-det] capture p2g at entry so the canon env-local-id tiebreak (g_vloc) is built BEFORE the
+    // first buildCP of this frame (buildCP runs before computeGradientAndHessian sets m_d_p2g).
+    if(getenv("STIFF_EE_CANON") && TetMesh.d_point_to_group) m_d_p2g = TetMesh.d_point_to_group;
 
     int iterCap = newton_iter_cap, k = 0;
     double semi_beta = 1.0;
@@ -12376,7 +14026,12 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // zeros masked envs' RHS, spmv skips their triplets. Reset all-active at frame
     // start (detection updates m_env_active each iter); cleared after the loop.
     const bool s4_mask_on = (m_env_active && TetMesh.d_dof_to_group
-                             && TetMesh.d_point_to_group && getenv("STIFF_PERENV_MASK"));
+                             && TetMesh.d_point_to_group
+                             && (getenv("STIFF_PERENV_MASK") || getenv("STIFF_PERENV_MASK_DEV")));
+    // [S4-dev] device-derived mask (from m_env_alpha, zero D2H). Requires the per-env alpha
+    // machinery (m_env_alpha filled by the S1 line-search block each iter).
+    const bool s4_dev_mask = s4_mask_on && m_env_alpha && getenv("STIFF_PERENV_MASK_DEV")
+                             && getenv("STIFF_PERENV_ALPHA");
     if(s4_mask_on)
     {
         std::fill(h_env_active.begin(), h_env_active.end(), 1);
@@ -12384,8 +14039,22 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                   kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice));
         m_global_linear_system->set_env_mask(m_env_active, TetMesh.d_dof_to_group, kEnvAlphaSlots);
     }
+    // [multi-env P3] register the DOF→group map for the SEGMENTED block-diagonal PCG even when
+    // masking is off (the PCG reads m_s4_dof_to_group/m_s4_ng). active=nullptr ⇒ no RHS masking.
+    else if(getenv("STIFF_SEGMENTED_PCG") && TetMesh.d_dof_to_group && TetMesh.d_point_to_group)
+        m_global_linear_system->set_env_mask(nullptr, TetMesh.d_dof_to_group, kEnvAlphaSlots);
     else
         m_global_linear_system->set_env_mask(nullptr, nullptr, 0);
+
+    int& s_dec_frame = g_dec_frame;   // [decouple probe] per-solve_subIP-call counter (~frame)
+    s_dec_frame++;
+
+    // [decouple] per-env convergence latch for the loop-exit override. The global gradVanish can
+    // fire while a per-env env is still UNDER-converged (its mates converged fast → loop ends → that
+    // env is cut off at a batch-dependent iter → drift). When DECOUPLE_THRESH, the loop exits only
+    // once ALL present envs are per-env frozen (each reached ITS OWN convergence), so an env's final
+    // state is independent of the mates / loop length. Updated at the end of S1 Phase B each iter.
+    bool all_env_frozen = false;
 
     for(; k < iterCap; ++k)
     {
@@ -12393,27 +14062,69 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             printf("  Newton iter %d ...\n", k);
         stats_at_current_frame["newton"].push_back(gipc::Json::object());
 
+        // [S4-dev] periodic all-active recheck (bounce-back detection): every RECHECK iters, unmask
+        // ALL envs so masked (frozen) envs get one REAL solve — if a κ doubling / friction update
+        // moved a frozen env off its optimum, its hmx exceeds thr and _per_env_alpha_compute
+        // un-freezes it (mask follows at end of this iter). Placed BEFORE the solve so the recheck
+        // iter solves the full system. Fixed cadence → deterministic.
+        if(s4_dev_mask && (k % 4 == 0))
+            _mask_fill<<<(kEnvAlphaSlots + 255) / 256, 256>>>(m_env_active, 1, kEnvAlphaSlots);
+
         totalCollisionPairs += h_cpNum[0];
         maxCOllisionPairNum =
             (maxCOllisionPairNum > h_cpNum[0]) ? maxCOllisionPairNum : h_cpNum[0];
-        cudaEvent_t start, end0, end1, end2, end3, end4;
+        cudaEvent_t start, end0, end1, end2, end3, end4, e2b;
         cudaEventCreate(&start);
         cudaEventCreate(&end0);
         cudaEventCreate(&end1);
         cudaEventCreate(&end2);
         cudaEventCreate(&end3);
         cudaEventCreate(&end4);
+        cudaEventCreate(&e2b);
 
         //printf("\n\n\ncollision num  %d\n\n\n", h_cpNum[0]+h_gpNum);
 
         cudaEventRecord(start);
+        g_dec_k = (int)k;   // [decouple probe] expose k to computeGradientAndHessian's stage dumps
         timemakePd += computeGradientAndHessian(TetMesh);
 
+        // [decouple probe] PRE-SOLVE gradient dump (shape_grads + fb hold the CLEAN gradient here,
+        // before calculateMovingDirection clobbers shape_grads as scratch). frame STIFF_DUMP_FRAME,
+        // any k if STIFF_PROBE_K unset → use k==0. Python compares env0 across batches.
+        if(getenv("STIFF_GRAD_PRE") && TetMesh.d_point_to_group
+           && s_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))
+           && (int)k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 0))
+        {
+            std::vector<double3> hsh(vertexNum), hfb(vertexNum);
+            std::vector<int>     hp(vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(hsh.data(), TetMesh.shape_grads, vertexNum*sizeof(double3), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(hfb.data(), TetMesh.fb, vertexNum*sizeof(double3), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(hp.data(), TetMesh.d_point_to_group, vertexNum*sizeof(int), cudaMemcpyDeviceToHost));
+            const char* fn = getenv("STIFF_GRAD_PRE");
+            FILE* a=fopen((std::string(fn)+".shape").c_str(),"wb"); if(a){fwrite(hsh.data(),sizeof(double3),vertexNum,a);fclose(a);}
+            FILE* b=fopen((std::string(fn)+".fb").c_str(),"wb");    if(b){fwrite(hfb.data(),sizeof(double3),vertexNum,b);fclose(b);}
+            FILE* c=fopen((std::string(fn)+".grp").c_str(),"wb");   if(c){fwrite(hp.data(),sizeof(int),vertexNum,c);fclose(c);}
+            printf("[grad-pre] dumped shape+fb+grp @frame %d k=%d\n", s_dec_frame, (int)k);
+        }
 
         double distToOpt_PN = calcMinMovement(_moveDir, pcg_data.squeue, vertexNum);
 
+        // [decouple] the Newton convergence threshold uses the MERGED-scene bboxDiagSize2, which
+        // varies with the batch (mates' extents) → env_0's stop point depends on its batch-mates.
+        // STIFF_DECOUPLE_THRESH replaces it with the abs_dhat-fixed eff bbox (batch-INVARIANT, same
+        // physical contact scale a single-env run would use), removing this coupling.
+        double thr_bbox2 = bboxDiagSize2;
+        // [convergence consistency] when an ABSOLUTE contact scale is set (absolute_dhat>0), the Newton
+        // convergence tolerance MUST follow that physical scale, NOT the merged-scene bboxDiagSize2
+        // (which grows with env count / spacing → the tolerance becomes batch-dependent and looser for
+        // merged, so merged 'converges' at a coarser residual than a single-env run). Gated on
+        // absolute_dhat>0 ALONE (not STIFF_DECOUPLE_THRESH) so ALL modes converge to the SAME physical
+        // tolerance. dHat/dTol/fDhat already use this eff bbox; this makes the Newton exit consistent.
+        if(absolute_dhat > 0.0 && relative_dhat > 0.0)
+            thr_bbox2 = (absolute_dhat * absolute_dhat) / (relative_dhat * relative_dhat);
+
         bool gradVanish = (distToOpt_PN < sqrt(Newton_solver_threshold * Newton_solver_threshold
-                                               * eff_bboxDiagSize2 * IPC_dt * IPC_dt));
+                                               * thr_bbox2 * IPC_dt * IPC_dt));
 
         // [multi-env P3a step2] per-env Newton convergence tracking (precursor to
         // mask early-exit). The merged Newton loop currently breaks on the GLOBAL
@@ -12462,13 +14173,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // Skip detection on early Newton iters: nothing converges before ~k=MINK
         // (measured), so the per-iter D2H+sync overhead there is pure waste.
         if(m_env_active && TetMesh.d_point_to_group && getenv("STIFF_PERENV_MASK")
-           && k >= 4)
+           && !s4_dev_mask && k >= 4)   // [S4-dev] device-derived mask supersedes host detection
         {
             const int NG = kEnvAlphaSlots;
             const int RECHECK = 4;
             const double margin = 0.5;
             double thr = sqrt(Newton_solver_threshold * Newton_solver_threshold
-                              * bboxDiagSize2 * IPC_dt * IPC_dt);
+                              * thr_bbox2 * IPC_dt * IPC_dt);   // [decouple] batch-invariant bbox
             static double* d_mm = nullptr; static int* d_ct = nullptr;
             if(!d_mm) { cudaMalloc((void**)&d_mm, NG*sizeof(double));
                         cudaMalloc((void**)&d_ct, NG*sizeof(int)); }
@@ -12509,7 +14220,18 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         //                        * sqrt(Newton_solver_threshold * Newton_solver_threshold * bboxDiagSize2)
         //                        * IPC_dt * IPC_dt);
 
-        if(k && gradVanish)
+        // [decouple] DECOUPLE_THRESH: exit only when ALL envs are per-env frozen (each converged),
+        // NOT on the global gradVanish (which can cut off an under-converged env when its mates
+        // finish first → batch-dependent final state). all_env_frozen is from the prev iter's S1
+        // Phase B. Baseline (off) keeps the global gradVanish exit.
+        // [robustness] the frozen-exit needs the S1 per-env-alpha machinery to actually run
+        // (m_env_alpha_valid, set by the prev iter's S1). With DECOUPLE_THRESH but WITHOUT
+        // STIFF_PERENV_ALPHA, all_env_frozen stays false forever → the loop ran to iterCap every
+        // frame (pathological, found by the flag ablation). Fall back to gradVanish in that case.
+        bool do_break = (getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid)
+                            ? (k && all_env_frozen)
+                            : (k && gradVanish);
+        if(do_break)
         {
             break;
         }
@@ -12519,14 +14241,75 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         //std::cout << "[" << k << "]"
         //          << "cg_count = " << cg_count << std::endl;
         total_Cg_count += cg_count;
+        // [decouple probe] full-precision moveDir dump (engine order) + d_point_to_group (engine
+        // order, aligned). At frame STIFF_DUMP_FRAME, Newton iter STIFF_PROBE_K. Python masks
+        // verts[grp==g] and compares matesA vs matesB to find the fine per-step coupling seed.
+        if(getenv("STIFF_GRAD_PROBE") && TetMesh.d_point_to_group
+           && s_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))
+           && (int)k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 1))
+        {
+            std::vector<double3> hmd(vertexNum), hgr(vertexNum), hsh(vertexNum);
+            std::vector<int>     hp(vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(hmd.data(), _moveDir, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(hgr.data(), TetMesh.fb, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));  // contact+ground grad
+            CUDA_SAFE_CALL(cudaMemcpy(hsh.data(), TetMesh.shape_grads, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));  // kinetic+elastic
+            CUDA_SAFE_CALL(cudaMemcpy(hp.data(), TetMesh.d_point_to_group, vertexNum * sizeof(int), cudaMemcpyDeviceToHost));
+            const char* fn = getenv("STIFF_GRAD_PROBE");
+            FILE* f = fopen(fn, "wb"); if(f){ fwrite(hmd.data(), sizeof(double3), vertexNum, f); fclose(f); }
+            std::string gradn = std::string(fn) + ".grad";
+            FILE* fg = fopen(gradn.c_str(), "wb"); if(fg){ fwrite(hgr.data(), sizeof(double3), vertexNum, fg); fclose(fg); }
+            std::string shn = std::string(fn) + ".shape";
+            FILE* fs = fopen(shn.c_str(), "wb"); if(fs){ fwrite(hsh.data(), sizeof(double3), vertexNum, fs); fclose(fs); }
+            std::string gn = std::string(fn) + ".grp";
+            FILE* g = fopen(gn.c_str(), "wb"); if(g){ fwrite(hp.data(), sizeof(int), vertexNum, g); fclose(g); }
+            printf("[grad-probe] dumped moveDir+grad+grp @frame %d k=%d (%d verts) -> %s\n",
+                   s_dec_frame, (int)k, vertexNum, fn);
+            // [decouple] ABD body pose dump (verify the gripper/arm pose drifts across batches → the
+            // FEM-pin seed). m_d_abd_body_q = Vector12 (12 doubles) per body; d_body_to_group = env id.
+            if(getenv("STIFF_ABD_DUMP") && m_abd_sim_data && TetMesh.d_body_to_group)
+            {
+                int nb = (int)abd_fem_count_info.abd_body_num;
+                const double* qptr = reinterpret_cast<const double*>(m_abd_sim_data->device.body_id_to_q.data());
+                const double* dqptr = reinterpret_cast<const double*>(m_abd_sim_data->device.body_id_to_dq.data());
+                std::vector<double> hq(12 * nb), hdq(12 * nb); std::vector<int> hbg(nb);
+                CUDA_SAFE_CALL(cudaMemcpy(hq.data(), qptr, 12 * nb * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hdq.data(), dqptr, 12 * nb * sizeof(double), cudaMemcpyDeviceToHost));
+                FILE* dq=fopen((std::string(fn)+".abddq").c_str(),"wb"); if(dq){fwrite(hdq.data(),sizeof(double),12*nb,dq);fclose(dq);}
+                CUDA_SAFE_CALL(cudaMemcpy(hbg.data(), TetMesh.d_body_to_group, nb * sizeof(int), cudaMemcpyDeviceToHost));
+                FILE* q=fopen((std::string(fn)+".abdq").c_str(),"wb"); if(q){fwrite(hq.data(),sizeof(double),12*nb,q);fclose(q);}
+                FILE* b=fopen((std::string(fn)+".abdg").c_str(),"wb"); if(b){fwrite(hbg.data(),sizeof(int),nb,b);fclose(b);}
+                printf("[abd-dump] %d bodies @frame %d k=%d\n", nb, s_dec_frame, (int)k);
+            }
+        }
         cudaEventRecord(end1);
         double alpha = 1.0, slackness_a = 0.8, slackness_m = 0.8;
 
-        alpha =
-            std::min(alpha, ground_largestFeasibleStepSize(slackness_a, pcg_data.squeue));
+        // ②-D2H: batch the two back-to-back CCD step-size reductions (ground +
+        // self) into one D2H of 2 doubles. Preserves original early-return
+        // semantics: m_skip_all_collision skips ALL reductions; surf_vertexNum<1
+        // skips ground; h_cpNum[0]<1 skips self. Each "did" branch only queues
+        // kernels when its preconditions are met.
+        if(m_skip_all_collision)
+        {
+            // both functions short-circuit to 1.0 -> no change to alpha
+        }
+        else
+        {
+            bool g_did = (surf_vertexNum >= 1);
+            bool s_did = (h_cpNum[0]     >= 1);
+            if(g_did) ground_largestFeasibleStepSize_DeviceOut(slackness_a, pcg_data.squeue, m_alpha_slots + 0);
+            // self reduces over PAIR count — squeue is mesh-sized (v0.6.3 OOB fix):
+            // must use the pair-capacity scratch, NOT pcg_data.squeue.
+            if(s_did) self_largestFeasibleStepSize_DeviceOut  (slackness_m, ensure_reduce_scratch(h_cpNum[0]), h_cpNum[0], m_alpha_slots + 1);
+            if(g_did || s_did)
+            {
+                double h_alpha[2] = {1.0, 1.0};
+                CUDA_SAFE_CALL(cudaMemcpy(h_alpha, m_alpha_slots, 2 * sizeof(double), cudaMemcpyDeviceToHost));
+                if(g_did) alpha = std::min(alpha, 1.0 / h_alpha[0]);
+                if(s_did) alpha = std::min(alpha, 1.0 / h_alpha[1]);
+            }
+        }
         //alpha = std::min(alpha, InjectiveStepSize(0.2, 1e-6, pcg_data.squeue, TetMesh.tetrahedras));
-        alpha = std::min(
-            alpha, self_largestFeasibleStepSize(slackness_m, ensure_reduce_scratch(h_cpNum[0]), h_cpNum[0]));
         double temp_alpha = alpha;
         double alpha_CFL  = alpha;
 
@@ -12554,7 +14337,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             if(h_cpNum[0] >= 1)  // narrow-self over OLD _ccd_collisonPairs[0..h_cpNum[0])
                 _per_env_selfTimeStep_max<<<(h_cpNum[0]+bs-1)/bs, bs>>>(
                     _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
-                    m_env_scratch + 1*NG, slackness_m, h_cpNum[0], NG);
+                    m_env_scratch + 1*NG, slackness_m, h_cpNum[0], NG,
+                    getenv("STIFF_CCD_CANON") ? m_d_vloc : nullptr);
         }
 
         buildBVH_FULLCCD(temp_alpha);
@@ -12623,10 +14407,36 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             if(h_ccd_cpNum > 0)  // refined-self over NEW _ccd_collisonPairs[0..h_ccd_cpNum)
                 _per_env_selfTimeStep_max<<<(h_ccd_cpNum+bs-1)/bs, bs>>>(
                     _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
-                    m_env_scratch + 2*NG, slackness_m, h_ccd_cpNum, NG);
+                    m_env_scratch + 2*NG, slackness_m, h_ccd_cpNum, NG,
+                    getenv("STIFF_CCD_CANON") ? m_d_vloc : nullptr);
             _per_env_max_cfl<<<(surf_vertexNum+bs-1)/bs, bs>>>(
                 TetMesh.d_point_to_group, _moveDir, _surfVerts, m_env_scratch + 3*NG,
                 surf_vertexNum, NG);
+            // [perf] DEVICE-SIDE per-env alpha + freeze (no cudaDeviceSynchronize, no 4x256 D2H, no
+            // host loop, no H2D) — writes m_env_alpha directly + a 2-int counter D2H for all_env_frozen.
+            // Bit-identical to the host loop (same per-env formulas). Host path kept only under a
+            // diagnostic flag.
+            const double _sq_    = sqrt(dHat);
+            const double _thrcv_ = getenv("STIFF_DECOUPLE_THRESH")
+                ? sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt) : 0.0;
+            const bool _s1diag_ = getenv("STIFF_PENV_STATS") || getenv("STIFF_A0_DUMP")
+                               || getenv("STIFF_S1_DEBUG") || getenv("STIFF_ALPHA_DBG");
+            if(!_s1diag_)
+            {
+                static int* d_env_cnt = nullptr;
+                if(!d_env_cnt) CUDA_SAFE_CALL(cudaMalloc((void**)&d_env_cnt, 2 * sizeof(int)));
+                CUDA_SAFE_CALL(cudaMemsetAsync(d_env_cnt, 0, 2 * sizeof(int)));
+                _per_env_alpha_compute<<<(NG + bs - 1) / bs, bs>>>(
+                    m_env_alpha, m_env_scratch, NG, _sq_, 1.0, (h_ccd_cpNum > 0) ? 1 : 0,
+                    temp_alpha, alpha_CFL, getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
+                    getenv("STIFF_NO_REFINE") ? 1 : 0, _thrcv_, d_env_cnt);
+                int _hc_[2];
+                CUDA_SAFE_CALL(cudaMemcpy(_hc_, d_env_cnt, 2 * sizeof(int), cudaMemcpyDeviceToHost));
+                m_env_alpha_valid = true;
+                all_env_frozen    = (_hc_[0] > 0 && _hc_[1] == _hc_[0]);
+            }
+            else
+            {
             cudaDeviceSynchronize();
             std::vector<double> hg(NG), hs(NG), hr(NG), hmx(NG);
             cudaMemcpy(hg.data(),  m_env_scratch + 0*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
@@ -12637,7 +14447,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             const double ccd_size = 1.0;
             const bool   have_ccd = (h_ccd_cpNum > 0);
             double       min_env  = 1e30, max_env = 0.0;
-            int          n_env    = 0;
+            int          n_env    = 0, n_frozen = 0;
             for(int g = 0; g < NG; ++g)
             {
                 if(hmx[g] <= 0.0) continue;  // env g has no surface verts -> absent
@@ -12649,12 +14459,20 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 {
                     double acfl = sq / hmx[g] * 0.5;
                     a = std::min(ta, acfl);
-                    // The refinement GATE is a global algorithmic choice (engine
-                    // gates on the GLOBAL temp_alpha/alpha_CFL, not per-env) — only
-                    // the VALUES are per-env. Using the per-env acfl in the gate
-                    // diverges from the engine (it skips the accurate refined CCD
-                    // when per-env acfl is looser). Gate globally, value per-env.
-                    if(temp_alpha > 2.0 * alpha_CFL)
+                    // The refinement GATE: the engine gates on the GLOBAL temp_alpha/alpha_CFL,
+                    // which makes env_0's branch decision (enter refined CCD or not) depend on the
+                    // MATES (global temp_alpha = min over all envs) → BREAKS batch-invariance: at a
+                    // frame where global temp_alpha diverges across batches, env_0 enters refinement
+                    // in one batch but not the other → env_0's feasible alpha differs → drift →
+                    // chaos amplifies. STIFF_DECOUPLE_THRESH gates per-env (ta_g vs acfl_g) so env_0's
+                    // branch depends only on env_0 (batch-invariant). Off → exact engine behavior.
+                    // [decouple TEST] STIFF_NO_REFINE: skip refinement entirely (env0's a=min(ta,acfl)
+                    // → fully per-env/batch-invariant; hr — built from global-temp_alpha CCD pairs — is
+                    // the confirmed last leak). isIntersected safety net in lineSearch catches any
+                    // resulting penetration. Used to verify hr is the only remaining batch-coupling.
+                    double gate_lhs = getenv("STIFF_DECOUPLE_THRESH") ? ta   : temp_alpha;
+                    double gate_rhs = getenv("STIFF_DECOUPLE_THRESH") ? acfl : alpha_CFL;
+                    if(!getenv("STIFF_NO_REFINE") && gate_lhs > 2.0 * gate_rhs)
                     {
                         double refined = (hr[g] > 0.0) ? 1.0 / hr[g] : 1.0;
                         a = std::min(ta, refined * ccd_size);
@@ -12662,9 +14480,32 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     }
                 }
                 h_env_alpha[g] = a;
+                // [decouple] FREEZE env g once IT has converged (per-env max-move < the per-env Newton
+                // threshold), so env g stops stepping at ITS OWN convergence iter — NOT the global loop
+                // count. The merged Newton loop runs a BATCH-DEPENDENT number of iters (harder mates →
+                // more iters: measured A=13 vs B=16 at frame0); during the extra iters an already-
+                // converged env's ABD (dq small but nonzero) keeps stepping → its gripper/arm pose
+                // drifts batch-dependently → FEM-pin seed. Freezing at the env's own convergence makes
+                // env g's total steps batch-invariant. Block-diagonal per-env solve ⇒ monotonic ⇒ no
+                // re-activation needed. Gated STIFF_DECOUPLE_THRESH.
+                if(getenv("STIFF_DECOUPLE_THRESH"))
+                {
+                    double thr_cv = sqrt(Newton_solver_threshold * Newton_solver_threshold
+                                         * thr_bbox2 * IPC_dt * IPC_dt);
+                    if(hmx[g] < thr_cv) h_env_alpha[g] = 0.0;
+                }
+                if(h_env_alpha[g] == 0.0) ++n_frozen;   // [decouple] per-env converged (frozen)
                 min_env = std::min(min_env, a);
                 max_env = std::max(max_env, a);
                 ++n_env;
+                if(getenv("STIFF_A0_DUMP") && g == 0
+                   && (!getenv("STIFF_DUMP_FRAME") || g_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))))
+                {   // [decouple] env0 per-iter: applied alpha (h_env_alpha[g], post-freeze) + hmx (max-move) + frozen?
+                    double thr_cv = sqrt(Newton_solver_threshold * Newton_solver_threshold
+                                         * thr_bbox2 * IPC_dt * IPC_dt);
+                    printf("[a0] frame=%d k=%d a_applied=%.17e a_feasible=%.17e hmx=%.17e thr_cv=%.6e frozen=%d\n",
+                           g_dec_frame, (int)k, h_env_alpha[g], a, hmx[g], thr_cv, (int)(h_env_alpha[g] == 0.0));
+                }
                 if(getenv("STIFF_S1_DEBUG") && alpha > 0.99 && a < 0.9)
                     printf("  [S1-dbg] g%d a=%.4e ta=%.4e ground=%.4e narrow=%.4e "
                            "refined=%.4e acfl=%.4e ccdN=%d alphaCFLglob=%.4e (global=%.4e)\n",
@@ -12672,16 +14513,40 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                            hr[g]>0?1.0/hr[g]:9.99, have_ccd?sq/hmx[g]*0.5:9.99,
                            (int)h_ccd_cpNum, alpha_CFL, alpha);
             }
+            // [env-det dbg] cross-env alpha mismatch (STIFF_ALPHA_DBG): pin the component that differs.
+            if(getenv("STIFF_ALPHA_DBG") && NG >= 2 && hmx[0] > 0.0 && hmx[1] > 0.0
+               && (h_env_alpha[0] != h_env_alpha[1] || hg[0] != hg[1] || hs[0] != hs[1]
+                   || hr[0] != hr[1] || hmx[0] != hmx[1]))
+            {
+                static int _ad = 0;
+                if(_ad++ < 12)
+                    printf("[alpha-dbg] a0=%.17e a1=%.17e | hg %.17e/%.17e hs %.17e/%.17e "
+                           "hr %.17e/%.17e hmx %.17e/%.17e ccdN=%d\n",
+                           h_env_alpha[0], h_env_alpha[1], hg[0], hg[1], hs[0], hs[1],
+                           hr[0], hr[1], hmx[0], hmx[1], (int)h_ccd_cpNum);
+            }
             CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
                                       NG * sizeof(double), cudaMemcpyHostToDevice));
             m_env_alpha_valid = true;  // m_env_alpha fresh -> lineSearch may use it
+            // [decouple] all present envs per-env frozen (converged)? → drives the loop-exit override
+            // so the loop runs until env_0 (and every env) reaches ITS OWN convergence, batch-independent.
+            all_env_frozen = (n_env > 0 && n_frozen == n_env);
             if(getenv("STIFF_PENV_STATS"))
                 printf("[S1-envalpha] k=%d global_alpha=%.6e min_env=%.6e max_env=%.6e "
                        "n_env=%d rel=%.2e (neutral-check; headroom=max_env/global)\n",
                        k, alpha, min_env, max_env, n_env,
                        fabs(alpha - min_env) / std::max(alpha, 1e-30));
+            }   // [perf] end diagnostic host path
         }
 
+        // [S4-dev] derive next iter's active mask from the freeze decision already on device
+        // (m_env_alpha == 0 ⇔ env converged this iter). Zero D2H — replaces the S4 host detection.
+        // Frozen set is final here: the S3 per-env backtrack only halves nonzero alphas (never → 0).
+        if(s4_dev_mask && m_env_alpha_valid)
+            _mask_from_env_alpha<<<(kEnvAlphaSlots + 255) / 256, 256>>>(
+                m_env_active, m_env_alpha, kEnvAlphaSlots);
+
+        cudaEventRecord(e2b);   // [phase-time] end of S1 per-env-alpha block / start of lineSearch
         bool isStop = lineSearch(TetMesh, alpha, alpha_CFL);
 
         cudaEventRecord(end3);
@@ -12697,6 +14562,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         cudaEventElapsedTime(&time22, end1, end2);
         cudaEventElapsedTime(&time33, end2, end3);
         cudaEventElapsedTime(&time44, end3, end4);
+        {   // [phase-time] time3 sub-split: S1 per-env alpha (end2->e2b) vs lineSearch (e2b->end3)
+            float t3a = 0, t3b = 0;
+            cudaEventElapsedTime(&t3a, end2, e2b);
+            cudaEventElapsedTime(&t3b, e2b, end3);
+            g_t3_s1_ms += t3a;
+            g_t3_ls_ms += t3b;
+        }
         time0 += time00;
         time1 += time11;
         time2 += time22;
@@ -12715,6 +14587,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         (cudaEventDestroy(end2));
         (cudaEventDestroy(end3));
         (cudaEventDestroy(end4));
+        (cudaEventDestroy(e2b));
         totalTimeStep += alpha;
 
         // Semi-implicit early exit (ref: arXiv 2512.12151, Algorithm 1)
@@ -12743,6 +14616,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     //outiter.close();
     if(g_gipc_log_level >= 1)
         printf("\n\n      Kappa: %f                               iteration k:  %d\n", Kappa, k);
+    // [phase-time] cumulative GPU ms per phase (across frames). time0=Hessian/grad assembly,
+    // time1=PCG linear solve, time2=CCD-BVH build, time3=line-search(+per-env alpha), time4=κ update.
+    // Compare modes to localize the isolated/strict slowdown. Also reports Newton iters this frame.
+    if(getenv("STIFF_PHASE_TIME"))
+        printf("[phase-time cum-ms] Hess=%.0f PCG=%.0f ccdBVH=%.0f lineSearch=%.0f kappaUpd=%.0f | ls-split[s1=%.0f ls=%.0f] ls-inner[e=%.0f bvh=%.0f cp=%.0f step=%.0f] | this-frame-newton-iters=%d cum-pcg-iters=%lld\n",
+               time0, time1, time2, time3, time4, g_t3_s1_ms, g_t3_ls_ms,
+               g_ls_e_ms, g_ls_bvh_ms, g_ls_cp_ms, g_ls_step_ms, k, (long long)total_Cg_count);
     return k;
 }
 
@@ -12800,6 +14680,78 @@ void GIPC::computeXTilta(device_TetraData& TetMesh, const double& rate)
                                             numbers);
 
     m_abd_system->cal_q_tilde(*m_abd_sim_data);
+}
+
+extern int total_Frames;   // file-scope frame counter (defined below); drives the stitch/soft target
+                           // (update_soft_constraint_target_position(total_Frames+1)) → MUST be in the
+                           // checkpoint or the restart's stitch target is for the wrong frame.
+
+// [decouple debug] full-state checkpoint. Persistent cross-frame state only (friction/contact is
+// ephemeral, rebuilt each step from positions): FEM vertexes/o_vertexes/velocities/xTilta +
+// ABD q/q_prev/q_v + Kappa + total_Frames. Binary: [magic u32][vN u32][nb u32][4*vN double3 FEM]
+// [3*nb Vector12 ABD][Kappa double][total_Frames i32]. Load restores them → next step() bit-identical.
+void GIPC::save_checkpoint(device_TetraData& tm, const char* path)
+{
+    const int vN = (int)vertexNum;
+    const int nb = (int)abd_fem_count_info.abd_body_num;
+    std::vector<double3> hv(vN), ho(vN), hvel(vN), hxt(vN);
+    CUDA_SAFE_CALL(cudaMemcpy(hv.data(),   tm.vertexes,   vN*sizeof(double3), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(ho.data(),   tm.o_vertexes, vN*sizeof(double3), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(hvel.data(), tm.velocities, vN*sizeof(double3), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(hxt.data(),  tm.xTilta,     vN*sizeof(double3), cudaMemcpyDeviceToHost));
+    std::vector<double> hq(12*nb), hqp(12*nb), hqv(12*nb);
+    if(nb > 0 && m_abd_sim_data)
+    {
+        auto& d = m_abd_sim_data->device;
+        CUDA_SAFE_CALL(cudaMemcpy(hq.data(),  reinterpret_cast<const double*>(d.body_id_to_q.data()),      12*nb*sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(hqp.data(), reinterpret_cast<const double*>(d.body_id_to_q_prev.data()), 12*nb*sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(hqv.data(), reinterpret_cast<const double*>(d.body_id_to_q_v.data()),    12*nb*sizeof(double), cudaMemcpyDeviceToHost));
+    }
+    FILE* f = fopen(path, "wb");
+    if(!f) { printf("[ckpt] cannot open %s for write\n", path); return; }
+    uint32_t magic = 0x53544B50u, uvN = (uint32_t)vN, unb = (uint32_t)nb;
+    fwrite(&magic,1,4,f); fwrite(&uvN,1,4,f); fwrite(&unb,1,4,f);
+    fwrite(hv.data(),sizeof(double3),vN,f); fwrite(ho.data(),sizeof(double3),vN,f);
+    fwrite(hvel.data(),sizeof(double3),vN,f); fwrite(hxt.data(),sizeof(double3),vN,f);
+    fwrite(hq.data(),sizeof(double),12*nb,f); fwrite(hqp.data(),sizeof(double),12*nb,f);
+    fwrite(hqv.data(),sizeof(double),12*nb,f);
+    fwrite(&Kappa,sizeof(double),1,f);
+    fwrite(&total_Frames,sizeof(int),1,f);
+    fclose(f);
+    printf("[ckpt] saved %s (vN=%d nb=%d Kappa=%.6e total_Frames=%d)\n", path, vN, nb, Kappa, total_Frames);
+}
+
+void GIPC::load_checkpoint(device_TetraData& tm, const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if(!f) { printf("[ckpt] cannot open %s for read\n", path); return; }
+    uint32_t magic=0, uvN=0, unb=0;
+    size_t rd = fread(&magic,1,4,f); rd += fread(&uvN,1,4,f); rd += fread(&unb,1,4,f);
+    if(magic != 0x53544B50u || (int)uvN != (int)vertexNum || (int)unb != (int)abd_fem_count_info.abd_body_num)
+    { printf("[ckpt] MISMATCH magic=%x vN=%u(exp %u) nb=%u(exp %u)\n", magic, uvN, (uint32_t)vertexNum, unb, (uint32_t)abd_fem_count_info.abd_body_num); fclose(f); return; }
+    const int vN = (int)uvN, nb = (int)unb;
+    std::vector<double3> hv(vN), ho(vN), hvel(vN), hxt(vN);
+    std::vector<double> hq(12*nb), hqp(12*nb), hqv(12*nb); double kap=0;
+    rd += fread(hv.data(),sizeof(double3),vN,f); rd += fread(ho.data(),sizeof(double3),vN,f);
+    rd += fread(hvel.data(),sizeof(double3),vN,f); rd += fread(hxt.data(),sizeof(double3),vN,f);
+    rd += fread(hq.data(),sizeof(double),12*nb,f); rd += fread(hqp.data(),sizeof(double),12*nb,f);
+    rd += fread(hqv.data(),sizeof(double),12*nb,f);
+    rd += fread(&kap,sizeof(double),1,f);
+    int tf = 0; rd += fread(&tf,sizeof(int),1,f); fclose(f); (void)rd;
+    CUDA_SAFE_CALL(cudaMemcpy(tm.vertexes,   hv.data(),   vN*sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(tm.o_vertexes, ho.data(),   vN*sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(tm.velocities, hvel.data(), vN*sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(tm.xTilta,     hxt.data(),  vN*sizeof(double3), cudaMemcpyHostToDevice));
+    if(nb > 0 && m_abd_sim_data)
+    {
+        auto& d = m_abd_sim_data->device;
+        CUDA_SAFE_CALL(cudaMemcpy(reinterpret_cast<double*>(d.body_id_to_q.data()),      hq.data(),  12*nb*sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(reinterpret_cast<double*>(d.body_id_to_q_prev.data()), hqp.data(), 12*nb*sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(reinterpret_cast<double*>(d.body_id_to_q_v.data()),    hqv.data(), 12*nb*sizeof(double), cudaMemcpyHostToDevice));
+    }
+    Kappa = kap;
+    total_Frames = tf;
+    printf("[ckpt] loaded %s (vN=%d nb=%d Kappa=%.6e total_Frames=%d)\n", path, vN, nb, Kappa, total_Frames);
 }
 
 
@@ -12880,14 +14832,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     initKappa(TetMesh);
     //Kappa = 1e4;
 #ifdef USE_FRICTION
-    CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, h_cpNum[0] * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, h_cpNum[0] * sizeof(double2)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&tanBasis, h_cpNum[0] * sizeof(__GEIGEN__::Matrix3x2d)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, h_cpNum[0] * sizeof(int4)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex_last, h_cpNum[0] * sizeof(int)));
-
-    CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, h_gpNum * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd, h_gpNum * sizeof(uint32_t)));
+    ensure_frictionBuffers();  // [0be8da3-port] grow-only, no per-frame malloc
     buildFrictionSets();
 #endif
     animation_fullRate = animation_subRate;
@@ -12931,37 +14876,13 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
         //computeXTilta(TetMesh, 1);
 #ifdef USE_FRICTION
-        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
-        CUDA_SAFE_CALL(cudaFree(distCoord));
-        CUDA_SAFE_CALL(cudaFree(tanBasis));
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
-        CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
-
-        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
-
-        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, h_cpNum[0] * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, h_cpNum[0] * sizeof(double2)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&tanBasis,
-                                  h_cpNum[0] * sizeof(__GEIGEN__::Matrix3x2d)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, h_cpNum[0] * sizeof(int4)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex_last, h_cpNum[0] * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, h_gpNum * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd,
-                                  h_gpNum * sizeof(uint32_t)));
+        ensure_frictionBuffers();  // [0be8da3-port] grow-only, no sub-iter realloc
         buildFrictionSets();
 #endif
     }
 
 #ifdef USE_FRICTION
-    CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
-    CUDA_SAFE_CALL(cudaFree(distCoord));
-    CUDA_SAFE_CALL(cudaFree(tanBasis));
-    CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
-    CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
-
-    CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
-    CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
+    // [0be8da3-port] friction buffers persist across frames; freed in FREE_DEVICE_MEM.
 #endif
 
     updateVelocities(TetMesh);

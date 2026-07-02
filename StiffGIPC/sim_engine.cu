@@ -340,6 +340,50 @@ void SimEngine::set_body_groups(const std::vector<int>& groups)
     m_impl->tetMesh.body_groups = groups;
 }
 
+void SimEngine::set_env_offsets(const std::vector<double>& per_group_xyz)
+{
+    auto& tm  = m_impl->tetMesh;
+    auto& ipc = m_impl->ipc;
+    if(ipc.d_env_offset == nullptr)
+    {
+        printf("[env-offset] WARNING: call set_env_offsets() AFTER finalize() (d_env_offset not allocated)\n");
+        return;
+    }
+    int          G   = (int)per_group_xyz.size() / 3;
+    const auto&  p2b = tm.point_id_to_body_id;          // point -> body
+    const auto&  bg  = tm.body_groups;                  // body  -> group
+    int          n   = ipc.vertexNum;
+    std::vector<double3> off(n, make_double3(0.0, 0.0, 0.0));
+    for(int v = 0; v < n && v < (int)p2b.size(); ++v)
+    {
+        int b = p2b[v];
+        int g = (b >= 0 && b < (int)bg.size()) ? bg[b] : -1;
+        if(g >= 0 && g < G)
+            off[v] = make_double3(per_group_xyz[3 * g + 0],
+                                  per_group_xyz[3 * g + 1],
+                                  per_group_xyz[3 * g + 2]);
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(ipc.d_env_offset, off.data(),
+                              n * sizeof(double3), cudaMemcpyHostToDevice));
+    if(::g_gipc_log_level >= 1)
+        printf("[env-offset] uploaded per-vertex offsets: %d groups, %d verts\n", G, n);
+}
+
+void SimEngine::get_point_groups(int* out, int count) const
+{
+    // [decouple] per-vertex env/group id in INPUT order (== get_vertex_positions order):
+    // out[v] = body_groups[point_id_to_body_id[v]]. -1 if ungrouped/unknown. Host-side, no GPU.
+    const auto& p2b = m_impl->tetMesh.point_id_to_body_id;   // input order, point -> body
+    const auto& bg  = m_impl->tetMesh.body_groups;           // body -> group (may be empty)
+    int n = std::min(count, static_cast<int>(p2b.size()));
+    for(int v = 0; v < n; ++v)
+    {
+        int b = p2b[v];
+        out[v] = (b >= 0 && b < static_cast<int>(bg.size())) ? bg[b] : -1;
+    }
+    for(int v = n; v < count; ++v) out[v] = -1;
+}
+
 void SimEngine::set_vertex_env_ids(const std::vector<int>& env_ids)
 {
     // [multi-env subscene] Per-VERTEX env id -> broad-phase skips contact pairs
@@ -836,6 +880,34 @@ void SimEngine::Impl::do_initFEM()
 
     tetMesh.meanMass  = massSum / tetMesh.vertexNum;
     tetMesh.meanVolum = volumeSum / tetMesh.vertexNum;
+    // [batch-size determinism] meanMass sets κ's scale (suggestKappa ∝ meanMass). The global massSum
+    // is a serial FP sum over ALL envs' primitives → varies at ~1e-14 with the env COUNT → seeds κ →
+    // chaos-amplifies → env_0 not batch-SIZE invariant. Under STIFF_DECOUPLE_THRESH recompute meanMass
+    // (and meanVolum) as the INTENSIVE per-vertex mean of ONE env (all envs identical, env-major
+    // contiguous layout) → N-invariant by construction. Falls back to the global mean if ungrouped.
+    if(getenv("STIFF_DECOUPLE_THRESH") && !tetMesh.body_groups.empty()
+       && (int)tetMesh.point_id_to_body_id.size() == tetMesh.vertexNum)
+    {
+        // env_0's verts = { v : body_groups[point_id_to_body_id[v]] == 0 }. The vertex layout is NOT
+        // env-major contiguous (bodies grouped by type, not env), so we must select by the group map,
+        // not by slicing the first block. env_0's per-vertex-mass mean is the intensive κ scale,
+        // identical regardless of env count → batch-SIZE invariant.
+        double m0 = 0.0;
+        long   c0 = 0;
+        for(int v = 0; v < tetMesh.vertexNum; v++)
+        {
+            int b = tetMesh.point_id_to_body_id[v];
+            int g = (b >= 0 && b < (int)tetMesh.body_groups.size()) ? tetMesh.body_groups[b] : -1;
+            if(g == 0) { m0 += tetMesh.masses[v]; c0++; }
+        }
+        if(c0 > 0)
+        {
+            double new_mean = m0 / (double)c0;
+            printf("[batch-inv] meanMass env0(group0, %ld verts)=%.17g (global was %.17g)\n",
+                   c0, new_mean, tetMesh.meanMass);
+            tetMesh.meanMass = new_mean;
+        }
+    }
 }
 
 // ---------- MAS partition (from gl_main.cu::setMAS_partition) ----------
@@ -1457,6 +1529,15 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     if(!tetMesh.joint_constraints.empty() || !tetMesh.prismatic_constraints.empty())
         ipc.init_joint_constraints_from_mesh(tetMesh);
 
+    // [env-det] enable env-major Morton on the merged BVH so co-located identical envs build
+    // env-blocked (mirror) trees ⇒ env-symmetric broad-phase enumeration (the last bit-identity layer).
+    if(getenv("STIFF_BVH_ENVDET")) ipc.enableEnvMajorBVH(d_tetMesh.d_point_to_group);
+    // [multi-env P2] enable per-env BVH EAGERLY (before warm-start buildCP) so the warm-start uses
+    // per-env LOCAL trees too — else the warm-start runs the merged path and (at spacing>0) injects
+    // the offset-overlap divergence that all later frames inherit. Per-env trees use local verts ⇒
+    // bit-identical at any spacing (render separation becomes a pure display offset).
+    if(getenv("STIFF_PERENV_BVH") && d_tetMesh.d_point_to_group)
+    { ipc.m_perenv_bvh = true; ipc.m_d_p2g = d_tetMesh.d_point_to_group; }
     // Build collision pairs + solver warm-start (mirrors gl_main.cu post-init)
     ipc.buildCP();
     ipc._moveDir          = ipc.pcg_data.dx;
@@ -2510,7 +2591,9 @@ void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,
     double3* d_grad = nullptr;
     CUDA_SAFE_CALL(cudaMalloc(&d_grad, nv * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMemset(d_grad, 0, nv * sizeof(double3)));
-    g.calBarrierGradient(d_grad, g.Kappa);    // body-body (DCD) contact force per vertex
+    g.zeroBinnedGrad();                       // [4.3] calBarrierGradient scatters to binned buf
+    g.calBarrierGradient(d_grad, g.Kappa);    // body-body (DCD) contact force per vertex (→ binned)
+    g.combineBinnedGrad(d_grad);              // [4.3] fold binned contact force into d_grad
     g.computeGroundGradient(d_grad, g.Kappa); // ground half-plane contact force per vertex
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -2713,7 +2796,9 @@ void SimEngine::get_pair_contact_force(int a_off, int a_cnt, int b_off, int b_cn
     uint32_t saved_cpNum = g.h_cpNum[0];
     g._collisonPairs = d_filtered;
     g.h_cpNum[0]     = static_cast<uint32_t>(filtered.size());
+    g.zeroBinnedGrad();                      // [4.3] calBarrierGradient scatters to binned buf
     g.calBarrierGradient(d_grad, g.Kappa);
+    g.combineBinnedGrad(d_grad);             // [4.3] fold binned contact force into d_grad
     g._collisonPairs = saved_pairs;
     g.h_cpNum[0]     = saved_cpNum;
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -2926,7 +3011,9 @@ void SimEngine::get_body_contact_force_batched(const int* h_offsets,
         s_grad_cap = nv;
     }
     CUDA_SAFE_CALL(cudaMemset(s_d_grad, 0, nv * sizeof(double3)));
-    g.calBarrierGradient(s_d_grad, g.Kappa);   // atomic-adds contact force per vertex
+    g.zeroBinnedGrad();                          // [4.3] calBarrierGradient scatters to binned buf
+    g.calBarrierGradient(s_d_grad, g.Kappa);     // contact force per vertex (→ binned accumulator)
+    g.combineBinnedGrad(s_d_grad);               // [4.3] fold binned contact force into s_d_grad
 
     static int*    s_d_off = nullptr;
     static int*    s_d_cnt = nullptr;
@@ -3726,4 +3813,14 @@ double SimEngine::get_total_pcg_iters() const        { return total_Cg_count; }
 double SimEngine::get_total_collision_pairs() const  { return totalCollisionPairs; }
 double SimEngine::get_max_collision_pairs() const    { return maxCOllisionPairNum; }
 int    SimEngine::get_total_frames_done() const      { return total_Frames; }
+
+void SimEngine::save_checkpoint(const std::string& path)
+{
+    m_impl->ipc.save_checkpoint(m_impl->d_tetMesh, path.c_str());
+}
+
+void SimEngine::load_checkpoint(const std::string& path)
+{
+    m_impl->ipc.load_checkpoint(m_impl->d_tetMesh, path.c_str());
+}
 }  // namespace gipc

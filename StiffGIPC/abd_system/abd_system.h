@@ -64,6 +64,18 @@ class ABDSystem
     muda::DeviceDoubletVector<double, 12> doublet_system_gradient;
     muda::DeviceBuffer<Matrix12x12>       abd_system_diag_preconditioner;
 
+    // [multi-env determinism 4.3] binned accumulators for the ABD assembly (system_gradient,
+    // body_hessian, wrench) — replace muda atomic_add with order-independent binned deposits
+    // so the every-frame arm solve is deterministic. Raw device ptrs (lazily grown); the
+    // assembly kernels reach them via g_abd_* device globals (set by memcpyToSymbol).
+    double* m_abd_sysbin    = nullptr; size_t m_abd_sysbin_cap    = 0;
+    double* m_abd_hessbin   = nullptr; size_t m_abd_hessbin_cap   = 0;
+    double* m_abd_wrenchbin = nullptr; size_t m_abd_wrenchbin_cap = 0;
+    // [4.3] reused scratch for the SETUP-time mass binning (unique_point_mass / body_mass /
+    // mass_center / dyadic / volume — the ABD mass matrix M root). Sized per-quantity.
+    double* m_massbin       = nullptr; size_t m_massbin_cap       = 0;
+    void _massbin_prep(size_t total_components);   // grow+zero+bind g_massbin
+
     muda::DeviceBuffer<Vector3> body_mass_center;
     muda::DeviceBuffer<Float>   body_mass;
     muda::DeviceBuffer<int>     body_unique_point_count;
@@ -292,6 +304,15 @@ class ABDSystem
                                            muda::CBufferView<double3> vertex_barrier_gradient,
                                            GIPCTripletMatrix& global_triplets);
 
+    // [multi-env determinism 4.3] open/close the ABD binned accumulators (zero+bind globals /
+    // combine back into system_gradient + abd_body_hessian). Bracket the coupling-gradient
+    // funcs (joint/driving/stitch/barrier) which scatter via atomic_add → binned.
+    void _abd_binned_open(ABDSimData& sim_data);
+    void _abd_binned_close(ABDSimData& sim_data);
+    // [4.3] bracket for the FEM-pin → ABD coupling (GIPC.cu): reuse m_abd_sysbin to bin that
+    // atomic_add too. n_dofs = system_gradient.size(). close combines += system_gradient.
+    void couple_bin_open(int n_dofs);
+    void couple_bin_close(int n_dofs);
     void _cal_abd_body_gradient_and_hessian(ABDSimData& sim_data);
     void _cal_abd_system_barrier_gradient(ABDSimData& sim_data,
                                           muda::CBufferView<double3> vertex_barrier_gradient);

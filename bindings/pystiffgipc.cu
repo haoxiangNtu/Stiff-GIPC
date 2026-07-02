@@ -209,6 +209,11 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("groups"))
         .def("set_vertex_env_ids", &SimEngine::set_vertex_env_ids,
              py::arg("env_ids"))
+        .def("set_env_offsets", &SimEngine::set_env_offsets,
+             py::arg("per_group_xyz"),
+             "[multi-env] per-group world offset (flat xyz, 3 per group). Engine expands "
+             "per-vertex; BVH separates envs while narrow-phase stays local (deterministic). "
+             "Call after finalize(); keep up-axis component 0.")
         .def("add_ground_collision_skip", &SimEngine::add_ground_collision_skip,
              py::arg("body_id"))
         .def("add_stitch_spring",
@@ -397,6 +402,15 @@ PYBIND11_MODULE(pystiffgipc, m)
             return arr;
         })
 
+        // [decouple] per-vertex env/group id aligned to get_vertices() order. -1 = ungrouped.
+        // verts[groups==g] extracts env g's vertices regardless of the engine's type-grouped layout.
+        .def("get_point_groups", [](const SimEngine& e) {
+            int n = e.get_vertex_count();
+            auto arr = py::array_t<int>(n);
+            e.get_point_groups(arr.mutable_data(), n);
+            return arr;
+        })
+
         // Vertex velocities as numpy array (N, 3) float64
         .def("get_vertex_velocities", [](const SimEngine& e) {
             int n = e.get_vertex_count();
@@ -423,6 +437,10 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         // Teleport FEM vertices: writes _vertexes, o_vertexes, xTilta and
         // (optionally) velocities. See sim_engine.h for rationale.
+        // Full-state checkpoint: deterministic mid-trajectory restart (FEM+ABD+Kappa state).
+        .def("save_checkpoint", [](SimEngine& e, const std::string& path) { e.save_checkpoint(path); }, py::arg("path"))
+        .def("load_checkpoint", [](SimEngine& e, const std::string& path) { e.load_checkpoint(path); }, py::arg("path"))
+
         .def("teleport_fem_vertices", [](SimEngine& e,
                 py::array_t<double, py::array::c_style | py::array::forcecast> positions,
                 py::object velocities) {

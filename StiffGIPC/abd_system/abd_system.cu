@@ -15,9 +15,50 @@
 #include <gipc/utils/host_log.h>
 #include <abd_system/abd_trimesh_utils.h>
 #include <abd_system/abd_jacobi_matrix.h>
+#include <linear_system/utils/binned_reduce.cuh>
+
+// [multi-env determinism 4.3] device global + combine kernels for the SETUP-time ABD mass
+// binning (the M root). g_massbin is a reused scratch (one quantity at a time, sequential).
+__device__ double* g_massbin = nullptr;
 
 namespace gipc
 {
+// combine binned scratch into a strided scalar target: out[e] = combine(bin[(e*stride+off)]).
+__global__ void _mb_comb_strided(double* out, const double* bin, int n, int stride, int off)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if(e >= n) return;
+    out[e] = binned_combine(bin + ((size_t)e * stride + off) * BINNED_K);
+}
+// combine into body_mass_center (Vector3 per body), interleaved at stride 4, off 1.
+__global__ void _mb_comb_center(double* c3, const double* bin, int nb)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if(b >= nb) return;
+    for(int c = 0; c < 3; ++c)
+        c3[b * 3 + c] = binned_combine(bin + ((size_t)b * 4 + 1 + c) * BINNED_K);
+}
+// combine into the dyadic mass struct (13 comps: m_mass, x_bar(3), dyadic(9)).
+__global__ void _mb_comb_dyadic(ABDJacobiDyadicMass* M, const double* bin, int nb)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if(b >= nb) return;
+    M[b].ref_mass() = binned_combine(bin + ((size_t)b * 13 + 0) * BINNED_K);
+    for(int c = 0; c < 3; ++c)
+        M[b].ref_mx()(c) = binned_combine(bin + ((size_t)b * 13 + 1 + c) * BINNED_K);
+    for(int i = 0; i < 3; ++i)
+        for(int j = 0; j < 3; ++j)
+            M[b].ref_mxx()(i, j) =
+                binned_combine(bin + ((size_t)b * 13 + 4 + i * 3 + j) * BINNED_K);
+}
+void ABDSystem::_massbin_prep(size_t total_components)
+{
+    size_t need = total_components * BINNED_K;
+    if(need > m_massbin_cap)
+    { if(m_massbin) cudaFree(m_massbin); cudaMalloc((void**)&m_massbin, need * sizeof(double)); m_massbin_cap = need; }
+    cudaMemset(m_massbin, 0, need * sizeof(double));
+    cudaMemcpyToSymbol(g_massbin, &m_massbin, sizeof(double*));
+}
 void ABDSystem::init_system(ABDSimData& sim_data)
 {
     _setup_system(true, sim_data);
@@ -96,7 +137,7 @@ void ABDSystem::_setup_system(bool init, ABDSimData& data)
                          abd.body_id_to_dq);
 
         // DIAG: verify F=I after _setup_abd_state
-        if(getenv("STIFF_ABD_DBG") && abd_body_count > 0)
+        if(abd_body_count > 0)
         {
             using Vec12 = Eigen::Matrix<double, 12, 1>;
             int n = std::min((size_t)3, abd_body_count);
@@ -176,6 +217,7 @@ void ABDSystem::_setup_unique_point_mass(size_t unique_point_count,
     using namespace muda;
 
     unique_point_mass.resize(unique_point_count, 0);
+    _massbin_prep((size_t)unique_point_count);   // [4.3] deterministic mass scatter
     ParallelFor()
         .kernel_name(__FUNCTION__)
         .apply(tets.size(),
@@ -192,9 +234,11 @@ void ABDSystem::_setup_unique_point_mass(size_t unique_point_count,
                    {
                        auto point_id = tet_points(j);
                        auto unique_point_id = point_id_to_unique_point_id(point_id);
-                       atomic_add(&unique_point_mass(unique_point_id), mass / 4);
+                       binned_deposit(g_massbin + (size_t)unique_point_id * BINNED_K, mass / 4);
                    }
                });
+    { int n = (int)unique_point_count, bs = 256, gs = (n + bs - 1) / bs;
+      _mb_comb_strided<<<gs, bs>>>(unique_point_mass.data(), m_massbin, n, 1, 0); }   // [4.3] combine
 }
 
 void ABDSystem::_calculate_body_mass_center(size_t body_count,
@@ -206,6 +250,7 @@ void ABDSystem::_calculate_body_mass_center(size_t body_count,
     using namespace muda::parallel;
     body_mass.resize(body_count, 0);
     body_mass_center.resize(body_count, Vector3::Zero());
+    _massbin_prep((size_t)body_count * 4);   // [4.3] mass(1)+center(3) per body, deterministic
 
     // TODO: maybe we can use a parallel reduce here
     ParallelFor()
@@ -223,9 +268,13 @@ void ABDSystem::_calculate_body_mass_center(size_t body_count,
                    auto    pos      = unique_point_position(i);
                    auto    body_id  = unique_point_id_to_body_id(i);
                    Vector3 mass_pos = mass * eigen::as_eigen(pos);
-                   atomic_add(&body_mass(body_id), mass);
-                   eigen::atomic_add(body_mass_center(body_id), mass_pos);
+                   binned_deposit(g_massbin + ((size_t)body_id * 4 + 0) * BINNED_K, mass);
+                   for(int c = 0; c < 3; ++c)
+                       binned_deposit(g_massbin + ((size_t)body_id * 4 + 1 + c) * BINNED_K, mass_pos(c));
                });
+    { int bs = 256, gs = ((int)body_count + bs - 1) / bs;   // [4.3] combine mass + center
+      _mb_comb_strided<<<gs, bs>>>(body_mass.data(), m_massbin, (int)body_count, 4, 0);
+      _mb_comb_center<<<gs, bs>>>((double*)body_mass_center.data(), m_massbin, (int)body_count); }
 
     ParallelFor()
         .file_line(__FILE__, __LINE__)
@@ -595,6 +644,7 @@ void ABDSystem::_setup_abd_dyadic_mass(size_t affine_body_count,
     using namespace muda;
     using namespace muda::parallel;
     abd_dyadic_mass.resize(affine_body_count, ABDJacobiDyadicMass::zero());
+    _massbin_prep((size_t)affine_body_count * 13);   // [4.3] dyadic mass (13 comps/body) deterministic
     // TODO: maybe we can use a parallel reduce here
     ParallelFor()
         .file_line(__FILE__, __LINE__)
@@ -605,10 +655,19 @@ void ABDSystem::_setup_abd_dyadic_mass(size_t affine_body_count,
                     abd_dyadic_mass.viewer().name("abd_dyadic_mass")] __device__(int i) mutable
                {
                    auto  body_id = tet_id_to_body_id(i);
-                   auto& dst     = abd_dyadic_mass(body_id);
                    auto& src     = tet_dyadic_mass(i);
-                   ABDJacobiDyadicMass::atomic_add(dst, src);
+                   // [4.3] deterministic deposit of the 13 dyadic-mass components
+                   binned_deposit(g_massbin + ((size_t)body_id * 13 + 0) * BINNED_K, src.cref_mass());
+                   for(int c = 0; c < 3; ++c)
+                       binned_deposit(g_massbin + ((size_t)body_id * 13 + 1 + c) * BINNED_K,
+                                      src.cref_mx()(c));
+                   for(int ii = 0; ii < 3; ++ii)
+                       for(int jj = 0; jj < 3; ++jj)
+                           binned_deposit(g_massbin + ((size_t)body_id * 13 + 4 + ii * 3 + jj) * BINNED_K,
+                                          src.cref_mxx()(ii, jj));
                });
+    { int bs = 256, gs = ((int)affine_body_count + bs - 1) / bs;   // [4.3] combine dyadic
+      _mb_comb_dyadic<<<gs, bs>>>(abd_dyadic_mass.data(), m_massbin, (int)affine_body_count); }
 
     abd_dyadic_mass_inv.resize(affine_body_count);
     Transform()
@@ -640,6 +699,7 @@ void ABDSystem::_setup_abd_volume(size_t                     affine_body_count,
     using namespace muda;
     using namespace muda::parallel;
     abd_volume.resize(affine_body_count, 0);
+    _massbin_prep((size_t)affine_body_count);   // [4.3] deterministic volume scatter
     ParallelFor()
         .kernel_name(__FUNCTION__)
         .apply(tet_id_to_body_id.size(),
@@ -649,8 +709,10 @@ void ABDSystem::_setup_abd_volume(size_t                     affine_body_count,
                {
                    auto body_id = tet_id_to_body_id(i);
                    auto volume  = tet_volumes(i);
-                   muda::atomic_add(&abd_volume(body_id), volume);
+                   binned_deposit(g_massbin + (size_t)body_id * BINNED_K, volume);
                });
+    { int n = (int)affine_body_count, bs = 256, gs = (n + bs - 1) / bs;   // [4.3] combine volume
+      _mb_comb_strided<<<gs, bs>>>(abd_volume.data(), m_massbin, n, 1, 0); }
 }
 
 void ABDSystem::_setup_tet_abd_gravity_force(const Vector3& gravity,
@@ -699,6 +761,7 @@ void ABDSystem::_setup_abd_gravity(muda::CBufferView<Vector12> tet_abd_gravity_f
     using namespace muda;
     using namespace muda::parallel;
     m_temp_abd_gravity_force.resize(affine_body_count, Vector12::Zero());
+    _massbin_prep((size_t)affine_body_count * 12);   // [4.3] deterministic gravity-force scatter
 
     // TODO: maybe we can use a parallel reduce here
     ParallelFor()
@@ -711,11 +774,11 @@ void ABDSystem::_setup_abd_gravity(muda::CBufferView<Vector12> tet_abd_gravity_f
                     "abd_gravity_force")] __device__(int i) mutable
                {
                    auto     body_id = tet_id_to_body_id(i);
-                   auto&    dst     = abd_gravity_force(body_id);
                    Vector12 src     = tet_abd_gravity_force(i);
-
-                   muda::eigen::atomic_add(dst, src);
+                   bin_add12(g_massbin, body_id, src);   // [4.3] deterministic
                });
+    { int n = (int)affine_body_count * 12, bs = 256, gs = (n + bs - 1) / bs;   // [4.3] combine gravity
+      _mb_comb_strided<<<gs, bs>>>((double*)m_temp_abd_gravity_force.data(), m_massbin, n, 1, 0); }
 
     abd_gravity.resize(affine_body_count);
     Transform()

@@ -29,12 +29,71 @@ class GIPC
     bool      animation      = false;
     double3*  _vertexes      = nullptr;
     double3*  _rest_vertexes = nullptr;
+    // [multi-env determinism 4.1+4.2] per-vertex env offset (default 0). The BVH builds on
+    // d_bvh_vertexes = _vertexes + d_env_offset (envs spatially separated → efficient
+    // broad-phase), while narrow-phase/CCD/solve read local _vertexes (identical per env →
+    // deterministic). Zero offset ⇒ d_bvh_vertexes == _vertexes ⇒ no behavior change.
+    double3*  d_env_offset   = nullptr;
+    double3*  d_bvh_vertexes = nullptr;
+    // [multi-env P2 / per-env BVH] per-env face/edge index lists (the BVH _active_idx subset).
+    // Faces/edges grouped by env via d_point_to_group[face.x]; per-env [offset,count) so the
+    // BVH Construct/Detect can be looped per env on LOCAL _vertexes (full precision, no cross-
+    // env candidates) — the root fix for cross-env divergence. Built once (topology static).
+    int*              d_perenv_face_idx = nullptr;   // face indices, env-contiguous
+    int*              d_perenv_edge_idx = nullptr;   // edge indices, env-contiguous
+    std::vector<int>  h_perenv_face_off, h_perenv_face_cnt;  // per-env [off,cnt) into face_idx
+    std::vector<int>  h_perenv_edge_off, h_perenv_edge_cnt;
+    std::vector<int>  h_perenv_active;               // env ids with ≥1 face or edge (skip empty NG slots)
+    int               m_perenv_bvh_groups = 0;       // NG once built; 0 = not built
+    bool              m_perenv_bvh = false;          // STIFF_PERENV_BVH gate
+    // [perenv-parallel #1] scratch pool for CONCURRENT per-env BVH builds. Per env i we point-swap
+    // bvh_f/bvh_e's scratch to pool slot i%K and run Construct+Detect on stream i%K (Construct captures
+    // the swapped pointers at host-launch time, so different slots overlap; same-slot envs serialize on
+    // the same stream). Shared I/O (verts/edges/_collisionPair/_cpNum...) stays on bvh_f/bvh_e.
+    struct BvhScratch { Node* nodes=nullptr; AABB* bvs=nullptr; uint64_t* mch=nullptr;
+                        uint32_t* idx=nullptr; AABB* tmp=nullptr; uint32_t* flags=nullptr; int* node_env=nullptr;
+                        // [perenv-parallel #2] per-slot cub sort scratch: the Morton sort must not
+                        // cudaMalloc/cudaFree (device-wide syncs serialized the pool streams).
+                        void* sort_tmp=nullptr; size_t sort_bytes=0;
+                        uint64_t* mch_alt=nullptr; uint32_t* idx_alt=nullptr; int sort_cap=0; };
+    std::vector<BvhScratch>   m_pool_f, m_pool_e;
+    std::vector<cudaStream_t> m_pool_streams;
+    int               m_pool_K = 0;                  // 0 = pool not allocated
+    void allocPerEnvPool(int K);                     // alloc K scratch sets + streams (once)
+    const int*        m_d_p2g = nullptr;             // captured TetMesh.d_point_to_group (for lazy index build)
+    // [multi-env cross-env DIAGNOSTIC] find the upstream env-asymmetry seed: compare env0 vs env1
+    // (identical envs, local-frame coords) of any per-vertex buffer via a per-env local-id
+    // correspondence. STIFF_XENV gates. xenvDiff returns max|env0[k]-env1[k]|.
+    int*              d_xenv_lid     = nullptr;       // per-vertex local id within its env (-1 if env>1)
+    double*           d_xenv_buf     = nullptr;       // [2 * maxlocal * 3] scatter target
+    int               m_xenv_maxlocal = 0;
+    bool              m_xenv_ready    = false;
+    int*              m_d_vloc        = nullptr;  // [env-det] global->env-local vert id (canon tiebreak)
+    bool              m_vloc_built    = false;
+    double            xenvDiff(const double3* buf, const char* label);
+    void              xenvPairClassify(const int4* pairs, int n, const char* label);
+    int*              d_face_env = nullptr;
+    int*              d_edge_env = nullptr;
+    int*              d_face_localid = nullptr;
+    int*              d_edge_localid = nullptr;
+    uint32_t*         d_face_v0 = nullptr;
+    uint32_t*         d_edge_v0 = nullptr;
+    void              enableEnvMajorBVH(const int* p2g);
+    // [multi-env per-group κ] per-group barrier stiffness. The DYNAMIC κ doubling (postLineSearch
+    // Kappa*=2 on a GLOBAL close-contact bool) is the cross-env bifurcation coupling; per-group κ
+    // + per-group close-val decouples it. nullptr/false → scalar Kappa (baseline, bit-identical).
+    double*           m_kappa_group = nullptr;        // device [NG]
+    std::vector<double> h_kappa_group;                // host mirror [NG]
+    bool              m_pergroup_kappa = false;       // STIFF_PERGROUP_KAPPA gate
+    int*              m_d_close_grp = nullptr;        // device [NG] per-group close-val isChange flag
+    // [multi-env determinism 4.3] binned (reproducible) FP accumulator for the contact+friction
+    // gradient: K bins per (vertex,component), each an EXACT fixed-point slice of one exponent
+    // band. Atomic deposits are order-independent (each bin's adds are exact) ⇒ bit-identical
+    // run-to-run AND across identical envs, with full dynamic range (no single-scale overflow).
+    // Layout: ((v*3 + comp)*BINNED_K + k). Combined back into contact_grads each Newton iter.
+    double*   g_grad_binned  = nullptr;
     uint3*    _faces         = nullptr;
     uint2*    _edges         = nullptr;
-
-    // [Step B] grow-only per-vertex scratch for the contact-force export hook
-    double3*  _ec_grad_scratch = nullptr;
-    int       _ec_scratch_cap  = 0;
     uint32_t* _surfVerts     = nullptr;
 
 
@@ -100,10 +159,6 @@ class GIPC
     double   dHat          = 0.0;
     double   fDhat         = 0.0;
     double   bboxDiagSize2 = 0.0;
-    // Effective bbox^2 = bboxDiagSize2 normally, but when absolute_dhat>0 it is the
-    // FIXED, env-count-independent value (absolute_dhat^2/relative_dhat^2). Reused by the
-    // Newton convergence threshold so convergence is consistent across num_envs.
-    double   eff_bboxDiagSize2 = 0.0;
     double   relative_dhat = 0.0;
     // Absolute contact distance (meters). >0 overrides the scene-bbox-derived
     // dHat so the contact thickness does NOT inflate with scene/env count.
@@ -133,6 +188,29 @@ class GIPC
     double*   lambda_lastH_scalar_gd  = nullptr;
     uint32_t* _collisonPairs_lastH_gd = nullptr;
     uint32_t  h_gpNum_last;
+
+    // ②-D2H: persistent 9-slot device buffer for batched energy reductions.
+    // computeEnergy() previously did 9 blocking cudaMemcpy(D2H) — one per
+    // Energy_Add_Reduction_Algorithm call. Now each reduction writes its
+    // final scalar into m_energy_slots[i] via D2D (queued, async), then
+    // ONE blocking D2H grabs all 9 doubles at the end.
+    static constexpr int kEnergySlotCount = 9;
+    double* m_energy_slots = nullptr;
+    // ②-D2H: 2-slot device buffer for batching ground+self largestFeasibleStepSize
+    // reductions (called back-to-back at the top of each line search). One D2H
+    // of 2 doubles instead of 2 separate blocking D2Hs.
+    double* m_alpha_slots = nullptr;
+
+    // [0be8da3-port, grow-only] element capacities of the persistent friction /
+    // close-constraint buffers. cudaMalloc/cudaFree device-sync, so the per-step
+    // alloc/free choreography is replaced by grow-on-demand (25% headroom);
+    // capacity-sized upfront allocation was rejected: ~2GB standing VRAM at
+    // N=20 (22.4/24GB) would cut the max env count.
+    size_t m_fric_cp_cap  = 0;  // 5 cp-sized friction buffers
+    size_t m_fric_gd_cap  = 0;  // 2 ground-sized friction buffers
+    size_t m_close_gp_cap = 0;  // 2 gp-sized close buffers
+    size_t m_close_cp_cap = 0;  // 2 cp-sized close buffers
+    void   ensure_frictionBuffers();
 
     // [multi-env S1] per-env (per-group) feasible line-search step substrate.
     // d_env_alpha[g] = the largest feasible alpha for env g this Newton iter
@@ -273,6 +351,14 @@ class GIPC
     void buildCP();
     void buildFullCP(const double& alpha);
     void buildBVH();
+    // [multi-env P2] build the per-env face/edge index lists (once; topology static). NG = #groups.
+    void buildPerEnvBVHIndex(int NG, const int* d_point_to_group);
+    // [multi-env P2] per-env Construct+Detect loop (DCD). Replaces buildBVH()+buildCP() when
+    // m_perenv_bvh: each env builds its tree on LOCAL _vertexes via _active_idx, queries, appends.
+    void buildBVH_and_CP_perenv(double dHat);
+    // [multi-env P2] per-env CCD Construct+FullDetect loop (line-search feasible-alpha). Same
+    // idea on the swept BVH so the per-env feasible alpha is full-precision / per-env identical.
+    void buildBVH_and_CP_perenv_CCD(double alpha);
 
     AABB* calcuMaxSceneSize();
 
@@ -291,7 +377,13 @@ class GIPC
     // out_pair[i]=(bodyA,bodyB) (bodyB=-1 for ground) and out_force[i]=world
     // contact force (N) on bodyA. Returns count = h_cpNum[0] + h_gpNum.
     int exportContacts(int2* out_pair, double3* out_force);
-
+    // [Step B] scratch gradient for exportContacts (per-vertex, grow-only).
+    double3*  _ec_grad_scratch = nullptr;
+    int       _ec_scratch_cap  = 0;
+    // [4.3] binned-gradient helpers: zero before / combine after any barrier/friction
+    // gradient kernel (they scatter to the binned accumulator, not their _gradient arg).
+    void zeroBinnedGrad();
+    void combineBinnedGrad(double3* out);
     void calFrictionHessian(device_TetraData& TetMesh);
     void calFrictionGradient(double3* _gradient, device_TetraData& TetMesh);
 
@@ -321,6 +413,17 @@ class GIPC
     // [multi-env S3] per-env total energy E_g into env_out[kEnvAlphaSlots]
     // (host array). Validates Sum_g E_g == global computeEnergy. Returns global E.
     double computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>& env_out);
+    // [de-CPU S3] device-resident variant: per-env energies land in d_Eg[kEnvAlphaSlots] on DEVICE
+    // (same term kernels + a device combine replicating the host order/factors -> bit-identical
+    // values). NO D2H. Used by the S3 per-env backtrack decision kernel.
+    void computeEnergy_perenv_dev(device_TetraData& TetMesh, double* d_Eg);
+    // [de-CPU S3] shared term-launcher: fills the static pe_all slice block on device (layout in
+    // GIPC.cu) and reports whether per-env kappa rescale applies. Used by both variants above.
+    double* _launch_perenv_energy_terms(device_TetraData& TetMesh, bool& perenv_k_out);
+    // ②-D2H batched variants — write minValue (NOT 1.0/minValue) to slot.
+    // Caller does the 1.0/x and the m_skip_all_collision / numbers<1 guards.
+    void   ground_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, double* out_slot);
+    void   self_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, int numbers, double* out_slot);
 
     double ground_largestFeasibleStepSize(double slackness, double* mqueue);
 
@@ -380,16 +483,23 @@ class GIPC
     std::unique_ptr<gipc::ABDSystem>          m_abd_system;
     std::unique_ptr<gipc::GlobalLinearSystem> m_global_linear_system;
 
+    // [decouple debug] Full-state checkpoint: save/restore the cross-frame persistent state
+    // (FEM vertexes/o_vertexes/velocities/xTilta + ABD q/q_prev/q_v + Kappa) so a mid-trajectory
+    // restart is bit-identical (friction/contact is ephemeral, rebuilt each step from positions).
+    // Enables fast iteration on deep-grasp Hessian-FP debugging: checkpoint frame N once, then
+    // load+step frame N+1 repeatedly instead of replaying frames 0..N each time.
+    void save_checkpoint(device_TetraData& tm, const char* path);
+    void load_checkpoint(device_TetraData& tm, const char* path);
+
     // Pending per-body density overrides (body_id -> density), stashed by
     // SimEngine::set_abd_body_density before finalize. build_gipc_system
     // transfers these into m_abd_system right after it is created and before
     // the per-body mass setup runs.
     std::unordered_map<int, double>           m_pending_abd_density;
 
-    // Pending per-body inertial overrides (body_id -> {mass, com(9 doubles:
-    // com[3] + inertia[3x3 row-major 6 unique? no, 9])}). Stashed by
-    // SimEngine::set_abd_body_inertia before finalize; transferred to
-    // m_abd_system right after it is created.
+    // Pending per-body inertial overrides (body_id -> {mass, com[3],
+    // inertia[3x3 row-major]}). Stashed by SimEngine::set_abd_body_inertia
+    // before finalize; transferred to m_abd_system right after it is created.
     struct PendingInertia { double mass; double com[3]; double inertia[9]; };
     std::unordered_map<int, PendingInertia>   m_pending_abd_inertia;
 };

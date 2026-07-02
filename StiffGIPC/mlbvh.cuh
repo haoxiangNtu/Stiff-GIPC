@@ -17,11 +17,23 @@
 // reaches the cap are redirected to a trash slot (buffers allocated with +1), so
 // detection can never write out of bounds; the host then grows + redoes.
 void set_emit_caps(int dcd_cap, int ccd_cap);
-
-// [multi-env subscene] Point the broad-phase env filter at a device array of
-// per-vertex env ids (length = engine vertex count). Contact pairs whose two
-// vertices carry different (>=0) env ids are skipped. nullptr disables it.
+void set_ee_nodedup(int v);
+void set_ee_canon(int v);
+void set_ee_nomollify(int v);
+void set_ee_trace(int v);
+void set_ee_tgt(int a, int b);
+void set_bvh_envmajor(int v);
+void set_ee_detgate(int v);
+void set_bvh_envpart(int v);  // [env-part B] enable env-id subtree pruning in broad-phase
+void set_self_p2g(const int* p);  // [perenv-par] per-vertex env id; cross-env self-collision pairs skipped at emission (null = off)
+// [multi-env subscene, v0.6.7 API] alias of set_self_p2g — points the broad-phase
+// env filter at a device array of per-vertex env ids. nullptr disables.
 void mlbvh_set_vertex_env_id(const int* d_vertex_env_id);
+struct Node;
+void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint32_t* flags, int number, cudaStream_t stream = 0);
+void reset_max_stack();
+int get_max_stack();
+void set_ee_vloc(const int* p);
 
 struct AABB
 {
@@ -80,6 +92,26 @@ class lbvh
     // operates on n_active leaves instead of full face_number.
     int*      _active_idx           = nullptr;
     int       face_number_active    = 0;
+    // [env-det] per-prim env id (indexed by global prim index) for env-major Morton (merged path).
+    const int* m_prim_env           = nullptr;
+    const int* m_prim_localid       = nullptr;  // [env-det] env-local prim rank for Morton low bits
+    const double3* m_env_offset      = nullptr;  // [env-det] LIVE per-vertex env offset (read at build)
+    const uint32_t* m_prim_v0        = nullptr;  // [env-det] per-prim first vertex (static)
+    // [env-part B] per-NODE env id (size 2N-1): leaves = prim env, internal = uniform env or -1 (mixed).
+    // Computed when env-major. Lets the broad-phase prune other-env subtrees by env-id ⇒ no cross-env
+    // candidates (fast) while AABBs stay LOCAL (overlap mirror ⇒ bit-identical). Allocated in MALLOC.
+    int*       m_node_env            = nullptr;
+
+    // [perenv-parallel #2] cub radix-sort scratch (per instance / per pool slot, pre-allocated):
+    // the per-env active-path Morton sort must do NO cudaMalloc/cudaFree — thrust's internal
+    // alloc/free are device-wide syncs that serialized the per-env pool streams (the detect
+    // kernels could never overlap). Swapped by GIPC's pool swapIn alongside the other scratch.
+    void*     _sort_tmp       = nullptr;   // cub temp storage
+    size_t    _sort_tmp_bytes = 0;         // byte capacity of _sort_tmp
+    uint64_t* _mch_alt        = nullptr;   // out-of-place key buffer
+    uint32_t* _idx_alt        = nullptr;   // out-of-place value buffer
+    int       _sort_cap       = 0;         // element capacity of the alt buffers
+    void ensure_sort_scratch(int N);       // (re)alloc to fit N (syncing malloc; pre-size pool slots)
 
   public:
     lbvh() {}
@@ -111,11 +143,13 @@ class lbvh_f : public lbvh
                 const int& vertNum,
                 int*       collision_skip_matrix = nullptr,
                 int        collision_body_count  = 0);
-    double Construct();
+    double Construct(cudaStream_t stream = 0);
     AABB*  getSceneSize();
-    double ConstructFullCCD(const double3* moveDir, const double& alpha);
+    double ConstructFullCCD(const double3* moveDir, const double& alpha, cudaStream_t stream = 0,
+                            const double* alpha_dev = nullptr);
     void   SelfCollitionDetect(double dHat, cudaStream_t stream = 0);
-    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream = 0);
+    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
+                                 cudaStream_t stream = 0, const double* alpha_dev = nullptr);
 };
 
 class lbvh_e : public lbvh
@@ -139,10 +173,12 @@ class lbvh_e : public lbvh
                 const int& vertNum,
                 int*       collision_skip_matrix = nullptr,
                 int        collision_body_count  = 0);
-    double Construct();
-    double ConstructFullCCD(const double3* moveDir, const double& alpha);
+    double Construct(cudaStream_t stream = 0);
+    double ConstructFullCCD(const double3* moveDir, const double& alpha, cudaStream_t stream = 0,
+                            const double* alpha_dev = nullptr);
     void   SelfCollitionDetect(double dHat, cudaStream_t stream = 0);
-    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha, cudaStream_t stream = 0);
+    void SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
+                                 cudaStream_t stream = 0, const double* alpha_dev = nullptr);
 };
 
 __device__ void _d_PP(const double3& v0, const double3& v1, double& d);

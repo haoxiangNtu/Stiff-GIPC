@@ -10,10 +10,73 @@
 #include <gipc/utils/math.h>
 #include <gipc/utils/timer.h>
 #include "cuda_tools/cuda_tools.h"
+#include <linear_system/utils/binned_reduce.cuh>
+// [multi-env determinism 4.3] device globals for the ABD binned accumulators (set via
+// cudaMemcpyToSymbol from ABDSystem::m_abd_* before assembly; -rdc on). cal_q_tilde.cu uses
+// g_abd_wrenchbin via extern. The assembly kernels' atomic_add → bin_add* into these.
+__device__ double* g_abd_sysbin    = nullptr;
+__device__ double* g_abd_hessbin   = nullptr;
+__device__ double* g_abd_wrenchbin = nullptr;
 #include <fstream>
 #include <vector>
 namespace gipc
 {
+// [4.3] combine binned accumulators back into the ABD buffers (+= onto the body-func init).
+__global__ void _abd_sysbin_combine_k(double* g, const double* bin, int n)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if(d >= n) return;
+    g[d] += binned_combine(bin + (size_t)d * BINNED_K);
+}
+__global__ void _abd_hessbin_combine_k(Matrix12x12* H, const double* bin, int nb)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if(b >= nb) return;
+    for(int i = 0; i < 12; ++i)
+        for(int j = 0; j < 12; ++j)
+            H[b](i, j) += binned_combine(bin + ((size_t)b * 144 + i * 12 + j) * BINNED_K);
+}
+void ABDSystem::_abd_binned_open(ABDSimData& sim_data)
+{
+    int N = sim_data.abd_fem_count_info().abd_body_num;
+    if(N < 1) return;
+    size_t sg = (size_t)N * 12 * BINNED_K, hb = (size_t)N * 144 * BINNED_K;
+    if(sg > m_abd_sysbin_cap)
+    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg; }
+    if(hb > m_abd_hessbin_cap)
+    { if(m_abd_hessbin) cudaFree(m_abd_hessbin); cudaMalloc((void**)&m_abd_hessbin, hb * sizeof(double)); m_abd_hessbin_cap = hb; }
+    cudaMemset(m_abd_sysbin, 0, sg * sizeof(double));
+    cudaMemset(m_abd_hessbin, 0, hb * sizeof(double));
+    cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*));
+    cudaMemcpyToSymbol(g_abd_hessbin, &m_abd_hessbin, sizeof(double*));
+}
+void ABDSystem::_abd_binned_close(ABDSimData& sim_data)
+{
+    int N = sim_data.abd_fem_count_info().abd_body_num;
+    if(N < 1) return;
+    { int n = N * 12;
+      muda::ParallelFor(256).apply(n,
+          [g = system_gradient.viewer(), bin = m_abd_sysbin] __device__(int d) mutable
+          { g(d) += binned_combine(bin + (size_t)d * BINNED_K); }); }
+    { int bs = 256, gs = (N + bs - 1) / bs;
+      _abd_hessbin_combine_k<<<gs, bs>>>(abd_body_hessian.data(), m_abd_hessbin, N); }
+}
+void ABDSystem::couple_bin_open(int n_dofs)
+{
+    if(n_dofs < 1) return;
+    size_t sg = (size_t)n_dofs * BINNED_K;
+    if(sg > m_abd_sysbin_cap)
+    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg; }
+    cudaMemset(m_abd_sysbin, 0, sg * sizeof(double));
+    cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*));
+}
+void ABDSystem::couple_bin_close(int n_dofs)
+{
+    if(n_dofs < 1) return;
+    muda::ParallelFor(256).apply(n_dofs,
+        [g = system_gradient.viewer(), bin = m_abd_sysbin] __device__(int d) mutable
+        { g(d) += binned_combine(bin + (size_t)d * BINNED_K); });
+}
 
 struct DrivingCtrlPacked  { Float target_angle;    Float strength_ratio; Float ext_torque; };
 struct PrisCtrlPacked     { Float target_distance; Float strength_ratio; Float ext_force; };
@@ -154,12 +217,14 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
                                                   muda::CBufferView<double3> vertex_barrier_gradient)
 {
     _cal_abd_body_gradient_and_hessian(sim_data);
+    _abd_binned_open(sim_data);   // [4.3] zero binned accumulators + bind globals (after per-body init)
     _cal_abd_joint_gradient_and_hessian(sim_data);
     _cal_abd_revolute_driving_gradient_and_hessian(sim_data);
     _cal_abd_prismatic_gradient_and_hessian(sim_data);
     _cal_abd_prismatic_driving_gradient_and_hessian(sim_data);
     _cal_abd_stitch_gradient_and_hessian(sim_data);
     _cal_abd_system_barrier_gradient(sim_data, vertex_barrier_gradient);
+    _abd_binned_close(sim_data);  // [4.3] combine binned coupling gradient/Hessian into ABD buffers
     _setup_abd_system_hessian(sim_data, global_triplets);
 }
 
@@ -168,12 +233,14 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
                                                   muda::CBufferView<Vector3> vertex_barrier_gradient)
 {
     _cal_abd_body_gradient_and_hessian(sim_data);
+    _abd_binned_open(sim_data);   // [4.3] zero binned accumulators + bind globals (after per-body init)
     _cal_abd_joint_gradient_and_hessian(sim_data);
     _cal_abd_revolute_driving_gradient_and_hessian(sim_data);
     _cal_abd_prismatic_gradient_and_hessian(sim_data);
     _cal_abd_prismatic_driving_gradient_and_hessian(sim_data);
     _cal_abd_stitch_gradient_and_hessian(sim_data);
     _cal_abd_system_barrier_gradient(sim_data, vertex_barrier_gradient);
+    _abd_binned_close(sim_data);  // [4.3] combine binned coupling gradient/Hessian into ABD buffers
     _setup_abd_system_hessian(sim_data, global_triplets);
 }
 
@@ -436,7 +503,7 @@ void ABDSystem::_cal_abd_system_barrier_gradient(ABDSimData& sim_data,
 
                    Vector12 G = J(i).T() * Vector3{g.x, g.y, g.z};
                    eigen::atomic_add(dst, G);
-                   system_gradient.segment<12>(body_id * 12).atomic_add(G);
+                   bin_add12_off(g_abd_sysbin, body_id * 12, G);
                });
 }
 
@@ -473,7 +540,7 @@ void ABDSystem::_cal_abd_system_barrier_gradient(ABDSimData& sim_data,
                    Vector12 G = J(i).T() * g;
 
                    eigen::atomic_add(dst, G);
-                   system_gradient.segment<12>(body_id * 12).atomic_add(G);
+                   bin_add12_off(g_abd_sysbin, body_id * 12, G);
                });
 }
 
@@ -990,18 +1057,18 @@ void ABDSystem::_cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data)
                    if(!parent_fixed)
                    {
                        eigen::atomic_add(affine_gradient(pid), grad_parent);
-                       system_gradient.segment<12>(pid * 12).atomic_add(grad_parent);
+                       bin_add12_off(g_abd_sysbin, pid * 12, grad_parent);
                        // Add self-body Hessian
-                       eigen::atomic_add(body_hessian(pid), H_pp);
+                       bin_add144(g_abd_hessbin, pid, H_pp);
                    }
 
                    // Add gradient to child body (skip if fixed)
                    if(!child_fixed)
                    {
                        eigen::atomic_add(affine_gradient(cid), grad_child);
-                       system_gradient.segment<12>(cid * 12).atomic_add(grad_child);
+                       bin_add12_off(g_abd_sysbin, cid * 12, grad_child);
                        // Add self-body Hessian
-                       eigen::atomic_add(body_hessian(cid), H_cc);
+                       bin_add144(g_abd_hessbin, cid, H_cc);
                    }
 
                    // Store cross-body Hessian for triplet writing
@@ -1196,11 +1263,6 @@ void ABDSystem::init_revolute_driving(
         drv.initial_angle_offset   = static_cast<Float>(ctrl.initial_angle_offset);
         drv.target_angle           = static_cast<Float>(ctrl.target_angle - ctrl.initial_angle_offset);
         drv.ext_torque             = static_cast<Float>(ctrl.ext_torque);  // [force-control]
-        // [joint limit] store bounds in the RELATIVE angle frame (= absolute - offset),
-        // matching theta computed by the limit penalty. limit_stiffness set on GPU below.
-        drv.lower_limit            = static_cast<Float>(ctrl.lower_limit - ctrl.initial_angle_offset);
-        drv.upper_limit            = static_cast<Float>(ctrl.upper_limit - ctrl.initial_angle_offset);
-        drv.limit_stiffness        = 0.0;  // computed on GPU using body masses
     }
 
     m_revolute_driving_data.resize(m_num_revolute_driving);
@@ -1375,9 +1437,7 @@ Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data)
                {
                    auto& drv = drvs(i);
                    energies(i) = revolute_driving_energy(drv, qs(drv.parent_body_id),
-                                                              qs(drv.child_body_id))
-                               + revolute_limit_energy(drv, qs(drv.parent_body_id),
-                                                            qs(drv.child_body_id));
+                                                              qs(drv.child_body_id));
                });
 
     muda::DeviceReduce().Sum(
@@ -1430,30 +1490,18 @@ void ABDSystem::_cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_d
                    Matrix12x12 H_11, H_22, H_12;
                    revolute_driving_hessian(drv, q1, q2, H_11, H_22, H_12);
 
-                   // [joint limit] one-sided position-limit penalty (mode-agnostic: it
-                   // depends on the current angle, not the drive target). Reuses the
-                   // driving spring toward the violated bound -> implicit, SPD Hessian.
-                   Vector12 lg1, lg2;
-                   Matrix12x12 lH11, lH22, lH12;
-                   revolute_limit_gradient_hessian(drv, q1, q2, lg1, lg2, lH11, lH22, lH12);
-                   grad1 += lg1;
-                   grad2 += lg2;
-                   H_11 += lH11;
-                   H_22 += lH22;
-                   H_12 += lH12;
-
                    if(!p_fixed)
                    {
                        eigen::atomic_add(affine_gradient(pid), grad1);
-                       sys_gradient.segment<12>(pid * 12).atomic_add(grad1);
-                       eigen::atomic_add(body_hessian(pid), H_11);
+                       bin_add12_off(g_abd_sysbin, pid * 12, grad1);
+                       bin_add144(g_abd_hessbin, pid, H_11);
                    }
 
                    if(!c_fixed)
                    {
                        eigen::atomic_add(affine_gradient(cid), grad2);
-                       sys_gradient.segment<12>(cid * 12).atomic_add(grad2);
-                       eigen::atomic_add(body_hessian(cid), H_22);
+                       bin_add12_off(g_abd_sysbin, cid * 12, grad2);
+                       bin_add144(g_abd_hessbin, cid, H_22);
                    }
 
                    if(p_fixed || c_fixed)
@@ -1638,15 +1686,15 @@ void ABDSystem::_cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data)
                    if(!p_fixed)
                    {
                        eigen::atomic_add(affine_gradient(pid), grad1);
-                       sys_gradient.segment<12>(pid * 12).atomic_add(grad1);
-                       eigen::atomic_add(body_hessian(pid), H_pp);
+                       bin_add12_off(g_abd_sysbin, pid * 12, grad1);
+                       bin_add144(g_abd_hessbin, pid, H_pp);
                    }
 
                    if(!c_fixed)
                    {
                        eigen::atomic_add(affine_gradient(cid), grad2);
-                       sys_gradient.segment<12>(cid * 12).atomic_add(grad2);
-                       eigen::atomic_add(body_hessian(cid), H_qq);
+                       bin_add12_off(g_abd_sysbin, cid * 12, grad2);
+                       bin_add144(g_abd_hessbin, cid, H_qq);
                    }
 
                    if(p_fixed || c_fixed)
@@ -1700,10 +1748,6 @@ void ABDSystem::init_prismatic_driving(
         drv.stiffness       = 0.0;
         drv.target_distance = static_cast<Float>(ctrl.target_distance);
         drv.ext_force       = static_cast<Float>(ctrl.ext_force);
-        // [joint limit] penalty bounds in the engine prismatic-coordinate frame.
-        drv.lower_limit         = static_cast<Float>(ctrl.lower_limit);
-        drv.upper_limit         = static_cast<Float>(ctrl.upper_limit);
-        drv.pen_limit_stiffness = 0.0;  // computed on GPU using body masses
     }
 
     m_prismatic_driving_data.resize(m_num_prismatic_driving);
@@ -1858,9 +1902,7 @@ Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data)
                {
                    auto& drv = drvs(i);
                    energies(i) = prismatic_driving_energy(drv, qs(drv.parent_body_id),
-                                                               qs(drv.child_body_id))
-                               + prismatic_limit_energy(drv, qs(drv.parent_body_id),
-                                                             qs(drv.child_body_id));
+                                                               qs(drv.child_body_id));
                });
 
     muda::DeviceReduce().Sum(
@@ -1912,28 +1954,18 @@ void ABDSystem::_cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_
                    prismatic_driving_gradient_hessian(drv, q1, q2,
                                                       grad1, grad2, H_pp, H_qq, H_pq);
 
-                   // [joint limit] one-sided position-limit penalty (mode-agnostic)
-                   Vector12 lg1, lg2;
-                   Matrix12x12 lH_pp, lH_qq, lH_pq;
-                   prismatic_limit_gradient_hessian(drv, q1, q2, lg1, lg2, lH_pp, lH_qq, lH_pq);
-                   grad1 += lg1;
-                   grad2 += lg2;
-                   H_pp += lH_pp;
-                   H_qq += lH_qq;
-                   H_pq += lH_pq;
-
                    if(!p_fixed)
                    {
                        eigen::atomic_add(affine_gradient(pid), grad1);
-                       sys_gradient.segment<12>(pid * 12).atomic_add(grad1);
-                       eigen::atomic_add(body_hessian(pid), H_pp);
+                       bin_add12_off(g_abd_sysbin, pid * 12, grad1);
+                       bin_add144(g_abd_hessbin, pid, H_pp);
                    }
 
                    if(!c_fixed)
                    {
                        eigen::atomic_add(affine_gradient(cid), grad2);
-                       sys_gradient.segment<12>(cid * 12).atomic_add(grad2);
-                       eigen::atomic_add(body_hessian(cid), H_qq);
+                       bin_add12_off(g_abd_sysbin, cid * 12, grad2);
+                       bin_add144(g_abd_hessbin, cid, H_qq);
                    }
 
                    if(p_fixed || c_fixed)
@@ -2077,12 +2109,12 @@ void ABDSystem::_cal_abd_stitch_gradient_and_hessian(ABDSimData& sim_data)
                    // ABD gradient: -k * J^T * d
                    Vector12 G = -(k) * (J.T() * d);
                    eigen::atomic_add(abd_gradient(body_id), G);
-                   sys_gradient.segment<12>(body_id * 12).atomic_add(G);
+                   bin_add12_off(g_abd_sysbin, body_id * 12, G);
 
                    // ABD Hessian: k * J^T * J (12x12)
                    Matrix3x3 kI = k * Matrix3x3::Identity();
                    Matrix12x12 H = gipc::ABDJacobi::JT_H_J(J.T(), kI, J);
-                   eigen::atomic_add(body_hessian(body_id), H);
+                   bin_add144(g_abd_hessbin, body_id, H);
                });
 }
 

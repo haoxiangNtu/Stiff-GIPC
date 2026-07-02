@@ -202,6 +202,11 @@ class SimEngine
     // broad-phase skips contact pairs whose two vertices carry different (>=0) env
     // ids -> cross-env isolation without spatial separation, uniform for FEM+ABD.
     void set_vertex_env_ids(const std::vector<int>& env_ids);
+    // [multi-env determinism 4.1] per-GROUP world offset (flat xyz, 3 per group). The engine
+    // expands to per-vertex (via point->body->group) and the BVH builds on _vertexes+offset
+    // (envs spatially separated) while narrow-phase stays on local _vertexes (deterministic).
+    // Call AFTER finalize(). Keep the up-axis component 0 so ground contact stays shared.
+    void set_env_offsets(const std::vector<double>& per_group_xyz);
     void add_ground_collision_skip(int body_id);
 
     /// Stitch a FEM vertex to an ABD body via a soft spring constraint.
@@ -345,6 +350,10 @@ class SimEngine
     int      get_surface_vertex_count() const;
 
     void     get_vertex_positions(double* out_xyz, int count) const;
+    // [decouple] per-vertex env/group id ALIGNED to get_vertex_positions order (input order):
+    // out[v] = body_groups[point_id_to_body_id[v]] (-1 if ungrouped). Lets Python extract a single
+    // env's verts (verts[groups==g]) for batch-invariance tests regardless of the type-grouped layout.
+    void     get_point_groups(int* out, int count) const;
     void     get_surface_faces(uint32_t* out_idx, int face_count) const;
     void     get_surface_vertex_indices(uint32_t* out_idx, int count) const;
 
@@ -439,6 +448,10 @@ class SimEngine
     // semantics).
     void teleport_fem_vertices(const double* xyz, int count,
                                const double* velocities = nullptr);
+
+    // ---- full-state checkpoint (deterministic mid-trajectory restart) ----
+    void save_checkpoint(const std::string& path);
+    void load_checkpoint(const std::string& path);
 
     // ---- Load record tracking ----
     int  get_load_record_count() const;

@@ -174,6 +174,72 @@ class BodyView:
                 f"label='{self.label}' verts={self.vertex_count})")
 
 
+# ---------------------------------------------------------------------------
+# Multi-env execution modes. Three tiers, each a superset of the previous:
+#   "merged"   (A) — baseline v0.6.x: all envs in one merged solve. Fastest, but
+#                    NO per-env isolation (cross-env contact possible, merged-bbox
+#                    dHat). Correct only for single-env or well-separated envs.
+#   "isolated" (B) — per-env DECOUPLED physics: env-id collision isolation, per-env
+#                    BVH, per-env κ (absolute dHat), per-env line-search + segmented
+#                    per-env PCG. Each env is a physically-correct independent sim.
+#                    Does NOT guarantee bit-identical / batch-invariant results.
+#   "strict"   (C) — isolated + full determinism machinery (canonical contact
+#                    ordering + deterministic SpMV; pair with co-located local-frame
+#                    layout). env_0 is BIT-IDENTICAL across mate content, env COUNT,
+#                    and run-to-run. Slowest.
+# The mode resolves to the low-level STIFF_* flags below (which stay available as
+# per-feature debug overrides). An explicitly-set STIFF_* env var always wins
+# (setdefault). STIFF_MULTIENV_MODE overrides the Config field.
+_MULTIENV_ISOLATED_FLAGS = [
+    "STIFF_BVH_ENVDET",     # env-id collision isolation (no cross-env contact)
+    "STIFF_PERENV_BVH",     # per-env broad-phase BVH
+    "STIFF_DECOUPLE_THRESH",  # absolute dHat + per-group κ gating (+ N-invariant meanMass)
+    "STIFF_PERGROUP_KAPPA",   # per-env barrier/friction/init κ
+    "STIFF_SEGMENTED_PCG",  # block-diagonal per-env PCG (own α/β/convergence)
+    "STIFF_PERENV_ALPHA",   # per-env line-search α
+    # K-stream concurrent per-env BVH build+query (perenv-parallel #2). QUALIFIED FOR STRICT
+    # 2026-07-04: run-to-run + cross-env + batch-size N=2/4/8 all 0.000 with PAR on (the
+    # canon/order-free stack absorbs the stream-interleaved pair emission). =0 opts out.
+    "STIFF_PERENV_PAR",
+]
+_MULTIENV_STRICT_EXTRA = [
+    "STIFF_EE_CANON",       # canonical edge-edge emission order
+    "STIFF_EE_DETGATE",     # deterministic EE dedup gate
+    "STIFF_CCD_CANON",      # canonical CCD emission order
+    "STIFF_SPMV_DET",       # deterministic (order-independent) SpMV
+]
+_MULTIENV_ISOLATED_ONLY = []   # (empty: PAR qualified for strict and moved into the base list)
+_MULTIENV_MODE_ALIASES = {
+    "0": "merged", "merged": "merged", "a": "merged",
+    "1": "isolated", "isolated": "isolated", "decoupled": "isolated", "b": "isolated",
+    "2": "strict", "strict": "strict", "deterministic": "strict", "c": "strict",
+}
+
+
+def resolve_multienv_mode(mode: str = "merged") -> str:
+    """Set the STIFF_* env flags for the requested multi-env mode (setdefault, so
+    explicit STIFF_* env vars win). STIFF_MULTIENV_MODE overrides `mode`. Returns
+    the canonical mode name. Idempotent; safe to call once per Engine."""
+    import os
+    raw = os.environ.get("STIFF_MULTIENV_MODE", mode)
+    canon = _MULTIENV_MODE_ALIASES.get(str(raw).strip().lower())
+    if canon is None:
+        raise ValueError(
+            f"unknown multienv_mode {raw!r}; use merged/isolated/strict (or 0/1/2)")
+    flags = []
+    if canon == "isolated":
+        flags = _MULTIENV_ISOLATED_FLAGS + _MULTIENV_ISOLATED_ONLY
+    elif canon == "strict":
+        flags = _MULTIENV_ISOLATED_FLAGS + _MULTIENV_STRICT_EXTRA
+    for f in flags:
+        os.environ.setdefault(f, "1")
+    # binned (order-free) gradient is a strict-only determinism feature; merged/isolated use the
+    # fast plain-atomic gradient path (STIFF_FAST_GRAD). strict keeps binned (needed for bit-identity).
+    if canon in ("merged", "isolated"):
+        os.environ.setdefault("STIFF_FAST_GRAD", "1")
+    return canon
+
+
 class Config:
     """Simulation configuration mirroring gipc::SimEngineConfig."""
 
@@ -185,7 +251,12 @@ class Config:
         poisson_rate: float = 0.49,
         friction_rate: float = 0.4,
         newton_tol: float = 1e-2,
-        pcg_tol: float = 1e-4,
+        # 1e-6 (was 1e-4, inherited from upstream, never tuned): with absolute-dhat
+        # kappa (correct contact stiffness) loose PCG directions explode Newton
+        # counts (measured 1407 vs 507 total Newton over 30f at 1e-4 vs 1e-6 on the
+        # multi-env grasp scene; net time strictly worse at 1e-4). Stiff-contact
+        # scenes may benefit from 1e-8 (env STIFF_PCG_TOL or this arg).
+        pcg_tol: float = 1e-6,
         relative_dhat: float = 1e-3,
         absolute_dhat: float = 0.0,
         joint_strength_ratio: float = 100.0,
@@ -206,8 +277,13 @@ class Config:
         ground_normal: tuple[float, float, float] = (0.0, 1.0, 0.0),
         ground_offset: float = -1.0,
         velocity_damping: float = 0.0,
+        multienv_mode: str = "merged",
         **kwargs,
     ):
+        # Multi-env execution tier: "merged" (baseline) / "isolated" (per-env decoupled,
+        # not bit-identical) / "strict" (bit-identical + batch-invariant). Resolved to
+        # STIFF_* flags by Engine(). STIFF_MULTIENV_MODE env var overrides this.
+        self.multienv_mode = multienv_mode
         self._cfg = _C.Config()
         self._cfg.dt = dt
         self._cfg.density = density
@@ -276,6 +352,9 @@ class Engine:
     def __init__(self, config: Optional[Config] = None):
         self._engine = _C.SimEngine()
         self._config = config or Config()
+        # Resolve the multi-env mode → STIFF_* flags BEFORE any load/finalize/step, so the
+        # gated engine paths (finalize meanMass, per-frame κ/BVH/PCG) see them. Env vars win.
+        self.multienv_mode = resolve_multienv_mode(getattr(self._config, "multienv_mode", "merged"))
         self._engine.set_config(self._config.native)
         self._engine.init_cuda()
         self._finalized = False

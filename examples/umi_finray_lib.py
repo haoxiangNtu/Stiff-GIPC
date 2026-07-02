@@ -601,6 +601,15 @@ def drive_frame(eng, robot, ejs, groups, prep, raw, mode, gstate, P, stitch_seg,
         r = rfor(grp['key'][0])
         grip = float(r[gl]) if grp['key'][1] == 'L' else float(r[gr])
         drive_side(eng, robot, grp, grip, prep["binary"], mode, gstate, P, all_stretch, all_contact)
+    # [diag] per-env total finray contact force (grip-success metric) — STIFF_GRIP_DIAG
+    if all_contact is not None and os.environ.get("STIFF_GRIP_DIAG"):
+        pe = {}
+        for grp in groups:
+            if '_cf_idx' in grp:
+                f = sum(float(np.linalg.norm(all_contact[i])) for i in grp['_cf_idx'])
+                e = grp['key'][0]; pe[e] = pe.get(e, 0.0) + f
+        _gd = os.environ.get("STIFF_GRIP_PREC", "2")
+        print("[grip] " + " ".join(f"{pe[e]:.{_gd}f}" for e in sorted(pe, key=str)), flush=True)
 
 
 # ----------------------------------------------------------------------------
@@ -775,11 +784,13 @@ def _load_traj_pool(prep, num_envs):
     jit = float(os.environ.get("CASE39ME_TRAJ_JITTER", "0"))
     if jit > 0.0:
         cols = prep["arm_l"] + prep["arm_r"]
+        pin0 = bool(int(os.environ.get("CASE39ME_PIN_ENV0", "0")))  # [decouple test] env0 = base (mates vary)
         per_env = []
         for e in range(num_envs):
             a = base.copy()
-            for j, c in enumerate(cols):                       # deterministic per-env offset
-                a[:, c] = a[:, c] + jit * math.sin(0.7 * (e + 1) + 1.3 * j)
+            if not (pin0 and e == 0):
+                for j, c in enumerate(cols):                   # deterministic per-env offset
+                    a[:, c] = a[:, c] + jit * math.sin(0.7 * (e + 1) + 1.3 * j)
             per_env.append(a)
         print(f"[traj] synthetic per-env arm jitter +/-{jit} rad over {num_envs} envs", flush=True)
         return per_env, L
@@ -797,6 +808,20 @@ def _load_traj_pool(prep, num_envs):
 def run_replay(scene_name, default_envs=1):
     mode = os.environ.get("GRIP_MODE", "pos")
     num_envs = int(os.environ.get("CASE39ME_NUM_ENVS", str(default_envs)))
+    # [multi-env] execution mode (see stiff_physics.engine.resolve_multienv_mode):
+    #   merged   — baseline v0.6.x merged solve (fast, no per-env isolation)
+    #   isolated — per-env decoupled physics, NOT bit-identical (correct independent envs, fast-ish)
+    #   strict   — isolated + full determinism → env_0 bit-identical vs mates / env count / run
+    # Default: strict for multi-env (reproducible), merged for single-env. Override with
+    # CASE39ME_MULTIENV_MODE. Back-compat: CASE39ME_NO_DETERMINISM=1 forces "merged".
+    _default_mode = "strict" if num_envs > 1 else "merged"
+    if int(os.environ.get("CASE39ME_NO_DETERMINISM", "0")):
+        _default_mode = "merged"
+    menv_mode = os.environ.get("CASE39ME_MULTIENV_MODE", _default_mode).strip().lower()
+    os.environ.setdefault("STIFF_MULTIENV_MODE", menv_mode)   # Engine() expands to STIFF_* flags
+    if menv_mode == "strict":
+        os.environ.setdefault("CASE39ME_LOCAL_FRAME", "1")   # co-located local frames (bit-exact numerics)
+    print(f"[umi] multi-env mode = {menv_mode}  (set CASE39ME_MULTIENV_MODE=merged/isolated/strict)", flush=True)
     spacing = float(os.environ.get("CASE39ME_SPACING", "4.0"))
     prep = prepare_scene(scene_name)
     P = _drive_params(num_envs)
@@ -807,9 +832,22 @@ def run_replay(scene_name, default_envs=1):
     sides = load_finray_sides()
     ge = dict(abd_cursor=0)
     t0 = time.perf_counter()
-    envs, n_abd = build_world(eng, prep, num_envs, spacing, sides, ge)
+    # [multi-env determinism 4.1+4.2] CASE39ME_LOCAL_FRAME=1: load all envs at the SAME
+    # origin (local, bit-identical numerics) and feed the separation grid to the BVH via
+    # set_env_offsets (efficient broad-phase). Removes the world-offset FP that makes
+    # identical envs diverge. spacing still controls the BVH separation distance.
+    local_frame = int(os.environ.get("CASE39ME_LOCAL_FRAME", "0"))
+    build_spacing = 0.0 if local_frame else spacing
+    envs, n_abd = build_world(eng, prep, num_envs, build_spacing, sides, ge)
     stitch_seg = _stitch_seg_arrays(envs)
     eng.finalize()
+    if local_frame:
+        offs = make_env_offsets(num_envs, spacing)   # per-env separation grid (x,0,z; up=y=0)
+        per_group = []
+        for o in offs:
+            per_group += [float(o[0, 3]), float(o[1, 3]), float(o[2, 3])]
+        eng.native.set_env_offsets(per_group)
+        print(f"[umi:{scene_name}] LOCAL_FRAME on: {num_envs} envs at origin + BVH offset grid (spacing={spacing})", flush=True)
     print(f"[umi:{scene_name}] built {num_envs} envs in {time.perf_counter()-t0:.1f}s ({n_abd} ABD)", flush=True)
     robot = _setup_after_finalize(eng, envs, P)
     if mode == "force":
@@ -821,9 +859,52 @@ def run_replay(scene_name, default_envs=1):
     per_env_actions, Lmax = _load_traj_pool(prep, num_envs)   # heterogeneous multi-env if not None
     hetero = per_env_actions is not None
 
-    if int(os.environ.get("CASE39ME_HEADLESS", "0")):
+    if int(os.environ.get("CASE39_HEADLESS", "0")) or int(os.environ.get("CASE39ME_HEADLESS", "0")):
         f0 = int(os.environ.get("CASE39_FRAME_START", "0"))
         f1 = min(int(os.environ.get("CASE39_FRAME_END", str(Lmax))), Lmax)
+        # [decouple debug] full-state checkpoint: load a saved frame-(f0-1) state and start at f0,
+        # skipping the replay of frames 0..f0-1 (fast iteration on deep-grasp frames). Friction/contact
+        # is ephemeral (rebuilt from positions) so the restart is bit-identical to a full replay.
+        _lc = os.environ.get("CASE39ME_LOAD_CKPT")
+        if _lc:
+            eng.native.load_checkpoint(_lc); print(f"[ckpt] loaded {_lc}, starting at frame {f0}", flush=True)
+            # restore the force-mode latch state (Python-side, drives set_prismatic_target/strength;
+            # fresh gstate at restart → wrong gripper drive). Cache key '__cf_seg__' is rebuildable.
+            import pickle
+            try:
+                with open(_lc + ".gstate", "rb") as _gf: _g = pickle.load(_gf)
+                gstate.clear(); gstate.update(_g); print(f"[ckpt] restored gstate ({len(_g)} keys)", flush=True)
+            except Exception as _e: print(f"[ckpt] no gstate restore: {_e}", flush=True)
+            _nw = int(os.environ.get("CASE39ME_WARMUP", "0"))
+            for _wi in range(_nw):
+                # [debug] warm up first-step-in-process transients (solver/PCG warmup, CUDA lazy init)
+                # with throwaway step(s), reloading the checkpoint each time to reset the physics state
+                # — so the real frame f0 is no longer among the process's first IPC_Solver calls.
+                if hetero:
+                    _per = [per_env_actions[e][min(f0,len(per_env_actions[e])-1)] for e in range(num_envs)]
+                    drive_frame(eng, robot, ejs, groups, prep, _per[0], mode, gstate, P, stitch_seg, per_env_raw=_per)
+                else:
+                    drive_frame(eng, robot, ejs, groups, prep, actions[f0], mode, gstate, P, stitch_seg)
+                eng.step()
+                eng.native.load_checkpoint(_lc)
+                try:
+                    with open(_lc + ".gstate", "rb") as _gf2: _g2 = pickle.load(_gf2)
+                    gstate.clear(); gstate.update(_g2)
+                except Exception: pass
+            if _nw: print(f"[ckpt] {_nw} warmup step(s) done + state reloaded", flush=True)
+            _ld = os.environ.get("CASE39ME_LOAD_DUMP")   # [debug] dump restored state (pre-step) to split state-vs-step
+            if _ld:
+                np.save(_ld, np.ascontiguousarray(eng.get_vertices()))
+                try: np.save(_ld.replace('.npy','_grp.npy'), np.ascontiguousarray(eng.native.get_point_groups()))
+                except Exception: pass
+                print(f"[ckpt] dumped restored state -> {_ld}", flush=True)
+        _sc = os.environ.get("CASE39ME_SAVE_CKPT"); _scf = int(os.environ.get("CASE39ME_SAVE_CKPT_FRAME", "-1"))
+        _di = os.environ.get("STIFF_DUMP_INIT")   # [decouple] pristine PRE-STEP state (before any eng.step())
+        if _di:
+            np.save(_di, np.ascontiguousarray(eng.get_vertices()))
+            try: np.save(_di.replace('.npy', '_grp.npy'), np.ascontiguousarray(eng.native.get_point_groups()))
+            except Exception: pass
+            print(f"[dump-init] pristine pre-step state -> {_di}", flush=True)
         ms = []
         for fr in range(f0, f1):
             if hetero:   # each env on its OWN trajectory (clamped to that traj's end)
@@ -834,6 +915,28 @@ def run_replay(scene_name, default_envs=1):
             else:
                 drive_frame(eng, robot, ejs, groups, prep, actions[fr], mode, gstate, P, stitch_seg)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter() - t) * 1000.0)
+            if _sc and fr == _scf:   # [decouple debug] save full state AFTER this frame's step
+                eng.native.save_checkpoint(_sc); print(f"[ckpt] saved {_sc} @frame {fr}", flush=True)
+                import pickle   # also save the force-mode latch state (gstate), minus rebuildable cache
+                try:
+                    _gsave = {k: v for k, v in gstate.items() if k != '__cf_seg__'}
+                    with open(_sc + ".gstate", "wb") as _gf: pickle.dump(_gsave, _gf)
+                    print(f"[ckpt] saved gstate ({len(_gsave)} keys)", flush=True)
+                except Exception as _e: print(f"[ckpt] gstate save failed: {_e}", flush=True)
+            if os.environ.get("STIFF_VERT_HASH"):
+                import hashlib
+                _vv = np.ascontiguousarray(eng.get_vertices())
+                print(f"[vhash] {fr} {hashlib.md5(_vv.tobytes()).hexdigest()[:16]}", flush=True)
+            _dp = os.environ.get("STIFF_VERT_DUMP")
+            _every = int(os.environ.get("STIFF_DUMP_EVERY", "0"))   # [decouple] periodic env-state dump
+            _hit = (_dp and fr == int(os.environ.get("STIFF_DUMP_FRAME", "0"))) \
+                   or (_dp and _every > 0 and fr % _every == 0)
+            if _hit:
+                _out = _dp if _every <= 0 else _dp.replace('.npy', f'_f{fr}.npy')
+                np.save(_out, np.ascontiguousarray(eng.get_vertices())); print(f"[vdump] saved {_out} @frame {fr}", flush=True)
+                try:  # [decouple] per-vertex env id (aligned to get_vertices) for env-correct masking
+                    np.save(_out.replace('.npy', '_grp.npy'), np.ascontiguousarray(eng.native.get_point_groups()))
+                except Exception as _e: print(f"[vdump] no get_point_groups: {_e}", flush=True)
             if fr % 20 == 0:
                 print(f"[umi:{scene_name}] frame {fr:4d} step={ms[-1]:6.0f}ms", flush=True)
         mm = float(np.mean(ms)) if ms else float('nan')
@@ -844,8 +947,9 @@ def run_replay(scene_name, default_envs=1):
     import polyscope as ps, polyscope.imgui as psim
     v = eng.get_vertices(); fa = eng.get_surface_faces()
     ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("none")
-    st = dict(idx=0, run=False, ms=0.,
-              mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)), v=v, f=fa)
+    st = dict(idx=0, run=bool(int(os.environ.get("CASE39ME_AUTOSTART", "0"))), ms=0.,
+              mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)), v=v, f=fa,
+              acc=0., nstep=0)  # acc/nstep: running mean of step ms for stdout fps report
 
     def cb():
         if st['run']:
@@ -873,6 +977,11 @@ def run_replay(scene_name, default_envs=1):
         else:
             drive_frame(eng, robot, ejs, groups, prep, actions[min(fr, L - 1)], mode, gstate, P, stitch_seg)
         t = time.perf_counter(); eng.step(); st['ms'] = (time.perf_counter() - t) * 1000.0
+        st['acc'] += st['ms']; st['nstep'] += 1
+        if st['nstep'] % 10 == 0:  # periodic stdout fps report (so headless-to-:1 GUI runs are measurable)
+            mm = st['acc'] / st['nstep']
+            print(f"[gui] frame {st['idx']}/{Lmax}  step {st['ms']:.0f}ms  mean {mm:.0f}ms "
+                  f"({1000.0/mm:.2f} fps) = {mm/num_envs:.1f} ms/env  envs={num_envs}", flush=True)
         v = eng.get_vertices(); fa = eng.get_surface_faces()
         if v.shape[0] != st['v'].shape[0] or fa.shape != st['f'].shape:
             st['mesh'] = ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)); st['v'], st['f'] = v, fa
