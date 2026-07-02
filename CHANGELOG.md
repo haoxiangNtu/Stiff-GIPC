@@ -4,6 +4,84 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-07-03
+
+> The "multi-env engine" release: v0.6.7 unified with the entire per-env
+> solver campaign. One tree now carries both the IsaacLab/Newton integration
+> APIs (v0.6.5–0.6.7) and the three-tier multi-env execution engine.
+> (0.7.x was an experimental perf series, later audited: its beneficial
+> changes are included here; its unstable ones are not.)
+
+### Added
+- **Multi-env execution modes** — `Config(multienv_mode=...)` or
+  `STIFF_MULTIENV_MODE`, three tiers:
+  - `"merged"` (default): all envs in one solve, fastest. κ/dHat now use the
+    absolute-dhat scale (see *Changed*), so contact physics no longer softens
+    as envs are added.
+  - `"isolated"`: per-env decoupled physics — env-id collision isolation,
+    per-env broad-phase BVH (K-stream concurrent build), per-env κ, per-env
+    line-search α, and a segmented block-diagonal PCG with per-env
+    α/β/convergence. Each env is an independent, physically-correct sim.
+  - `"strict"`: isolated + full determinism machinery (canonical contact
+    ordering, order-independent binned reductions, deterministic SpMV).
+    env_0 is BIT-IDENTICAL run-to-run, across mate content, and across env
+    COUNT (N=2/4/8 verified 0.000 at release).
+- **Per-group world offsets** — `Engine.set_env_offsets` (render/broad-phase
+  separation while narrow-phase stays in local frames; the substrate for
+  strict-mode local-frame layouts).
+- **`Engine.get_point_groups`** — per-vertex env id aligned to
+  `get_vertices()` order (extract any single env's vertices).
+- **Full-state checkpoint** — `Engine.save_checkpoint` / `load_checkpoint`
+  (FEM+ABD+κ state; deterministic mid-trajectory restart).
+- **Per-contact force export** — the exact I5/NEWF barrier-gradient kernel
+  now optionally attributes per-pair forces (`GIPC::exportContacts` hook),
+  wired through the batched contact-force readback APIs.
+
+### Changed
+- **Default `pcg_tol` 1e-4 → 1e-6.** The 1e-4 default was inherited from
+  upstream and never tuned; with correct (absolute-dhat) contact stiffness it
+  explodes Newton counts (measured 1407 vs 507 total Newton over 30 frames on
+  a multi-env grasp; net time strictly worse). Stiff-contact scenes may
+  benefit from 1e-8 (`pcg_tol` arg or `STIFF_PCG_TOL`).
+- **κ scale consistency**: when `absolute_dhat > 0`, suggest/upper-bound κ and
+  the Newton convergence threshold all use the effective (absolute) scale in
+  ALL modes — merged multi-env scenes previously diluted κ through the
+  whole-scene bbox (softer, batch-dependent physics).
+
+### Performance
+- Segmented PCG: CUDA-graph replay of the inner iteration block (K=8),
+  spmv-fused and preconditioner-fused per-env dot products, cub-based Morton
+  sort on preallocated scratch (no per-sort device sync), K-stream parallel
+  per-env BVH pool. Isolated-mode cost per env reduced ~46% over the campaign
+  (942.7 → ~505 ms/env on the N=4 grasp reference).
+- Batched host↔device control-scalar traffic (v0.7-audit ports): contact
+  Hessian partition ids 4→1 D2H, energy reductions 9→1, line-search feasible
+  steps 2→1, cpNum+gpNum 2→1. Friction/close-constraint buffers are now
+  persistent grow-only allocations (no per-frame cudaMalloc/cudaFree device
+  drains); reduction workspaces sized by pair capacity (removes a latent OOB
+  class).
+- Release-gate perf reference (N=4 grasp, 30f): merged 397 ms/env,
+  isolated 475 ms/env, both faster than either parent tree.
+
+### Fixed
+- **Batch-size invariance**: per-env line-search S3 backtrack decisions moved
+  fully on-device — a stale host mirror previously destroyed per-env α state
+  when a backtrack fired, making env_0 depend on the env COUNT.
+- **meanMass batch invariance** (strict): κ's scale is seeded from env_0's
+  intensive per-vertex mean instead of a serial FP sum over all envs.
+- Ground d=0 NaN guard, `set_vertex_boundary` metis-order remap,
+  `teleport_fem_vertices` FEM-block offset, OBJ `f v//vn` parsing (inherited
+  from the 0.6.x line and preserved through the unification).
+- Python module loader: ABI-tagged build dirs resolve before generic
+  `build/` (mixed py3.11/3.12 worktrees no longer load a stale module).
+
+### Known limitations
+- `isolated` mode decouples physics but does not promise bit-identity; use
+  `strict` for reproducibility experiments (~2× the isolated PCG cost).
+- MAS preconditioner (`preconditioner_type=1`) is unvalidated with the
+  multi-env machinery (known Newton-cap regression on one hybrid scene);
+  multi-env modes currently assume `preconditioner_type=0`.
+
 ## [0.6.7] — 2026-07-02
 
 > The "unification" release: v0.6.6 + exactly the changes proven necessary by
