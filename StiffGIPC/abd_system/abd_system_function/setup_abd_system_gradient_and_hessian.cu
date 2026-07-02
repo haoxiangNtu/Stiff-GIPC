@@ -1196,6 +1196,11 @@ void ABDSystem::init_revolute_driving(
         drv.initial_angle_offset   = static_cast<Float>(ctrl.initial_angle_offset);
         drv.target_angle           = static_cast<Float>(ctrl.target_angle - ctrl.initial_angle_offset);
         drv.ext_torque             = static_cast<Float>(ctrl.ext_torque);  // [force-control]
+        // [joint limit] store bounds in the RELATIVE angle frame (= absolute - offset),
+        // matching theta computed by the limit penalty. limit_stiffness set on GPU below.
+        drv.lower_limit            = static_cast<Float>(ctrl.lower_limit - ctrl.initial_angle_offset);
+        drv.upper_limit            = static_cast<Float>(ctrl.upper_limit - ctrl.initial_angle_offset);
+        drv.limit_stiffness        = 0.0;  // computed on GPU using body masses
     }
 
     m_revolute_driving_data.resize(m_num_revolute_driving);
@@ -1209,6 +1214,7 @@ void ABDSystem::init_revolute_driving(
     // stiff penalty terms relative to kinetic energy in the IP formulation.
     using namespace muda;
     Float sr  = parms.revolute_driving_strength_ratio;
+    Float lsr = parms.joint_limit_strength_ratio;  // [joint limit] mass-scaled penalty stiffness
 
     // Upload per-joint strength ratios to a temp buffer
     std::vector<Float> host_ctrl_sr(m_num_revolute_driving, 1.0);
@@ -1226,7 +1232,7 @@ void ABDSystem::init_revolute_driving(
                 qs       = abd.body_id_to_q.cviewer().name("qs"),
                 masses   = body_mass.cviewer().name("body_mass"),
                 ctrl_sr  = d_ctrl_sr.cviewer().name("ctrl_sr"),
-                sr] __device__(int i) mutable
+                sr, lsr] __device__(int i) mutable
                {
                    auto& drv = drvs(i);
                    int pid = drv.parent_body_id;
@@ -1234,6 +1240,7 @@ void ABDSystem::init_revolute_driving(
 
                    Float mass_sum = masses(pid) + masses(cid);
                    drv.stiffness = sr * ctrl_sr(i) * mass_sum;
+                   drv.limit_stiffness = lsr * mass_sum;  // [joint limit] mass-scaled penalty
 
                    Matrix3x3 A_parent;
                    A_parent.row(0) = qs(pid).segment<3>(3).transpose();
@@ -1368,7 +1375,9 @@ Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data)
                {
                    auto& drv = drvs(i);
                    energies(i) = revolute_driving_energy(drv, qs(drv.parent_body_id),
-                                                              qs(drv.child_body_id));
+                                                              qs(drv.child_body_id))
+                               + revolute_limit_energy(drv, qs(drv.parent_body_id),
+                                                            qs(drv.child_body_id));
                });
 
     muda::DeviceReduce().Sum(
@@ -1420,6 +1429,18 @@ void ABDSystem::_cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_d
 
                    Matrix12x12 H_11, H_22, H_12;
                    revolute_driving_hessian(drv, q1, q2, H_11, H_22, H_12);
+
+                   // [joint limit] one-sided position-limit penalty (mode-agnostic: it
+                   // depends on the current angle, not the drive target). Reuses the
+                   // driving spring toward the violated bound -> implicit, SPD Hessian.
+                   Vector12 lg1, lg2;
+                   Matrix12x12 lH11, lH22, lH12;
+                   revolute_limit_gradient_hessian(drv, q1, q2, lg1, lg2, lH11, lH22, lH12);
+                   grad1 += lg1;
+                   grad2 += lg2;
+                   H_11 += lH11;
+                   H_22 += lH22;
+                   H_12 += lH12;
 
                    if(!p_fixed)
                    {
@@ -1679,6 +1700,10 @@ void ABDSystem::init_prismatic_driving(
         drv.stiffness       = 0.0;
         drv.target_distance = static_cast<Float>(ctrl.target_distance);
         drv.ext_force       = static_cast<Float>(ctrl.ext_force);
+        // [joint limit] penalty bounds in the engine prismatic-coordinate frame.
+        drv.lower_limit         = static_cast<Float>(ctrl.lower_limit);
+        drv.upper_limit         = static_cast<Float>(ctrl.upper_limit);
+        drv.pen_limit_stiffness = 0.0;  // computed on GPU using body masses
     }
 
     m_prismatic_driving_data.resize(m_num_prismatic_driving);
@@ -1686,6 +1711,7 @@ void ABDSystem::init_prismatic_driving(
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     Float sr = parms.prismatic_driving_strength_ratio;
+    Float lsr = parms.joint_limit_strength_ratio;  // [joint limit] mass-scaled penalty stiffness
 
     std::vector<Float> host_ctrl_sr(m_num_prismatic_driving, 1.0);
     for(int i = 0; i < m_num_prismatic_driving && i < static_cast<int>(controls.size()); i++)
@@ -1703,7 +1729,7 @@ void ABDSystem::init_prismatic_driving(
                 qs       = abd.body_id_to_q.cviewer().name("qs"),
                 masses   = body_mass.cviewer().name("body_mass"),
                 ctrl_sr  = d_ctrl_sr.cviewer().name("ctrl_sr"),
-                sr] __device__(int i) mutable
+                sr, lsr] __device__(int i) mutable
                {
                    auto& drv = drvs(i);
                    int pid = drv.parent_body_id;
@@ -1711,6 +1737,7 @@ void ABDSystem::init_prismatic_driving(
 
                    Float mass_sum = masses(pid) + masses(cid);
                    drv.stiffness = sr * ctrl_sr(i) * mass_sum;
+                   drv.pen_limit_stiffness = lsr * mass_sum;  // [joint limit] mass-scaled penalty
 
                    Matrix3x3 Ap, Ac;
                    Ap.row(0) = qs(pid).segment<3>(3).transpose();
@@ -1831,7 +1858,9 @@ Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data)
                {
                    auto& drv = drvs(i);
                    energies(i) = prismatic_driving_energy(drv, qs(drv.parent_body_id),
-                                                               qs(drv.child_body_id));
+                                                               qs(drv.child_body_id))
+                               + prismatic_limit_energy(drv, qs(drv.parent_body_id),
+                                                             qs(drv.child_body_id));
                });
 
     muda::DeviceReduce().Sum(
@@ -1882,6 +1911,16 @@ void ABDSystem::_cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_
                    Matrix12x12 H_pp, H_qq, H_pq;
                    prismatic_driving_gradient_hessian(drv, q1, q2,
                                                       grad1, grad2, H_pp, H_qq, H_pq);
+
+                   // [joint limit] one-sided position-limit penalty (mode-agnostic)
+                   Vector12 lg1, lg2;
+                   Matrix12x12 lH_pp, lH_qq, lH_pq;
+                   prismatic_limit_gradient_hessian(drv, q1, q2, lg1, lg2, lH_pp, lH_qq, lH_pq);
+                   grad1 += lg1;
+                   grad2 += lg2;
+                   H_pp += lH_pp;
+                   H_qq += lH_qq;
+                   H_pq += lH_pq;
 
                    if(!p_fixed)
                    {

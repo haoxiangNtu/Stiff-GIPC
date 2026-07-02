@@ -71,6 +71,16 @@ struct RevoluteDrivingGPUData
     // of the PD term: stiffness>0 = position control, ext_torque!=0 = torque
     // control; set stiffness=0 for pure torque control. Both can be 0.
     Float   ext_torque = Float(0);
+
+    // [joint limit] One-sided position-limit PENALTY (NOT a barrier), expressed in the
+    // RELATIVE angle frame (already offset by initial_angle_offset, like target_angle).
+    // Active for ANY control mode because it is a function of the CURRENT angle theta,
+    // not the drive target — mirrors MuJoCo's mode-independent joint limit. Implemented
+    // by reusing the driving spring with target = the violated bound and stiffness =
+    // limit_stiffness, so it inherits the same gradient + SPD Gauss-Newton Hessian.
+    Float   lower_limit     = -Float(1e30);  // relative-frame lower bound (rad); huge = none
+    Float   upper_limit     =  Float(1e30);  // relative-frame upper bound (rad)
+    Float   limit_stiffness =  Float(0);     // K_lim = limit_strength_ratio*(m_p+m_c); 0 = off
 };
 
 
@@ -263,6 +273,61 @@ MUDA_GENERIC inline void revolute_driving_hessian(
     H_11_out = K * (ds_dq1 * ds_dq1.transpose() + beta * dc_dq1 * dc_dq1.transpose());
     H_22_out = K * (ds_dq2 * ds_dq2.transpose() + beta * dc_dq2 * dc_dq2.transpose());
     H_12_out = K * (ds_dq1 * ds_dq2.transpose() + beta * dc_dq1 * dc_dq2.transpose());
+}
+
+
+/// Current RELATIVE joint angle theta = atan2(sin_theta, cos_theta) (same frame as
+/// target_angle: absolute = theta + initial_angle_offset).
+MUDA_GENERIC inline Float revolute_current_relative_angle(
+    const RevoluteDrivingGPUData& drv, const Vector12& q1, const Vector12& q2)
+{
+    Matrix3x3 A1 = extract_A(q1);
+    Matrix3x3 A2 = extract_A(q2);
+    Vector3 p  = A1 * drv.p_bar;
+    Vector3 pN = A1 * drv.pN_bar;
+    Vector3 q  = A2 * drv.q_bar;
+    Vector3 qN = A2 * drv.qN_bar;
+    Float cos_theta = Float(0.5) * (p.dot(q) + pN.dot(qN));
+    Float sin_theta = Float(0.5) * (q.dot(pN) - qN.dot(p));
+    return atan2(sin_theta, cos_theta);
+}
+
+/// One-sided joint-LIMIT penalty energy. Reuses the driving spring with target = the
+/// violated bound and stiffness = limit_stiffness. Returns 0 when within [lower, upper].
+MUDA_GENERIC inline Float revolute_limit_energy(
+    const RevoluteDrivingGPUData& drv, const Vector12& q1, const Vector12& q2)
+{
+    if(drv.limit_stiffness <= Float(0)) return Float(0);
+    Float theta = revolute_current_relative_angle(drv, q1, q2);
+    Float bound;
+    if(theta < drv.lower_limit)      bound = drv.lower_limit;
+    else if(theta > drv.upper_limit) bound = drv.upper_limit;
+    else return Float(0);
+    RevoluteDrivingGPUData d = drv;
+    d.target_angle = bound;
+    d.stiffness    = drv.limit_stiffness;
+    d.ext_torque   = Float(0);
+    return revolute_driving_energy(d, q1, q2);
+}
+
+/// One-sided joint-LIMIT penalty gradient + Gauss-Newton Hessian (zero when within range).
+MUDA_GENERIC inline void revolute_limit_gradient_hessian(
+    const RevoluteDrivingGPUData& drv, const Vector12& q1, const Vector12& q2,
+    Vector12& g1, Vector12& g2, Matrix12x12& H11, Matrix12x12& H22, Matrix12x12& H12)
+{
+    g1.setZero(); g2.setZero(); H11.setZero(); H22.setZero(); H12.setZero();
+    if(drv.limit_stiffness <= Float(0)) return;
+    Float theta = revolute_current_relative_angle(drv, q1, q2);
+    Float bound;
+    if(theta < drv.lower_limit)      bound = drv.lower_limit;
+    else if(theta > drv.upper_limit) bound = drv.upper_limit;
+    else return;
+    RevoluteDrivingGPUData d = drv;
+    d.target_angle = bound;
+    d.stiffness    = drv.limit_stiffness;
+    d.ext_torque   = Float(0);
+    revolute_driving_gradient(d, q1, q2, g1, g2);
+    revolute_driving_hessian(d, q1, q2, H11, H22, H12);
 }
 
 
@@ -687,6 +752,14 @@ struct PrismaticDrivingGPUData
     Float limit_dir2   = Float(1);
     Float limit_dhat2  = Float(0);
     Float limit_kappa2 = Float(0);
+
+    // [joint limit] One-sided position-limit PENALTY (same scheme as the revolute
+    // limit; distinct from the IPC barrier fields above). Active for any control mode
+    // (function of the current displacement d, not the drive target). lo/hi are in the
+    // engine's prismatic-coordinate frame (= the d computed by prismatic_driving_*).
+    Float lower_limit     = -Float(1e30);
+    Float upper_limit     =  Float(1e30);
+    Float pen_limit_stiffness = Float(0);  // K_lim = limit_strength_ratio*(m_p+m_c); 0 = off
 };
 
 
@@ -803,6 +876,51 @@ MUDA_GENERIC inline void prismatic_driving_gradient_hessian(
     H_pp_out = hscale * dd_dqp * dd_dqp.transpose();
     H_qq_out = hscale * dd_dqq * dd_dqq.transpose();
     H_pq_out = hscale * dd_dqp * dd_dqq.transpose();
+}
+
+
+/// Current prismatic displacement d = (Cq - Cp)·tq (engine joint-coordinate frame).
+MUDA_GENERIC inline Float prismatic_current_displacement(
+    const PrismaticDrivingGPUData& drv, const Vector12& qp, const Vector12& qq)
+{
+    Vector3 Cp = ABDJacobi(drv.Cp_bar) * qp;
+    Vector3 Cq = ABDJacobi(drv.Cq_bar) * qq;
+    Vector3 tq = extract_A(qq) * drv.tq_bar;
+    return (Cq - Cp).dot(tq);
+}
+
+/// One-sided prismatic position-limit PENALTY (same scheme as revolute_limit_*). Reuses
+/// the driving spring toward the violated bound with the barrier disabled. Zero in range.
+MUDA_GENERIC inline Float prismatic_limit_energy(
+    const PrismaticDrivingGPUData& drv, const Vector12& qp, const Vector12& qq)
+{
+    if(drv.pen_limit_stiffness <= Float(0)) return Float(0);
+    Float d = prismatic_current_displacement(drv, qp, qq);
+    Float bound;
+    if(d < drv.lower_limit)      bound = drv.lower_limit;
+    else if(d > drv.upper_limit) bound = drv.upper_limit;
+    else return Float(0);
+    PrismaticDrivingGPUData c = drv;
+    c.target_distance = bound; c.stiffness = drv.pen_limit_stiffness; c.ext_force = Float(0);
+    c.limit_kappa = Float(0); c.limit_kappa2 = Float(0);  // disable barrier in the reused call
+    return prismatic_driving_energy(c, qp, qq);
+}
+
+MUDA_GENERIC inline void prismatic_limit_gradient_hessian(
+    const PrismaticDrivingGPUData& drv, const Vector12& qp, const Vector12& qq,
+    Vector12& gp, Vector12& gq, Matrix12x12& Hpp, Matrix12x12& Hqq, Matrix12x12& Hpq)
+{
+    gp.setZero(); gq.setZero(); Hpp.setZero(); Hqq.setZero(); Hpq.setZero();
+    if(drv.pen_limit_stiffness <= Float(0)) return;
+    Float d = prismatic_current_displacement(drv, qp, qq);
+    Float bound;
+    if(d < drv.lower_limit)      bound = drv.lower_limit;
+    else if(d > drv.upper_limit) bound = drv.upper_limit;
+    else return;
+    PrismaticDrivingGPUData c = drv;
+    c.target_distance = bound; c.stiffness = drv.pen_limit_stiffness; c.ext_force = Float(0);
+    c.limit_kappa = Float(0); c.limit_kappa2 = Float(0);
+    prismatic_driving_gradient_hessian(c, qp, qq, gp, gq, Hpp, Hqq, Hpq);
 }
 
 

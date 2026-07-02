@@ -6642,7 +6642,7 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
     // which poisons the whole global RHS and zeros the Newton search direction
     // (everything freezes). Clamp to a tiny positive value so d=0 yields a
     // large-but-finite push-out instead of NaN.
-    dist2 = fmax(dist2, 1e-12);
+    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -6692,7 +6692,7 @@ __global__ void _computeGroundGradient(const double3* vertexes,
     int     gidx   = _environment_collisionPair[idx];
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
-    dist2 = fmax(dist2, 1e-12);  // [d=0 guard] avoid ground-barrier NaN (see _computeGroundGradientAndHessian)
+    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-barrier NaN (see _computeGroundGradientAndHessian)
 
     double t   = dist2 - dHat;
     double g_b = t * std::log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -7038,7 +7038,7 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
     int     gidx   = _environment_collisionPair[idx];
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
-    dist2 = fmax(dist2, 1e-12);  // [d=0 guard] avoid ground-barrier energy NaN at d=0
+    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-barrier energy NaN at d=0
     double  temp  = -(dist2 - dHat) * (dist2 - dHat) * log(dist2 / dHat);
 
     _penv_energy_accum(penv, p2g, gidx, ng, temp);  // [S3] ground pair's vertex env
@@ -8701,7 +8701,7 @@ __global__ void _calFrictionLastH_gd(const double3* _vertexes,
     int     gidx   = _collisionPair_environment[idx];
     double  dist = __GEIGEN__::__v_vec_dot(normal, _vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
-    dist2 = fmax(dist2, 1e-12);  // [d=0 guard] avoid ground-friction lambda NaN at d=0
+    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-friction lambda NaN at d=0
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -9026,7 +9026,7 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     // and the root cause of super-linear contact growth in multi-env. When
     // absolute_dhat>0, derive an EFFECTIVE bbox so dHat == absolute_dhat^2 and
     // dTol/fDhat stay consistent with a single-env scene of that contact scale.
-    double eff_bboxDiagSize2 = bboxDiagSize2;
+    eff_bboxDiagSize2 = bboxDiagSize2;  // member: reused by the Newton convergence threshold
     if(absolute_dhat > 0.0 && relative_dhat > 0.0)
         eff_bboxDiagSize2 = (absolute_dhat * absolute_dhat)
                             / (relative_dhat * relative_dhat);
@@ -12413,7 +12413,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         double distToOpt_PN = calcMinMovement(_moveDir, pcg_data.squeue, vertexNum);
 
         bool gradVanish = (distToOpt_PN < sqrt(Newton_solver_threshold * Newton_solver_threshold
-                                               * bboxDiagSize2 * IPC_dt * IPC_dt));
+                                               * eff_bboxDiagSize2 * IPC_dt * IPC_dt));
 
         // [multi-env P3a step2] per-env Newton convergence tracking (precursor to
         // mask early-exit). The merged Newton loop currently breaks on the GLOBAL

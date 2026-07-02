@@ -18,6 +18,11 @@
 // detection can never write out of bounds; the host then grows + redoes.
 void set_emit_caps(int dcd_cap, int ccd_cap);
 
+// [multi-env subscene] Point the broad-phase env filter at a device array of
+// per-vertex env ids (length = engine vertex count). Contact pairs whose two
+// vertices carry different (>=0) env ids are skipped. nullptr disables it.
+void mlbvh_set_vertex_env_id(const int* d_vertex_env_id);
+
 struct AABB
 {
   public:

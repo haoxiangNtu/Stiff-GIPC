@@ -207,6 +207,8 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("body_a"), py::arg("body_b"))
         .def("set_body_groups", &SimEngine::set_body_groups,
              py::arg("groups"))
+        .def("set_vertex_env_ids", &SimEngine::set_vertex_env_ids,
+             py::arg("env_ids"))
         .def("add_ground_collision_skip", &SimEngine::add_ground_collision_skip,
              py::arg("body_id"))
         .def("add_stitch_spring",

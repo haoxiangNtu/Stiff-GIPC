@@ -198,6 +198,10 @@ class SimEngine
 
     void add_collision_exclusion(int body_a, int body_b);
     void set_body_groups(const std::vector<int>& groups);
+    // [multi-env subscene] Per-VERTEX env id (length = engine vertex count). The
+    // broad-phase skips contact pairs whose two vertices carry different (>=0) env
+    // ids -> cross-env isolation without spatial separation, uniform for FEM+ABD.
+    void set_vertex_env_ids(const std::vector<int>& env_ids);
     void add_ground_collision_skip(int body_id);
 
     /// Stitch a FEM vertex to an ABD body via a soft spring constraint.

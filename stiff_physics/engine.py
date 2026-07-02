@@ -187,6 +187,7 @@ class Config:
         newton_tol: float = 1e-2,
         pcg_tol: float = 1e-4,
         relative_dhat: float = 1e-3,
+        absolute_dhat: float = 0.0,
         joint_strength_ratio: float = 100.0,
         revolute_driving_strength_ratio: float = 100.0,
         semi_implicit_enabled: bool = False,
@@ -217,6 +218,10 @@ class Config:
         self._cfg.newton_tol = newton_tol
         self._cfg.pcg_tol = pcg_tol
         self._cfg.relative_dhat = relative_dhat
+        # absolute_dhat>0 makes dHat = absolute_dhat^2 (fixed), independent of the
+        # full-scene bbox → consistent contact across num_envs (no cross-env coupling).
+        if hasattr(self._cfg, "absolute_dhat"):
+            self._cfg.absolute_dhat = absolute_dhat
         self._cfg.joint_strength_ratio = joint_strength_ratio
         self._cfg.revolute_driving_strength_ratio = revolute_driving_strength_ratio
         self._cfg.prismatic_strength_ratio = prismatic_strength_ratio
@@ -437,6 +442,21 @@ class Engine:
         with everything). Call before finalize().
         """
         self._engine.set_body_groups([int(g) for g in groups])
+
+    def set_vertex_env_ids(self, env_ids) -> None:
+        """Set per-VERTEX env id, length = engine vertex count (ABD-body vertices in
+        load order, then FEM particles).
+
+        The broad-phase skips any contact pair whose two vertices carry different
+        (>= 0) env ids — cross-env contact isolation WITHOUT spatial separation,
+        applied uniformly to FEM particles and ABD-body vertices. Unlike
+        set_body_groups (per-body, folded into the O(body^2) skip matrix at
+        finalize), this handles a single FEM body whose particles span many envs,
+        and is decoupled from the block-diagonal solve (contact filtering only).
+        env id < 0 = shared geometry that collides with every env. May be called
+        any time after finalize(); the device array is (re)uploaded on each call.
+        """
+        self._engine.set_vertex_env_ids([int(e) for e in env_ids])
 
     def add_ground_collision_skip(self, body_id: int) -> None:
         self._engine.add_ground_collision_skip(body_id)

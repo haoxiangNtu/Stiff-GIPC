@@ -4,6 +4,56 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.6.7] — 2026-07-02
+
+> The "unification" release: v0.6.6 + exactly the changes proven necessary by
+> the IsaacLab/Newton multi-env RL validation campaign (each item gated by a
+> dedicated test; see `docs/STIFFGIPC_UNIFY_PLAN.md` in IsaacLab-3.0).
+
+### Added
+- **Per-vertex environment isolation** for contact: `Engine.set_vertex_env_ids`
+  (+ `SimEngine::set_vertex_env_ids` / pybind). The broad-phase skips any contact
+  pair whose two vertices carry different (>=0) env ids — uniform FEM+ABD
+  cross-env isolation WITHOUT spatial separation, decoupled from the solve
+  (contact filtering only). env id < 0 = shared geometry. Unlike the per-body
+  skip matrix this isolates a combined FEM body whose particles span many envs.
+- **Engine-native joint limits** (revolute + prismatic): mass-scaled one-sided
+  penalty spring toward the violated bound (`joint_limit_strength_ratio`,
+  default 20000; implicit energy with gradient + SPD Gauss-Newton Hessian —
+  a MuJoCo-style penalty, NOT a log-barrier). 0 disables.
+- **`absolute_dhat` passthrough** in the Python `Config`/`Engine` shell — the
+  engine's fixed-dHat mode existed but was unreachable from Python (the shell
+  never wrote it into `SimEngineConfig`, so it silently stayed 0/relative).
+
+### Fixed
+- **Newton convergence threshold is env-count-independent**: `gradVanish` now
+  uses the effective bbox (`eff_bboxDiagSize2` = absolute_dhat²/relative_dhat²
+  when absolute_dhat>0) instead of the raw whole-scene bbox, so convergence no
+  longer loosens as envs are tiled (was: N-env scenes converged to a different
+  quality than 1-env).
+- **Ground-barrier d=0 guard no longer freezes grounded bodies**: the
+  `fmax(dist2, 1e-12)` clamp capped the barrier force near d=0 (force should
+  → ∞), collapsing the line-search alpha and freezing any vertex resting
+  exactly on the ground. Replaced with the conditional
+  `dist2 == 0.0 ? 1e-12 : dist2` (NaN guard only at exact zero) in all 4 sites
+  (gradient/Hessian, energy, friction lambda). Strict non-penetration preserved.
+- **`teleport_fem_vertices` respects the FEM block offset** (`fem_offset`) in
+  mixed ABD+FEM scenes — per-env FEM resets previously wrote from vertex 0
+  (ABD vertices) instead of the FEM block start.
+- **OBJ loader parses `f v//vn` faces** (double-slash, no texcoord): the missing
+  branch pushed an uninitialized face index → CUDA out-of-bounds / frozen soft
+  bodies when loading normal-split OBJ exports.
+
+## [0.6.6] — 2026-06-24
+
+> Released without a changelog entry at the time; recorded retroactively.
+> Highlights (relative to 0.6.5): engine-side absolute dHat mode
+> (`absolute_dhat` → fixed contact thickness via effective bbox), gravity
+> body-force rotation term for trimesh ABD bodies (`compute_trimesh_body_force`
+> full integral — frozen-articulation gravity torque fix), revolute slew cap
+> (`max_revolute_step_per_frame`), collision exclusion/groups/ground-skip APIs,
+> per-body density & inertia setters, and the corresponding pybind bindings.
+
 ## [0.6.5] — 2026-06-22
 
 > v0.6.5 = v0.6.4 + the full multi-env backport (engine + examples) and the

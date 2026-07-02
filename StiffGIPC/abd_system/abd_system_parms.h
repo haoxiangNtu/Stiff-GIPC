@@ -22,6 +22,14 @@ class ABDSystemParms
     // Same mass-based formulation as rbs-uipc (default 100).
     Float    revolute_driving_strength_ratio = 100.0;
 
+    // [joint limit] One-sided position-limit PENALTY stiffness: K_lim =
+    // joint_limit_strength_ratio * (m_parent + m_child). A mass-scaled spring toward the
+    // violated bound (NOT a barrier). Because it is an implicit energy term (gradient + SPD
+    // Gauss-Newton Hessian) it stays stable even when stiff. 0 = disable limits.
+    // 20000 (vs the 1000 used elsewhere): a stiff drive (target_ke~1e3) needs a stiff
+    // limit spring to actually hold the bound (1000 -> ~2.5x overshoot; 20000 -> ~5%).
+    Float    joint_limit_strength_ratio = 20000.0;
+
     // Prismatic joint constraint: kappa = strength_ratio * (m_parent + m_child).
     Float    prismatic_strength_ratio = 100.0;
 

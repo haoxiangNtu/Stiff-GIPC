@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include "GIPC.cuh"
+#include "mlbvh.cuh"
 #include "load_mesh.h"
 #include "device_fem_data.cuh"
 #include "femEnergy.cuh"
@@ -51,6 +52,12 @@ struct SimEngine::Impl
     double3* d_contact_force = nullptr;
     int      contact_cap     = 0;
     int      contact_count   = 0;
+
+    // [multi-env subscene] device array of per-vertex env ids for broad-phase
+    // cross-env contact isolation (see mlbvh_set_vertex_env_id). Alloc'd on first
+    // set_vertex_env_ids(); length = vertexNum. Grow-only, mirrors d_contact_pair.
+    int*     d_vertex_env_id   = nullptr;
+    int      vertex_env_id_cap = 0;
 
     std::vector<BodyLoadRecord> load_records;
 
@@ -331,6 +338,31 @@ void SimEngine::set_body_groups(const std::vector<int>& groups)
     // [multi-env] group id per collision-body (ABD ids first, then FEM). Bodies
     // in different groups (both >=0) are excluded from collision at finalize.
     m_impl->tetMesh.body_groups = groups;
+}
+
+void SimEngine::set_vertex_env_ids(const std::vector<int>& env_ids)
+{
+    // [multi-env subscene] Per-VERTEX env id -> broad-phase skips contact pairs
+    // whose two vertices belong to different (>=0) envs. Unlike set_body_groups
+    // (per-body), this isolates a FEM body whose particles span many envs, WITHOUT
+    // spatial separation. Decoupled from the block-diagonal solve (contact only).
+    auto& impl = *m_impl;
+    int   n    = static_cast<int>(env_ids.size());
+    if(n <= 0)
+    {
+        mlbvh_set_vertex_env_id(nullptr);
+        return;
+    }
+    if(impl.d_vertex_env_id == nullptr || impl.vertex_env_id_cap < n)
+    {
+        if(impl.d_vertex_env_id)
+            cudaFree(impl.d_vertex_env_id);
+        CUDA_SAFE_CALL(cudaMalloc(&impl.d_vertex_env_id, n * sizeof(int)));
+        impl.vertex_env_id_cap = n;
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_vertex_env_id, env_ids.data(),
+                              n * sizeof(int), cudaMemcpyHostToDevice));
+    mlbvh_set_vertex_env_id(impl.d_vertex_env_id);
 }
 
 void SimEngine::add_ground_collision_skip(int body_id)
@@ -3604,19 +3636,30 @@ void SimEngine::set_vertex_velocities_gpu(const double* xyz, int count)
 void SimEngine::teleport_fem_vertices(const double* xyz, int count,
                                       const double* velocities)
 {
-    int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum));
+    // FEM vertices live AFTER the ABD vertices in the global _vertexes buffer. The
+    // caller passes FEM-only positions (count = FEM vertex count), so we MUST write at
+    // the FEM offset, not at index 0. The old code wrote to _vertexes[0..n], which in a
+    // multi-body scene (robot ABD verts first, then the FEM block) clobbered the first
+    // ABD verts and NEVER moved the block -> the FEM block could not be reset/teleported
+    // at all (it only worked in FEM-only scenes where the offset happens to be 0).
+    int fem_offset = 0;
+    if(!m_impl->fem_body_ranges.empty())
+        fem_offset = m_impl->fem_body_ranges[0].vertex_start;
+    int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum) - fem_offset);
     if(n <= 0) return;
+    double3* p_base  = m_impl->ipc._vertexes        + fem_offset;
+    double3* o_base  = m_impl->d_tetMesh.o_vertexes  + fem_offset;
+    double3* xt_base = m_impl->d_tetMesh.xTilta      + fem_offset;
+    double3* v_base  = m_impl->d_tetMesh.velocities   + fem_offset;
     // Write _vertexes (current) and o_vertexes (committed previous-step).
-    CUDA_SAFE_CALL(cudaMemcpy(m_impl->ipc._vertexes, xyz,
-                              n * sizeof(double3), cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.o_vertexes, xyz,
-                              n * sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(p_base, xyz, n * sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(o_base, xyz, n * sizeof(double3), cudaMemcpyHostToDevice));
 
     if(velocities != nullptr)
     {
         // Preserve inertia: write v and build xTilta = x + v*dt + g*dt^2
         // on the host, then upload.
-        CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.velocities, velocities,
+        CUDA_SAFE_CALL(cudaMemcpy(v_base, velocities,
                                   n * sizeof(double3), cudaMemcpyHostToDevice));
         double dt = m_impl->ipc.IPC_dt;
         double3 g = m_impl->ipc.gravity;
@@ -3628,16 +3671,16 @@ void SimEngine::teleport_fem_vertices(const double* xyz, int count,
             xTilta_host[3*i+1] = xyz[3*i+1] + velocities[3*i+1] * dt + g.y * dt2;
             xTilta_host[3*i+2] = xyz[3*i+2] + velocities[3*i+2] * dt + g.z * dt2;
         }
-        CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.xTilta, xTilta_host.data(),
+        CUDA_SAFE_CALL(cudaMemcpy(xt_base, xTilta_host.data(),
                                   n * sizeof(double3), cudaMemcpyHostToDevice));
     }
     else
     {
         // Zero velocity, xTilta = new_pos (caller declines to preserve
         // inertia; matches teleport_abd_bodies semantics).
-        CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.xTilta, xyz,
+        CUDA_SAFE_CALL(cudaMemcpy(xt_base, xyz,
                                   n * sizeof(double3), cudaMemcpyHostToDevice));
-        CUDA_SAFE_CALL(cudaMemset(m_impl->d_tetMesh.velocities, 0,
+        CUDA_SAFE_CALL(cudaMemset(v_base, 0,
                                   n * sizeof(double3)));
     }
 }

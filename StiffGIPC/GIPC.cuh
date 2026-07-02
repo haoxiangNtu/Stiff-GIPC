@@ -100,6 +100,10 @@ class GIPC
     double   dHat          = 0.0;
     double   fDhat         = 0.0;
     double   bboxDiagSize2 = 0.0;
+    // Effective bbox^2 = bboxDiagSize2 normally, but when absolute_dhat>0 it is the
+    // FIXED, env-count-independent value (absolute_dhat^2/relative_dhat^2). Reused by the
+    // Newton convergence threshold so convergence is consistent across num_envs.
+    double   eff_bboxDiagSize2 = 0.0;
     double   relative_dhat = 0.0;
     // Absolute contact distance (meters). >0 overrides the scene-bbox-derived
     // dHat so the contact thickness does NOT inflate with scene/env count.
