@@ -8,6 +8,11 @@
 
 #include "femEnergy.cuh"
 #include "math.h"
+// [multi-env determinism 4.3] elastic (FEM/bending/triangle/strain) gradient scatter is
+// deterministic via binned accumulation into the shared g_gbin (defined in GIPC.cu; -rdc on).
+// Callers in GIPC.cu bracket the elastic gradient block with zeroBinnedGrad()/combineBinnedGrad().
+#include <linear_system/utils/binned_reduce.cuh>
+extern __device__ double* g_gbin;
 #include <stdio.h>
 
 
@@ -1807,21 +1812,21 @@ __global__ void _calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInvers
     //printf("%f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f\n", f.v[0], f.v[1], f.v[2], f.v[3], f.v[4], f.v[5], f.v[6], f.v[7], f.v[8], f.v[9], f.v[10], f.v[11]);
 
     {
-        atomicAdd(&(gradient[tetrahedras[idx].x].x), f[0]);
-        atomicAdd(&(gradient[tetrahedras[idx].x].y), f[1]);
-        atomicAdd(&(gradient[tetrahedras[idx].x].z), f[2]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].x) * 3 + 0) * BINNED_K, f[0]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].x) * 3 + 1) * BINNED_K, f[1]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].x) * 3 + 2) * BINNED_K, f[2]);
 
-        atomicAdd(&(gradient[tetrahedras[idx].y].x), f[3]);
-        atomicAdd(&(gradient[tetrahedras[idx].y].y), f[4]);
-        atomicAdd(&(gradient[tetrahedras[idx].y].z), f[5]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].y) * 3 + 0) * BINNED_K, f[3]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].y) * 3 + 1) * BINNED_K, f[4]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].y) * 3 + 2) * BINNED_K, f[5]);
 
-        atomicAdd(&(gradient[tetrahedras[idx].z].x), f[6]);
-        atomicAdd(&(gradient[tetrahedras[idx].z].y), f[7]);
-        atomicAdd(&(gradient[tetrahedras[idx].z].z), f[8]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].z) * 3 + 0) * BINNED_K, f[6]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].z) * 3 + 1) * BINNED_K, f[7]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].z) * 3 + 2) * BINNED_K, f[8]);
 
-        atomicAdd(&(gradient[tetrahedras[idx].w].x), f[9]);
-        atomicAdd(&(gradient[tetrahedras[idx].w].y), f[10]);
-        atomicAdd(&(gradient[tetrahedras[idx].w].z), f[11]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].w) * 3 + 0) * BINNED_K, f[9]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].w) * 3 + 1) * BINNED_K, f[10]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].w) * 3 + 2) * BINNED_K, f[11]);
     }
 
 #ifdef USE_SNK2
@@ -2095,15 +2100,15 @@ __global__ void _calculate_triangle_fem_strain_limiting_gradient_hessian(
     //printf("%f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f\n", f.v[0], f.v[1], f.v[2], f.v[3], f.v[4], f.v[5], f.v[6], f.v[7], f.v[8], f.v[9], f.v[10], f.v[11]);
     if(true)
     {
-        atomicAdd(&(gradient[triangles[idx].x].x), f.v[0]);
-        atomicAdd(&(gradient[triangles[idx].x].y), f.v[1]);
-        atomicAdd(&(gradient[triangles[idx].x].z), f.v[2]);
-        atomicAdd(&(gradient[triangles[idx].y].x), f.v[3]);
-        atomicAdd(&(gradient[triangles[idx].y].y), f.v[4]);
-        atomicAdd(&(gradient[triangles[idx].y].z), f.v[5]);
-        atomicAdd(&(gradient[triangles[idx].z].x), f.v[6]);
-        atomicAdd(&(gradient[triangles[idx].z].y), f.v[7]);
-        atomicAdd(&(gradient[triangles[idx].z].z), f.v[8]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 0) * BINNED_K, f.v[0]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 1) * BINNED_K, f.v[1]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 2) * BINNED_K, f.v[2]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 0) * BINNED_K, f.v[3]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 1) * BINNED_K, f.v[4]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 2) * BINNED_K, f.v[5]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 0) * BINNED_K, f.v[6]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 1) * BINNED_K, f.v[7]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 2) * BINNED_K, f.v[8]);
     }
 
     Matrix2d triInvsm;
@@ -2204,15 +2209,15 @@ __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d*
     //printf("%f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f\n", f.v[0], f.v[1], f.v[2], f.v[3], f.v[4], f.v[5], f.v[6], f.v[7], f.v[8], f.v[9], f.v[10], f.v[11]);
 
     {
-        atomicAdd(&(gradient[triangles[idx].x].x), f.v[0]);
-        atomicAdd(&(gradient[triangles[idx].x].y), f.v[1]);
-        atomicAdd(&(gradient[triangles[idx].x].z), f.v[2]);
-        atomicAdd(&(gradient[triangles[idx].y].x), f.v[3]);
-        atomicAdd(&(gradient[triangles[idx].y].y), f.v[4]);
-        atomicAdd(&(gradient[triangles[idx].y].z), f.v[5]);
-        atomicAdd(&(gradient[triangles[idx].z].x), f.v[6]);
-        atomicAdd(&(gradient[triangles[idx].z].y), f.v[7]);
-        atomicAdd(&(gradient[triangles[idx].z].z), f.v[8]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 0) * BINNED_K, f.v[0]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 1) * BINNED_K, f.v[1]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 2) * BINNED_K, f.v[2]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 0) * BINNED_K, f.v[3]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 1) * BINNED_K, f.v[4]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 2) * BINNED_K, f.v[5]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 0) * BINNED_K, f.v[6]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 1) * BINNED_K, f.v[7]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 2) * BINNED_K, f.v[8]);
     }
 
     __GEIGEN__::Matrix6x6d Hq = __GEIGEN__::__s_M6x6_Multiply(
@@ -2270,15 +2275,15 @@ __global__ void _calculate_triangle_fem_gradient(__GEIGEN__::Matrix2x2d* trimInv
     //printf("%f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f  %f\n", f.v[0], f.v[1], f.v[2], f.v[3], f.v[4], f.v[5], f.v[6], f.v[7], f.v[8], f.v[9], f.v[10], f.v[11]);
 
     {
-        atomicAdd(&(gradient[triangles[idx].x].x), f.v[0]);
-        atomicAdd(&(gradient[triangles[idx].x].y), f.v[1]);
-        atomicAdd(&(gradient[triangles[idx].x].z), f.v[2]);
-        atomicAdd(&(gradient[triangles[idx].y].x), f.v[3]);
-        atomicAdd(&(gradient[triangles[idx].y].y), f.v[4]);
-        atomicAdd(&(gradient[triangles[idx].y].z), f.v[5]);
-        atomicAdd(&(gradient[triangles[idx].z].x), f.v[6]);
-        atomicAdd(&(gradient[triangles[idx].z].y), f.v[7]);
-        atomicAdd(&(gradient[triangles[idx].z].z), f.v[8]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 0) * BINNED_K, f.v[0]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 1) * BINNED_K, f.v[1]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].x) * 3 + 2) * BINNED_K, f.v[2]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 0) * BINNED_K, f.v[3]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 1) * BINNED_K, f.v[4]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].y) * 3 + 2) * BINNED_K, f.v[5]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 0) * BINNED_K, f.v[6]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 1) * BINNED_K, f.v[7]);
+        binned_deposit(g_gbin + ((size_t)(triangles[idx].z) * 3 + 2) * BINNED_K, f.v[8]);
     }
 }
 
@@ -2349,21 +2354,21 @@ __global__ void _calculate_fem_gradient(__GEIGEN__::Matrix3x3d* DmInverses,
     }
 
     {
-        atomicAdd(&(gradient[tetrahedras[idx].x].x), f.v[0]);
-        atomicAdd(&(gradient[tetrahedras[idx].x].y), f.v[1]);
-        atomicAdd(&(gradient[tetrahedras[idx].x].z), f.v[2]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].x) * 3 + 0) * BINNED_K, f.v[0]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].x) * 3 + 1) * BINNED_K, f.v[1]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].x) * 3 + 2) * BINNED_K, f.v[2]);
 
-        atomicAdd(&(gradient[tetrahedras[idx].y].x), f.v[3]);
-        atomicAdd(&(gradient[tetrahedras[idx].y].y), f.v[4]);
-        atomicAdd(&(gradient[tetrahedras[idx].y].z), f.v[5]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].y) * 3 + 0) * BINNED_K, f.v[3]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].y) * 3 + 1) * BINNED_K, f.v[4]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].y) * 3 + 2) * BINNED_K, f.v[5]);
 
-        atomicAdd(&(gradient[tetrahedras[idx].z].x), f.v[6]);
-        atomicAdd(&(gradient[tetrahedras[idx].z].y), f.v[7]);
-        atomicAdd(&(gradient[tetrahedras[idx].z].z), f.v[8]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].z) * 3 + 0) * BINNED_K, f.v[6]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].z) * 3 + 1) * BINNED_K, f.v[7]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].z) * 3 + 2) * BINNED_K, f.v[8]);
 
-        atomicAdd(&(gradient[tetrahedras[idx].w].x), f.v[9]);
-        atomicAdd(&(gradient[tetrahedras[idx].w].y), f.v[10]);
-        atomicAdd(&(gradient[tetrahedras[idx].w].z), f.v[11]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].w) * 3 + 0) * BINNED_K, f.v[9]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].w) * 3 + 1) * BINNED_K, f.v[10]);
+        binned_deposit(g_gbin + ((size_t)(tetrahedras[idx].w) * 3 + 2) * BINNED_K, f.v[11]);
     }
 }
 
@@ -2453,21 +2458,21 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
 
 
     {
-        atomicAdd(&(gradient[edge.x].x), grad_transpose(0, 0));
-        atomicAdd(&(gradient[edge.x].y), grad_transpose(0, 1));
-        atomicAdd(&(gradient[edge.x].z), grad_transpose(0, 2));
+        binned_deposit(g_gbin + ((size_t)(edge.x) * 3 + 0) * BINNED_K, grad_transpose(0, 0));
+        binned_deposit(g_gbin + ((size_t)(edge.x) * 3 + 1) * BINNED_K, grad_transpose(0, 1));
+        binned_deposit(g_gbin + ((size_t)(edge.x) * 3 + 2) * BINNED_K, grad_transpose(0, 2));
 
-        atomicAdd(&(gradient[edge.y].x), grad_transpose(0, 3));
-        atomicAdd(&(gradient[edge.y].y), grad_transpose(0, 4));
-        atomicAdd(&(gradient[edge.y].z), grad_transpose(0, 5));
+        binned_deposit(g_gbin + ((size_t)(edge.y) * 3 + 0) * BINNED_K, grad_transpose(0, 3));
+        binned_deposit(g_gbin + ((size_t)(edge.y) * 3 + 1) * BINNED_K, grad_transpose(0, 4));
+        binned_deposit(g_gbin + ((size_t)(edge.y) * 3 + 2) * BINNED_K, grad_transpose(0, 5));
 
-        atomicAdd(&(gradient[adj.x].x), grad_transpose(0, 6));
-        atomicAdd(&(gradient[adj.x].y), grad_transpose(0, 7));
-        atomicAdd(&(gradient[adj.x].z), grad_transpose(0, 8));
+        binned_deposit(g_gbin + ((size_t)(adj.x) * 3 + 0) * BINNED_K, grad_transpose(0, 6));
+        binned_deposit(g_gbin + ((size_t)(adj.x) * 3 + 1) * BINNED_K, grad_transpose(0, 7));
+        binned_deposit(g_gbin + ((size_t)(adj.x) * 3 + 2) * BINNED_K, grad_transpose(0, 8));
 
-        atomicAdd(&(gradient[adj.y].x), grad_transpose(0, 9));
-        atomicAdd(&(gradient[adj.y].y), grad_transpose(0, 10));
-        atomicAdd(&(gradient[adj.y].z), grad_transpose(0, 11));
+        binned_deposit(g_gbin + ((size_t)(adj.y) * 3 + 0) * BINNED_K, grad_transpose(0, 9));
+        binned_deposit(g_gbin + ((size_t)(adj.y) * 3 + 1) * BINNED_K, grad_transpose(0, 10));
+        binned_deposit(g_gbin + ((size_t)(adj.y) * 3 + 2) * BINNED_K, grad_transpose(0, 11));
     }
 
     H = IPC_dt * IPC_dt * length * bendStiff * H;
@@ -2716,9 +2721,9 @@ __global__ void _calculate_quad_bending_gradient_hessian(const double3* vertexes
     unsigned int vertex_indices[4] = {edge.x, edge.y, adj.x, adj.y};
     for(int i = 0; i < 4; i++)
     {
-        atomicAdd(&(gradient[vertex_indices[i]].x), grad(i * 3 + 0));
-        atomicAdd(&(gradient[vertex_indices[i]].y), grad(i * 3 + 1));
-        atomicAdd(&(gradient[vertex_indices[i]].z), grad(i * 3 + 2));
+        binned_deposit(g_gbin + ((size_t)(vertex_indices[i]) * 3 + 0) * BINNED_K, grad(i * 3 + 0));
+        binned_deposit(g_gbin + ((size_t)(vertex_indices[i]) * 3 + 1) * BINNED_K, grad(i * 3 + 1));
+        binned_deposit(g_gbin + ((size_t)(vertex_indices[i]) * 3 + 2) * BINNED_K, grad(i * 3 + 2));
     }
 
     // Compute Hessian: H_ij = Q_ij * I_3x3

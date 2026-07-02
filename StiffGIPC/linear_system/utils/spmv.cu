@@ -1,9 +1,16 @@
 #include <linear_system/utils/spmv.h>
+#include <linear_system/utils/binned_reduce.cuh>
 #include <muda/launch/launch.h>
 #include <cub/warp/warp_reduce.cuh>
 
 namespace gipc
 {
+
+Spmv::~Spmv()
+{
+    if(m_ybin)
+        cudaFree(m_ybin);
+}
 
 void Spmv::warp_reduce_sym_spmv(Float                         a,
                                 Eigen::Matrix3d*              triplet_values,
@@ -35,10 +42,47 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
         muda::BufferLaunch().fill<Float>(y.buffer_view(), 0);
     }
 
+    // [perf/fast-spmv] merged/isolated (STIFF_FAST_GRAD) don't need the binned order-free y:
+    // accumulate straight into y with atomicAdd — skips the ybin memset (~8MB/call: THE dominant
+    // memset load) and the combine pass. strict (no FAST_GRAD / SPMV_DET set) keeps the binned path.
+    static int s_fast = -1;
+    if(s_fast < 0)
+        s_fast = (getenv("STIFF_FAST_GRAD") && !getenv("STIFF_SPMV_DET")) ? 1 : 0;
+    const bool fast = (s_fast == 1);
+
+    // [multi-env determinism 4.3] grow + zero the binned y accumulator. The matvec deposits
+    // the a*A*x contributions here (order-independent) and we combine into y afterwards, so
+    // the result is bit-identical regardless of atomic/thread order.
+    if(!fast)
+    {
+        size_t need = (size_t)y.size() * BINNED_K;
+        if(need > m_ybin_cap)
+        {
+            if(m_ybin)
+                cudaFree(m_ybin);
+            cudaMalloc((void**)&m_ybin, need * sizeof(double));
+            m_ybin_cap = need;
+            cudaMemset(m_ybin, 0, need * sizeof(double));   // once at (re)alloc
+        }
+        // [strict-perf] NO per-call memset: the combine kernel re-zeroes each bin after reading it
+        // (read-then-zero == memset-before-next-deposit; ybin is spmv-private) — removes the ~8MB
+        // memset EVERY spmv (the dominant memset load). Bit-identical by construction.
+    }
+
     constexpr int          warp_size = 32;
     constexpr unsigned int warp_mask = ~0u;
     constexpr int          block_dim = 256;
     int block_count = (triplet_count + block_dim - 1) / block_dim;
+
+    // [env-det] when set, deposit each row contribution per-entry (fully order-free) instead of
+    // warp-segmented-reducing first — the warp reduce sums in lane order, which differs cross-env
+    // for mirror rows at different global triplet positions (the last 1-ULP cross-env seed).
+    bool det = (getenv("STIFF_SPMV_DET") != nullptr);
+
+    // [seg-fused dot] one-shot accumulator pointer (consumed per call; seg_pcg re-sets each iter).
+    double* seg_dot = m_seg_dot_partials;
+    int     seg_ng  = m_seg_dot_ng;
+    m_seg_dot_partials = nullptr;
 
     muda::Launch(block_count, block_dim)
         .kernel_name(__FUNCTION__)
@@ -50,7 +94,11 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
              triplet_count,
              x = x.viewer().name("x"),
              b = b,
+             det = det,
+             fast = fast,
+             seg_dot, seg_ng,
              s4_active, s4_dof_to_group, s4_ng,
+             ybin = m_ybin,
              y = y.viewer().name("y")] __device__() mutable
             {
                 using WarpReduceFloat = cub::WarpReduce<Float, warp_size>;
@@ -76,6 +124,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                 int     i      = -1;
                 char    flags;
                 Vector3 vec;
+                double  dotc = 0.0;   // [seg-fused dot] this triplet's contribution to x·(aAx)
 
                 // set the previous row index
                 if(global_thread_id > 0)
@@ -99,11 +148,50 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                         Vector3 vec_ = a * block_value.transpose()
                                        * x.segment<N>(i * N).as_eigen();
 
-                        y.segment<N>(j * N).atomic_add(vec_);
+                        if(fast)
+                        {
+                            atomicAdd(&y(j * N + 0), vec_(0));
+                            atomicAdd(&y(j * N + 1), vec_(1));
+                            atomicAdd(&y(j * N + 2), vec_(2));
+                        }
+                        else
+                        {
+                        // [4.3] deterministic deposit instead of y.atomic_add(vec_)
+                        binned_deposit(ybin + (size_t)(j * N + 0) * BINNED_K, vec_(0));
+                        binned_deposit(ybin + (size_t)(j * N + 1) * BINNED_K, vec_(1));
+                        binned_deposit(ybin + (size_t)(j * N + 2) * BINNED_K, vec_(2));
+                        }
+                        // [seg-fused dot] x_row·(a·block·x_col) + x_col·(a·blockᵀ·x_row).
+                        // NOTE: segments re-materialized INLINE (never store the muda segment
+                        // proxy in an auto/eval temporary — dangling Map ⇒ 0x0 writes).
+                        if(seg_dot)
+                            dotc = a * x.segment<N>(i * N).as_eigen().dot(vec)
+                                   + x.segment<N>(j * N).as_eigen().dot(vec_);
                     }
+                    else if(seg_dot)   // i==j: x_row == x_col
+                        dotc = a * x.segment<N>(j * N).as_eigen().dot(vec);
                 }
 
+                // [seg-fused dot] block-hashed strided partials keep the per-env atomics cool
+                // (ng*PSTRIDE slots); the caller's combine kernel sums + re-zeroes them.
+                if(seg_dot && dotc != 0.0)
+                {
+                    int g = s4_dof_to_group ? s4_dof_to_group[i] : 0;
+                    if(g >= 0 && g < seg_ng)
+                        atomicAdd(&seg_dot[(size_t)g * 256 + (blockIdx.x & 255)], dotc);
+                }
 
+                if(det)
+                {
+                    // [env-det] per-entry deposit (no warp reduce) ⇒ fully order-free ⇒ the row
+                    // contribution is bit-identical regardless of warp/triplet layout ⇒ cross-env mirror.
+                    Vector3 result = a * vec;
+                    binned_deposit(ybin + (size_t)(i * N + 0) * BINNED_K, result(0));
+                    binned_deposit(ybin + (size_t)(i * N + 1) * BINNED_K, result(1));
+                    binned_deposit(ybin + (size_t)(i * N + 2) * BINNED_K, result(2));
+                }
+                else
+                {
                 if((lane_id == 0) || (prev_i != i))
                 {
                     flags = 1;
@@ -135,13 +223,38 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
 
                 if(flags)
                 {
-                    auto seg_y  = y.segment<N>(i * N);
-                    auto result = a * vec;
-
-                    // Must use atomic add!
-                    // Because the same row may be processed by different warps
-                    seg_y.atomic_add(result.eval());
+                    Vector3 result = a * vec;
+                    if(fast)
+                    {   // [perf/fast-spmv] straight atomic accumulate (no binned round-trip)
+                        atomicAdd(&y(i * N + 0), result(0));
+                        atomicAdd(&y(i * N + 1), result(1));
+                        atomicAdd(&y(i * N + 2), result(2));
+                    }
+                    else
+                    {
+                    // [4.3] deterministic deposit instead of seg_y.atomic_add(a*vec)
+                    binned_deposit(ybin + (size_t)(i * N + 0) * BINNED_K, result(0));
+                    binned_deposit(ybin + (size_t)(i * N + 1) * BINNED_K, result(1));
+                    binned_deposit(ybin + (size_t)(i * N + 2) * BINNED_K, result(2));
+                    }
+                }
                 }
             });
+
+    if(fast)
+        return;   // [perf/fast-spmv] y already fully accumulated — no binned combine needed
+
+    // [multi-env determinism 4.3] combine the binned a*A*x contributions into y (which already
+    // holds b*y or 0). Order-independent ⇒ the matvec is now bit-identical run-to-run.
+    muda::ParallelFor()
+        .kernel_name("spmv_binned_combine")
+        .apply(y.size(),
+               [ybin = m_ybin, y = y.viewer().name("y")] __device__(int d) mutable
+               {
+                   double* b = ybin + (size_t)d * BINNED_K;
+                   y(d) += binned_combine(b);
+#pragma unroll
+                   for(int kk = 0; kk < BINNED_K; ++kk) b[kk] = 0.0;   // re-zero for the next spmv
+               });
 }
 }  // namespace gipc

@@ -54,6 +54,10 @@ class IterativeSolver
 
     muda::LinearSystemContext& ctx() const;
 
+    // [multi-env P3] derived solvers may need the system's per-env DOF→group map
+    // (m_s4_dof_to_group / m_s4_ng) for the segmented block-diagonal PCG.
+    GlobalLinearSystem* system_ptr() const { return m_system; }
+
   private:
     void system(GlobalLinearSystem& system) { m_system = &system; }
 };

@@ -4,6 +4,7 @@
 #include <muda/cub/device/device_radix_sort.h>
 #include <gipc/utils/timer.h>
 #include <gipc/utils/parallel_algorithm/fast_segmental_reduce.h>
+#include <linear_system/utils/binned_reduce.cuh>
 
 namespace gipc
 {
@@ -187,12 +188,56 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                               0,
                               global_triplets.h_unique_key_number * sizeof(Eigen::Matrix3d)));
 
-    FastSegmentalReduce()
-        .kernel_name(__FUNCTION__)
-        .reduce(length,
-                sorted_partition_output,
-                global_triplets.block_values(out_start_id),
-                global_triplets.block_values(start));
+    // [multi-env determinism 4.3 #4] DETERMINISTIC merge of duplicate (i,j) blocks. The old
+    // FastSegmentalReduce summed each segment in sorted-array (= stable-sort = emission) order,
+    // which is non-deterministic for contact triplets ⇒ non-det matrix values. Instead scatter
+    // each sorted block's 9 doubles into a binned accumulator keyed by the unique output index
+    // (order-independent ⇒ bit-identical), then combine.
+    {
+        int    nuniq = global_triplets.h_unique_key_number;
+        size_t need  = (size_t)nuniq * 9 * BINNED_K;
+        if(need > m_mergebin_cap)
+        {
+            if(m_mergebin)
+                cudaFree(m_mergebin);
+            cudaMalloc((void**)&m_mergebin, need * sizeof(double));
+            m_mergebin_cap = need;
+        }
+        cudaMemset(m_mergebin, 0, need * sizeof(double));
+
+        auto* src_blocks = global_triplets.block_values(out_start_id);  // sorted src (length)
+        auto* dst_blocks = global_triplets.block_values(start);         // unique out (nuniq)
+        double* mbin     = m_mergebin;
+
+        ParallelFor(256)
+            .kernel_name("binned_block_merge_scatter")
+            .apply(length,
+                   [src_blocks, mbin, sorted_partition_output] __device__(int i) mutable
+                   {
+                       int           out = sorted_partition_output[i];
+                       const double* sd  = reinterpret_cast<const double*>(src_blocks + i);
+#pragma unroll
+                       for(int c = 0; c < 9; ++c)
+                           binned_deposit(mbin + ((size_t)out * 9 + c) * BINNED_K, sd[c]);
+                   });
+
+        ParallelFor(256)
+            .kernel_name("binned_block_merge_combine")
+            .apply(nuniq,
+                   [dst_blocks, mbin] __device__(int u) mutable
+                   {
+                       double* dd = reinterpret_cast<double*>(dst_blocks + u);
+#pragma unroll
+                       for(int c = 0; c < 9; ++c)
+                           dd[c] = binned_combine(mbin + ((size_t)u * 9 + c) * BINNED_K);
+                   });
+    }
+}
+
+Converter::~Converter()
+{
+    if(m_mergebin)
+        cudaFree(m_mergebin);
 }
 
 void Converter::ge2sym(GIPCTripletMatrix& global_triplets)

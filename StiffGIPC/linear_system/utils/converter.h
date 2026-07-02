@@ -33,5 +33,14 @@ class Converter
 
 
     void ge2sym(GIPCTripletMatrix& global_triplets);
+
+    ~Converter();
+
+  private:
+    // [multi-env determinism 4.3 #4] binned accumulator for the duplicate-block merge
+    // (9 doubles per unique block, BINNED_K bins each): makes the merge order-independent
+    // ⇒ deterministic matrix values (FastSegmentalReduce summed in emission order). Grown lazily.
+    double* m_mergebin     = nullptr;
+    size_t  m_mergebin_cap = 0;
 };
 }  // namespace gipc

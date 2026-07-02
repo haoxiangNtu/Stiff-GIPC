@@ -72,6 +72,24 @@ class GlobalLinearSystem
     // is block-indexed (size = block count); a DOF i belongs to block i/3.
     void set_env_mask(const int* active, const int* dof_to_group, int ng)
     { m_s4_active = active; m_s4_dof_to_group = dof_to_group; m_s4_ng = ng; }
+    // [seg-fused dot] arm the NEXT spmv to also accumulate the per-env x·(aAx) into `partials`
+    // (one-shot; see Spmv::set_seg_dot_accum). Used by seg_pcg's fast path.
+    void set_seg_dot_accum(double* partials, int ng) { m_spmv.set_seg_dot_accum(partials, ng); }
+    // [seg-fused dot] arm the NEXT apply_preconditioner to accumulate the per-env r·z (of the
+    // FINAL z) into `partials`. Returns false (and arms nothing) unless the global AND all local
+    // preconditioners are seg_dot_capable — caller falls back to the standalone dot.
+    bool arm_precond_seg_dot(double* partials, const int* d2g, int ng)
+    {
+        if(!m_global_preconditioner || !m_global_preconditioner->seg_dot_capable())
+            return false;
+        for(auto& p : m_local_preconditioners)
+            if(!p->seg_dot_capable())
+                return false;
+        m_global_preconditioner->arm_seg_dot(partials, d2g, ng);
+        for(auto& p : m_local_preconditioners)
+            p->arm_seg_dot(partials, d2g, ng);
+        return true;
+    }
     const int* m_s4_active       = nullptr;
     const int* m_s4_dof_to_group = nullptr;
     int        m_s4_ng           = 0;

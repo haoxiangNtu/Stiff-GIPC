@@ -1341,6 +1341,13 @@ __device__ __host__ void __Inverse(const Matrix3x3d& input, Matrix3x3d& result)
 
 __device__ __host__ void __Inverse2x2(const Matrix2x2d& input, Matrix2x2d& result)
 {
+    // [multi-env determinism 4.3] Initialize result to 0 FIRST. For a singular `input`
+    // (e.g. parallel edges in the friction closest-point), the elimination below hits the
+    // `j == dim` early-return WITHOUT writing `result` — leaving it UNINITIALIZED (garbage).
+    // That garbage is finite + non-deterministic run-to-run, and was THE residual non-atomic
+    // source: friction distCoord → friction Hessian → matrix → solve. Zero is the deterministic
+    // (and physically reasonable) fallback for a degenerate closest-point.
+    result.m[0][0] = result.m[0][1] = result.m[1][0] = result.m[1][1] = 0.0;
     double    eps = 1e-15;
     const int dim = 2;
     double    mat[dim][dim * 2];

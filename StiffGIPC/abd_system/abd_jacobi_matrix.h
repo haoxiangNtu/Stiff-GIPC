@@ -201,6 +201,14 @@ class ABDJacobiDyadicMass
     static MUDA_DEVICE ABDJacobiDyadicMass atomic_add(ABDJacobiDyadicMass& dst,
                                                       const ABDJacobiDyadicMass& src);
 
+    // [multi-env determinism 4.3] component accessors for binned (deterministic) accumulation.
+    MUDA_GENERIC double&    ref_mass() { return m_mass; }
+    MUDA_GENERIC Vector3&   ref_mx()   { return m_mass_times_x_bar; }
+    MUDA_GENERIC Matrix3x3& ref_mxx()  { return m_mass_times_dyadic_x_bar; }
+    MUDA_GENERIC double           cref_mass() const { return m_mass; }
+    MUDA_GENERIC const Vector3&   cref_mx()   const { return m_mass_times_x_bar; }
+    MUDA_GENERIC const Matrix3x3& cref_mxx()  const { return m_mass_times_dyadic_x_bar; }
+
   private:
     double m_mass;
     //tex: $$ m\bar{\mathbf{x}} $$

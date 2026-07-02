@@ -27,7 +27,13 @@ class IPreconditioner
     virtual ~IPreconditioner();
 
     virtual Json as_json() const;
-    
+
+    // [seg-fused dot] optional: a capable preconditioner accumulates the per-env r·z alongside
+    // its z-write (one-shot arm; the ABD local uses the read-old-z correction so the sum equals
+    // r·z of the FINAL z). seg_pcg fuses only when the global AND all locals are capable.
+    virtual bool seg_dot_capable() const { return false; }
+    virtual void arm_seg_dot(double* /*partials*/, const int* /*d2g*/, int /*ng*/) {}
+
   protected:
     muda::LinearSystemContext& ctx() const;
 

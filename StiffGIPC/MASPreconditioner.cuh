@@ -41,6 +41,9 @@ class MASPreconditioner
     __GEIGEN__::MasMatrixSymf* d_precondMatMas;
     Eigen::Vector3f*              d_multiLevelR;
     Precision_T3*              d_multiLevelZ;
+    double* d_mRbin  = nullptr;  // [4.3] binned d_multiLevelR coarse accumulation
+    double* d_mZbin  = nullptr;  // [4.3] binned d_multiLevelZ Schwarz accumulation
+    double* d_matbin = nullptr;  // [4.3] binned d_inverseMatMas coarse aggregation
 
   public:
     int           neighborListSize;

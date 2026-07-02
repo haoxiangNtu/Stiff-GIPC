@@ -7,6 +7,7 @@
 //
 
 #include "MASPreconditioner.cuh"
+#include <linear_system/utils/binned_reduce.cuh>  // [4.3] MAS determinism: binned reproducible FP
 #include "cuda_tools/cuda_tools.h"
 #include "device_launch_parameters.h"
 #include <muda/launch/launch.h>
@@ -25,6 +26,45 @@ using namespace std;
 #define SYME
 #define GROUP
 
+// [4.3] MAS determinism: binned reproducible-FP accumulation for the three non-deterministic
+// float/double atomicAdd targets — d_multiLevelR (restrict), d_multiLevelZ (Schwarz apply),
+// d_inverseMatMas (coarse Hessian aggregation). Order-independent ⇒ bit-identical. The bins are
+// set via cudaMemcpyToSymbol before the depositing kernels; combined back by the kernels below.
+#define MAS_NB (BANKSIZE * (BANKSIZE + 1) / 2)
+__device__ double* g_mRbin  = nullptr;
+__device__ double* g_mZbin  = nullptr;
+__device__ double* g_matbin = nullptr;
+
+__global__ void _mas_comb_mZ(Precision_T3* mZ, const double* bin, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    mZ[i].x = binned_combine(bin + ((size_t)i * 3 + 0) * BINNED_K);
+    mZ[i].y = binned_combine(bin + ((size_t)i * 3 + 1) * BINNED_K);
+    mZ[i].z = binned_combine(bin + ((size_t)i * 3 + 2) * BINNED_K);
+}
+__global__ void _mas_comb_mR(Eigen::Vector3f* mR, const double* bin, int start, int end)
+{
+    int i = start + blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= end) return;
+    mR[i][0] = (float)binned_combine(bin + ((size_t)i * 3 + 0) * BINNED_K);
+    mR[i][1] = (float)binned_combine(bin + ((size_t)i * 3 + 1) * BINNED_K);
+    mR[i][2] = (float)binned_combine(bin + ((size_t)i * 3 + 2) * BINNED_K);
+}
+__global__ void _mas_comb_mat(__GEIGEN__::MasMatrixSymT* mat, const double* bin, int startC, int endC)
+{
+    int t    = blockIdx.x * blockDim.x + threadIdx.x;
+    int nblk = (endC - startC) * MAS_NB;
+    if(t >= nblk) return;
+    int cPid  = startC + t / MAS_NB;
+    int index = t % MAS_NB;
+#pragma unroll
+    for(int i = 0; i < 3; i++)
+#pragma unroll
+        for(int j = 0; j < 3; j++)
+            mat[cPid].M[index](i, j) =
+                binned_combine(bin + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j) * BINNED_K);
+}
 
 __global__ void _buildCML0(const unsigned int* _neighborStart,
                            unsigned int*       _neighborNum,
@@ -808,9 +848,9 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
                 {
                     level++;
                     idx = _goingNext[idx];
-                    atomicAdd(&(_multiLR[idx][0]), r[0]);
-                    atomicAdd(&(_multiLR[idx][1]), r[1]);
-                    atomicAdd(&(_multiLR[idx][2]), r[2]);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 0) * BINNED_K, (double)r[0]);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 1) * BINNED_K, (double)r[1]);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 2) * BINNED_K, (double)r[2]);
                 }
             }
             return;
@@ -835,11 +875,12 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
                 {
                     level++;
                     idx = _goingNext[idx];
-                    atomicAdd(&(_multiLR[idx][0]), c_sumResidual[threadIdx.x]);
-                    atomicAdd(&(_multiLR[idx][1]),
-                              c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE]);
-                    atomicAdd(&(_multiLR[idx][2]),
-                              c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE * 2]);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 0) * BINNED_K,
+                                   (double)c_sumResidual[threadIdx.x]);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 1) * BINNED_K,
+                                   (double)c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE]);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 2) * BINNED_K,
+                                   (double)c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE * 2]);
                 }
             }
         }
@@ -1020,9 +1061,10 @@ __global__ void _schwarzLocalXSym6(const __GEIGEN__::MasMatrixSymf* Pred,
 
     if(bBoundary)
     {
-        atomicAdd((&(mZ[vrid].x)), rdata[0]);
-        atomicAdd((&(mZ[vrid].y)), rdata[1]);
-        atomicAdd((&(mZ[vrid].z)), rdata[2]);
+        // [4.3] binned deposit instead of float atomicAdd → order-independent ⇒ deterministic
+        binned_deposit(g_mZbin + ((size_t)vrid * 3 + 0) * BINNED_K, (double)rdata[0]);
+        binned_deposit(g_mZbin + ((size_t)vrid * 3 + 1) * BINNED_K, (double)rdata[1]);
+        binned_deposit(g_mZbin + ((size_t)vrid * 3 + 2) * BINNED_K, (double)rdata[2]);
     }
 }
 
@@ -1831,6 +1873,17 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
 
     using namespace muda;
     int tripletNum = triplet_number;
+    // [4.3] zero the binned coarse-aggregation accumulator + bind the device-symbol pointer.
+    // Only COARSE cluster-blocks accumulate (fine blocks are set directly at level 0).
+    {
+        int startC = totalMapNodes / BANKSIZE;
+        int endC   = totalNumberClusters / BANKSIZE;
+        if(endC > startC)
+            CUDA_SAFE_CALL(cudaMemset(
+                d_matbin + (size_t)startC * MAS_NB * 9 * BINNED_K, 0,
+                (size_t)(endC - startC) * MAS_NB * 9 * BINNED_K * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_matbin, &d_matbin, sizeof(double*)));
+    }
     if(true)
     {
         ParallelFor()
@@ -1898,13 +1951,18 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                                     {
                                         for(int j = 0; j < 3; j++)
                                         {
-                                            atomicAdd(
-                                                &(_invMatrix[cPid].M[index](i, j)),
+                                            binned_deposit(
+                                                g_matbin
+                                                    + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j)
+                                                          * BINNED_K,
                                                 H(i, j));
                                             if(vertCid == vertRid)
                                             {
-                                                atomicAdd(
-                                                    &(_invMatrix[cPid].M[index](i, j)),
+                                                binned_deposit(
+                                                    g_matbin
+                                                        + (((size_t)cPid * MAS_NB + index) * 9 + i * 3
+                                                           + j)
+                                                              * BINNED_K,
                                                     H(j, i));
                                             }
                                         }
@@ -1920,8 +1978,11 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                                     {
                                         for(int j = 0; j < 3; j++)
                                         {
-                                            atomicAdd(&(_invMatrix[cPid].M[index](i, j)),
-                                                      H(j, i));
+                                            binned_deposit(
+                                                g_matbin
+                                                    + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j)
+                                                          * BINNED_K,
+                                                H(j, i));
                                         }
                                     }
                                 }
@@ -2016,8 +2077,10 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                                     {
                                         for(int j = 0; j < 3; j++)
                                         {
-                                            atomicAdd(
-                                                &(_invMatrix[cPid].M[index](i, j)),
+                                            binned_deposit(
+                                                g_matbin
+                                                    + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j)
+                                                          * BINNED_K,
                                                 mat3(i, j));
                                         }
                                     }
@@ -2050,8 +2113,12 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                                         {
                                             for(int j = 0; j < 3; j++)
                                             {
-                                                atomicAdd(&(_invMatrix[cPid].M[index](i, j)),
-                                                          mat3(i, j));
+                                                binned_deposit(
+                                                    g_matbin
+                                                        + (((size_t)cPid * MAS_NB + index) * 9 + i * 3
+                                                           + j)
+                                                              * BINNED_K,
+                                                    mat3(i, j));
                                             }
                                         }
                                     }
@@ -2072,6 +2139,14 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
     if(number2 < 1)
         return;
     int numBlocks2 = (number2 + blockSize2 - 1) / blockSize2;
+
+    {  // [4.3] combine binned coarse aggregation back into d_inverseMatMas (before inversion)
+        int startC = totalMapNodes / BANKSIZE;
+        int endC   = totalNumberClusters / BANKSIZE;
+        int nblk   = (endC - startC) * MAS_NB;
+        if(nblk > 0)
+            _mas_comb_mat<<<(nblk + 255) / 256, 256>>>(d_inverseMatMas, d_matbin, startC, endC);
+    }
 
     __inverse6_P96x96<<<numBlocks2, blockSize2>>>(d_precondMatMas, d_inverseMatMas, number2);
 
@@ -2218,30 +2293,53 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
 }
 
 
+static void _mas_ksum(const char* name, const void* dptr, size_t nbytes)
+{
+    if(!getenv("STIFF_KSUM") || !dptr || nbytes == 0) return;
+    std::vector<uint64_t> h((nbytes + 7) / 8, 0);
+    cudaMemcpy(h.data(), dptr, nbytes, cudaMemcpyDeviceToHost);
+    uint64_t acc = 1469598103934665603ULL;
+    for(uint64_t v : h) { acc ^= v; acc *= 1099511628211ULL; }
+    printf("[masksum] %-14s %016llx\n", name, (unsigned long long)acc);
+}
+
 void MASPreconditioner::preconditioning(const double3* R, double3* Z)
 {
     if(totalNodes < 1)
         return;
+    if(getenv("STIFF_KSUM")) { cudaDeviceSynchronize();
+        _mas_ksum("precondMat", d_precondMatMas,
+                  (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf)); }
     CUDA_SAFE_CALL(cudaMemset(d_multiLevelR + totalMapNodes,
                               0,
                               (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f)));
 
     CUDA_SAFE_CALL(cudaMemset(d_multiLevelZ, 0, (totalNumberClusters) * sizeof(Precision_T3)));
 
-    //cudaEvent_t start, end0, end1, end2;
-    //cudaEventCreate(&start);
-    //cudaEventCreate(&end0);
-    //cudaEventCreate(&end1);
-    //cudaEventCreate(&end2);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    //cudaEventRecord(start);
+    // [4.3] zero the binned accumulators + bind the device-symbol pointers. mR: only the COARSE
+    // slots accumulate (fine [0,totalMapNodes) is set directly in __buildMultiLevelR); mZ: all.
+    CUDA_SAFE_CALL(cudaMemset(d_mRbin + (size_t)totalMapNodes * 3 * BINNED_K, 0,
+                              (size_t)(totalNumberClusters - totalMapNodes) * 3 * BINNED_K
+                                  * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemset(d_mZbin, 0,
+                              (size_t)totalNumberClusters * 3 * BINNED_K * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mRbin, &d_mRbin, sizeof(double*)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mZbin, &d_mZbin, sizeof(double*)));
+
     BuildMultiLevelR(R);
-    //cudaEventRecord(end0);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    {  // [4.3] combine binned coarse mR back into d_multiLevelR
+        int n = totalNumberClusters - totalMapNodes;
+        if(n > 0)
+            _mas_comb_mR<<<(n + 255) / 256, 256>>>(d_multiLevelR, d_mRbin, totalMapNodes,
+                                                   totalNumberClusters);
+    }
 
     SchwarzLocalXSym_block3();
-    //cudaEventRecord(end1);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    {  // [4.3] combine binned mZ back into d_multiLevelZ
+        int n = totalNumberClusters;
+        if(n > 0)
+            _mas_comb_mZ<<<(n + 255) / 256, 256>>>(d_multiLevelZ, d_mZbin, n);
+    }
 
     CollectFinalZ(Z);
     //cudaEventRecord(end2);
@@ -2330,6 +2428,12 @@ void MASPreconditioner::initPreconditioner_Matrix()
                               totalCluster / BANKSIZE * sizeof(__GEIGEN__::MasMatrixSymf)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_multiLevelR, totalCluster * sizeof(Eigen::Vector3f)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_multiLevelZ, totalCluster * sizeof(Precision_T3)));
+    // [4.3] binned reproducible-FP accumulators (double, K bins per scalar) for MAS determinism
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_mRbin, (size_t)3 * totalCluster * BINNED_K * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_mZbin, (size_t)3 * totalCluster * BINNED_K * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_matbin,
+                              (size_t)(totalCluster / BANKSIZE) * MAS_NB * 9 * BINNED_K
+                                  * sizeof(double)));
 }
 
 void MASPreconditioner::FreeMAS()
@@ -2363,4 +2467,7 @@ void MASPreconditioner::FreeMAS()
     CUDA_SAFE_CALL(cudaFree(d_precondMatMas));
     CUDA_SAFE_CALL(cudaFree(d_multiLevelR));
     CUDA_SAFE_CALL(cudaFree(d_multiLevelZ));
+    if(d_mRbin) CUDA_SAFE_CALL(cudaFree(d_mRbin));
+    if(d_mZbin) CUDA_SAFE_CALL(cudaFree(d_mZbin));
+    if(d_matbin) CUDA_SAFE_CALL(cudaFree(d_matbin));
 }

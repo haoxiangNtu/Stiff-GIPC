@@ -2,6 +2,7 @@
 #include <muda/cub/device/device_reduce.h>
 #include <abd_system/abd_energy.h>
 #include <abd_system/abd_joint_constraint.h>
+#include <linear_system/utils/binned_reduce.cuh>  // [decouple] order-free per-env energy
 namespace gipc
 {
 Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
@@ -246,39 +247,59 @@ double ABDSystem::cal_abd_energy_perenv(ABDSimData& sim_data, const int* body_to
     auto abd_count = sim_data.abd_fem_count_info().abd_body_num;
     if(!env_out || !body_to_group) return total;
 
+    // [decouple] order-free per-env energy accumulation. The previous atomicAdd(&env_out[g], E)
+    // sums doubles in thread-scheduling order, which depends on the TOTAL work (batch) → env_0's
+    // per-env ABD energy gets a ~1e-16 batch-dependent jitter → near the per-env line-search descent
+    // threshold this FLIPS env_0's backtrack-halve decision → env_0's ABD step alpha differs → its
+    // gripper/arm pose drifts across batches (confirmed root: ABD dq identical, q drifts after the
+    // last step). Binned deposit (Demmel-Nguyen, exact per-bin) is order-independent → bit-identical.
+    static double* s_ebin = nullptr; static int s_ebin_ng = 0;
+    if(s_ebin_ng < ng)
+    {
+        if(s_ebin) cudaFree(s_ebin);
+        cudaMalloc((void**)&s_ebin, (size_t)ng * BINNED_K * sizeof(double));
+        s_ebin_ng = ng;
+    }
+    cudaMemset(s_ebin, 0, (size_t)ng * BINNED_K * sizeof(double));
+    double* ebin = s_ebin;
+
     // per-body terms: kinetic, shape (element i -> body i)
     if(abd_count > 0)
     {
         ParallelFor(256).apply(abd_count,
             [E = m_kinetic_energy_per_affine_body.cviewer().name("K"),
-             body_to_group, ng, env_out] __device__(int i) mutable
-            { int g = body_to_group[i]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+             body_to_group, ng, ebin] __device__(int i) mutable
+            { int g = body_to_group[i]; if(g >= 0 && g < ng) binned_deposit(ebin + (size_t)g * BINNED_K, E(i)); });
         ParallelFor(256).apply(abd_count,
             [E = m_shape_energy_per_affine_body.cviewer().name("V"),
-             body_to_group, ng, env_out] __device__(int i) mutable
-            { int g = body_to_group[i]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+             body_to_group, ng, ebin] __device__(int i) mutable
+            { int g = body_to_group[i]; if(g >= 0 && g < ng) binned_deposit(ebin + (size_t)g * BINNED_K, E(i)); });
     }
     // constraint terms: keyed by parent_body_id (parent/child same env after P1)
     if(m_num_joints > 0)
         ParallelFor(256).apply(m_num_joints,
             [E = m_joint_energy_per_joint.cviewer().name("J"),
-             d = m_joint_data.cviewer().name("jd"), body_to_group, ng, env_out] __device__(int i) mutable
-            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+             d = m_joint_data.cviewer().name("jd"), body_to_group, ng, ebin] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) binned_deposit(ebin + (size_t)g * BINNED_K, E(i)); });
     if(m_num_revolute_driving > 0)
         ParallelFor(256).apply(m_num_revolute_driving,
             [E = m_revolute_driving_energy_per.cviewer().name("R"),
-             d = m_revolute_driving_data.cviewer().name("rd"), body_to_group, ng, env_out] __device__(int i) mutable
-            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+             d = m_revolute_driving_data.cviewer().name("rd"), body_to_group, ng, ebin] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) binned_deposit(ebin + (size_t)g * BINNED_K, E(i)); });
     if(m_num_prismatic > 0)
         ParallelFor(256).apply(m_num_prismatic,
             [E = m_prismatic_energy_per.cviewer().name("P"),
-             d = m_prismatic_data.cviewer().name("pd"), body_to_group, ng, env_out] __device__(int i) mutable
-            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+             d = m_prismatic_data.cviewer().name("pd"), body_to_group, ng, ebin] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) binned_deposit(ebin + (size_t)g * BINNED_K, E(i)); });
     if(m_num_prismatic_driving > 0)
         ParallelFor(256).apply(m_num_prismatic_driving,
             [E = m_prismatic_driving_energy_per.cviewer().name("PD"),
-             d = m_prismatic_driving_data.cviewer().name("pdd"), body_to_group, ng, env_out] __device__(int i) mutable
-            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) atomicAdd(&env_out[g], E(i)); });
+             d = m_prismatic_driving_data.cviewer().name("pdd"), body_to_group, ng, ebin] __device__(int i) mutable
+            { int g = body_to_group[d(i).parent_body_id]; if(g >= 0 && g < ng) binned_deposit(ebin + (size_t)g * BINNED_K, E(i)); });
+    // combine bins -> env_out (fixed order, exact)
+    ParallelFor(256).apply(ng,
+        [ebin, env_out] __device__(int g) mutable
+        { env_out[g] += binned_combine(ebin + (size_t)g * BINNED_K); });
     return total;
 }
 

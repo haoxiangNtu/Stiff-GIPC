@@ -51,6 +51,30 @@ class PCGSolver : public IterativeSolver
     void*      cub_temp_ptr   = nullptr;
     size_t     cub_temp_bytes = 0;
 
+    // [multi-env P3] SEGMENTED (block-diagonal) PCG state. The matrix is block-diagonal after P1
+    // (no cross-env contacts) and the preconditioner is intra-env, so the ONLY cross-env coupling
+    // in the solve is the GLOBAL dot products (one scalar α/β/convergence over all envs). Per-env
+    // dots (binned → exact, order-independent ⇒ per-env deterministic AND cross-env symmetric)
+    // + per-env α/β/convergence make each env a mathematically INDEPENDENT solve → cross-env
+    // bit-identical for identical envs. Gated (STIFF_SEGMENTED_PCG + dof_to_group present); the
+    // scalar path is otherwise unchanged (single-env bit-identical).
+    int        m_seg_ng       = 0;          // #envs (groups); 0 ⇒ segmented off
+    Float*     d_rz_g         = nullptr;    // [ng] per-env r·z
+    Float*     d_rz0_g        = nullptr;    // [ng] per-env initial r·z
+    Float*     d_rzn_g        = nullptr;    // [ng] per-env new r·z
+    Float*     d_dot_g        = nullptr;    // [ng] per-env p·Ap
+    double*    d_segbin        = nullptr;   // [ng*BINNED_K] segmented binned-dot accumulator
+    int*       d_break_g      = nullptr;    // [ng] per-env converged flag
+    double*    d_dot_partials = nullptr;    // [ng*256] spmv-fused per-env dot partials (fast path)
+    // [warm-start (1)] per-env safeguarded warm start (STIFF_PCG_WARM, default off):
+    Float*     d_rr_g         = nullptr;    // [ng] ||b - A*x0||^2 per env
+    Float*     d_bb_g         = nullptr;    // [ng] ||b||^2 per env
+    int*       d_use_warm     = nullptr;    // [ng] per-env decision: 1 = keep x0, 0 = reset to zero
+    // [E-W (2)] per-env adaptive forcing terms (STIFF_PCG_EW, default off):
+    Float*     d_ew_prev      = nullptr;    // [ng] previous solve's rz0_g (gradient-norm^2 proxy)
+    Float*     d_tol2_g       = nullptr;    // [ng] this solve's per-env tolerance (eta^2)
+    bool       m_seg_alloced  = false;
+
     PCGSolverConfig   m_config;
 
   protected:
@@ -58,5 +82,11 @@ class PCGSolver : public IterativeSolver
 
   private:
     SizeT pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter);
+    // [multi-env P3] segmented block-diagonal PCG (per-env α/β/convergence). dof_to_group is
+    // block-indexed (DOF i → block i/3 → group dof_to_group[i/3]).
+    SizeT seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter,
+                  const int* dof_to_group, int ng);
+    // segmented binned dot: out_g[g] = Σ_{i: dof_to_group[i/3]==g} a[i]*b[i] (exact, per-env).
+    void seg_dot(const Float* a, const Float* b, const int* d2g, int ng, int n, Float* out_g);
 };
 }  // namespace gipc

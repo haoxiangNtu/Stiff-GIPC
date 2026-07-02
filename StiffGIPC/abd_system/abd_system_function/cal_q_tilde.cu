@@ -2,8 +2,11 @@
 #include <abd_system/abd_driving_joint.h>   // [force-control] extract_A, RevoluteDrivingGPUData
 #include <muda/cub/device/device_reduce.h>
 #include <gipc/utils/timer.h>
+#include <linear_system/utils/binned_reduce.cuh>
+extern __device__ double* g_abd_wrenchbin;   // [4.3] defined in setup_abd_system_gradient_and_hessian.cu
 namespace gipc
 {
+__global__ void _abd_sysbin_combine_k(double* g, const double* bin, int n);  // [4.3] fwd (defined in setup_...cu)
 // [force-control] Device-safe inverse-transpose of a 3x3 (cofactor / det), to
 // match libuipc's exact A^-T in the joint-torque wrench (handles affine
 // shear/scale, not just the rigid A^-T = A limit).  Eigen's built-in .inverse()
@@ -44,6 +47,16 @@ void ABDSystem::cal_q_tilde(ABDSimData& sim_data)
     // needed). Each torque joint adds F_k = [0; vec(+/-tau/2 [e]_x A_k^-T)] to
     // its parent (-) and child (+), accumulated into body_id_to_abd_joint_wrench.
     abd.body_id_to_abd_joint_wrench.fill(Vector12::Zero());
+    // [multi-env determinism 4.3] wrench is assembled by atomic_add (joint/prismatic) → bin it
+    // deterministically: alloc+zero the binned buffer, bind the global; combine back before use.
+    if(abd_body_count > 0)
+    {
+        size_t wn = (size_t)abd_body_count * 12 * BINNED_K;
+        if(wn > m_abd_wrenchbin_cap)
+        { if(m_abd_wrenchbin) cudaFree(m_abd_wrenchbin); cudaMalloc((void**)&m_abd_wrenchbin, wn * sizeof(double)); m_abd_wrenchbin_cap = wn; }
+        cudaMemset(m_abd_wrenchbin, 0, wn * sizeof(double));
+        cudaMemcpyToSymbol(g_abd_wrenchbin, &m_abd_wrenchbin, sizeof(double*));
+    }
     if(m_num_revolute_driving > 0)
     {
         ParallelFor()
@@ -103,8 +116,8 @@ void ABDSystem::cal_q_tilde(ABDSimData& sim_data)
                        Fp.segment<3>(3) = FpA.row(0).transpose(); Fp.segment<3>(6) = FpA.row(1).transpose(); Fp.segment<3>(9) = FpA.row(2).transpose();
                        Fc.segment<3>(3) = FcA.row(0).transpose(); Fc.segment<3>(6) = FcA.row(1).transpose(); Fc.segment<3>(9) = FcA.row(2).transpose();
 
-                       eigen::atomic_add(wrench(pid), Fp);
-                       eigen::atomic_add(wrench(cid), Fc);
+                       bin_add12(g_abd_wrenchbin, pid, Fp);
+                       bin_add12(g_abd_wrenchbin, cid, Fc);
                    });
     }
 
@@ -146,9 +159,18 @@ void ABDSystem::cal_q_tilde(ABDSimData& sim_data)
                        Fp.segment<3>(0) = f * ti;   // parent gets -f*t
                        Fc.segment<3>(0) = f * tj;   // child  gets +f*t
 
-                       eigen::atomic_add(wrench(pid), Fp);
-                       eigen::atomic_add(wrench(cid), Fc);
+                       bin_add12(g_abd_wrenchbin, pid, Fp);
+                       bin_add12(g_abd_wrenchbin, cid, Fc);
                    });
+    }
+
+    // [multi-env determinism 4.3] combine the binned wrench back into body_id_to_abd_joint_wrench
+    // (deterministic) before it is consumed into q_tilde below.
+    if(abd_body_count > 0)
+    {
+        int n = abd_body_count * 12, bs = 256, gs = (n + bs - 1) / bs;
+        _abd_sysbin_combine_k<<<gs, bs>>>(
+            (double*)abd.body_id_to_abd_joint_wrench.data(), m_abd_wrenchbin, n);
     }
 
     ParallelFor()

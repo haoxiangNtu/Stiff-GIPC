@@ -23,5 +23,21 @@ class Spmv
                               const int*                    s4_active = nullptr,
                               const int*                    s4_dof_to_group = nullptr,
                               int                           s4_ng = 0);
+    ~Spmv();
+
+    // [seg-fused dot] when set (by seg_pcg's fast path), the spmv ALSO accumulates the per-env
+    // dot x·(aAx) into `partials` (ng*SEG_DOT_PSTRIDE strided slots, block-hashed to spread
+    // atomics; combined+rezeroed by the caller's combine kernel). Cleared after use.
+    static constexpr int SEG_DOT_PSTRIDE = 256;
+    void set_seg_dot_accum(double* partials, int ng)
+    { m_seg_dot_partials = partials; m_seg_dot_ng = ng; }
+
+  private:
+    // [multi-env determinism 4.3] binned accumulator for y (BINNED_K bins per scalar DOF):
+    // makes the matvec's row accumulation order-independent ⇒ deterministic. Grown lazily.
+    double* m_ybin     = nullptr;
+    size_t  m_ybin_cap = 0;
+    double* m_seg_dot_partials = nullptr;   // [seg-fused dot] null = off
+    int     m_seg_dot_ng       = 0;
 };
 }  // namespace gipc
