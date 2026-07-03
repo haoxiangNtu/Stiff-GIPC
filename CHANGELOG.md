@@ -4,6 +4,34 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026-07-04
+
+### Fixed
+- **Per-env machinery vs undeclared groups**: `d_point_to_group` is always
+  allocated (all `-1` wildcard when `set_body_groups` was never called), and
+  pointer-nullness gates half-engaged the multi-env machinery: per-group κ
+  kernels read `kappa_grp[-1]` (out-of-bounds barrier stiffness), the per-env
+  line search validated itself with zero env coverage (Newton pegged at the
+  iteration cap), and the per-env BVH excluded every primitive (**silent loss
+  of all self-collision**). All activation sites now require a real
+  `groups_present` flag; per-group kernels guard `-1` (mixed grouped+wildcard
+  scenes are now correct too). isolated/strict without groups run
+  merged-equivalent and print a one-line warning.
+
+### Changed
+- **Convergence threshold sources** (design: env-scale relative):
+  with declared groups, the merged-mode Newton exit uses the AVERAGE per-env
+  rest bbox and per-env freeze checks use each env's OWN bbox — env-count
+  invariant without reading `absolute_dhat`/`relative_dhat` (the
+  `abs²/rel²` reverse-solve is removed from the exit path; `relative_dhat`
+  is now fully inert for convergence). Ungrouped scenes keep the legacy
+  whole-scene-bbox exit bit-for-bit.
+
+### Added
+- **`newton_velocity_tol`** (m/s, default 0 = off): opt-in uipc-style physical
+  Newton exit (`max step displacement ≤ v·dt`), uniform across
+  merged/isolated/strict; scene-size and env-count independent.
+
 ## [0.8.0] — 2026-07-03
 
 > The "multi-env engine" release: v0.6.7 unified with the entire per-env
