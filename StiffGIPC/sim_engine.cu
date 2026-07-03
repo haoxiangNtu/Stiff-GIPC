@@ -1424,6 +1424,46 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     // "ext used 0 / cap 0" for non-hybrid scenes. Hybrid scenes keep the full margin.
     ipc.m_triplet_internal_margin =
         (d_tetMesh.n_fem_pins > 0) ? cfg.triplet_internal_margin : 1.0;
+    // [env-scale convergence] per-env rest bbox diag^2 (+ avg over active envs). Host-side,
+    // once. Wildcard (-1) verts belong to no env and do not shape any env's scale.
+    if(d_tetMesh.h_groups_present
+       && (int)tetMesh.point_id_to_body_id.size() == (int)tetMesh.vertexes.size())
+    {
+        const int NG = 256;
+        std::vector<double3> lo(NG, make_double3(1e300, 1e300, 1e300));
+        std::vector<double3> hi(NG, make_double3(-1e300, -1e300, -1e300));
+        std::vector<int>     cnt(NG, 0);
+        const auto& p2b = tetMesh.point_id_to_body_id;
+        const auto& bg  = tetMesh.body_groups;
+        for(size_t v = 0; v < tetMesh.vertexes.size(); ++v)
+        {
+            int b = p2b[v];
+            int g = (b >= 0 && b < (int)bg.size()) ? bg[b] : -1;
+            if(g < 0 || g >= NG) continue;
+            const auto& P = tetMesh.vertexes[v];
+            lo[g].x = std::min(lo[g].x, P.x); hi[g].x = std::max(hi[g].x, P.x);
+            lo[g].y = std::min(lo[g].y, P.y); hi[g].y = std::max(hi[g].y, P.y);
+            lo[g].z = std::min(lo[g].z, P.z); hi[g].z = std::max(hi[g].z, P.z);
+            cnt[g]++;
+        }
+        ipc.h_env_bbox2.assign(NG, 0.0);
+        double sum = 0.0; int nact = 0;
+        for(int g = 0; g < NG; ++g)
+        {
+            if(cnt[g] <= 0) continue;
+            double dx = hi[g].x - lo[g].x, dy = hi[g].y - lo[g].y, dz = hi[g].z - lo[g].z;
+            ipc.h_env_bbox2[g] = dx * dx + dy * dy + dz * dz;
+            sum += ipc.h_env_bbox2[g]; ++nact;
+        }
+        ipc.m_avg_env_bbox2 = (nact > 0) ? (sum / nact) : 0.0;
+        if(!ipc.d_env_bbox2)
+            CUDA_SAFE_CALL(cudaMalloc((void**)&ipc.d_env_bbox2, NG * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMemcpy(ipc.d_env_bbox2, ipc.h_env_bbox2.data(),
+                                  NG * sizeof(double), cudaMemcpyHostToDevice));
+        if(::g_gipc_log_level >= 1)
+            printf("[env-scale] per-env bbox: active=%d avg_diag2=%.6g (env0=%.6g)\n",
+                   nact, ipc.m_avg_env_bbox2, ipc.h_env_bbox2[0]);
+    }
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer,
              cfg.linear_system_buff_scale);
 

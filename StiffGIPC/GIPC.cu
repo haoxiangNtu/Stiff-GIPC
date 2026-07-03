@@ -10002,7 +10002,9 @@ __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir,
 __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng,
                                        double sq, double ccd_size, int have_ccd,
                                        double temp_alpha, double alpha_CFL, int decouple,
-                                       int no_refine, double thr_cv, int* cnt)
+                                       int no_refine, double thr_cv,
+                                       const double* env_bbox2, double ntol_dt, double vtol_dt,
+                                       int* cnt)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
@@ -10026,7 +10028,12 @@ __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch,
             a              = fmax(a, acfl);
         }
     }
-    if(decouple && hmx < thr_cv) a = 0.0;   // freeze converged env
+    // [env-scale] each env freezes against ITS OWN bbox scale (batch-invariant);
+    // vtol_dt>0 = physical override; null env_bbox2 = scalar fallback (thr_cv).
+    double thr_g = thr_cv;
+    if(env_bbox2 && env_bbox2[g] > 0.0)
+        thr_g = (vtol_dt > 0.0) ? vtol_dt : (ntol_dt * sqrt(env_bbox2[g]));
+    if(decouple && hmx < thr_g) a = 0.0;   // freeze converged env
     env_alpha[g] = a;
     atomicAdd(&cnt[0], 1);                   // n_env (present)
     if(a == 0.0) atomicAdd(&cnt[1], 1);      // n_frozen
@@ -14118,15 +14125,14 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // varies with the batch (mates' extents) → env_0's stop point depends on its batch-mates.
         // STIFF_DECOUPLE_THRESH replaces it with the abs_dhat-fixed eff bbox (batch-INVARIANT, same
         // physical contact scale a single-env run would use), removing this coupling.
-        double thr_bbox2 = bboxDiagSize2;
-        // [convergence consistency] when an ABSOLUTE contact scale is set (absolute_dhat>0), the Newton
-        // convergence tolerance MUST follow that physical scale, NOT the merged-scene bboxDiagSize2
-        // (which grows with env count / spacing → the tolerance becomes batch-dependent and looser for
-        // merged, so merged 'converges' at a coarser residual than a single-env run). Gated on
-        // absolute_dhat>0 ALONE (not STIFF_DECOUPLE_THRESH) so ALL modes converge to the SAME physical
-        // tolerance. dHat/dTol/fDhat already use this eff bbox; this makes the Newton exit consistent.
-        if(absolute_dhat > 0.0 && relative_dhat > 0.0)
-            thr_bbox2 = (absolute_dhat * absolute_dhat) / (relative_dhat * relative_dhat);
+        double thr_bbox2 = bboxDiagSize2;   // legacy: whole scene (== the env for ungrouped scenes)
+        // [env-scale convergence] with declared groups, the merged-mode exit uses the AVERAGE
+        // per-env rest bbox: N-invariant like the old abs^2/rel^2 reverse-solve, but keeps
+        // GIPC's relative (scene-scale-adaptive) semantics AND reads neither absolute_dhat nor
+        // relative_dhat (kills the hidden-rel-knob leak). Per-env freeze sites use each env's
+        // OWN bbox (batch-invariant). velocity_tol>0 overrides everything (physical exit).
+        if(TetMesh.h_groups_present && m_avg_env_bbox2 > 0.0)
+            thr_bbox2 = m_avg_env_bbox2;
 
         // [uipc-style opt-in] newton_velocity_tol>0: physical exit (max step displacement
         // <= v_tol*dt), scene-size/env-count independent, relative_dhat fully inert.
@@ -14207,7 +14213,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 if(hct[g] <= 0) { h_env_active[g] = 0; continue; }  // absent env
                 ++n_present;
                 if(recheck || k == 0) h_env_active[g] = 1;          // periodic full re-check
-                else if(h_env_active[g] && hmm[g] < thr * margin)   // deeply converged -> mask
+                else if(h_env_active[g]
+                        && hmm[g] < ((newton_velocity_tol > 0.0 || h_env_bbox2.empty() || h_env_bbox2[g] <= 0.0)
+                                         ? thr
+                                         : Newton_solver_threshold * IPC_dt * sqrt(h_env_bbox2[g]))
+                                        * margin)   // [env-scale] own-bbox; deeply converged -> mask
                     h_env_active[g] = 0;
                 if(h_env_active[g]) ++n_active;
             }
@@ -14440,7 +14450,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 _per_env_alpha_compute<<<(NG + bs - 1) / bs, bs>>>(
                     m_env_alpha, m_env_scratch, NG, _sq_, 1.0, (h_ccd_cpNum > 0) ? 1 : 0,
                     temp_alpha, alpha_CFL, getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
-                    getenv("STIFF_NO_REFINE") ? 1 : 0, _thrcv_, d_env_cnt);
+                    getenv("STIFF_NO_REFINE") ? 1 : 0, _thrcv_,
+                    d_env_bbox2, Newton_solver_threshold * IPC_dt, newton_velocity_tol * IPC_dt,
+                    d_env_cnt);
                 int _hc_[2];
                 CUDA_SAFE_CALL(cudaMemcpy(_hc_, d_env_cnt, 2 * sizeof(int), cudaMemcpyDeviceToHost));
                 m_env_alpha_valid = true;
@@ -14501,7 +14513,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 // re-activation needed. Gated STIFF_DECOUPLE_THRESH.
                 if(getenv("STIFF_DECOUPLE_THRESH"))
                 {
-                    double thr_cv = ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt));
+                    double thr_cv = (newton_velocity_tol > 0.0)
+                        ? (newton_velocity_tol * IPC_dt)
+                        : ((!h_env_bbox2.empty() && h_env_bbox2[g] > 0.0)
+                               ? Newton_solver_threshold * IPC_dt * sqrt(h_env_bbox2[g])   // [env-scale] own bbox
+                               : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt));
                     if(hmx[g] < thr_cv) h_env_alpha[g] = 0.0;
                 }
                 if(h_env_alpha[g] == 0.0) ++n_frozen;   // [decouple] per-env converged (frozen)

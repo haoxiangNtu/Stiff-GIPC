@@ -82,6 +82,13 @@ class GIPC
     // [multi-env per-group κ] per-group barrier stiffness. The DYNAMIC κ doubling (postLineSearch
     // Kappa*=2 on a GLOBAL close-contact bool) is the cross-env bifurcation coupling; per-group κ
     // + per-group close-val decouples it. nullptr/false → scalar Kappa (baseline, bit-identical).
+    // [env-scale convergence] per-env STATIC bbox diag^2 (rest state, built at finalize
+    // from p2g). Convergence thresholds: merged uses the AVG over active envs (N-invariant,
+    // no absolute/relative_dhat in the exit path); per-env freeze uses each env's OWN value
+    // (batch-invariant for strict). Empty/0 -> legacy whole-scene bboxDiagSize2.
+    double*             d_env_bbox2     = nullptr;   // device [NG]
+    std::vector<double> h_env_bbox2;                 // host mirror [NG]
+    double              m_avg_env_bbox2 = 0.0;       // avg over active envs
     double*           m_kappa_group = nullptr;        // device [NG]
     std::vector<double> h_kappa_group;                // host mirror [NG]
     bool              m_pergroup_kappa = false;       // STIFF_PERGROUP_KAPPA gate
