@@ -14128,8 +14128,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         if(absolute_dhat > 0.0 && relative_dhat > 0.0)
             thr_bbox2 = (absolute_dhat * absolute_dhat) / (relative_dhat * relative_dhat);
 
-        bool gradVanish = (distToOpt_PN < sqrt(Newton_solver_threshold * Newton_solver_threshold
-                                               * thr_bbox2 * IPC_dt * IPC_dt));
+        // [uipc-style opt-in] newton_velocity_tol>0: physical exit (max step displacement
+        // <= v_tol*dt), scene-size/env-count independent, relative_dhat fully inert.
+        double _newton_thr = (newton_velocity_tol > 0.0)
+                                 ? (newton_velocity_tol * IPC_dt)
+                                 : sqrt(Newton_solver_threshold * Newton_solver_threshold
+                                        * thr_bbox2 * IPC_dt * IPC_dt);
+        bool gradVanish = (distToOpt_PN < _newton_thr);
 
         // [multi-env P3a step2] per-env Newton convergence tracking (precursor to
         // mask early-exit). The merged Newton loop currently breaks on the GLOBAL
@@ -14183,8 +14188,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             const int NG = kEnvAlphaSlots;
             const int RECHECK = 4;
             const double margin = 0.5;
-            double thr = sqrt(Newton_solver_threshold * Newton_solver_threshold
-                              * thr_bbox2 * IPC_dt * IPC_dt);   // [decouple] batch-invariant bbox
+            double thr = ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt));   // [decouple] batch-invariant; velocity_tol opt-in
             static double* d_mm = nullptr; static int* d_ct = nullptr;
             if(!d_mm) { cudaMalloc((void**)&d_mm, NG*sizeof(double));
                         cudaMalloc((void**)&d_ct, NG*sizeof(int)); }
@@ -14425,8 +14429,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             // Bit-identical to the host loop (same per-env formulas). Host path kept only under a
             // diagnostic flag.
             const double _sq_    = sqrt(dHat);
-            const double _thrcv_ = getenv("STIFF_DECOUPLE_THRESH")
-                ? sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt) : 0.0;
+            const double _thrcv_ = getenv("STIFF_DECOUPLE_THRESH") ? ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt)) : 0.0;
             const bool _s1diag_ = getenv("STIFF_PENV_STATS") || getenv("STIFF_A0_DUMP")
                                || getenv("STIFF_S1_DEBUG") || getenv("STIFF_ALPHA_DBG");
             if(!_s1diag_)
@@ -14498,8 +14501,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 // re-activation needed. Gated STIFF_DECOUPLE_THRESH.
                 if(getenv("STIFF_DECOUPLE_THRESH"))
                 {
-                    double thr_cv = sqrt(Newton_solver_threshold * Newton_solver_threshold
-                                         * thr_bbox2 * IPC_dt * IPC_dt);
+                    double thr_cv = ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt));
                     if(hmx[g] < thr_cv) h_env_alpha[g] = 0.0;
                 }
                 if(h_env_alpha[g] == 0.0) ++n_frozen;   // [decouple] per-env converged (frozen)
@@ -14509,8 +14511,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 if(getenv("STIFF_A0_DUMP") && g == 0
                    && (!getenv("STIFF_DUMP_FRAME") || g_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))))
                 {   // [decouple] env0 per-iter: applied alpha (h_env_alpha[g], post-freeze) + hmx (max-move) + frozen?
-                    double thr_cv = sqrt(Newton_solver_threshold * Newton_solver_threshold
-                                         * thr_bbox2 * IPC_dt * IPC_dt);
+                    double thr_cv = ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt));
                     printf("[a0] frame=%d k=%d a_applied=%.17e a_feasible=%.17e hmx=%.17e thr_cv=%.6e frozen=%d\n",
                            g_dec_frame, (int)k, h_env_alpha[g], a, hmx[g], thr_cv, (int)(h_env_alpha[g] == 0.0));
                 }

@@ -296,6 +296,7 @@ class GIPC
     double clothDensity            = 0.0;
     double softMotionRate          = 0.0;
     double Newton_solver_threshold = 0.0;
+    double newton_velocity_tol     = 0.0;   // [uipc-style opt-in] 0 = legacy exit
     double pcg_threshold           = 0.0;
 
     gipc::ABDFEMCountInfo abd_fem_count_info{};

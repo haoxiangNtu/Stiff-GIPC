@@ -29,6 +29,12 @@ struct SimEngineConfig
     double strain_rate         = 100;
     double soft_motion_rate    = 1e0;
     double newton_tol          = 1e-2;
+    // [uipc-style, opt-in] physical Newton exit: converged when the max vertex
+    // displacement of the step <= newton_velocity_tol * dt (units m/s; uipc
+    // default is 0.05). 0 = OFF (legacy newton_tol * length-scale * dt keeps
+    // exact current behavior). Scene-size and env-count independent by
+    // construction; also makes relative_dhat fully inert for the exit check.
+    double newton_velocity_tol = 0.0;
     double pcg_tol             = 1e-4;
     double relative_dhat       = 1e-3;
 

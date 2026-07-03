@@ -251,6 +251,11 @@ class Config:
         poisson_rate: float = 0.49,
         friction_rate: float = 0.4,
         newton_tol: float = 1e-2,
+        # [uipc-style, opt-in] physical Newton exit: max step displacement <=
+        # newton_velocity_tol * dt (m/s; uipc default 0.05). 0 = legacy
+        # newton_tol*length*dt exit (exact current behavior). Scene-size and
+        # env-count independent; makes relative_dhat inert for the exit check.
+        newton_velocity_tol: float = 0.0,
         # 1e-6 (was 1e-4, inherited from upstream, never tuned): with absolute-dhat
         # kappa (correct contact stiffness) loose PCG directions explode Newton
         # counts (measured 1407 vs 507 total Newton over 30f at 1e-4 vs 1e-6 on the
@@ -292,6 +297,8 @@ class Config:
         self._cfg.friction_rate = friction_rate
         self._cfg.gd_friction_rate = friction_rate
         self._cfg.newton_tol = newton_tol
+        if hasattr(self._cfg, "newton_velocity_tol"):
+            self._cfg.newton_velocity_tol = newton_velocity_tol
         self._cfg.pcg_tol = pcg_tol
         self._cfg.relative_dhat = relative_dhat
         # absolute_dhat>0 makes dHat = absolute_dhat^2 (fixed), independent of the

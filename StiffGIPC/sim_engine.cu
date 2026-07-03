@@ -804,6 +804,7 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.ground_offset_cfg   = cfg.ground_offset;
     ipc.pcg_threshold       = cfg.pcg_tol;
     ipc.Newton_solver_threshold = cfg.newton_tol;
+    ipc.newton_velocity_tol     = cfg.newton_velocity_tol;   // [uipc-style opt-in]
     ipc.relative_dhat       = cfg.relative_dhat;
     ipc.absolute_dhat       = cfg.absolute_dhat;
     ipc.YoungModulus        = cfg.young_modulus;
@@ -1537,6 +1538,17 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     // per-env LOCAL trees too — else the warm-start runs the merged path and (at spacing>0) injects
     // the offset-overlap divergence that all later frames inherit. Per-env trees use local verts ⇒
     // bit-identical at any spacing (render separation becomes a pure display offset).
+    // [option A] no groups declared but per-env features requested -> they all
+    // coherently no-op (exact merged behavior). Warn ONCE so the degradation is
+    // never silent (user decision 2026-07-04: fallback + warning, not auto-group).
+    if(!d_tetMesh.h_groups_present
+       && (getenv("STIFF_PERENV_BVH") || getenv("STIFF_PERENV_ALPHA")
+           || getenv("STIFF_PERGROUP_KAPPA") || getenv("STIFF_SEGMENTED_PCG")
+           || getenv("STIFF_BVH_ENVDET") || getenv("STIFF_DECOUPLE_THRESH")))
+        printf("[multienv] WARNING: isolated/strict features requested but NO body groups declared "
+               "(set_body_groups never called) — per-env machinery disabled, running merged-equivalent. "
+               "Declare groups (all bodies -> 0 for a single env) to engage per-env paths.\n");
+
     // [N=1 guard] h_groups_present REQUIRED: with the all -1 wildcard table the
     // per-env index excludes EVERY primitive (active=0) -> ZERO self-collision
     // detection -> silently wrong physics (cloth through gripper).
