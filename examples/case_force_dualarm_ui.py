@@ -19,9 +19,13 @@ from stiff_physics.robot import Robot
 import polyscope as ps
 import polyscope.imgui as psim
 
+from pathlib import Path
+ASSETS_DIR = str(Path(__file__).resolve().parent.parent / "Assets") + "/"
+
+
 URDF = "sim_data/urdf/ridgeback_dual_panda_UMI/ridgeback_dual_panda2.urdf"
 
-eng = Engine(Config(gravity=(0.0, 0.0, 0.0), dt=0.01))
+eng = Engine(Config(gravity=(0.0, 0.0, 0.0), dt=0.01, assets_dir=ASSETS_DIR))
 eng.load_urdf(URDF, root_fixed=True, revolute_as_motor=True)
 eng.finalize()
 robot = Robot(eng)

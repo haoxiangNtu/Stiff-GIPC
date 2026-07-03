@@ -94,7 +94,9 @@ class GlobalLinearSystem
     // apply() graph-capturable. Gates the PCG CUDA-graph capture (MAS -> false).
     bool precond_graph_capturable() const
     {
-        if(!m_global_preconditioner || !m_global_preconditioner->graph_capturable())
+        // No global preconditioner (e.g. P_type=1: MAS+ABD are LOCALS) is fine —
+        // only registered preconditioners must be capture-safe.
+        if(m_global_preconditioner && !m_global_preconditioner->graph_capturable())
             return false;
         for(auto& p : m_local_preconditioners)
             if(!p->graph_capturable())

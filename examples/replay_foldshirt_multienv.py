@@ -35,7 +35,10 @@ URDF_PATH   = _ASSETS_DIR + "sim_data/urdf/ridgeback_dual_panda_soft/ridgeback_d
 RIGID_MSH   = _ASSETS_DIR + "sim_data/hybrid_d/STRATEGY_F_rigid.msh"
 RIGID_REMAP = _ASSETS_DIR + "sim_data/hybrid_d/STRATEGY_F_rigid_remap.npz"
 UNIFIED_NPZ = _ASSETS_DIR + "sim_data/hybrid_d/STRATEGY_F_unified.npz"
-DEFAULT_EP  = "/tmp/replay_0528/episode_00000.hdf5"
+# bundled episode (same schema as the /tmp/replay_0528 recordings: actions (T,16)
+# + robot_init_pose + object_init_info attrs); argv[1] still overrides.
+DEFAULT_EP  = str(Path(__file__).resolve().parent.parent / "Assets" / "trajectories"
+                  / "episode_fold_shirt_umi.hdf5")
 ARM_SCALE = 1.0
 FINGER_LABELS = ['left_arm_leftfinger','left_arm_rightfinger',
                  'right_arm_leftfinger','right_arm_rightfinger']
