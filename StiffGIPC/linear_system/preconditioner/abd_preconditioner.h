@@ -21,6 +21,7 @@ class ABDPreconditioner : public LocalPreconditioner
     // [seg-fused dot] correction accumulation: r·(z_new − z_old) per body (z_old = the global
     // diag preconditioner's z, read before overwrite) → Σ equals r·z of the FINAL z.
     bool seg_dot_capable() const override { return true; }
+    bool graph_capturable() const override { return true; }
     void arm_seg_dot(double* partials, const int* d2g, int ng) override
     { m_sd_partials = partials; m_sd_d2g = d2g; m_sd_ng = ng; }
 

@@ -90,6 +90,17 @@ class GlobalLinearSystem
             p->arm_seg_dot(partials, d2g, ng);
         return true;
     }
+    // [pcg-graph] true iff the global AND all local preconditioners declare their
+    // apply() graph-capturable. Gates the PCG CUDA-graph capture (MAS -> false).
+    bool precond_graph_capturable() const
+    {
+        if(!m_global_preconditioner || !m_global_preconditioner->graph_capturable())
+            return false;
+        for(auto& p : m_local_preconditioners)
+            if(!p->graph_capturable())
+                return false;
+        return true;
+    }
     const int* m_s4_active       = nullptr;
     const int* m_s4_dof_to_group = nullptr;
     int        m_s4_ng           = 0;

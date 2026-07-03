@@ -18,6 +18,7 @@ class DiagPreconditioner : public GlobalPreconditioner
 
     // [seg-fused dot] accumulate per-env r·z (all blocks, diag z) alongside the z-write.
     bool seg_dot_capable() const override { return true; }
+    bool graph_capturable() const override { return true; }
     void arm_seg_dot(double* partials, const int* d2g, int ng) override
     { m_sd_partials = partials; m_sd_d2g = d2g; m_sd_ng = ng; }
 

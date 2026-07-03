@@ -33,6 +33,12 @@ class IPreconditioner
     // r·z of the FINAL z). seg_pcg fuses only when the global AND all locals are capable.
     virtual bool seg_dot_capable() const { return false; }
     virtual void arm_seg_dot(double* /*partials*/, const int* /*d2g*/, int /*ng*/) {}
+    // [pcg-graph] whether apply() is CUDA-graph-capturable (no stream sync / alloc
+    // inside). Conservative default false — MAS and unknown preconditioners keep
+    // the PCG graph OFF (capture of a syncing apply throws
+    // cudaErrorStreamCaptureUnsupported; caught by the v0.8.0 fresh-env sweep on
+    // default-preconditioner case_26).
+    virtual bool graph_capturable() const { return false; }
 
   protected:
     muda::LinearSystemContext& ctx() const;

@@ -706,7 +706,10 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     static int s_graph_env = -1;
     if(s_graph_env < 0)
     { const char* e = getenv("STIFF_PCG_GRAPH"); s_graph_env = e ? atoi(e) : 1; }
-    bool use_graph = s_graph_env && getenv("STIFF_FAST_GRAD") && !getenv("STIFF_SPMV_DET");
+    bool use_graph = s_graph_env && getenv("STIFF_FAST_GRAD") && !getenv("STIFF_SPMV_DET")
+                     // [pcg-graph] MAS (and unknown) preconditioners sync inside apply() ->
+                     // capture would throw cudaErrorStreamCaptureUnsupported (fresh-env case_26).
+                     && system_ptr() && system_ptr()->precond_graph_capturable();
 
     cudaGraph_t     pg  = nullptr;
     cudaGraphExec_t pge = nullptr;
@@ -1015,7 +1018,9 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     { const char* e = getenv("STIFF_PCG_GRAPH"); s_graph_env_seg = e ? atoi(e) : 1; }
     // [strict-perf] graphs are arithmetic-neutral (same kernels/order/args) — enable for the
     // binned (strict) path too; verified by the full determinism battery.
-    bool use_graph = (s_graph_env_seg != 0);
+    bool use_graph = (s_graph_env_seg != 0)
+                     // [pcg-graph] same capture-capability guard as the merged path (MAS syncs).
+                     && system_ptr() && system_ptr()->precond_graph_capturable();
 
     cudaGraph_t     pg  = nullptr;
     cudaGraphExec_t pge = nullptr;
