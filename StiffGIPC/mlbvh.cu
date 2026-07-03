@@ -1659,11 +1659,23 @@ void set_self_p2g(const int* p){
 }
 unsigned long long get_xskip(){ unsigned long long h=0; cudaMemcpyFromSymbol(&h, g_xskip, sizeof(h)); return h; }
 
-// [v0.6.7 API compat] public name for the per-vertex env broad-phase filter
-// (SimEngine::set_vertex_env_ids). Identical semantics to set_self_p2g: a pair
-// is skipped iff both endpoint env ids are >=0 and different; -1 = shared
-// (collides with every env); nullptr disables. Both names drive g_self_p2g.
-void mlbvh_set_vertex_env_id(const int* d_vertex_env_id) { set_self_p2g(d_vertex_env_id); }
+// [multi-env subscene, v0.6.7 API] user-facing per-vertex env filter
+// (SimEngine::set_vertex_env_ids). SEPARATE symbol from g_self_p2g on purpose:
+// buildCP RESETS g_self_p2g every call (DECOUPLE_THRESH-gated internal filter),
+// which would wipe an API-set array (caught by test_env_isolation: isolate mode
+// stacked instead of passing through). The two filters compose (skip if either
+// says skip). Semantics: pair skipped iff both env ids >= 0 and different.
+__device__ const int* g_vertex_env_id = nullptr;
+__device__ inline bool _same_env(int vA, int vB)
+{
+    if(g_vertex_env_id == nullptr) return true;
+    int ea = g_vertex_env_id[vA], eb = g_vertex_env_id[vB];
+    return ea < 0 || eb < 0 || ea == eb;
+}
+void mlbvh_set_vertex_env_id(const int* d_vertex_env_id)
+{
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_vertex_env_id, &d_vertex_env_id, sizeof(const int*)));
+}
 
 // [perenv-par] skip a self-collision pair iff both representative verts are in DIFFERENT non-negative
 // envs. Gate-off (g_self_p2g==null) or any static (-1) endpoint => never skip.
@@ -1782,7 +1794,8 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && !_cross_env_skip(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x)
+                   && _same_env(idx, _faces[obj_idx].x))
                 {
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
@@ -1816,7 +1829,8 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && !_cross_env_skip(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x)
+                   && _same_env(idx, _faces[obj_idx].x))
                 {
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
@@ -1910,7 +1924,8 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && !_cross_env_skip(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x)
+                   && _same_env(idx, _faces[obj_idx].x))
                 {
 
                     if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
@@ -1941,7 +1956,8 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
-                   && !_cross_env_skip(idx, _faces[obj_idx].x))
+                   && !_cross_env_skip(idx, _faces[obj_idx].x)
+                   && _same_env(idx, _faces[obj_idx].x))
                 {
                     if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
                          && _btype[_faces[obj_idx].y] >= 2
@@ -2029,7 +2045,8 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
+                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
 
 
@@ -2075,7 +2092,8 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
+                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
                         if(!(_edges[self_eid].x == _edges[obj_idx].x
                              || _edges[self_eid].x == _edges[obj_idx].y
@@ -2175,7 +2193,8 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
+                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
@@ -2210,7 +2229,8 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
                        && !_is_collision_excluded(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x],
                                                  _collision_skip_matrix, _collision_body_count)
-                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x))
+                       && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
+                       && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
