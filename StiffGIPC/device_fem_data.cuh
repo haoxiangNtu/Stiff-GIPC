@@ -73,6 +73,13 @@ class device_TetraData
     // for per-group contact segmentation + per-env block-diagonal solve (P2b/P3).
     int*    d_body_to_group  = nullptr;
     int*    d_point_to_group = nullptr;
+    // [N=1 guard] HOST flag: true iff set_body_groups uploaded real group ids.
+    // d_point_to_group is always allocated (all -1 wildcard when unset), so the
+    // per-env machinery must key off THIS, not pointer nullness — with all -1,
+    // per-env features half-engage (S1 "valid" with zero coverage -> do_break
+    // waits on envs that don't exist -> Newton pegs at iterCap; kappa_grp[-1]
+    // OOB). Set in SimEngine finalize alongside the p2g upload.
+    bool    h_groups_present = false;
     // [multi-env P2a] group id per linear-system BLOCK (size = abd_body_num*4 +
     // fem_point_num): ABD block b -> body b/4; FEM block -> its vertex. This is
     // what the per-env PCG reductions (P3a) key off. Allocated in sim_engine.

@@ -3265,7 +3265,7 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
     // nullptr → scalar (baseline, bit-identical). Computed BEFORE MMCVIDI is mutated below.
     double Kappa = Kappa_scalar;
     if(kappa_grp && p2g)
-    { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); Kappa = kappa_grp[p2g[_gv]]; }
+    { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); int _gg = p2g[_gv]; if(_gg >= 0) Kappa = kappa_grp[_gg]; }  /* [-1 guard] wildcard -> scalar */
     double dHat_sqrt = sqrt(dHat);
     //double dHat = dHat_sqrt * dHat_sqrt;
     //double Kappa = 1;
@@ -5125,7 +5125,7 @@ __global__ void _checkSelfCloseVal(const double3* _vertexes,
         *_isChange = 1;
         // [multi-env per-group κ] flag only THIS pair's env (intra-env after P1).
         if(_isChange_grp && p2g)
-        { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); _isChange_grp[p2g[_gv]] = 1; }
+        { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); int _gg = p2g[_gv]; if(_gg >= 0) _isChange_grp[_gg] = 1; }  /* [-1 guard] */
     }
 }
 
@@ -5466,7 +5466,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
     // [multi-env per-group κ] nullptr → scalar (baseline). Before MMCVIDI mutation.
     double Kappa = Kappa_scalar;
     if(kappa_grp && p2g)
-    { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); Kappa = kappa_grp[p2g[_gv]]; }
+    { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); int _gg = p2g[_gv]; if(_gg >= 0) Kappa = kappa_grp[_gg]; }  /* [-1 guard] wildcard -> scalar */
     double dHat_sqrt = sqrt(dHat);
     //double dHat = dHat_sqrt * dHat_sqrt;
     //double Kappa = 1;
@@ -6757,7 +6757,7 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
     double3      normal = *g_normal;
     unsigned int gidx   = _environment_collisionPair[idx];
     // [multi-env per-group κ] ground pair is a single vertex; nullptr → scalar (baseline).
-    double Kappa = (kappa_grp && p2g) ? kappa_grp[p2g[gidx]] : Kappa_scalar;
+    double Kappa = (kappa_grp && p2g && p2g[gidx] >= 0) ? kappa_grp[p2g[gidx]] : Kappa_scalar /* [-1 guard] */;
     double dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double dist2 = dist * dist;
     // [d=0 guard] a vertex sitting EXACTLY on the ground (dist2==0) makes
@@ -6816,7 +6816,7 @@ __global__ void _computeGroundGradient(const double3* vertexes,
     double3 normal = *g_normal;
     int     gidx   = _environment_collisionPair[idx];
     // [multi-env per-group κ] nullptr → scalar (baseline).
-    double  Kappa = (kappa_grp && p2g) ? kappa_grp[p2g[gidx]] : Kappa_scalar;
+    double  Kappa = (kappa_grp && p2g && p2g[gidx] >= 0) ? kappa_grp[p2g[gidx]] : Kappa_scalar /* [-1 guard] */;
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
     dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-barrier NaN (see _computeGroundGradientAndHessian)
@@ -6881,7 +6881,7 @@ __global__ void _checkGroundCloseVal(const double3* vertexes,
     if(dist2 < _closeConstraintVal[idx])
     {
         *_isChange = 1;
-        if(_isChange_grp && p2g) _isChange_grp[p2g[gidx]] = 1;   // [per-group κ]
+        if(_isChange_grp && p2g && p2g[gidx] >= 0) _isChange_grp[p2g[gidx]] = 1;  /* [-1 guard] */   // [per-group κ]
     }
 }
 
@@ -8840,7 +8840,7 @@ __global__ void _calFrictionLastH_gd(const double3* _vertexes,
 
     // [decouple] per-group κ so env0's friction normal-force is batch-invariant (global Kappa is a
     // reduction over ALL envs ⇒ batch-dependent; friction Hessian ∝ λ exposes it even at zero sliding).
-    double Kp = (kappa_grp && p2g) ? kappa_grp[p2g[gidx]] : Kappa;
+    double Kp = (kappa_grp && p2g && p2g[gidx] >= 0) ? kappa_grp[p2g[gidx]] : Kappa;  /* [-1 guard] */
     lambda_lastH_gd[idx]        = -Kp * 2.0 * sqrt(dist2) * g_b;
     _collisionPair_last_gd[idx] = gidx;
 }
@@ -8868,7 +8868,7 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
     // representative vertex (same convention as the barrier, GIPC.cu:3250).
     double Kappa_eff = Kappa;
     if(kappa_grp && p2g)
-    { int gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); if(gv >= 0) Kappa_eff = kappa_grp[p2g[gv]]; }
+    { int gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); if(gv >= 0) { int _gg = p2g[gv]; if(_gg >= 0) Kappa_eff = kappa_grp[_gg]; } }  /* [-1 guard] */
     if(MMCVIDI.x >= 0)
     {
         if(MMCVIDI.w >= 0)
@@ -11751,7 +11751,9 @@ void GIPC::initKappa(device_TetraData& TetMesh)
     // fell back to the GLOBAL Kappa (= -gsum/gsnorm, a reduction over ALL envs' verts → N-dependent)
     // → the batch-SIZE divergence seed. Enable per-group κ here too so env_0 uses its OWN per-env κ
     // (binned over d_point_to_group) from the very first step → N-independent.
-    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group && !m_pergroup_kappa)
+    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group
+       && TetMesh.h_groups_present   /* [N=1 guard] wildcard p2g -> kappa_grp[-1] OOB */
+       && !m_pergroup_kappa)
     {
         m_pergroup_kappa = true;
         m_d_p2g          = TetMesh.d_point_to_group;
@@ -12077,7 +12079,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         xenvDiff(_vertexes, lbl);
     }
     // [multi-env per-group κ] enable + allocate (once). STIFF_PERGROUP_KAPPA gates; needs groups.
-    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group && !m_pergroup_kappa)
+    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group
+       && TetMesh.h_groups_present   /* [N=1 guard] wildcard p2g -> kappa_grp[-1] OOB */
+       && !m_pergroup_kappa)
     {
         m_pergroup_kappa = true;
         m_d_p2g          = TetMesh.d_point_to_group;
@@ -14323,6 +14327,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // Regions: m_env_scratch[0*NG]=ground invstep, [1*NG]=narrow-self invstep.
         m_env_alpha_valid = false;  // reset each Newton iter; S1 sets true below
         const bool s1_on = (m_env_scratch && TetMesh.d_point_to_group
+                            // [N=1 guard] all -1 p2g = zero env coverage: S1 would flag itself
+                            // valid, all_env_frozen unreachable -> Newton pegs at iterCap.
+                            && TetMesh.h_groups_present
                             && surf_vertexNum >= 1 && !m_skip_all_collision
                             && getenv("STIFF_PERENV_ALPHA"));
         if(s1_on)

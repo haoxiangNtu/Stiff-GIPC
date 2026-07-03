@@ -1104,6 +1104,7 @@ void SimEngine::Impl::do_upload_to_gpu()
     // groups set -> single-env behaviour unchanged.
     if(have_groups && d_tetMesh.collision_body_num > 0)
     {
+        d_tetMesh.h_groups_present = true;   // [N=1 guard] per-env machinery master key
         int N = d_tetMesh.collision_body_num;
         std::vector<int> bg(N, -1);
         for(int i = 0; i < N && i < (int)tetMesh.body_groups.size(); ++i)
