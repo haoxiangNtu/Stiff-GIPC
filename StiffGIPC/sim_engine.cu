@@ -1532,12 +1532,15 @@ void SimEngine::Impl::do_init_bvh_and_solver()
 
     // [env-det] enable env-major Morton on the merged BVH so co-located identical envs build
     // env-blocked (mirror) trees ⇒ env-symmetric broad-phase enumeration (the last bit-identity layer).
-    if(getenv("STIFF_BVH_ENVDET")) ipc.enableEnvMajorBVH(d_tetMesh.d_point_to_group);
+    if(getenv("STIFF_BVH_ENVDET") && d_tetMesh.h_groups_present) ipc.enableEnvMajorBVH(d_tetMesh.d_point_to_group);  // [N=1 guard]
     // [multi-env P2] enable per-env BVH EAGERLY (before warm-start buildCP) so the warm-start uses
     // per-env LOCAL trees too — else the warm-start runs the merged path and (at spacing>0) injects
     // the offset-overlap divergence that all later frames inherit. Per-env trees use local verts ⇒
     // bit-identical at any spacing (render separation becomes a pure display offset).
-    if(getenv("STIFF_PERENV_BVH") && d_tetMesh.d_point_to_group)
+    // [N=1 guard] h_groups_present REQUIRED: with the all -1 wildcard table the
+    // per-env index excludes EVERY primitive (active=0) -> ZERO self-collision
+    // detection -> silently wrong physics (cloth through gripper).
+    if(getenv("STIFF_PERENV_BVH") && d_tetMesh.d_point_to_group && d_tetMesh.h_groups_present)
     { ipc.m_perenv_bvh = true; ipc.m_d_p2g = d_tetMesh.d_point_to_group; }
     // Build collision pairs + solver warm-start (mirrors gl_main.cu post-init)
     ipc.buildCP();

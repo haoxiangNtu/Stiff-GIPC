@@ -12064,7 +12064,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
     // [multi-env P2] capture d_point_to_group + enable per-env BVH (once). buildCP uses these
     // lazily (it has no TetMesh). STIFF_PERENV_BVH gates; needs grouped envs (d_point_to_group).
-    if(getenv("STIFF_PERENV_BVH") && TetMesh.d_point_to_group)
+    if(getenv("STIFF_PERENV_BVH") && TetMesh.d_point_to_group
+       && TetMesh.h_groups_present)   // [N=1 guard] all -1 p2g -> per-env index excludes
+                                      // EVERY prim (active=0) -> ZERO self-collision
     {
         m_perenv_bvh = true;
         m_d_p2g      = TetMesh.d_point_to_group;
