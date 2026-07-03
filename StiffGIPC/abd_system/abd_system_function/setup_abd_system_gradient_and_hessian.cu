@@ -59,6 +59,7 @@ void ABDSystem::_abd_binned_close(ABDSimData& sim_data)
           [g = system_gradient.viewer(), bin = m_abd_sysbin] __device__(int d) mutable
           { g(d) += binned_combine(bin + (size_t)d * BINNED_K); }); }
     { int bs = 256, gs = (N + bs - 1) / bs;
+      if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
       _abd_hessbin_combine_k<<<gs, bs>>>(abd_body_hessian.data(), m_abd_hessbin, N); }
 }
 void ABDSystem::couple_bin_open(int n_dofs)

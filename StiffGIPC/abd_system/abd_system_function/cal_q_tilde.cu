@@ -169,6 +169,7 @@ void ABDSystem::cal_q_tilde(ABDSimData& sim_data)
     if(abd_body_count > 0)
     {
         int n = abd_body_count * 12, bs = 256, gs = (n + bs - 1) / bs;
+        if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
         _abd_sysbin_combine_k<<<gs, bs>>>(
             (double*)abd.body_id_to_abd_joint_wrench.data(), m_abd_wrenchbin, n);
     }

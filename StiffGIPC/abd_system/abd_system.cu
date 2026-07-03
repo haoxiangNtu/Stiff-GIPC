@@ -238,6 +238,7 @@ void ABDSystem::_setup_unique_point_mass(size_t unique_point_count,
                    }
                });
     { int n = (int)unique_point_count, bs = 256, gs = (n + bs - 1) / bs;
+      if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
       _mb_comb_strided<<<gs, bs>>>(unique_point_mass.data(), m_massbin, n, 1, 0); }   // [4.3] combine
 }
 
@@ -273,7 +274,9 @@ void ABDSystem::_calculate_body_mass_center(size_t body_count,
                        binned_deposit(g_massbin + ((size_t)body_id * 4 + 1 + c) * BINNED_K, mass_pos(c));
                });
     { int bs = 256, gs = ((int)body_count + bs - 1) / bs;   // [4.3] combine mass + center
+      if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
       _mb_comb_strided<<<gs, bs>>>(body_mass.data(), m_massbin, (int)body_count, 4, 0);
+      if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
       _mb_comb_center<<<gs, bs>>>((double*)body_mass_center.data(), m_massbin, (int)body_count); }
 
     ParallelFor()
@@ -667,6 +670,7 @@ void ABDSystem::_setup_abd_dyadic_mass(size_t affine_body_count,
                                           src.cref_mxx()(ii, jj));
                });
     { int bs = 256, gs = ((int)affine_body_count + bs - 1) / bs;   // [4.3] combine dyadic
+      if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
       _mb_comb_dyadic<<<gs, bs>>>(abd_dyadic_mass.data(), m_massbin, (int)affine_body_count); }
 
     abd_dyadic_mass_inv.resize(affine_body_count);
@@ -712,6 +716,7 @@ void ABDSystem::_setup_abd_volume(size_t                     affine_body_count,
                    binned_deposit(g_massbin + (size_t)body_id * BINNED_K, volume);
                });
     { int n = (int)affine_body_count, bs = 256, gs = (n + bs - 1) / bs;   // [4.3] combine volume
+      if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
       _mb_comb_strided<<<gs, bs>>>(abd_volume.data(), m_massbin, n, 1, 0); }
 }
 
@@ -778,6 +783,7 @@ void ABDSystem::_setup_abd_gravity(muda::CBufferView<Vector12> tet_abd_gravity_f
                    bin_add12(g_massbin, body_id, src);   // [4.3] deterministic
                });
     { int n = (int)affine_body_count * 12, bs = 256, gs = (n + bs - 1) / bs;   // [4.3] combine gravity
+      if(gs > 0)  // [zero-ABD guard] gridDim=0 launch = cudaErrorInvalidConfiguration
       _mb_comb_strided<<<gs, bs>>>((double*)m_temp_abd_gravity_force.data(), m_massbin, n, 1, 0); }
 
     abd_gravity.resize(affine_body_count);
