@@ -11,6 +11,11 @@ class MAS_Preconditioner : public LocalPreconditioner
 {
     using Base = LocalPreconditioner;
     MASPreconditioner& MAS_Prec;
+    // [MAS graph-capture] apply() is capture-safe since the symbol binds moved to
+    // alloc time and the zeroing went cudaMemsetAsync (see MASPreconditioner.cu).
+    // NOTE: STIFF_KSUM diagnostic still syncs — capture failure falls back to the
+    // plain PCG loop gracefully, so the diag flag stays usable.
+    bool graph_capturable() const override { return true; }
     double*            masses;
     uint32_t*          cpNum;
 

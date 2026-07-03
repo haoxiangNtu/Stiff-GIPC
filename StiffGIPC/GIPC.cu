@@ -3198,14 +3198,13 @@ __global__ void _gfxToGrad(double3* _grad, const double* gbin, int n)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if(i >= n) return;
     double gx = 0, gy = 0, gz = 0;
-    if(!g_binned_on)
-    {   // fast path: bin 0 holds the raw plain-atomic sum
-        gx = gbin[((size_t)i * 3 + 0) * BINNED_K];
-        gy = gbin[((size_t)i * 3 + 1) * BINNED_K];
-        gz = gbin[((size_t)i * 3 + 2) * BINNED_K];
-        _grad[i].x += gx; _grad[i].y += gy; _grad[i].z += gz;
-        return;
-    }
+    // [fast-grad root fix] NO bin-0-only fast read: depositors are MIXED — _gfxAdd
+    // goes raw into bin 0 in fast mode, but header binned_deposit users (femEnergy
+    // elastic gradient: initKappa / getTotalForce / semi paths) ALWAYS 4-bin split.
+    // Reading only bin 0 dropped their bins 1..K-1 (bin 0 alone is the value
+    // rounded to ulp(2^60·1.5)=256!) -> garbage κ suggestion at contact onset ->
+    // line-search death spiral on bbox-dHat scenes (case_26 family). Summing all
+    // K bins is correct for BOTH deposit forms (fast leaves bins 1..K-1 = 0).
 #pragma unroll
     for(int k = BINNED_K - 1; k >= 0; --k)   // finest bin first, fixed order
     {
@@ -12059,7 +12058,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // [multienv-mode] one-time: fast plain-atomic gradient for merged/isolated (STIFF_FAST_GRAD),
     // binned order-free gradient for strict/default. Set once (device symbol).
     static bool s_binned_set = false;
-    if(!s_binned_set) { set_binned_on(getenv("STIFF_FAST_GRAD") ? 0 : 1); s_binned_set = true; }
+    if(!s_binned_set) { set_binned_on((getenv("STIFF_FAST_GRAD") && !getenv("STIFF_DIAG_BINNED_GRAD")) ? 0 : 1); s_binned_set = true; }  // [DIAG] STIFF_DIAG_BINNED_GRAD=1 forces binned gradient under FAST
 
     // [multi-env P2] capture d_point_to_group + enable per-env BVH (once). buildCP uses these
     // lazily (it has no TetMesh). STIFF_PERENV_BVH gates; needs grouped envs (d_point_to_group).

@@ -2310,21 +2310,22 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
     if(getenv("STIFF_KSUM")) { cudaDeviceSynchronize();
         _mas_ksum("precondMat", d_precondMatMas,
                   (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf)); }
-    CUDA_SAFE_CALL(cudaMemset(d_multiLevelR + totalMapNodes,
+    // [MAS graph-capture] all Async on the PTDS stream: the sync cudaMemset /
+    // cudaMemcpyToSymbol variants broke PCG-graph capture (symbols now bound
+    // once at alloc in the MAS malloc routine).
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelR + totalMapNodes,
                               0,
-                              (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f)));
+                              (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f), 0));
 
-    CUDA_SAFE_CALL(cudaMemset(d_multiLevelZ, 0, (totalNumberClusters) * sizeof(Precision_T3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelZ, 0, (totalNumberClusters) * sizeof(Precision_T3), 0));
 
-    // [4.3] zero the binned accumulators + bind the device-symbol pointers. mR: only the COARSE
+    // [4.3] zero the binned accumulators. mR: only the COARSE
     // slots accumulate (fine [0,totalMapNodes) is set directly in __buildMultiLevelR); mZ: all.
-    CUDA_SAFE_CALL(cudaMemset(d_mRbin + (size_t)totalMapNodes * 3 * BINNED_K, 0,
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_mRbin + (size_t)totalMapNodes * 3 * BINNED_K, 0,
                               (size_t)(totalNumberClusters - totalMapNodes) * 3 * BINNED_K
-                                  * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMemset(d_mZbin, 0,
-                              (size_t)totalNumberClusters * 3 * BINNED_K * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mRbin, &d_mRbin, sizeof(double*)));
-    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mZbin, &d_mZbin, sizeof(double*)));
+                                  * sizeof(double), 0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_mZbin, 0,
+                              (size_t)totalNumberClusters * 3 * BINNED_K * sizeof(double), 0));
 
     BuildMultiLevelR(R);
     {  // [4.3] combine binned coarse mR back into d_multiLevelR
@@ -2431,6 +2432,11 @@ void MASPreconditioner::initPreconditioner_Matrix()
     // [4.3] binned reproducible-FP accumulators (double, K bins per scalar) for MAS determinism
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_mRbin, (size_t)3 * totalCluster * BINNED_K * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_mZbin, (size_t)3 * totalCluster * BINNED_K * sizeof(double)));
+    // [MAS graph-capture] bind the binned-accumulator device symbols ONCE here —
+    // the per-call cudaMemcpyToSymbol in preconditioning() was a synchronous API
+    // call inside the PCG-graph capture region (cudaErrorStreamCaptureUnsupported).
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mRbin, &d_mRbin, sizeof(double*)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mZbin, &d_mZbin, sizeof(double*)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_matbin,
                               (size_t)(totalCluster / BANKSIZE) * MAS_NB * 9 * BINNED_K
                                   * sizeof(double)));
