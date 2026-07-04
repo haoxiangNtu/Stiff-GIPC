@@ -13,9 +13,21 @@
 #define BINNED_E0 60
 #endif
 
+// [det-gating] STRICT-mode positive gate for ALL binned users (fem gradient, MAS R/Z,
+// ABD bin_add12, energies, ...). 0 (default) = fast plain atomic into bins[0]
+// (bins[1..K-1] stay 0, so binned_combine is unchanged); 1 = exact exponent-binned
+// deposits (bit-identical accumulation, the strict-mode contract). Defined in GIPC.cu
+// (RDC on, like g_gbin); set once from the positive determinism gate.
+extern __device__ int g_det_reduce;
+
 // deposit `val` into the K contiguous bins at `bins` (order-independent, exact).
 __device__ __forceinline__ void binned_deposit(double* bins, double val)
 {
+    if(!g_det_reduce)
+    {   // fast path: one plain atomic; last-ulps run-variance allowed outside strict
+        atomicAdd(&bins[0], val);
+        return;
+    }
     double x = val;
 #pragma unroll
     for(int k = 0; k < BINNED_K; ++k)

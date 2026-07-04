@@ -3156,6 +3156,9 @@ __device__ double* g_gbin = nullptr;
 // merged/isolated don't need bit-identical gradients → fast plain-atomic path (bin 0 as a raw
 // accumulator, full precision, non-deterministic order). g_binned_on=1 default (back-compat / strict).
 __device__ int g_binned_on = 1;
+// [det-gating] central strict-mode reduce flag consumed by binned_deposit (binned_reduce.cuh).
+__device__ int g_det_reduce = 0;
+static void set_det_reduce(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_det_reduce, &v, sizeof(int))); }
 static void set_binned_on(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_binned_on, &v, sizeof(int))); }
 // [xenv crack] target verts for the reliable (low-volume) deposit trace — set via env.
 __device__ int g_bar_trace = 0;
@@ -12073,7 +12076,16 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // [multienv-mode] one-time: fast plain-atomic gradient for merged/isolated (STIFF_FAST_GRAD),
     // binned order-free gradient for strict/default. Set once (device symbol).
     static bool s_binned_set = false;
-    if(!s_binned_set) { set_binned_on((getenv("STIFF_FAST_GRAD") && !getenv("STIFF_DIAG_BINNED_GRAD")) ? 0 : 1); s_binned_set = true; }  // [DIAG] STIFF_DIAG_BINNED_GRAD=1 forces binned gradient under FAST
+    if(!s_binned_set)
+    {   // [det-gating] POSITIVE gate: determinism machinery is strict-mode opt-in
+        // (STIFF_SPMV_DET, set by mode=strict). merged/isolated never pay the
+        // bit-identity tax, даже when the python resolve layer is bypassed.
+        // STIFF_DIAG_BINNED_GRAD=1 forces binned (diagnostics).
+        int det = (getenv("STIFF_SPMV_DET") || getenv("STIFF_DIAG_BINNED_GRAD")) ? 1 : 0;
+        set_binned_on(det);
+        set_det_reduce(det);   // fem/MAS/ABD binned_deposit users, centrally
+        s_binned_set = true;
+    }
 
     // [multi-env P2] capture d_point_to_group + enable per-env BVH (once). buildCP uses these
     // lazily (it has no TetMesh). STIFF_PERENV_BVH gates; needs grouped envs (d_point_to_group).

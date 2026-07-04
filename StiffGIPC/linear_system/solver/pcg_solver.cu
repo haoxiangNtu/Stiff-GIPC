@@ -706,7 +706,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     static int s_graph_env = -1;
     if(s_graph_env < 0)
     { const char* e = getenv("STIFF_PCG_GRAPH"); s_graph_env = e ? atoi(e) : 1; }
-    bool use_graph = s_graph_env && getenv("STIFF_FAST_GRAD") && !getenv("STIFF_SPMV_DET")
+    bool use_graph = s_graph_env && !getenv("STIFF_SPMV_DET")   // [det-gating] graph for ALL non-strict modes (was: required STIFF_FAST_GRAD)
                      // [pcg-graph] MAS (and unknown) preconditioners sync inside apply() ->
                      // capture would throw cudaErrorStreamCaptureUnsupported (fresh-env case_26).
                      && system_ptr() && system_ptr()->precond_graph_capturable();
@@ -792,7 +792,8 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     int n = (int)b.size();
     static bool s_seg_binned_set = false;   // [multienv-mode] binned seg-dot only for strict (bit-identity)
     if(!s_seg_binned_set) {
-        int on = getenv("STIFF_FAST_GRAD") ? 0 : 1;
+        // [det-gating] binned seg-dot = strict-only (positive gate); STIFF_SEG_BINNED=1 forces.
+        int on = (getenv("STIFF_SPMV_DET") || getenv("STIFF_SEG_BINNED")) ? 1 : 0;
         set_seg_binned(on); s_seg_binned_host = on; s_seg_binned_set = true;   // device + host mirror
     }
     if(!m_seg_alloced || m_seg_ng < ng)

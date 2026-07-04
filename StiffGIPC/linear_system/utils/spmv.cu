@@ -47,7 +47,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
     // memset load) and the combine pass. strict (no FAST_GRAD / SPMV_DET set) keeps the binned path.
     static int s_fast = -1;
     if(s_fast < 0)
-        s_fast = (getenv("STIFF_FAST_GRAD") && !getenv("STIFF_SPMV_DET")) ? 1 : 0;
+        s_fast = getenv("STIFF_SPMV_DET") ? 0 : 1;   // [det-gating] ybin(order-free y) = strict-only
     const bool fast = (s_fast == 1);
 
     // [multi-env determinism 4.3] grow + zero the binned y accumulator. The matvec deposits
