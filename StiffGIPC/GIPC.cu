@@ -3157,7 +3157,12 @@ __device__ double* g_gbin = nullptr;
 // accumulator, full precision, non-deterministic order). g_binned_on=1 default (back-compat / strict).
 __device__ int g_binned_on = 1;
 // [det-gating] central strict-mode reduce flag consumed by binned_deposit (binned_reduce.cuh).
-__device__ int g_det_reduce = 0;
+// DEFAULT 1 (conservative, like g_binned_on): deposits fired BEFORE the first
+// computeGradientAndHessian latch (frame-0 init energies etc.) must stay order-free, or strict's
+// run-to-run bit-identity is seeded broken at the first line search (measured: default 0 diverged
+// foldshirt strict by f0k2; default 1 restores 17-digit reproducibility). The latch only RELAXES
+// to 0 for merged/isolated.
+__device__ int g_det_reduce = 1;
 static void set_det_reduce(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_det_reduce, &v, sizeof(int))); }
 static void set_binned_on(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_binned_on, &v, sizeof(int))); }
 // [xenv crack] target verts for the reliable (low-volume) deposit trace — set via env.
