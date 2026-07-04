@@ -145,6 +145,18 @@ void CudaDeviceBuffer<T>::reserve(size_t new_capacity)
 }
 
 template <typename T>
+void CudaDeviceBuffer<T>::reserve_discard(size_t new_capacity)
+{
+    if(new_capacity <= m_capacity)
+        return;
+    // free FIRST so peak = max(old, new), not old+new. Contents discarded by contract.
+    CUDA_SAFE_CALL(cudaFree(m_data));
+    m_data = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_data, new_capacity * sizeof(T)));
+    m_capacity = new_capacity;
+}
+
+template <typename T>
 void CudaDeviceBuffer<T>::clear()
 {
     //CUDA_SAFE_CALL(cudaFree(m_data));

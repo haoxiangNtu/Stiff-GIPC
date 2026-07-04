@@ -54,6 +54,25 @@ class GIPCTripletMatrix
         m_block_col_indices.resize(nonzero_count);
     }
 
+    // [P0-mem] pre-assembly growth: contents need NOT survive (assembly fully
+    // rewrites [0:len) and the converter's scratch [len:2len) is written before read),
+    // so grow free->malloc (no copy, no double residency). Margin is CAPPED in
+    // absolute bytes (512MB of blocks) instead of a pure ratio: a 30% ratio on a
+    // multi-GB buffer over-reserves by GBs, and that overshoot is what tips 24GB
+    // cards over the edge at high env counts.
+    void ensure_capacity_discard(size_t need)
+    {
+        if(m_block_values.capacity() >= need)
+            return;
+        size_t margin_cap = (size_t)(512ull * 1024 * 1024) / sizeof(BlockMatrix);
+        size_t margin     = need * 3 / 10;
+        if(margin > margin_cap) margin = margin_cap;
+        size_t cap = need + margin;
+        m_block_values.reserve_discard(cap);
+        m_block_row_indices.reserve_discard(cap);
+        m_block_col_indices.reserve_discard(cap);
+    }
+
     void reserve_triplets(size_t nonzero_count)
     {
         m_block_values.reserve(nonzero_count);

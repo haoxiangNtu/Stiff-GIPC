@@ -53,6 +53,27 @@ bool GlobalLinearSystem::build_linear_system()
     CUDA_SAFE_CALL(cudaMemset(m_x.view().data(), 0,
                               total_rhs_count * sizeof(Float)));
 
+    // [P0-mem pre-grow] grow the triplet storage BEFORE assembly. At this point
+    // global_triplet_offset (exact count) is known from report_subsystem_info()
+    // and the buffer holds only LAST iteration's dead triplets -> free+malloc
+    // (no copy). This replaces the post-assembly copying safety net in
+    // convert_new() as the primary growth path (that net still exists, but
+    // should no longer fire). Hash scratch moved here too (same reasoning:
+    // update_hash_value fully rewrites it).
+    {
+        auto*           gt     = gipc_global_triplet;
+        const long long length = gt->global_triplet_offset;
+        gt->ensure_capacity_discard((size_t)(2LL * length));
+        if(gt->global_external_max_capcity < length)
+        {
+            long long hm = length * 3 / 10;
+            long long hcap_bytes = 512ll * 1024 * 1024 / (long long)sizeof(uint64_t);
+            if(hm > hcap_bytes) hm = hcap_bytes;
+            gt->resize_collision_hash_size((size_t)(length + hm));
+            gt->global_external_max_capcity = (int)(length + hm);
+        }
+    }
+
     auto rhs_view = m_b.view();
 
     for(auto& subsystem : m_subsystems)

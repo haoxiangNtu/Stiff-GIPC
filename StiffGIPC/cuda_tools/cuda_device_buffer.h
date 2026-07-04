@@ -33,6 +33,10 @@ class CudaDeviceBuffer
 
     void resize(size_t new_size);
     void reserve(size_t new_capacity);
+    // [P0-mem] grow WITHOUT preserving contents: free old THEN malloc new.
+    // No old+new double residency (reserve() holds both during its copy),
+    // for scratch storage that is fully rewritten after the grow.
+    void reserve_discard(size_t new_capacity);
     void clear();
     void reset_zero();
  
