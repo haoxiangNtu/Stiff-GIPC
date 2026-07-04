@@ -1857,12 +1857,16 @@ __global__ void _calBarrierHessian(const double3*   _vertexes,
                                    int              offset4,
                                    int              offset3,
                                    int              offset2,
-                                   int              number)
+                                   int              number,
+                                   const double*    kappa_grp = nullptr,   // [split-GH] per-group kappa parity with the fused kernel
+                                   const int*       p2g       = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     int4   MMCVIDI   = _collisionPair[idx];
+    if(kappa_grp && p2g)
+    { int _gv = (MMCVIDI.x >= 0) ? MMCVIDI.x : (-MMCVIDI.x - 1); int _gg = p2g[_gv]; if(_gg >= 0) Kappa = kappa_grp[_gg]; }  /* [-1 guard] wildcard -> scalar */
     double dHat_sqrt = sqrt(dHat);
 
     double gassThreshold = 1e-6;
@@ -10818,7 +10822,7 @@ void GIPC::calBarrierHessian()
     int numbers = h_cpNum[0];
     if(numbers < 1)
         return;
-    const unsigned int threadNum = 32;
+    const unsigned int threadNum = 256;   // [split-GH] parity with the fused kernel launch
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
 
     _calBarrierHessian<<<blockNum, threadNum>>>(_vertexes,
@@ -10834,7 +10838,9 @@ void GIPC::calBarrierHessian()
                                                 h_cpNum[4],
                                                 h_cpNum[3],
                                                 h_cpNum[2],
-                                                numbers);
+                                                numbers,
+                                                m_pergroup_kappa ? m_kappa_group : nullptr,   // [split-GH]
+                                                m_pergroup_kappa ? m_d_p2g : nullptr);
 }
 
 static void _dbg_ksum(const char*, const void*, size_t);            // [4.3 fwd]
@@ -12196,6 +12202,23 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
           int t0 = getenv("STIFF_BAR_TGT0") ? atoi(getenv("STIFF_BAR_TGT0")) : -1;
           int t1 = getenv("STIFF_BAR_TGT1") ? atoi(getenv("STIFF_BAR_TGT1")) : -1;
           set_bar_targets(on, t0, t1); }
+        if(getenv("STIFF_SPLIT_GH"))
+        {   // [split-GH experiment] launch gradient(152reg) + hessian-only kernels
+            // instead of the fused 254-reg kernel; gradient lands in the SAME _gfx
+            // accumulator (both kernels scatter via _gfxAdd). A/B flag, default off.
+            int _numbers = h_cpNum[0];
+            if(_numbers >= 1)
+            {
+                const unsigned int _tn = 256;
+                int                _bn = (_numbers + _tn - 1) / _tn;
+                _calBarrierGradient<<<_bn, _tn>>>(_vertexes, _rest_vertexes,
+                    _collisonPairs, contact_grads, dHat, Kappa, _numbers,
+                    m_pergroup_kappa ? m_kappa_group : nullptr,
+                    m_pergroup_kappa ? m_d_p2g : nullptr);
+            }
+            calBarrierHessian();
+        }
+        else
         calBarrierGradientAndHessian(contact_grads, Kappa);
         set_bar_targets(0, -1, -1);
         gipc_global_triplet.global_triplet_offset +=
