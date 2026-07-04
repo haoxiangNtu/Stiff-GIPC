@@ -9808,6 +9808,7 @@ void GIPC::buildCP()
     set_ee_nodedup(getenv("STIFF_EE_NODEDUP") ? 1 : 0);
     set_ee_detgate(getenv("STIFF_EE_DETGATE") ? 1 : 0);
     set_bvh_envpart(getenv("STIFF_BVH_ENVPART") ? 1 : 0);
+    set_bvh_audit(getenv("STIFF_STACK_DIAG") ? 1 : 0);  // [audit-gate] per-pop depth probe, diag only
     // [perenv-par] per-vertex cross-env skip at self-collision emission (robust where BVH env-part is
     // bypassed by env-MIXED co-located nodes). Gated STIFF_DECOUPLE_THRESH; null = off (legacy path).
     set_self_p2g((getenv("STIFF_DECOUPLE_THRESH") && m_d_p2g) ? m_d_p2g : nullptr);

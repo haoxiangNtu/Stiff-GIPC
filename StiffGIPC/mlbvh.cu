@@ -9,6 +9,7 @@
 #include "mlbvh.cuh"
 #include <cub/device/device_radix_sort.cuh>   // [perenv-parallel #2] malloc-free Morton sort
 #include <cmath>
+#include <cstdlib>   // [ee-lb] getenv/atoi for the launch-variant pick
 #include "cuda_tools/cuda_tools.h"
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
@@ -71,6 +72,11 @@ void set_ee_nomollify(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_nomollify,
 // membership residual: did env1 TEST a candidate env0 emitted? (enumeration vs classification)
 __device__ int g_ee_trace = 0;
 __device__ int g_max_stack = 0;  // [ovf] max traversal stack depth reached
+// [audit-gate] the per-pop atomicMax below is a whole-grid same-address GLOBAL atomic inside the
+// hottest traversal loops (selfQuery_* = top-2 frame cost). The report side was already gated on
+// STIFF_STACK_DIAG (GIPC.cu) — the probe itself never was. Default OFF.
+__device__ int g_bvh_audit = 0;
+void set_bvh_audit(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_audit,&v,sizeof(int))); }
 void reset_max_stack(){ int z=0; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_max_stack,&z,sizeof(int))); }
 int get_max_stack(){ int v=0; CUDA_SAFE_CALL(cudaMemcpyFromSymbol(&v,g_max_stack,sizeof(int))); return v; }
 void set_ee_trace(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); }
@@ -1782,7 +1788,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
-        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
+        if(g_bvh_audit) { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
@@ -1912,7 +1918,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
-        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
+        if(g_bvh_audit) { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
@@ -1983,7 +1989,9 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
 }
 
 
-__global__ void _selfQuery_ee(const int*     _bodyID,
+// [ee-lb] traversal body shared by the __launch_bounds__ occupancy variants below (same code,
+// different register budgets — selected at launch via STIFF_EE_LB).
+static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID,
                               const int*     _btype,
                               const double3* _vertexes,
                               const double3* _rest_vertexes,
@@ -2031,7 +2039,7 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
-        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
+        if(g_bvh_audit) { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
@@ -2130,6 +2138,33 @@ __global__ void _selfQuery_ee(const int*     _bodyID,
     } while(stack < stack_ptr);
 }
 
+// [ee-lb] launch shells. Baseline compiles to ~168 reg → 1 block/SM (8 warps, 16.7% theoretical
+// occupancy; 11.8% achieved) while DRAM sits at ~0.3% — latency-bound with nothing in flight to
+// hide it. The capped variants trade registers (spills land in an idle L1/L2) for resident warps:
+//   lb2: __launch_bounds__(256,2) → ≤128 reg → 16 warps/SM;  lb3: (256,3) → ≤85 reg → 24 warps/SM.
+#define _SQEE_PARAMS                                                                               \
+    const int *_bodyID, const int *_btype, const double3 *_vertexes,                               \
+        const double3 *_rest_vertexes, const uint2 *_edges, const AABB *_bvs,                      \
+        const Node *_nodes, int4 *_collisionPair, int4 *_ccd_collisionPair, uint32_t *_cpNum,      \
+        int *MatIndex, double dHat, int number, const int *_collision_skip_matrix,                 \
+        int _collision_body_count, const int *_body_id_to_is_fem, const int *node_env
+#define _SQEE_ARGS                                                                                 \
+    _bodyID, _btype, _vertexes, _rest_vertexes, _edges, _bvs, _nodes, _collisionPair,              \
+        _ccd_collisionPair, _cpNum, MatIndex, dHat, number, _collision_skip_matrix,                \
+        _collision_body_count, _body_id_to_is_fem, node_env
+__global__ void _selfQuery_ee(_SQEE_PARAMS)
+{
+    _selfQuery_ee_body(_SQEE_ARGS);
+}
+__global__ void __launch_bounds__(256, 2) _selfQuery_ee_lb2(_SQEE_PARAMS)
+{
+    _selfQuery_ee_body(_SQEE_ARGS);
+}
+__global__ void __launch_bounds__(256, 3) _selfQuery_ee_lb3(_SQEE_PARAMS)
+{
+    _selfQuery_ee_body(_SQEE_ARGS);
+}
+
 __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                                   const int*     _btype,
                                   const double3* _vertexes,
@@ -2179,7 +2214,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
     do
     {
         const uint32_t node_id = *--stack_ptr;
-        { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
+        if(g_bvh_audit) { int _d=(int)(stack_ptr-stack); atomicMax(&g_max_stack,_d); }
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
@@ -2493,7 +2528,16 @@ void selfQuery_ee(const int*     _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_ee<<<blockNum, threadNum, 0, stream>>>(_bodyID,
+    // [ee-lb] STIFF_EE_LB: 0/unset = baseline (168 reg, 8 warps/SM), 2 = ≤128 reg (16 warps),
+    // 3 = ≤85 reg (24 warps). Same body — occupancy/spill A/B without swapping wheels.
+    static int s_ee_lb = -1;
+    if(s_ee_lb < 0)
+    {
+        const char* e = getenv("STIFF_EE_LB");
+        s_ee_lb       = e ? atoi(e) : 0;
+    }
+    auto* kern = s_ee_lb == 2 ? _selfQuery_ee_lb2 : s_ee_lb == 3 ? _selfQuery_ee_lb3 : _selfQuery_ee;
+    kern<<<blockNum, threadNum, 0, stream>>>(_bodyID,
                                            _btype,
                                            _vertexes,
                                            _rest_vertexes,

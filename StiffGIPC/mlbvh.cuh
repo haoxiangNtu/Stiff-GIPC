@@ -33,6 +33,7 @@ struct Node;
 void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint32_t* flags, int number, cudaStream_t stream = 0);
 void reset_max_stack();
 int get_max_stack();
+void set_bvh_audit(int v);  // [audit-gate] enable the per-pop stack-depth probe (STIFF_STACK_DIAG)
 void set_ee_vloc(const int* p);
 
 struct AABB

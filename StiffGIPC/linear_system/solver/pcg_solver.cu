@@ -27,27 +27,66 @@ extern int g_dec_k;
 // for both (non-binned leaves bins 1..K-1 = 0). Set once from STIFF_FAST_GRAD (same gate as g_binned_on).
 __device__ int g_seg_binned = 1;
 static void set_seg_binned(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_seg_binned, &v, sizeof(int))); }
+// [warp-reduce] per-warp fixed-tree pre-sum before the shared-bin deposit: one deposit per WARP
+// instead of one per thread (32x fewer same-address shared atomics — ncu shows this kernel at
+// healthy 62-79% occupancy yet 18.5% of the strict frame: pure atomic-replay serialization).
+// Determinism: the lane→DOF mapping is fixed by the launch config, the shuffle tree order is fixed,
+// and env k's absolute DOF range doesn't depend on N ⇒ run-to-run bit-identity AND batch-invariance
+// hold. (The pre-sum rounds before binning, so values differ from the per-lane version — a wheel
+// version change, same as any kernel edit. Identical envs may now differ from EACH OTHER in final
+// ulps because their DOF ranges sit at different warp phases; each env stays deterministic.)
+// Warps straddling an env boundary (~1 per 1000 with ~32k DOFs/env) fall back to per-lane deposits.
+__device__ int g_seg_warp = 1;
+static void set_seg_warp(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_seg_warp, &v, sizeof(int))); }
 __global__ void _seg_dot_deposit(const double* a, const double* b, const int* d2g,
                                  double* segbin, int ng, int n)
 {
     extern __shared__ double sbin[];
     for(int j = threadIdx.x; j < ng * BINNED_K; j += blockDim.x) sbin[j] = 0.0;
     __syncthreads();
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int    i = blockIdx.x * blockDim.x + threadIdx.x;
+    int    g = -1;
+    double v = 0.0;
     if(i < n)
     {
-        int g = d2g[i / 3];
-        if(g >= 0 && g < ng)
+        int gg = d2g[i / 3];
+        if(gg >= 0 && gg < ng) { g = gg; v = a[i] * b[i]; }
+    }
+    if(g_seg_warp)
+    {
+        const unsigned full = 0xffffffffu;   // no early returns above ⇒ all 32 lanes present
+        unsigned       has  = __ballot_sync(full, g >= 0);
+        if(has)
         {
-            if(g_seg_binned) binned_deposit(sbin + (size_t)g * BINNED_K, a[i] * b[i]);
-            else atomicAdd(&sbin[(size_t)g * BINNED_K], a[i] * b[i]);   // fast: plain shared-atomic → bin 0
+            int lg = __shfl_sync(full, g, __ffs(has) - 1);
+            if(__all_sync(full, g < 0 || g == lg))
+            {   // whole warp in one env segment (dominant case): tree-sum, lane 0 deposits
+                double s = v;
+#pragma unroll
+                for(int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(full, s, o);
+                if((threadIdx.x & 31) == 0)
+                {
+                    if(g_seg_binned) binned_deposit(sbin + (size_t)lg * BINNED_K, s);
+                    else atomicAdd(&sbin[(size_t)lg * BINNED_K], s);
+                }
+            }
+            else if(g >= 0)
+            {   // env-boundary warp: per-lane (original path)
+                if(g_seg_binned) binned_deposit(sbin + (size_t)g * BINNED_K, v);
+                else atomicAdd(&sbin[(size_t)g * BINNED_K], v);
+            }
         }
+    }
+    else if(g >= 0)
+    {
+        if(g_seg_binned) binned_deposit(sbin + (size_t)g * BINNED_K, v);
+        else atomicAdd(&sbin[(size_t)g * BINNED_K], v);   // fast: plain shared-atomic → bin 0
     }
     __syncthreads();
     for(int j = threadIdx.x; j < ng * BINNED_K; j += blockDim.x)
     {
-        double v = sbin[j];
-        if(v != 0.0) atomicAdd(&segbin[j], v);   // exact: block slices share the bin's exponent
+        double vb = sbin[j];
+        if(vb != 0.0) atomicAdd(&segbin[j], vb);   // exact: block slices share the bin's exponent
     }
 }
 __global__ void _seg_dot_combine(double* out_g, double* segbin, int ng)
@@ -68,12 +107,32 @@ __global__ void _seg_dot_fused(const double* a, const double* b, const int* d2g,
     extern __shared__ double ssum[];
     for(int j = threadIdx.x; j < ng; j += blockDim.x) ssum[j] = 0.0;
     __syncthreads();
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int    i = blockIdx.x * blockDim.x + threadIdx.x;
+    int    g = -1;
+    double v = 0.0;
     if(i < n)
     {
-        int g = d2g[i / 3];
-        if(g >= 0 && g < ng) atomicAdd(&ssum[g], a[i] * b[i]);
+        int gg = d2g[i / 3];
+        if(gg >= 0 && gg < ng) { g = gg; v = a[i] * b[i]; }
     }
+    if(g_seg_warp)
+    {   // [warp-reduce] same pre-sum as _seg_dot_deposit (no bit-identity claim on this path)
+        const unsigned full = 0xffffffffu;
+        unsigned       has  = __ballot_sync(full, g >= 0);
+        if(has)
+        {
+            int lg = __shfl_sync(full, g, __ffs(has) - 1);
+            if(__all_sync(full, g < 0 || g == lg))
+            {
+                double s = v;
+#pragma unroll
+                for(int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(full, s, o);
+                if((threadIdx.x & 31) == 0) atomicAdd(&ssum[lg], s);
+            }
+            else if(g >= 0) atomicAdd(&ssum[g], v);
+        }
+    }
+    else if(g >= 0) atomicAdd(&ssum[g], v);
     __syncthreads();
     for(int j = threadIdx.x; j < ng; j += blockDim.x)
         if(ssum[j] != 0.0) atomicAdd(&out_g[j], ssum[j]);
@@ -795,6 +854,39 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         // [det-gating] binned seg-dot = strict-only (positive gate); STIFF_SEG_BINNED=1 forces.
         int on = (getenv("STIFF_SPMV_DET") || getenv("STIFF_SEG_BINNED")) ? 1 : 0;
         set_seg_binned(on); s_seg_binned_host = on; s_seg_binned_set = true;   // device + host mirror
+        // [warp-reduce] default ON for all modes (deterministic fixed-tree); STIFF_SEG_WARP=0 = A/B off.
+        const char* w = getenv("STIFF_SEG_WARP");
+        set_seg_warp(w ? atoi(w) : 1);
+        // [warp-reduce diag] STIFF_SEG_WARP=2: audit d2g at 32-DOF (warp) granularity. Mixed warps
+        // silently degrade the pre-sum to the per-lane fallback — this measures how often.
+        if(w && atoi(w) == 2)
+        {
+            int nb = (int)b.size() / 3;
+            std::vector<int> hd(nb);
+            cudaMemcpy(hd.data(), d2g, (size_t)nb * sizeof(int), cudaMemcpyDeviceToHost);
+            long nn = (long)b.size(), uni = 0, mix = 0;
+            for(long w0 = 0; w0 < nn; w0 += 32)
+            {
+                int lg = -2; bool u = true;
+                for(long i = w0; i < w0 + 32 && i < nn; i++)
+                {
+                    int gg = hd[i / 3];
+                    if(gg < 0) continue;
+                    if(lg == -2) lg = gg;
+                    else if(gg != lg) { u = false; break; }
+                }
+                (u ? uni : mix)++;
+            }
+            long tot = uni + mix; if(tot < 1) tot = 1;
+            printf("[seg-warp] d2g audit: n=%ld nb=%d warps uni=%ld mix=%ld (%.1f%% mixed)\n",
+                   nn, nb, uni, mix, 100.0 * mix / tot);
+            printf("[seg-warp] d2g[0..47]:");
+            for(int j = 0; j < 48 && j < nb; j++) printf(" %d", hd[j]);
+            printf("\n[seg-warp] d2g[mid..mid+23]:");
+            for(int j = nb / 2; j < nb / 2 + 24 && j < nb; j++) printf(" %d", hd[j]);
+            printf("\n");
+            fflush(stdout);
+        }
     }
     if(!m_seg_alloced || m_seg_ng < ng)
     {
