@@ -3,7 +3,7 @@
 #include"cuda_tools/cuda_device_buffer.h"
 #include"Eigen/Eigen"
 
-//#define SymGH
+#define SymGH   // [symgh-validate] block-level upper-triangular storage (-37.5% triplets); half-finished per author — this branch is the strict validation run
 #ifdef SymGH
 #define M12_Off 10
 #define M9_Off 6
