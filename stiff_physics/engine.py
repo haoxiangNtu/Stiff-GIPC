@@ -233,10 +233,14 @@ def resolve_multienv_mode(mode: str = "merged") -> str:
         flags = _MULTIENV_ISOLATED_FLAGS + _MULTIENV_STRICT_EXTRA
     for f in flags:
         os.environ.setdefault(f, "1")
-    # binned (order-free) gradient is a strict-only determinism feature; merged/isolated use the
-    # fast plain-atomic gradient path (STIFF_FAST_GRAD). strict keeps binned (needed for bit-identity).
-    if canon in ("merged", "isolated"):
-        os.environ.setdefault("STIFF_FAST_GRAD", "1")
+    # [0.8.2] determinism is POSITIVE-gated in the binary now (strict sets STIFF_SPMV_DET above;
+    # merged/isolated run the fast paths by default) — the old STIFF_FAST_GRAD hint is no longer
+    # read by the engine and is not set anymore.
+    # merged defaults the selfQuery_ee occupancy variant (STIFF_EE_LB=2: 128reg → 16 warps/SM,
+    # measured -5.6%/frame). NOT defaulted for strict (measured no gain: seg/binned atomics own
+    # the L2 there) nor isolated (unmeasured); both can opt in explicitly.
+    if canon == "merged":
+        os.environ.setdefault("STIFF_EE_LB", "2")
     return canon
 
 
@@ -261,7 +265,7 @@ class Config:
         # counts (measured 1407 vs 507 total Newton over 30f at 1e-4 vs 1e-6 on the
         # multi-env grasp scene; net time strictly worse at 1e-4). Stiff-contact
         # scenes may benefit from 1e-8 (env STIFF_PCG_TOL or this arg).
-        pcg_tol: float = 1e-6,
+        pcg_tol: float = 1e-4,  # [0.8.2] back to the 0.6.x default; 1e-6 cost ~22% at N=1 for no accuracy need
         relative_dhat: float = 1e-3,
         absolute_dhat: float = 0.0,
         joint_strength_ratio: float = 100.0,

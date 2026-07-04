@@ -4,6 +4,58 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] — 2026-07-04
+
+Memory- and speed-focused release. Foldshirt multi-env N=8 (200 frames,
+RTX 4090, ms/frame): merged 1312.7 → **984.4** (-25 %), strict 2514.4 →
+**1921.8** (-24 %). Red-cloth full-episode max envs on 24 GB: **16 → 30**.
+
+### Added
+- **Block-upper-triangular Hessian storage (SymGH)**: only `row ≤ col` blocks
+  are stored/assembled; the SpMV mirrors the transpose. −37.5 % triplets.
+  Combined with the allocator fixes below: red-cloth max N **16 → 30** (+87 %),
+  plus ~6-14 % speed from the smaller assembly/SpMV stream.
+- **Pre-assembly discard-growth for triplet buffers**: capacity grows via
+  `cudaFree`-then-`cudaMalloc` (no copy, no old+new double-residency) at the
+  point where the exact extent is known; growth margin capped at an absolute
+  512 MB (was multiplicative 2×1.3).
+- **seg-dot warp pre-reduction** (`STIFF_SEG_WARP=0` opts out, `=2` prints a
+  d2g warp-layout audit): per-warp fixed-tree `__shfl_down_sync` pre-sum emits
+  ONE shared-bin deposit per warp instead of 32. The per-env dot kernel drops
+  111.5 µs → 14.2 µs (7.9×); a strict frame drops 26 %. Bit-identity and
+  batch-invariance preserved (fixed lane→DOF map, fixed tree order,
+  N-independent env DOF ranges); env-boundary warps fall back to per-lane.
+- **Targeted `__launch_bounds__` variant for the EE broad-phase**
+  (`STIFF_EE_LB=2`, defaulted for **merged**): 168 → 128 reg/thread doubles
+  resident warps on the latency-bound `_selfQuery_ee` (occupancy 11.8 %,
+  DRAM 0.3 %); spills are only 112 B/thread into an idle L1. Merged −5.6 %.
+  `STIFF_EE_LB=3` (80 reg) exists for experiments but measured **+52 %**
+  (L1 thrash against the 8 KB/thread traversal stack) — do not use.
+- **BVH stack-depth probe gated** (`STIFF_STACK_DIAG`): the per-pop
+  `atomicMax` on a single global address in all four traversal kernels was
+  always-on; it is now diagnostics-only.
+
+### Fixed
+- **Strict-mode run-to-run bit-identity regression** (from the det-gating
+  refactor): the central `g_det_reduce` gate defaulted to the fast path, so
+  `binned_deposit` users firing before the first `computeGradientAndHessian`
+  latch (frame-0 init energy reductions) accumulated in non-deterministic
+  order and seeded divergence at the first line search. Default is now
+  conservative (binned); the latch only relaxes merged/isolated. Verified:
+  rz0 probe 17-digit identical across runs and bit-equal to the pre-det-gate
+  baseline.
+- **Determinism machinery positively gated**: strict opts *in* via
+  `STIFF_SPMV_DET`; merged/isolated never pay the binned/ybin/seg-binned tax
+  and may use CUDA-graph PCG. A stray `STIFF_FAST_GRAD=1` can no longer
+  silently break strict's bit-identity contract (the flag is not read at all).
+
+### Changed
+- **`pcg_tol` default back to `1e-4`** (the 0.8.0/0.8.1 shell silently
+  defaulted to `1e-6`, costing ~22 % at N=1 with no accuracy requirement
+  behind it).
+- The shell no longer sets `STIFF_FAST_GRAD` for merged/isolated (dead flag);
+  merged defaults `STIFF_EE_LB=2`.
+
 ## [0.8.1] — 2026-07-04
 
 ### Fixed
