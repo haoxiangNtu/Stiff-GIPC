@@ -854,9 +854,16 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         // [det-gating] binned seg-dot = strict-only (positive gate); STIFF_SEG_BINNED=1 forces.
         int on = (getenv("STIFF_SPMV_DET") || getenv("STIFF_SEG_BINNED")) ? 1 : 0;
         set_seg_binned(on); s_seg_binned_host = on; s_seg_binned_set = true;   // device + host mirror
-        // [warp-reduce] default ON for all modes (deterministic fixed-tree); STIFF_SEG_WARP=0 = A/B off.
+        // [warp-reduce] DETERMINISM FIX (was: default ON for all modes — WRONG). The per-warp float
+        // pre-sum is NOT binned-exact, AND the warp grouping depends on the GLOBAL DOF layout (env k
+        // starts at offset Σ_{j<k} N_j, which is not 32-aligned), so env0 and env1 sum DIFFERENT lane
+        // groups → ~ULP cross-env/batch divergence that chaotic contact amplifies to macroscopic.
+        // It preserves run-to-run (layout fixed within a run) but breaks cross-env AND batch. So:
+        // strict (binned, requires bit-identity) MUST take the plain per-lane binned deposit;
+        // merged/isolated keep the 7.9× warp pre-sum (they don't require bit-identity). Override:
+        // STIFF_SEG_WARP=1 forces it on even for strict (A/B only, breaks determinism).
         const char* w = getenv("STIFF_SEG_WARP");
-        set_seg_warp(w ? atoi(w) : 1);
+        set_seg_warp(w ? atoi(w) : (on ? 0 : 1));
         // [warp-reduce diag] STIFF_SEG_WARP=2: audit d2g at 32-DOF (warp) granularity. Mixed warps
         // silently degrade the pre-sum to the per-lane fallback — this measures how often.
         if(w && atoi(w) == 2)
