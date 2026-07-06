@@ -4,6 +4,34 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.2.1] — 2026-07-07
+
+Determinism correctness patch.
+
+### Fixed
+- **strict cross-env / batch bit-identity regression** introduced by the v0.8.2
+  seg-dot warp pre-reduction. The per-warp `__shfl` tree pre-sum is a plain
+  (non-binned) float add AND its warp grouping is keyed on the global DOF index
+  (env *k* starts at offset Σⱼ Nⱼ, not 32-aligned), so env0 and env1 summed
+  different lane groups → env0 ≠ env1 by ~7 ULP at Newton k=1, amplified by
+  stiff contact to ~8 mm by frame 0. It preserved run-to-run (fixed layout
+  within a run — all v0.8.2 verified) but broke cross-env AND batch invariance.
+  The pre-reduce is now **positively gated OFF for strict** (`STIFF_SPMV_DET`);
+  merged/isolated keep it. Verified: foldshirt strict (non-MAS diagonal precond)
+  env0==env1 and env0@N=2==env0@N=4 bit-identical (0.0) across all frames.
+
+### Corrected
+- The v0.8.2 changelog's **strict −24% / seg-dot −26%** figure is **retracted**
+  — it timed a determinism-broken strict. Correct strict keeps the per-lane
+  binned seg-dot (~111 µs). Recovering a warp pre-sum for strict deterministically
+  needs per-env DOF padding to 32 (future work).
+
+### Known limitation
+- The **MAS preconditioner** (`CASE39_PRECOND=1`) is separately cross-env
+  asymmetric (its warp-bank clustering is keyed on the global vertex layout);
+  multi-env determinism is only guaranteed on the diagonal preconditioner path.
+  MAS × multi-env is WIP.
+
 ## [0.8.2] — 2026-07-04
 
 Memory- and speed-focused release. Foldshirt multi-env N=8 (200 frames,
