@@ -17,6 +17,12 @@ class MASPreconditioner
     int totalNodes = 0;
     int totalMapNodes = 0;
     int levelnum;
+  public:
+    int m_numEnvs = 1;   // [per-env MAS] #body-groups (envs); set at setup from tetMesh.body_groups
+  private:
+    int* d_envBase  = nullptr;   // [per-env MAS] device scratch: per-env aligned base offsets
+    int* d_envStart = nullptr;   //   per-env pre-mutation scan start (avoids RAW hazard in _apply)
+    int* d_padTot   = nullptr;   //   per-env-padded cluster total (written to d_levelSize on device)
     int collision_node_Offset;
     int totalNumberClusters;
     //int bankSize;

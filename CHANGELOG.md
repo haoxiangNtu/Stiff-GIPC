@@ -4,6 +4,49 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.3] — 2026-07-07
+
+Multi-env MAS preconditioner determinism — resolves the v0.8.2.1 known limitation.
+
+### Fixed
+- **strict + MAS preconditioner (`CASE39_PRECOND=1`) cross-env / batch / run-to-run
+  bit-identity** (the v0.8.2.1 "MAS × multi-env is WIP" limitation). Root cause: the MAS
+  builds ONE global hierarchy over all envs; at coarse aggregation levels the (physically
+  independent) envs' clusters land in the same `BANKSIZE` bank, so the block-diagonal
+  Schwarz smoother's per-bank solve couples envs — violating the block-diagonal multi-env
+  PCG assumption that each env is an independent solve. That made the MAS preconditioner
+  env-asymmetric AND, under strict, pathologically slow (block-diagonal solver vs a
+  coupling preconditioner → poor convergence; the full trajectory did not finish in 60 min
+  at N=8). Fix: **per-env-segmented aggregation** — each env's clusters are padded to a
+  `BANKSIZE`-aligned block at EVERY level, so envs never share a bank and the smoother
+  stays intra-env. All-device (3 small integer kernels, no host round-trip; exact → zero
+  determinism impact). Verified (foldshirt, RTX 4090): strict+MAS env0==env1 (cross-env
+  0.0), env0@N=2==env0@N=8 (batch invariance 0.0), run-to-run identical, for N=2/4/8.
+
+### Changed
+- **per-env MAS is now the default for multi-env** (bodies in >1 group) in every mode
+  when the MAS preconditioner is active. The old global MAS aggregates non-interacting
+  envs into shared coarse banks — meaningless (the system is block-diagonal per env) AND
+  slower. Single-env → no segmentation. `STIFF_MAS_SEG` overrides: `0` = force off
+  (measure the old global MAS), `1` = force on (body-group count), `N` = force N envs.
+  The diagonal preconditioner (`CASE39_PRECOND=0`) is unaffected (it has no hierarchy);
+  strict on the diagonal path was already bit-identical since v0.8.2.1.
+
+### Performance (foldshirt full trajectory ~1618 frames, RTX 4090, ms/frame)
+- **strict N=8: MAS (per-env) 608.9 vs diagonal 711.2 → 14 % faster.** per-env MAS is
+  the only usable MAS at strict scale (global MAS is pathological) and beats the diagonal
+  preconditioner (fewer PCG iterations → less of strict's per-iteration binned work).
+- merged/isolated: the diagonal preconditioner remains fastest (merged N=8 = 432.9);
+  with MAS, per-env is the *correct* hierarchy but a few % slower than the old global MAS
+  in these non-bit-identical fast paths (the extra per-env padding nodes are not offset by
+  convergence gains, as MAS does not pay off there). Use `CASE39_PRECOND=0` for speed.
+
+### Hardening
+- The multilevel-R restrict reduction (partial-cluster warp `else` branch) used a
+  non-deterministic float `atomicAdd`; it is now a deterministic per-cluster ordered sum
+  (own-slot deposit + `__syncwarp` + ascending-lane sum). Defensive — no measured effect,
+  but removes a latent non-deterministic reduction on the strict path.
+
 ## [0.8.2.1] — 2026-07-07
 
 Determinism correctness patch.

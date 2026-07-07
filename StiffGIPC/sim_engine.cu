@@ -1353,6 +1353,16 @@ void SimEngine::Impl::do_init_bvh_and_solver()
             ipc._collisonPairs,
             tetMesh.part_offset * BANKSIZE);
 
+        // [per-env MAS] #envs = #body groups. The MAS aggregation uses this to keep each env's
+        // clusters in BANKSIZE-aligned banks at every level (intra-env preconditioner). Homogeneous
+        // multi-env only; the aggregation self-disables (falls back to the global hierarchy) when
+        // the per-env warp split does not divide evenly.
+        {
+            int _ne = 0;
+            for(int g : tetMesh.body_groups) if(g + 1 > _ne) _ne = g + 1;
+            ipc.pcg_data.MP.m_numEnvs = (_ne > 1) ? _ne : 1;
+        }
+
         ipc.pcg_data.MP.neighborListSize = neighborListSize;
 
         if(neighborListSize > 0)

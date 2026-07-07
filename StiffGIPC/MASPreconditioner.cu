@@ -806,6 +806,12 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
 
     __shared__ int prefixSum[DEFAULT_WARPNUM];
 
+    // [MAS determinism] mask of the real (idx>=0) lanes in this warp, captured while ALL 32 lanes
+    // are still converged. Used below to drive a deterministic per-cluster residual reduction that
+    // replaces the order-dependent float atomicAdd (which broke strict cross-env / run-to-run
+    // bit-identity). Padding lanes (idx<0) are excluded and never participate in the warp collective.
+    unsigned int _activeMsk = __ballot_sync(0xffffffffu, idx >= 0);
+
     if(laneId == 0)
     {
         prefixSum[localWarpId] = _prefixOrigin[gwarpId];
@@ -857,30 +863,39 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
         }
         else
         {
-            int elected_lane = __ffs(connectMsk) - 1;
-
-            c_sumResidual[threadIdx.x]                         = 0;
-            c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE]     = 0;
-            c_sumResidual[threadIdx.x + 2 * DEFAULT_BLOCKSIZE] = 0;
-            atomicAdd(c_sumResidual + localWarpId * BANKSIZE + elected_lane, r[0]);
-            atomicAdd(c_sumResidual + localWarpId * BANKSIZE + elected_lane + DEFAULT_BLOCKSIZE,
-                      r[1]);
-            atomicAdd(c_sumResidual + localWarpId * BANKSIZE + elected_lane + 2 * DEFAULT_BLOCKSIZE,
-                      r[2]);
+            // [MAS determinism] Deterministic replacement for the old order-dependent
+            //   atomicAdd(c_sumResidual + warp*BANKSIZE + elected_lane, r)
+            // which summed each cluster's lane residuals into its elected lane in
+            // hardware-scheduling order → different FP rounding per env / per run → broke
+            // strict cross-env & run-to-run bit-identity (P=0 diagonal was bit-exact, P=1 MAS
+            // diverged from the 2nd Newton solve). Now: every real lane writes its own residual
+            // into its own slot (no contention), then each cluster's elected lane sums its
+            // members in ASCENDING lane order (reproducible). Matches the binned-determinism
+            // design already used on the if-branch and the Sym6 apply.
+            c_sumResidual[threadIdx.x]                         = r[0];
+            c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE]     = r[1];
+            c_sumResidual[threadIdx.x + 2 * DEFAULT_BLOCKSIZE] = r[2];
+            __syncwarp(_activeMsk);
 
             unsigned int electedPrefix = __popc(connectMsk & _LanemaskLt(laneId));
             if(electedPrefix == 0)
             {
+                FloatP sx = 0, sy = 0, sz = 0;
+                int    base = localWarpId * BANKSIZE;
+                for(unsigned int m = connectMsk; m; m &= (m - 1))
+                {
+                    int l = __ffs(m) - 1;
+                    sx += c_sumResidual[base + l];
+                    sy += c_sumResidual[base + l + DEFAULT_BLOCKSIZE];
+                    sz += c_sumResidual[base + l + 2 * DEFAULT_BLOCKSIZE];
+                }
                 while(level < levelNum - 1)
                 {
                     level++;
                     idx = _goingNext[idx];
-                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 0) * BINNED_K,
-                                   (double)c_sumResidual[threadIdx.x]);
-                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 1) * BINNED_K,
-                                   (double)c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE]);
-                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 2) * BINNED_K,
-                                   (double)c_sumResidual[threadIdx.x + DEFAULT_BLOCKSIZE * 2]);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 0) * BINNED_K, (double)sx);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 1) * BINNED_K, (double)sy);
+                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 2) * BINNED_K, (double)sz);
                 }
             }
         }
@@ -1584,6 +1599,77 @@ __global__ void _buildCollisionConnection_new(unsigned int* _pConnect,
 }
 
 
+// [per-env MAS] Env-segment an already-exclusive-scanned per-warp prefix so each env's coarse
+// clusters occupy a BANKSIZE-aligned block → envs never share a bank at any level → the
+// block-diagonal Schwarz smoother stays intra-env → strict cross-env / batch bit-identity.
+// Homogeneous multi-env: env e owns warps [e*wpe,(e+1)*wpe). ALL device-side (integer, exact →
+// zero determinism impact; no host round-trip, no sync — the earlier host cudaMemcpy version was
+// only an implementation shortcut, not a determinism requirement).
+//
+// _mas_env_base: n_env is small → single thread. Computes each env's aligned base offset + its
+// pre-mutation scan start (envStart, so _apply has no read-after-write hazard) + the padded total.
+__global__ void _mas_env_base(const unsigned int* prefixSum, const unsigned int* prefix,
+                              int wpe, int n_env, int* envBase, int* envStart, int* padTot)
+{
+    if(blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    int base = 0;
+    for(int e = 0; e < n_env; e++)
+    {
+        int          sW = e * wpe, eW = (e + 1) * wpe;
+        envStart[e]     = (int)prefixSum[sW];
+        unsigned int Ce = prefixSum[eW - 1] + prefix[eW - 1] - prefixSum[sW];   // clusters in env e
+        envBase[e]      = base;
+        base += ((int)Ce + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
+    }
+    *padTot = base;
+}
+// apply the per-env aligned offset to every warp's prefix (envStart precomputed ⇒ no RAW hazard)
+__global__ void _mas_env_apply(unsigned int* prefixSum, const int* envBase, const int* envStart,
+                               int warpNum, int wpe)
+{
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    if(w >= warpNum)
+        return;
+    int e       = w / wpe;
+    prefixSum[w] = (unsigned int)(envBase[e] + ((int)prefixSum[w] - envStart[e]));
+}
+// override d_levelSize[L].x with the per-env-padded cluster total (device — no host copy)
+__global__ void _mas_env_setx(int2* levelSizeSlot, const int* padTot)
+{
+    if(blockIdx.x == 0 && threadIdx.x == 0)
+        levelSizeSlot->x = *padTot;
+}
+// Host-side decision only (getenv + integer arithmetic, no device access → no sync): returns the
+// effective env count to segment by, or <=1 when disabled.
+//   default (STIFF_MAS_SEG unset): ON for multi-env (numEnvs>1) in EVERY mode.
+//       Rationale: the envs never interact (the system is block-diagonal per env), so a per-env MAS
+//       hierarchy is the CORRECT preconditioner; a global MAS would aggregate non-interacting envs
+//       into shared coarse banks — meaningless AND slower. For strict it additionally gives the
+//       cross-env/batch bit-identity contract. Single-env (numEnvs==1) → nothing to segment → OFF.
+//   explicit override (any mode, e.g. for A/B perf tests):
+//       STIFF_MAS_SEG=0 → force OFF  (measure the old global MAS)
+//       STIFF_MAS_SEG=1 → force ON, use body-group count
+//       STIFF_MAS_SEG=N → force ON, N envs
+static int _mas_envSegN(int warpNum, int numEnvs)
+{
+    const char* force = getenv("STIFF_MAS_SEG");
+    int n_env;
+    if(force)
+    {
+        n_env = atoi(force);            // 0=off, 1=auto(body-group count), N=force N
+        if(n_env == 1)
+            n_env = numEnvs;
+    }
+    else
+    {
+        n_env = numEnvs;                // default: ON for multi-env, every mode (see rationale above)
+    }
+    if(n_env <= 1 || warpNum <= 0 || warpNum % n_env != 0)
+        return 1;
+    return n_env;
+}
+
 void MASPreconditioner::BuildConnectMaskL0()
 {
 
@@ -1649,6 +1735,16 @@ void MASPreconditioner::BuildLevel1()
     thrust::exclusive_scan(thrust::device_ptr<int>(d_prefixOriginal),
                            thrust::device_ptr<int>(d_prefixOriginal) + warpNum,
                            thrust::device_ptr<int>(d_prefixSumOriginal));
+    // [per-env MAS] pad each env's level-1 clusters to a BANKSIZE-aligned block (no bank sharing).
+    int _segN = _mas_envSegN(warpNum, m_numEnvs);
+    if(_segN > 1)
+    {
+        int wpe = warpNum / _segN;
+        _mas_env_base<<<1, 1>>>((unsigned int*)d_prefixSumOriginal, (unsigned int*)d_prefixOriginal,
+                                wpe, _segN, d_envBase, d_envStart, d_padTot);
+        _mas_env_apply<<<(warpNum + 255) / 256, 256>>>((unsigned int*)d_prefixSumOriginal, d_envBase,
+                                                       d_envStart, warpNum, wpe);
+    }
     _buildLevel1_new<<<numBlocks, blockSize>>>(d_levelSize,
                                                d_coarseSpaceTables,
                                                d_goingNext,
@@ -1657,6 +1753,8 @@ void MASPreconditioner::BuildLevel1()
                                                d_prefixOriginal,
                                                d_partId_map_real,
                                                number);
+    if(_segN > 1)
+        _mas_env_setx<<<1, 1>>>(d_levelSize + 1, d_padTot);   // padded level-1 cluster count (device)
 #else
     int number    = totalNodes;
     int blockSize = BANKSIZE * BANKSIZE;
@@ -1746,9 +1844,19 @@ void MASPreconditioner::PrefixSumLx(int level)
     thrust::exclusive_scan(thrust::device_ptr<unsigned int>(d_nextPrefix),
                            thrust::device_ptr<unsigned int>(d_nextPrefix) + warpNum,
                            thrust::device_ptr<unsigned int>(d_nextPrefixSum));
+    // [per-env MAS] pad each env's level-(level+1) clusters to a BANKSIZE-aligned block.
+    int _segN = _mas_envSegN(warpNum, m_numEnvs);
+    if(_segN > 1)
+    {
+        int wpe = warpNum / _segN;
+        _mas_env_base<<<1, 1>>>(d_nextPrefixSum, d_nextPrefix, wpe, _segN, d_envBase, d_envStart, d_padTot);
+        _mas_env_apply<<<(warpNum + 255) / 256, 256>>>(d_nextPrefixSum, d_envBase, d_envStart, warpNum, wpe);
+    }
 
     _prefixSumLx<<<numBlocks, blockSize>>>(
         d_levelSize, d_nextPrefix, d_nextPrefixSum, d_nextConnectMask, d_goingNext, level, levelBegin, number);
+    if(_segN > 1)
+        _mas_env_setx<<<1, 1>>>(d_levelSize + level + 1, d_padTot);   // padded cluster count (device)
 }
 
 void MASPreconditioner::AggregationKernel()
@@ -2400,6 +2508,10 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
     //CUDA_SAFE_CALL(cudaMalloc((void**)&d_neighborStart, vertNum * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_neighborNumInit, vertNum * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_partId_map_real, partMapSize * sizeof(int)));
+    // [per-env MAS] small device scratch for the env-segmented prefix (fixed max #envs = 4096).
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_envBase,  4096 * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_envStart, 4096 * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_padTot,   sizeof(int)));
 }
 
 void MASPreconditioner::initPreconditioner_Matrix()
