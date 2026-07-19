@@ -505,7 +505,11 @@ class GIPC
     void                                      init_joint_constraints_from_mesh(class tetrahedra_obj& tetMesh);
     /// Update revolute driving joint target angles from tetMesh.joint_angle_controls.
     /// Call each frame before IPC_Solver when using interactive joint control.
-    void                                      update_joint_angle_targets_from_mesh(class tetrahedra_obj& tetMesh);
+    void update_joint_angle_targets_from_mesh(class tetrahedra_obj& tetMesh,
+                                              double substep_ratio = 1.0);
+    // [drive-substep] host mesh remembered by the per-frame target update so
+    // solve_subIP can re-ramp targets each Newton iteration (STIFF_DRIVE_SUBSTEP=N).
+    class tetrahedra_obj* m_drive_substep_mesh = nullptr;
     std::unique_ptr<gipc::ABDSimData>         m_abd_sim_data;
     std::unique_ptr<gipc::ABDSystem>          m_abd_system;
     std::unique_ptr<gipc::GlobalLinearSystem> m_global_linear_system;

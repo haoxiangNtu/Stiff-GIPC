@@ -1344,7 +1344,8 @@ void ABDSystem::init_revolute_driving(
 
 void ABDSystem::update_revolute_driving_targets(
     ABDSimData& sim_data,
-    const std::vector<JointAngleControlInfo>& controls)
+    const std::vector<JointAngleControlInfo>& controls,
+    double substep_ratio)
 {
     if(controls.empty() || m_num_revolute_driving == 0)
         return;
@@ -1374,7 +1375,8 @@ void ABDSystem::update_revolute_driving_targets(
                 q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
                 masses  = body_mass.cviewer().name("body_mass"),
                 ctrls   = d_ctrl.cviewer().name("ctrls"),
-                sr, kMaxStepPerFrame] __device__(int i) mutable
+                sr, kMaxStepPerFrame,
+                ratio = static_cast<Float>(substep_ratio)] __device__(int i) mutable
                {
                    auto& drv = drvs(i);
                    int pid = drv.parent_body_id;
@@ -1407,7 +1409,7 @@ void ABDSystem::update_revolute_driving_targets(
                    diff = (diff >  kMaxStepPerFrame) ?  kMaxStepPerFrame :
                           (diff < -kMaxStepPerFrame) ? -kMaxStepPerFrame : diff;
 
-                   drv.target_angle = theta_prev + diff;
+                   drv.target_angle = theta_prev + diff * ratio;  // [drive-substep]
 
                    Float mass_sum = masses(pid) + masses(cid);
                    drv.stiffness = sr * ctrls(i).strength_ratio * mass_sum;
@@ -1817,7 +1819,8 @@ void ABDSystem::init_prismatic_driving(
 
 void ABDSystem::update_prismatic_driving_targets(
     ABDSimData& sim_data,
-    const std::vector<PrismaticDrivingControlInfo>& controls)
+    const std::vector<PrismaticDrivingControlInfo>& controls,
+    double substep_ratio)
 {
     if(controls.empty() || m_num_prismatic_driving == 0)
         return;
@@ -1847,7 +1850,8 @@ void ABDSystem::update_prismatic_driving_targets(
                 q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
                 masses  = body_mass.cviewer().name("body_mass"),
                 ctrls   = d_ctrl.cviewer().name("ctrls"),
-                sr, kMaxStepPerFrame] __device__(int i) mutable
+                sr, kMaxStepPerFrame,
+                ratio = static_cast<Float>(substep_ratio)] __device__(int i) mutable
                {
                    auto& drv = drvs(i);
                    int pid = drv.parent_body_id;
@@ -1871,7 +1875,7 @@ void ABDSystem::update_prismatic_driving_targets(
                    diff = (diff >  kMaxStepPerFrame) ?  kMaxStepPerFrame :
                           (diff < -kMaxStepPerFrame) ? -kMaxStepPerFrame : diff;
 
-                   drv.target_distance = d_prev + diff;
+                   drv.target_distance = d_prev + diff * ratio;  // [drive-substep]
 
                    Float mass_sum = masses(pid) + masses(cid);
                    drv.stiffness = sr * ctrls(i).strength_ratio * mass_sum;
@@ -2006,25 +2010,54 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
     auto rows = global_triplet->block_row_indices(global_triplet->h_abd_abd_contact_start_id);
     auto cols = global_triplet->block_col_indices(global_triplet->h_abd_abd_contact_start_id);
     {
+        // [kick root-cause fix] The old scatter ASSIGNED (=) each contact
+        // triplet's 3x3 into the body block: (a) it WIPED the dyadic-mass seed
+        // (the kinetic regularization) from every touched sub-block, and
+        // (b) duplicate triplets targeting the same sub-block (one per contact
+        // pair — the common case) raced and all but one were lost. Under
+        // ground contact a light body's preconditioner block degenerated to a
+        // rank-deficient contact-only matrix, so inverse(P) EXPLODED along the
+        // soft rotation mode — the very amplifier behind the "resting rigid
+        // body flip/kick" pathology (libuipc's abd_diag_preconditioner, which
+        // accumulates the full block, is immune; validated 0.075 vs 16.65 m/s
+        // on the same pusher-vs-toy scene). Fix: ACCUMULATE onto the mass seed
+        // with atomics. (The old racy assignment was already order-
+        // nondeterministic, so this does not regress determinism.)
+        // STIFF_ABD_PRECOND_LEGACY=1 restores the old behavior for A/B.
+        static const bool s_legacy = [] {
+            const char* v = getenv("STIFF_ABD_PRECOND_LEGACY");
+            return v && v[0] && v[0] != '0';
+        }();
+        const bool legacy = s_legacy;  // locals are capturable by device lambdas
         ParallelFor(256)
             .kernel_name(__FUNCTION__)
             .apply(global_triplet->abd_abd_contact_num,
-                   [P = abd_system_diag_preconditioner.viewer().name("P"), triplet, rows, cols] __device__(
-                       int i) mutable
+                   [P = abd_system_diag_preconditioner.viewer().name("P"),
+                    triplet, rows, cols, legacy] __device__(int i) mutable
                    {
                        auto row = rows[i];
                        auto H   = triplet[i];
                        auto col = cols[i];
-                       //auto&& [row, col, H] = bcoo(i);
-                       if(row / 4 == col / 4)
+                       if(row / 4 != col / 4)
+                           return;
+                       if(legacy)
                        {
                            P(row / 4).block<3, 3>((row % 4) * 3, (col % 4) * 3) = H;
                            if(row != col)
-                           {
                                P(row / 4).block<3, 3>((col % 4) * 3, (row % 4) * 3) =
                                    H.transpose();
-                           }
+                           return;
                        }
+                       const int b  = row / 4;
+                       const int r0 = (row % 4) * 3;
+                       const int c0 = (col % 4) * 3;
+                       for(int a = 0; a < 3; ++a)
+                           for(int c = 0; c < 3; ++c)
+                           {
+                               atomicAdd(&P(b)(r0 + a, c0 + c), H(a, c));
+                               if(row != col)
+                                   atomicAdd(&P(b)(c0 + c, r0 + a), H(a, c));
+                           }
                    });
         int count = sim_data.abd_fem_count_info().abd_body_num;
                 ParallelFor(256)

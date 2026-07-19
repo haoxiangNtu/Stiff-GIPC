@@ -365,8 +365,13 @@ class ABDSystem
     /// Update target angles for revolute driving joints (called per frame from UI).
     /// Uses incremental-angle approach: reads q_prev to compute the actual angle,
     /// then sets target = θ_prev + clamp(θ_goal - θ_prev, -step, step).
+    /// [drive-substep] substep_ratio in (0,1] scales the (rate-limited) step
+    /// toward the goal — uipc-style animation substepping: called each Newton
+    /// iteration with ratio=(k+1)/S the driving target ramps across the solve
+    /// instead of dumping the whole frame's driving energy into iteration 0.
     void update_revolute_driving_targets(ABDSimData& sim_data,
-                                         const std::vector<JointAngleControlInfo>& controls);
+                                         const std::vector<JointAngleControlInfo>& controls,
+                                         double substep_ratio = 1.0);
 
     void _cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data);
     void _cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_data);
@@ -380,7 +385,8 @@ class ABDSystem
                                 const std::vector<PrismaticJointHostInfo>& host_prismatic);
 
     void update_prismatic_driving_targets(ABDSimData& sim_data,
-                                          const std::vector<PrismaticDrivingControlInfo>& controls);
+                                          const std::vector<PrismaticDrivingControlInfo>& controls,
+                                          double substep_ratio = 1.0);
 
     void _cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data);
     void _cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_data);

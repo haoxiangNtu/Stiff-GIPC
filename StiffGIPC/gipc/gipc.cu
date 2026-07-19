@@ -138,13 +138,17 @@ void GIPC::init_joint_constraints_from_mesh(tetrahedra_obj& tetMesh)
     }
 }
 
-void GIPC::update_joint_angle_targets_from_mesh(tetrahedra_obj& tetMesh)
+void GIPC::update_joint_angle_targets_from_mesh(tetrahedra_obj& tetMesh, double substep_ratio)
 {
+    m_drive_substep_mesh = &tetMesh;  // [drive-substep] solve_subIP re-ramps from here
+
     if(!tetMesh.joint_angle_controls.empty())
-        m_abd_system->update_revolute_driving_targets(*m_abd_sim_data, tetMesh.joint_angle_controls);
+        m_abd_system->update_revolute_driving_targets(
+            *m_abd_sim_data, tetMesh.joint_angle_controls, substep_ratio);
 
     if(!tetMesh.prismatic_drive_controls.empty())
-        m_abd_system->update_prismatic_driving_targets(*m_abd_sim_data, tetMesh.prismatic_drive_controls);
+        m_abd_system->update_prismatic_driving_targets(
+            *m_abd_sim_data, tetMesh.prismatic_drive_controls, substep_ratio);
 }
 
 void GIPC::create_LinearSystem(device_TetraData& tet)

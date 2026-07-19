@@ -3183,6 +3183,9 @@ __device__ double* g_gbin = nullptr;
 // merged/isolated don't need bit-identical gradients → fast plain-atomic path (bin 0 as a raw
 // accumulator, full precision, non-deterministic order). g_binned_on=1 default (back-compat / strict).
 __device__ int g_binned_on = 1;
+// [PSD clamp] 1 = restore upstream's unprojected (indefinite) ground Hessian.
+// Set once from STIFF_GROUND_HESS_LEGACY in MALLOC_DEVICE_MEM.
+__device__ int g_ground_hess_legacy = 0;
 // [det-gating] central strict-mode reduce flag consumed by binned_deposit (binned_reduce.cuh).
 // DEFAULT 1 (conservative, like g_binned_on): deposits fired BEFORE the first
 // computeGradientAndHessian latch (frame-0 init energies etc.) must stay order-free, or strict's
@@ -6827,8 +6830,17 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
         _gfxAdd(gidx, 2, grad.z);
     }
 
+    // [PSD clamp] the log-barrier's curvature coefficient goes NEGATIVE in part
+    // of its range; upstream commented out the `if(param > 0)` guard, so the
+    // ground contact injected an INDEFINITE rank-1 block (Kappa*param*nn^T,
+    // param<0) into the global Hessian — Newton directions lose their descent
+    // guarantee along that mode. Clamp to 0 instead of restoring the if: the
+    // pair stays in the bookkeeping (same counts/indices, no downstream shift),
+    // only the negative curvature is projected out (exact PSD projection of a
+    // rank-1 term). STIFF_GROUND_HESS_LEGACY=1 restores upstream behavior.
     double param = 4.0 * H_b * dist2 + 2.0 * g_b;
-    //if(param > 0)
+    if(param < 0.0 && !g_ground_hess_legacy)
+        param = 0.0;
     {
         __GEIGEN__::Matrix3x3d nn = __GEIGEN__::__v_vec_toMat(normal, normal);
         __GEIGEN__::Matrix3x3d Hpg = __GEIGEN__::__S_Mat_multiply(nn, Kappa * param);
@@ -9130,6 +9142,11 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_gpNum, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_gdCollapse, sizeof(int)));   // [d-floor fail-fast]
     CUDA_SAFE_CALL(cudaMemset(_gdCollapse, 0, sizeof(int)));
+    {   // [PSD clamp] ground-Hessian projection opt-out (see g_ground_hess_legacy)
+        const char* v      = getenv("STIFF_GROUND_HESS_LEGACY");
+        int         legacy = (v && v[0] && v[0] != '0') ? 1 : 0;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ground_hess_legacy, &legacy, sizeof(int)));
+    }
 
     // [multi-env S1] per-env feasible-alpha substrate (physics-neutral until S2).
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_alpha, kEnvAlphaSlots * sizeof(double)));
@@ -14180,6 +14197,17 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // [per-env productization] reset per-env telemetry for this solve
     m_env_frozen_iter.assign(kEnvAlphaSlots, -1);
     m_env_status.assign(kEnvAlphaSlots, 0);
+    // [drive-substep] uipc-style animation substepping for joint driving: with
+    // STIFF_DRIVE_SUBSTEP=S (>1), the per-frame driving target ramps linearly
+    // over the first S Newton iterations (ratio=(k+1)/S) instead of dumping the
+    // whole frame's driving energy into iteration 0 — that lump budget is what
+    // the global monotone line search can "spend" on flipping a light resting
+    // body (the kick). Convergence exits are suppressed until the ramp
+    // completes (uipc: animation_reach_target).
+    static const int s_drive_substep =
+        getenv("STIFF_DRIVE_SUBSTEP") ? atoi(getenv("STIFF_DRIVE_SUBSTEP")) : 0;
+    const bool drive_substep_on = s_drive_substep > 1 && m_drive_substep_mesh;
+    double     drive_ratio      = drive_substep_on ? 0.0 : 1.0;
 
     CUDA_SAFE_CALL(cudaMemset(_moveDir, 0, vertexNum * sizeof(double3)));
     double totalTimeStep = 0;
@@ -14223,6 +14251,15 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         if(g_gipc_log_level >= 1 && k > 0 && k % 10 == 0)
             printf("  Newton iter %d ...\n", k);
         stats_at_current_frame["newton"].push_back(gipc::Json::object());
+
+        // [drive-substep] ramp the joint driving targets across the solve.
+        // theta_prev/d_prev derive from q_prev (frame-start state, constant
+        // within the solve), so re-invoking per iteration is deterministic.
+        if(drive_substep_on && drive_ratio < 1.0)
+        {
+            drive_ratio = std::min(1.0, double(k + 1) / s_drive_substep);
+            update_joint_angle_targets_from_mesh(*m_drive_substep_mesh, drive_ratio);
+        }
 
         // [S4-dev] periodic all-active recheck (bounce-back detection): every RECHECK iters, unmask
         // ALL envs so masked (frozen) envs get one REAL solve — if a κ doubling / friction update
@@ -14400,6 +14437,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         bool do_break = (getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid)
                             ? (k && all_env_frozen)
                             : (k && gradVanish);
+        // [drive-substep] no convergence exit until the driving ramp completes
+        // (uipc: animation_reach_target gates convergence_check).
+        do_break = do_break && drive_ratio >= 1.0;
         if(do_break)
         {
             break;
@@ -14826,7 +14866,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 noted = true;
             }
         }
-        if(semi_implicit_enabled && k >= semi_implicit_min_iter && !semi_decoupled)
+        if(semi_implicit_enabled && k >= semi_implicit_min_iter && !semi_decoupled
+           && drive_ratio >= 1.0)  // [drive-substep] ramp not done -> no early exit
         {
             if(TetMesh.h_groups_present)  // [N=1 guard] p2g is allocated (all -1) even single-env
             {   // multi-env scene, merged exit: legal but batch-coupled — say so once.
