@@ -4067,25 +4067,68 @@ void SimEngine::teleport_fem_vertices(const double* xyz, int count,
     double3* o_base  = m_impl->d_tetMesh.o_vertexes  + fem_offset;
     double3* xt_base = m_impl->d_tetMesh.xTilta      + fem_offset;
     double3* v_base  = m_impl->d_tetMesh.velocities   + fem_offset;
+
+    // [MAS-perm FIX] get_vertices() returns INPUT order (it unscrambles the
+    // metis sort), and callers naturally round-trip those arrays back in here.
+    // The old code wrote them RAW into the engine-order buffers — on any
+    // metis-sorted body (cloth under the default MAS preconditioner) that
+    // SCRAMBLES the mesh: read-back mismatched by ~0.3 m on a 30x30 cloth,
+    // and with a velocity field the spaghettified state crashed the next
+    // solve with CUDA illegal access (both previously blamed on other
+    // causes). Symmetric fix: permute input->engine before writing, exactly
+    // inverse to get_vertex_positions(). perm[engine_i] = input_j, both
+    // global indices; entries outside [fem_offset, fem_offset+n) fall back
+    // to identity per-slot (defensive, mirrors the getter).
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    const bool  use_perm = !perm.empty()
+                          && static_cast<int>(perm.size()) >= fem_offset + n;
+    std::vector<double> xyz_e;          // engine-order positions
+    const double*       xyz_w = xyz;    // what we actually write
+    if(use_perm)
+    {
+        xyz_e.resize(3 * (size_t)n);
+        for(int i = 0; i < n; i++)
+        {
+            int j = perm[fem_offset + i] - fem_offset;   // input slot for engine slot i
+            if(j < 0 || j >= n) j = i;                   // defensive identity
+            xyz_e[3*i+0] = xyz[3*j+0];
+            xyz_e[3*i+1] = xyz[3*j+1];
+            xyz_e[3*i+2] = xyz[3*j+2];
+        }
+        xyz_w = xyz_e.data();
+    }
     // Write _vertexes (current) and o_vertexes (committed previous-step).
-    CUDA_SAFE_CALL(cudaMemcpy(p_base, xyz, n * sizeof(double3), cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(o_base, xyz, n * sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(p_base, xyz_w, n * sizeof(double3), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(o_base, xyz_w, n * sizeof(double3), cudaMemcpyHostToDevice));
 
     if(velocities != nullptr)
     {
-        // Preserve inertia: write v and build xTilta = x + v*dt + g*dt^2
-        // on the host, then upload.
-        CUDA_SAFE_CALL(cudaMemcpy(v_base, velocities,
-                                  n * sizeof(double3), cudaMemcpyHostToDevice));
+        // Preserve inertia: write v (engine order) and build
+        // xTilta = x + v*dt + g*dt^2 on the host, then upload.
         double dt = m_impl->ipc.IPC_dt;
         double3 g = m_impl->ipc.gravity;
         double dt2 = dt * dt;
-        std::vector<double> xTilta_host(3 * n);
+        std::vector<double> vel_e(3 * (size_t)n);
         for(int i = 0; i < n; i++)
         {
-            xTilta_host[3*i+0] = xyz[3*i+0] + velocities[3*i+0] * dt + g.x * dt2;
-            xTilta_host[3*i+1] = xyz[3*i+1] + velocities[3*i+1] * dt + g.y * dt2;
-            xTilta_host[3*i+2] = xyz[3*i+2] + velocities[3*i+2] * dt + g.z * dt2;
+            int j = i;
+            if(use_perm)
+            {
+                j = perm[fem_offset + i] - fem_offset;
+                if(j < 0 || j >= n) j = i;
+            }
+            vel_e[3*i+0] = velocities[3*j+0];
+            vel_e[3*i+1] = velocities[3*j+1];
+            vel_e[3*i+2] = velocities[3*j+2];
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(v_base, vel_e.data(),
+                                  n * sizeof(double3), cudaMemcpyHostToDevice));
+        std::vector<double> xTilta_host(3 * (size_t)n);
+        for(int i = 0; i < n; i++)
+        {
+            xTilta_host[3*i+0] = xyz_w[3*i+0] + vel_e[3*i+0] * dt + g.x * dt2;
+            xTilta_host[3*i+1] = xyz_w[3*i+1] + vel_e[3*i+1] * dt + g.y * dt2;
+            xTilta_host[3*i+2] = xyz_w[3*i+2] + vel_e[3*i+2] * dt + g.z * dt2;
         }
         CUDA_SAFE_CALL(cudaMemcpy(xt_base, xTilta_host.data(),
                                   n * sizeof(double3), cudaMemcpyHostToDevice));
@@ -4094,7 +4137,7 @@ void SimEngine::teleport_fem_vertices(const double* xyz, int count,
     {
         // Zero velocity, xTilta = new_pos (caller declines to preserve
         // inertia; matches teleport_abd_bodies semantics).
-        CUDA_SAFE_CALL(cudaMemcpy(xt_base, xyz,
+        CUDA_SAFE_CALL(cudaMemcpy(xt_base, xyz_w,
                                   n * sizeof(double3), cudaMemcpyHostToDevice));
         CUDA_SAFE_CALL(cudaMemset(v_base, 0,
                                   n * sizeof(double3)));

@@ -45,17 +45,21 @@ and [Semantic Versioning](https://semver.org/).
   `test_perbody_density.py`, `test_perbody_friction.py`,
   `test_contact_force_stress.py`, `test_perenv_telemetry.py`.
 
-### Known issues found (not yet fixed)
-- **Dense self-contact crash (PRE-EXISTING v0.8.3)**: a violently crumpled
-  cloth (30x30, 3 random 0.7-1.2 m/s kicks) dies with a CUDA illegal-access /
-  invalid-address-space error surfacing in the contact triplet assembly
-  (GIPC.cu ~12030-12050). Reproduced UNCHANGED on the v0.8.3.1 baseline
-  (Stiff-GIPC-v08 build, error 700 at the same site) — not introduced by this
-  branch. Suspected root cause: the linear-system triplet buffers scale only
-  by the STATIC `linear_system_buff_scale` (no overflow growth or bounds
-  check, unlike the DCD/CCD pair buffers) and dense cloth self-contact
-  overflows them. Repro: `recipe_towel_scramble.py` with
-  `linear_system_buff_scale=1` (default), any KICK_V >= 0.7.
+### Fixed (found during this session's testing)
+- **teleport_fem_vertices ignored the metis permutation (PRE-EXISTING
+  v0.8.3)**: `get_vertices()` returns INPUT order (transparently unscrambling
+  the MAS/metis sort) but `teleport_fem_vertices()` wrote the arrays RAW in
+  engine order — on any metis-sorted body (cloth under the default MAS
+  preconditioner) a round-trip teleport SCRAMBLED the mesh (read-back
+  mismatch ~0.32 m on a 30x30 cloth), and with a velocity field the
+  spaghettified cloth killed the next solve with CUDA illegal-access errors
+  (those crashes were first mis-attributed to CCD-grow / dense contact /
+  linear-system buffers — all disproved by A/B; the untouched v0.8.3.1
+  baseline crashes identically). Fixed by applying the input->engine
+  permutation (exact inverse of get_vertex_positions) to positions and
+  velocities before writing. Validated: cloth round-trip error 0.319 m -> 0.0,
+  crumpled state held over 40 frames (drift 25 um); tet-body teleport tests
+  unchanged to the last digit.
 - `set_vertex_velocities_gpu` alone does not rebuild `xTilta` — a bare
   velocity write never moves a body; use
   `teleport_fem_vertices(positions, velocities)`.
