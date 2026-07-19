@@ -163,6 +163,14 @@ class GIPC
     // ground-mu directly.
     double*   d_vert_mu    = nullptr;
     double*   d_vert_mu_gd = nullptr;
+    // [per-env productization] per-env solve telemetry, reset each solve_subIP.
+    // Filled by the HOST S1 path (per_env_exit / STIFF_PERENV_ALPHA without the
+    // dev-mask fast path). frozen_iter[g]: Newton iter at which env g froze
+    // (-1 = ran to loop end). status[g]: 0 active/absent, 1 converged,
+    // 2 timeout (env_newton_iter_cap), 3 diverged (NaN/inf max-move).
+    std::vector<int> m_env_frozen_iter;
+    std::vector<int> m_env_status;
+    int              env_newton_iter_cap = 0;  // per-env iter budget; 0 = off
     int       m_gdCollapseStreak = 0;  // [d-floor fail-fast] consecutive detections below floor (transient impacts recover; pins persist)
     void      throwIfGroundCollapsePersists();  // [d-floor fail-fast] read flag, throw on persistent collapse
     //uint32_t* _cpNum;

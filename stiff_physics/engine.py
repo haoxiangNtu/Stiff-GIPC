@@ -391,6 +391,11 @@ class Engine:
             os.environ.setdefault("STIFF_DECOUPLE_THRESH", "1")
             os.environ.setdefault("STIFF_PERENV_ALPHA", "1")
             os.environ.setdefault("STIFF_PERENV_MASK", "1")
+            # telemetry (per-env iters/status, NaN quarantine) lives in the host
+            # S1 path — make it part of the productized switch. Set
+            # STIFF_PERENV_TELEM=0 explicitly to opt back into the zero-D2H
+            # device fast path (no telemetry).
+            os.environ.setdefault("STIFF_PERENV_TELEM", "1")
         self._engine.set_config(self._config.native)
         self._engine.init_cuda()
         self._finalized = False
@@ -1030,6 +1035,33 @@ class Engine:
         path uses :meth:`get_contacts_device`. Call AFTER :meth:`step`.
         """
         return self._engine.get_contacts()
+
+    def get_vertex_contact_forces(self, include_ground: bool = True) -> np.ndarray:
+        """Per-vertex IPC contact force (N, 3) in Newtons of the current state.
+
+        Self-contact barrier forces, plus ground-contact when
+        ``include_ground``. The unsummed distribution behind
+        ``get_body_contact_force_batched`` — slice with
+        :meth:`get_load_records` vertex ranges for per-body maps. Rebuilds
+        contacts once; call between frames.
+        """
+        return np.asarray(self._engine.get_vertex_contact_forces(include_ground))
+
+    def get_fem_von_mises_stress(self) -> np.ndarray:
+        """Per-vertex von Mises stress (Pa): per-tet Neo-Hookean Cauchy stress,
+        max-scattered to vertices. Non-tet vertices (cloth/ABD) are 0."""
+        return np.asarray(self._engine.get_fem_von_mises_stress())
+
+    def get_per_env_newton_iters(self) -> np.ndarray:
+        """Newton iter at which each env froze last solve (-1 = ran to loop
+        end / absent). Requires the host per-env path (``per_env_exit=True``
+        plus ``env_newton_iter_cap`` or STIFF_PERENV_TELEM=1)."""
+        return np.asarray(self._engine.get_per_env_newton_iters())
+
+    def get_per_env_status(self) -> np.ndarray:
+        """Per-env status of the last solve: 0 active/absent, 1 converged,
+        2 timeout (env_newton_iter_cap), 3 diverged (NaN quarantined)."""
+        return np.asarray(self._engine.get_per_env_status())
 
     def set_body_friction(self, body_offset: int, mu: float,
                           ground_mu: float | None = None) -> None:

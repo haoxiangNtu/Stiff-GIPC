@@ -14177,6 +14177,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
     int iterCap = newton_iter_cap, k = 0;
     double semi_beta = 1.0;
+    // [per-env productization] reset per-env telemetry for this solve
+    m_env_frozen_iter.assign(kEnvAlphaSlots, -1);
+    m_env_status.assign(kEnvAlphaSlots, 0);
 
     CUDA_SAFE_CALL(cudaMemset(_moveDir, 0, vertexNum * sizeof(double3)));
     double totalTimeStep = 0;
@@ -14588,7 +14591,14 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             const double _sq_    = sqrt(dHat);
             const double _thrcv_ = getenv("STIFF_DECOUPLE_THRESH") ? ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt)) : 0.0;
             const bool _s1diag_ = getenv("STIFF_PENV_STATS") || getenv("STIFF_A0_DUMP")
-                               || getenv("STIFF_S1_DEBUG") || getenv("STIFF_ALPHA_DBG");
+                               || getenv("STIFF_S1_DEBUG") || getenv("STIFF_ALPHA_DBG")
+                               // [per-env productization] telemetry (freeze iters/
+                               // status), the per-env iter budget and the NaN
+                               // quarantine live in the host loop — route there
+                               // when any of them is requested.
+                               || env_newton_iter_cap > 0
+                               || (getenv("STIFF_PERENV_TELEM")
+                                   && getenv("STIFF_PERENV_TELEM")[0] != '0');
             if(!_s1diag_)
             {
                 static int* d_env_cnt = nullptr;
@@ -14667,7 +14677,39 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt));
                     if(hmx[g] < thr_cv) h_env_alpha[g] = 0.0;
                 }
+                // [per-env productization] quarantine + budget, evaluated per iter
+                // (no latch needed: NaN persists, k only grows).
+                if(h_env_alpha[g] != 0.0)
+                {
+                    if(std::isnan(hmx[g]) || std::isinf(hmx[g]))
+                    {   // diverged env: freeze it so its NaN cannot poison the batch
+                        h_env_alpha[g] = 0.0;
+                        if(m_env_status[g] < 2)
+                        {
+                            m_env_status[g]      = 3;
+                            m_env_frozen_iter[g] = (int)k;
+                            printf("  [per-env] env %d DIVERGED (NaN/inf max-move) at iter %d -> frozen\n",
+                                   g, (int)k);
+                        }
+                    }
+                    else if(env_newton_iter_cap > 0 && (int)k + 1 >= env_newton_iter_cap)
+                    {   // per-env iteration budget: give up on THIS env only
+                        h_env_alpha[g] = 0.0;
+                        if(m_env_status[g] < 2)
+                        {
+                            m_env_status[g]      = 2;
+                            m_env_frozen_iter[g] = (int)k;
+                            printf("  [per-env] env %d TIMEOUT (cap=%d) at iter %d -> frozen\n",
+                                   g, env_newton_iter_cap, (int)k);
+                        }
+                    }
+                }
                 if(h_env_alpha[g] == 0.0) ++n_frozen;   // [decouple] per-env converged (frozen)
+                if(h_env_alpha[g] == 0.0 && m_env_frozen_iter[g] < 0)
+                {   // [per-env productization] first freeze = convergence iter
+                    m_env_frozen_iter[g] = (int)k;
+                    if(m_env_status[g] == 0) m_env_status[g] = 1;
+                }
                 min_env = std::min(min_env, a);
                 max_env = std::max(max_env, a);
                 ++n_env;

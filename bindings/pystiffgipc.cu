@@ -46,6 +46,7 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readwrite("semi_implicit_beta_tol",           &SimEngineConfig::semi_implicit_beta_tol)
         .def_readwrite("semi_implicit_min_iter",           &SimEngineConfig::semi_implicit_min_iter)
         .def_readwrite("newton_iter_cap",                  &SimEngineConfig::newton_iter_cap)
+        .def_readwrite("env_newton_iter_cap",              &SimEngineConfig::env_newton_iter_cap)
         .def_readwrite("skip_all_collision",               &SimEngineConfig::skip_all_collision)
         .def_readwrite("velocity_damping",                 &SimEngineConfig::velocity_damping)
         .def_readwrite("gravity",                          &SimEngineConfig::gravity)
@@ -410,6 +411,12 @@ PYBIND11_MODULE(pystiffgipc, m)
             "Cauchy -> von Mises -> max over incident tets. Non-tet vertices "
             "(cloth/ABD) are 0.")
         .def("get_total_newton_iters", &SimEngine::get_total_newton_iters)
+        .def("get_per_env_newton_iters", &SimEngine::get_per_env_newton_iters,
+             "[per-env] Newton iter at which each env froze last solve (-1 = ran "
+             "to loop end / absent). 256 slots. Host per-env path only.")
+        .def("get_per_env_status", &SimEngine::get_per_env_status,
+             "[per-env] Status of the last solve per env: 0 active/absent, "
+             "1 converged, 2 timeout (env_newton_iter_cap), 3 diverged. 256 slots.")
         .def("get_total_pcg_iters", &SimEngine::get_total_pcg_iters)
         .def("get_total_collision_pairs", &SimEngine::get_total_collision_pairs)
         .def("get_max_collision_pairs", &SimEngine::get_max_collision_pairs)

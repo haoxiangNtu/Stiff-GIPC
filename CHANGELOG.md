@@ -4,6 +4,65 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — branch fix/p0-stability
+
+### Fixed (stability, P0)
+- **semi-implicit exit scoping**: the global `beta *= 1-alpha` early exit is
+  disabled under the per-env decoupled exit (it re-coupled the batch: a fast
+  env's good steps cut off still-unconverged mates at a batch-dependent iter);
+  merged multi-env runs get a one-time batch-coupling warning. Decay factor
+  clamped `>= 0`.
+- **d-floor fail-fast** (ported from the 0.6-multienv line): the five
+  `[d=0 guard]` silent clamps are removed; a ground distance persisting below
+  1e-9 m for 800 consecutive detections now throws (impact transients recover;
+  collapse pins — problem-record D2 — do not). Covers the merged AND the
+  per-env detection paths.
+
+### Added
+- **Per-soft-body density**: `load_mesh(density=...)` /
+  `set_soft_body_density(body_offset, rho)` — per-tet & per-triangle override
+  consumed by the finalize mass build (unset bodies keep the global
+  `Config.density`/`cloth_density`).
+- **Per-body friction**: `set_body_friction(body_offset, mu, ground_mu=None)`
+  — per-vertex mu tables; self-contact pairs combine geometrically, ground
+  contact per-vertex; energy/gradient/Hessian consistent; feature unused =
+  bit-identical legacy path.
+- **Contact-force distribution**: `get_vertex_contact_forces(include_ground)`
+  — per-vertex contact forces in NEWTONS (validated: resting-cube net vertical
+  reaction = weight to 4 digits).
+- **FEM stress**: `get_fem_von_mises_stress()` — per-tet Neo-Hookean Cauchy →
+  von Mises → per-vertex max.
+- **Per-env productization**: `Config(per_env_exit=True)` switch;
+  `Config(env_newton_iter_cap=N)` per-env Newton budget (TIMEOUT-freezes only
+  the offending env); NaN/inf quarantine (DIVERGED-freeze);
+  `get_per_env_newton_iters()` / `get_per_env_status()`.
+- `Config(gd_friction_rate=...)` and
+  `Config(collision_detection_buff_scale=...)` as explicit parameters; URDF
+  importer warns on primitive (non-mesh) collision geometry instead of a
+  silent skip.
+- Recipe + regression examples: `recipe_towel_scramble.py` (crumpled-cloth
+  initial states via teleport/checkpoint), `test_dfloor_bunny_drop.py`,
+  `test_perbody_density.py`, `test_perbody_friction.py`,
+  `test_contact_force_stress.py`, `test_perenv_telemetry.py`.
+
+### Known issues found (not yet fixed)
+- **Dense self-contact crash (PRE-EXISTING v0.8.3)**: a violently crumpled
+  cloth (30x30, 3 random 0.7-1.2 m/s kicks) dies with a CUDA illegal-access /
+  invalid-address-space error surfacing in the contact triplet assembly
+  (GIPC.cu ~12030-12050). Reproduced UNCHANGED on the v0.8.3.1 baseline
+  (Stiff-GIPC-v08 build, error 700 at the same site) — not introduced by this
+  branch. Suspected root cause: the linear-system triplet buffers scale only
+  by the STATIC `linear_system_buff_scale` (no overflow growth or bounds
+  check, unlike the DCD/CCD pair buffers) and dense cloth self-contact
+  overflows them. Repro: `recipe_towel_scramble.py` with
+  `linear_system_buff_scale=1` (default), any KICK_V >= 0.7.
+- `set_vertex_velocities_gpu` alone does not rebuild `xTilta` — a bare
+  velocity write never moves a body; use
+  `teleport_fem_vertices(positions, velocities)`.
+- `get_body_contact_force_batched` returns incremental-potential-gradient
+  units (force × dt²), NOT Newtons — downstream users beware (the new
+  `get_vertex_contact_forces` IS in Newtons).
+
 ## [0.8.3] — 2026-07-07
 
 Multi-env MAS preconditioner determinism — resolves the v0.8.2.1 known limitation.

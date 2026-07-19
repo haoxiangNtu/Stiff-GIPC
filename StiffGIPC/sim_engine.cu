@@ -477,6 +477,16 @@ void SimEngine::set_per_tet_young_for_body(int body_offset,
                *std::max_element(per_tet_young.begin(), per_tet_young.end()));
 }
 
+std::vector<int> SimEngine::get_per_env_newton_iters() const
+{
+    return m_impl->ipc.m_env_frozen_iter;
+}
+
+std::vector<int> SimEngine::get_per_env_status() const
+{
+    return m_impl->ipc.m_env_status;
+}
+
 void SimEngine::set_body_friction(int body_offset, double mu, double ground_mu)
 {
     if(body_offset < 0 || body_offset >= (int)m_impl->load_records.size())
@@ -880,6 +890,7 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.semi_implicit_beta_tol = cfg.semi_implicit_beta_tol;
     ipc.semi_implicit_min_iter = cfg.semi_implicit_min_iter;
     ipc.newton_iter_cap        = cfg.newton_iter_cap;
+    ipc.env_newton_iter_cap    = cfg.env_newton_iter_cap;  // [per-env productization]
 
     ipc.m_skip_all_collision = cfg.skip_all_collision;
 }
@@ -3246,6 +3257,11 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
     g.combineBinnedGrad(s_d_grad);
     CUDA_SAFE_CALL(cudaMemcpy(out3, s_d_grad, (size_t)nw * 3 * sizeof(double),
                               cudaMemcpyDeviceToHost));
+    // The buffer holds the incremental-potential gradient (force * dt^2):
+    // measured mg*dt^2 on a resting cube. Scale to physical Newtons.
+    const double inv_dt2 = 1.0 / (g.IPC_dt * g.IPC_dt);
+    for(int i = 0; i < nw * 3; ++i)
+        out3[i] *= inv_dt2;
     return nw;
 }
 

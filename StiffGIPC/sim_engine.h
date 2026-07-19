@@ -69,6 +69,10 @@ struct SimEngineConfig
     bool   semi_implicit_enabled  = false;
     double semi_implicit_beta_tol = 1e-3;
     int    semi_implicit_min_iter = 1;
+    // [per-env productization] per-env Newton iteration budget: an env still
+    // active at this iter is force-frozen with status TIMEOUT (others continue
+    // unaffected). 0 = off. Host per-env path only.
+    int    env_newton_iter_cap    = 0;
     int    newton_iter_cap        = 1000;
 
     bool   skip_all_collision = false;
@@ -278,6 +282,14 @@ class SimEngine
     /// incident tets. Vertices not in any tet (cloth, ABD) get 0. Writes
     /// min(n, vertexNum) values; returns the number written.
     int get_fem_von_mises_stress(double* out, int n);
+
+    /// [per-env productization] Newton iter at which each env froze last solve
+    /// (converged / timeout / diverged; -1 = ran to loop end or absent).
+    /// 256 slots. Host per-env path only (per_env_exit / STIFF_PERENV_ALPHA).
+    std::vector<int> get_per_env_newton_iters() const;
+    /// [per-env productization] Per-env status of the last solve:
+    /// 0 active/absent, 1 converged, 2 timeout, 3 diverged. 256 slots.
+    std::vector<int> get_per_env_status() const;
 
     /// [FEM-pin] Hard-constraint pin: forces a FEM vertex's world position
     /// to follow an ABD anchor vertex by a fixed offset, EXACTLY (no soft
