@@ -154,6 +154,9 @@ class GIPC
 
     uint32_t* _gpNum       = nullptr;
     uint32_t* _close_gpNum = nullptr;
+    int*      _gdCollapse  = nullptr;  // [d-floor fail-fast] device flag: ground distance below floor
+    int       m_gdCollapseStreak = 0;  // [d-floor fail-fast] consecutive detections below floor (transient impacts recover; pins persist)
+    void      throwIfGroundCollapsePersists();  // [d-floor fail-fast] read flag, throw on persistent collapse
     //uint32_t* _cpNum;
     uint32_t h_cpNum[5]  = {0, 0, 0, 0, 0};
     uint32_t h_ccd_cpNum = 0;

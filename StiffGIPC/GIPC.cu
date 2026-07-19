@@ -8,6 +8,8 @@
 
 #include "GIPC.cuh"
 #include "eigen_data.h"  // Vector12 for stitch local-frame fix
+#include <stdexcept>     // [d-floor fail-fast] ground-distance collapse -> throw
+#include <string>
 #include <gipc/gipc.h>
 #include "cuda_tools/cuda_tools.h"
 #include "GIPC_PDerivative.cuh"
@@ -6717,7 +6719,8 @@ __global__ void _GroundCollisionDetect(const double3*  vertexes,
                                        int       number,
                                        const int* _point_body_id,
                                        const int* _ground_skip_body,
-                                       int        _ground_body_count)
+                                       int        _ground_body_count,
+                                       int*       _gdCollapse)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -6732,6 +6735,11 @@ __global__ void _GroundCollisionDetect(const double3*  vertexes,
     double dist = __GEIGEN__::__v_vec_dot(*g_normal, vertexes[svI]) - *g_offset;
     if(dist * dist > dHat)
         return;
+
+    // [d-floor fail-fast] flag ground-distance hit below 1 nm (incl. d<=0).
+    // Free ride on the detection pass: no extra kernel, no reduction, no malloc.
+    if(dist < 1e-9)
+        atomicExch(_gdCollapse, 1);
 
     _environment_collisionPair[atomicAdd(_gpNum, 1)] = svI;
 }
@@ -6772,12 +6780,8 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
     double Kappa = (kappa_grp && p2g && p2g[gidx] >= 0) ? kappa_grp[p2g[gidx]] : Kappa_scalar /* [-1 guard] */;
     double dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double dist2 = dist * dist;
-    // [d=0 guard] a vertex sitting EXACTLY on the ground (dist2==0) makes
-    // log(dist2/dHat) and 1/dist2 below blow up to +-inf -> NaN in the gradient,
-    // which poisons the whole global RHS and zeros the Newton search direction
-    // (everything freezes). Clamp to a tiny positive value so d=0 yields a
-    // large-but-finite push-out instead of NaN.
-    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);
+    // [d-floor fail-fast] no d~0 clamp here: buildCP() throws when the min ground
+    // distance collapses below the 1e-9 m floor, before this kernel can see it.
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -6831,7 +6835,7 @@ __global__ void _computeGroundGradient(const double3* vertexes,
     double  Kappa = (kappa_grp && p2g && p2g[gidx] >= 0) ? kappa_grp[p2g[gidx]] : Kappa_scalar /* [-1 guard] */;
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
-    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-barrier NaN (see _computeGroundGradientAndHessian)
+    // [d-floor fail-fast] clamp removed; buildCP() throws before d can collapse here.
 
     double t   = dist2 - dHat;
     double g_b = t * std::log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -7180,7 +7184,7 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
     int     gidx   = _environment_collisionPair[idx];
     double  dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
-    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-barrier energy NaN at d=0
+    // [d-floor fail-fast] clamp removed; buildCP() throws before d can collapse here.
     double  temp  = -(dist2 - dHat) * (dist2 - dHat) * log(dist2 / dHat);
 
     _penv_energy_accum(penv, p2g, gidx, ng, temp);  // [S3] ground pair's vertex env
@@ -8845,7 +8849,7 @@ __global__ void _calFrictionLastH_gd(const double3* _vertexes,
     int     gidx   = _collisionPair_environment[idx];
     double  dist = __GEIGEN__::__v_vec_dot(normal, _vertexes[gidx]) - *g_offset;
     double  dist2 = dist * dist;
-    dist2 = (dist2 == 0.0 ? 1e-12 : dist2);  // [d=0 guard] avoid ground-friction lambda NaN at d=0
+    // [d-floor fail-fast] clamp removed; buildCP() throws before d can collapse here.
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -9084,6 +9088,8 @@ void GIPC::MALLOC_DEVICE_MEM()
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_cpNum, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_gpNum, sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_gdCollapse, sizeof(int)));   // [d-floor fail-fast]
+    CUDA_SAFE_CALL(cudaMemset(_gdCollapse, 0, sizeof(int)));
 
     // [multi-env S1] per-env feasible-alpha substrate (physics-neutral until S2).
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_alpha, kEnvAlphaSlots * sizeof(double)));
@@ -9350,7 +9356,7 @@ void GIPC::GroundCollisionDetect()
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     _GroundCollisionDetect<<<blockNum, threadNum>>>(
         _vertexes, _surfVerts, _groundOffset, _groundNormal, _environment_collisionPair, _gpNum, dHat, numbers,
-        _point_body_id, _ground_skip_body, _ground_body_count);
+        _point_body_id, _ground_skip_body, _ground_body_count, _gdCollapse);
 }
 
 void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int global_hessian_fem_offset)
@@ -9841,6 +9847,7 @@ void GIPC::buildCP()
     // before its kernel reads/atomicAdds _cpNum.
     CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
     CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
     cudaEvent_t reset_evt;
     cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
     cudaEventRecord(reset_evt, 0);
@@ -9920,6 +9927,7 @@ void GIPC::buildCP()
         set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
+        CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
         bvh_f.SelfCollitionDetect(dHat);
         bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
         GroundCollisionDetect();
@@ -9930,6 +9938,48 @@ void GIPC::buildCP()
             memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
             h_gpNum = cp_gp_buf[5];
         }
+    }
+
+    throwIfGroundCollapsePersists();  // [d-floor fail-fast]
+}
+
+// [d-floor fail-fast] IPC's invariant is ground distance d > 0, maintained by
+// CCD + the log-barrier. Under pathological pressing the distance can collapse
+// far below physical validity (observed: healthy um-scale equilibrium ->
+// 1e-23 m within two frames), after which the barrier Hessian (~1/d^2) makes
+// Newton escape O(d)/iteration -- the vertex is permanently pinned and the
+// "solution" is garbage (verified identical at iter caps 200 and 600).
+// The engine must not silently solve past a broken invariant: fail loudly.
+// (The former `dist2==0 ? 1e-12` clamps that papered over the NaN symptom of
+//  this state are removed for the same reason -- clamp-and-continue hides a
+//  state the engine cannot actually handle.)
+// Cost: the flag is set inside the detection kernel (free ride) and read back
+// as 4 bytes here -- no reductions, no allocations in the hot path.
+//
+// PERSISTENCE, not instant: a legitimate impact can transiently dip a vertex
+// below the floor within its impact frame (verified: a plain bunny drop
+// does), then the barrier pushes it back out. A COLLAPSE PIN persists
+// forever (verified: bitwise-frozen at 5e-23 m across 60+ frames, iter caps
+// 200 and 600 identical). So throw only when the sub-nm state persists
+// across ~4 frames' worth of consecutive detections.
+void GIPC::throwIfGroundCollapsePersists()
+{
+    if(!_gdCollapse)
+        return;
+    int collapsed = 0;
+    if(h_gpNum > 0)
+        CUDA_SAFE_CALL(cudaMemcpy(&collapsed, _gdCollapse, sizeof(int), cudaMemcpyDeviceToHost));
+    m_gdCollapseStreak = collapsed ? (m_gdCollapseStreak + 1) : 0;
+    if(m_gdCollapseStreak >= 800)
+    {
+        throw std::runtime_error(
+            "[StiffGIPC] IPC invariant violation: a ground contact distance "
+            "has stayed below 1e-9 m for 800 consecutive collision "
+            "detections (~several frames) -- a collapsed log-barrier pin, "
+            "not an impact transient. Newton cannot escape it (step ~ "
+            "O(d)/iter; verified iter-cap independent). Likely cause: "
+            "excessive pressing/drive force into the ground, or CCD failing "
+            "to hold d > 0. Aborting instead of silently mis-solving.");
     }
 }
 
@@ -10769,6 +10819,7 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
     bvh_f._vertexes = saved_f;
     bvh_e._vertexes = saved_e;
+    CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
     if(!getenv("STIFF_SKIP_GRND")) GroundCollisionDetect();
     {   // [9d28824-port] one 6-int D2H
         uint32_t cp_gp_buf[6];
@@ -10776,6 +10827,8 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
         memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
     }
+
+    throwIfGroundCollapsePersists();  // [d-floor fail-fast] (per-env detection path)
 }
 
 AABB* GIPC::calcuMaxSceneSize()
@@ -11016,8 +11069,7 @@ __global__ void _exportGroundContactForces(const double3*   _vertexes,
     double3 nrm = g_normal[0];
     double  dist = __GEIGEN__::__v_vec_dot(nrm, _vertexes[gidx]) - g_offset[0];
     double  dis  = dist * dist;
-    if(dis < 1e-12)
-        dis = 1e-12;  // [d=0 guard]
+    // [d-floor fail-fast] clamp removed; buildCP() throws before d can collapse here.
     double t      = dis - dHat;
     double g_b    = t * log(dis / dHat) * -2.0 - (t * t) / dis;
     double lambda = -Kappa * 2.0 * sqrt(dis) * g_b;
@@ -13670,11 +13722,17 @@ bool GIPC::isIntersected(device_TetraData& TetMesh)
     // dc11e10).  Set GIPC_FORCE_CCD_SANITY=1 to restore the v0.6-and-earlier
     // behavior of running the check.  STIFF_SKIP_CCD_SANITY=0 also restored
     // (back-compat); any other value or unset = skip.
+    // [fail-fast][2026-07-08] We tried default-ON: on a plain scene (single FEM
+    // bunny dropped on the ground) the edge-tri recheck reports intersections
+    // every bisection ("type 0 intersection happened" x260k) and the alpha loop
+    // never exits -> hang. The checker is not usable as a default in its current
+    // state (false positives / self-intersection sensitivity), which is the real
+    // reason it was disabled — document this instead of hiding it. Default stays
+    // OFF; GIPC_FORCE_CCD_SANITY=1 opts in for debugging. The ground-collapse
+    // invariant is enforced separately by the buildCP d-floor throw.
     static const bool keep_sanity = []{
         const char* v_force = std::getenv("GIPC_FORCE_CCD_SANITY");
         if(v_force && v_force[0] && v_force[0] != '0') return true;
-        const char* v_skip = std::getenv("STIFF_SKIP_CCD_SANITY");
-        if(v_skip && v_skip[0] == '0') return true;  // explicit opt-out of skip
         return false;
     }();
     if(!keep_sanity) return false;
@@ -14659,9 +14717,41 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // Semi-implicit early exit (ref: arXiv 2512.12151, Algorithm 1)
         // beta tracks cumulative line-search progress; when alpha≈1 (good step),
         // beta decays fast -> early exit.  When alpha is small, beta stays large.
-        if(semi_implicit_enabled && k >= semi_implicit_min_iter)
+        // [semi-implicit x multi-env] beta/alpha are GLOBAL. Under the per-env
+        // decoupled exit (DECOUPLE_THRESH) a global early break would re-couple the
+        // batch: one env's good steps cut off still-unconverged mates at a
+        // batch-dependent iter — the exact drift DECOUPLE_THRESH exists to prevent.
+        // The decoupled path therefore ignores the semi-implicit exit (its per-env
+        // frozen check already exits as soon as every env converged). A true per-env
+        // beta belongs with the per-env productization work.
+        const bool semi_decoupled = getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid;
+        if(semi_implicit_enabled && semi_decoupled)
         {
-            semi_beta *= (1.0 - alpha);
+            static bool noted = false;
+            if(!noted)
+            {
+                printf("  [semi-implicit] NOTE: per-env decoupled exit active -> the "
+                       "GLOBAL semi-implicit early exit is disabled (per-env frozen "
+                       "check governs termination).\n");
+                noted = true;
+            }
+        }
+        if(semi_implicit_enabled && k >= semi_implicit_min_iter && !semi_decoupled)
+        {
+            if(TetMesh.h_groups_present)  // [N=1 guard] p2g is allocated (all -1) even single-env
+            {   // multi-env scene, merged exit: legal but batch-coupled — say so once.
+                static bool warned = false;
+                if(!warned)
+                {
+                    printf("  [semi-implicit] WARNING: multi-env scene with a GLOBAL "
+                           "semi-implicit exit — every env stops at the same Newton "
+                           "iter, so a fast env can terminate a still-unconverged "
+                           "mate (batch-coupled result). For per-env convergence "
+                           "run with STIFF_DECOUPLE_THRESH=1 STIFF_PERENV_ALPHA=1.\n");
+                    warned = true;
+                }
+            }
+            semi_beta *= fmax(0.0, 1.0 - alpha);  // clamp: alpha>1 must not flip beta's sign
             if(semi_beta <= semi_implicit_beta_tol)
             {
                 printf("  [semi-implicit] early exit at Newton iter %d (beta=%.6e, tol=%.6e)\n",
