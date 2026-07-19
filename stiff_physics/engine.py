@@ -1031,6 +1031,21 @@ class Engine:
         """
         return self._engine.get_contacts()
 
+    def set_body_friction(self, body_offset: int, mu: float,
+                          ground_mu: float | None = None) -> None:
+        """Override one body's friction coefficient (per-body friction).
+
+        ``body_offset`` indexes :meth:`get_load_records`. Self-contact pairs
+        use the geometric mean of the two sides' mu; ground contact uses
+        ``ground_mu`` for this body (None = keep the global
+        ``gd_friction_rate``). Call after loading the body, before
+        :meth:`finalize`. Scenes that never call this run the legacy global-mu
+        path bit-identically. Example: GRIP's UMI soft finger (mu=3.5) grasping
+        a mu=0.4 object in one scene.
+        """
+        self._engine.set_body_friction(int(body_offset), float(mu),
+                                       -1.0 if ground_mu is None else float(ground_mu))
+
     def set_soft_body_density(self, body_offset: int, density: float) -> None:
         """Override one SOFT body's density (FEM tets or cloth shell).
 

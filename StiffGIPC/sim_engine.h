@@ -254,6 +254,31 @@ class SimEngine
     /// (e.g. an ABD body — use set_abd_body_density for those).
     void set_soft_body_density(int body_offset, double density);
 
+    /// [per-body friction] Override one body's friction coefficient.
+    /// `body_offset` = index into get_load_records(); applies to every vertex
+    /// of that body (ABD or FEM/cloth). Self-contact pairs combine the two
+    /// sides' mu geometrically (sqrt(mu_a * mu_b)); ground contact uses
+    /// `ground_mu` for this body's vertices (< 0 = keep the global
+    /// gd_friction_rate). Call AFTER loading the body and BEFORE finalize().
+    /// If no body is ever overridden the engine runs the legacy global-mu
+    /// path bit-identically.
+    void set_body_friction(int body_offset, double mu, double ground_mu = -1.0);
+
+    /// [contact-force distribution] Per-vertex IPC contact gradient (N,3) of
+    /// the CURRENT state — the unsummed buffer behind
+    /// get_body_contact_force_batched (self-contact barrier; ground barrier
+    /// added when include_ground). Rebuilds contacts once (BVH+CP); call
+    /// between frames. Convention matches the batched API (sum of these over a
+    /// body's vertices = its net contact force). Writes min(n, vertexNum)
+    /// triples into out3; returns the number written.
+    int get_vertex_contact_forces(double* out3, int n, bool include_ground = true);
+
+    /// [FEM stress] Per-vertex von Mises stress (Pa) of the current state:
+    /// per-tet Neo-Hookean Cauchy stress -> von Mises -> per-vertex MAX over
+    /// incident tets. Vertices not in any tet (cloth, ABD) get 0. Writes
+    /// min(n, vertexNum) values; returns the number written.
+    int get_fem_von_mises_stress(double* out, int n);
+
     /// [FEM-pin] Hard-constraint pin: forces a FEM vertex's world position
     /// to follow an ABD anchor vertex by a fixed offset, EXACTLY (no soft
     /// spring error). Acts like a stitch spring with infinite stiffness —

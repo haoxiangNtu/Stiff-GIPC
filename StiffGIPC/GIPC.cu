@@ -1366,6 +1366,27 @@ __device__ double __cal_Friction_energy(const double3*         _vertexes,
     }
 }
 
+// [per-body friction] Per-pair mu from the per-vertex table. A contact pair
+// couples two primitives; each primitive lives on ONE body, so one
+// representative vertex per side carries the side's mu exactly:
+//   EE  (x>=0):            edges (x,y)-(z,w)   -> reps x and z
+//   PT/PE/PP (x<0, enc.):  point -x-1 vs prim  -> reps -x-1 and y (decoded)
+// Combine = geometric mean (PhysX-style multiplicative feel; symmetric).
+// vmu == nullptr -> feature off, return the scalar fallback (legacy path).
+__device__ __forceinline__ double _pair_mu(const int4 v, const double* vmu, double fallback)
+{
+    if(!vmu)
+        return fallback;
+    int a, b;
+    if(v.x >= 0) { a = v.x; b = v.z; }
+    else
+    {
+        a = -v.x - 1;
+        b = (v.y >= 0) ? v.y : -v.y - 1;
+    }
+    return sqrt(vmu[a] * vmu[b]);
+}
+
 __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        const double3*   _o_vertexes,
                                        const double3*   _normal,
@@ -1378,14 +1399,16 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        double           eps2,
                                        double*          lastH,
                                        int              global_offset,
-                                       double           coef)
+                                       double           coef,
+                                       const double*    vert_mu_gd)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     double                 eps           = sqrt(eps2);
     unsigned int           gidx          = _last_collisionPair_gd[idx];
-    double                 multiplier_vI = coef * lastH[idx];
+    double                 multiplier_vI =
+        (vert_mu_gd ? vert_mu_gd[gidx] : coef) * lastH[idx];  // [per-body friction]
     __GEIGEN__::Matrix3x3d H_vI;
 
     double3 Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
@@ -1488,6 +1511,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                                     double                  eps2,
                                     double*                 lastH,
                                     double                  coef,
+                                    const double*           vert_mu,
                                     int                     cd_offset4,
                                     int                     cd_offset3,
                                     int                     cd_offset2,
@@ -1499,6 +1523,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
     if(idx >= number)
         return;
     int4    MMCVIDI = _last_collisionPair[idx];
+    const double mu = _pair_mu(MMCVIDI, vert_mu, coef);  // [per-body friction]
     double  eps     = sqrt(eps2);
     double3 relDX3D;
     int global_offset = cd_offset4 * M12_Off + cd_offset3 * M9_Off + cd_offset2 * M6_Off;
@@ -1571,7 +1596,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
 
         __GEIGEN__::Matrix12x12d HessianBlock =
             __GEIGEN__::__s_M12x12_Multiply(__M12x2_M12x2T_Multiply(TM2, T),
-                                            coef * lastH[idx]);
+                                            mu * lastH[idx]);
         int Hidx   = atomicAdd(_cpNum + 4, 1);
         int offset = global_offset + Hidx * M12_Off;
         //Hidx += cd_offset4;
@@ -1649,7 +1674,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
 
             __GEIGEN__::Matrix6x6d HessianBlock =
                 __GEIGEN__::__s_M6x6_Multiply(__M6x2_M6x2T_Multiply(TM2, T),
-                                              coef * lastH[idx]);
+                                              mu * lastH[idx]);
 
             int Hidx   = atomicAdd(_cpNum + 2, 1);
             int offset = global_offset + f_offset4 * M12_Off
@@ -1733,7 +1758,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
 
             __GEIGEN__::Matrix9x9d HessianBlock =
                 __GEIGEN__::__s_M9x9_Multiply(__M9x2_M9x2T_Multiply(TM2, T),
-                                              coef * lastH[idx]);
+                                              mu * lastH[idx]);
             int Hidx   = atomicAdd(_cpNum + 3, 1);
             int offset = global_offset + f_offset4 * M12_Off + Hidx * M9_Off;
             //Hidx += cd_offset3;
@@ -1818,7 +1843,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
 
             __GEIGEN__::Matrix12x12d HessianBlock =
                 __GEIGEN__::__s_M12x12_Multiply(__M12x2_M12x2T_Multiply(TM2, T),
-                                                coef * lastH[idx]);
+                                                mu * lastH[idx]);
             int Hidx   = atomicAdd(_cpNum + 4, 1);
             int offset = global_offset + Hidx * M12_Off;
             //Hidx += cd_offset4;
@@ -5215,7 +5240,8 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
                                         double   dt,
                                         double   eps2,
                                         double*  lastH,
-                                        double   coef)
+                                        double   coef,
+                                        const double* vert_mu_gd)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -5230,7 +5256,7 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
     if(VProjMag2 > eps2)
     {
         double3 gdf =
-            __GEIGEN__::__s_vec_multiply(VProj, coef * lastH[idx] / sqrt(VProjMag2));
+            __GEIGEN__::__s_vec_multiply(VProj, (vert_mu_gd ? vert_mu_gd[gidx] : coef) * lastH[idx] / sqrt(VProjMag2));
         /*_gfxAdd(gidx, 0, gdf.x);
         _gfxAdd(gidx, 1, gdf.y);
         _gfxAdd(gidx, 2, gdf.z);*/
@@ -5238,7 +5264,7 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
     }
     else
     {
-        double3 gdf = __GEIGEN__::__s_vec_multiply(VProj, coef * lastH[idx] / eps);
+        double3 gdf = __GEIGEN__::__s_vec_multiply(VProj, (vert_mu_gd ? vert_mu_gd[gidx] : coef) * lastH[idx] / eps);
         /*_gfxAdd(gidx, 0, gdf.x);
         _gfxAdd(gidx, 1, gdf.y);
         _gfxAdd(gidx, 2, gdf.z);*/
@@ -5256,13 +5282,15 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                                      __GEIGEN__::Matrix3x2d* tanBasis,
                                      double                  eps2,
                                      double*                 lastH,
-                                     double                  coef)
+                                     double                  coef,
+                                     const double*           vert_mu)
 {
     double eps = std::sqrt(eps2);
     int    idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
     int4    MMCVIDI = _last_collisionPair[idx];
+    const double mu = _pair_mu(MMCVIDI, vert_mu, coef);  // [per-body friction]
     double3 relDX3D;
     if(MMCVIDI.x >= 0)
     {
@@ -5291,7 +5319,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
         __GEIGEN__::Vector12 TTTDX;
         Friction::liftRelDXTanToMesh_EE(
             relDX, tanBasis[idx], distCoord[idx].x, distCoord[idx].y, TTTDX);
-        TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * coef);
+        TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * mu);
         {
             _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
             _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
@@ -5335,7 +5363,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
 
             __GEIGEN__::Vector6 TTTDX;
             Friction::liftRelDXTanToMesh_PP(relDX, tanBasis[idx], TTTDX);
-            TTTDX = __GEIGEN__::__s_vec6_multiply(TTTDX, lastH[idx] * coef);
+            TTTDX = __GEIGEN__::__s_vec6_multiply(TTTDX, lastH[idx] * mu);
             {
                 _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
                 _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
@@ -5370,7 +5398,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
             }
             __GEIGEN__::Vector9 TTTDX;
             Friction::liftRelDXTanToMesh_PE(relDX, tanBasis[idx], distCoord[idx].x, TTTDX);
-            TTTDX = __GEIGEN__::__s_vec9_multiply(TTTDX, lastH[idx] * coef);
+            TTTDX = __GEIGEN__::__s_vec9_multiply(TTTDX, lastH[idx] * mu);
             {
                 _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
                 _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
@@ -5412,7 +5440,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
             __GEIGEN__::Vector12 TTTDX;
             Friction::liftRelDXTanToMesh_PT(
                 relDX, tanBasis[idx], distCoord[idx].x, distCoord[idx].y, TTTDX);
-            TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * coef);
+            TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * mu);
 
             _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
             _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
@@ -7036,7 +7064,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
                                                 const double* lastH,
                                                 double        fricDHat,
                                                 double        eps,
-                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0
+                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                                const double* vert_mu = nullptr, double mu_global = 1.0
 
 )
 {
@@ -7050,6 +7079,12 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
 
     double temp = __cal_Friction_energy(
         vertexes, o_vertexes, _collisionPair[idx], dt, distCoord[idx], tanBasis[idx], lastH[idx], fricDHat, eps);
+    // [per-body friction] the host combine multiplies the GLOBAL mu into this
+    // sum (fric = frictionRate * slot); scale each pair's term by mu_pair/mu
+    // here so the product lands on mu_pair exactly — zero changes to the four
+    // combine paths, and the per-env slots below get the same scaling.
+    if(vert_mu)
+        temp *= _pair_mu(_collisionPair[idx], vert_mu, mu_global) / mu_global;
 
     { int v0 = _collisionPair[idx].x; if(v0 < 0) v0 = -v0 - 1;  // [S3] friction pair env
       _penv_energy_accum(penv, p2g, v0, ng, temp); }
@@ -7104,7 +7139,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
                                                    double        dt,
                                                    const double* lastH,
                                                    double        eps,
-                                                   double* penv = nullptr, const int* p2g = nullptr, int ng = 0
+                                                   double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                                   const double* vert_mu_gd = nullptr, double mu_global = 1.0
 
 )
 {
@@ -7118,6 +7154,10 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
 
     double temp = __cal_Friction_gd_energy(
         vertexes, o_vertexes, _normal, _collisionPair_gd[idx], dt, lastH[idx], eps);
+    // [per-body friction] see _getFrictionEnergy_Reduction_3D: host combine
+    // multiplies the GLOBAL gd mu; scale per-vertex here so the product is exact.
+    if(vert_mu_gd)
+        temp *= vert_mu_gd[_collisionPair_gd[idx]] / mu_global;
 
     _penv_energy_accum(penv, p2g, _collisionPair_gd[idx], ng, temp);  // [S3] gd friction env
 
@@ -10941,6 +10981,7 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             fDhat * IPC_dt * IPC_dt,
             lambda_lastH_scalar,
             frictionRate,
+            d_vert_mu,  // [per-body friction]
             h_cpNum[4],
             h_cpNum[3],
             h_cpNum[2],
@@ -10970,7 +11011,7 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
         fDhat * IPC_dt * IPC_dt,
         lambda_lastH_scalar_gd,
         global_offset,
-        gd_frictionRate);
+        gd_frictionRate, d_vert_mu_gd);  // [per-body friction]
 }
 
 void GIPC::computeSelfCloseVal()
@@ -11147,7 +11188,8 @@ void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
                                                       tanBasis,
                                                       fDhat * IPC_dt * IPC_dt,
                                                       lambda_lastH_scalar,
-                                                      frictionRate);
+                                                      frictionRate,
+                                                      d_vert_mu);  // [per-body friction]
     }
     numbers = h_gpNum_last;
     if(numbers < 1)
@@ -11163,7 +11205,7 @@ void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
                                                      IPC_dt,
                                                      fDhat * IPC_dt * IPC_dt,
                                                      lambda_lastH_scalar_gd,
-                                                     gd_frictionRate);
+                                                     gd_frictionRate, d_vert_mu_gd);  // [per-body friction]
 }
 
 
@@ -13022,7 +13064,9 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
                 tanBasis,
                 lambda_lastH_scalar,
                 fDhat * IPC_dt * IPC_dt,
-                sqrt(fDhat) * IPC_dt);
+                sqrt(fDhat) * IPC_dt,
+                nullptr, nullptr, 0,
+                d_vert_mu, frictionRate);  // [per-body friction]
             break;
         case 6:
             _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
@@ -13034,7 +13078,9 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
                 numbers,
                 IPC_dt,
                 lambda_lastH_scalar_gd,
-                sqrt(fDhat) * IPC_dt);
+                sqrt(fDhat) * IPC_dt,
+                nullptr, nullptr, 0,
+                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
             break;
         case 7:
             _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
@@ -13180,14 +13226,16 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
                 queue, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
                 numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
                 fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
-                pe, pe ? p2g : nullptr, ng);
+                pe, pe ? p2g : nullptr, ng,
+                d_vert_mu, frictionRate);  // [per-body friction]
             break;
         case 6:
             _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
                 _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
                 sqrt(fDhat) * IPC_dt,
-                pe, pe ? p2g : nullptr, ng);
+                pe, pe ? p2g : nullptr, ng,
+                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
             break;
         case 7:
             _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(

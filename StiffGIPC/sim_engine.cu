@@ -61,6 +61,11 @@ struct SimEngine::Impl
 
     std::vector<BodyLoadRecord> load_records;
 
+    // [per-body friction] load-record index -> (mu, ground_mu). ground_mu < 0
+    // = keep the global gd_friction_rate. Expanded to per-vertex device tables
+    // at finalize; empty map = feature off (kernels take the scalar path).
+    std::unordered_map<int, std::pair<double, double>> pending_body_mu;
+
     // Per-FEM-body vertex ranges (populated during load)
     struct FEMBodyRange { int vertex_start; int vertex_count; };
     std::vector<FEMBodyRange> fem_body_ranges;
@@ -470,6 +475,18 @@ void SimEngine::set_per_tet_young_for_body(int body_offset,
                body_offset, tet_indices.size(),
                *std::min_element(per_tet_young.begin(), per_tet_young.end()),
                *std::max_element(per_tet_young.begin(), per_tet_young.end()));
+}
+
+void SimEngine::set_body_friction(int body_offset, double mu, double ground_mu)
+{
+    if(body_offset < 0 || body_offset >= (int)m_impl->load_records.size())
+        throw std::runtime_error("set_body_friction: invalid body_offset "
+                                 + std::to_string(body_offset));
+    if(!(mu >= 0.0))
+        throw std::runtime_error("set_body_friction: mu must be >= 0");
+    // Stash only — expanded to per-vertex tables at finalize (vertex layout is
+    // final there). ground_mu < 0 keeps the global gd_friction_rate.
+    m_impl->pending_body_mu[body_offset] = {mu, ground_mu};
 }
 
 void SimEngine::set_soft_body_density(int body_offset, double density)
@@ -1035,6 +1052,40 @@ void SimEngine::Impl::do_upload_to_gpu()
               tetMesh.vertexNum * sizeof(int), cudaMemcpyHostToDevice);
     safe_copy(d_tetMesh.velocities, tetMesh.velocities.data(),
               tetMesh.vertexNum * sizeof(double3), cudaMemcpyHostToDevice);
+
+    // [per-body friction] expand pending per-body mu overrides into per-vertex
+    // device tables. Values are uniform within each body's vertex range, so the
+    // within-body metis sort (see stitch note below) cannot misroute them.
+    // Nothing pending -> tables stay nullptr -> every friction kernel takes its
+    // legacy scalar path (bit-identical to the feature-less build).
+    if(!pending_body_mu.empty())
+    {
+        std::vector<double> h_mu(tetMesh.vertexNum, cfg.friction_rate);
+        std::vector<double> h_mu_gd(tetMesh.vertexNum, cfg.gd_friction_rate);
+        for(const auto& kv : pending_body_mu)
+        {
+            const auto& r     = load_records[kv.first];
+            const int   v_end = std::min(r.vertex_offset + r.vertex_count,
+                                         (int)tetMesh.vertexNum);
+            for(int v = r.vertex_offset; v < v_end; ++v)
+            {
+                h_mu[v] = kv.second.first;
+                if(kv.second.second >= 0.0)
+                    h_mu_gd[v] = kv.second.second;
+            }
+        }
+        CUDA_SAFE_CALL(cudaMalloc((void**)&ipc.d_vert_mu,
+                                  tetMesh.vertexNum * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&ipc.d_vert_mu_gd,
+                                  tetMesh.vertexNum * sizeof(double)));
+        safe_copy(ipc.d_vert_mu, h_mu.data(),
+                  tetMesh.vertexNum * sizeof(double), cudaMemcpyHostToDevice);
+        safe_copy(ipc.d_vert_mu_gd, h_mu_gd.data(),
+                  tetMesh.vertexNum * sizeof(double), cudaMemcpyHostToDevice);
+        if(g_gipc_log_level >= 1)
+            printf("[per-body-friction] %zu bodies overridden (defaults mu=%.3g gd=%.3g)\n",
+                   pending_body_mu.size(), cfg.friction_rate, cfg.gd_friction_rate);
+    }
     // [MAS stitch index fix] When MAS is active (preconditioner_type != 0), FEM
     // bodies are loaded in metis-SORTED order: engine vertex (off+i) holds INPUT
     // vertex (off + sort_index[i]); vertex_metis_to_input[engine] = input.
@@ -3157,6 +3208,144 @@ void SimEngine::get_body_contact_force_batched(const int* h_offsets,
     CUDA_SAFE_CALL(cudaMemcpy(s_d_cnt, h_counts, n_seg * sizeof(int), cudaMemcpyHostToDevice));
     _contact_force_sum_batched_kernel<<<n_seg, 256>>>(s_d_grad, nv, s_d_off, s_d_cnt, s_d_out);
     CUDA_SAFE_CALL(cudaMemcpy(h_out3, s_d_out, n_seg * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+}
+
+int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_ground)
+{
+    // [contact-force distribution] identical contact rebuild as
+    // get_body_contact_force_batched, but returns the UNsummed per-vertex
+    // buffer — the image-style force-distribution feedback.
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    int   nv   = static_cast<int>(g.vertexNum);
+    int   nw   = std::min(n, nv);
+    if(nw <= 0)
+        return 0;
+    memset(out3, 0, (size_t)nw * 3 * sizeof(double));
+    if(g.m_skip_all_collision)
+        return nw;
+
+    g.buildBVH();
+    g.buildCP();
+    if(g.h_cpNum[0] < 1 && !(include_ground && g.h_gpNum > 0))
+        return nw;   // nothing in contact -> all zeros
+
+    static double3* s_d_grad = nullptr;
+    static int      s_cap    = 0;
+    if(nv > s_cap)
+    {
+        if(s_d_grad) cudaFree(s_d_grad);
+        CUDA_SAFE_CALL(cudaMalloc(&s_d_grad, nv * sizeof(double3)));
+        s_cap = nv;
+    }
+    CUDA_SAFE_CALL(cudaMemset(s_d_grad, 0, nv * sizeof(double3)));
+    g.zeroBinnedGrad();
+    g.calBarrierGradient(s_d_grad, g.Kappa);
+    if(include_ground)
+        g.computeGroundGradient(s_d_grad, g.Kappa);
+    g.combineBinnedGrad(s_d_grad);
+    CUDA_SAFE_CALL(cudaMemcpy(out3, s_d_grad, (size_t)nw * 3 * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+    return nw;
+}
+
+// [FEM stress] per-tet Neo-Hookean Cauchy -> von Mises. Plain-double 3x3 math
+// (no __GEIGEN__ device helpers needed). GIPC's stable-NHK per-tet arrays are
+// lengthRate = 4/3 * mu_lame and volumeRate = lambda + 5/6 * mu_lame; recover
+// (mu, lambda) from them so the stress matches the body's actual material.
+__global__ void _fem_tet_von_mises(const double3* verts, const uint4* tets,
+                                   const __GEIGEN__::Matrix3x3d* DmInv,
+                                   const double* lengthRate, const double* volumeRate,
+                                   double* tet_vm, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n)
+        return;
+    const uint4   t  = tets[i];
+    const double3 x0 = verts[t.x], x1 = verts[t.y], x2 = verts[t.z], x3 = verts[t.w];
+    double Ds[3][3] = {{x1.x - x0.x, x2.x - x0.x, x3.x - x0.x},
+                       {x1.y - x0.y, x2.y - x0.y, x3.y - x0.y},
+                       {x1.z - x0.z, x2.z - x0.z, x3.z - x0.z}};
+    const auto& Di = DmInv[i];
+    double F[3][3];
+    for(int r = 0; r < 3; ++r)
+        for(int c = 0; c < 3; ++c)
+            F[r][c] = Ds[r][0] * Di.m[0][c] + Ds[r][1] * Di.m[1][c] + Ds[r][2] * Di.m[2][c];
+    const double J = F[0][0] * (F[1][1] * F[2][2] - F[1][2] * F[2][1])
+                     - F[0][1] * (F[1][0] * F[2][2] - F[1][2] * F[2][0])
+                     + F[0][2] * (F[1][0] * F[2][1] - F[1][1] * F[2][0]);
+    if(!(J > 1e-12)) { tet_vm[i] = 0.0; return; }   // inverted/degenerate: skip
+    const double mu_l  = 0.75 * lengthRate[i];
+    const double lam   = volumeRate[i] - (5.0 / 6.0) * mu_l;
+    // Cauchy sigma = mu/J (F F^T - I) + lambda ln(J)/J I
+    double B[3][3];
+    for(int r = 0; r < 3; ++r)
+        for(int c = 0; c < 3; ++c)
+            B[r][c] = F[r][0] * F[c][0] + F[r][1] * F[c][1] + F[r][2] * F[c][2];
+    const double a = mu_l / J, b = lam * log(J) / J;
+    double s[3][3];
+    for(int r = 0; r < 3; ++r)
+        for(int c = 0; c < 3; ++c)
+            s[r][c] = a * (B[r][c] - (r == c ? 1.0 : 0.0)) + (r == c ? b : 0.0);
+    const double tr3 = (s[0][0] + s[1][1] + s[2][2]) / 3.0;
+    s[0][0] -= tr3; s[1][1] -= tr3; s[2][2] -= tr3;
+    double dd = 0.0;
+    for(int r = 0; r < 3; ++r)
+        for(int c = 0; c < 3; ++c)
+            dd += s[r][c] * s[r][c];
+    tet_vm[i] = sqrt(1.5 * dd);
+}
+
+__device__ inline void _se_atomicMaxPosDouble(double* addr, double val)
+{
+    // positive doubles compare correctly as int64 bit patterns
+    atomicMax((unsigned long long*)addr, __double_as_longlong(val));
+}
+
+__global__ void _fem_scatter_vm_to_verts(const uint4* tets, const double* tet_vm,
+                                         double* vert_vm, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n)
+        return;
+    const uint4  t = tets[i];
+    const double v = tet_vm[i];
+    _se_atomicMaxPosDouble(&vert_vm[t.x], v);
+    _se_atomicMaxPosDouble(&vert_vm[t.y], v);
+    _se_atomicMaxPosDouble(&vert_vm[t.z], v);
+    _se_atomicMaxPosDouble(&vert_vm[t.w], v);
+}
+
+int SimEngine::get_fem_von_mises_stress(double* out, int n)
+{
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    int   nv   = static_cast<int>(g.vertexNum);
+    int   nt   = impl.tetMesh.tetrahedraNum;
+    int   nw   = std::min(n, nv);
+    if(nw <= 0)
+        return 0;
+    memset(out, 0, (size_t)nw * sizeof(double));
+    if(nt <= 0)
+        return nw;
+    static double* s_tet_vm  = nullptr;
+    static double* s_vert_vm = nullptr;
+    static int     s_nt = 0, s_nv = 0;
+    if(nt > s_nt) { if(s_tet_vm) cudaFree(s_tet_vm);
+        CUDA_SAFE_CALL(cudaMalloc(&s_tet_vm, nt * sizeof(double))); s_nt = nt; }
+    if(nv > s_nv) { if(s_vert_vm) cudaFree(s_vert_vm);
+        CUDA_SAFE_CALL(cudaMalloc(&s_vert_vm, nv * sizeof(double))); s_nv = nv; }
+    CUDA_SAFE_CALL(cudaMemset(s_vert_vm, 0, nv * sizeof(double)));
+    const int bs = 256;
+    _fem_tet_von_mises<<<(nt + bs - 1) / bs, bs>>>(
+        impl.d_tetMesh.vertexes, impl.d_tetMesh.tetrahedras,
+        impl.d_tetMesh.DmInverses, impl.d_tetMesh.lengthRate,
+        impl.d_tetMesh.volumeRate, s_tet_vm, nt);
+    _fem_scatter_vm_to_verts<<<(nt + bs - 1) / bs, bs>>>(
+        impl.d_tetMesh.tetrahedras, s_tet_vm, s_vert_vm, nt);
+    CUDA_SAFE_CALL(cudaMemcpy(out, s_vert_vm, (size_t)nw * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+    return nw;
 }
 
 double SimEngine::get_prismatic_current_distance(int idx) const

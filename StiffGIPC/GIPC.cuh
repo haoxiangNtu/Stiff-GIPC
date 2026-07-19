@@ -155,6 +155,14 @@ class GIPC
     uint32_t* _gpNum       = nullptr;
     uint32_t* _close_gpNum = nullptr;
     int*      _gdCollapse  = nullptr;  // [d-floor fail-fast] device flag: ground distance below floor
+    // [per-body friction] per-vertex mu tables (device, size vertexNum), built
+    // at finalize from SimEngine's pending per-body overrides. nullptr = feature
+    // unused -> every friction kernel takes its legacy scalar path
+    // (bit-identical to v0.8.3). Self-contact pairs combine the two sides'
+    // representative-vertex mu geometrically; ground pairs use the vertex's own
+    // ground-mu directly.
+    double*   d_vert_mu    = nullptr;
+    double*   d_vert_mu_gd = nullptr;
     int       m_gdCollapseStreak = 0;  // [d-floor fail-fast] consecutive detections below floor (transient impacts recover; pins persist)
     void      throwIfGroundCollapsePersists();  // [d-floor fail-fast] read flag, throw on persistent collapse
     //uint32_t* _cpNum;

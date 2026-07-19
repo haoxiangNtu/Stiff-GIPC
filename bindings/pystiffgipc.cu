@@ -388,6 +388,27 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("get_assets_dir", &SimEngine::get_assets_dir)
 
+        .def("get_vertex_contact_forces", [](SimEngine& e, bool include_ground) {
+                int n = e.get_vertex_count();
+                auto arr = py::array_t<double>({n, 3});
+                int nw = e.get_vertex_contact_forces(arr.mutable_data(), n, include_ground);
+                (void)nw;
+                return arr;
+            }, py::arg("include_ground") = true,
+            "[contact-force distribution] Per-vertex IPC contact gradient (N,3) "
+            "of the current state (self-contact barrier; + ground barrier when "
+            "include_ground). The unsummed buffer behind "
+            "get_body_contact_force_batched. Rebuilds contacts once; call "
+            "between frames.")
+        .def("get_fem_von_mises_stress", [](SimEngine& e) {
+                int n = e.get_vertex_count();
+                auto arr = py::array_t<double>(n);
+                e.get_fem_von_mises_stress(arr.mutable_data(), n);
+                return arr;
+            },
+            "[FEM stress] Per-vertex von Mises stress (Pa): per-tet Neo-Hookean "
+            "Cauchy -> von Mises -> max over incident tets. Non-tet vertices "
+            "(cloth/ABD) are 0.")
         .def("get_total_newton_iters", &SimEngine::get_total_newton_iters)
         .def("get_total_pcg_iters", &SimEngine::get_total_pcg_iters)
         .def("get_total_collision_pairs", &SimEngine::get_total_collision_pairs)
@@ -537,6 +558,12 @@ PYBIND11_MODULE(pystiffgipc, m)
              "Override one ABD body's density (mass = density * volume). Lets a "
              "scene mix per-body densities. Call AFTER loading the body and "
              "BEFORE finalize().")
+        .def("set_body_friction", &SimEngine::set_body_friction,
+             py::arg("body_offset"), py::arg("mu"), py::arg("ground_mu") = -1.0,
+             "[per-body friction] Override one body's friction coefficient "
+             "(body_offset = index into get_load_records()). Pairs combine "
+             "sqrt(mu_a*mu_b); ground_mu < 0 keeps the global gd_friction_rate. "
+             "Call AFTER loading the body, BEFORE finalize().")
         .def("set_soft_body_density", &SimEngine::set_soft_body_density,
              py::arg("body_offset"), py::arg("density"),
              "[per-body density] Override one SOFT body's density (FEM tets or "
