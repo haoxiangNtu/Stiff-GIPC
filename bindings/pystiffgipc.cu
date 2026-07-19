@@ -537,6 +537,12 @@ PYBIND11_MODULE(pystiffgipc, m)
              "Override one ABD body's density (mass = density * volume). Lets a "
              "scene mix per-body densities. Call AFTER loading the body and "
              "BEFORE finalize().")
+        .def("set_soft_body_density", &SimEngine::set_soft_body_density,
+             py::arg("body_offset"), py::arg("density"),
+             "[per-body density] Override one SOFT body's density (FEM tets or "
+             "cloth shell). body_offset = index into get_load_records(). Call "
+             "AFTER loading the body, BEFORE finalize(). Unset bodies keep the "
+             "global Config.density / cloth_density.")
         .def("set_abd_body_inertia", [](SimEngine& self, int body_id, double mass,
                 py::array_t<double, py::array::c_style | py::array::forcecast> com,
                 py::array_t<double, py::array::c_style | py::array::forcecast> inertia) {

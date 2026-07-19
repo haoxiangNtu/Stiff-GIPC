@@ -636,6 +636,23 @@ bool UrdfSceneImporter::parse_urdf()
             info.collision_origin = urdf_pose_to_matrix(link->collision->origin);
 
             auto geom_type = link->collision->geometry->type;
+            if(geom_type != urdf::Geometry::MESH)
+            {
+                // [B1 warning] Primitive collision geometry (box/sphere/cylinder)
+                // is NOT supported: this importer only loads mesh collision
+                // elements, so the link would silently lose its collision shape.
+                // Say so loudly instead — convert the primitive to a triangle
+                // mesh in the URDF (e.g. *_collmesh.urdf) to keep it.
+                const char* tn = geom_type == urdf::Geometry::BOX      ? "box"
+                                 : geom_type == urdf::Geometry::SPHERE   ? "sphere"
+                                 : geom_type == urdf::Geometry::CYLINDER ? "cylinder"
+                                                                          : "non-mesh";
+                std::cerr << "[UrdfSceneImporter] WARNING: link '" << name
+                          << "' has a " << tn << " collision primitive — only MESH "
+                          << "collision is supported, this link's collision will be "
+                          << "SKIPPED (convert primitives to meshes in the URDF)."
+                          << std::endl;
+            }
             if(geom_type == urdf::Geometry::MESH)
             {
                 auto mesh = std::dynamic_pointer_cast<urdf::Mesh>(link->collision->geometry);

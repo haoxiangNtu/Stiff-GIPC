@@ -244,6 +244,16 @@ class SimEngine
     void set_per_tet_young_for_body(int body_offset,
                                     const std::vector<double>& per_tet_young);
 
+    /// [per-body density] Override one SOFT body's density (FEM tet volume or
+    /// cloth shell). `body_offset` = index into get_load_records(). Applies to
+    /// every tet (all 4 verts inside the body's vertex range) and every
+    /// triangle shell element (all 3 verts inside) owned by that body; the
+    /// mass build at finalize then uses it instead of the global
+    /// Config.density / cloth_density. Must be called AFTER the body is loaded
+    /// and BEFORE finalize(). Throws if the record owns no soft elements
+    /// (e.g. an ABD body — use set_abd_body_density for those).
+    void set_soft_body_density(int body_offset, double density);
+
     /// [FEM-pin] Hard-constraint pin: forces a FEM vertex's world position
     /// to follow an ABD anchor vertex by a fixed offset, EXACTLY (no soft
     /// spring error). Acts like a stitch spring with infinite stiffness —

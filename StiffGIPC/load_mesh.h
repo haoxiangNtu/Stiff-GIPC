@@ -72,6 +72,12 @@ class tetrahedra_obj
     vector<double3>    targetPos;
     vector<double3>    tetra_fiberDir;
     vector<double>     vert_youngth_modules;
+    // [per-body density] per-tet / per-triangle density override, filled by
+    // SimEngine::set_soft_body_density (lazy-resized; <= 0 means "use the
+    // global Config.density / cloth_density"). Host-only: consumed once by
+    // do_initFEM's mass build.
+    vector<double>     tet_densities;
+    vector<double>     tri_densities;
     vector<double>     lengthRate;
     vector<double>     volumeRate;
     std::vector<uint2> tri_edges_adj_points;

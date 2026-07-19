@@ -472,6 +472,54 @@ void SimEngine::set_per_tet_young_for_body(int body_offset,
                *std::max_element(per_tet_young.begin(), per_tet_young.end()));
 }
 
+void SimEngine::set_soft_body_density(int body_offset, double density)
+{
+    auto& tm = m_impl->tetMesh;
+    if(body_offset < 0 || body_offset >= (int)m_impl->load_records.size())
+        throw std::runtime_error("set_soft_body_density: invalid body_offset "
+                                 + std::to_string(body_offset));
+    if(!(density > 0.0))
+        throw std::runtime_error("set_soft_body_density: density must be > 0");
+    const auto& r     = m_impl->load_records[body_offset];
+    int         v_off = r.vertex_offset;
+    int         v_end = v_off + r.vertex_count;
+    // Lazy grow (default <= 0 == "use global"); resize only ever grows, so
+    // earlier per-body assignments survive later loads.
+    if((int)tm.tet_densities.size() < tm.tetrahedraNum)
+        tm.tet_densities.resize(tm.tetrahedraNum, -1.0);
+    if(tm.tri_densities.size() < tm.triangles.size())
+        tm.tri_densities.resize(tm.triangles.size(), -1.0);
+    int n_tet = 0, n_tri = 0;
+    for(int t = 0; t < tm.tetrahedraNum; ++t)
+    {
+        const auto& te = tm.tetrahedras[t];
+        if((int)te.x >= v_off && (int)te.x < v_end && (int)te.y >= v_off
+           && (int)te.y < v_end && (int)te.z >= v_off && (int)te.z < v_end
+           && (int)te.w >= v_off && (int)te.w < v_end)
+        {
+            tm.tet_densities[t] = density;
+            ++n_tet;
+        }
+    }
+    for(size_t t = 0; t < tm.triangles.size(); ++t)
+    {
+        const auto& tr = tm.triangles[t];
+        if((int)tr.x >= v_off && (int)tr.x < v_end && (int)tr.y >= v_off
+           && (int)tr.y < v_end && (int)tr.z >= v_off && (int)tr.z < v_end)
+        {
+            tm.tri_densities[t] = density;
+            ++n_tri;
+        }
+    }
+    if(n_tet + n_tri == 0)
+        throw std::runtime_error(
+            "set_soft_body_density: body " + std::to_string(body_offset)
+            + " owns no tets or shell triangles (ABD body? use set_abd_body_density)");
+    if(g_gipc_log_level >= 1)
+        printf("[per-body-density] body %d: %d tets, %d tris -> rho=%.3g\n",
+               body_offset, n_tet, n_tri, density);
+}
+
 void SimEngine::add_fem_pin_to_abd(int fem_vertex_global_id,
                                    int abd_anchor_vertex_global_id,
                                    int abd_body_id,
@@ -843,12 +891,17 @@ void SimEngine::Impl::do_initFEM()
         __GEIGEN__::__Inverse(DM, DM_inverse);
         double vlm = calculateVolum(tetMesh.vertexes.data(), tetMesh.tetrahedras[i]);
 
-        tetMesh.masses[tetMesh.tetrahedras[i].x] += vlm * ipc.density / 4;
-        tetMesh.masses[tetMesh.tetrahedras[i].y] += vlm * ipc.density / 4;
-        tetMesh.masses[tetMesh.tetrahedras[i].z] += vlm * ipc.density / 4;
-        tetMesh.masses[tetMesh.tetrahedras[i].w] += vlm * ipc.density / 4;
+        // [per-body density] per-tet override (<= 0 / absent = global density)
+        const double tet_rho = (i < (int)tetMesh.tet_densities.size()
+                                && tetMesh.tet_densities[i] > 0.0)
+                                   ? tetMesh.tet_densities[i]
+                                   : ipc.density;
+        tetMesh.masses[tetMesh.tetrahedras[i].x] += vlm * tet_rho / 4;
+        tetMesh.masses[tetMesh.tetrahedras[i].y] += vlm * tet_rho / 4;
+        tetMesh.masses[tetMesh.tetrahedras[i].z] += vlm * tet_rho / 4;
+        tetMesh.masses[tetMesh.tetrahedras[i].w] += vlm * tet_rho / 4;
 
-        massSum += vlm * ipc.density;
+        massSum += vlm * tet_rho;
         volumeSum += vlm;
         tetMesh.DM_inverse.push_back(DM_inverse);
         tetMesh.volum.push_back(vlm);
@@ -870,11 +923,16 @@ void SimEngine::Impl::do_initFEM()
         area *= ipc.clothThickness;
         tetMesh.area.push_back(area);
 
-        tetMesh.masses[tetMesh.triangles[i].x] += ipc.clothDensity * area / 3;
-        tetMesh.masses[tetMesh.triangles[i].y] += ipc.clothDensity * area / 3;
-        tetMesh.masses[tetMesh.triangles[i].z] += ipc.clothDensity * area / 3;
+        // [per-body density] per-triangle override (<= 0 / absent = global cloth_density)
+        const double tri_rho = (i < tetMesh.tri_densities.size()
+                                && tetMesh.tri_densities[i] > 0.0)
+                                   ? tetMesh.tri_densities[i]
+                                   : ipc.clothDensity;
+        tetMesh.masses[tetMesh.triangles[i].x] += tri_rho * area / 3;
+        tetMesh.masses[tetMesh.triangles[i].y] += tri_rho * area / 3;
+        tetMesh.masses[tetMesh.triangles[i].z] += tri_rho * area / 3;
 
-        massSum += area * ipc.clothDensity;
+        massSum += area * tri_rho;
         volumeSum += area;
         tetMesh.tri_DM_inverse.push_back(DM_inverse);
     }

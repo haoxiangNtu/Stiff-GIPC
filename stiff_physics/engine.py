@@ -254,6 +254,12 @@ class Config:
         young_modulus: float = 1e7,
         poisson_rate: float = 0.49,
         friction_rate: float = 0.4,
+        # Ground friction coefficient. None (default) = follow friction_rate —
+        # the historic behavior. Pass a value to decouple ground friction from
+        # object-object friction (the A2 "gd_friction_rate wrapper bug" fix:
+        # previously this could only be set by poking cfg._cfg after
+        # construction).
+        gd_friction_rate: float | None = None,
         newton_tol: float = 1e-2,
         # [uipc-style, opt-in] physical Newton exit: max step displacement <=
         # newton_velocity_tol * dt (m/s; uipc default 0.05). 0 = legacy
@@ -287,19 +293,32 @@ class Config:
         ground_offset: float = -1.0,
         velocity_damping: float = 0.0,
         multienv_mode: str = "merged",
+        # Initial DCD pair-buffer capacity multiplier. Overflow self-heals (the
+        # engine grows the buffers 1.5x and redoes detection), so this only
+        # tunes how often the grow-redo cost is paid at startup vs memory used.
+        collision_detection_buff_scale: float = 6.0,
+        # [per-env exit] Productized switch for the per-env decoupled Newton
+        # exit: each env converges by its OWN criterion and is frozen/masked
+        # out (resources released) instead of being coupled to the batch.
+        # Resolves to STIFF_DECOUPLE_THRESH + STIFF_PERENV_ALPHA +
+        # STIFF_PERENV_MASK at Engine() time (explicit env vars still win).
+        # Only meaningful for multi-env scenes.
+        per_env_exit: bool = False,
         **kwargs,
     ):
         # Multi-env execution tier: "merged" (baseline) / "isolated" (per-env decoupled,
         # not bit-identical) / "strict" (bit-identical + batch-invariant). Resolved to
         # STIFF_* flags by Engine(). STIFF_MULTIENV_MODE env var overrides this.
         self.multienv_mode = multienv_mode
+        self.per_env_exit = per_env_exit
         self._cfg = _C.Config()
         self._cfg.dt = dt
         self._cfg.density = density
         self._cfg.young_modulus = young_modulus
         self._cfg.poisson_rate = poisson_rate
         self._cfg.friction_rate = friction_rate
-        self._cfg.gd_friction_rate = friction_rate
+        self._cfg.gd_friction_rate = (friction_rate if gd_friction_rate is None
+                                      else gd_friction_rate)
         self._cfg.newton_tol = newton_tol
         if hasattr(self._cfg, "newton_velocity_tol"):
             self._cfg.newton_velocity_tol = newton_velocity_tol
@@ -324,7 +343,7 @@ class Config:
         self._cfg.skip_all_collision = skip_all_collision
         self._cfg.preconditioner_type = preconditioner_type
         self._cfg.cuda_device = cuda_device
-        self._cfg.collision_detection_buff_scale = 6.0
+        self._cfg.collision_detection_buff_scale = collision_detection_buff_scale
         self._cfg.velocity_damping = velocity_damping
         if not assets_dir and _INSTALLED_MODE and _PACKAGE_DATA_DIR.is_dir():
             self._cfg.assets_dir = str(_PACKAGE_DATA_DIR) + "/"
@@ -366,6 +385,12 @@ class Engine:
         # Resolve the multi-env mode → STIFF_* flags BEFORE any load/finalize/step, so the
         # gated engine paths (finalize meanMass, per-frame κ/BVH/PCG) see them. Env vars win.
         self.multienv_mode = resolve_multienv_mode(getattr(self._config, "multienv_mode", "merged"))
+        if getattr(self._config, "per_env_exit", False):
+            # [per-env exit] productized switch — see Config docstring. setdefault
+            # so explicitly-set env vars (incl. "0" overrides) still win.
+            os.environ.setdefault("STIFF_DECOUPLE_THRESH", "1")
+            os.environ.setdefault("STIFF_PERENV_ALPHA", "1")
+            os.environ.setdefault("STIFF_PERENV_MASK", "1")
         self._engine.set_config(self._config.native)
         self._engine.init_cuda()
         self._finalized = False
@@ -420,6 +445,7 @@ class Engine:
         transform: Optional[np.ndarray] = None,
         young_modulus: float = 1e7,
         boundary_type: str | int = "Free",
+        density: float | None = None,
     ) -> None:
         """Load a raw mesh (.msh for 3D tet, .obj for 2D cloth/shell).
 
@@ -430,6 +456,9 @@ class Engine:
             transform: 4x4 transformation matrix (identity if None).
             young_modulus: Young's modulus for this body.
             boundary_type: "Free" (0) or "Fixed" (1).
+            density: Per-body density override (kg/m^3 for 3D FEM, surface
+                density for cloth). None = global Config.density /
+                cloth_density. FEM/cloth bodies only.
         """
         if transform is None:
             transform = np.eye(4)
@@ -445,6 +474,10 @@ class Engine:
                 resolved = candidate
 
         self._engine.load_mesh(resolved, dimensions, bt, transform, young_modulus, bb)
+        if density is not None:
+            # The body just loaded is the last load record.
+            self._engine.set_soft_body_density(
+                len(self._engine.get_all_load_records()) - 1, float(density))
 
     def load_mesh_from_data(
         self,
@@ -997,6 +1030,16 @@ class Engine:
         path uses :meth:`get_contacts_device`. Call AFTER :meth:`step`.
         """
         return self._engine.get_contacts()
+
+    def set_soft_body_density(self, body_offset: int, density: float) -> None:
+        """Override one SOFT body's density (FEM tets or cloth shell).
+
+        ``body_offset`` indexes :meth:`get_load_records`. Call after loading
+        the body and before :meth:`finalize`. Unset bodies keep the global
+        ``Config.density`` / ``cloth_density`` — this is what makes a
+        light-towel + heavy-soft-plate scene possible.
+        """
+        self._engine.set_soft_body_density(int(body_offset), float(density))
 
     def set_abd_body_density(self, body_id: int, density: float) -> None:
         """Override one ABD body's density (mass = density × volume).
