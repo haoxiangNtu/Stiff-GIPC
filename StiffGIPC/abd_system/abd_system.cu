@@ -21,6 +21,8 @@
 // binning (the M root). g_massbin is a reused scratch (one quantity at a time, sequential).
 __device__ double* g_massbin = nullptr;
 
+extern int g_gipc_log_level;  // defined in GIPC.cu; gates the [abd-mass] audit print
+
 namespace gipc
 {
 // combine binned scratch into a strided scalar target: out[e] = combine(bin[(e*stride+off)]).
@@ -890,6 +892,69 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
             center = ov.com;
             double trI = ov.inertia.trace();
             m_xx_centered = (0.5 * trI) * Eigen::Matrix3d::Identity() - ov.inertia;
+        }
+
+        // [mass-audit] the kick hunt needs ground truth on what mass each
+        // surface-mesh ABD body ACTUALLY gets (density override hit or miss,
+        // divergence-theorem integral sane or garbage).
+        if(g_gipc_log_level >= 1)
+        printf("[abd-mass] body %d: m=%.6g kg (density=%.3g, override=%s) "
+               "com=(%.3f,%.3f,%.3f) trMxx=%.3g\n",
+               smb.body_id, out_m, body_density,
+               (d_it2 != m_body_density_override.end()) ? "yes" : "no",
+               center.x(), center.y(), center.z(), m_xx_centered.trace());
+
+        // [inertia-sanity / kick root cause] The centered second moment is
+        // integral rho (x-c)(x-c)^T dV — mathematically PSD. A non-closed or
+        // inconsistently-wound surface (e.g. quads truncated to one triangle
+        // at load) makes the divergence-theorem cubic integral come out
+        // INDEFINITE — a NEGATIVE rotational kinetic curvature that turns the
+        // Newton/line-search into a flip-seeking energy pump: the exact
+        // mechanism behind the 12-16 m/s "resting toy kick" (fd scene,
+        // Toy00.obj: 44 dropped quad-triangles -> trMxx=-0.0159 -> kicks;
+        // libuipc immune only because its loaders triangulate correctly).
+        // Enforce physicality: project to PSD (eigenvalue clamp) and warn
+        // loudly — mass problems must never be silent (problem-record B1
+        // lesson). Also guard m<=0 (fully inverted winding).
+        if(!(out_m > 0.0))
+        {
+            fprintf(stderr,
+                    "[ABD][ERROR] surface-mesh body %d integrated NON-POSITIVE "
+                    "mass %.6g — surface not closed / winding inverted. "
+                    "Fix the mesh or its triangulation.\n",
+                    smb.body_id, out_m);
+            throw std::runtime_error("[StiffGIPC] ABD surface-mesh body has "
+                                     "non-positive integrated mass (open or "
+                                     "mis-wound surface)");
+        }
+        {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(m_xx_centered);
+            const double lmin = es.eigenvalues().minCoeff();
+            if(lmin < 0.0)
+            {
+                fprintf(stderr,
+                        "[ABD][WARN] surface-mesh body %d has an INDEFINITE "
+                        "centered second moment (min eig %.3g, tr %.3g) — the "
+                        "surface is not closed/consistently wound (dropped "
+                        "quads?). Clamping to PSD; rotational inertia will be "
+                        "approximate. FIX THE MESH.\n",
+                        smb.body_id, lmin, m_xx_centered.trace());
+                Eigen::Vector3d ev = es.eigenvalues().cwiseMax(0.0);
+                m_xx_centered = es.eigenvectors() * ev.asDiagonal()
+                                * es.eigenvectors().transpose();
+                // fully degenerate (all modes clamped ~0): fall back to a
+                // point-cloud second moment so the body still has SOME inertia
+                if(ev.maxCoeff() <= 0.0)
+                {
+                    Eigen::Matrix3d pc = Eigen::Matrix3d::Zero();
+                    for(const auto& v : smb.vertices)
+                    {
+                        Eigen::Vector3d d = v - center;
+                        pc += (out_m / (double)smb.vertices.size()) * d * d.transpose();
+                    }
+                    m_xx_centered = pc;
+                }
+            }
         }
 
         // Build ABDJacobiDyadicMass in body-centered frame
