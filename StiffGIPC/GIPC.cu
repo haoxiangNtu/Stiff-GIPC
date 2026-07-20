@@ -14197,6 +14197,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // [per-env productization] reset per-env telemetry for this solve
     m_env_frozen_iter.assign(kEnvAlphaSlots, -1);
     m_env_status.assign(kEnvAlphaSlots, 0);
+    // [semi-implicit per-env] beta_g for the decoupled/host path: each env
+    // accumulates its OWN line-search progress (candidate alpha_g from S1)
+    // and exits by freezing ITSELF — the per-env analogue of Alg.1 that the
+    // global beta cannot provide without re-coupling the batch.
+    std::vector<double> semi_beta_env(kEnvAlphaSlots, 1.0);
     // [drive-substep] uipc-style animation substepping for joint driving: with
     // STIFF_DRIVE_SUBSTEP=S (>1), the per-frame driving target ramps linearly
     // over the first S Newton iterations (ratio=(k+1)/S) instead of dumping the
@@ -14743,6 +14748,20 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                    g, env_newton_iter_cap, (int)k);
                         }
                     }
+                    else if(semi_implicit_enabled && (int)k >= semi_implicit_min_iter)
+                    {   // [semi-implicit per-env] beta_g *= (1 - alpha_g);
+                        // freeze only THIS env when its beta drops below tol.
+                        semi_beta_env[g] *= std::max(0.0, 1.0 - h_env_alpha[g]);
+                        if(semi_beta_env[g] <= semi_implicit_beta_tol)
+                        {
+                            h_env_alpha[g] = 0.0;
+                            if(m_env_status[g] == 0)
+                            {
+                                m_env_status[g]      = 1;   // converged (semi-implicit accept)
+                                m_env_frozen_iter[g] = (int)k;
+                            }
+                        }
+                    }
                 }
                 if(h_env_alpha[g] == 0.0) ++n_frozen;   // [decouple] per-env converged (frozen)
                 if(h_env_alpha[g] == 0.0 && m_env_frozen_iter[g] < 0)
@@ -14860,9 +14879,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             static bool noted = false;
             if(!noted)
             {
-                printf("  [semi-implicit] NOTE: per-env decoupled exit active -> the "
-                       "GLOBAL semi-implicit early exit is disabled (per-env frozen "
-                       "check governs termination).\n");
+                printf("  [semi-implicit] NOTE: per-env decoupled exit active -> "
+                       "beta runs PER-ENV (each env freezes at its own beta<=tol); "
+                       "the global early exit is disabled.\n");
                 noted = true;
             }
         }

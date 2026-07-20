@@ -21,11 +21,12 @@ from stiff_physics.engine import Engine, Config
 ASSETS = os.path.join(ROOT, "Assets") + "/"
 
 
-def run(env_cap):
+def run(env_cap, semi=False):
     cfg = Config(dt=0.01, density=1e3, young_modulus=1e5, poisson_rate=0.49,
                  friction_rate=0.4, relative_dhat=1e-3, ground_offset=0.0,
                  assets_dir=ASSETS, per_env_exit=True,
-                 env_newton_iter_cap=env_cap)
+                 env_newton_iter_cap=env_cap,
+                 semi_implicit_enabled=semi, semi_implicit_beta_tol=1e-2)
     eng = Engine(cfg)
     t0 = np.eye(4); t0[0, 3] = -0.6; t0[1, 3] = -0.09
     t1 = np.eye(4); t1[0, 3] = +0.6; t1[1, 3] = -0.09
@@ -60,6 +61,13 @@ if not np.isfinite(V).all():
     print("FAIL: B diverged after timeout freeze"); ok = False
 if not (status == 2).any():
     print("FAIL: B no env reported timeout (2) despite cap=1"); ok = False
+
+V, iters, status = run(env_cap=0, semi=True)
+print(f"C semi   : per-env iters={iters.tolist()} status={status.tolist()}")
+if not np.isfinite(V).all():
+    print("FAIL: C diverged"); ok = False
+if not (status == 1).all():
+    print("FAIL: C envs did not converge under per-env semi-implicit"); ok = False
 
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

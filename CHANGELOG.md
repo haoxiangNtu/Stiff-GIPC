@@ -4,7 +4,27 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — branch fix/p0-stability
+## [0.8.4] — in preparation (branch fix/p0-stability; official release pending
+review + the strict-determinism release gates per the release handbook)
+
+### Added (this session, second wave)
+- **Passive joints**: `add_revolute_joint(..., passive=True)` /
+  `add_prismatic_joint(..., passive=True)` — free hinge/slider (no position
+  servo). Previously EVERY joint was position-locked at its initial angle.
+- **Revolute joint limits actually work**: the limit energy/gradient/Hessian
+  existed as dead code (zero call sites) AND the bounds were never copied to
+  the GPU (stayed +-1e30). Wired + copied; a limited passive hinge now stops
+  at its bound with zero overshoot (test_passive_revolute B).
+- **semi-implicit per-env beta** (decoupled path): each env accumulates its
+  own beta_g and freezes itself at beta_g <= tol — replaces the earlier
+  "disable global exit under decoupling" stopgap.
+
+### Known limitations (documented, deliberately deferred)
+- D7 lagged friction anchors: per-Newton-iteration anchor updates would need
+  the close-set/kappa pipeline rebuilt inside the Newton loop; deferred.
+  dt = 0.01 (TRO parity) remains the official mitigation.
+- The kick trust-region (v08 WIP) is now defense-in-depth only: the root
+  cause was non-physical inertia from broken meshes (see Fixed).
 
 ### Fixed (stability, P0)
 - **semi-implicit exit scoping**: the global `beta *= 1-alpha` early exit is
