@@ -367,18 +367,24 @@ class SimEngine
                         const Eigen::Vector3d& world_normal,
                         const Eigen::Vector3d& world_bitangent);
 
+    /// [passive joints] passive=true creates a PURE hinge/slider: the position
+    /// servo (strength_ratio) is zeroed so the joint swings/slides freely under
+    /// physics; URDF limits still act (independent joint_limit penalty).
+    /// passive=false (default) keeps the historic position-servo behavior.
     int add_revolute_joint(int parent_body, int child_body,
                            const Eigen::Vector3d& world_axis,
                            const Eigen::Vector3d& joint_pos,
                            double lower_limit, double upper_limit,
                            double initial_angle = 0.0,
-                           const std::string& name = "");
+                           const std::string& name = "",
+                           bool passive = false);
 
     int add_prismatic_joint(int parent_body, int child_body,
                             const Eigen::Vector3d& world_center,
                             const Eigen::Vector3d& world_axis,
                             double lower_limit, double upper_limit,
-                            const std::string& name = "");
+                            const std::string& name = "",
+                            bool passive = false);
 
     // Per-vertex boundary type (0=Free, 1=Fixed). Must call before finalize().
     void set_vertex_boundary(int vertex_index, int boundary_type);

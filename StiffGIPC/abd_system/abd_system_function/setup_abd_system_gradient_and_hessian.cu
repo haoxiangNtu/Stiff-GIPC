@@ -1264,6 +1264,14 @@ void ABDSystem::init_revolute_driving(
         drv.initial_angle_offset   = static_cast<Float>(ctrl.initial_angle_offset);
         drv.target_angle           = static_cast<Float>(ctrl.target_angle - ctrl.initial_angle_offset);
         drv.ext_torque             = static_cast<Float>(ctrl.ext_torque);  // [force-control]
+        // [joint limit FIX] the ctrl's URDF/API limits were NEVER copied into
+        // the GPU driving data — drv.lower/upper stayed at their +-1e30 "none"
+        // defaults, so the limit penalty could never fire (a limited passive
+        // hinge swung straight through its bounds; regression
+        // test_passive_revolute case B). Same relative frame as target_angle:
+        // shift by initial_angle_offset.
+        drv.lower_limit = static_cast<Float>(ctrl.lower_limit - ctrl.initial_angle_offset);
+        drv.upper_limit = static_cast<Float>(ctrl.upper_limit - ctrl.initial_angle_offset);
     }
 
     m_revolute_driving_data.resize(m_num_revolute_driving);
@@ -1440,6 +1448,12 @@ Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data)
                {
                    auto& drv = drvs(i);
                    energies(i) = revolute_driving_energy(drv, qs(drv.parent_body_id),
+                                                              qs(drv.child_body_id))
+                                 // [joint limit FIX] the one-sided limit energy
+                                 // was implemented but NEVER wired in — add it
+                                 // so limits act (incl. passive joints, whose
+                                 // driving term is zero).
+                                 + revolute_limit_energy(drv, qs(drv.parent_body_id),
                                                               qs(drv.child_body_id));
                });
 
@@ -1492,6 +1506,18 @@ void ABDSystem::_cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_d
 
                    Matrix12x12 H_11, H_22, H_12;
                    revolute_driving_hessian(drv, q1, q2, H_11, H_22, H_12);
+
+                   // [joint limit FIX] wire the (previously dead) one-sided
+                   // limit gradient + SPD Gauss-Newton Hessian into the same
+                   // scatter. Zero when within [lower, upper].
+                   {
+                       Vector12    lg1, lg2;
+                       Matrix12x12 lH11, lH22, lH12;
+                       revolute_limit_gradient_hessian(drv, q1, q2, lg1, lg2,
+                                                       lH11, lH22, lH12);
+                       grad1 += lg1; grad2 += lg2;
+                       H_11 += lH11; H_22 += lH22; H_12 += lH12;
+                   }
 
                    if(!p_fixed)
                    {

@@ -329,33 +329,36 @@ PYBIND11_MODULE(pystiffgipc, m)
                                       py::array_t<double> pos,
                                       double lower, double upper,
                                       double init_angle,
-                                      const std::string& name) {
+                                      const std::string& name,
+                                      bool passive) {
             auto ax = axis.unchecked<1>();
             auto p  = pos.unchecked<1>();
             return self.add_revolute_joint(parent, child,
                 Eigen::Vector3d(ax(0), ax(1), ax(2)),
                 Eigen::Vector3d(p(0), p(1), p(2)),
-                lower, upper, init_angle, name);
+                lower, upper, init_angle, name, passive);
         }, py::arg("parent_body"), py::arg("child_body"),
            py::arg("world_axis"), py::arg("joint_pos"),
            py::arg("lower_limit"), py::arg("upper_limit"),
-           py::arg("initial_angle") = 0.0, py::arg("name") = "")
+           py::arg("initial_angle") = 0.0, py::arg("name") = "",
+           py::arg("passive") = false)
 
         .def("add_prismatic_joint", [](SimEngine& self, int parent, int child,
                                        py::array_t<double> center,
                                        py::array_t<double> axis,
                                        double lower, double upper,
-                                       const std::string& name) {
+                                       const std::string& name,
+                                       bool passive) {
             auto c  = center.unchecked<1>();
             auto ax = axis.unchecked<1>();
             return self.add_prismatic_joint(parent, child,
                 Eigen::Vector3d(c(0), c(1), c(2)),
                 Eigen::Vector3d(ax(0), ax(1), ax(2)),
-                lower, upper, name);
+                lower, upper, name, passive);
         }, py::arg("parent_body"), py::arg("child_body"),
            py::arg("world_center"), py::arg("world_axis"),
            py::arg("lower_limit"), py::arg("upper_limit"),
-           py::arg("name") = "")
+           py::arg("name") = "", py::arg("passive") = false)
 
         .def("set_vertex_boundary", &SimEngine::set_vertex_boundary,
              py::arg("vertex_index"), py::arg("boundary_type"))

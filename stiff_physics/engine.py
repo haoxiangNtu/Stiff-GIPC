@@ -758,26 +758,35 @@ class Engine:
                            world_axis, joint_pos,
                            lower_limit: float, upper_limit: float,
                            initial_angle: float = 0.0,
-                           name: str = "") -> int:
-        """Create a revolute joint between two ABD bodies. Must call before finalize()."""
+                           name: str = "",
+                           passive: bool = False) -> int:
+        """Create a revolute joint between two ABD bodies. Must call before finalize().
+
+        passive=True -> a FREE hinge (no position servo; limits still enforced)
+        for articulated objects like doors/scissors. Default False keeps the
+        historic hold-at-initial-angle behavior.
+        """
         import numpy as np
         ax = np.asarray(world_axis, dtype=np.float64).ravel()
         p = np.asarray(joint_pos, dtype=np.float64).ravel()
         return self._engine.add_revolute_joint(parent_body, child_body,
                                                ax, p, lower_limit, upper_limit,
-                                               initial_angle, name)
+                                               initial_angle, name, passive)
 
     def add_prismatic_joint(self, parent_body: int, child_body: int,
                             world_center, world_axis,
                             lower_limit: float, upper_limit: float,
-                            name: str = "") -> int:
-        """Create a prismatic joint between two ABD bodies. Must call before finalize()."""
+                            name: str = "",
+                            passive: bool = False) -> int:
+        """Create a prismatic joint between two ABD bodies. Must call before finalize().
+
+        passive=True -> a free slider (no position servo; limits still act)."""
         import numpy as np
         c = np.asarray(world_center, dtype=np.float64).ravel()
         ax = np.asarray(world_axis, dtype=np.float64).ravel()
         return self._engine.add_prismatic_joint(parent_body, child_body,
                                                 c, ax, lower_limit, upper_limit,
-                                                name)
+                                                name, passive)
 
     def set_vertex_boundary(self, vertex_index: int, boundary_type: int) -> None:
         """Set per-vertex boundary type (0=Free, 1=Fixed). Must call before finalize()."""

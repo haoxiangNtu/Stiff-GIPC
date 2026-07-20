@@ -695,7 +695,8 @@ int SimEngine::add_revolute_joint(int parent_body, int child_body,
                                   const Eigen::Vector3d& joint_pos,
                                   double lower_limit, double upper_limit,
                                   double initial_angle,
-                                  const std::string& name)
+                                  const std::string& name,
+                                  bool passive)
 {
     Eigen::Vector3d axis = world_axis.normalized();
     Eigen::Vector3d half = axis * 0.5;
@@ -725,6 +726,12 @@ int SimEngine::add_revolute_joint(int parent_body, int child_body,
     ctrl.lower_limit      = std::max(lower_limit, -JointAngleControlInfo::kSafeAngleLimit);
     ctrl.upper_limit      = std::min(upper_limit,  JointAngleControlInfo::kSafeAngleLimit);
     ctrl.joint_name       = name;
+    // [passive joints] a passive hinge has NO position servo: K = sr *
+    // strength_ratio * mass == 0. The axis/anchor constraint and the
+    // independent joint-limit penalty still act. Without this every manual
+    // revolute was silently position-locked at initial_angle (a "passive"
+    // pendulum stayed frozen horizontal — regression test_passive_revolute).
+    ctrl.strength_ratio = passive ? 0.0 : 1.0;
     m_impl->tetMesh.joint_angle_controls.push_back(ctrl);
 
     int idx = static_cast<int>(m_impl->tetMesh.joint_constraints.size());
@@ -736,7 +743,8 @@ int SimEngine::add_prismatic_joint(int parent_body, int child_body,
                                    const Eigen::Vector3d& world_center,
                                    const Eigen::Vector3d& world_axis,
                                    double lower_limit, double upper_limit,
-                                   const std::string& name)
+                                   const std::string& name,
+                                   bool passive)
 {
     Eigen::Vector3d axis = world_axis.normalized();
 
@@ -764,6 +772,8 @@ int SimEngine::add_prismatic_joint(int parent_body, int child_body,
     pctrl.lower_limit     = lower_limit;
     pctrl.upper_limit     = upper_limit;
     pctrl.joint_name      = name;
+    // [passive joints] see add_revolute_joint: zero the position servo.
+    pctrl.strength_ratio = passive ? 0.0 : 1.0;
 
     m_impl->tetMesh.prismatic_constraints.push_back(pj);
     m_impl->tetMesh.prismatic_drive_controls.push_back(pctrl);
