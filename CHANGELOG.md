@@ -82,10 +82,13 @@ Stability, contact-solver consistency, and public API hardening release.
 ### Validation
 - The ModelScope plate replay completed all 228 frames in every mode with no
   CCD guard, line-search warning, NaN, or 1000-iteration frame. Peak Newton
-  iterations were 16 (merged), 24 (isolated), and 10 (strict); all three used
+  iterations were 10 (merged), 21 (isolated), and 21 (strict); all three used
   zero tolerance-assisted energy accepts.
 - Two independent strict replays matched bit-for-bit for every sampled body
   transform and exactly for every per-frame Newton/PCG iteration count.
+- Fresh cp311/cp312 wheel installs passed the strict-ground and reversed-winding
+  regressions; all 92 tracked public examples passed syntax and startup smoke
+  checks, and the headless joint-control example completed all 100 frames.
 - Passive-limit, reversed joint-order, density, friction, force/stress,
   per-environment telemetry, ABD-preconditioner, and d-floor regressions pass.
 
