@@ -81,19 +81,37 @@ Stability, contact-solver consistency, and public API hardening release.
 - URDF import now warns about unsupported primitive collision geometry instead
   of silently skipping it.
 
-### Validation
-- The ModelScope plate replay completed all 228 frames in every mode with no
-  CCD guard, line-search warning, NaN, or 1000-iteration frame. Peak Newton
-  iterations were 14 (merged), 12 (isolated), and 11 (strict); all three used
-  zero tolerance-assisted energy accepts.
-- Two independent strict replays matched bit-for-bit for every sampled body
-  transform and exactly for every per-frame Newton/PCG iteration count.
-- Fresh cp311/cp312 wheel installs passed the strict-ground and reversed-winding
-  regressions; all 92 tracked public examples passed syntax and startup smoke
-  checks, and the headless joint-control example completed all 100 frames.
-- Passive-limit, reversed joint-order, density, friction, force/stress,
-  per-environment telemetry, ABD-preconditioner, and ground-domain regressions
-  pass.
+### Fixed (post-candidate, final release)
+- **One-sided revolute limits: lagged active-set.** The limit term re-tested
+  theta every Newton iteration, so at an active bound the active set CHATTERED
+  (inactive-side Hessian has no limit curvature -> huge free-fall direction ->
+  line search cuts alpha to ~1e-7 -> next iterate lands active and is pushed
+  back out). Every frame after first bound contact ran to the 1000-iteration
+  cap (~19 s/frame). The activation flag is now frozen once per frame from the
+  previous converged angle and released by the multiplier-sign test (a
+  one-sided limit may push, never pull). Limited hinge: cap-outs -> 1
+  iteration/frame, momentum overshoot then exact settle at the bound. Known
+  trade-offs: bound contact engages one frame late (overshoot ~ v*dt) and an
+  engaged frame is two-sided until release.
+
+### Validation (final build: alpha-exit removal + lagged limits included)
+- ModelScope plate teleop replay (228 frames, the only teleop-format
+  trajectory) completed in every mode with no CCD guard, line-search warning,
+  NaN, or cap-out. Peak Newton iterations: 25 (merged), 36 (isolated),
+  45 (strict); slowest frame 1.34 s (strict). Merged peak is run-to-run
+  variable by design (atomic reductions); strict is reproducible.
+- ModelScope plate collect task (config_plate_new): grasp completed at frame
+  82 in all three modes; peak Newton 3-4, physical frames < 0.1 s.
+- ModelScope beaker task (config_beaker_soft_new): completed 93 frames in
+  1.1 s worst-frame, peak Newton 11 — the historical 13-19 s/frame stall
+  (frames 80-92) is gone. The pre-July-18 config_beaker_soft no longer loads
+  under the current env stack (robot joint renames), unrelated to the engine.
+- Passive-limit (free + limited), reversed joint-order, density, friction,
+  force/stress, kick/ABD-preconditioner, per-environment telemetry, and
+  ground-domain regressions pass on the final build.
+- Historical solver baseline for the same plate replay: 0.8.2 peaked at 621
+  Newton iterations (16.7 s single frame) at the grasp; the final build peaks
+  at 76 or lower depending on mode.
 
 ### Known limitations
 - Merged, isolated, and strict modes share physical parameters and acceptance

@@ -280,6 +280,13 @@ def main():
                 print(f"[fs-hl] frame {fr:4d} step={ms[-1]:6.0f}ms cloth_y/env={['%+.3f'%z for z in cz]}", flush=True)
         mm = float(np.mean(ms))
         print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({1000.0/mm:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
+        # [release gate] final-state vertex dump for the strict bitwise trio
+        # (cross-env / batch-invariance / run-to-run). Engine-local vertices are
+        # co-located across envs in strict layout, so slices compare bitwise.
+        dump = os.environ.get("CASE39ME_DUMP_VERTS")
+        if dump:
+            np.save(dump, np.asarray(eng.get_vertices()))
+            print(f"[fs-hl] verts dumped -> {dump}", flush=True)
         return
 
     import polyscope as ps, polyscope.imgui as psim
