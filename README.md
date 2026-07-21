@@ -11,14 +11,20 @@ The `stiff-physics` package provides a self-contained pre-compiled engine. No C+
 | OS | Linux x86_64 (Ubuntu 20.04+) |
 | GPU | NVIDIA RTX 4090 (sm_89) or RTX 5090 (sm_120) |
 | Driver | NVIDIA driver with CUDA 12.x support |
-| Python | 3.11 |
+| Python | 3.11 or 3.12 |
 
 ## Installation
 
 ### 1. Install the engine (from GitHub Release)
 
+Choose the wheel matching your Python ABI:
+
 ```bash
-pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.1.1/stiff_physics-0.1.1-cp311-cp311-linux_x86_64.whl
+# Python 3.11
+pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.8.4/stiff_physics-0.8.4-cp311-cp311-linux_x86_64.whl
+
+# Python 3.12
+pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.8.4/stiff_physics-0.8.4-cp312-cp312-linux_x86_64.whl
 ```
 
 ### 2. Install visualization dependencies

@@ -4,7 +4,7 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
-## [0.8.4] — 2026-07-21
+## [0.8.4] — 2026-07-22
 
 Stability, contact-solver consistency, and public API hardening release.
 
