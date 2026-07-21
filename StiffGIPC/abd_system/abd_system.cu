@@ -846,6 +846,12 @@ void ABDSystem::_fix_surface_mesh_mass_centers()
                                           parms.mass_density, m, m_x, m_xx,
                                           orient_ptr);
 
+        gipc::normalize_trimesh_dyadic_mass_orientation(m, m_x, m_xx);
+        if(!(m > 0.0) || !std::isfinite(m) || !m_x.allFinite()
+           || !m_xx.allFinite())
+            throw std::runtime_error(
+                "[StiffGIPC] ABD surface mesh has zero or non-finite mass moments");
+
         Eigen::Vector3d center = m_x / m;
         // Inertial override: the ABD body frame origin is the COM, which drives
         // the revolute torque arm. Use the authored COM when provided.
@@ -889,6 +895,26 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
                                           out_m, out_m_x, out_m_xx,
                                           orient_ptr);
 
+        const bool reversed_winding =
+            gipc::normalize_trimesh_dyadic_mass_orientation(
+                out_m, out_m_x, out_m_xx);
+        if(!(out_m > 0.0) || !std::isfinite(out_m) || !out_m_x.allFinite()
+           || !out_m_xx.allFinite())
+        {
+            fprintf(stderr,
+                    "[ABD][ERROR] surface-mesh body %d has zero or non-finite "
+                    "integrated mass moments. Fix the mesh closure and "
+                    "triangulation.\n",
+                    smb.body_id);
+            throw std::runtime_error(
+                "[StiffGIPC] ABD surface-mesh body has invalid integrated mass moments");
+        }
+        if(reversed_winding && g_gipc_log_level >= 1)
+            fprintf(stderr,
+                    "[ABD][WARN] surface-mesh body %d has globally reversed "
+                    "winding; signed mass moments were normalized.\n",
+                    smb.body_id);
+
         Eigen::Vector3d center = out_m_x / out_m;
 
         // Centered second moment: m_xx_bar = m_xx - (1/m) * m_x * m_x^T
@@ -930,17 +956,15 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
         // libuipc immune only because its loaders triangulate correctly).
         // Enforce physicality: project to PSD (eigenvalue clamp) and warn
         // loudly — mass problems must never be silent (problem-record B1
-        // lesson). Also guard m<=0 (fully inverted winding).
-        if(!(out_m > 0.0))
+        // lesson). Globally reversed winding is normalized above; a bad
+        // override must still fail before matrix inversion.
+        if(!(out_m > 0.0) || !std::isfinite(out_m))
         {
             fprintf(stderr,
-                    "[ABD][ERROR] surface-mesh body %d integrated NON-POSITIVE "
-                    "mass %.6g — surface not closed / winding inverted. "
-                    "Fix the mesh or its triangulation.\n",
+                    "[ABD][ERROR] surface-mesh body %d has invalid mass %.6g.\n",
                     smb.body_id, out_m);
-            throw std::runtime_error("[StiffGIPC] ABD surface-mesh body has "
-                                     "non-positive integrated mass (open or "
-                                     "mis-wound surface)");
+            throw std::runtime_error(
+                "[StiffGIPC] ABD surface-mesh body has invalid mass");
         }
         {
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(m_xx_centered);

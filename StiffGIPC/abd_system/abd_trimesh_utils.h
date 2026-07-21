@@ -211,4 +211,21 @@ inline Vector12 compute_trimesh_body_force(
     return body_force;
 }
 
+/// Normalize the signed mass moments of a consistently inward-wound closed
+/// surface. Reversing every triangle flips all divergence-theorem integrals,
+/// but does not change the represented physical body.
+inline bool normalize_trimesh_dyadic_mass_orientation(
+    double&          mass,
+    Eigen::Vector3d& mass_first_moment,
+    Eigen::Matrix3d& mass_second_moment)
+{
+    if(mass >= 0.0)
+        return false;
+
+    mass               = -mass;
+    mass_first_moment  = -mass_first_moment;
+    mass_second_moment = -mass_second_moment;
+    return true;
+}
+
 }  // namespace gipc

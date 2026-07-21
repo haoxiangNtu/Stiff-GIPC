@@ -62,7 +62,9 @@ Stability, contact-solver consistency, and public API hardening release.
   get/teleport round trip.
 - ABD preconditioner accumulation, ground-contact Hessian PSD projection,
   surface-mesh inertia validation, semi-implicit exit scoping, and persistent
-  sub-1e-9 m ground-distance fail-fast handling were hardened.
+  sub-1e-9 m ground-distance fail-fast handling were hardened. Closed surface
+  meshes with globally reversed winding now normalize all signed mass moments
+  together instead of being rejected as negative mass.
 - URDF import now warns about unsupported primitive collision geometry instead
   of silently skipping it.
 
