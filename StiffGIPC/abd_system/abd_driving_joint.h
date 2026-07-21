@@ -81,6 +81,19 @@ struct RevoluteDrivingGPUData
     Float   lower_limit     = -Float(1e30);  // relative-frame lower bound (rad); huge = none
     Float   upper_limit     =  Float(1e30);  // relative-frame upper bound (rad)
     Float   limit_stiffness =  Float(0);     // K_lim = limit_strength_ratio*(m_p+m_c); 0 = off
+    // [limit lagged active-set] Frozen ONCE PER FRAME by
+    // update_revolute_driving_targets from theta_prev: -1 = lower bound active,
+    // +1 = upper, 0 = free. The energy/gradient/Hessian use this frozen flag
+    // instead of re-testing theta every Newton iteration. Rationale: the
+    // per-iteration test made the limit term appear/disappear between iterates;
+    // on the inactive side the Hessian carries NO limit curvature, so the Newton
+    // direction is a huge free-fall step, line search cuts alpha to ~1e-7, the
+    // next iterate lands active, gets pushed back out, and the active set
+    // chatters until newton_iter_cap (measured: limited hinge hit the 1000 cap
+    // from the first bound contact, single frames ~19 s). With the set frozen
+    // the in-frame energy is a fixed smooth quadratic -> Newton converges in a
+    // few iterations. Release rule = multiplier sign (see the update kernel).
+    int     limit_active    = 0;
 };
 
 
@@ -298,11 +311,14 @@ MUDA_GENERIC inline Float revolute_limit_energy(
     const RevoluteDrivingGPUData& drv, const Vector12& q1, const Vector12& q2)
 {
     if(drv.limit_stiffness <= Float(0)) return Float(0);
-    Float theta = revolute_current_relative_angle(drv, q1, q2);
-    Float bound;
-    if(theta < drv.lower_limit)      bound = drv.lower_limit;
-    else if(theta > drv.upper_limit) bound = drv.upper_limit;
-    else return Float(0);
+    // [limit lagged active-set] use the per-FRAME frozen flag, not a
+    // per-iteration theta test (that chattered; see limit_active in the struct).
+    // While active the spring is TWO-SIDED toward the bound for this frame —
+    // equivalent to treating the inequality as an equality constraint for one
+    // frame; the update kernel releases it when the multiplier sign says the
+    // spring is pulling instead of pushing.
+    if(drv.limit_active == 0) return Float(0);
+    Float bound = (drv.limit_active < 0) ? drv.lower_limit : drv.upper_limit;
     RevoluteDrivingGPUData d = drv;
     d.target_angle = bound;
     d.stiffness    = drv.limit_stiffness;
@@ -317,11 +333,10 @@ MUDA_GENERIC inline void revolute_limit_gradient_hessian(
 {
     g1.setZero(); g2.setZero(); H11.setZero(); H22.setZero(); H12.setZero();
     if(drv.limit_stiffness <= Float(0)) return;
-    Float theta = revolute_current_relative_angle(drv, q1, q2);
-    Float bound;
-    if(theta < drv.lower_limit)      bound = drv.lower_limit;
-    else if(theta > drv.upper_limit) bound = drv.upper_limit;
-    else return;
+    // [limit lagged active-set] frozen flag; must MATCH revolute_limit_energy
+    // exactly or line search sees an energy inconsistent with the gradient.
+    if(drv.limit_active == 0) return;
+    Float bound = (drv.limit_active < 0) ? drv.lower_limit : drv.upper_limit;
     RevoluteDrivingGPUData d = drv;
     d.target_angle = bound;
     d.stiffness    = drv.limit_stiffness;

@@ -1443,6 +1443,34 @@ void ABDSystem::update_revolute_driving_targets(
                    Float mass_sum = masses(pid) + masses(cid);
                    drv.stiffness = sr * ctrls(i).strength_ratio * mass_sum;
                    drv.ext_torque = ctrls(i).ext_torque;  // [force-control] live sync
+
+                   // [limit lagged active-set] once-per-frame state machine on
+                   // theta_prev (last frame's CONVERGED angle):
+                   //   engage  : theta actually crossed a bound;
+                   //   release : the converged angle sits back INSIDE the bound
+                   //             — with a two-sided frame spring that can only
+                   //             happen when the spring ended up PULLING the
+                   //             joint toward the bound (multiplier sign test:
+                   //             a one-sided limit must never pull). A pressed
+                   //             joint converges slightly OUTSIDE the bound
+                   //             (depth ~ torque/K_lim), so it stays engaged
+                   //             with no flip-flop.
+                   if(drv.limit_stiffness > Float(0))
+                   {
+                       if(drv.limit_active == 0)
+                       {
+                           if(theta_prev < drv.lower_limit)      drv.limit_active = -1;
+                           else if(theta_prev > drv.upper_limit) drv.limit_active = +1;
+                       }
+                       else if(drv.limit_active < 0)
+                       {
+                           if(theta_prev > drv.lower_limit) drv.limit_active = 0;
+                       }
+                       else
+                       {
+                           if(theta_prev < drv.upper_limit) drv.limit_active = 0;
+                       }
+                   }
                });
 }
 
