@@ -145,6 +145,43 @@ __device__ inline void write_triplet_cv2(Eigen::Matrix3d* triplet_value,
 }
 
 
+__device__ inline void write_cross_body_triplet_cv2(
+    Eigen::Matrix3d* triplet_value,
+    int*             row_ids,
+    int*             col_ids,
+    int              body_i,
+    int              body_j,
+    const Matrix12x12& input,
+    const int&        offset)
+{
+    int          output_body_i = body_i;
+    int          output_body_j = body_j;
+    Matrix12x12  output         = input;
+
+    if(body_i == body_j)
+    {
+        Matrix12x12 input_transpose = input.transpose();
+        output += input_transpose;
+    }
+    else if(body_i > body_j)
+    {
+        output_body_i = body_j;
+        output_body_j = body_i;
+        output         = input.transpose();
+    }
+
+    unsigned int output_base_i = static_cast<unsigned int>(output_body_i * 4);
+    unsigned int output_base_j = static_cast<unsigned int>(output_body_j * 4);
+    unsigned int index_row[4] = {
+        output_base_i, output_base_i + 1, output_base_i + 2, output_base_i + 3};
+    unsigned int index_col[4] = {
+        output_base_j, output_base_j + 1, output_base_j + 2, output_base_j + 3};
+
+    write_triplet_cv2<12, 12>(
+        triplet_value, row_ids, col_ids, index_row, index_col, output, offset);
+}
+
+
 template <typename T>
 __global__ inline void moveMemory_0(T* data, int output_start, int input_start, int length)
 {
@@ -177,13 +214,24 @@ __global__ void write_barrier_hessian(//muda::TripletMatrixViewer<double, 12> tr
     auto body_id_i = body_id[i];
     auto body_id_j = body_id[j];
 
+    int output_body_i = body_id_i;
+    int output_body_j = body_id_j;
+    int offset = vI * 16 + start_output;
 
-    int          offset       = vI * 16 + start_output;
+    if(output_body_i > output_body_j)
+    {
+        int temp = output_body_i;
+        output_body_i = output_body_j;
+        output_body_j = temp;
+    }
+
+    unsigned int output_base_i = static_cast<unsigned int>(output_body_i * 4);
+    unsigned int output_base_j = static_cast<unsigned int>(output_body_j * 4);
     unsigned int index_row[4] = {
-        body_id_i * 4, body_id_i * 4 + 1, body_id_i * 4 + 2, body_id_i * 4 + 3};
+        output_base_i, output_base_i + 1, output_base_i + 2, output_base_i + 3};
 
     unsigned int index_col[4] = {
-        body_id_j * 4, body_id_j * 4 + 1, body_id_j * 4 + 2, body_id_j * 4 + 3};
+        output_base_j, output_base_j + 1, output_base_j + 2, output_base_j + 3};
 
     if(is_fixed[body_id_i] == BodyBoundaryType::Fixed
        || is_fixed[body_id_j] == BodyBoundaryType::Fixed)
@@ -194,6 +242,18 @@ __global__ void write_barrier_hessian(//muda::TripletMatrixViewer<double, 12> tr
     else
     {
         auto ABD_H = ABDJacobi::JT_H_J(abd_J[i].T(), H, abd_J[j]);
+        Matrix12x12 ABD_H_transpose = ABD_H.transpose();
+        if(body_id_i == body_id_j)
+        {
+            if(i == j)
+                ABD_H = (ABD_H + ABD_H_transpose) * 0.5;
+            else
+                ABD_H += ABD_H_transpose;
+        }
+        else if(body_id_i > body_id_j)
+        {
+            ABD_H = ABD_H_transpose;
+        }
         write_triplet_cv2<12, 12>(triplet, rows, cols, index_row, index_col, ABD_H, offset);
     }
 
@@ -217,6 +277,13 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
                                                   GIPCTripletMatrix& global_triplets,
                                                   muda::CBufferView<double3> vertex_barrier_gradient)
 {
+    setup_abd_non_contact_gradient(sim_data);
+    add_abd_contact_gradient(sim_data, vertex_barrier_gradient);
+    _setup_abd_system_hessian(sim_data, global_triplets);
+}
+
+void ABDSystem::setup_abd_non_contact_gradient(ABDSimData& sim_data)
+{
     _cal_abd_body_gradient_and_hessian(sim_data);
     _abd_binned_open(sim_data);   // [4.3] zero binned accumulators + bind globals (after per-body init)
     _cal_abd_joint_gradient_and_hessian(sim_data);
@@ -224,9 +291,15 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
     _cal_abd_prismatic_gradient_and_hessian(sim_data);
     _cal_abd_prismatic_driving_gradient_and_hessian(sim_data);
     _cal_abd_stitch_gradient_and_hessian(sim_data);
-    _cal_abd_system_barrier_gradient(sim_data, vertex_barrier_gradient);
     _abd_binned_close(sim_data);  // [4.3] combine binned coupling gradient/Hessian into ABD buffers
-    _setup_abd_system_hessian(sim_data, global_triplets);
+}
+
+void ABDSystem::add_abd_contact_gradient(
+    ABDSimData& sim_data, muda::CBufferView<double3> vertex_contact_gradient)
+{
+    _abd_binned_open(sim_data);
+    _cal_abd_system_barrier_gradient(sim_data, vertex_contact_gradient);
+    _abd_binned_close(sim_data);
 }
 
 void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
@@ -743,22 +816,9 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
                        auto H_pc = cross_hessian(j);
 
-                       unsigned int index_row[4] = {
-                           (unsigned int)(pid * 4),
-                           (unsigned int)(pid * 4 + 1),
-                           (unsigned int)(pid * 4 + 2),
-                           (unsigned int)(pid * 4 + 3)};
-
-                       unsigned int index_col[4] = {
-                           (unsigned int)(cid * 4),
-                           (unsigned int)(cid * 4 + 1),
-                           (unsigned int)(cid * 4 + 2),
-                           (unsigned int)(cid * 4 + 3)};
-
                        int offset = joint_output_start + j * 16;
-                       write_triplet_cv2<12, 12>(
-                           triplet_out, row_out, col_out,
-                           index_row, index_col, H_pc, offset);
+                       write_cross_body_triplet_cv2(
+                           triplet_out, row_out, col_out, pid, cid, H_pc, offset);
                    });
     }
 
@@ -787,22 +847,9 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
                        auto H_pc = cross_hessian(j);
 
-                       unsigned int index_row[4] = {
-                           (unsigned int)(pid * 4),
-                           (unsigned int)(pid * 4 + 1),
-                           (unsigned int)(pid * 4 + 2),
-                           (unsigned int)(pid * 4 + 3)};
-
-                       unsigned int index_col[4] = {
-                           (unsigned int)(cid * 4),
-                           (unsigned int)(cid * 4 + 1),
-                           (unsigned int)(cid * 4 + 2),
-                           (unsigned int)(cid * 4 + 3)};
-
                        int offset = drv_output_start + j * 16;
-                       write_triplet_cv2<12, 12>(
-                           triplet_out, row_out, col_out,
-                           index_row, index_col, H_pc, offset);
+                       write_cross_body_triplet_cv2(
+                           triplet_out, row_out, col_out, pid, cid, H_pc, offset);
                    });
     }
 
@@ -832,22 +879,9 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
                        auto H_pc = cross_hessian(j);
 
-                       unsigned int index_row[4] = {
-                           (unsigned int)(pid * 4),
-                           (unsigned int)(pid * 4 + 1),
-                           (unsigned int)(pid * 4 + 2),
-                           (unsigned int)(pid * 4 + 3)};
-
-                       unsigned int index_col[4] = {
-                           (unsigned int)(cid * 4),
-                           (unsigned int)(cid * 4 + 1),
-                           (unsigned int)(cid * 4 + 2),
-                           (unsigned int)(cid * 4 + 3)};
-
                        int offset = pris_output_start + j * 16;
-                       write_triplet_cv2<12, 12>(
-                           triplet_out, row_out, col_out,
-                           index_row, index_col, H_pc, offset);
+                       write_cross_body_triplet_cv2(
+                           triplet_out, row_out, col_out, pid, cid, H_pc, offset);
                    });
     }
 
@@ -878,22 +912,9 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
                        auto H_pc = cross_hessian(j);
 
-                       unsigned int index_row[4] = {
-                           (unsigned int)(pid * 4),
-                           (unsigned int)(pid * 4 + 1),
-                           (unsigned int)(pid * 4 + 2),
-                           (unsigned int)(pid * 4 + 3)};
-
-                       unsigned int index_col[4] = {
-                           (unsigned int)(cid * 4),
-                           (unsigned int)(cid * 4 + 1),
-                           (unsigned int)(cid * 4 + 2),
-                           (unsigned int)(cid * 4 + 3)};
-
                        int offset = pris_drv_output_start + j * 16;
-                       write_triplet_cv2<12, 12>(
-                           triplet_out, row_out, col_out,
-                           index_row, index_col, H_pc, offset);
+                       write_cross_body_triplet_cv2(
+                           triplet_out, row_out, col_out, pid, cid, H_pc, offset);
                    });
     }
 
@@ -2086,7 +2107,7 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
                            }
                    });
         int count = sim_data.abd_fem_count_info().abd_body_num;
-                ParallelFor(256)
+        ParallelFor(256)
             .kernel_name(__FUNCTION__)
             .apply(count,
                    [P = abd_system_diag_preconditioner.viewer().name("P")] __device__(int i) mutable

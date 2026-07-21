@@ -682,7 +682,9 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
 
     // [multi-env P3] segmented block-diagonal PCG when enabled + env map present. Each env is a
     // mathematically independent solve (per-env α/β/convergence) → cross-env bit-identical for
-    // identical envs. Gated by STIFF_SEGMENTED_PCG; falls back to the scalar PCG otherwise.
+    // identical envs. ng is the ACTIVE group count, not the fixed slot capacity. ng=1 still uses
+    // segmented kernels so changing batch count never silently changes the numerical algorithm.
+    // Falls back to scalar PCG only when segmentation is disabled or no groups were declared.
     const int* d2g = nullptr;
     int        ng  = 0;
     if(getenv("STIFF_SEGMENTED_PCG") && system_ptr())
@@ -690,7 +692,7 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
         d2g = system_ptr()->m_s4_dof_to_group;
         ng  = system_ptr()->m_s4_ng;
     }
-    auto iter = (d2g && ng > 1)
+    auto iter = (d2g && ng > 0)
                     ? seg_pcg(x, b, m_config.max_iter_ratio * b.size(), d2g, ng)
                     : pcg(x, b, m_config.max_iter_ratio * b.size());
 

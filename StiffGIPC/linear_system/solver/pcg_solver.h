@@ -56,9 +56,10 @@ class PCGSolver : public IterativeSolver
     // in the solve is the GLOBAL dot products (one scalar α/β/convergence over all envs). Per-env
     // dots (binned → exact, order-independent ⇒ per-env deterministic AND cross-env symmetric)
     // + per-env α/β/convergence make each env a mathematically INDEPENDENT solve → cross-env
-    // bit-identical for identical envs. Gated (STIFF_SEGMENTED_PCG + dof_to_group present); the
-    // scalar path is otherwise unchanged (single-env bit-identical).
-    int        m_seg_ng       = 0;          // #envs (groups); 0 ⇒ segmented off
+    // bit-identical for identical envs. Gated (STIFF_SEGMENTED_PCG + dof_to_group present).
+    // A single active group deliberately stays on this path: batch count must not change the
+    // numerical algorithm, and ng=1 launches only one real slot rather than the slot capacity.
+    int        m_seg_ng       = 0;          // allocated active-group capacity; 0 ⇒ unallocated
     Float*     d_rz_g         = nullptr;    // [ng] per-env r·z
     Float*     d_rz0_g        = nullptr;    // [ng] per-env initial r·z
     Float*     d_rzn_g        = nullptr;    // [ng] per-env new r·z

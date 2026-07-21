@@ -29,7 +29,7 @@ def run(ground_mu_override):
                  assets_dir=ASSETS)
     eng = Engine(cfg)
     # cube.msh spans y=[0.10, 0.50]; shift so the base sits ~5 mm above ground
-    tf = np.eye(4); tf[1, 3] = -0.115
+    tf = np.eye(4); tf[1, 3] = -0.095
     eng.load_mesh("tetMesh/cube.msh", dimensions=3, body_type="FEM", transform=tf)
     if ground_mu_override is not None:
         eng.set_body_friction(0, 0.4, ground_mu=ground_mu_override)

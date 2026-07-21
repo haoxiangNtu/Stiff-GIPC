@@ -47,6 +47,9 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readwrite("semi_implicit_min_iter",           &SimEngineConfig::semi_implicit_min_iter)
         .def_readwrite("newton_iter_cap",                  &SimEngineConfig::newton_iter_cap)
         .def_readwrite("env_newton_iter_cap",              &SimEngineConfig::env_newton_iter_cap)
+        .def_readwrite("line_search_max_iter",             &SimEngineConfig::line_search_max_iter)
+        .def_readwrite("energy_abs_tol",                   &SimEngineConfig::energy_abs_tol)
+        .def_readwrite("energy_rel_tol",                   &SimEngineConfig::energy_rel_tol)
         .def_readwrite("skip_all_collision",               &SimEngineConfig::skip_all_collision)
         .def_readwrite("velocity_damping",                 &SimEngineConfig::velocity_damping)
         .def_readwrite("gravity",                          &SimEngineConfig::gravity)
@@ -208,7 +211,9 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("add_collision_exclusion", &SimEngine::add_collision_exclusion,
              py::arg("body_a"), py::arg("body_b"))
         .def("set_body_groups", &SimEngine::set_body_groups,
-             py::arg("groups"))
+             py::arg("groups"),
+             "One dense [0,N) group id per collision body (N<=256). "
+             "Wildcard -1 is merged-only; isolated/strict require all bodies grouped.")
         .def("set_vertex_env_ids", &SimEngine::set_vertex_env_ids,
              py::arg("env_ids"))
         .def("set_env_offsets", &SimEngine::set_env_offsets,
@@ -424,6 +429,10 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_total_collision_pairs", &SimEngine::get_total_collision_pairs)
         .def("get_max_collision_pairs", &SimEngine::get_max_collision_pairs)
         .def("get_total_frames_done", &SimEngine::get_total_frames_done)
+        .def("get_total_energy_tolerance_accepts",
+             &SimEngine::get_total_energy_tolerance_accepts,
+             "Number of final line-search decisions accepted only by the optional "
+             "energy tolerance since engine creation/reset.")
 
 
         // Vertex positions as numpy array (N, 3) float64
@@ -568,6 +577,10 @@ PYBIND11_MODULE(pystiffgipc, m)
              "Override one ABD body's density (mass = density * volume). Lets a "
              "scene mix per-body densities. Call AFTER loading the body and "
              "BEFORE finalize().")
+        .def("set_abd_body_mass", &SimEngine::set_abd_body_mass,
+             py::arg("body_id"), py::arg("mass"),
+             "Override one surface-mesh ABD body's total mass in kilograms. "
+             "Call AFTER loading the body and BEFORE finalize().")
         .def("set_body_friction", &SimEngine::set_body_friction,
              py::arg("body_offset"), py::arg("mu"), py::arg("ground_mu") = -1.0,
              "[per-body friction] Override one body's friction coefficient "

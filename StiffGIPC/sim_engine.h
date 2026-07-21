@@ -73,6 +73,16 @@ struct SimEngineConfig
     // active at this iter is force-frozen with status TIMEOUT (others continue
     // unaffected). 0 = off. Host per-env path only.
     int    env_newton_iter_cap    = 0;
+    // [T1] line-search backtracking budget before the engine reports a
+    // non-descent step. 8 was the old hard-coded value (bad steps accepted
+    // silently); 64 matches libuipc.
+    int    line_search_max_iter   = 64;
+    // Optional shared energy-comparison tolerance for merged and per-env line
+    // search. Defaults to exact non-increase, matching libuipc's IPC path:
+    // E1 <= E0. Nonzero values explicitly allow
+    // E1 <= E0 + abs_tol + rel_tol*|E0| (plus Armijo when enabled).
+    double energy_abs_tol         = 0.0;
+    double energy_rel_tol         = 0.0;
     int    newton_iter_cap        = 1000;
 
     bool   skip_all_collision = false;
@@ -207,6 +217,9 @@ class SimEngine
     void add_ground(double height = 0.0);
 
     void add_collision_exclusion(int body_a, int body_b);
+    /// Declare one group id per collision body. Non-negative ids must be dense
+    /// [0,N), N<=256. Wildcard -1 is supported only by merged-mode execution;
+    /// isolated/strict require every body to be grouped. Validated at finalize().
     void set_body_groups(const std::vector<int>& groups);
     // [multi-env subscene] Per-VERTEX env id (length = engine vertex count). The
     // broad-phase skips contact pairs whose two vertices carry different (>=0) env
@@ -360,7 +373,8 @@ class SimEngine
     std::vector<int>    get_abd_surface_body_triangles(int body_id) const;
 
     // ---- Programmatic joint creation (must call before finalize()) ----
-    // Returns the constraint index.
+    // Parent/child IDs may be in either numeric order. Invalid or identical IDs
+    // throw std::invalid_argument. Returns the constraint index.
 
     int add_fixed_joint(int parent_body, int child_body,
                         const Eigen::Vector3d& world_anchor,
@@ -458,6 +472,10 @@ class SimEngine
     /// Override one ABD body's density (mass = density * volume). Call after
     /// loading the body and before finalize().
     void set_abd_body_density(int body_id, double density);
+
+    /// Override one surface-mesh ABD body's total mass in kilograms. Call after
+    /// loading the body and before finalize().
+    void set_abd_body_mass(int body_id, double mass);
 
     /// Override one ABD body's inertial props (mass, COM[3], inertia[9] row-major
     /// 3x3 about COM, all in the load/world frame). Call after loading the body
@@ -611,6 +629,7 @@ class SimEngine
     double get_total_collision_pairs() const;
     double get_max_collision_pairs() const;
     int    get_total_frames_done() const;
+    uint64_t get_total_energy_tolerance_accepts() const;
 
 
   private:

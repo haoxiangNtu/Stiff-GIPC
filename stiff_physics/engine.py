@@ -183,10 +183,10 @@ class BodyView:
 #                    BVH, per-env κ (absolute dHat), per-env line-search + segmented
 #                    per-env PCG. Each env is a physically-correct independent sim.
 #                    Does NOT guarantee bit-identical / batch-invariant results.
-#   "strict"   (C) — isolated + full determinism machinery (canonical contact
-#                    ordering + deterministic SpMV; pair with co-located local-frame
-#                    layout). env_0 is BIT-IDENTICAL across mate content, env COUNT,
-#                    and run-to-run. Slowest.
+#   "strict"   (C) — isolated + deterministic kernels/canonical contact ordering.
+#                    Guarantees repeatability for a fixed scene and batch layout.
+#                    Cross-batch-size identity remains a validation target, not a
+#                    public contract. Slowest.
 # The mode resolves to the low-level STIFF_* flags below (which stay available as
 # per-feature debug overrides). An explicitly-set STIFF_* env var always wins
 # (setdefault). STIFF_MULTIENV_MODE overrides the Config field.
@@ -280,6 +280,11 @@ class Config:
         semi_implicit_beta_tol: float = 1e-3,
         semi_implicit_min_iter: int = 1,
         newton_iter_cap: int = 1000,
+        # Optional shared merged/per-env energy acceptance band. Defaults to
+        # strict non-increase (E1 <= E0); set nonzero values explicitly to use
+        # E1 <= E0 + energy_abs_tol + energy_rel_tol*abs(E0).
+        energy_abs_tol: float = 0.0,
+        energy_rel_tol: float = 0.0,
         skip_all_collision: bool = False,
         preconditioner_type: int = 1,
         cuda_device: int = 0,
@@ -307,7 +312,7 @@ class Config:
         **kwargs,
     ):
         # Multi-env execution tier: "merged" (baseline) / "isolated" (per-env decoupled,
-        # not bit-identical) / "strict" (bit-identical + batch-invariant). Resolved to
+        # not bit-identical) / "strict" (fixed-layout repeatable). Resolved to
         # STIFF_* flags by Engine(). STIFF_MULTIENV_MODE env var overrides this.
         self.multienv_mode = multienv_mode
         self.per_env_exit = per_env_exit
@@ -340,6 +345,10 @@ class Config:
         self._cfg.semi_implicit_beta_tol = semi_implicit_beta_tol
         self._cfg.semi_implicit_min_iter = semi_implicit_min_iter
         self._cfg.newton_iter_cap = newton_iter_cap
+        if energy_abs_tol < 0.0 or energy_rel_tol < 0.0:
+            raise ValueError("energy tolerances must be non-negative")
+        self._cfg.energy_abs_tol = energy_abs_tol
+        self._cfg.energy_rel_tol = energy_rel_tol
         self._cfg.skip_all_collision = skip_all_collision
         self._cfg.preconditioner_type = preconditioner_type
         self._cfg.cuda_device = cuda_device
@@ -566,8 +575,10 @@ class Engine:
 
         Bodies in different groups (both >= 0) never collide — folded into the
         collision-skip matrix at finalize(), so spatially-tiled environments are
-        guaranteed isolated regardless of spacing. group < 0 = wildcard (collides
-        with everything). Call before finalize().
+        guaranteed isolated regardless of spacing. Non-negative ids must be dense
+        ``0..N-1`` and N must not exceed 256. ``-1`` is a merged-mode wildcard;
+        isolated/strict require every collision body to belong to a group. Invalid
+        declarations fail at finalize() instead of silently degrading physics.
         """
         self._engine.set_body_groups([int(g) for g in groups])
 
@@ -747,7 +758,11 @@ class Engine:
 
     def add_fixed_joint(self, parent_body: int, child_body: int,
                         world_anchor, world_normal, world_bitangent) -> int:
-        """Create a fixed joint between two ABD bodies. Must call before finalize()."""
+        """Create a fixed joint between two ABD bodies. Must call before finalize().
+
+        Parent/child IDs may be in either numeric order; the engine canonicalizes
+        Hessian storage internally. Invalid or identical body IDs raise an error.
+        """
         import numpy as np
         a = np.asarray(world_anchor, dtype=np.float64).ravel()
         n = np.asarray(world_normal, dtype=np.float64).ravel()
@@ -761,6 +776,9 @@ class Engine:
                            name: str = "",
                            passive: bool = False) -> int:
         """Create a revolute joint between two ABD bodies. Must call before finalize().
+
+        Parent/child IDs may be in either numeric order; the engine canonicalizes
+        Hessian storage internally. Invalid or identical body IDs raise an error.
 
         passive=True -> a FREE hinge (no position servo; limits still enforced)
         for articulated objects like doors/scissors. Default False keeps the
@@ -779,6 +797,9 @@ class Engine:
                             name: str = "",
                             passive: bool = False) -> int:
         """Create a prismatic joint between two ABD bodies. Must call before finalize().
+
+        Parent/child IDs may be in either numeric order; the engine canonicalizes
+        Hessian storage internally. Invalid or identical body IDs raise an error.
 
         passive=True -> a free slider (no position servo; limits still act)."""
         import numpy as np
@@ -1072,6 +1093,10 @@ class Engine:
         2 timeout (env_newton_iter_cap), 3 diverged (NaN quarantined)."""
         return np.asarray(self._engine.get_per_env_status())
 
+    def get_total_energy_tolerance_accepts(self) -> int:
+        """Return the cumulative count of tolerance-assisted energy accepts."""
+        return int(self._engine.get_total_energy_tolerance_accepts())
+
     def set_body_friction(self, body_offset: int, mu: float,
                           ground_mu: float | None = None) -> None:
         """Override one body's friction coefficient (per-body friction).
@@ -1105,6 +1130,14 @@ class Engine:
         body is loaded and BEFORE :meth:`finalize`.
         """
         self._engine.set_abd_body_density(int(body_id), float(density))
+
+    def set_abd_body_mass(self, body_id: int, mass: float) -> None:
+        """Override one surface-mesh ABD body's total mass in kilograms.
+
+        This API is intentionally distinct from :meth:`set_abd_body_density`.
+        Call it after loading the body and before :meth:`finalize`.
+        """
+        self._engine.set_abd_body_mass(int(body_id), float(mass))
 
     def set_abd_body_inertia(self, body_id: int, mass: float,
                              com, inertia) -> None:

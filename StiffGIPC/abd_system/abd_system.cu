@@ -815,7 +815,10 @@ void ABDSystem::_fix_surface_mesh_vertex_masses(muda::DeviceBuffer<Float>& uniqu
         auto   d_it   = m_body_density_override.find(smb.body_id);
         double body_density = (d_it != m_body_density_override.end()) ? d_it->second
                                                                       : parms.mass_density;
-        double total_mass = std::abs(volume) * body_density;
+        auto   m_it = m_body_mass_override.find(smb.body_id);
+        double total_mass = (m_it != m_body_mass_override.end())
+                                ? m_it->second
+                                : std::abs(volume) * body_density;
         double mass_per_vertex = total_mass / static_cast<double>(smb.point_count);
 
         std::vector<Float> h_masses(smb.point_count, static_cast<Float>(mass_per_vertex));
@@ -870,6 +873,17 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
         auto   d_it2 = m_body_density_override.find(smb.body_id);
         double body_density = (d_it2 != m_body_density_override.end()) ? d_it2->second
                                                                        : parms.mass_density;
+        const double volume = gipc::compute_trimesh_volume(
+            smb.vertices, smb.triangles, orient_ptr);
+        auto m_it = m_body_mass_override.find(smb.body_id);
+        if(m_it != m_body_mass_override.end())
+        {
+            const double abs_volume = std::abs(volume);
+            if(!(abs_volume > 0.0))
+                throw std::runtime_error(
+                    "[StiffGIPC] cannot apply ABD mass override to a zero-volume surface mesh");
+            body_density = m_it->second / abs_volume;
+        }
         gipc::compute_trimesh_dyadic_mass(smb.vertices, smb.triangles,
                                           body_density,
                                           out_m, out_m_x, out_m_xx,
@@ -901,7 +915,8 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
         printf("[abd-mass] body %d: m=%.6g kg (density=%.3g, override=%s) "
                "com=(%.3f,%.3f,%.3f) trMxx=%.3g\n",
                smb.body_id, out_m, body_density,
-               (d_it2 != m_body_density_override.end()) ? "yes" : "no",
+               (m_it != m_body_mass_override.end()) ? "mass"
+                   : ((d_it2 != m_body_density_override.end()) ? "density" : "no"),
                center.x(), center.y(), center.z(), m_xx_centered.trace());
 
         // [inertia-sanity / kick root cause] The centered second moment is
@@ -976,7 +991,6 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
                    cudaMemcpyHostToDevice);
 
         // Upload volume
-        double volume = gipc::compute_trimesh_volume(smb.vertices, smb.triangles, orient_ptr);
         Float h_vol = static_cast<Float>(std::abs(volume));
         cudaMemcpy(abd.body_id_to_volume.data() + smb.body_id,
                    &h_vol,

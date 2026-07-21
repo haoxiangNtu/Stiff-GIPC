@@ -33,6 +33,9 @@ void GIPC::build_gipc_system(device_TetraData& tet)
     for(const auto& kv : m_pending_abd_density)
         m_abd_system->set_body_density_override(kv.first, kv.second);
 
+    for(const auto& kv : m_pending_abd_mass)
+        m_abd_system->set_body_mass_override(kv.first, kv.second);
+
     // Transfer per-body inertial overrides (mass / COM / inertia) likewise.
     for(const auto& kv : m_pending_abd_inertia)
     {

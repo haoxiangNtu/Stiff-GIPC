@@ -4,88 +4,89 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
-## [0.8.4] — in preparation (branch fix/p0-stability; official release pending
-review + the strict-determinism release gates per the release handbook)
+## [0.8.4] — 2026-07-21
 
-### Added (this session, second wave)
-- **Passive joints**: `add_revolute_joint(..., passive=True)` /
-  `add_prismatic_joint(..., passive=True)` — free hinge/slider (no position
-  servo). Previously EVERY joint was position-locked at its initial angle.
-- **Revolute joint limits actually work**: the limit energy/gradient/Hessian
-  existed as dead code (zero call sites) AND the bounds were never copied to
-  the GPU (stayed +-1e30). Wired + copied; a limited passive hinge now stops
-  at its bound with zero overshoot (test_passive_revolute B).
-- **semi-implicit per-env beta** (decoupled path): each env accumulates its
-  own beta_g and freezes itself at beta_g <= tol — replaces the earlier
-  "disable global exit under decoupling" stopgap.
-
-### Known limitations (documented, deliberately deferred)
-- D7 lagged friction anchors: per-Newton-iteration anchor updates would need
-  the close-set/kappa pipeline rebuilt inside the Newton loop; deferred.
-  dt = 0.01 (TRO parity) remains the official mitigation.
-- The kick trust-region (v08 WIP) is now defense-in-depth only: the root
-  cause was non-physical inertia from broken meshes (see Fixed).
-
-### Fixed (stability, P0)
-- **semi-implicit exit scoping**: the global `beta *= 1-alpha` early exit is
-  disabled under the per-env decoupled exit (it re-coupled the batch: a fast
-  env's good steps cut off still-unconverged mates at a batch-dependent iter);
-  merged multi-env runs get a one-time batch-coupling warning. Decay factor
-  clamped `>= 0`.
-- **d-floor fail-fast** (ported from the 0.6-multienv line): the five
-  `[d=0 guard]` silent clamps are removed; a ground distance persisting below
-  1e-9 m for 800 consecutive detections now throws (impact transients recover;
-  collapse pins — problem-record D2 — do not). Covers the merged AND the
-  per-env detection paths.
+Stability, contact-solver consistency, and public API hardening release.
 
 ### Added
-- **Per-soft-body density**: `load_mesh(density=...)` /
-  `set_soft_body_density(body_offset, rho)` — per-tet & per-triangle override
-  consumed by the finalize mass build (unset bodies keep the global
-  `Config.density`/`cloth_density`).
-- **Per-body friction**: `set_body_friction(body_offset, mu, ground_mu=None)`
-  — per-vertex mu tables; self-contact pairs combine geometrically, ground
-  contact per-vertex; energy/gradient/Hessian consistent; feature unused =
-  bit-identical legacy path.
-- **Contact-force distribution**: `get_vertex_contact_forces(include_ground)`
-  — per-vertex contact forces in NEWTONS (validated: resting-cube net vertical
-  reaction = weight to 4 digits).
-- **FEM stress**: `get_fem_von_mises_stress()` — per-tet Neo-Hookean Cauchy →
-  von Mises → per-vertex max.
-- **Per-env productization**: `Config(per_env_exit=True)` switch;
-  `Config(env_newton_iter_cap=N)` per-env Newton budget (TIMEOUT-freezes only
-  the offending env); NaN/inf quarantine (DIVERGED-freeze);
-  `get_per_env_newton_iters()` / `get_per_env_status()`.
-- `Config(gd_friction_rate=...)` and
-  `Config(collision_detection_buff_scale=...)` as explicit parameters; URDF
-  importer warns on primitive (non-mesh) collision geometry instead of a
-  silent skip.
-- Recipe + regression examples: `recipe_towel_scramble.py` (crumpled-cloth
-  initial states via teleport/checkpoint), `test_dfloor_bunny_drop.py`,
-  `test_perbody_density.py`, `test_perbody_friction.py`,
-  `test_contact_force_stress.py`, `test_perenv_telemetry.py`.
+- Passive revolute and prismatic joints through `passive=True`, plus active
+  revolute-limit energy, gradient, Hessian, and device-side limit data.
+- Per-soft-body density, per-body friction, and explicit ABD mass/inertia
+  overrides through `set_abd_body_mass` and `set_abd_body_inertia`.
+- Per-vertex contact forces in Newtons, FEM von Mises stress, per-environment
+  Newton iteration/status telemetry, timeout freezing, and NaN/Inf quarantine.
+- `Config` controls for per-environment exit, environment iteration caps,
+  friction descent rate, collision buffer scaling, line-search budget, and
+  optional absolute/relative energy comparison tolerances.
+- Regression examples for passive joints, reversed parent/child body order,
+  density, friction, contact force/stress, d-floor handling, and telemetry.
 
-### Fixed (found during this session's testing)
-- **teleport_fem_vertices ignored the metis permutation (PRE-EXISTING
-  v0.8.3)**: `get_vertices()` returns INPUT order (transparently unscrambling
-  the MAS/metis sort) but `teleport_fem_vertices()` wrote the arrays RAW in
-  engine order — on any metis-sorted body (cloth under the default MAS
-  preconditioner) a round-trip teleport SCRAMBLED the mesh (read-back
-  mismatch ~0.32 m on a 30x30 cloth), and with a velocity field the
-  spaghettified cloth killed the next solve with CUDA illegal-access errors
-  (those crashes were first mis-attributed to CCD-grow / dense contact /
-  linear-system buffers — all disproved by A/B; the untouched v0.8.3.1
-  baseline crashes identically). Fixed by applying the input->engine
-  permutation (exact inverse of get_vertex_positions) to positions and
-  velocities before writing. Validated: cloth round-trip error 0.319 m -> 0.0,
-  crumpled state held over 40 frames (drift 25 um); tet-body teleport tests
-  unchanged to the last digit.
-- `set_vertex_velocities_gpu` alone does not rebuild `xTilta` — a bare
-  velocity write never moves a body; use
-  `teleport_fem_vertices(positions, velocities)`.
-- `get_body_contact_force_batched` returns incremental-potential-gradient
-  units (force × dt²), NOT Newtons — downstream users beware (the new
-  `get_vertex_contact_forces` IS in Newtons).
+### Changed
+- CCD step selection now carries direct `alpha` candidates and performs `MIN`
+  reductions in merged, isolated, and strict modes. Reciprocal-alpha recovery
+  and its divide-by-zero guard are removed; non-finite or non-positive active
+  distances now fail loudly instead of becoming an unconstrained candidate.
+- Isolated/strict contact stiffness uses the actual 12-dimensional ABD
+  generalized degrees of freedom rather than counting collision vertices as
+  independent 3D degrees of freedom.
+- Segmented execution separates the fixed 256-slot capacity from the active
+  group count, so a single active environment no longer processes 255 empty
+  slots while retaining the isolated numerical path.
+- Merged and isolated line searches share the same energy rule. The default is
+  the exact comparison (`energy_abs_tol=energy_rel_tol=0`); configured
+  tolerances use `abs_tol + rel_tol*abs(E0)` and are reported by a counter.
+- The merged line-search budget is configurable and defaults to 64 halvings;
+  budget exhaustion is always reported.
+- Semi-implicit decoupled execution maintains and freezes per-environment beta
+  values instead of re-coupling the batch through one global exit state.
+
+### Fixed
+- ABD contact Hessian assembly now writes `A + A^T` when two contact vertices
+  map to the same rigid body, and uses a canonical transpose when body IDs are
+  reversed. This fixes the hidden same-body folded-block asymmetry.
+- Programmatic joint Hessian assembly no longer assumes
+  `parent_id < child_id`; reversed IDs are canonicalized, validated, and
+  surfaced to users instead of silently producing zero cross-body blocks.
+- Partial-block CUDA reductions now keep all participating threads at barriers
+  and use valid shuffle masks, removing undefined behavior in direct alpha,
+  segmented PCG, and related reductions.
+- Merged Newton convergence checks use the direction produced by the current
+  PCG solve instead of a stale previous-iteration direction.
+- Scalar line search now terminates on the accepted displacement norm after
+  backtracking. Active one-sided joint limits no longer repeat an unchanged,
+  machine-scale step until the 1000-iteration cap.
+- Per-group contact energy, stiffness, alpha, and frozen-environment handling
+  now consistently use the owning environment's parameters.
+- `teleport_fem_vertices` now applies the input-to-engine METIS permutation to
+  positions and velocities; sorted cloth meshes no longer scramble on a
+  get/teleport round trip.
+- ABD preconditioner accumulation, ground-contact Hessian PSD projection,
+  surface-mesh inertia validation, semi-implicit exit scoping, and persistent
+  sub-1e-9 m ground-distance fail-fast handling were hardened.
+- URDF import now warns about unsupported primitive collision geometry instead
+  of silently skipping it.
+
+### Validation
+- The ModelScope plate replay completed all 228 frames in every mode with no
+  CCD guard, line-search warning, NaN, or 1000-iteration frame. Peak Newton
+  iterations were 16 (merged), 24 (isolated), and 10 (strict); all three used
+  zero tolerance-assisted energy accepts.
+- Two independent strict replays matched bit-for-bit for every sampled body
+  transform and exactly for every per-frame Newton/PCG iteration count.
+- Passive-limit, reversed joint-order, density, friction, force/stress,
+  per-environment telemetry, ABD-preconditioner, and d-floor regressions pass.
+
+### Known limitations
+- Merged, isolated, and strict modes share physical parameters and acceptance
+  rules, but do not promise identical trajectories: segmented reductions,
+  per-environment line search, and nonlinear contact active-set changes can
+  legitimately select different floating-point paths.
+- Line-search exhaustion remains a loud warning followed by acceptance of the
+  final candidate for compatibility; production callers should treat it as a
+  solver-health failure and adjust time step, drive stiffness, or the budget.
+- Friction anchors remain lagged within a Newton solve. A 0.01 s time step is
+  the supported mitigation until the close-set/kappa pipeline is rebuilt per
+  Newton iteration.
 
 ## [0.8.3] — 2026-07-07
 

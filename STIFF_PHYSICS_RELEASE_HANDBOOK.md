@@ -204,11 +204,12 @@ git push origin master
 
 #### 分支政策（必读）
 
-发布工作必须在 `release/stable` 分支上进行。这条分支是**唯一**允许打 release tag 的分支，其他分支的 commit 进 release 必须经过 cherry-pick 审计。
+发布工作必须在指定的稳定分支上进行：新主线使用 `release/stable`，已经建立维护线的版本使用 `release/stable-X.Y`（例如 0.8.x 使用 `release/stable-0.8`）。只有这些稳定分支允许打 release tag，其他分支的 commit 进入 release 必须经过逐项审计。
 
-| 分支 | 用途 | 能否 cherry-pick 进 `release/stable` |
+| 分支 | 用途 | 能否 cherry-pick 进稳定分支 |
 |---|---|---|
 | `release/stable` | release 源码权威分支，每个 release tag 都从这里打 | — (本身就是) |
+| `release/stable-X.Y` | 已发布版本线的维护分支；该版本线后续 tag 从这里打 | — (本身就是) |
 | `lhx/daily-v2` | **当前 daily-dev** (引擎 API + hybrid mesh 工作主线) | ✅ 单 commit 审过后可以 |
 | `lhx/multi-env-instance` | multi-env-instance feature 分支 (多环境 Python API) | ✅ 单 commit 审过后可以 |
 | `lhx/hybrid-mesh` | hybrid mesh 研究 + demo (case_29..41) | ⚠️ 引擎部分镜像 daily-v2; 研究 demo 不进 release |

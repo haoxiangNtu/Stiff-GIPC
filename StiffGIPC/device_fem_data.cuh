@@ -17,6 +17,7 @@
 class device_TetraData
 {
   public:
+    static constexpr int kGroupSlotCapacity = 256;
     double3* vertexes        = nullptr;
     double3* o_vertexes      = nullptr;
     double3* rest_vertexes   = nullptr;
@@ -80,6 +81,9 @@ class device_TetraData
     // waits on envs that don't exist -> Newton pegs at iterCap; kappa_grp[-1]
     // OOB). Set in SimEngine finalize alongside the p2g upload.
     bool    h_groups_present = false;
+    // Host metadata: number of real groups. Group ids are validated as dense
+    // [0, h_group_count), independently of the fixed device slot capacity.
+    int     h_group_count    = 0;
     // [multi-env P2a] group id per linear-system BLOCK (size = abd_body_num*4 +
     // fem_point_num): ABD block b -> body b/4; FEM block -> its vertex. This is
     // what the per-env PCG reductions (P3a) key off. Allocated in sim_engine.

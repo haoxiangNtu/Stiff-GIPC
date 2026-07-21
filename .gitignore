@@ -39,6 +39,7 @@ stiff_physics/data/
 _skipped.face
 _skipped.node
 timeCost.txt
+Assets/sorted_mesh/*.idx
 
 # Demo media — too large for git
 *.mp4

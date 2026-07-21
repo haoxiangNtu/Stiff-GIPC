@@ -124,6 +124,11 @@ class ABDSystem
     // the global parms.mass_density, so a scene can mix densities.
     std::unordered_map<int, double> m_body_density_override;
 
+    // Per-body total-mass overrides for surface-mesh ABD bodies. The
+    // mesh-derived COM is preserved and the dyadic inertia is scaled to the
+    // requested mass. A mass override takes precedence over density.
+    std::unordered_map<int, double> m_body_mass_override;
+
     // Per-body inertial overrides (body_id -> {mass, com (world, at load time),
     // inertia 3x3 about com}). When present, _apply_surface_mesh_body_overrides
     // builds the ABD dyadic mass from THESE authored values (e.g. URDF inertial
@@ -152,6 +157,13 @@ class ABDSystem
     void set_body_density_override(int body_id, double density)
     {
         m_body_density_override[body_id] = density;
+    }
+
+    /// Override the total mass of one surface-mesh ABD body. Call before
+    /// finalize. Keep kilograms separate from density (kg/m^3).
+    void set_body_mass_override(int body_id, double mass)
+    {
+        m_body_mass_override[body_id] = mass;
     }
 
     /// Override the inertial properties (mass, COM in world/load frame, 3x3
@@ -303,6 +315,10 @@ class ABDSystem
                                            int*        fbtype,
                                            muda::CBufferView<double3> vertex_barrier_gradient,
                                            GIPCTripletMatrix& global_triplets);
+
+    void setup_abd_non_contact_gradient(ABDSimData& sim_data);
+    void add_abd_contact_gradient(ABDSimData& sim_data,
+                                  muda::CBufferView<double3> vertex_contact_gradient);
 
     // [multi-env determinism 4.3] open/close the ABD binned accumulators (zero+bind globals /
     // combine back into system_gradient + abd_body_hessian). Bracket the coupling-gradient

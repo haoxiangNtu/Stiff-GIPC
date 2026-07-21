@@ -39,7 +39,7 @@ eng = Engine(cfg)
 
 # cube.msh spans 0.4 on a side, centered ~(0, 0.3, 0)ish -> use transforms to place.
 # toy: 5 cm light cube resting on ground
-t_toy = np.eye(4); t_toy[:3, :3] *= 0.125; t_toy[1, 3] = -0.0355  # base ~2 mm above ground
+t_toy = np.eye(4); t_toy[:3, :3] *= 0.125; t_toy[1, 3] = -0.0105  # base ~2 mm above ground
 eng.load_mesh("tetMesh/cube.msh", dimensions=3, body_type="ABD", transform=t_toy)
 # anchor: fixed cube well above, holds the prismatic joint
 t_anc = np.eye(4); t_anc[:3, :3] *= 0.125; t_anc[0, 3] = -0.25; t_anc[1, 3] = 0.30
@@ -78,3 +78,6 @@ for fr in range(FRAMES):
 
 print(f"[{tag}] SUMMARY PEAK toy vertex speed = {peak:.3f} m/s at frame {peak_fr} "
       f"(drive ~0.067 m/s; libuipc reference peak ~0.075 m/s; kick pathology = several m/s)")
+ok = np.isfinite(peak) and peak < 0.5
+print("PASS" if ok else "FAIL")
+sys.exit(0 if ok else 1)

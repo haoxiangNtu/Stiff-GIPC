@@ -154,7 +154,8 @@ class GIPC
 
     uint32_t* _gpNum       = nullptr;
     uint32_t* _close_gpNum = nullptr;
-    int*      _gdCollapse  = nullptr;  // [d-floor fail-fast] device flag: ground distance below floor
+    int*      _gdCollapse  = nullptr;  // [d-floor fail-fast] first collapsed vertex id + 1; zero = none
+    int*      m_ccd_alpha_invalid = nullptr;  // bit 0: ground alpha, bit 1: self-CCD alpha
     // [per-body friction] per-vertex mu tables (device, size vertexNum), built
     // at finalize from SimEngine's pending per-body overrides. nullptr = feature
     // unused -> every friction kernel takes its legacy scalar path
@@ -171,8 +172,14 @@ class GIPC
     std::vector<int> m_env_frozen_iter;
     std::vector<int> m_env_status;
     int              env_newton_iter_cap = 0;  // per-env iter budget; 0 = off
+    // [T1] line-search backtracking budget (halvings); 0 = engine default (64).
+    int              line_search_max_iter = 64;
+    double           energy_abs_tol       = 0.0;
+    double           energy_rel_tol       = 0.0;
+    uint64_t         energy_tolerance_accept_count = 0;
     int       m_gdCollapseStreak = 0;  // [d-floor fail-fast] consecutive detections below floor (transient impacts recover; pins persist)
     void      throwIfGroundCollapsePersists();  // [d-floor fail-fast] read flag, throw on persistent collapse
+    void      throwIfInvalidCcdAlpha(const char* context);
     //uint32_t* _cpNum;
     uint32_t h_cpNum[5]  = {0, 0, 0, 0, 0};
     uint32_t h_ccd_cpNum = 0;
@@ -222,10 +229,9 @@ class GIPC
     // ONE blocking D2H grabs all 9 doubles at the end.
     static constexpr int kEnergySlotCount = 9;
     double* m_energy_slots = nullptr;
-    // ②-D2H: 2-slot device buffer for batching ground+self largestFeasibleStepSize
-    // reductions (called back-to-back at the top of each line search). One D2H
-    // of 2 doubles instead of 2 separate blocking D2Hs.
-    double* m_alpha_slots = nullptr;
+    // ②-D2H: direct ground/self feasible-alpha results. Both first-stage and
+    // final reductions use MIN, so callers consume these values without inversion.
+    double* m_ccd_alpha_slots = nullptr;
 
     // [0be8da3-port, grow-only] element capacities of the persistent friction /
     // close-constraint buffers. cudaMalloc/cudaFree device-sync, so the per-step
@@ -240,18 +246,20 @@ class GIPC
 
     // [multi-env S1] per-env (per-group) feasible line-search step substrate.
     // d_env_alpha[g] = the largest feasible alpha for env g this Newton iter
-    // (per-env CFL + per-env CCD min). NG fixed slots; envs are dense 0..ng-1.
+    // (per-env CFL + per-env CCD min). Storage has fixed capacity, while kernels
+    // receive m_active_group_count; envs are validated dense 0..ng-1.
     // PHYSICS-NEUTRAL until S2: computed + validated only, the actual step still
     // uses the global scalar alpha. Gated by env STIFF_PERENV_ALPHA. h_env_alpha
     // is the host mirror S2 will read to drive per-env step_forward.
-    static constexpr int kEnvAlphaSlots = 256;
+    static constexpr int kEnvAlphaSlots = device_TetraData::kGroupSlotCapacity;
+    int                 m_active_group_count = 0;
     double*             m_env_alpha   = nullptr;   // device, size kEnvAlphaSlots
     std::vector<double> h_env_alpha;               // host mirror
     // scratch for the per-env feasibility reductions split across two phases of
-    // one Newton iter: regions [0]=ground [1]=self-narrow [2]=refined-self
-    // [3]=cfl-maxspeed, each kEnvAlphaSlots wide. Phase A (pre-buildFullCP)
-    // fills ground+self-narrow; Phase B fills refined+cfl and combines.
-    double*             m_env_scratch = nullptr;   // device, size 4*kEnvAlphaSlots
+    // one Newton iter: direct-alpha regions [0]=ground [1]=self-narrow
+    // [2]=refined-self, [3]=surface cfl-maxspeed, [4]=all-vertex Newton max-move.
+    // Alpha regions are initialized to 1 and MIN-reduced; max regions start at 0.
+    double*             m_env_scratch = nullptr;   // device, size 5*kEnvAlphaSlots
     // [multi-env S2] per-env step apply. When m_perenv_apply is true, step_forward
     // moves FEM vert v by m_env_alpha[point_to_group[v]] and ABD body b by
     // m_abd_body_alpha[b] (gathered = m_env_alpha[body_to_group[b]]). The scalar
@@ -398,7 +406,8 @@ class GIPC
     void calBarrierHessian();
     void calBarrierGradient(double3* _gradient, double mKap,
                             int2* ec_pair = nullptr, double3* ec_force = nullptr,
-                            const int* ec_pbid = nullptr, double ec_inv_dt2 = 0.0);
+                            const int* ec_pbid = nullptr, double ec_inv_dt2 = 0.0,
+                            bool use_group_kappa = true);
 
     // [Step B] per-contact force export for the Newton ContactSensor. Fills
     // out_pair[i]=(bodyA,bodyB) (bodyB=-1 for ground) and out_force[i]=world
@@ -420,7 +429,8 @@ class GIPC
 
     void partitionContactHessian();
 
-    void  computeGroundGradient(double3* _gradient, double mKap);
+    void  computeGroundGradient(double3* _gradient, double mKap,
+                                bool use_group_kappa = true);
     void computeSoftConstraintGradientAndHessian(double3* _gradient,
                                                  int global_hessian_fem_offset);
 
@@ -436,7 +446,8 @@ class GIPC
     void   Energy_Add_Reduction_Algorithm_DeviceOut(int type,
                                                     device_TetraData& TetMesh,
                                                     double* out_slot,
-                                                    double* out_penv = nullptr);
+                                                    double* out_penv = nullptr,
+                                                    double energy_kappa = -1.0);
     // [multi-env S3] per-env total energy E_g into env_out[kEnvAlphaSlots]
     // (host array). Validates Sum_g E_g == global computeEnergy. Returns global E.
     double computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>& env_out);
@@ -447,8 +458,8 @@ class GIPC
     // [de-CPU S3] shared term-launcher: fills the static pe_all slice block on device (layout in
     // GIPC.cu) and reports whether per-env kappa rescale applies. Used by both variants above.
     double* _launch_perenv_energy_terms(device_TetraData& TetMesh, bool& perenv_k_out);
-    // ②-D2H batched variants — write minValue (NOT 1.0/minValue) to slot.
-    // Caller does the 1.0/x and the m_skip_all_collision / numbers<1 guards.
+    // ②-D2H batched variants — write direct feasible alpha to each slot.
+    // Caller applies MIN and handles m_skip_all_collision / numbers<1 guards.
     void   ground_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, double* out_slot);
     void   self_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, int numbers, double* out_slot);
 
@@ -527,6 +538,10 @@ class GIPC
     // transfers these into m_abd_system right after it is created and before
     // the per-body mass setup runs.
     std::unordered_map<int, double>           m_pending_abd_density;
+
+    // Pending total-mass overrides (body_id -> kilograms). Kept distinct from
+    // density so external scene APIs cannot silently confuse kg with kg/m^3.
+    std::unordered_map<int, double>           m_pending_abd_mass;
 
     // Pending per-body inertial overrides (body_id -> {mass, com[3],
     // inertia[3x3 row-major]}). Stashed by SimEngine::set_abd_body_inertia

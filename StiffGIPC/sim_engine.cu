@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <map>
 #include <algorithm>
+#include <stdexcept>
 #include <cuda_runtime.h>
 
 #include "GIPC.cuh"
@@ -125,6 +126,40 @@ namespace {
 struct NullStreambuf : std::streambuf { int overflow(int c) override { return c; } };
 NullStreambuf  g_null_streambuf;
 std::streambuf* g_saved_cout_buf = nullptr;
+
+void validate_programmatic_joint_bodies(int         body_count,
+                                        int         parent_body,
+                                        int         child_body,
+                                        const char* api_name)
+{
+    if(parent_body < 0 || parent_body >= body_count
+       || child_body < 0 || child_body >= body_count)
+    {
+        throw std::invalid_argument(
+            std::string(api_name) + ": parent_body and child_body must be valid ABD "
+            "body IDs in [0, " + std::to_string(body_count) + "); got parent="
+            + std::to_string(parent_body) + ", child=" + std::to_string(child_body));
+    }
+    if(parent_body == child_body)
+    {
+        throw std::invalid_argument(
+            std::string(api_name) + ": parent_body and child_body must be different; got body="
+            + std::to_string(parent_body));
+    }
+    if(parent_body > child_body && ::g_gipc_log_level >= 1)
+    {
+        static bool reverse_order_notice_emitted = false;
+        if(!reverse_order_notice_emitted)
+        {
+            std::cerr << "[SimEngine] NOTICE: " << api_name << " received parent_body="
+                      << parent_body << " > child_body=" << child_body
+                      << ". This order is valid; cross-body Hessian storage will be "
+                         "canonicalized internally. No caller-side reordering is required."
+                      << std::endl;
+            reverse_order_notice_emitted = true;
+        }
+    }
+}
 }  // namespace
 
 void SimEngine::set_log_level(int level)
@@ -155,6 +190,10 @@ void SimEngine::reset()
 
 void SimEngine::set_config(const SimEngineConfig& cfg)
 {
+    if(!std::isfinite(cfg.energy_abs_tol) || cfg.energy_abs_tol < 0.0
+       || !std::isfinite(cfg.energy_rel_tol) || cfg.energy_rel_tol < 0.0)
+        throw std::invalid_argument(
+            "energy_abs_tol and energy_rel_tol must be finite and non-negative");
     m_impl->cfg = cfg;
 }
 
@@ -671,6 +710,12 @@ int SimEngine::add_fixed_joint(int parent_body, int child_body,
                                const Eigen::Vector3d& world_normal,
                                const Eigen::Vector3d& world_bitangent)
 {
+    validate_programmatic_joint_bodies(
+        m_impl->tetMesh.abd_fem_count_info.abd_body_num,
+        parent_body,
+        child_body,
+        "add_fixed_joint");
+
     JointConstraintHostInfo jc;
     jc.parent_body_id = parent_body;
     jc.child_body_id  = child_body;
@@ -698,6 +743,12 @@ int SimEngine::add_revolute_joint(int parent_body, int child_body,
                                   const std::string& name,
                                   bool passive)
 {
+    validate_programmatic_joint_bodies(
+        m_impl->tetMesh.abd_fem_count_info.abd_body_num,
+        parent_body,
+        child_body,
+        "add_revolute_joint");
+
     Eigen::Vector3d axis = world_axis.normalized();
     Eigen::Vector3d half = axis * 0.5;
 
@@ -746,6 +797,12 @@ int SimEngine::add_prismatic_joint(int parent_body, int child_body,
                                    const std::string& name,
                                    bool passive)
 {
+    validate_programmatic_joint_bodies(
+        m_impl->tetMesh.abd_fem_count_info.abd_body_num,
+        parent_body,
+        child_body,
+        "add_prismatic_joint");
+
     Eigen::Vector3d axis = world_axis.normalized();
 
     Eigen::Vector3d n_perp;
@@ -901,6 +958,9 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.semi_implicit_min_iter = cfg.semi_implicit_min_iter;
     ipc.newton_iter_cap        = cfg.newton_iter_cap;
     ipc.env_newton_iter_cap    = cfg.env_newton_iter_cap;  // [per-env productization]
+    ipc.line_search_max_iter   = cfg.line_search_max_iter;  // [T1]
+    ipc.energy_abs_tol         = cfg.energy_abs_tol;
+    ipc.energy_rel_tol         = cfg.energy_rel_tol;
 
     ipc.m_skip_all_collision = cfg.skip_all_collision;
 }
@@ -1187,7 +1247,56 @@ void SimEngine::Impl::do_upload_to_gpu()
     // Collision exclusion matrix
     if(::g_gipc_log_level >= 1) printf("[CollisionExclusion] pairs=%d, collision_body_num=%d\n",
            (int)tetMesh.collision_exclusion_pairs.size(), d_tetMesh.collision_body_num);
-    const bool have_groups = !tetMesh.body_groups.empty();
+    const bool groups_declared = !tetMesh.body_groups.empty();
+    bool       have_groups     = false;
+    int        active_group_count = 0;
+    if(groups_declared)
+    {
+        const int body_count = d_tetMesh.collision_body_num;
+        if((int)tetMesh.body_groups.size() != body_count)
+            throw std::invalid_argument(
+                "set_body_groups: expected exactly " + std::to_string(body_count)
+                + " group ids (one per collision body), got "
+                + std::to_string(tetMesh.body_groups.size()));
+
+        std::vector<int> seen(device_TetraData::kGroupSlotCapacity, 0);
+        bool has_wildcard = false;
+        for(int body = 0; body < body_count; ++body)
+        {
+            int group = tetMesh.body_groups[body];
+            if(group < -1 || group >= device_TetraData::kGroupSlotCapacity)
+                throw std::invalid_argument(
+                    "set_body_groups: group id for body " + std::to_string(body)
+                    + " must be -1 or in [0, "
+                    + std::to_string(device_TetraData::kGroupSlotCapacity)
+                    + "), got " + std::to_string(group));
+            if(group < 0)
+            {
+                has_wildcard = true;
+                continue;
+            }
+            seen[group] = 1;
+            active_group_count = std::max(active_group_count, group + 1);
+        }
+        for(int group = 0; group < active_group_count; ++group)
+            if(!seen[group])
+                throw std::invalid_argument(
+                    "set_body_groups: active group ids must be dense [0, N); missing group "
+                    + std::to_string(group));
+
+        const bool isolated_features = getenv("STIFF_PERENV_BVH")
+                                    || getenv("STIFF_PERENV_ALPHA")
+                                    || getenv("STIFF_PERGROUP_KAPPA")
+                                    || getenv("STIFF_SEGMENTED_PCG")
+                                    || getenv("STIFF_DECOUPLE_THRESH");
+        if(isolated_features && (active_group_count == 0 || has_wildcard))
+            throw std::invalid_argument(
+                "isolated/strict mode requires every collision body to have a non-negative "
+                "dense group id; wildcard group -1 is only supported by merged mode");
+        have_groups = active_group_count > 0;
+    }
+    d_tetMesh.h_group_count = active_group_count;
+    ipc.m_active_group_count = active_group_count;
     if((!tetMesh.collision_exclusion_pairs.empty() || have_groups)
        && d_tetMesh.collision_body_num > 0)
     {
@@ -1488,9 +1597,7 @@ void SimEngine::Impl::do_init_bvh_and_solver()
         // multi-env only; the aggregation self-disables (falls back to the global hierarchy) when
         // the per-env warp split does not divide evenly.
         {
-            int _ne = 0;
-            for(int g : tetMesh.body_groups) if(g + 1 > _ne) _ne = g + 1;
-            ipc.pcg_data.MP.m_numEnvs = (_ne > 1) ? _ne : 1;
+            ipc.pcg_data.MP.m_numEnvs = std::max(1, d_tetMesh.h_group_count);
         }
 
         ipc.pcg_data.MP.neighborListSize = neighborListSize;
@@ -1564,15 +1671,21 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     // "ext used 0 / cap 0" for non-hybrid scenes. Hybrid scenes keep the full margin.
     ipc.m_triplet_internal_margin =
         (d_tetMesh.n_fem_pins > 0) ? cfg.triplet_internal_margin : 1.0;
-    // [env-scale convergence] per-env rest bbox diag^2 (+ avg over active envs). Host-side,
-    // once. Wildcard (-1) verts belong to no env and do not shape any env's scale.
+    // [env-scale convergence] per-env world-space bbox diag^2 (+ avg over active envs), once.
+    // Derive it from the finalized device state so every import path uses the positions actually
+    // consumed by the solver. This is the complete environment scale and need not equal the
+    // contact BVH's bboxDiagSize2 (for example, a robot may extend beyond its active contact BVH).
+    // Wildcard (-1) verts belong to no env and do not shape any env's scale.
     if(d_tetMesh.h_groups_present
        && (int)tetMesh.point_id_to_body_id.size() == (int)tetMesh.vertexes.size())
     {
-        const int NG = 256;
+        const int NG = d_tetMesh.h_group_count;
         std::vector<double3> lo(NG, make_double3(1e300, 1e300, 1e300));
         std::vector<double3> hi(NG, make_double3(-1e300, -1e300, -1e300));
         std::vector<int>     cnt(NG, 0);
+        std::vector<double3> world_vertexes(ipc.vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(world_vertexes.data(), d_tetMesh.vertexes,
+                                  ipc.vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
         const auto& p2b = tetMesh.point_id_to_body_id;
         const auto& bg  = tetMesh.body_groups;
         for(size_t v = 0; v < tetMesh.vertexes.size(); ++v)
@@ -1580,7 +1693,7 @@ void SimEngine::Impl::do_init_bvh_and_solver()
             int b = p2b[v];
             int g = (b >= 0 && b < (int)bg.size()) ? bg[b] : -1;
             if(g < 0 || g >= NG) continue;
-            const auto& P = tetMesh.vertexes[v];
+            const auto& P = world_vertexes[v];
             lo[g].x = std::min(lo[g].x, P.x); hi[g].x = std::max(hi[g].x, P.x);
             lo[g].y = std::min(lo[g].y, P.y); hi[g].y = std::max(hi[g].y, P.y);
             lo[g].z = std::min(lo[g].z, P.z); hi[g].z = std::max(hi[g].z, P.z);
@@ -1733,7 +1846,11 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     // per-env index excludes EVERY primitive (active=0) -> ZERO self-collision
     // detection -> silently wrong physics (cloth through gripper).
     if(getenv("STIFF_PERENV_BVH") && d_tetMesh.d_point_to_group && d_tetMesh.h_groups_present)
-    { ipc.m_perenv_bvh = true; ipc.m_d_p2g = d_tetMesh.d_point_to_group; }
+    {
+        ipc.m_perenv_bvh = true;
+        ipc.m_d_p2g = d_tetMesh.d_point_to_group;
+        ipc.m_active_group_count = d_tetMesh.h_group_count;
+    }
     // Build collision pairs + solver warm-start (mirrors gl_main.cu post-init)
     ipc.buildCP();
     ipc._moveDir          = ipc.pcg_data.dx;
@@ -2521,6 +2638,15 @@ void SimEngine::set_abd_body_density(int body_id, double density)
     // finalize), so we stash the override on GIPC; build_gipc_system transfers
     // it to the ABDSystem right before the per-body mass setup runs.
     m_impl->ipc.m_pending_abd_density[body_id] = density;
+}
+
+void SimEngine::set_abd_body_mass(int body_id, double mass)
+{
+    if(body_id < 0)
+        throw std::runtime_error("set_abd_body_mass: body_id must be non-negative");
+    if(!(mass > 0.0) || !std::isfinite(mass))
+        throw std::runtime_error("set_abd_body_mass: mass must be finite and > 0");
+    m_impl->ipc.m_pending_abd_mass[body_id] = mass;
 }
 
 void SimEngine::set_abd_body_inertia(int body_id, double mass,
@@ -4195,6 +4321,10 @@ double SimEngine::get_total_pcg_iters() const        { return total_Cg_count; }
 double SimEngine::get_total_collision_pairs() const  { return totalCollisionPairs; }
 double SimEngine::get_max_collision_pairs() const    { return maxCOllisionPairNum; }
 int    SimEngine::get_total_frames_done() const      { return total_Frames; }
+uint64_t SimEngine::get_total_energy_tolerance_accepts() const
+{
+    return m_impl->ipc.energy_tolerance_accept_count;
+}
 
 void SimEngine::save_checkpoint(const std::string& path)
 {
