@@ -154,11 +154,12 @@ class GIPC
 
     uint32_t* _gpNum       = nullptr;
     uint32_t* _close_gpNum = nullptr;
-    // Ground-distance invariant flag: zero = none, positive = first vertex
-    // below the positive distance floor plus one, negative = first vertex
+    // Ground-distance invariant flag: zero = none; otherwise the first vertex
     // with a non-finite or non-positive distance encoded as -(id + 1).
     int*      _gdCollapse  = nullptr;
     int*      m_ccd_alpha_invalid = nullptr;  // bit 0: ground alpha, bit 1: self-CCD alpha
+    int*      m_ground_trial_invalid = nullptr;
+    int*      m_env_ground_trial_invalid = nullptr;
     // [per-body friction] per-vertex mu tables (device, size vertexNum), built
     // at finalize from SimEngine's pending per-body overrides. nullptr = feature
     // unused -> every friction kernel takes its legacy scalar path
@@ -180,9 +181,10 @@ class GIPC
     double           energy_abs_tol       = 0.0;
     double           energy_rel_tol       = 0.0;
     uint64_t         energy_tolerance_accept_count = 0;
-    int       m_gdCollapseStreak = 0;  // consecutive positive sub-nm detections
     void      throwIfGroundDistanceInvalid();
     void      throwIfInvalidCcdAlpha(const char* context);
+    int       groundTrialStatus(const int* point_to_group, int group_count);
+    void      halveGroundInvalidEnvAlpha(int group_count);
     //uint32_t* _cpNum;
     uint32_t h_cpNum[5]  = {0, 0, 0, 0, 0};
     uint32_t h_ccd_cpNum = 0;

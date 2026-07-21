@@ -62,16 +62,17 @@ Stability, contact-solver consistency, and public API hardening release.
   get/teleport round trip.
 - ABD preconditioner accumulation, ground-contact Hessian PSD projection,
   surface-mesh inertia validation, semi-implicit exit scoping, and persistent
-  sub-1e-9 m ground-distance fail-fast handling were hardened. Closed surface
+  ground-distance invariant handling were hardened. Closed surface
   meshes with globally reversed winding now normalize all signed mass moments
   together instead of being rejected as negative mass.
 - Ground distance validation now rejects non-finite or non-positive distances
-  immediately, while retaining the persistence window only for still-feasible
-  positive sub-1e-9 m impact transients.
-- Ground CCD now preserves a 1e-9 m numerical interior margin without clamping
-  barrier distances, and accepted-displacement convergence covers CCD-, CFL-,
-  and energy-limited steps. Repeated machine-scale updates can no longer round
-  a still-feasible contact distance down to the barrier boundary.
+  immediately while preserving every finite positive distance as feasible.
+- Ground CCD now follows libuipc's relative fraction-to-boundary semantics:
+  direct `0.9*d/c` alpha candidates reduced by `MIN`, with no absolute distance
+  floor. After trial coordinates are written, merged and per-environment line
+  searches verify strict positive distance and backtrack any alpha whose
+  floating-point update lands on the barrier boundary. Accepted-displacement
+  convergence covers CCD-, CFL-, and energy-limited steps.
 - Zero-contact Hessian partitioning now returns without launching radix-sort or
   zero-length CUDA copies, and contact partitioning now reserves its exact
   out-of-place `[n,2n)` reorder range before use. Contact-free and large-contact
@@ -82,7 +83,7 @@ Stability, contact-solver consistency, and public API hardening release.
 ### Validation
 - The ModelScope plate replay completed all 228 frames in every mode with no
   CCD guard, line-search warning, NaN, or 1000-iteration frame. Peak Newton
-  iterations were 10 (merged), 21 (isolated), and 21 (strict); all three used
+  iterations were 14 (merged), 12 (isolated), and 11 (strict); all three used
   zero tolerance-assisted energy accepts.
 - Two independent strict replays matched bit-for-bit for every sampled body
   transform and exactly for every per-frame Newton/PCG iteration count.
@@ -90,7 +91,8 @@ Stability, contact-solver consistency, and public API hardening release.
   regressions; all 92 tracked public examples passed syntax and startup smoke
   checks, and the headless joint-control example completed all 100 frames.
 - Passive-limit, reversed joint-order, density, friction, force/stress,
-  per-environment telemetry, ABD-preconditioner, and d-floor regressions pass.
+  per-environment telemetry, ABD-preconditioner, and ground-domain regressions
+  pass.
 
 ### Known limitations
 - Merged, isolated, and strict modes share physical parameters and acceptance

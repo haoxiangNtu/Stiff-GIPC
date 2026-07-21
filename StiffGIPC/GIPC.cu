@@ -41,11 +41,6 @@ int g_gipc_log_level = 1;
 #define RANK 2
 #define NEWF
 
-// Keep ground contact strictly inside the logarithmic barrier's domain with a
-// physical margin that remains representable when world coordinates are O(1).
-// This limits the step, not the distance used by barrier energy/derivatives.
-static constexpr double kGroundInteriorMargin = 1e-9;
-
 template <typename Scalar, int size>
 __device__ __host__ void makePDGeneral(Eigen::Matrix<Scalar, size, size>& symMtr)
 {
@@ -6745,19 +6740,13 @@ __global__ void _GroundCollisionDetect(const double3*  vertexes,
     double dist = __GEIGEN__::__v_vec_dot(*g_normal, vertexes[svI]) - *g_offset;
     if(!isfinite(dist) || dist <= 0.0)
     {
-        // A non-positive distance is outside the log-barrier domain and must
-        // outrank any positive sub-nanometre candidate already recorded.
+        // A non-positive distance is outside the logarithmic barrier domain.
         atomicMin(_gdCollapse, -(svI + 1));
         _environment_collisionPair[atomicAdd(_gpNum, 1)] = svI;
         return;
     }
     if(dist * dist > dHat)
         return;
-
-    // Record one still-feasible vertex whose positive ground distance fell
-    // below 1 nm. Runtime impact transients use the persistence policy below.
-    if(dist < kGroundInteriorMargin)
-        atomicCAS(_gdCollapse, 0, svI + 1);
 
     _environment_collisionPair[atomicAdd(_gpNum, 1)] = svI;
 }
@@ -7038,8 +7027,56 @@ __global__ void _checkGroundIntersection(const double3* vertexes,
     int     gidx   = _environment_collisionPair[idx];
     double  dist = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     //printf("%f  %f\n", *g_offset, dist);
-    if(dist < 0)
+    if(!isfinite(dist) || dist <= 0.0)
         *_isIntersect = -1;
+}
+
+__global__ void _markGroundTrialInvalid(const double3* vertexes,
+                                        const uint32_t* surface_vertices,
+                                        const double* g_offset,
+                                        const double3* g_normal,
+                                        const int* point_body_id,
+                                        const int* ground_skip_body,
+                                        int ground_body_count,
+                                        const int* point_to_group,
+                                        int* env_invalid,
+                                        int* status,
+                                        int group_count,
+                                        int number)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number) return;
+    int vertex = surface_vertices[idx];
+    if(point_body_id && ground_skip_body && ground_body_count > 0)
+    {
+        int body = point_body_id[vertex];
+        if(body >= 0 && body < ground_body_count && ground_skip_body[body]) return;
+    }
+    double distance = __GEIGEN__::__v_vec_dot(*g_normal, vertexes[vertex]) - *g_offset;
+    if(isfinite(distance) && distance > 0.0) return;
+
+    if(point_to_group && env_invalid)
+    {
+        int group = point_to_group[vertex];
+        if(group >= 0 && group < group_count)
+        {
+            atomicExch(env_invalid + group, 1);
+            atomicOr(status, 1);
+            return;
+        }
+        atomicOr(status, 2);
+        return;
+    }
+    atomicOr(status, 1);
+}
+
+__global__ void _halveGroundInvalidEnvAlpha(double* env_alpha,
+                                            const int* env_invalid,
+                                            int group_count)
+{
+    int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if(group >= group_count || env_invalid[group] == 0) return;
+    env_alpha[group] *= 0.5;
 }
 
 // [multi-env S3] per-env energy accumulation helper. Element's env = group of one
@@ -7322,27 +7359,15 @@ __global__ void _reduct_min_groundAlpha_to_double(const double3* vertexes,
                     if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
                     temp = 0.0;
                 }
-                else if(dist > 0.0)
+                else
                 {
-                    const double interior_room = dist - kGroundInteriorMargin;
-                    if(interior_room <= 0.0)
-                    {
-                        // The state is still barrier-feasible, but no inward
-                        // displacement is numerically safe. A positive no-op
-                        // alpha lets accepted-displacement convergence end the
-                        // Newton solve without crossing or clamping the barrier.
-                        temp = DBL_MIN;
-                    }
+                    const double candidate = slackness * (dist / coef);
+                    if(candidate > 0.0)
+                        temp = fmin(1.0, candidate);
                     else
                     {
-                        double candidate = interior_room * slackness / coef;
-                        if(isfinite(candidate) && candidate > 0.0)
-                            temp = fmin(1.0, candidate);
-                        else
-                        {
-                            if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
-                            temp = 0.0;
-                        }
+                        if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                        temp = 0.0;
                     }
                 }
             }
@@ -9082,6 +9107,16 @@ void GIPC::FREE_DEVICE_MEM()
     if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
     if(m_ccd_alpha_slots) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_slots)); m_ccd_alpha_slots = nullptr; }
     if(m_ccd_alpha_invalid) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_invalid)); m_ccd_alpha_invalid = nullptr; }
+    if(m_ground_trial_invalid)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_ground_trial_invalid));
+        m_ground_trial_invalid = nullptr;
+    }
+    if(m_env_ground_trial_invalid)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_env_ground_trial_invalid));
+        m_env_ground_trial_invalid = nullptr;
+    }
 
     pcg_data.FREE_DEVICE_MEM();
 
@@ -9130,6 +9165,12 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMemset(_gdCollapse, 0, sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_invalid, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemset(m_ccd_alpha_invalid, 0, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_ground_trial_invalid, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(m_ground_trial_invalid, 0, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc(
+        (void**)&m_env_ground_trial_invalid, kEnvAlphaSlots * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(
+        m_env_ground_trial_invalid, 0, kEnvAlphaSlots * sizeof(int)));
     {   // [PSD clamp] ground-Hessian projection opt-out (see g_ground_hess_legacy)
         const char* v      = getenv("STIFF_GROUND_HESS_LEGACY");
         int         legacy = (v && v[0] && v[0] != '0') ? 1 : 0;
@@ -10011,9 +10052,8 @@ void GIPC::buildCP()
 // as 4 bytes here -- no reductions, no allocations in the hot path.
 //
 // A non-finite or non-positive distance is already outside the barrier domain
-// and throws immediately. A still-positive sub-nm distance uses persistence:
-// a legitimate impact can transiently dip below the floor within its impact
-// frame (verified with a plain bunny drop), whereas a collapse pin persists.
+// and throws immediately. Every finite positive distance remains feasible;
+// there is deliberately no absolute distance floor.
 void GIPC::throwIfGroundDistanceInvalid()
 {
     if(!_gdCollapse)
@@ -10021,11 +10061,9 @@ void GIPC::throwIfGroundDistanceInvalid()
     int collapsed = 0;
     if(h_gpNum > 0)
         CUDA_SAFE_CALL(cudaMemcpy(&collapsed, _gdCollapse, sizeof(int), cudaMemcpyDeviceToHost));
-    const bool infeasible = collapsed < 0;
-    m_gdCollapseStreak = collapsed > 0 ? (m_gdCollapseStreak + 1) : 0;
-    if(infeasible || m_gdCollapseStreak >= 800)
+    if(collapsed < 0)
     {
-        const int vertex = (infeasible ? -collapsed : collapsed) - 1;
+        const int vertex = -collapsed - 1;
         int body = -1;
         double3 position = make_double3(0.0, 0.0, 0.0);
         double3 normal = make_double3(0.0, 0.0, 0.0);
@@ -10045,10 +10083,7 @@ void GIPC::throwIfGroundDistanceInvalid()
         const double distance = normal.x * position.x + normal.y * position.y
                               + normal.z * position.z - offset;
         char message[1024];
-        const char* reason = infeasible
-                                 ? "ground distance is non-finite or non-positive"
-                                 : "positive ground distance stayed below 1e-9 m for "
-                                   "800 consecutive collision detections";
+        const char* reason = "ground distance is non-finite or non-positive";
         snprintf(message,
                  sizeof(message),
                  "[StiffGIPC] IPC invariant violation: %s. vertex=%d body=%d "
@@ -10065,10 +10100,7 @@ void GIPC::throwIfGroundDistanceInvalid()
                  normal.z,
                  offset,
                  distance,
-                 infeasible
-                     ? " The logarithmic barrier requires strict distance > 0."
-                     : " This is a collapsed log-barrier pin, not an impact transient; "
-                       "Newton progress is O(distance) per iteration.");
+                 " The logarithmic barrier requires strict distance > 0.");
         throw std::runtime_error(message);
     }
 }
@@ -10380,23 +10412,15 @@ __global__ void _per_env_groundAlpha_min(const double3* vertexes,
                 if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
                 temp = 0.0;
             }
-            else if(dist > 0.0)
+            else
             {
-                const double interior_room = dist - kGroundInteriorMargin;
-                if(interior_room <= 0.0)
-                {
-                    temp = DBL_MIN;
-                }
+                const double candidate = slackness * (dist / coef);
+                if(candidate > 0.0)
+                    temp = fmin(1.0, candidate);
                 else
                 {
-                    double candidate = interior_room * slackness / coef;
-                    if(isfinite(candidate) && candidate > 0.0)
-                        temp = fmin(1.0, candidate);
-                    else
-                    {
-                        if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
-                        temp = 0.0;
-                    }
+                    if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                    temp = 0.0;
                 }
             }
         }
@@ -14029,6 +14053,44 @@ bool GIPC::checkGroundIntersection()
     return false;
 }
 
+int GIPC::groundTrialStatus(const int* point_to_group, int group_count)
+{
+    if(m_skip_all_collision || surf_vertexNum == 0 || !m_ground_trial_invalid)
+        return 0;
+    const bool per_env = point_to_group && m_env_ground_trial_invalid && group_count > 0;
+    CUDA_SAFE_CALL(cudaMemsetAsync(m_ground_trial_invalid, 0, sizeof(int)));
+    if(per_env)
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_env_ground_trial_invalid, 0, group_count * sizeof(int)));
+    const int threads = 256;
+    _markGroundTrialInvalid<<<(surf_vertexNum + threads - 1) / threads, threads>>>(
+        _vertexes,
+        _surfVerts,
+        _groundOffset,
+        _groundNormal,
+        _point_body_id,
+        _ground_skip_body,
+        _ground_body_count,
+        per_env ? point_to_group : nullptr,
+        per_env ? m_env_ground_trial_invalid : nullptr,
+        m_ground_trial_invalid,
+        group_count,
+        surf_vertexNum);
+    int status = 0;
+    CUDA_SAFE_CALL(cudaMemcpy(
+        &status, m_ground_trial_invalid, sizeof(int), cudaMemcpyDeviceToHost));
+    return status;
+}
+
+void GIPC::halveGroundInvalidEnvAlpha(int group_count)
+{
+    if(group_count <= 0 || !m_env_alpha || !m_env_ground_trial_invalid)
+        return;
+    const int threads = 256;
+    _halveGroundInvalidEnvAlpha<<<(group_count + threads - 1) / threads, threads>>>(
+        m_env_alpha, m_env_ground_trial_invalid, group_count);
+}
+
 bool GIPC::isIntersected(device_TetraData& TetMesh)
 {
     if(m_skip_all_collision)
@@ -14128,6 +14190,8 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
 
     double alpha_SL = alpha;
+    const int line_search_budget =
+        line_search_max_iter > 0 ? line_search_max_iter : 64;
 
     // [multi-env S2/S3] RIGOROUS per-env line search. Step each env by its own
     // CCD-feasible alpha (m_env_alpha, S1-validated safe), then enforce PER-ENV
@@ -14175,6 +14239,17 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
             _ts.stop();
             _LsTimer _tb(&g_ls_bvh_ms);
             buildBVH();
+            int ground_trial_status = groundTrialStatus(TetMesh.d_point_to_group, NG);
+            if(ground_trial_status != 0)
+            {
+                _tb.stop();
+                if((ground_trial_status & 2) == 0)
+                {
+                    halveGroundInvalidEnvAlpha(NG);
+                    continue;
+                }
+                break;
+            }
             bool _isect = isIntersected(TetMesh);
             _tb.stop();
             if(_isect)   // CCD-safe alpha should prevent this; safety net
@@ -14222,6 +14297,21 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     buildBVH();
 
+    int ground_trial_backtracks = 0;
+    int ground_trial_status = groundTrialStatus(nullptr, 0);
+    while(ground_trial_status != 0 && ground_trial_backtracks < line_search_budget)
+    {
+        alpha *= 0.5;
+        ++ground_trial_backtracks;
+        step_forward(TetMesh, alpha, false);
+        buildBVH();
+        ground_trial_status = groundTrialStatus(nullptr, 0);
+    }
+    if(ground_trial_status != 0)
+        throw std::runtime_error(
+            "[StiffGIPC] ground trial step remained outside the strict barrier "
+            "domain after line-search backtracking");
+
     int numOfIntersect = 0;
     int insectNum      = 0;
 
@@ -14251,9 +14341,6 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     // limit from silently accepting a non-descent step in difficult contact.
     // Exhaustion remains loud because the current engine policy accepts the
     // final candidate so callers can decide whether to abort the simulation.
-    const int line_search_budget =
-        line_search_max_iter > 0 ? line_search_max_iter : 64;
-
     const double energy_tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
     while((testingE > lastEnergyVal + c1m * alpha + energy_tol)
           && numOfLineSearch < line_search_budget)
@@ -14823,7 +14910,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             }
         }
         cudaEventRecord(end1);
-        double alpha = 1.0, slackness_a = 0.8, slackness_m = 0.8;
+        double alpha = 1.0, slackness_a = 0.9, slackness_m = 0.8;
         double diag_ground_alpha = 1.0;
         double diag_narrow_alpha = 1.0;
         double diag_refined_alpha = 1.0;
@@ -15246,12 +15333,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                          + normal.z * direction.z;
                 if(distance > 0.0 && coefficient > 0.0)
                 {
-                    const double interior_room = distance - kGroundInteriorMargin;
-                    const double candidate = interior_room > 0.0
-                                                 ? std::min(
-                                                       1.0,
-                                                       0.8 * interior_room / coefficient)
-                                                 : DBL_MIN;
+                    const double candidate = std::min(
+                        1.0, slackness_a * (distance / coefficient));
                     if(candidate < limiting_alpha)
                     {
                         limiting_alpha = candidate;
