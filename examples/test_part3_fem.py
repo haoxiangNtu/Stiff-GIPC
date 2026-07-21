@@ -19,6 +19,7 @@ eng = Engine(cfg)
 T1 = np.eye(4); T1[:3,:3] *= 0.5; T1[1,3] = -0.4
 eng.load_mesh("sim_data/tetmesh/cube.msh", dimensions=3, body_type="ABD",
               transform=T1, young_modulus=1e8, boundary_type="Fixed")
+eng.add_ground_collision_skip(eng.abd_body_count - 1)
 print(f"[test] ABD count: {eng.abd_body_count}", flush=True)
 
 T2 = np.eye(4); T2[:3,:3] *= 0.3; T2[1,3] = 0.0

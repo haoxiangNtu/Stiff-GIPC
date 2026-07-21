@@ -17,10 +17,10 @@ dependencies = [
 # deprecation). Until demos migrate to PushFont/PopFont, pin to <2.6.
 # Lower bound 2.4 = first version with the imgui binding subset we use.
 vis = ["polyscope>=2.4,<2.6"]
-usd = ["usd-core"]
+usd = ["usd-core", "urdf-parser-py"]
 # Extra Python deps used only by some example scripts (mesh authoring /
 # replay / USD pipeline). Install with: pip install stiff-physics[examples]
-examples = ["trimesh", "meshio", "usd-core"]
+examples = ["trimesh", "meshio", "usd-core", "urdf-parser-py"]
 dev = ["pytest", "black", "ruff"]
 
 [tool.scikit-build]

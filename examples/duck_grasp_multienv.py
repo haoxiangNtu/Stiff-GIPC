@@ -197,8 +197,12 @@ def main():
     # (ABD) first, then every env's duck (FEM) — NOT interleaved per env.
     offs = [np.array([(e % side) * spacing, (e // side) * spacing, 0.0]) for e in range(N)]
     for e in range(N):
+        robot_body_start = eng.abd_body_count
         eng.native.load_urdf(URDF, tf(franka_base + offs[e]), True, False, 1e7, init_angles)
+        for body_id in range(robot_body_start, eng.abd_body_count):
+            eng.add_ground_collision_skip(body_id)
         eng.load_mesh_from_data(table_v, table_f, 3, 3, 0, tf(offs[e]), 1e9, 1)   # rigid Fixed table
+        eng.add_ground_collision_skip(eng.abd_body_count - 1)
     for e in range(N):
         eng.load_mesh_from_data(dverts, dcells, 4, 3,
                                 0 if ducktype == "ABD" else 1,

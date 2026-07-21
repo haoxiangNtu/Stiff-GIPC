@@ -68,6 +68,14 @@ Stability, contact-solver consistency, and public API hardening release.
 - Ground distance validation now rejects non-finite or non-positive distances
   immediately, while retaining the persistence window only for still-feasible
   positive sub-1e-9 m impact transients.
+- Ground CCD now preserves a 1e-9 m numerical interior margin without clamping
+  barrier distances, and accepted-displacement convergence covers CCD-, CFL-,
+  and energy-limited steps. Repeated machine-scale updates can no longer round
+  a still-feasible contact distance down to the barrier boundary.
+- Zero-contact Hessian partitioning now returns without launching radix-sort or
+  zero-length CUDA copies, and contact partitioning now reserves its exact
+  out-of-place `[n,2n)` reorder range before use. Contact-free and large-contact
+  ABD scenes therefore avoid invalid CUDA copies and scratch overflows.
 - URDF import now warns about unsupported primitive collision geometry instead
   of silently skipping it.
 

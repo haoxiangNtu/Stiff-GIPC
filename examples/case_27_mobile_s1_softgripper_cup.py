@@ -221,6 +221,7 @@ def main():
         eng.load_mesh(TABLE_MESH, dimensions=3, body_type="ABD",
                       transform=table_tf, young_modulus=1e9, boundary_type="Fixed")
         table_body_id = eng.abd_body_count - 1
+        eng.add_ground_collision_skip(table_body_id)
         print(f"[softgripper] table body_id={table_body_id}", flush=True)
 
     # 5. Exclusions: non-finger arm vs cup, all arm vs table

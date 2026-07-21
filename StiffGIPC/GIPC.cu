@@ -41,6 +41,11 @@ int g_gipc_log_level = 1;
 #define RANK 2
 #define NEWF
 
+// Keep ground contact strictly inside the logarithmic barrier's domain with a
+// physical margin that remains representable when world coordinates are O(1).
+// This limits the step, not the distance used by barrier energy/derivatives.
+static constexpr double kGroundInteriorMargin = 1e-9;
+
 template <typename Scalar, int size>
 __device__ __host__ void makePDGeneral(Eigen::Matrix<Scalar, size, size>& symMtr)
 {
@@ -6751,7 +6756,7 @@ __global__ void _GroundCollisionDetect(const double3*  vertexes,
 
     // Record one still-feasible vertex whose positive ground distance fell
     // below 1 nm. Runtime impact transients use the persistence policy below.
-    if(dist < 1e-9)
+    if(dist < kGroundInteriorMargin)
         atomicCAS(_gdCollapse, 0, svI + 1);
 
     _environment_collisionPair[atomicAdd(_gpNum, 1)] = svI;
@@ -6793,8 +6798,8 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
     double Kappa = (kappa_grp && p2g && p2g[gidx] >= 0) ? kappa_grp[p2g[gidx]] : Kappa_scalar /* [-1 guard] */;
     double dist  = __GEIGEN__::__v_vec_dot(normal, vertexes[gidx]) - *g_offset;
     double dist2 = dist * dist;
-    // [d-floor fail-fast] no d~0 clamp here: buildCP() throws when the min ground
-    // distance collapses below the 1e-9 m floor, before this kernel can see it.
+    // No d~0 clamp here: ground CCD preserves a numerical interior margin and
+    // buildCP() rejects any state that nevertheless leaves the strict domain.
 
     double t   = dist2 - dHat;
     double g_b = t * log(dist2 / dHat) * -2.0 - (t * t) / dist2;
@@ -7319,13 +7324,25 @@ __global__ void _reduct_min_groundAlpha_to_double(const double3* vertexes,
                 }
                 else if(dist > 0.0)
                 {
-                    double candidate = dist * slackness / coef;
-                    if(isfinite(candidate) && candidate > 0.0)
-                        temp = fmin(1.0, candidate);
+                    const double interior_room = dist - kGroundInteriorMargin;
+                    if(interior_room <= 0.0)
+                    {
+                        // The state is still barrier-feasible, but no inward
+                        // displacement is numerically safe. A positive no-op
+                        // alpha lets accepted-displacement convergence end the
+                        // Newton solve without crossing or clamping the barrier.
+                        temp = DBL_MIN;
+                    }
                     else
                     {
-                        if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
-                        temp = 0.0;
+                        double candidate = interior_room * slackness / coef;
+                        if(isfinite(candidate) && candidate > 0.0)
+                            temp = fmin(1.0, candidate);
+                        else
+                        {
+                            if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                            temp = 0.0;
+                        }
                     }
                 }
             }
@@ -10365,13 +10382,21 @@ __global__ void _per_env_groundAlpha_min(const double3* vertexes,
             }
             else if(dist > 0.0)
             {
-                double candidate = dist * slackness / coef;
-                if(isfinite(candidate) && candidate > 0.0)
-                    temp = fmin(1.0, candidate);
+                const double interior_room = dist - kGroundInteriorMargin;
+                if(interior_room <= 0.0)
+                {
+                    temp = DBL_MIN;
+                }
                 else
                 {
-                    if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
-                    temp = 0.0;
+                    double candidate = interior_room * slackness / coef;
+                    if(isfinite(candidate) && candidate > 0.0)
+                        temp = fmin(1.0, candidate);
+                    else
+                    {
+                        if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                        temp = 0.0;
+                    }
                 }
             }
         }
@@ -12187,6 +12212,31 @@ void GIPC::initKappa(device_TetraData& TetMesh)
 
 void GIPC::partitionContactHessian()
 {
+    if(gipc_global_triplet.global_collision_triplet_offset <= 0)
+    {
+        gipc_global_triplet.fem_fem_contact_num = 0;
+        gipc_global_triplet.abd_fem_contact_num = 0;
+        gipc_global_triplet.fem_abd_contact_num = 0;
+        gipc_global_triplet.abd_abd_contact_num = 0;
+        gipc_global_triplet.h_fem_fem_contact_start_id = 0;
+        gipc_global_triplet.h_abd_fem_contact_start_id = 0;
+        gipc_global_triplet.h_fem_abd_contact_start_id = 0;
+        gipc_global_triplet.h_abd_abd_contact_start_id = 0;
+        return;
+    }
+
+    // Contact partitioning is itself an out-of-place reorder: assembled
+    // triplets live in [0,n), while _reorder_triplets writes [n,2n) before
+    // the ranges are copied back. Dynamic pre-assembly growth only guarantees
+    // [0,n), and the global converter's equivalent safety net runs later.
+    // Grow here from the exact contact count while preserving [0,n).
+    const size_t contact_triplet_count = static_cast<size_t>(
+        gipc_global_triplet.global_collision_triplet_offset);
+    if(gipc_global_triplet.triplet_capacity() < 2 * contact_triplet_count)
+    {
+        gipc_global_triplet.resize_triplets(contact_triplet_count);
+        gipc_global_triplet.reserve_triplets(contact_triplet_count * 26 / 10);
+    }
 
     muda::DeviceRadixSort().SortPairs(gipc_global_triplet.block_hash_value(),
                                       gipc_global_triplet.block_sort_hash_value(),
@@ -12332,9 +12382,6 @@ void GIPC::partitionContactHessian()
         gipc_global_triplet.h_abd_fem_contact_start_id + gipc_global_triplet.abd_fem_contact_num;
     gipc_global_triplet.h_abd_abd_contact_start_id =
         gipc_global_triplet.h_fem_abd_contact_start_id + gipc_global_triplet.fem_abd_contact_num;
-
-
-    int number = gipc_global_triplet.global_collision_triplet_offset;
 
     CUDA_SAFE_CALL(
         cudaMemcpy(gipc_global_triplet.block_row_indices(),
@@ -15199,7 +15246,12 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                          + normal.z * direction.z;
                 if(distance > 0.0 && coefficient > 0.0)
                 {
-                    const double candidate = std::min(1.0, 0.8 * distance / coefficient);
+                    const double interior_room = distance - kGroundInteriorMargin;
+                    const double candidate = interior_room > 0.0
+                                                 ? std::min(
+                                                       1.0,
+                                                       0.8 * interior_room / coefficient)
+                                                 : DBL_MIN;
                     if(candidate < limiting_alpha)
                     {
                         limiting_alpha = candidate;
@@ -15233,9 +15285,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             && TetMesh.h_groups_present && abd_fem_count_info.fem_point_num > 0
             && getenv("STIFF_PERENV_ALPHA");
         lineSearch(TetMesh, alpha, alpha_CFL);
-        const bool line_search_stagnated =
-            !per_env_line_search && alpha < alpha_before_line_search
-            && alpha * distToOpt_PN < _newton_thr && drive_ratio >= 1.0;
+        const bool accepted_step_stagnated =
+            !per_env_line_search && alpha * distToOpt_PN < _newton_thr
+            && drive_ratio >= 1.0;
 
         if(merged_diag_sample)
             printf("[merged-alpha] frame=%d k=%d move=%.17e thr=%.17e "
@@ -15286,13 +15338,14 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         // Convergence is defined by the displacement that was actually
         // accepted, not only by the unscaled Newton direction. At an active
-        // one-sided joint limit the direction can remain finite while exact
-        // energy backtracking reduces alpha to machine scale. Repeating that
-        // same no-op direction until newton_iter_cap is neither progress nor a
-        // solver failure, so terminate once the accepted update is below the
-        // normal Newton displacement threshold. Per-environment line search
-        // has its own freeze path and is deliberately excluded here.
-        if(line_search_stagnated)
+        // one-sided joint limit or active contact the direction can remain
+        // finite while CCD, CFL, or exact energy backtracking reduces alpha to
+        // machine scale. Repeating that same no-op direction until
+        // newton_iter_cap is neither progress nor a solver failure, so
+        // terminate once the accepted update is below the normal Newton
+        // displacement threshold. Per-environment line search has its own
+        // freeze path and is deliberately excluded here.
+        if(accepted_step_stagnated)
         {
             ++k;
             break;
