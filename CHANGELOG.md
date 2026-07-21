@@ -52,9 +52,10 @@ Stability, contact-solver consistency, and public API hardening release.
   segmented PCG, and related reductions.
 - Merged Newton convergence checks use the direction produced by the current
   PCG solve instead of a stale previous-iteration direction.
-- Scalar line search now terminates on the accepted displacement norm after
-  backtracking. Active one-sided joint limits no longer repeat an unchanged,
-  machine-scale step until the 1000-iteration cap.
+- Newton convergence is evaluated from the current unscaled solve direction,
+  never from the displacement after CCD or line-search scaling. A contact-
+  limited small `alpha` therefore cannot masquerade as convergence and make
+  cloth motion under-resolved after impact.
 - Per-group contact energy, stiffness, alpha, and frozen-environment handling
   now consistently use the owning environment's parameters.
 - `teleport_fem_vertices` now applies the input-to-engine METIS permutation to

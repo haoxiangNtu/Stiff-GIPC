@@ -15363,14 +15363,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                    limiting_distance,
                    limiting_coefficient);
         }
-        const bool per_env_line_search =
-            m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
-            && TetMesh.h_groups_present && abd_fem_count_info.fem_point_num > 0
-            && getenv("STIFF_PERENV_ALPHA");
         lineSearch(TetMesh, alpha, alpha_CFL);
-        const bool accepted_step_stagnated =
-            !per_env_line_search && alpha * distToOpt_PN < _newton_thr
-            && drive_ratio >= 1.0;
 
         if(merged_diag_sample)
             printf("[merged-alpha] frame=%d k=%d move=%.17e thr=%.17e "
@@ -15418,21 +15411,6 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         //       time44);
         destroy_iteration_events();
         totalTimeStep += alpha;
-
-        // Convergence is defined by the displacement that was actually
-        // accepted, not only by the unscaled Newton direction. At an active
-        // one-sided joint limit or active contact the direction can remain
-        // finite while CCD, CFL, or exact energy backtracking reduces alpha to
-        // machine scale. Repeating that same no-op direction until
-        // newton_iter_cap is neither progress nor a solver failure, so
-        // terminate once the accepted update is below the normal Newton
-        // displacement threshold. Per-environment line search has its own
-        // freeze path and is deliberately excluded here.
-        if(accepted_step_stagnated)
-        {
-            ++k;
-            break;
-        }
 
         // Semi-implicit early exit (ref: arXiv 2512.12151, Algorithm 1)
         // beta tracks cumulative line-search progress; when alpha≈1 (good step),
