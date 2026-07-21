@@ -154,7 +154,10 @@ class GIPC
 
     uint32_t* _gpNum       = nullptr;
     uint32_t* _close_gpNum = nullptr;
-    int*      _gdCollapse  = nullptr;  // [d-floor fail-fast] first collapsed vertex id + 1; zero = none
+    // Ground-distance invariant flag: zero = none, positive = first vertex
+    // below the positive distance floor plus one, negative = first vertex
+    // with a non-finite or non-positive distance encoded as -(id + 1).
+    int*      _gdCollapse  = nullptr;
     int*      m_ccd_alpha_invalid = nullptr;  // bit 0: ground alpha, bit 1: self-CCD alpha
     // [per-body friction] per-vertex mu tables (device, size vertexNum), built
     // at finalize from SimEngine's pending per-body overrides. nullptr = feature
@@ -177,8 +180,8 @@ class GIPC
     double           energy_abs_tol       = 0.0;
     double           energy_rel_tol       = 0.0;
     uint64_t         energy_tolerance_accept_count = 0;
-    int       m_gdCollapseStreak = 0;  // [d-floor fail-fast] consecutive detections below floor (transient impacts recover; pins persist)
-    void      throwIfGroundCollapsePersists();  // [d-floor fail-fast] read flag, throw on persistent collapse
+    int       m_gdCollapseStreak = 0;  // consecutive positive sub-nm detections
+    void      throwIfGroundDistanceInvalid();
     void      throwIfInvalidCcdAlpha(const char* context);
     //uint32_t* _cpNum;
     uint32_t h_cpNum[5]  = {0, 0, 0, 0, 0};

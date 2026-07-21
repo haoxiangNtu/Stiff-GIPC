@@ -65,6 +65,9 @@ Stability, contact-solver consistency, and public API hardening release.
   sub-1e-9 m ground-distance fail-fast handling were hardened. Closed surface
   meshes with globally reversed winding now normalize all signed mass moments
   together instead of being rejected as negative mass.
+- Ground distance validation now rejects non-finite or non-positive distances
+  immediately, while retaining the persistence window only for still-feasible
+  positive sub-1e-9 m impact transients.
 - URDF import now warns about unsupported primitive collision geometry instead
   of silently skipping it.
 

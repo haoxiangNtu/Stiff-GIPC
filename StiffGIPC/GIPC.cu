@@ -6738,12 +6738,19 @@ __global__ void _GroundCollisionDetect(const double3*  vertexes,
             return;
     }
     double dist = __GEIGEN__::__v_vec_dot(*g_normal, vertexes[svI]) - *g_offset;
+    if(!isfinite(dist) || dist <= 0.0)
+    {
+        // A non-positive distance is outside the log-barrier domain and must
+        // outrank any positive sub-nanometre candidate already recorded.
+        atomicMin(_gdCollapse, -(svI + 1));
+        _environment_collisionPair[atomicAdd(_gpNum, 1)] = svI;
+        return;
+    }
     if(dist * dist > dHat)
         return;
 
-    // [d-floor fail-fast] record one surface vertex whose ground distance hit
-    // below 1 nm (incl. d<=0). Store vertex_id + 1 so zero remains "none".
-    // Free ride on the detection pass: no extra kernel, no reduction, no malloc.
+    // Record one still-feasible vertex whose positive ground distance fell
+    // below 1 nm. Runtime impact transients use the persistence policy below.
     if(dist < 1e-9)
         atomicCAS(_gdCollapse, 0, svI + 1);
 
@@ -9970,10 +9977,10 @@ void GIPC::buildCP()
         }
     }
 
-    throwIfGroundCollapsePersists();  // [d-floor fail-fast]
+    throwIfGroundDistanceInvalid();
 }
 
-// [d-floor fail-fast] IPC's invariant is ground distance d > 0, maintained by
+// IPC's invariant is ground distance d > 0, maintained by
 // CCD + the log-barrier. Under pathological pressing the distance can collapse
 // far below physical validity (observed: healthy um-scale equilibrium ->
 // 1e-23 m within two frames), after which the barrier Hessian (~1/d^2) makes
@@ -9986,23 +9993,22 @@ void GIPC::buildCP()
 // Cost: the flag is set inside the detection kernel (free ride) and read back
 // as 4 bytes here -- no reductions, no allocations in the hot path.
 //
-// PERSISTENCE, not instant: a legitimate impact can transiently dip a vertex
-// below the floor within its impact frame (verified: a plain bunny drop
-// does), then the barrier pushes it back out. A COLLAPSE PIN persists
-// forever (verified: bitwise-frozen at 5e-23 m across 60+ frames, iter caps
-// 200 and 600 identical). So throw only when the sub-nm state persists
-// across ~4 frames' worth of consecutive detections.
-void GIPC::throwIfGroundCollapsePersists()
+// A non-finite or non-positive distance is already outside the barrier domain
+// and throws immediately. A still-positive sub-nm distance uses persistence:
+// a legitimate impact can transiently dip below the floor within its impact
+// frame (verified with a plain bunny drop), whereas a collapse pin persists.
+void GIPC::throwIfGroundDistanceInvalid()
 {
     if(!_gdCollapse)
         return;
     int collapsed = 0;
     if(h_gpNum > 0)
         CUDA_SAFE_CALL(cudaMemcpy(&collapsed, _gdCollapse, sizeof(int), cudaMemcpyDeviceToHost));
-    m_gdCollapseStreak = collapsed ? (m_gdCollapseStreak + 1) : 0;
-    if(m_gdCollapseStreak >= 800)
+    const bool infeasible = collapsed < 0;
+    m_gdCollapseStreak = collapsed > 0 ? (m_gdCollapseStreak + 1) : 0;
+    if(infeasible || m_gdCollapseStreak >= 800)
     {
-        const int vertex = collapsed - 1;
+        const int vertex = (infeasible ? -collapsed : collapsed) - 1;
         int body = -1;
         double3 position = make_double3(0.0, 0.0, 0.0);
         double3 normal = make_double3(0.0, 0.0, 0.0);
@@ -10022,14 +10028,16 @@ void GIPC::throwIfGroundCollapsePersists()
         const double distance = normal.x * position.x + normal.y * position.y
                               + normal.z * position.z - offset;
         char message[1024];
+        const char* reason = infeasible
+                                 ? "ground distance is non-finite or non-positive"
+                                 : "positive ground distance stayed below 1e-9 m for "
+                                   "800 consecutive collision detections";
         snprintf(message,
                  sizeof(message),
-                 "[StiffGIPC] IPC invariant violation: ground distance stayed below "
-                 "1e-9 m for 800 consecutive collision detections. vertex=%d body=%d "
+                 "[StiffGIPC] IPC invariant violation: %s. vertex=%d body=%d "
                  "position=(%.17e, %.17e, %.17e) normal=(%.17e, %.17e, %.17e) "
-                 "offset=%.17e distance=%.17e. This is a collapsed log-barrier pin, "
-                 "not an impact transient; Newton cannot escape it with a global "
-                 "CCD step (progress is O(distance) per iteration).",
+                 "offset=%.17e distance=%.17e.%s",
+                 reason,
                  vertex,
                  body,
                  position.x,
@@ -10039,7 +10047,11 @@ void GIPC::throwIfGroundCollapsePersists()
                  normal.y,
                  normal.z,
                  offset,
-                 distance);
+                 distance,
+                 infeasible
+                     ? " The logarithmic barrier requires strict distance > 0."
+                     : " This is a collapsed log-barrier pin, not an impact transient; "
+                       "Newton progress is O(distance) per iteration.");
         throw std::runtime_error(message);
     }
 }
@@ -10982,7 +10994,7 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
         h_gpNum = cp_gp_buf[5];
     }
 
-    throwIfGroundCollapsePersists();  // [d-floor fail-fast] (per-env detection path)
+    throwIfGroundDistanceInvalid();
 }
 
 AABB* GIPC::calcuMaxSceneSize()
