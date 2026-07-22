@@ -69,9 +69,13 @@ substep+未消费的 min/max D2H；telemetry event/文件写。
    cudaMemset 改 cudaMemsetAsync（同步版在 capture 内非法）；
 3. scatter/combine 的 launch 尺寸（:225 apply(nuniq)）：capacity-launch
    （按 length 启动 + `u < d_unique_count` 设备 guard）或并入 tier；
-4. SpMV 形状（PCG graph 每 solve 重录的根因）：P1 的 tier 化对象——unique
-   count 分档，档内固定 num_items+guard；`d_unique_key_number` 成为设备真值，
-   host 镜像仅 telemetry。
+4. SpMV 形状（PCG graph 每 solve 重录的根因）：P1 已 tier 化 ✓。
+   ⚠️ 2026-07-23 实证：`d_unique_key_number` 挂在共享块
+   `d_contact_start_block+4`，装配管线的中间 kernel 会覆盖它——solve 前的
+   host 重发布**不是冗余**（删除后 strict 哈希漂移 f7fb→ce42，三比内部仍
+   一致=错得一致的静默错误，靠跨版本哈希对照抓获）。P3a 完全体必须给
+   unique count 一个**独立、不复用的设备槽**，converter 直写该槽后才可删
+   host 重发布与 mirror D2H。
 另：`_make_unique_indices` 旧路径（cub::Unique，:93-127）确认只有注释引用，
 生产走 warp_reduction 路径 ✓ 不需迁移。
 
