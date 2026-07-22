@@ -1328,6 +1328,16 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
 
     if(use_device_loop)
     {
+        // The deterministic SpMV owns a lazily-sized binned accumulator. Its
+        // first call performs cudaMalloc/cudaMemset, which is illegal inside a
+        // stream capture and used to invalidate the real strict+grouped graph
+        // before the first PCG iteration. Prime only Ap here (no solver state
+        // changes); the captured body overwrites Ap before consuming it. Work
+        // is ordered on the same PTDS stream, so no host synchronization is
+        // needed. merged/isolated use the non-binned SpMV and skip this cost.
+        if(getenv("STIFF_SPMV_DET"))
+            spmv(p.cview(), Ap.view());
+
         cudaGraph_t dg = nullptr;
         bool ready = false;
         bool rebuilt = false;
