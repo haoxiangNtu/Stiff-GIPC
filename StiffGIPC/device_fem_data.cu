@@ -8,6 +8,7 @@
 
 #include "device_fem_data.cuh"
 #include "cuda_tools/cuda_tools.h"
+#include <stdexcept>
 
 
 void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
@@ -204,4 +205,47 @@ void device_TetraData::update_soft_constraint_target_position(int step_id, doubl
                               host_target_vertices.data(),
                               m_soft_num * sizeof(double3),
                               cudaMemcpyHostToDevice));
+}
+
+namespace
+{
+__global__ void _update_soft_targets_device(const double3*  vertexes,
+                                            const uint32_t* target_indices,
+                                            const int*      paired_vertices,
+                                            const double3*  rest_offsets,
+                                            double3*        targets,
+                                            int             count)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= count) return;
+
+    const int paired = paired_vertices ? paired_vertices[i] : -1;
+    if(paired >= 0)
+    {
+        const double3 p = vertexes[paired];
+        const double3 o = rest_offsets[i];
+        targets[i] = make_double3(p.x + o.x, p.y + o.y, p.z + o.z);
+    }
+    else
+    {
+        targets[i] = vertexes[target_indices[i]];
+    }
+}
+}  // namespace
+
+void device_TetraData::update_soft_constraint_target_position_device()
+{
+    if(m_soft_num < 1) return;
+    if(has_host_step_functor())
+        throw std::logic_error(
+            "device soft-target update requested with a host step functor");
+
+    constexpr int threads = 256;
+    _update_soft_targets_device<<<(m_soft_num + threads - 1) / threads, threads>>>(
+        vertexes,
+        targetIndex,
+        d_stitch_paired_vertex,
+        d_stitch_rest_offset,
+        targetVert,
+        m_soft_num);
 }

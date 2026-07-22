@@ -175,6 +175,17 @@ class device_TetraData
 
     void update_soft_constraint_target_position(int step_id, double ipc_dt);
 
+    bool has_host_step_functor() const
+    {
+        return update_soft_constraint_functor != nullptr
+            || pre_step_functor != nullptr;
+    }
+
+    // Graph-compatible target refresh for fixed soft pins and bilateral
+    // stitches.  Arbitrary host functors are rejected and make the caller use
+    // the legacy solver for that frame.
+    void update_soft_constraint_target_position_device();
+
 
   public:
     device_TetraData() {}

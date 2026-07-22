@@ -14,6 +14,23 @@
 namespace gipc
 {
 
+// Stable POD input packets for the per-frame joint controls.  Keeping these
+// types outside the update functions lets ABDSystem own persistent device
+// buffers instead of allocating a temporary DeviceBuffer on every call.
+struct DrivingCtrlPacked
+{
+    Float target_angle;
+    Float strength_ratio;
+    Float ext_torque;
+};
+
+struct PrisCtrlPacked
+{
+    Float target_distance;
+    Float strength_ratio;
+    Float ext_force;
+};
+
 /// Host-side surface mesh data for ABD bodies loaded from triangle meshes.
 /// Used by ABDSystem to compute mass/volume/gravity via surface integrals.
 struct ABDSurfaceMeshBody
@@ -101,6 +118,7 @@ class ABDSystem
     muda::DeviceBuffer<Matrix12x12>              m_revolute_driving_cross_hessian;
     muda::DeviceVar<Float>                       m_revolute_driving_energy;
     muda::DeviceBuffer<Float>                    m_revolute_driving_energy_per;
+    muda::DeviceBuffer<DrivingCtrlPacked>         m_revolute_driving_input;
 
     // ---- Prismatic Joint Constraint Data ----
     int                                         m_num_prismatic = 0;
@@ -115,6 +133,7 @@ class ABDSystem
     muda::DeviceBuffer<Matrix12x12>              m_prismatic_driving_cross_hessian;
     muda::DeviceVar<Float>                       m_prismatic_driving_energy;
     muda::DeviceBuffer<Float>                    m_prismatic_driving_energy_per;
+    muda::DeviceBuffer<PrisCtrlPacked>            m_prismatic_driving_input;
 
     // ---- Surface Mesh Bodies (for native surface integral path) ----
     std::vector<ABDSurfaceMeshBody> m_surface_mesh_bodies;

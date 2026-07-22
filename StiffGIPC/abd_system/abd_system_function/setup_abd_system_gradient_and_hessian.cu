@@ -79,9 +79,6 @@ void ABDSystem::couple_bin_close(int n_dofs)
         { g(d) += binned_combine(bin + (size_t)d * BINNED_K); });
 }
 
-struct DrivingCtrlPacked  { Float target_angle;    Float strength_ratio; Float ext_torque; };
-struct PrisCtrlPacked     { Float target_distance; Float strength_ratio; Float ext_force; };
-
 //template <int ROWS, int COLS>
 __device__ inline void write_triplet_cv(Eigen::Matrix3d* triplet_value,
                                         int*             row_ids,
@@ -1391,8 +1388,12 @@ void ABDSystem::update_revolute_driving_targets(
         host_ctrl[i].ext_torque     = static_cast<Float>(controls[i].ext_torque);  // [force-control]
     }
 
-    muda::DeviceBuffer<DrivingCtrlPacked> d_ctrl(n);
-    d_ctrl.view().copy_from(host_ctrl.data());
+    // [frame-fsm P3b] resize only on topology change.  The live prefix is
+    // overwritten every frame, preserving the previous byte-for-byte input
+    // semantics without frame-time cudaMalloc/cudaFree.
+    if(m_revolute_driving_input.size() != static_cast<size_t>(n))
+        m_revolute_driving_input.resize(n);
+    m_revolute_driving_input.view().copy_from(host_ctrl.data());
 
     Float kMaxStepPerFrame = parms.max_revolute_step_per_frame;
     Float sr = parms.revolute_driving_strength_ratio;
@@ -1403,7 +1404,7 @@ void ABDSystem::update_revolute_driving_targets(
                [drvs    = m_revolute_driving_data.viewer().name("revolute_driving"),
                 q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
                 masses  = body_mass.cviewer().name("body_mass"),
-                ctrls   = d_ctrl.cviewer().name("ctrls"),
+                ctrls   = m_revolute_driving_input.cviewer().name("ctrls"),
                 sr, kMaxStepPerFrame,
                 ratio = static_cast<Float>(substep_ratio)] __device__(int i) mutable
                {
@@ -1915,8 +1916,9 @@ void ABDSystem::update_prismatic_driving_targets(
         host_ctrl[i].ext_force       = static_cast<Float>(controls[i].ext_force);
     }
 
-    muda::DeviceBuffer<PrisCtrlPacked> d_ctrl(n);
-    d_ctrl.view().copy_from(host_ctrl.data());
+    if(m_prismatic_driving_input.size() != static_cast<size_t>(n))
+        m_prismatic_driving_input.resize(n);
+    m_prismatic_driving_input.view().copy_from(host_ctrl.data());
 
     Float kMaxStepPerFrame = parms.max_prismatic_step_per_frame;
     Float sr = parms.prismatic_driving_strength_ratio;
@@ -1927,7 +1929,7 @@ void ABDSystem::update_prismatic_driving_targets(
                [drvs    = m_prismatic_driving_data.viewer().name("prismatic_driving"),
                 q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
                 masses  = body_mass.cviewer().name("body_mass"),
-                ctrls   = d_ctrl.cviewer().name("ctrls"),
+                ctrls   = m_prismatic_driving_input.cviewer().name("ctrls"),
                 sr, kMaxStepPerFrame,
                 ratio = static_cast<Float>(substep_ratio)] __device__(int i) mutable
                {
