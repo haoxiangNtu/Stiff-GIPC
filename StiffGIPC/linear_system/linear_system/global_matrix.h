@@ -185,32 +185,39 @@ class GIPCTripletMatrix
     int global_external_max_capcity     = 0;
     int global_internal_capcity         = 0;
 
-    int* d_abd_abd_contact_start_id;
-    int* d_abd_fem_contact_start_id;
-    int* d_fem_abd_contact_start_id;
-    int* d_fem_fem_contact_start_id;
-    int* d_unique_key_number;
+    int* d_abd_abd_contact_start_id = nullptr;
+    int* d_abd_fem_contact_start_id = nullptr;
+    int* d_fem_abd_contact_start_id = nullptr;
+    int* d_fem_fem_contact_start_id = nullptr;
 
-    // ②-D2H: one contiguous [5] block (abd_abd, abd_fem, fem_abd, fem_fem,
-    // unique_key) so partitionContactHessian reads the 4 start-ids in a SINGLE
-    // blocking D2H instead of 4 separate ones (each drains the GPU). The 4
-    // pointers below alias offsets 0..3, so kernels that write them are
-    // unchanged and the values are bit-identical.
+    // [frame-fsm P3a] The converter-published unique count is a persistent
+    // solver input.  It must never alias either contact-partition outputs or a
+    // transient assembly counter: local-preconditioner selection and pinned
+    // FEM expansion both legitimately overwrite their counters after convert.
+    int* d_unique_key_number     = nullptr;
+    int* d_assembly_scratch_count = nullptr;
+
+    // ②-D2H: one contiguous [4] block (abd_abd, abd_fem, fem_abd, fem_fem)
+    // so partitionContactHessian reads the four start ids in one blocking D2H.
+    // The unique count deliberately has its own allocation above.
     int* d_contact_start_block = nullptr;
 
     void init_var()
     {
-        CUDA_SAFE_CALL(cudaMalloc((void**)&d_contact_start_block, 5 * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_contact_start_block, 4 * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_unique_key_number, sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_assembly_scratch_count, sizeof(int)));
         d_abd_abd_contact_start_id = d_contact_start_block + 0;
         d_abd_fem_contact_start_id = d_contact_start_block + 1;
         d_fem_abd_contact_start_id = d_contact_start_block + 2;
         d_fem_fem_contact_start_id = d_contact_start_block + 3;
-        d_unique_key_number        = d_contact_start_block + 4;
     }
 
     void free_var()
     {
         CUDA_SAFE_CALL(cudaFree(d_contact_start_block));
+        CUDA_SAFE_CALL(cudaFree(d_unique_key_number));
+        CUDA_SAFE_CALL(cudaFree(d_assembly_scratch_count));
     }
 
     int h_abd_abd_contact_start_id = -1;

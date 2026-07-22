@@ -7,11 +7,6 @@
 
 namespace
 {
-__global__ void publish_pcg_unique_count(int* out, int count)
-{
-    if(threadIdx.x == 0 && blockIdx.x == 0) *out = count;
-}
-
 int pcg_capacity_tier(int count)
 {
     if(count <= 0) return 0;
@@ -199,12 +194,8 @@ gipc::SizeT GlobalLinearSystem::solve_linear_system()
         _s4_zero_masked_rhs<<<gn, bs>>>(m_b.view().data(), m_s4_active,
                                         m_s4_dof_to_group, n, m_s4_ng);
     }
-    // Converter P3 will eventually keep this count device-native. During P1
-    // the converter still materializes the exact host count, so publish it
-    // once before PCG; cached SpMV nodes read this stable device address.
-    publish_pcg_unique_count<<<1, 1>>>(
-        gipc_global_triplet->d_unique_key_number,
-        gipc_global_triplet->h_unique_key_number);
+    // The converter publishes the exact count directly into its dedicated
+    // persistent device slot. Cached SpMV nodes consume that slot unchanged.
     auto iter = m_solver->solve(m_x, m_b);
     distribute_solution();
     return iter;

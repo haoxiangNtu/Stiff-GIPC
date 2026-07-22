@@ -13484,9 +13484,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             // Actual count tracked via atomic counter.
             int ext_capacity = fem_triplet_num * 16;
 
-            // Reset counter device-side.  Reuse the existing
-            // d_unique_key_number scratch int* on GIPCTripletMatrix.
-            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_unique_key_number,
+            // Reset the transient expansion counter.  The converter's
+            // persistent unique-count slot is intentionally never scratch.
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_assembly_scratch_count,
                                            0, sizeof(int)));
 
             muda::ParallelFor(256)
@@ -13498,7 +13498,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                         ext_rows = gipc_global_triplet.block_row_indices(ext_start),
                         ext_cols = gipc_global_triplet.block_col_indices(ext_start),
                         ext_vals = gipc_global_triplet.block_values(ext_start),
-                        ext_count = gipc_global_triplet.d_unique_key_number,
+                        ext_count = gipc_global_triplet.d_assembly_scratch_count,
                         BDType   = TetMesh.BoundaryType,
                         v2pin    = TetMesh.vertex_to_pin_idx,
                         pin_body = TetMesh.d_fem_pin_abd_body_id,
@@ -13658,7 +13658,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             // Read final extension count and bump triplet offset.
             int h_ext_count = 0;
             CUDA_SAFE_CALL(cudaMemcpy(&h_ext_count,
-                                      gipc_global_triplet.d_unique_key_number,
+                                      gipc_global_triplet.d_assembly_scratch_count,
                                       sizeof(int),
                                       cudaMemcpyDeviceToHost));
             if(h_ext_count > ext_capacity)
