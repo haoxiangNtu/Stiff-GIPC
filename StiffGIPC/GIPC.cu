@@ -11573,12 +11573,21 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
                h_cpNum[0], MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
         CUDA_SAFE_CALL(cudaFree(_collisonPairs));
         CUDA_SAFE_CALL(cudaFree(_MatIndex));
-        CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
         CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs,     ((size_t)newcap + 1) * sizeof(int4)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex,          ((size_t)newcap + 1) * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
         MAX_COLLITION_PAIRS_NUM     = newcap;
-        if(newcap > MAX_CCD_COLLITION_PAIRS_NUM) MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        // DCD emission mirrors every pair into the CCD buffer.  Preserve an
+        // already-larger CCD allocation; shrinking the allocation to newcap
+        // while retaining the old logical MAX_CCD cap made the emit guard and
+        // CCD tier family believe more storage existed than was physically
+        // allocated.  Only replace the CCD buffer when DCD truly outgrows it.
+        if(newcap > MAX_CCD_COLLITION_PAIRS_NUM)
+        {
+            CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs,
+                                      ((size_t)newcap + 1) * sizeof(int4)));
+            MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        }
         bvh_f._collisionPair     = bvh_e._collisionPair     = _collisonPairs;
         bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
         bvh_f._MatIndex          = bvh_e._MatIndex          = _MatIndex;
@@ -15300,10 +15309,29 @@ static std::uint64_t ls_graph_signature(GIPC& ipc,
     ptr(ipc.m_energy_slots);
     ptr(ipc.m_line_search_energy);
     ptr(ipc.m_abd_body_alpha);
+    // Friction energy is part of every captured energy tier.  These buffers
+    // grow independently of the DCD/CCD pair buffers (25% headroom) and are
+    // freed/reallocated when the accepted contact set crosses that headroom.
+    // A cached exec therefore owns these addresses just as surely as it owns
+    // _collisonPairs.  Omitting them let a later tier read freed last-H data;
+    // large real scenes eventually produced a NaN energy even though the DCD
+    // capacity and its graph key were both current.
+    ptr(ipc.lambda_lastH_scalar);
+    ptr(ipc.distCoord);
+    ptr(ipc.tanBasis);
+    ptr(ipc._collisonPairs_lastH);
+    ptr(ipc.lambda_lastH_scalar_gd);
+    ptr(ipc._collisonPairs_lastH_gd);
     ptr(ipc.bvh_f._nodes);
     ptr(ipc.bvh_e._nodes);
     seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.MAX_COLLITION_PAIRS_NUM));
     seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.MAX_CCD_COLLITION_PAIRS_NUM));
+    // Types 5/6 use exact host-published launch shapes.  Counts belong in the
+    // signature even when cudaMalloc happens to recycle every buffer address.
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.h_cpNum_last[0]));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.h_gpNum_last));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.m_fric_cp_cap));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.m_fric_gd_cap));
     seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.vertexNum));
     seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.surf_vertexNum));
     seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.m_perenv_bvh));
@@ -16546,6 +16574,9 @@ void GIPC::ensure_frictionBuffers()
         CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, n * sizeof(int4)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex_last, n * sizeof(int)));
         m_fric_cp_cap = n;
+        if(getenv("STIFF_LS_GRAPH_DIAG"))
+            printf("[friction-grow] cp=%u cap=%zu; LS graph key will rebind last-H buffers\n",
+                   h_cpNum[0], m_fric_cp_cap);
     }
     if((size_t)h_gpNum > m_fric_gd_cap)
     {
@@ -16558,6 +16589,9 @@ void GIPC::ensure_frictionBuffers()
         CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, n * sizeof(double)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd, n * sizeof(uint32_t)));
         m_fric_gd_cap = n;
+        if(getenv("STIFF_LS_GRAPH_DIAG"))
+            printf("[friction-ground-grow] gp=%u cap=%zu; LS graph key will rebind last-H buffers\n",
+                   h_gpNum, m_fric_gd_cap);
     }
     if(h_cpNum[0])
         CUDA_SAFE_CALL(cudaMemset(distCoord, 0, h_cpNum[0] * sizeof(double2)));  // [4.3] frame-0 lag uninit
