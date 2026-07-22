@@ -178,15 +178,31 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                });
 
 
+    // [frame-fsm P3a-prep] publish the exact unique count on the DEVICE first
+    // (scan tail + 1) so downstream launches can guard against it without a
+    // round-trip; the host mirror read below now only feeds the SpMV shape
+    // publication (removed entirely in full P3a).
+    {
+        auto* d_cnt = global_triplets.d_unique_key_number;
+        auto* d_src = sorted_partition_output + length - 1;
+        muda::ParallelFor(1)
+            .kernel_name("publish_unique_count")
+            .apply(1,
+                   [d_cnt, d_src] __device__(int) mutable
+                   { *d_cnt = *d_src + 1; });
+    }
     CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
                               sorted_partition_output + length - 1,
                               sizeof(int),
                               cudaMemcpyDeviceToHost));
     global_triplets.h_unique_key_number += 1;
 
-    CUDA_SAFE_CALL(cudaMemset(global_triplets.block_values(start),
-                              0,
-                              global_triplets.h_unique_key_number * sizeof(Eigen::Matrix3d)));
+    // upper-bound (nuniq <= length) async clear: legal inside capture and
+    // independent of the host mirror.
+    CUDA_SAFE_CALL(cudaMemsetAsync(global_triplets.block_values(start),
+                                   0,
+                                   (size_t)length * sizeof(Eigen::Matrix3d),
+                                   cudaStreamPerThread));
 
     // [multi-env determinism 4.3 #4] DETERMINISTIC merge of duplicate (i,j) blocks. The old
     // FastSegmentalReduce summed each segment in sorted-array (= stable-sort = emission) order,
@@ -194,8 +210,14 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
     // each sorted block's 9 doubles into a binned accumulator keyed by the unique output index
     // (order-independent ⇒ bit-identical), then combine.
     {
-        int    nuniq = global_triplets.h_unique_key_number;
-        size_t need  = (size_t)nuniq * 9 * BINNED_K;
+        // [frame-fsm P3a-prep] size the merge bins by the LENGTH upper bound
+        // (nuniq <= length always) on power-of-two steps: growth happens on
+        // capacity tiers only (O(log) mallocs over a run, none once the
+        // high-water tier is reached), and the clear is stream-ordered.
+        size_t cap_len = 1;
+        while(cap_len < (size_t)length)
+            cap_len <<= 1;
+        size_t need = cap_len * 9 * BINNED_K;
         if(need > m_mergebin_cap)
         {
             if(m_mergebin)
@@ -203,7 +225,9 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
             cudaMalloc((void**)&m_mergebin, need * sizeof(double));
             m_mergebin_cap = need;
         }
-        cudaMemset(m_mergebin, 0, need * sizeof(double));
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_mergebin, 0,
+                                       (size_t)length * 9 * BINNED_K * sizeof(double),
+                                       cudaStreamPerThread));
 
         auto* src_blocks = global_triplets.block_values(out_start_id);  // sorted src (length)
         auto* dst_blocks = global_triplets.block_values(start);         // unique out (nuniq)
@@ -221,11 +245,14 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                            binned_deposit(mbin + ((size_t)out * 9 + c) * BINNED_K, sd[c]);
                    });
 
+        auto* d_uniq = global_triplets.d_unique_key_number;
         ParallelFor(256)
             .kernel_name("binned_block_merge_combine")
-            .apply(nuniq,
-                   [dst_blocks, mbin] __device__(int u) mutable
+            .apply(length,
+                   [dst_blocks, mbin, d_uniq] __device__(int u) mutable
                    {
+                       if(u >= *d_uniq)
+                           return;
                        double* dd = reinterpret_cast<double*>(dst_blocks + u);
 #pragma unroll
                        for(int c = 0; c < 9; ++c)
