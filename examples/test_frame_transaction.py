@@ -40,10 +40,15 @@ def make_engine():
     sys.path.insert(0, str(ROOT))
     from stiff_physics.engine import Config, Engine
 
-    engine = Engine(Config(dt=0.020,
-                           ground_offset=-0.5,
-                           assets_dir=ASSETS,
-                           preconditioner_type=0))
+    engine = Engine(Config(
+        dt=0.020,
+        ground_offset=-0.5,
+        assets_dir=ASSETS,
+        preconditioner_type=0,
+        collision_detection_buff_scale=float(
+            os.environ.get("STIFF_FRAME_TEST_BUFF_SCALE", "6.0")
+        ),
+    ))
     transform = np.eye(4)
     transform[:3, :3] *= 0.1
     transform[1, 3] = 0.5
@@ -94,6 +99,7 @@ def run_case(name: str, updates: dict[str, str]) -> dict:
         "STIFF_FRAME_GRAPH", "STIFF_FRAME_FORCE_ROLLBACK",
         "STIFF_FRAME_TEST_DCD_CAP", "STIFF_FRAME_TEST_CCD_CAP",
         "STIFF_FRAME_TEST_TRIPLET_CAP", "STIFF_FRAME_TEST_NAN_VERTEX",
+        "STIFF_FRAME_TEST_BUFF_SCALE",
     ):
         env.pop(key, None)
     env.update(PYTHONPATH=str(ROOT),
@@ -126,12 +132,15 @@ def parent() -> None:
         "STIFF_FRAME_GRAPH": "1", "STIFF_FRAME_FORCE_ROLLBACK": "1"})
     small = run_case("triplet cap=0", {
         "STIFF_FRAME_GRAPH": "1", "STIFF_FRAME_TEST_TRIPLET_CAP": "0"})
+    physical_small = run_case("physical cap small", {
+        "STIFF_FRAME_GRAPH": "1", "STIFF_FRAME_TEST_BUFF_SCALE": "0.001"})
     nan = run_case("NaN rollback", {
         "STIFF_FRAME_GRAPH": "1", "STIFF_FRAME_TEST_NAN_VERTEX": "0"})
 
     reference = legacy["after"]
     for name, payload in (("graph A", graph_a), ("graph B", graph_b),
-                          ("forced rollback", forced), ("small cap", small)):
+                          ("forced rollback", forced), ("small cap", small),
+                          ("physical small cap", physical_small)):
         assert payload["result"] == 0, (name, payload)
         assert payload["after"] == reference, (name, payload)
     assert graph_a["after"] == graph_b["after"]
@@ -139,6 +148,9 @@ def parent() -> None:
     assert small["attempt"] == small["retry_count"] == 1
     assert small["required_triplets"] > 0
     assert small["retry_invalid_bits"] & (1 << 18)
+    assert physical_small["attempt"] == physical_small["retry_count"] == 1
+    assert physical_small["required_ccd_pairs"] > 0
+    assert physical_small["retry_invalid_bits"] & (1 << 17)
     assert graph_a["root_d2h_nodes"] == 0
     assert graph_a["terminal_d2h_nodes"] == 1
 
