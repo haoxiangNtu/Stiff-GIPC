@@ -3357,11 +3357,19 @@ void SimEngine::get_body_contact_force_batched(const int* h_offsets,
     CUDA_SAFE_CALL(cudaMemcpy(h_out3, s_d_out, n_seg * 3 * sizeof(double), cudaMemcpyDeviceToHost));
 }
 
-int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_ground)
+int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_ground,
+                                         int components)
 {
     // [contact-force distribution] identical contact rebuild as
     // get_body_contact_force_batched, but returns the UNsummed per-vertex
     // buffer — the image-style force-distribution feedback.
+    // components: 0 = normal (barrier [+ground]) only — historic behavior;
+    //             1 = friction_lagged only — the friction-potential gradient
+    //                 the solver ACTUALLY used this step (positions current,
+    //                 lambda/tangent basis lagged one step by construction);
+    //             2 = total = normal + friction_lagged.
+    // The lagged-friction path reads the immutable lastH set — it must NOT
+    // rebuild friction sets (that would perturb the next solve's state).
     auto& impl = *m_impl;
     GIPC& g    = impl.ipc;
     int   nv   = static_cast<int>(g.vertexNum);
@@ -3371,11 +3379,20 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
     memset(out3, 0, (size_t)nw * 3 * sizeof(double));
     if(g.m_skip_all_collision)
         return nw;
+    const bool want_normal   = (components == 0 || components == 2);
+    const bool want_friction = (components == 1 || components == 2);
+    const bool have_friction = (g.h_cpNum_last[0] > 0 || g.h_gpNum_last > 0);
 
-    g.buildBVH();
-    g.buildCP();
-    if(g.h_cpNum[0] < 1 && !(include_ground && g.h_gpNum > 0))
-        return nw;   // nothing in contact -> all zeros
+    if(want_normal)
+    {
+        g.buildBVH();
+        g.buildCP();
+    }
+    // [audit] the old early-return must not swallow a friction-only request:
+    // lagged friction can exist while the CURRENT normal set is empty.
+    if((!want_normal || (g.h_cpNum[0] < 1 && !(include_ground && g.h_gpNum > 0)))
+       && !(want_friction && have_friction))
+        return nw;   // nothing requested is present -> all zeros
 
     static double3* s_d_grad = nullptr;
     static int      s_cap    = 0;
@@ -3387,9 +3404,14 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
     }
     CUDA_SAFE_CALL(cudaMemset(s_d_grad, 0, nv * sizeof(double3)));
     g.zeroBinnedGrad();
-    g.calBarrierGradient(s_d_grad, g.Kappa);
-    if(include_ground)
-        g.computeGroundGradient(s_d_grad, g.Kappa);
+    if(want_normal)
+    {
+        g.calBarrierGradient(s_d_grad, g.Kappa);
+        if(include_ground)
+            g.computeGroundGradient(s_d_grad, g.Kappa);
+    }
+    if(want_friction && have_friction)
+        g.calFrictionGradient(s_d_grad, impl.d_tetMesh);   // lastH set, read-only
     g.combineBinnedGrad(s_d_grad);
     CUDA_SAFE_CALL(cudaMemcpy(out3, s_d_grad, (size_t)nw * 3 * sizeof(double),
                               cudaMemcpyDeviceToHost));
@@ -3430,10 +3452,54 @@ __global__ void _fem_tet_von_mises(const double3* verts, const uint4* tets,
     const double J = F[0][0] * (F[1][1] * F[2][2] - F[1][2] * F[2][1])
                      - F[0][1] * (F[1][0] * F[2][2] - F[1][2] * F[2][0])
                      + F[0][2] * (F[1][0] * F[2][1] - F[1][1] * F[2][0]);
-    if(!(J > 1e-12)) { tet_vm[i] = 0.0; return; }   // inverted/degenerate: skip
+    if(!(J > 1e-12) || !isfinite(J))
+    {   // [vM constitutive-consistency] inverted/degenerate element: report NaN,
+        // NOT 0 — a silent zero hides the WORST element in the body (audit
+        // leftover #2). Downstream: filter with isfinite() / treat NaN as
+        // "element state invalid for stress readout".
+        tet_vm[i] = nan("");
+        return;
+    }
+#ifdef USE_SNK1
+    // [vM constitutive-consistency] use the SAME P(F) as the solver's energy
+    // (femEnergy.cu __computePEPF_StableNHK3D1_double, active under USE_SNK1):
+    //   P = u*F + r*(J - 1 - u/r)*cof(F),  u = lengthRate, r = volumeRate
+    // Cauchy sigma = P F^T / J. The previous exporter recovered standard-NHK
+    // (mu, lambda) and used log(J) — a DIFFERENT constitutive law from what the
+    // solver minimizes, so exported magnitudes were systematically off.
+    {
+        const double u = lengthRate[i], r_ = volumeRate[i];
+        double cof[3][3];
+        cof[0][0] = F[1][1]*F[2][2] - F[1][2]*F[2][1];
+        cof[0][1] = F[1][2]*F[2][0] - F[1][0]*F[2][2];
+        cof[0][2] = F[1][0]*F[2][1] - F[1][1]*F[2][0];
+        cof[1][0] = F[2][1]*F[0][2] - F[2][2]*F[0][1];
+        cof[1][1] = F[2][2]*F[0][0] - F[2][0]*F[0][2];
+        cof[1][2] = F[2][0]*F[0][1] - F[2][1]*F[0][0];
+        cof[2][0] = F[0][1]*F[1][2] - F[1][1]*F[0][2];
+        cof[2][1] = F[0][2]*F[1][0] - F[0][0]*F[1][2];
+        cof[2][2] = F[0][0]*F[1][1] - F[0][1]*F[1][0];
+        const double w = r_ * (J - 1.0 - u / r_);
+        double P[3][3], s[3][3];
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                P[r][c] = u * F[r][c] + w * cof[r][c];
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                s[r][c] = (P[r][0]*F[c][0] + P[r][1]*F[c][1] + P[r][2]*F[c][2]) / J;
+        const double tr3s = (s[0][0] + s[1][1] + s[2][2]) / 3.0;
+        s[0][0] -= tr3s; s[1][1] -= tr3s; s[2][2] -= tr3s;
+        double dd2 = 0.0;
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                dd2 += s[r][c] * s[r][c];
+        tet_vm[i] = sqrt(1.5 * dd2);
+        return;
+    }
+#endif
     const double mu_l  = 0.75 * lengthRate[i];
     const double lam   = volumeRate[i] - (5.0 / 6.0) * mu_l;
-    // Cauchy sigma = mu/J (F F^T - I) + lambda ln(J)/J I
+    // Cauchy sigma = mu/J (F F^T - I) + lambda ln(J)/J I  (standard NHK builds)
     double B[3][3];
     for(int r = 0; r < 3; ++r)
         for(int c = 0; c < 3; ++c)

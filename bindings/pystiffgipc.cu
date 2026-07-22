@@ -397,18 +397,24 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("get_assets_dir", &SimEngine::get_assets_dir)
 
-        .def("get_vertex_contact_forces", [](SimEngine& e, bool include_ground) {
+        .def("get_vertex_contact_forces", [](SimEngine& e, bool include_ground,
+                                             int components) {
                 int n = e.get_vertex_count();
                 auto arr = py::array_t<double>({n, 3});
-                int nw = e.get_vertex_contact_forces(arr.mutable_data(), n, include_ground);
+                int nw = e.get_vertex_contact_forces(arr.mutable_data(), n,
+                                                     include_ground, components);
                 (void)nw;
                 return arr;
-            }, py::arg("include_ground") = true,
+            }, py::arg("include_ground") = true, py::arg("components") = 0,
             "[contact-force distribution] Per-vertex physical contact FORCES "
-            "(N,3) in NEWTONS (= -gradient/dt^2; body-body barrier, + ground "
-            "barrier when include_ground; friction NOT included). NOTE: units "
-            "differ from the legacy batched API, which returns raw gradients "
-            "(-force*dt^2). Rebuilds contacts once; call between frames.")
+            "(N,3) in NEWTONS (= -gradient/dt^2). components: 0 = normal only "
+            "(body-body barrier, + ground barrier when include_ground) — "
+            "historic behavior; 1 = friction_lagged only (the friction-"
+            "potential gradient the solver ACTUALLY used this step: positions "
+            "current, lambda/tangent basis lagged one step); 2 = total. NOTE: "
+            "units differ from the legacy batched API (raw gradients). "
+            "Rebuilds normal contacts once when requested; the lagged-friction "
+            "path is read-only on the solver's frozen friction set.")
         .def("get_fem_von_mises_stress", [](SimEngine& e) {
                 int n = e.get_vertex_count();
                 auto arr = py::array_t<double>(n);

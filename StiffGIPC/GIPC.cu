@@ -15184,6 +15184,30 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             cudaDeviceSynchronize();
             throwIfInvalidCcdAlpha("per-env CCD reduction");
             std::vector<double> hg(NG), hs(NG), hr(NG), hmx(NG), hnm(NG);
+            // [semi-implicit beta timing fix] update beta_g from the PREVIOUS
+            // iteration's ACCEPTED per-env alpha (m_env_alpha still holds it —
+            // this S1 pass overwrites it further below), not from this
+            // iteration's pre-line-search candidate. Candidate-based decay
+            // overestimated progress whenever backtracking halved the step
+            // (audit leftover #5). Threshold crossing only arms a freeze flag
+            // consumed in the loop below (freeze-next semantics).
+            static std::vector<char> semi_freeze_next;
+            if(semi_implicit_enabled && (int)k >= semi_implicit_min_iter + 1)
+            {
+                std::vector<double> h_acc(NG);
+                cudaMemcpy(h_acc.data(), m_env_alpha, NG*sizeof(double), cudaMemcpyDeviceToHost);
+                if((int)semi_freeze_next.size() < NG) semi_freeze_next.assign(NG, 0);
+                for(int g = 0; g < NG; ++g)
+                {
+                    if(m_env_status[g] != 0) continue;         // already frozen/diverged
+                    semi_beta_env[g] *= std::max(0.0, 1.0 - h_acc[g]);
+                    if(semi_beta_env[g] <= semi_implicit_beta_tol)
+                        semi_freeze_next[g] = 1;
+                }
+            }
+            else if((int)semi_freeze_next.size() < NG)
+                semi_freeze_next.assign(NG, 0);
+            if((int)k == 0) std::fill(semi_freeze_next.begin(), semi_freeze_next.end(), 0);
             cudaMemcpy(hg.data(),  m_env_scratch + 0*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
             cudaMemcpy(hs.data(),  m_env_scratch + 1*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
             cudaMemcpy(hr.data(),  m_env_scratch + 2*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
@@ -15268,18 +15292,15 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                    g, env_newton_iter_cap, (int)k);
                         }
                     }
-                    else if(semi_implicit_enabled && (int)k >= semi_implicit_min_iter)
-                    {   // [semi-implicit per-env] beta_g *= (1 - alpha_g);
-                        // freeze only THIS env when its beta drops below tol.
-                        semi_beta_env[g] *= std::max(0.0, 1.0 - h_env_alpha[g]);
-                        if(semi_beta_env[g] <= semi_implicit_beta_tol)
+                    else if(semi_implicit_enabled && semi_freeze_next[g])
+                    {   // [semi-implicit per-env, beta timing fix] the freeze flag
+                        // was armed from the PREVIOUS iteration's accepted alpha
+                        // (see the beta update above the loop); consume it here.
+                        h_env_alpha[g] = 0.0;
+                        if(m_env_status[g] == 0)
                         {
-                            h_env_alpha[g] = 0.0;
-                            if(m_env_status[g] == 0)
-                            {
-                                m_env_status[g]      = 1;   // converged (semi-implicit accept)
-                                m_env_frozen_iter[g] = (int)k;
-                            }
+                            m_env_status[g]      = 1;   // converged (semi-implicit accept)
+                            m_env_frozen_iter[g] = (int)k;
                         }
                     }
                 }

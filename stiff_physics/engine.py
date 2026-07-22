@@ -1088,16 +1088,27 @@ class Engine:
         """
         return self._engine.get_contacts()
 
-    def get_vertex_contact_forces(self, include_ground: bool = True) -> np.ndarray:
+    def get_vertex_contact_forces(self, include_ground: bool = True,
+                                  components: str = "normal") -> np.ndarray:
         """Per-vertex IPC contact force (N, 3) in Newtons of the current state.
 
-        Self-contact barrier forces, plus ground-contact when
-        ``include_ground``. The unsummed distribution behind
-        ``get_body_contact_force_batched`` — slice with
-        :meth:`get_load_records` vertex ranges for per-body maps. Rebuilds
-        contacts once; call between frames.
+        ``components`` selects what is included:
+
+        - ``"normal"`` (default, historic behavior): body-body barrier forces,
+          plus ground contact when ``include_ground``.
+        - ``"friction_lagged"``: the friction forces the solver ACTUALLY used
+          this step. Positions are current; the normal force (lambda) and
+          tangent basis are lagged one step by IPC's semi-implicit friction —
+          this is the honest label for what the engine applies.
+        - ``"total"``: normal + friction_lagged (e.g. an object at rest on a
+          slope now sums to ~zero net contact force).
+
+        Slice with :meth:`get_load_records` vertex ranges for per-body maps.
+        Rebuilds normal contacts once when requested; the friction path is
+        read-only on the solver's frozen friction set.
         """
-        return np.asarray(self._engine.get_vertex_contact_forces(include_ground))
+        comp = {"normal": 0, "friction_lagged": 1, "total": 2}[components]
+        return np.asarray(self._engine.get_vertex_contact_forces(include_ground, comp))
 
     def get_fem_von_mises_stress(self) -> np.ndarray:
         """Per-vertex von Mises stress (Pa): per-tet Neo-Hookean Cauchy stress,

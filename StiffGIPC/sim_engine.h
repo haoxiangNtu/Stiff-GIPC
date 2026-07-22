@@ -288,7 +288,11 @@ class SimEngine
     /// legacy batched API, which returns raw gradients (-force*dt^2) (sum over a
     /// body's vertices = its net contact force). Writes min(n, vertexNum)
     /// triples into out3; returns the number written.
-    int get_vertex_contact_forces(double* out3, int n, bool include_ground = true);
+    /// components: 0 = normal only (historic), 1 = friction_lagged only
+    /// (the friction-potential gradient the solver actually used this step —
+    /// positions current, lambda/tangent basis lagged), 2 = total.
+    int get_vertex_contact_forces(double* out3, int n, bool include_ground = true,
+                                  int components = 0);
 
     /// [FEM stress] Per-vertex von Mises stress (Pa) of the current state:
     /// per-tet Neo-Hookean Cauchy stress -> von Mises -> per-vertex MAX over
