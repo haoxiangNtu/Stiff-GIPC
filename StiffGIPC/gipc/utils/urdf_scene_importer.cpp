@@ -2,14 +2,233 @@
 #include <gipc/utils/simple_scene_importer.h>
 #include <urdf_parser/urdf_parser.h>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <map>
 #include <set>
 #include <Eigen/Geometry>
 
 namespace gipc
 {
 namespace fs = std::filesystem;
+
+// ============================================================================
+// URDF primitive collision -> conservative circumscribed proxy mesh (B1)
+//
+// box/sphere/cylinder collision elements are converted to watertight triangle
+// meshes that CONTAIN the exact primitive (proxy >= primitive everywhere, so
+// contact can only be conservative, never missed), written to a cache .obj and
+// loaded through the normal surface-mesh path.  All collision elements of a
+// link are merged into one proxy with each element's own origin baked into the
+// vertices; the link's collision_origin is then Identity.
+// ============================================================================
+namespace
+{
+constexpr double kPrimPi = 3.14159265358979323846;
+
+struct PrimMesh
+{
+    std::vector<Eigen::Vector3d> V;
+    std::vector<Eigen::Vector3i> F;  // 0-based indices, outward CCW winding
+};
+
+void prim_append(PrimMesh& dst, const PrimMesh& src, const Eigen::Matrix4d& X)
+{
+    const int base = static_cast<int>(dst.V.size());
+    for(const auto& v : src.V)
+    {
+        Eigen::Vector4d h = X * Eigen::Vector4d(v.x(), v.y(), v.z(), 1.0);
+        dst.V.emplace_back(h.x(), h.y(), h.z());
+    }
+    for(const auto& f : src.F)
+        dst.F.emplace_back(f.x() + base, f.y() + base, f.z() + base);
+}
+
+// URDF box size = full extents; exact representation, no inflation needed.
+PrimMesh prim_box(double sx, double sy, double sz)
+{
+    PrimMesh     m;
+    const double x = 0.5 * sx, y = 0.5 * sy, z = 0.5 * sz;
+    m.V = {{-x, -y, -z}, {x, -y, -z}, {x, y, -z}, {-x, y, -z},
+           {-x, -y, z},  {x, -y, z},  {x, y, z},  {-x, y, z}};
+    const int idx[12][3] = {{0, 2, 1}, {0, 3, 2}, {4, 5, 6}, {4, 6, 7},
+                            {0, 1, 5}, {0, 5, 4}, {2, 3, 7}, {2, 7, 6},
+                            {1, 2, 6}, {1, 6, 5}, {3, 0, 4}, {3, 4, 7}};
+    for(const auto& f : idx)
+        m.F.emplace_back(f[0], f[1], f[2]);
+    return m;
+}
+
+// Icosphere subdivided `subdiv` times, then uniformly scaled so every face
+// PLANE lies at distance >= radius from the center: the convex proxy then
+// contains the exact ball (circumscribed, ~2.4% radial inflation at subdiv 2).
+PrimMesh prim_icosphere(double radius, int subdiv = 2)
+{
+    const double                 t = (1.0 + std::sqrt(5.0)) / 2.0;
+    std::vector<Eigen::Vector3d> V = {{-1, t, 0},  {1, t, 0},  {-1, -t, 0},
+                                      {1, -t, 0},  {0, -1, t}, {0, 1, t},
+                                      {0, -1, -t}, {0, 1, -t}, {t, 0, -1},
+                                      {t, 0, 1},   {-t, 0, -1}, {-t, 0, 1}};
+    for(auto& v : V)
+        v.normalize();
+    std::vector<Eigen::Vector3i> F = {
+        {0, 11, 5}, {0, 5, 1},  {0, 1, 7},   {0, 7, 10}, {0, 10, 11},
+        {1, 5, 9},  {5, 11, 4}, {11, 10, 2}, {10, 7, 6}, {7, 1, 8},
+        {3, 9, 4},  {3, 4, 2},  {3, 2, 6},   {3, 6, 8},  {3, 8, 9},
+        {4, 9, 5},  {2, 4, 11}, {6, 2, 10},  {8, 6, 7},  {9, 8, 1}};
+
+    for(int s = 0; s < subdiv; s++)
+    {
+        std::map<std::pair<int, int>, int> midcache;
+        auto midpoint = [&](int a, int b) -> int
+        {
+            const auto key = std::minmax(a, b);
+            auto       it  = midcache.find(key);
+            if(it != midcache.end())
+                return it->second;
+            V.push_back((V[a] + V[b]).normalized());
+            const int id  = static_cast<int>(V.size()) - 1;
+            midcache[key] = id;
+            return id;
+        };
+        std::vector<Eigen::Vector3i> F2;
+        F2.reserve(F.size() * 4);
+        for(const auto& f : F)
+        {
+            const int a = midpoint(f[0], f[1]);
+            const int b = midpoint(f[1], f[2]);
+            const int c = midpoint(f[2], f[0]);
+            F2.emplace_back(f[0], a, c);
+            F2.emplace_back(f[1], b, a);
+            F2.emplace_back(f[2], c, b);
+            F2.emplace_back(a, b, c);
+        }
+        F.swap(F2);
+    }
+
+    double dmin = 1.0;
+    for(const auto& f : F)
+    {
+        Eigen::Vector3d n  = (V[f[1]] - V[f[0]]).cross(V[f[2]] - V[f[0]]);
+        const double    nn = n.norm();
+        if(nn > 0)
+            dmin = std::min(dmin, std::abs(n.dot(V[f[0]])) / nn);
+    }
+    const double s = radius / std::max(dmin, 1e-12);
+
+    PrimMesh m;
+    m.V.reserve(V.size());
+    for(const auto& v : V)
+        m.V.push_back(v * s);
+    m.F = std::move(F);
+    return m;
+}
+
+// URDF cylinder: axis = local +Z, centered at origin.  Radial vertices use the
+// circumscribed-polygon radius r/cos(pi/n) so the flat side walls stay outside
+// the exact cylinder (~0.9% radial inflation at n=24).  Caps are center fans.
+PrimMesh prim_cylinder(double radius, double length, int nseg = 24)
+{
+    PrimMesh     m;
+    const double hz    = 0.5 * length;
+    const double r_out = radius / std::cos(kPrimPi / nseg);
+    for(int k = 0; k < nseg; k++)
+    {
+        const double a = 2.0 * kPrimPi * k / nseg;
+        m.V.emplace_back(r_out * std::cos(a), r_out * std::sin(a), -hz);
+    }
+    for(int k = 0; k < nseg; k++)
+    {
+        const double a = 2.0 * kPrimPi * k / nseg;
+        m.V.emplace_back(r_out * std::cos(a), r_out * std::sin(a), hz);
+    }
+    m.V.emplace_back(0, 0, -hz);
+    m.V.emplace_back(0, 0, hz);
+    const int cb = 2 * nseg, ct = 2 * nseg + 1;
+    for(int k = 0; k < nseg; k++)
+    {
+        const int k1 = (k + 1) % nseg;
+        m.F.emplace_back(k, k1, nseg + k1);
+        m.F.emplace_back(k, nseg + k1, nseg + k);
+        m.F.emplace_back(cb, k1, k);
+        m.F.emplace_back(ct, nseg + k, nseg + k1);
+    }
+    return m;
+}
+
+// Build one merged proxy from a primitive collision element; returns false if
+// the geometry type is not a supported primitive or has degenerate parameters.
+bool prim_from_collision(const urdf::CollisionSharedPtr& coll,
+                         const Eigen::Matrix4d&          origin,
+                         PrimMesh&                       merged,
+                         std::string&                    desc)
+{
+    if(!coll || !coll->geometry)
+        return false;
+    switch(coll->geometry->type)
+    {
+        case urdf::Geometry::BOX: {
+            auto box = std::dynamic_pointer_cast<urdf::Box>(coll->geometry);
+            if(!box || box->dim.x <= 0 || box->dim.y <= 0 || box->dim.z <= 0)
+                return false;
+            prim_append(merged, prim_box(box->dim.x, box->dim.y, box->dim.z), origin);
+            desc += (desc.empty() ? "" : "+") + std::string("box");
+            return true;
+        }
+        case urdf::Geometry::SPHERE: {
+            auto sp = std::dynamic_pointer_cast<urdf::Sphere>(coll->geometry);
+            if(!sp || sp->radius <= 0)
+                return false;
+            prim_append(merged, prim_icosphere(sp->radius), origin);
+            desc += (desc.empty() ? "" : "+") + std::string("sphere");
+            return true;
+        }
+        case urdf::Geometry::CYLINDER: {
+            auto cy = std::dynamic_pointer_cast<urdf::Cylinder>(coll->geometry);
+            if(!cy || cy->radius <= 0 || cy->length <= 0)
+                return false;
+            prim_append(merged, prim_cylinder(cy->radius, cy->length), origin);
+            desc += (desc.empty() ? "" : "+") + std::string("cylinder");
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// Write the proxy as .obj into a cache dir (next to the URDF, falling back to
+// the system temp dir).  Returns empty string on failure.
+std::string write_prim_obj(const PrimMesh&    m,
+                           const fs::path&    urdf_folder,
+                           const std::string& urdf_stem,
+                           const std::string& link_name)
+{
+    auto try_write = [&](const fs::path& dir) -> std::string
+    {
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const fs::path path = dir / (urdf_stem + "_" + link_name + "_prim.obj");
+        std::ofstream  out(path);
+        if(!out)
+            return {};
+        out << std::setprecision(17);
+        out << "# StiffGIPC auto-generated conservative primitive proxy\n";
+        for(const auto& v : m.V)
+            out << "v " << v.x() << " " << v.y() << " " << v.z() << "\n";
+        for(const auto& f : m.F)
+            out << "f " << f.x() + 1 << " " << f.y() + 1 << " " << f.z() + 1 << "\n";
+        out.close();
+        return out.good() ? fs::absolute(path).string() : std::string{};
+    };
+    std::string p = try_write(urdf_folder / ".stiffgipc_prim_cache");
+    if(p.empty())
+        p = try_write(fs::temp_directory_path() / "stiffgipc_prim_cache");
+    return p;
+}
+}  // namespace
 
 // ============================================================================
 // Public API
@@ -635,27 +854,79 @@ bool UrdfSceneImporter::parse_urdf()
             info.has_collision    = true;
             info.collision_origin = urdf_pose_to_matrix(link->collision->origin);
 
-            auto geom_type = link->collision->geometry->type;
-            if(geom_type != urdf::Geometry::MESH)
+            // Gather all collision elements of this link (urdfdom fills
+            // collision_array; `collision` aliases the first element).
+            std::vector<urdf::CollisionSharedPtr> colls;
+            if(!link->collision_array.empty())
+                colls.assign(link->collision_array.begin(),
+                             link->collision_array.end());
+            else
+                colls.push_back(link->collision);
+
+            urdf::CollisionSharedPtr mesh_coll;
+            int                      prim_count = 0;
+            for(const auto& c : colls)
             {
-                // [B1 warning] Primitive collision geometry (box/sphere/cylinder)
-                // is NOT supported: this importer only loads mesh collision
-                // elements, so the link would silently lose its collision shape.
-                // Say so loudly instead — convert the primitive to a triangle
-                // mesh in the URDF (e.g. *_collmesh.urdf) to keep it.
-                const char* tn = geom_type == urdf::Geometry::BOX      ? "box"
-                                 : geom_type == urdf::Geometry::SPHERE   ? "sphere"
-                                 : geom_type == urdf::Geometry::CYLINDER ? "cylinder"
-                                                                          : "non-mesh";
-                std::cerr << "[UrdfSceneImporter] WARNING: link '" << name
-                          << "' has a " << tn << " collision primitive — only MESH "
-                          << "collision is supported, this link's collision will be "
-                          << "SKIPPED (convert primitives to meshes in the URDF)."
-                          << std::endl;
+                if(!c || !c->geometry)
+                    continue;
+                if(c->geometry->type == urdf::Geometry::MESH && !mesh_coll)
+                    mesh_coll = c;
+                else if(c->geometry->type != urdf::Geometry::MESH)
+                    prim_count++;
             }
-            if(geom_type == urdf::Geometry::MESH)
+
+            if(!mesh_coll && prim_count > 0)
             {
-                auto mesh = std::dynamic_pointer_cast<urdf::Mesh>(link->collision->geometry);
+                // [B1] Primitive-only collision: merge every element into one
+                // conservative proxy mesh, each element's origin baked into
+                // the vertices (collision_origin becomes Identity).
+                PrimMesh    merged;
+                std::string desc;
+                for(const auto& c : colls)
+                {
+                    if(!prim_from_collision(c, urdf_pose_to_matrix(c->origin), merged, desc))
+                        std::cerr << "[UrdfSceneImporter] WARNING: link '" << name
+                                  << "' has an unsupported or degenerate "
+                                  << "collision primitive element, skipped."
+                                  << std::endl;
+                }
+                if(!merged.F.empty())
+                {
+                    const std::string stem = fs::path{m_urdf_path}.stem().string();
+                    const std::string path =
+                        write_prim_obj(merged, urdf_folder, stem, name);
+                    if(!path.empty())
+                    {
+                        info.collision_mesh_filename = path;
+                        info.collision_origin = Eigen::Matrix4d::Identity();
+                        info.collision_scale  = Eigen::Vector3d::Ones();
+                        std::cout << "[UrdfSceneImporter] link '" << name
+                                  << "': generated conservative primitive proxy ("
+                                  << desc << ", " << merged.V.size() << " verts, "
+                                  << merged.F.size() << " tris) -> " << path
+                                  << std::endl;
+                    }
+                    else
+                    {
+                        std::cerr << "[UrdfSceneImporter] WARNING: link '" << name
+                                  << "': failed to write primitive proxy mesh, "
+                                  << "this link's collision will be SKIPPED."
+                                  << std::endl;
+                    }
+                }
+            }
+            else if(mesh_coll && prim_count > 0)
+            {
+                std::cerr << "[UrdfSceneImporter] WARNING: link '" << name
+                          << "' mixes mesh and primitive collision elements — "
+                          << "using the first mesh, " << prim_count
+                          << " primitive element(s) IGNORED." << std::endl;
+            }
+
+            if(mesh_coll)
+            {
+                info.collision_origin = urdf_pose_to_matrix(mesh_coll->origin);
+                auto mesh = std::dynamic_pointer_cast<urdf::Mesh>(mesh_coll->geometry);
                 if(mesh && !mesh->filename.empty())
                 {
                     // Resolve the mesh file path

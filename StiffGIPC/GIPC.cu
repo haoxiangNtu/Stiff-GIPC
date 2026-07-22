@@ -14384,6 +14384,17 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     while(checkInterset && isIntersected(TetMesh))
     {
+        if(numOfIntersect >= line_search_budget)
+        {
+            // After `line_search_budget` halvings the trial state is numerically
+            // the start state: the Newton step BEGAN intersecting (IPC feasibility
+            // invariant already broken upstream) — no step size can fix that.
+            // Fail fast like the ground trial above instead of spinning forever.
+            throw std::runtime_error(
+                "[StiffGIPC] mesh intersection persists after line-search "
+                "backtracking (start state likely already intersecting; IPC "
+                "feasibility invariant broken in an earlier step)");
+        }
         printf("type 0 intersection happened 0:  %d\n", insectNum);
         insectNum++;
         alpha /= 2.0;
@@ -14446,6 +14457,14 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         bool needRecomputeCS = false;
         while(checkInterset && isIntersected(TetMesh))
         {
+            if(numOfIntersect >= line_search_budget)
+            {
+                throw std::runtime_error(
+                    "[StiffGIPC] mesh intersection persists after energy "
+                    "line-search backtracking (start state likely already "
+                    "intersecting; IPC feasibility invariant broken in an "
+                    "earlier step)");
+            }
             printf("type 1 intersection happened 1:  %d\n", insectNum);
             insectNum++;
             alpha /= 2.0;
@@ -15748,9 +15767,16 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         bool rehash = true;
 
         buildBVH();
-        int numOfIntersect = 0;
+        int       numOfIntersect        = 0;
+        const int boundary_isect_budget = line_search_max_iter > 0 ? line_search_max_iter : 64;
         while(isIntersected(TetMesh))
         {
+            if(numOfIntersect >= boundary_isect_budget)
+            {
+                throw std::runtime_error(
+                    "[StiffGIPC] boundary-move intersection persists after "
+                    "backtracking (pre-move state likely already intersecting)");
+            }
             printf("type 6 intersection happened:    %f\n", alpha);
             alpha /= 2.0;
             updateBoundaryMoveDir(TetMesh, alpha, total_Frames);
