@@ -475,6 +475,12 @@ class GIPC
     // Queue all FEM/contact/ABD reductions and the exact-order device combine
     // into out_scalar. No D2H or host synchronization.
     void computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar);
+    // P2 line-search graph variant. Contact/ground terms launch a fixed tier
+    // capacity and read their exact counts from _cpNum/_gpNum on device, so a
+    // backtracking trial never needs the h_cpNum/h_gpNum mirrors.
+    void computeEnergy_DeviceOut_Capacity(device_TetraData& TetMesh,
+                                          double* out_scalar,
+                                          int pair_capacity);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
     // [backport] standalone per-env energy dispatcher: writes the reduced global
@@ -484,7 +490,9 @@ class GIPC
                                                     device_TetraData& TetMesh,
                                                     double* out_slot,
                                                     double* out_penv = nullptr,
-                                                    double energy_kappa = -1.0);
+                                                    double energy_kappa = -1.0,
+                                                    int launch_capacity = -1,
+                                                    const uint32_t* device_count = nullptr);
     // [multi-env S3] per-env total energy E_g into env_out[kEnvAlphaSlots]
     // (host array). Validates Sum_g E_g == global computeEnergy. Returns global E.
     double computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>& env_out);

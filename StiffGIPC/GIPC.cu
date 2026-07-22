@@ -7265,14 +7265,23 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
                                                double dHat,
                                                double Kappa,
                                                int    number,
-                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                               const uint32_t* device_count = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
 
     extern __shared__ double tep[];
     double temp = 0.0;
-    if(idx < number)
+    // `number` is the fixed launch capacity when device_count is present.
+    // Padding lanes contribute exact +0 and never touch pair payload storage.
+    // Keeping the capacity rounded to whole 256-thread blocks preserves the
+    // legacy reduction grouping for every live lane.
+    const uint32_t live_count = device_count
+                                    ? min(*device_count,
+                                          static_cast<uint32_t>(number))
+                                    : static_cast<uint32_t>(number);
+    if(static_cast<uint32_t>(idx) < live_count)
     {
         double3 normal = *g_normal;
         int     gidx   = _environment_collisionPair[idx];
@@ -8232,7 +8241,8 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
                                                double         _Kappa,
                                                double         _dHat,
                                                int            cpNum,
-                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                               const uint32_t* device_count = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -8240,7 +8250,11 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
     extern __shared__ double tep[];
     int                      numbers = cpNum;
     double                   temp = 0.0;
-    if(idx < numbers)
+    const uint32_t live_count = device_count
+                                    ? min(*device_count,
+                                          static_cast<uint32_t>(numbers))
+                                    : static_cast<uint32_t>(numbers);
+    if(static_cast<uint32_t>(idx) < live_count)
     {
         temp = __cal_Barrier_energy(
             vertexes, rest_vertexes, _collisionPair[idx], _Kappa, _dHat);
@@ -13828,7 +13842,9 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
                                                      device_TetraData& TetMesh,
                                                      double*           out_slot,
                                                      double*           out_penv,
-                                                     double            energy_kappa)
+                                                     double            energy_kappa,
+                                                     int               launch_capacity,
+                                                     const uint32_t*   device_count)
 {
     // [multi-env S3] per-env energy bucket for this term (size kEnvAlphaSlots) and
     // the global point_to_group; passed to the kernels when out_penv != nullptr.
@@ -13851,6 +13867,9 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
     else if(type == 8 || type == 11)numbers = triangleNum;
     else if(type == 9)              numbers = softNum;
     else if(type == 10)             numbers = tri_edge_num;
+
+    if(launch_capacity >= 0)
+        numbers = launch_capacity;
 
     if(numbers == 0)
     {
@@ -13886,7 +13905,7 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
             _getBarrierEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs,
                 energy_kappa >= 0.0 ? energy_kappa : Kappa, dHat, numbers,
-                pe, pe ? p2g : nullptr, ng);
+                pe, pe ? p2g : nullptr, ng, device_count);
             break;
         case 3:
             _getDeltaEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
@@ -13896,7 +13915,7 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
             _computeGroundEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, _groundOffset, _groundNormal,
                 _environment_collisionPair, dHat, Kappa, numbers,
-                pe, pe ? p2g : nullptr, ng);
+                pe, pe ? p2g : nullptr, ng, device_count);
             break;
         case 5:
             _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
@@ -14064,6 +14083,39 @@ void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar
                 "[line-search] device energy combine differs from host order");
         energy_validated = true;
     }
+}
+
+void GIPC::computeEnergy_DeviceOut_Capacity(device_TetraData& TetMesh,
+                                            double* out_scalar,
+                                            int pair_capacity)
+{
+    // Fixed-topology terms keep their historical exact launch shapes. Only
+    // DCD pairs and ground pairs are dynamic inside the LS graph: launch their
+    // tier/surface capacities and guard every payload read with the device
+    // counters populated by the immediately preceding buildCP.
+    Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, m_energy_slots + 0);
+    Energy_Add_Reduction_Algorithm_DeviceOut(1,  TetMesh, m_energy_slots + 1);
+    Energy_Add_Reduction_Algorithm_DeviceOut(8,  TetMesh, m_energy_slots + 2);
+    Energy_Add_Reduction_Algorithm_DeviceOut(10, TetMesh, m_energy_slots + 3);
+    Energy_Add_Reduction_Algorithm_DeviceOut(9,  TetMesh, m_energy_slots + 4);
+    Energy_Add_Reduction_Algorithm_DeviceOut(
+        2, TetMesh, m_energy_slots + 5, nullptr, -1.0,
+        pair_capacity, _cpNum);
+    Energy_Add_Reduction_Algorithm_DeviceOut(
+        4, TetMesh, m_energy_slots + 6, nullptr, -1.0,
+        static_cast<int>(surf_vertexNum), _gpNum);
+#ifdef USE_FRICTION
+    Energy_Add_Reduction_Algorithm_DeviceOut(5, TetMesh, m_energy_slots + 7);
+    Energy_Add_Reduction_Algorithm_DeviceOut(6, TetMesh, m_energy_slots + 8);
+#endif
+    m_abd_system->cal_abd_energy_DeviceOut(*m_abd_sim_data, m_energy_slots + 9);
+
+    _global_energy_combine<<<1, 1>>>(m_energy_slots,
+                                     IPC_dt * IPC_dt,
+                                     Kappa,
+                                     frictionRate,
+                                     gd_frictionRate,
+                                     out_scalar);
 }
 
 double GIPC::computeEnergy(device_TetraData& TetMesh)
