@@ -2502,6 +2502,38 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
 #endif
     PrepareHessian_bcoo(triplet_values, row_ids, col_ids, indices, offset, triplet_num);
 
+    // [debug] STIFF_MAS_DUMP=<dir>: dump the FIRST assembly's raw bcoo triplet
+    // input + per-bank cluster prefix, enabling a FULL external CPU oracle
+    // that independently rebuilds fine writes, the kernel-1 cross-bank ladder
+    // and the kernel-2 intra-bank aggregation (see examples/test_mas_oracle.py).
+    {
+        static int  _tdumped = 0;
+        const char* _dd      = getenv("STIFF_MAS_DUMP");
+        if(_dd && !_tdumped)
+        {
+            _tdumped = 1;
+            cudaDeviceSynchronize();
+            auto wr = [&](const char* name, const void* dev, size_t bytes)
+            {
+                std::vector<char> h(bytes);
+                cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
+                char p[768];
+                snprintf(p, sizeof(p), "%s/%s.bin", _dd, name);
+                FILE* f = fopen(p, "wb");
+                if(f) { fwrite(h.data(), 1, bytes, f); fclose(f); }
+            };
+            wr("mas_trip_rows", row_ids, (size_t)(offset + triplet_num) * sizeof(int));
+            wr("mas_trip_cols", col_ids, (size_t)(offset + triplet_num) * sizeof(int));
+            wr("mas_trip_vals", triplet_values,
+               (size_t)(offset + triplet_num) * sizeof(Eigen::Matrix3d));
+            wr("mas_trip_idx", indices, (size_t)triplet_num * sizeof(uint32_t));
+            wr("mas_prefix0", d_prefixOriginal,
+               (size_t)(totalMapNodes / BANKSIZE) * sizeof(int));
+            printf("[mas-dump] wrote triplets (offset=%d num=%d banks=%d)\n",
+                   offset, triplet_num, totalMapNodes / BANKSIZE);
+        }
+    }
+
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
 
