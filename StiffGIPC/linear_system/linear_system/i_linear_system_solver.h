@@ -53,6 +53,10 @@ class IterativeSolver
     {
     }
 
+    // Device-side phase handoff after an internally self-tailed solve.  The
+    // default keeps non-PCG solvers source-compatible.
+    virtual void set_device_continuation(cudaGraphExec_t /*successor*/) {}
+
   protected:
     /**
      * \brief Subclass of ILinearSystemSolver must implement this method to solve the linear system Ax = b, directly or iteratively.

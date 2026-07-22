@@ -82,6 +82,11 @@ class GlobalLinearSystem
         if(m_solver) m_solver->enqueue_frame_stats(frame, stream);
     }
 
+    void set_solver_device_continuation(cudaGraphExec_t successor)
+    {
+        if(m_solver) m_solver->set_device_continuation(successor);
+    }
+
     Json               as_json() const;
     GIPCTripletMatrix* gipc_global_triplet = nullptr;
 

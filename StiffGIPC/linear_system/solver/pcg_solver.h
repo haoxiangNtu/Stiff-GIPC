@@ -62,7 +62,7 @@ class PCGSolver : public IterativeSolver
 
     // P2 hook. The successor must be an uploaded device-launchable executable
     // owned by the same engine; nullptr keeps the P1 host phase boundary.
-    void set_device_continuation(cudaGraphExec_t successor)
+    void set_device_continuation(cudaGraphExec_t successor) override
     {
         m_successor_exec = static_cast<unsigned long long>(
             reinterpret_cast<std::uintptr_t>(successor));

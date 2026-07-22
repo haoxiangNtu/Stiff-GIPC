@@ -106,6 +106,7 @@ struct FrameGraphContext
 {
     cudaGraphExec_t root_exec     = nullptr;
     cudaGraphExec_t terminal_exec = nullptr;
+    cudaGraphExec_t pcg_continuation_exec = nullptr;
 
     frame_fsm::FrameDeviceState* d_state  = nullptr;
     frame_fsm::FrameStatus*      d_status = nullptr;
@@ -200,6 +201,8 @@ void destroy_context(FrameGraphContext* ctx)
     if(!ctx) return;
     if(ctx->root_exec) cudaGraphExecDestroy(ctx->root_exec);
     if(ctx->terminal_exec) cudaGraphExecDestroy(ctx->terminal_exec);
+    if(ctx->pcg_continuation_exec)
+        cudaGraphExecDestroy(ctx->pcg_continuation_exec);
     device_free(ctx->d_state);
     device_free(ctx->d_status);
     device_free(ctx->d_begin);
@@ -270,6 +273,13 @@ __global__ void frame_begin_init(frame_fsm::FrameDeviceState* state,
     aux->animation_full_rate = input->animation_full_rate;
     aux->drive_ratio = 1.0;
     aux->substep = 0;
+}
+
+__global__ void frame_post_pcg_continuation(
+    frame_fsm::FrameDeviceState* state)
+{
+    if(blockIdx.x || threadIdx.x || state->result != frame_fsm::FRAME_OK) return;
+    state->phase = frame_fsm::PHASE_NEWTON_DECIDE;
 }
 
 __global__ void frame_terminal_apply(frame_fsm::FrameDeviceState* state,
@@ -565,6 +575,22 @@ void capture_root_graph(GIPC& ipc,
     CUDA_SAFE_CALL(cudaGraphDestroy(graph));
 }
 
+void capture_pcg_continuation_graph(FrameGraphContext& ctx)
+{
+    cudaGraph_t graph = nullptr;
+    CUDA_SAFE_CALL(cudaStreamBeginCapture(cudaStreamPerThread,
+                                          cudaStreamCaptureModeThreadLocal));
+    frame_post_pcg_continuation<<<1, 1, 0, cudaStreamPerThread>>>(ctx.d_state);
+    CUDA_SAFE_CALL(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    CUDA_SAFE_CALL(cudaGraphInstantiateWithFlags(
+        &ctx.pcg_continuation_exec,
+        graph,
+        cudaGraphInstantiateFlagDeviceLaunch));
+    CUDA_SAFE_CALL(cudaGraphUpload(ctx.pcg_continuation_exec,
+                                  cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaGraphDestroy(graph));
+}
+
 void capture_terminal_graph(GIPC& ipc,
                             device_TetraData& mesh,
                             FrameGraphContext& ctx)
@@ -801,6 +827,8 @@ std::string status_error(const frame_fsm::FrameStatus& st,
 
 void GIPC::destroy_frame_graph()
 {
+    if(m_global_linear_system)
+        m_global_linear_system->set_solver_device_continuation(nullptr);
     destroy_context(static_cast<FrameGraphContext*>(m_frame_graph_context));
     m_frame_graph_context = nullptr;
     m_frame_graph_active = false;
@@ -919,6 +947,10 @@ void GIPC::prepare_frame_graph(device_TetraData& mesh)
         *ctx->h_terminal = FrameTerminalInput{};
         *ctx->h_status = frame_fsm::FrameStatus{};
 
+        capture_pcg_continuation_graph(*ctx);
+        if(m_global_linear_system)
+            m_global_linear_system->set_solver_device_continuation(
+                ctx->pcg_continuation_exec);
         capture_root_graph(*this, mesh, *ctx);
         capture_terminal_graph(*this, mesh, *ctx);
         if(ctx->root_d2h != 0 || ctx->terminal_d2h != 1)
@@ -970,7 +1002,8 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     ctx.h_begin->attempt  = attempt;
     ctx.h_begin->path_flags = frame_fsm::PATH_GRAPH_REQUESTED
                             | frame_fsm::PATH_GRAPH_ACTIVE
-                            | frame_fsm::PATH_P3B1_HOST_NEWTON;
+                            | frame_fsm::PATH_HOST_PHASE_BRIDGE
+                            | frame_fsm::PATH_PCG_DEVICE_CONTINUATION;
     if(attempt > 0) ctx.h_begin->path_flags |= frame_fsm::PATH_RETRIED;
     ctx.h_begin->kappa = Kappa;
     ctx.h_begin->animation_full_rate = animation_fullRate;

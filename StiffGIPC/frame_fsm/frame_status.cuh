@@ -66,18 +66,20 @@ enum FrameInvalidBits : uint32_t
 };
 
 // Execution-path facts are reported separately from the result.  In
-// particular, P3b-1 deliberately exposes its host Newton boundaries instead
-// of pretending that the whole-frame one-root contract has already been met.
+// particular, the transaction bridge deliberately exposes its host phase
+// boundaries instead of claiming either P3b delivery tier before the entire
+// Newton iteration is device-dispatched.
 enum FramePathFlags : uint32_t
 {
     PATH_GRAPH_REQUESTED       = 1u << 0,
     PATH_GRAPH_ACTIVE          = 1u << 1,
     PATH_LEGACY_FALLBACK       = 1u << 2,
-    PATH_P3B1_HOST_NEWTON      = 1u << 3,
+    PATH_HOST_PHASE_BRIDGE     = 1u << 3,
     PATH_P3B2_FULL_TAIL        = 1u << 4,
     PATH_TERMINAL_ROLLBACK     = 1u << 5,
     PATH_TEST_INJECTION        = 1u << 6,
     PATH_RETRIED               = 1u << 7,
+    PATH_PCG_DEVICE_CONTINUATION = 1u << 8,
 };
 
 enum FrameErrorCode : int32_t
