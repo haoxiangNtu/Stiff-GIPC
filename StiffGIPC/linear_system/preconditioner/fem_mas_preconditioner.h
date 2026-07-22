@@ -13,14 +13,10 @@ class MAS_Preconditioner : public LocalPreconditioner
     MASPreconditioner& MAS_Prec;
     // [MAS graph-capture] apply() is capture-safe since the symbol binds moved to
     // alloc time and the zeroing went cudaMemsetAsync (see MASPreconditioner.cu).
-    // NOTE: STIFF_KSUM diagnostic still syncs — capture failure falls back to the
-    // plain PCG loop gracefully, so the diag flag stays usable.
-    // LEFT false for v0.8.0: apply() itself is capture-safe now (symbol binds
-    // hoisted, memsets Async) but engaging the merged graph on a MAS scene still
-    // trips a muda wait inside the captured region (dangling capture -> teardown
-    // cudaFree storm). MAS runs the plain PCG loop (healthy, case_26 4.3s);
-    // the ~3% graph gain moves to the MAS-B follow-up.
-    bool graph_capturable() const override { return false; }
+    // Synchronous diagnostics are gated by PCGSolver before capture. The
+    // production apply path is capture-safe (symbol binds are hoisted and
+    // zeroing is async).
+    bool graph_capturable() const override { return true; }
     double*            masses;
     uint32_t*          cpNum;
 

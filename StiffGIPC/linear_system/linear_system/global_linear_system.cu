@@ -105,7 +105,10 @@ void GlobalLinearSystem::distribute_solution()
     for(auto& subsystem : m_inner_subsystems)
         subsystem->do_retrieve_solution(x_view);
 
-    muda::wait_device();
+    // All subsystem retrieval kernels and the subsequent GIPC line-search work
+    // use the per-thread default stream (the project is compiled with
+    // --default-stream=per-thread). Stream ordering is sufficient here; the
+    // former wait_device() stalled every device stream once per Newton step.
 }
 
 DiagonalSubsystem& GlobalLinearSystem::_create_subsystem(U<DiagonalSubsystem>&& subsystem)
@@ -200,7 +203,19 @@ void GlobalLinearSystem::apply_preconditioner(muda::DenseVectorView<Float>  z,
     if(m_global_preconditioner)
         m_global_preconditioner->do_apply(r, z);
     else  // if no global preconditioner, use identity
-        z.buffer_view().copy_from(r.buffer_view());
+    {
+        // BufferView::copy_from() creates a temporary BufferLaunch and calls
+        // wait(), which is illegal during CUDA Graph capture. Keep the identity
+        // stage ordered on the project's per-thread default stream without a
+        // host synchronization point.
+        MUDA_ASSERT(z.size() == r.size(),
+                    "Identity preconditioner input/output size mismatch.");
+        CUDA_SAFE_CALL(cudaMemcpyAsync(z.data(),
+                                       r.data(),
+                                       r.size() * sizeof(Float),
+                                       cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
+    }
 
     // then apply local preconditioners
     // it's user's choice to rewrite or reuse the global preconditioner
