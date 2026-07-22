@@ -65,6 +65,30 @@ enum FrameInvalidBits : uint32_t
     OVF_MAS_CLUSTERS       = 1u << 20,
 };
 
+// Execution-path facts are reported separately from the result.  In
+// particular, P3b-1 deliberately exposes its host Newton boundaries instead
+// of pretending that the whole-frame one-root contract has already been met.
+enum FramePathFlags : uint32_t
+{
+    PATH_GRAPH_REQUESTED       = 1u << 0,
+    PATH_GRAPH_ACTIVE          = 1u << 1,
+    PATH_LEGACY_FALLBACK       = 1u << 2,
+    PATH_P3B1_HOST_NEWTON      = 1u << 3,
+    PATH_P3B2_FULL_TAIL        = 1u << 4,
+    PATH_TERMINAL_ROLLBACK     = 1u << 5,
+    PATH_TEST_INJECTION        = 1u << 6,
+};
+
+enum FrameErrorCode : int32_t
+{
+    ERR_NONE              = 0,
+    ERR_CAPACITY          = 1,
+    ERR_NONFINITE_STATE   = 2,
+    ERR_SOLVER_EXCEPTION  = 3,
+    ERR_RETRY_EXHAUSTED   = 4,
+    ERR_GRAPH_LAUNCH      = 5,
+};
+
 // ---- per-frame status block (device writes, host reads once per frame) -----
 
 struct alignas(16) FrameStatus
@@ -81,6 +105,11 @@ struct alignas(16) FrameStatus
     int32_t  err_newton_iter;
     int32_t  err_ls_iter;
 
+    int32_t  error_code;      // FrameErrorCode; first failure wins
+    uint32_t path_flags;      // FramePathFlags
+    int32_t  graph_launches;  // root + terminal graph launches for this attempt
+    int32_t  host_boundaries; // host-controlled Newton/phase boundaries (audit)
+
     // work counters (always valid; device-accumulated, host reads at boundary)
     int32_t  substeps;
     int32_t  newton_iters;
@@ -96,12 +125,22 @@ struct alignas(16) FrameStatus
     int32_t  required_ccd_pairs;
     int32_t  required_triplets;
     int32_t  required_unique_blocks;
+    int32_t  hw_mas_clusters;
+    int32_t  required_mas_clusters;
+
+    // Graph audit.  A compliant graph has no D2H in root and exactly one D2H
+    // node in its terminal executable.
+    int32_t  root_graph_nodes;
+    int32_t  root_d2h_nodes;
+    int32_t  terminal_graph_nodes;
+    int32_t  terminal_d2h_nodes;
 
     // key scalars for observability (last committed Newton iteration)
     double   final_alpha;
     double   final_energy;
     double   max_movement;
     double   cfl_alpha;
+    double   kappa;
 
     // frame identity (host writes before launch, device echoes back)
     int64_t  frame_id;
@@ -129,6 +168,10 @@ struct alignas(16) FrameDeviceState
     uint32_t invalid_bits;
     int32_t  err_env;
     int32_t  err_primitive;
+    int32_t  err_newton_iter;
+    int32_t  err_ls_iter;
+    uint32_t path_flags;
+    int32_t  host_boundaries;
 
     // live counts (device truth; capacity guards compare against tier caps)
     int32_t  cp_count;
@@ -136,7 +179,16 @@ struct alignas(16) FrameDeviceState
     int32_t  ccd_count;
     int32_t  triplet_count;
     int32_t  unique_count;
-    int32_t  _pad1;
+    int32_t  hw_dcd_pairs;
+    int32_t  hw_ccd_pairs;
+    int32_t  hw_triplets;
+    int32_t  hw_unique_blocks;
+    int32_t  hw_mas_clusters;
+    int32_t  required_dcd_pairs;
+    int32_t  required_ccd_pairs;
+    int32_t  required_triplets;
+    int32_t  required_unique_blocks;
+    int32_t  required_mas_clusters;
 
     // control scalars
     double   alpha;
@@ -144,6 +196,11 @@ struct alignas(16) FrameDeviceState
     double   energy_E0;
     double   energy_trial;
     double   max_movement;
+    double   kappa;
+
+    int64_t  frame_id;
+    int32_t  attempt;
+    int32_t  _pad1;
 };
 
 #if defined(__CUDACC__)
@@ -159,6 +216,8 @@ __device__ __forceinline__ void fsm_record_error(FrameDeviceState* st,
     {
         st->err_env       = env;
         st->err_primitive = prim;
+        st->err_newton_iter = st->newton_iter;
+        st->err_ls_iter     = st->ls_trial;
     }
     atomicOr(&st->invalid_bits, bits);
 }

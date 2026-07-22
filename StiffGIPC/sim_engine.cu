@@ -33,6 +33,7 @@
 
 // Defined at GLOBAL scope in GIPC.cu (GIPC class is not in namespace gipc).
 extern int g_gipc_log_level;
+extern int totalNT;
 
 namespace gipc
 {
@@ -2206,6 +2207,12 @@ void SimEngine::finalize()
         printf("[M1+M2+M3.5] %d FEM pins: local_pos transformed, btype=Fixed, "
                "is_pinned_vertex mask + vertex_to_pin_idx uploaded\n", n_pins);
     }
+
+    const char* frame_graph_env = std::getenv("STIFF_FRAME_GRAPH");
+    const bool frame_graph_requested = frame_graph_env && frame_graph_env[0]
+                                    && std::atoi(frame_graph_env) != 0;
+    if(frame_graph_requested && !impl.d_tetMesh.has_host_step_functor())
+        impl.ipc.prepare_frame_graph(impl.d_tetMesh);
 }
 
 // ======================== step ========================
@@ -2413,7 +2420,21 @@ void SimEngine::step()
         impl.ipc.update_joint_angle_targets_from_mesh(impl.tetMesh);
     }
 
-    impl.ipc.IPC_Solver(impl.d_tetMesh);
+    const char* frame_graph_env = std::getenv("STIFF_FRAME_GRAPH");
+    const bool frame_graph_requested = frame_graph_env && frame_graph_env[0]
+                                    && std::atoi(frame_graph_env) != 0;
+    const bool callback_fallback = frame_graph_requested
+                                && impl.d_tetMesh.has_host_step_functor();
+    const int newton_before = ::totalNT;
+    if(frame_graph_requested && !callback_fallback)
+        impl.ipc.IPC_Solver_FrameGraph(impl.d_tetMesh);
+    else
+    {
+        impl.ipc.IPC_Solver(impl.d_tetMesh);
+        impl.ipc.record_legacy_frame_status(frame_graph_requested,
+                                            callback_fallback,
+                                            ::totalNT - newton_before);
+    }
     // [frame-fsm P0] IPC_Solver already ends with the frame's single PTDS
     // synchronization (event- or stream-based); the former device-wide sync
     // here stalled every stream on the card once more per frame for nothing.
@@ -2422,9 +2443,13 @@ void SimEngine::step()
     // [NaN-sentinel] always-on lightweight NaN watchdog (~1 atomic int +
     // 4-byte D->H copy per step). Prints a one-time warning at first
     // occurrence so users notice silent physics divergence.
-    check_nan_sentinel_(impl.tetMesh.vertexNum,
-                        impl.d_tetMesh.vertexes,
-                        impl.d_tetMesh.velocities);
+    // The graph terminal validates positions/velocities before commit and
+    // rolls back on first non-finite state, so the separate sentinel would be
+    // a redundant post-frame D2H. Legacy/fallback retain their exact behavior.
+    if(!frame_graph_requested || callback_fallback)
+        check_nan_sentinel_(impl.tetMesh.vertexNum,
+                            impl.d_tetMesh.vertexes,
+                            impl.d_tetMesh.velocities);
 
     // [NAN_DIAG] env-gated — only runs when NAN_DIAG=1.
     dump_nan_diagnostics_(impl.tetMesh.tetrahedraNum,
@@ -2433,6 +2458,11 @@ void SimEngine::step()
                           impl.d_tetMesh.velocities,
                           impl.d_tetMesh.vertexes,
                           impl.tetMesh.point_id_to_body_id);
+}
+
+frame_fsm::FrameStatus SimEngine::get_frame_status() const
+{
+    return m_impl->ipc.get_frame_status();
 }
 
 // ======================== state queries ========================

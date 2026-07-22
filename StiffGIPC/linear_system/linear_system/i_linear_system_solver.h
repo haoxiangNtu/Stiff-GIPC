@@ -3,6 +3,7 @@
 #include <list>
 #include <linear_system/linear_system/linear_subsystem.h>
 #include <muda/ext/linear_system.h>
+#include <frame_fsm/frame_status.cuh>
 
 namespace gipc
 {
@@ -41,6 +42,15 @@ class IterativeSolver
         cudaStream_t /*stream*/ = cudaStreamPerThread)
     {
         return {};
+    }
+
+    // Queue the pending iteration delta into the frame-owned device state and
+    // reset it without a host read/synchronization.  Non-PCG solvers keep the
+    // source-compatible no-op default.
+    virtual void enqueue_frame_stats(
+        frame_fsm::FrameDeviceState* /*frame*/,
+        cudaStream_t /*stream*/ = cudaStreamPerThread)
+    {
     }
 
   protected:

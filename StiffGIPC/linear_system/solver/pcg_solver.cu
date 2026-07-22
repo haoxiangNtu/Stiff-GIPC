@@ -915,6 +915,27 @@ IterativeSolverStats PCGSolver::collect_stats(bool reset_pending,
     return result;
 }
 
+__global__ static void pcg_publish_frame_stats(
+    PCGDeviceCounters* counters,
+    frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x != 0 || threadIdx.x != 0 || !counters || !frame) return;
+    const unsigned long long pending =
+        atomicExch(&counters->pending_iterations, 0ull);
+    const unsigned long long capped =
+        pending > static_cast<unsigned long long>(0x7fffffff)
+            ? static_cast<unsigned long long>(0x7fffffff)
+            : pending;
+    frame->pcg_iter_total += static_cast<int>(capped);
+}
+
+void PCGSolver::enqueue_frame_stats(frame_fsm::FrameDeviceState* frame,
+                                    cudaStream_t stream)
+{
+    if(!d_scalars_alloced || !d_counters || !frame) return;
+    pcg_publish_frame_stats<<<1, 1, 0, stream>>>(d_counters, frame);
+}
+
 PCGSolver::~PCGSolver()
 {
     // Executables retain kernel arguments pointing at the scalar/segmented

@@ -56,6 +56,10 @@ class PCGSolver : public IterativeSolver
         bool reset_pending = true,
         cudaStream_t stream = cudaStreamPerThread) override;
 
+    void enqueue_frame_stats(
+        frame_fsm::FrameDeviceState* frame,
+        cudaStream_t stream = cudaStreamPerThread) override;
+
     // P2 hook. The successor must be an uploaded device-launchable executable
     // owned by the same engine; nullptr keeps the P1 host phase boundary.
     void set_device_continuation(cudaGraphExec_t successor)

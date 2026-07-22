@@ -22,6 +22,7 @@
 #include "FrictionUtils.cuh"
 #include "frame_fsm/frame_status.cuh"
 #include <cfloat>
+#include <climits>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -9258,6 +9259,7 @@ void GIPC::FREE_DEVICE_MEM()
 {
     // Executables retain all captured buffer addresses. Destroy the per-engine
     // family before releasing any allocation referenced by a graph node.
+    destroy_frame_graph();
     destroy_ls_graph_state(this);
     CUDA_SAFE_CALL(cudaFree(_MatIndex));
     if(m_reduce_scratch) { CUDA_SAFE_CALL(cudaFree(m_reduce_scratch)); m_reduce_scratch=nullptr; m_reduce_cap=0; }
@@ -10387,6 +10389,7 @@ void GIPC::buildCP()
         memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
     }
+    frame_graph_guard_pairs(static_cast<int>(h_cpNum[0]), 0);
 
     // Overflow → grow DCD pair buffers + redo detection (BVH unchanged, no pairs
     // lost; emits were redirected to the trash slot so nothing was corrupted).
@@ -11126,6 +11129,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     if(ccd_par) { for(int k2 = 0; k2 < ccd_K; ++k2) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k2]));
                   cswapIn(bvh_f, cof); cswapIn(bvh_e, coe); }  // restore original scratch
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    frame_graph_guard_pairs(0, static_cast<int>(h_ccd_cpNum));
     // [perenv-parallel #1 FIX] the per-env CCD path (like the merged buildFullCP) MUST grow + redo on
     // overflow — else at the grasp h_ccd_cpNum exceeds the cap and the line-search per-env alpha reads
     // _ccd_collisonPairs OOB → illegal access (the N>4 crash). Emits past cap went to the trash slot.
@@ -11185,6 +11189,7 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
         cudaStreamPerThread, m_aux_done_event, 0));
 
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    frame_graph_guard_pairs(0, static_cast<int>(h_ccd_cpNum));
 
     // Overflow → grow CCD pair buffer + redo detection. The swept BVH
     // (ConstructFullCCD) is unchanged, so we only re-run the query into the
@@ -11579,6 +11584,8 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     if(par) { for(int k = 0; k < K; ++k) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k]));
               swapIn(bvh_f, of); swapIn(bvh_e, oe); }  // restore original scratch
     CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    frame_graph_guard_pairs(static_cast<int>(h_cpNum[0]),
+                            static_cast<int>(h_cpNum[0]));
     // [perenv-parallel #1 FIX] the per-env path (like the merged path) MUST grow the pair buffers on
     // overflow + redo — else at large N the pair count exceeds the cap and consumers (line-search,
     // gradient) read OOB → illegal access. Per-env DCD fills BOTH _collisonPairs and _ccd_collisonPairs
@@ -13150,6 +13157,8 @@ void GIPC::partitionContactHessian()
                                + segmentCapacity[2]};
     size_t needed = static_cast<size_t>(tier)
                     + static_cast<size_t>(partitionCapacity);
+    frame_graph_guard_triplets(static_cast<int>(std::min<size_t>(
+        needed, static_cast<size_t>(INT_MAX))));
     if(gipc_global_triplet.triplet_capacity() < needed)
     {
         gipc_global_triplet.resize_triplets(static_cast<size_t>(exact_count));
@@ -13337,6 +13346,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         // (global_linear_system.cu), so the peak capacity = 2*length (the irreducible
         // out-of-place-converter floor), not 2*bound. Saves ~20% of the grasp-peak buffer.
         long long bv_need = bound;
+        frame_graph_guard_triplets(static_cast<int>(std::min<long long>(
+            bv_need, static_cast<long long>(INT_MAX))));
         if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(bv_need))
             gipc_global_triplet.reserve_triplets(static_cast<size_t>(bv_need * 1.1));
         if(gipc_global_triplet.global_external_max_capcity < bound)
@@ -14002,6 +14013,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         gipc_global_triplet.global_triplet_offset += TetMesh.n_fem_pins * 10;
     }
 
+    frame_graph_note_assembly(gipc_global_triplet.global_triplet_offset,
+                              gipc_global_triplet.h_unique_key_number);
     return time00;
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
@@ -16221,6 +16234,11 @@ static bool ls_run_graph(GIPC& ipc,
     std::memcpy(ipc.h_cpNum, host_control.cp_counts, sizeof(ipc.h_cpNum));
     ipc.h_gpNum = host_control.gp_count;
     ipc.snapshotDcdCcdPairs();
+    ipc.frame_graph_note_line_search(host_control.frame.ls_trial,
+                                     host_control.frame.invalid_bits,
+                                     alpha,
+                                     energy0,
+                                     energy1);
 
     if(getenv("STIFF_LS_GRAPH_DIAG"))
         printf("[ls-graph-audit] launches=%llu trials=%llu halves=%d "
@@ -17951,7 +17969,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     // [frame-fsm P0] production frames take ONE stream synchronization at the
     // tail and create no timing events; the historical per-frame timing pair
     // is log-gated (g_gipc_log_level >= 1).
-    const bool  frame_timing = g_gipc_log_level >= 1;
+    const bool  frame_graph_attempt = m_frame_graph_active;
+    const bool  frame_timing = g_gipc_log_level >= 1 && !frame_graph_attempt;
     cudaEvent_t start = nullptr, end0 = nullptr;
     if(frame_timing)
     {
@@ -18019,7 +18038,10 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         printf("boundary alpha: %f\n  finished a step\n", alpha);
     }
 
-    TetMesh.update_soft_constraint_target_position(total_Frames + 1, IPC_dt);
+    if(frame_graph_attempt)
+        TetMesh.update_soft_constraint_target_position_device();
+    else
+        TetMesh.update_soft_constraint_target_position(total_Frames + 1, IPC_dt);
     //suggestKappa(Kappa);
     upperBoundKappa(Kappa);
     if(Kappa < 1e-16)
@@ -18046,13 +18068,11 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
         CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
 
-        totalNT += solve_subIP(TetMesh, time0, time1, time2, time3, time4);
-
-        double2 minMaxDist1 = minMaxGroundDist();
-        double2 minMaxDist2 = minMaxSelfDist();
-
-        double minDist = std::min(minMaxDist1.x, minMaxDist2.x);
-        double maxDist = std::max(minMaxDist1.y, minMaxDist2.y);
+        const int substep_newton =
+            solve_subIP(TetMesh, time0, time1, time2, time3, time4);
+        totalNT += substep_newton;
+        if(frame_graph_attempt)
+            frame_graph_note_newton(substep_newton);
 
 
         bool finishMotion = animation_fullRate > 0.99 ? true : false;
@@ -18089,11 +18109,13 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     // D2H on the hot path); their iteration counts accumulate in device
     // counters. Fold the pending delta into total_Cg_count here — the frame
     // boundary is the one place we synchronize anyway, so this read is free.
-    if(m_global_linear_system)
+    if(m_global_linear_system && !frame_graph_attempt)
     {
         auto st = m_global_linear_system->collect_solver_stats(true);
         total_Cg_count += (int)st.pending_iterations;
     }
+    if(frame_graph_attempt)
+        frame_graph_enqueue_terminal(TetMesh);
     if(frame_timing)
     {
         cudaEventRecord(end0);
@@ -18110,6 +18132,14 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         // [frame-fsm P0] the one frame-boundary synchronization (PTDS only;
         // aux-stream work has already been event-joined into PTDS upstream).
         CUDA_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
+    }
+    if(frame_graph_attempt)
+    {
+        const int result = frame_graph_finish_terminal();
+        if(result == frame_fsm::FRAME_RETRY_REQUIRED)
+            throw std::runtime_error("frame transaction requested capacity retry");
+        if(result != frame_fsm::FRAME_OK)
+            throw std::runtime_error("frame transaction terminal reported fatal status");
     }
     total_Frames++;
     if(g_gipc_log_level >= 1)

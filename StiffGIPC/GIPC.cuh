@@ -15,6 +15,7 @@
 #include "device_fem_data.cuh"
 
 #include "PCG_SOLVER.cuh"
+#include "frame_fsm/frame_status.cuh"
 #include <gipc/abd_fem_count_info.h>
 namespace gipc
 {
@@ -267,6 +268,15 @@ class GIPC
     // CCD device-control state: ground, narrow-self, temp alpha, max speed,
     // refined-self, final alpha, CFL alpha, effective-invalid snapshot.
     double* m_ccd_alpha_slots = nullptr;
+
+    // P3b frame transaction/FSM state.  The implementation and graph-owned
+    // snapshots are private to frame_fsm/frame_transaction.cu; this header
+    // exposes only the stable status ABI and the small set of integration
+    // hooks used by the legacy Newton body during the P3b-1 bridge.
+    void*                    m_frame_graph_context = nullptr;
+    bool                     m_frame_graph_active  = false;
+    bool                     m_frame_terminal_emitted = false;
+    frame_fsm::FrameStatus   m_last_frame_status{};
 
     // [0be8da3-port, grow-only] element capacities of the persistent friction /
     // close-constraint buffers. cudaMalloc/cudaFree device-sync, so the per-step
@@ -561,6 +571,49 @@ class GIPC
                      double&           time3,
                      double&           time4);
     void IPC_Solver(device_TetraData& TetMesh);
+    void IPC_Solver_FrameGraph(device_TetraData& TetMesh);
+
+    // Allocate/capture the frame transaction graph family. Safe to call more
+    // than once; finalize calls it only when STIFF_FRAME_GRAPH is requested.
+    void prepare_frame_graph(device_TetraData& TetMesh);
+    void destroy_frame_graph();
+    void frame_graph_begin(device_TetraData& TetMesh,
+                           int64_t frame_id,
+                           int attempt);
+    void frame_graph_enqueue_terminal(device_TetraData& TetMesh,
+                                      int result = frame_fsm::FRAME_OK,
+                                      int error_code = frame_fsm::ERR_NONE,
+                                      uint32_t invalid_bits = 0,
+                                      int err_env = -1,
+                                      int err_primitive = -1);
+    int  frame_graph_finish_terminal();
+    void frame_graph_request_retry(uint32_t invalid_bits,
+                                   int required_dcd_pairs = 0,
+                                   int required_ccd_pairs = 0,
+                                   int required_triplets = 0,
+                                   int required_unique_blocks = 0,
+                                   int required_mas_clusters = 0);
+    void frame_graph_note_pairs(int dcd_pairs, int ccd_pairs);
+    void frame_graph_guard_pairs(int dcd_pairs, int ccd_pairs);
+    void frame_graph_note_assembly(int triplets, int unique_blocks = 0,
+                                   int mas_clusters = 0);
+    void frame_graph_guard_triplets(int required_triplets);
+    void frame_graph_note_newton(int iterations,
+                                 double max_movement = 0.0,
+                                 double alpha = 1.0,
+                                 double cfl_alpha = 1.0);
+    void frame_graph_note_line_search(int trials,
+                                      uint32_t invalid_bits,
+                                      double alpha,
+                                      double energy0,
+                                      double energy1);
+    void record_legacy_frame_status(bool graph_requested,
+                                    bool callback_fallback,
+                                    int newton_iterations = 0);
+    const frame_fsm::FrameStatus& get_frame_status() const
+    {
+        return m_last_frame_status;
+    }
     void sortMesh(device_TetraData& TetMesh, int updateVertNum);
     void buildFrictionSets();
 

@@ -861,6 +861,10 @@ class Engine:
             print(f"[iterlog] fr={fr} newton={total - prev}", flush=True)
             self._iterlog_prev, self._iterlog_frame = total, fr + 1
 
+    def get_frame_status(self):
+        """Return the native read-only status packet for the latest frame."""
+        return self._engine.get_frame_status()
+
     def set_log_level(self, level: int) -> None:
         """Control per-frame solver log verbosity.
 

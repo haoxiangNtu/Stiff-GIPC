@@ -74,6 +74,14 @@ class GlobalLinearSystem
                         : IterativeSolverStats{};
     }
 
+
+    void enqueue_frame_solver_stats(
+        frame_fsm::FrameDeviceState* frame,
+        cudaStream_t stream = cudaStreamPerThread)
+    {
+        if(m_solver) m_solver->enqueue_frame_stats(frame, stream);
+    }
+
     Json               as_json() const;
     GIPCTripletMatrix* gipc_global_triplet = nullptr;
 

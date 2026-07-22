@@ -7,6 +7,7 @@
 #include <map>
 #include <cstdint>
 #include <Eigen/Core>
+#include <frame_fsm/frame_status.cuh>
 
 struct JointAngleControlInfo;
 struct PrismaticDrivingControlInfo;
@@ -419,6 +420,10 @@ class SimEngine
     void finalize();
 
     void step();
+
+    /// Read-only status packet from the most recent frame (legacy, fallback,
+    /// committed graph attempt, or terminal failure/retry).
+    frame_fsm::FrameStatus get_frame_status() const;
 
     // ---- State queries ----
     int      get_vertex_count() const;
