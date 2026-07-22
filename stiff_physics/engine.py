@@ -393,6 +393,12 @@ class Engine:
         self._config = config or Config()
         # Resolve the multi-env mode → STIFF_* flags BEFORE any load/finalize/step, so the
         # gated engine paths (finalize meanMass, per-frame κ/BVH/PCG) see them. Env vars win.
+        # [frame-fsm P0] STIFF_LOG_LEVEL=0 -> quiet production frames: no
+        # per-frame timing events, no timeCost.txt/stats.json writes, a single
+        # stream synchronization per step (see GIPC::IPC_Solver frame_timing).
+        _lv = os.environ.get("STIFF_LOG_LEVEL")
+        if _lv is not None:
+            self._engine.set_log_level(int(_lv))
         self.multienv_mode = resolve_multienv_mode(getattr(self._config, "multienv_mode", "merged"))
         if getattr(self._config, "per_env_exit", False):
             # [per-env exit] productized switch — see Config docstring. setdefault

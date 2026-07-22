@@ -16250,11 +16250,19 @@ bool   isUpdateBoundary = false;
 void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 {
     //double animation_fullRate = 0;
-    cudaEvent_t start, end0;
-    cudaEventCreate(&start);
-    cudaEventCreate(&end0);
+    // [frame-fsm P0] production frames take ONE stream synchronization at the
+    // tail and create no timing events; the historical per-frame timing pair
+    // is log-gated (g_gipc_log_level >= 1).
+    const bool  frame_timing = g_gipc_log_level >= 1;
+    cudaEvent_t start = nullptr, end0 = nullptr;
+    if(frame_timing)
+    {
+        cudaEventCreate(&start);
+        cudaEventCreate(&end0);
+    }
     double alpha = 1;
-    cudaEventRecord(start);
+    if(frame_timing)
+        cudaEventRecord(start);
     //    if(isRotate&&total_Frames*IPC_dt>=2.2){
     //        isRotate = false;
     //        updateBoundary2(TetMesh);
@@ -16379,14 +16387,23 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     updateVelocities(TetMesh);
 
     computeXTilta(TetMesh, 1);
-    cudaEventRecord(end0);
-    // Engine.step remains synchronous, but only waits for this PTDS chain.
-    CUDA_SAFE_CALL(cudaEventSynchronize(end0));
-    float tttime;
-    cudaEventElapsedTime(&tttime, start, end0);
-    cudaEventDestroy(start);
-    cudaEventDestroy(end0);
-    totalTime += tttime;
+    if(frame_timing)
+    {
+        cudaEventRecord(end0);
+        // Engine.step remains synchronous, but only waits for this PTDS chain.
+        CUDA_SAFE_CALL(cudaEventSynchronize(end0));
+        float tttime;
+        cudaEventElapsedTime(&tttime, start, end0);
+        cudaEventDestroy(start);
+        cudaEventDestroy(end0);
+        totalTime += tttime;
+    }
+    else
+    {
+        // [frame-fsm P0] the one frame-boundary synchronization (PTDS only;
+        // aux-stream work has already been event-joined into PTDS upstream).
+        CUDA_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
+    }
     total_Frames++;
     if(g_gipc_log_level >= 1)
         printf("average time cost:     %f,    frame id:   %d\n", totalTime / totalNT, total_Frames);
@@ -16427,6 +16444,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     ttime4 += time4;
 
 
+    if(frame_timing)
+    {
     std::ofstream outTime("timeCost.txt");
 
     outTime << "time0: " << ttime0 / 1000.0 << std::endl;
@@ -16444,6 +16463,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     outTime << "maxCOllisionPairNum: " << maxCOllisionPairNum << std::endl;
     outTime << "totalCgTime: " << total_Cg_count << std::endl;
     outTime.close();
+    }
 
 
     auto& stats = gipc::Statistics::instance();
@@ -16453,7 +16473,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     if(g_gipc_log_level >= 1)
         gipc::GlobalTimer::current()->print_merged_timings();
     gipc::GlobalTimer::current()->clear();
-    stats.write_to_file(std::string{gipc::output_dir()} + "/stats.json");
+    if(frame_timing)
+        stats.write_to_file(std::string{gipc::output_dir()} + "/stats.json");
 
     auto f = stats.frame();
     stats.frame(f + 1);

@@ -2414,7 +2414,9 @@ void SimEngine::step()
     }
 
     impl.ipc.IPC_Solver(impl.d_tetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // [frame-fsm P0] IPC_Solver already ends with the frame's single PTDS
+    // synchronization (event- or stream-based); the former device-wide sync
+    // here stalled every stream on the card once more per frame for nothing.
     impl.step_count++;
 
     // [NaN-sentinel] always-on lightweight NaN watchdog (~1 atomic int +
