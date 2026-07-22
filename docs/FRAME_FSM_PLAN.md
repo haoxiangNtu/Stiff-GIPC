@@ -59,6 +59,22 @@ initKappa（FEM 归约 D2H+ABD 梯度整段回拷）；软约束 host functor；
 临时 DeviceBuffer；isIntersected 内部 cudaMalloc+D2H（默认关）；帧外层 animation
 substep+未消费的 min/max D2H；telemetry event/文件写。
 
+## P3a 实现细目（2026-07-23 调研，converter.cu 逐点）
+
+`h_unique_key_number` 的 D2H（converter.cu:181）有四个下游，逐个去 host 化：
+1. `block_values` 清零（:187）：nuniq≤length，改按 length 上界 memsetAsync
+   （或合并进 combine kernel 的 guard 写零）；
+2. mergebin 容量 grow（:200-207，cudaMalloc 帧内！）：按 triplet 容量上界
+   T*9*K 一次性预分配（finalize），显存 288T B（已计入容量核算）；其
+   cudaMemset 改 cudaMemsetAsync（同步版在 capture 内非法）；
+3. scatter/combine 的 launch 尺寸（:225 apply(nuniq)）：capacity-launch
+   （按 length 启动 + `u < d_unique_count` 设备 guard）或并入 tier；
+4. SpMV 形状（PCG graph 每 solve 重录的根因）：P1 的 tier 化对象——unique
+   count 分档，档内固定 num_items+guard；`d_unique_key_number` 成为设备真值，
+   host 镜像仅 telemetry。
+另：`_make_unique_indices` 旧路径（cub::Unique，:93-127）确认只有注释引用，
+生产走 warp_reduction 路径 ✓ 不需迁移。
+
 ## 立即项状态
 
 - [x] sm_80 加入默认构建架构（本分支）
