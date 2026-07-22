@@ -243,6 +243,20 @@ def main():
     eng.finalize()
     print(f"[fs] finalized {num_envs} envs in {time.perf_counter()-t0:.1f}s ({n_abd_total} ABD)", flush=True)
 
+    # [release gate] CASE39ME_BVH_OFFSET=<spacing>: the strict-determinism layout
+    # — envs load CO-LOCATED (CASE39ME_SPACING=0) so their local vertices are
+    # bit-comparable, while the ENGINE separates them for the broad-phase via
+    # d_env_offset (BVH sees offset copies; physics stays on local vertices).
+    # This is the v0.8.3 bitwise-trio configuration.
+    bvh_off = float(os.environ.get("CASE39ME_BVH_OFFSET", "0"))
+    if bvh_off > 0.0 and num_envs > 1:
+        boffs = make_env_offsets(num_envs, bvh_off)
+        flat = []
+        for o in boffs:
+            flat += [float(o[0, 3]), 0.0, float(o[2, 3])]  # up-axis stays 0
+        eng.native.set_env_offsets(flat)
+        print(f"[fs] BVH env offsets set (spacing={bvh_off}, physics co-located)", flush=True)
+
     if int(os.environ.get("CASE36_DISABLE_GRAVITY","1")):
         for env in envs:
             for a in env['arm_ids']: eng.native.set_body_apply_gravity(a, False)
@@ -286,7 +300,10 @@ def main():
         dump = os.environ.get("CASE39ME_DUMP_VERTS")
         if dump:
             np.save(dump, np.asarray(eng.get_vertices()))
-            print(f"[fs-hl] verts dumped -> {dump}", flush=True)
+            recs = np.asarray([(r.vertex_offset, r.vertex_count, r.body_type)
+                               for r in eng.get_load_records()], dtype=np.int64)
+            np.save(dump.replace(".npy", "_recs.npy"), recs)
+            print(f"[fs-hl] verts dumped -> {dump} (+recs)", flush=True)
         return
 
     import polyscope as ps, polyscope.imgui as psim

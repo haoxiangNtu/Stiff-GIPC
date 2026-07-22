@@ -843,6 +843,17 @@ class Engine:
     def step(self) -> None:
         """Advance simulation by one timestep (dt)."""
         self._engine.step()
+        # [release gate] STIFF_ITER_LOG=1: per-frame Newton-iteration telemetry
+        # for ANY example without touching the example (peak / anomaly audits).
+        if os.environ.get("STIFF_ITER_LOG"):
+            try:
+                total = self._engine.get_total_newton_iters()
+            except AttributeError:
+                return
+            prev = getattr(self, "_iterlog_prev", 0)
+            fr = getattr(self, "_iterlog_frame", 0)
+            print(f"[iterlog] fr={fr} newton={total - prev}", flush=True)
+            self._iterlog_prev, self._iterlog_frame = total, fr + 1
 
     def set_log_level(self, level: int) -> None:
         """Control per-frame solver log verbosity.
