@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/eigen.h>
 #include "sim_engine.h"
+#include "GIPC.cuh"
 
 namespace py = pybind11;
 using namespace gipc;
@@ -10,6 +11,9 @@ using namespace gipc;
 PYBIND11_MODULE(pystiffgipc, m)
 {
     m.doc() = "StiffGIPC Python bindings - IPC-based physics simulation engine";
+    m.def("_test_ccd_nan_max_speed_fail_fast",
+          &stiff_test_ccd_nan_max_speed_fail_fast,
+          "Internal regression hook for device-CCD NaN fail-fast.");
 
     // ---- SimEngineConfig ----
     py::class_<SimEngineConfig>(m, "Config")

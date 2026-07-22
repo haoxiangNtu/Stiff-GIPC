@@ -93,6 +93,10 @@ migration-relevant items.
   measurement artifact. Sentinel guards against future axis bias.
 
 ### Fixed (continued)
+- **CCD NaN handling is intentionally fail-fast.** The device-resident CCD
+  control chain preserves a non-finite max-speed/CFL result through the final
+  alpha decision and raises a diagnosed error. It does not inherit the legacy
+  host `std::min` behavior that could silently discard a NaN and continue.
 - **MAS reorder kernels: intra-warp shared-memory races closed.** The six
   reorder kernels relied on pre-Volta warp lockstep for their shared-memory
   handshakes (zero -> vote -> publish -> cross-lane read with no

@@ -1395,11 +1395,13 @@ __global__ void _calcLeafBvs_ccd(const double3*      _vertexes,
                                  int                 type = 0,
                                  const int*          _bodyID = nullptr,
                                  const int*          _collision_skip_matrix = nullptr,
-                                 int                 _collision_body_count = 0)
+                                 int                 _collision_body_count = 0,
+                                 const double*       alpha_dev = nullptr)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= faceNum)
         return;
+    if(alpha_dev) alpha = *alpha_dev;
     AABB _bv;
 
     element_type _e   = _elements[idx];
@@ -2378,7 +2380,8 @@ void calcLeafBvs_fullCCD(const double3*      _vertexes,
                          const int&          type,
                          const int*          _bodyID = nullptr,
                          const int*          _collision_skip_matrix = nullptr,
-                         int                 _collision_body_count = 0)
+                         int                 _collision_body_count = 0,
+                         const double*       alpha_dev = nullptr)
 {
     int numbers = faceNum;
     if(numbers < 1)
@@ -2387,7 +2390,7 @@ void calcLeafBvs_fullCCD(const double3*      _vertexes,
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     _calcLeafBvs_ccd<<<blockNum, threadNum>>>(
         _vertexes, _moveDir, alpha, _faces, _bvs + numbers - 1, faceNum, type,
-        _bodyID, _collision_skip_matrix, _collision_body_count);
+        _bodyID, _collision_skip_matrix, _collision_body_count, alpha_dev);
 }
 
 // BVH-skip #3 launchers: write n_active leaves at _bvs+(n_active-1), saving
@@ -2818,7 +2821,8 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
-                        _bodyId, _collision_skip_matrix, _collision_body_count);
+                        _bodyId, _collision_skip_matrix, _collision_body_count,
+                        alpha_dev);
     scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
@@ -2923,7 +2927,8 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
-                        _bodyId, _collision_skip_matrix, _collision_body_count);
+                        _bodyId, _collision_skip_matrix, _collision_body_count,
+                        alpha_dev);
     scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
