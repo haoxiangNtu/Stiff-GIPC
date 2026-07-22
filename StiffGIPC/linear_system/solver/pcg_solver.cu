@@ -533,6 +533,59 @@ __global__ void copy_scalar_kernel(double* dst, const double* src)
     *dst = *src;
 }
 
+// A device-launchable graph executes K ordinary PCG iterations and ends in
+// this kernel.  If another full K-batch fits and convergence has not been
+// reached, enqueue the same executable graph as a tail launch.  Tail launches
+// are serialized after the current graph, so PCG's iteration order is exactly
+// the same as the host K-stride loop while the convergence decision stays on
+// the GPU.  Device graph launch is available before conditional graph nodes
+// (CUDA 12.0 vs 12.3), which keeps this path usable on the A800's R535 driver.
+__global__ void pcg_graph_state_init(unsigned long long* state,
+                                     unsigned long long  first_iteration)
+{
+    state[0] = first_iteration;
+    state[1] = 0;
+}
+
+__global__ void pcg_graph_tail_relaunch(unsigned long long* state,
+                                        const int*          d_break,
+                                        unsigned long long  max_iter,
+                                        unsigned long long  check_k)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    const unsigned long long next = state[0] + check_k;
+    state[0] = next;
+    state[1] = static_cast<unsigned long long>(*d_break != 0);
+    if(*d_break == 0 && next + check_k <= max_iter)
+        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+}
+
+__global__ void pcg_seg_graph_tail_relaunch(unsigned long long* state,
+                                            const int*          d_break_g,
+                                            int                 ng,
+                                            unsigned long long  max_iter,
+                                            unsigned long long  check_k)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    bool all_converged = true;
+    for(int g = 0; g < ng; ++g)
+        if(d_break_g[g] == 0)
+        {
+            all_converged = false;
+            break;
+        }
+
+    const unsigned long long next = state[0] + check_k;
+    state[0] = next;
+    state[1] = static_cast<unsigned long long>(all_converged);
+    if(!all_converged && next + check_k <= max_iter)
+        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+}
+
 
 double My_PCG_General_v_v_Reduction_Algorithm(double* temp, double* A, double* B, int vertexNum)
 {
@@ -639,6 +692,12 @@ PCGSolver::PCGSolver(const PCGSolverConfig& cfg)
 
 PCGSolver::~PCGSolver()
 {
+    // Executables retain kernel arguments pointing at the scalar/segmented
+    // buffers, so release them before the referenced allocations.
+    if(m_device_loop_exec)
+        cudaGraphExecDestroy(m_device_loop_exec);
+    if(m_seg_device_loop_exec)
+        cudaGraphExecDestroy(m_seg_device_loop_exec);
     if(d_scalars_alloced)
     {
         cudaFree(d_rz);
@@ -648,6 +707,7 @@ PCGSolver::~PCGSolver()
         cudaFree(d_alpha);
         cudaFree(d_beta);
         cudaFree(d_break);
+        cudaFree(d_graph_state);
     }
     if(cub_temp_ptr) cudaFree(cub_temp_ptr);
     if(m_seg_alloced)
@@ -677,6 +737,7 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
         cudaMalloc(&d_alpha,   sizeof(Float));
         cudaMalloc(&d_beta,    sizeof(Float));
         cudaMalloc(&d_break,   sizeof(int));
+        cudaMalloc(&d_graph_state, 2 * sizeof(unsigned long long));
         d_scalars_alloced = true;
     }
 
@@ -768,12 +829,127 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     if(s_graph_env < 0)
     { const char* e = getenv("STIFF_PCG_GRAPH"); s_graph_env = e ? atoi(e) : 1; }
     bool use_graph = s_graph_env && !getenv("STIFF_SPMV_DET")   // [det-gating] graph for ALL non-strict modes (was: required STIFF_FAST_GRAD)
-                     // These diagnostics perform synchronous MAS reads and are
-                     // intentionally incompatible with CUDA Graph capture.
+                     // STIFF_KSUM intentionally synchronizes inside MAS diagnostics.
                      && !getenv("STIFF_KSUM")
                      && !getenv("STIFF_MAS_FUSE_VALIDATE")
                      && !getenv("STIFF_MAS_DUMP")
                      && system_ptr() && system_ptr()->precond_graph_capturable();
+
+    // [persistent PCG graph] Capture one K-iteration batch as a device-launchable
+    // graph.  Its final kernel evaluates d_break and tail-launches the same graph,
+    // eliminating all intermediate D2H convergence checks.  This is deliberately
+    // attempted before the legacy host-replayed graph.  Any capture/instantiate
+    // failure is non-fatal and falls through to that well-tested path.
+    static int s_device_loop_env = -1;
+    if(s_device_loop_env < 0)
+    {
+        const char* e = getenv("STIFF_PCG_DEVICE_LOOP");
+        s_device_loop_env = e ? atoi(e) : 1;
+    }
+    static int s_driver_version = -1;
+    if(s_driver_version < 0)
+        cudaDriverGetVersion(&s_driver_version);
+    const bool use_device_loop = use_graph && s_device_loop_env
+                              && s_driver_version >= 12000
+                              && K > 0 && 1 + K <= max_iter;
+
+    if(use_device_loop)
+    {
+        cudaGraph_t     dg  = nullptr;
+        bool            ready = false;
+        bool            rebuilt = false;
+
+        cudaError_t capture_status = cudaStreamBeginCapture(
+            cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        if(capture_status == cudaSuccess)
+        {
+            for(SizeT i = 0; i < K; ++i)
+                body();
+            pcg_graph_tail_relaunch<<<1, 1>>>(
+                d_graph_state,
+                d_break,
+                static_cast<unsigned long long>(max_iter),
+                static_cast<unsigned long long>(K));
+            capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
+            if(capture_status == cudaSuccess && dg)
+            {
+                if(m_device_loop_exec)
+                {
+                    cudaGraphExecUpdateResultInfo update_info{};
+                    capture_status = cudaGraphExecUpdate(
+                        m_device_loop_exec, dg, &update_info);
+                    ready = capture_status == cudaSuccess
+                         && update_info.result == cudaGraphExecUpdateSuccess;
+                    if(!ready)
+                    {
+                        cudaGraphExecDestroy(m_device_loop_exec);
+                        m_device_loop_exec = nullptr;
+                    }
+                }
+                if(!m_device_loop_exec)
+                {
+                    capture_status = cudaGraphInstantiateWithFlags(
+                        &m_device_loop_exec,
+                        dg,
+                        cudaGraphInstantiateFlagDeviceLaunch);
+                    ready   = capture_status == cudaSuccess && m_device_loop_exec;
+                    rebuilt = ready;
+                }
+            }
+        }
+        else
+        {
+            // A failed BeginCapture does not put the stream into capture mode.
+            cudaGetLastError();
+        }
+
+        if(ready)
+        {
+            // Device-graph updates must be uploaded again before device launch.
+            // Upload is stream ordered, so no host synchronization is introduced.
+            CUDA_SAFE_CALL(cudaGraphUpload(m_device_loop_exec, cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaGraphDestroy(dg));
+            dg = nullptr;
+            pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
+            CUDA_SAFE_CALL(cudaGraphLaunch(m_device_loop_exec, cudaStreamPerThread));
+
+            unsigned long long graph_state[2] = {1ULL, 0ULL};
+            CUDA_SAFE_CALL(cudaMemcpy(graph_state,
+                                      d_graph_state,
+                                      sizeof(graph_state),
+                                      cudaMemcpyDeviceToHost));
+            k       = static_cast<SizeT>(graph_state[0]);
+            h_break = static_cast<int>(graph_state[1]);
+
+            static bool once = false;
+            if(!once)
+            {
+                once = true;
+                printf("[pcg-device-loop] self-tail graph active (K=%d, driver=%d)\n",
+                       (int)K,
+                       s_driver_version);
+            }
+            if(rebuilt && getenv("STIFF_PCG_GRAPH_DIAG"))
+                printf("[pcg-device-loop] executable rebuilt\n");
+
+            // The device graph stops before a partial final batch.  Preserve the
+            // legacy max-iteration semantics with at most K-1 plain tail steps.
+            if(!h_break)
+                for(; k < max_iter; ++k)
+                    body();
+            return k;
+        }
+
+        if(dg)  cudaGraphDestroy(dg);
+        cudaGetLastError();
+        static bool oncef = false;
+        if(!oncef)
+        {
+            oncef = true;
+            printf("[pcg-device-loop] unavailable (%s) -> host graph fallback\n",
+                   cudaGetErrorString(capture_status));
+        }
+    }
 
     cudaGraph_t     pg  = nullptr;
     cudaGraphExec_t pge = nullptr;
@@ -903,7 +1079,10 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     if(!m_seg_alloced || m_seg_ng < ng)
     {
         if(m_seg_alloced)
-        { cudaFree(d_rz_g); cudaFree(d_rz0_g); cudaFree(d_rzn_g); cudaFree(d_dot_g);
+        {
+          if(m_seg_device_loop_exec)
+          { cudaGraphExecDestroy(m_seg_device_loop_exec); m_seg_device_loop_exec = nullptr; }
+          cudaFree(d_rz_g); cudaFree(d_rz0_g); cudaFree(d_rzn_g); cudaFree(d_dot_g);
           cudaFree(d_segbin); cudaFree(d_break_g); cudaFree(d_dot_partials);
           cudaFree(d_rr_g); cudaFree(d_bb_g); cudaFree(d_use_warm);
           cudaFree(d_ew_prev); cudaFree(d_tol2_g); }
@@ -1124,12 +1303,125 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     // [strict-perf] graphs are arithmetic-neutral (same kernels/order/args) — enable for the
     // binned (strict) path too; verified by the full determinism battery.
     bool use_graph = (s_graph_env_seg != 0)
-                     // Keep synchronous MAS diagnostics outside capture on the
-                     // strict/segmented path as well.
                      && !getenv("STIFF_KSUM")
                      && !getenv("STIFF_MAS_FUSE_VALIDATE")
                      && !getenv("STIFF_MAS_DUMP")
                      && system_ptr() && system_ptr()->precond_graph_capturable();
+
+    // The segmented solver uses two rz buffers with host-side pointer
+    // ping-pong.  An even K returns to the same orientation at graph boundaries,
+    // making the captured batch safely repeatable.  The final graph kernel
+    // checks all per-environment break flags and self-tail-launches on device.
+    static int s_device_loop_env_seg = -1;
+    if(s_device_loop_env_seg < 0)
+    {
+        const char* e = getenv("STIFF_PCG_DEVICE_LOOP");
+        s_device_loop_env_seg = e ? atoi(e) : 1;
+    }
+    static int s_driver_version_seg = -1;
+    if(s_driver_version_seg < 0)
+        cudaDriverGetVersion(&s_driver_version_seg);
+    const bool use_device_loop = use_graph && s_device_loop_env_seg
+                              && s_driver_version_seg >= 12000
+                              && K > 0 && (K & 1) == 0
+                              && 1 + K <= max_iter;
+
+    if(use_device_loop)
+    {
+        cudaGraph_t dg = nullptr;
+        bool ready = false;
+        bool rebuilt = false;
+        cudaError_t capture_status = cudaStreamBeginCapture(
+            cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        if(capture_status == cudaSuccess)
+        {
+            for(SizeT i = 0; i < K; ++i)
+                body();
+            pcg_seg_graph_tail_relaunch<<<1, 1>>>(
+                d_graph_state,
+                d_break_g,
+                ng,
+                static_cast<unsigned long long>(max_iter),
+                static_cast<unsigned long long>(K));
+            capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
+            if(capture_status == cudaSuccess && dg)
+            {
+                if(m_seg_device_loop_exec)
+                {
+                    cudaGraphExecUpdateResultInfo update_info{};
+                    capture_status = cudaGraphExecUpdate(
+                        m_seg_device_loop_exec, dg, &update_info);
+                    ready = capture_status == cudaSuccess
+                         && update_info.result == cudaGraphExecUpdateSuccess;
+                    if(!ready)
+                    {
+                        cudaGraphExecDestroy(m_seg_device_loop_exec);
+                        m_seg_device_loop_exec = nullptr;
+                    }
+                }
+                if(!m_seg_device_loop_exec)
+                {
+                    capture_status = cudaGraphInstantiateWithFlags(
+                        &m_seg_device_loop_exec,
+                        dg,
+                        cudaGraphInstantiateFlagDeviceLaunch);
+                    ready   = capture_status == cudaSuccess && m_seg_device_loop_exec;
+                    rebuilt = ready;
+                }
+            }
+        }
+        else
+        {
+            cudaGetLastError();
+        }
+
+        if(ready)
+        {
+            CUDA_SAFE_CALL(cudaGraphUpload(m_seg_device_loop_exec,
+                                           cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaGraphDestroy(dg));
+            dg = nullptr;
+            pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
+            CUDA_SAFE_CALL(cudaGraphLaunch(m_seg_device_loop_exec,
+                                           cudaStreamPerThread));
+
+            unsigned long long graph_state[2] = {1ULL, 0ULL};
+            CUDA_SAFE_CALL(cudaMemcpy(graph_state,
+                                      d_graph_state,
+                                      sizeof(graph_state),
+                                      cudaMemcpyDeviceToHost));
+            k = static_cast<SizeT>(graph_state[0]);
+            const bool all_converged = graph_state[1] != 0;
+
+            static bool once = false;
+            if(!once)
+            {
+                once = true;
+                printf("[pcg-device-loop] segmented self-tail graph active "
+                       "(K=%d, driver=%d)\n",
+                       (int)K,
+                       s_driver_version_seg);
+            }
+            if(rebuilt && getenv("STIFF_PCG_GRAPH_DIAG"))
+                printf("[pcg-device-loop] segmented executable rebuilt\n");
+
+            if(!all_converged)
+                for(; k < max_iter; ++k)
+                    body();
+            return k;
+        }
+
+        if(dg) cudaGraphDestroy(dg);
+        cudaGetLastError();
+        static bool oncef = false;
+        if(!oncef)
+        {
+            oncef = true;
+            printf("[pcg-device-loop] segmented unavailable (%s) "
+                   "-> host graph fallback\n",
+                   cudaGetErrorString(capture_status));
+        }
+    }
 
     cudaGraph_t     pg  = nullptr;
     cudaGraphExec_t pge = nullptr;
