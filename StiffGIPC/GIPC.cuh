@@ -256,6 +256,12 @@ class GIPC
     double* m_compatibility_energy    = nullptr;
     // Line-search decision only: 0=descent, 1=retry, 2=tolerance acceptance.
     int*    m_line_search_decision    = nullptr;
+    // P2 persistent global line-search graph. The concrete host/device
+    // control types stay private to GIPC.cu so this header does not expose a
+    // second ABI beside frame_fsm::FrameDeviceState.
+    void*   m_ls_graph_context        = nullptr;  // host-owned per-engine exec family
+    void*   m_ls_device_control       = nullptr;  // device block embedding FrameDeviceState
+    void*   m_ccd_tier_control        = nullptr;  // device CCD tier transition state
     // Newton convergence only: 0=continue, 1=converged.
     int*    m_newton_convergence_decision = nullptr;
     // CCD device-control state: ground, narrow-self, temp alpha, max speed,
@@ -510,7 +516,9 @@ class GIPC
     void   self_full_largestFeasibleStepSize_DeviceOut(double slackness,
                                                        double* mqueue,
                                                        int numbers,
-                                                       double* out_slot);
+                                                       double* out_slot,
+                                                       int launch_capacity = -1,
+                                                       const uint32_t* device_count = nullptr);
     void   cfl_largestSpeed_DeviceOut(double* mqueue, double* out_slot);
 
     double ground_largestFeasibleStepSize(double slackness, double* mqueue);

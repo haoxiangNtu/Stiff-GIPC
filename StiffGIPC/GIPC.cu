@@ -20,7 +20,10 @@
 #include <thrust/sequence.h>
 #include <thrust/device_ptr.h>
 #include "FrictionUtils.cuh"
+#include "frame_fsm/frame_status.cuh"
 #include <cfloat>
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <cstdlib>   // std::getenv for STIFF_SKIP_CCD_SANITY
@@ -54,6 +57,153 @@ enum CcdAlphaInvalidBits : int
 };
 static constexpr int kCcdInvalidEffectiveMask = (1 << 6) - 1;
 static constexpr int kCcdRawInvalid           = 1;
+
+namespace
+{
+constexpr int kLsTierCount = 4;
+
+// FrameDeviceState is the stable prefix consumed by the eventual whole-frame
+// FSM. P2 keeps graph handles and the five legacy type counts in an adjacent
+// private payload; the only host read is the completed block at the LS phase
+// boundary.
+struct alignas(16) LsDeviceControl
+{
+    frame_fsm::FrameDeviceState frame{};
+    uint32_t cp_counts[5] = {0, 0, 0, 0, 0};
+    uint32_t gp_count     = 0;
+
+    int ground_halves    = 0;
+    int energy_halves    = 0;
+    int energy_trials    = 0;
+    int budget           = 64;
+    int inject_halves    = 0;
+    int physical_dcd_cap = 0;
+    int selected_tier    = -1;
+    int launch_status    = 0;
+
+    unsigned long long trial_exec = 0;
+    unsigned long long energy_exec[kLsTierCount] = {0, 0, 0, 0};
+    int tier_caps[kLsTierCount] = {0, 0, 0, 0};
+
+    double c1m       = 0.0;
+    double abs_tol   = 0.0;
+    double rel_tol   = 0.0;
+    double _pad0     = 0.0;
+
+    unsigned long long graph_trials = 0;
+    unsigned long long tier_hits[kLsTierCount] = {0, 0, 0, 0};
+};
+
+struct alignas(16) CcdTierControl
+{
+    frame_fsm::FrameDeviceState frame{};
+    unsigned long long exec[kLsTierCount] = {0, 0, 0, 0};
+    int tier_caps[kLsTierCount] = {0, 0, 0, 0};
+    int physical_cap = 0;
+    int selected_tier = -1;
+    int launch_status = 0;
+};
+
+struct LsGraphContext
+{
+    cudaGraphExec_t trial_exec = nullptr;
+    cudaGraphExec_t energy_exec[kLsTierCount] = {nullptr, nullptr, nullptr, nullptr};
+    int             tier_caps[kLsTierCount] = {0, 0, 0, 0};
+    std::uint64_t   signature = 0;
+    std::uint64_t   failed_signature = 0;
+    int             physical_dcd_cap = 0;
+    int             graph_nodes = 0;
+    int             graph_d2h_nodes = 0;
+    int             capture_errors = 0;
+    unsigned long long launches = 0;
+    unsigned long long boundary_d2h = 0;
+    std::vector<cudaEvent_t> capture_events;
+
+    cudaGraphExec_t ccd_dispatch_exec = nullptr;
+    cudaGraphExec_t ccd_exec[kLsTierCount] = {nullptr, nullptr, nullptr, nullptr};
+    int             ccd_tier_caps[kLsTierCount] = {0, 0, 0, 0};
+    std::uint64_t   ccd_signature = 0;
+    std::uint64_t   ccd_failed_signature = 0;
+    int             ccd_graph_nodes = 0;
+    int             ccd_graph_d2h_nodes = 0;
+    bool            ccd_overflow_seen = false;
+};
+
+static void destroy_ccd_graph_execs(LsGraphContext* ctx)
+{
+    if(!ctx) return;
+    if(ctx->ccd_dispatch_exec)
+    {
+        cudaGraphExecDestroy(ctx->ccd_dispatch_exec);
+        ctx->ccd_dispatch_exec = nullptr;
+    }
+    for(cudaGraphExec_t& exec : ctx->ccd_exec)
+    {
+        if(exec) cudaGraphExecDestroy(exec);
+        exec = nullptr;
+    }
+    ctx->ccd_signature = 0;
+    ctx->ccd_graph_nodes = 0;
+    ctx->ccd_graph_d2h_nodes = 0;
+}
+
+static void destroy_ls_graph_execs(LsGraphContext* ctx)
+{
+    if(!ctx) return;
+    if(ctx->trial_exec)
+    {
+        cudaGraphExecDestroy(ctx->trial_exec);
+        ctx->trial_exec = nullptr;
+    }
+    for(cudaGraphExec_t& exec : ctx->energy_exec)
+    {
+        if(exec) cudaGraphExecDestroy(exec);
+        exec = nullptr;
+    }
+    for(cudaEvent_t event : ctx->capture_events)
+        if(event) cudaEventDestroy(event);
+    ctx->capture_events.clear();
+    ctx->signature = 0;
+    ctx->physical_dcd_cap = 0;
+    ctx->graph_nodes = 0;
+    ctx->graph_d2h_nodes = 0;
+}
+
+static void destroy_ls_graph_state(GIPC* ipc)
+{
+    if(!ipc) return;
+    auto* ctx = static_cast<LsGraphContext*>(ipc->m_ls_graph_context);
+    if(ctx)
+    {
+        destroy_ls_graph_execs(ctx);
+        destroy_ccd_graph_execs(ctx);
+        delete ctx;
+        ipc->m_ls_graph_context = nullptr;
+    }
+    if(ipc->m_ls_device_control)
+    {
+        cudaFree(ipc->m_ls_device_control);
+        ipc->m_ls_device_control = nullptr;
+    }
+    if(ipc->m_ccd_tier_control)
+    {
+        cudaFree(ipc->m_ccd_tier_control);
+        ipc->m_ccd_tier_control = nullptr;
+    }
+}
+
+static void note_ccd_pair_overflow(GIPC* ipc)
+{
+    if(!ipc) return;
+    auto* ctx = static_cast<LsGraphContext*>(ipc->m_ls_graph_context);
+    if(!ctx)
+    {
+        ctx = new LsGraphContext{};
+        ipc->m_ls_graph_context = ctx;
+    }
+    ctx->ccd_overflow_seen = true;
+}
+}  // namespace
 
 template <typename Scalar, int size>
 __device__ __host__ void makePDGeneral(Eigen::Matrix<Scalar, size, size>& symMtr)
@@ -7056,7 +7206,8 @@ __global__ void _markGroundTrialInvalid(const double3* vertexes,
                                         int* env_invalid,
                                         int* status,
                                         int group_count,
-                                        int number)
+                                        int number,
+                                        frame_fsm::FrameDeviceState* fsm_state = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number) return;
@@ -7068,6 +7219,12 @@ __global__ void _markGroundTrialInvalid(const double3* vertexes,
     }
     double distance = __GEIGEN__::__v_vec_dot(*g_normal, vertexes[vertex]) - *g_offset;
     if(isfinite(distance) && distance > 0.0) return;
+
+    // Preserve the first offending primitive for the P2 phase-boundary
+    // diagnostic. This is only context; the transition kernel decides whether
+    // another halve is legal or the invalid trial is terminal.
+    if(fsm_state)
+        atomicCAS(&fsm_state->err_primitive, -1, vertex);
 
     if(point_to_group && env_invalid)
     {
@@ -7521,7 +7678,8 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
                                                 double         slackness,
                                                 int            number,
                                                 int*           ccd_alpha_invalid,
-                                                int            invalid_bit)
+                                                int            invalid_bit,
+                                                const uint32_t* device_count = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7531,7 +7689,10 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
     double temp         = 1.0;
     double CCDDistRatio = 1.0 - slackness;
 
-    if(idx < number)
+    const uint32_t active_count = device_count
+                                      ? *device_count
+                                      : static_cast<uint32_t>(number);
+    if(static_cast<uint32_t>(idx) < active_count)
     {
         int4 MMCVIDI = _ccd_collitionPairs[idx];
         if(MMCVIDI.x < 0)
@@ -9079,6 +9240,9 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 /// </summary>
 void GIPC::FREE_DEVICE_MEM()
 {
+    // Executables retain all captured buffer addresses. Destroy the per-engine
+    // family before releasing any allocation referenced by a graph node.
+    destroy_ls_graph_state(this);
     CUDA_SAFE_CALL(cudaFree(_MatIndex));
     if(m_reduce_scratch) { CUDA_SAFE_CALL(cudaFree(m_reduce_scratch)); m_reduce_scratch=nullptr; m_reduce_cap=0; }
     CUDA_SAFE_CALL(cudaFree(_collisonPairs));
@@ -9947,8 +10111,11 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mque
 void GIPC::self_full_largestFeasibleStepSize_DeviceOut(double slackness,
                                                        double* mqueue,
                                                        int numbers,
-                                                       double* out_slot)
+                                                       double* out_slot,
+                                                       int launch_capacity,
+                                                       const uint32_t* device_count)
 {
+    if(launch_capacity >= 0) numbers = launch_capacity;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     const unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
@@ -9963,7 +10130,8 @@ void GIPC::self_full_largestFeasibleStepSize_DeviceOut(double slackness,
         slackness,
         numbers,
         m_ccd_refined_invalid,
-        kCcdRawInvalid);
+        kCcdRawInvalid,
+        device_count);
     numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;
     while(numbers > 1)
@@ -10946,6 +11114,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     // _ccd_collisonPairs OOB → illegal access (the N>4 crash). Emits past cap went to the trash slot.
     if((int)h_ccd_cpNum > MAX_CCD_COLLITION_PAIRS_NUM)
     {
+        note_ccd_pair_overflow(this);
         int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
         printf("[perenv CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo\n",
                h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
@@ -11007,6 +11176,7 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
     // they always see a fully-populated, in-bounds buffer.
     while((int)h_ccd_cpNum > MAX_CCD_COLLITION_PAIRS_NUM)
     {
+        note_ccd_pair_overflow(this);
         int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
         printf("[CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo detection\n",
                h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
@@ -14658,6 +14828,1214 @@ struct _LsTimer {
               *acc += m; cudaEventDestroy(a); cudaEventDestroy(b); on=false; } }
 };
 
+namespace
+{
+__global__ void _ls_step_forward_device(double3*       vertexes,
+                                        const double3* vertexes_temp,
+                                        const double3* move_dir,
+                                        const int*     btype,
+                                        const LsDeviceControl* control,
+                                        int numbers)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= numbers) return;
+    if(abs(btype[idx]) == 0)
+    {
+        const double alpha = control->frame.alpha;
+        vertexes[idx] = __GEIGEN__::__minus(
+            vertexes_temp[idx],
+            __GEIGEN__::__s_vec_multiply(move_dir[idx], alpha));
+    }
+}
+
+__global__ void _ls_fill_abd_alpha(double* abd_alpha,
+                                   const LsDeviceControl* control,
+                                   int body_count)
+{
+    int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if(body < body_count) abd_alpha[body] = control->frame.alpha;
+}
+
+__device__ __forceinline__ bool _ls_tail_launch(unsigned long long handle,
+                                                LsDeviceControl* control)
+{
+    if(handle == 0)
+    {
+        control->launch_status = static_cast<int>(cudaErrorInvalidResourceHandle);
+        control->frame.result  = frame_fsm::FRAME_RUNTIME_ERROR;
+        frame_fsm::fsm_record_error(&control->frame,
+                                    frame_fsm::FRAME_RUNTIME_ERROR,
+                                    0,
+                                    -1,
+                                    -1);
+        return false;
+    }
+    cudaGraphExec_t exec = reinterpret_cast<cudaGraphExec_t>(
+        static_cast<uintptr_t>(handle));
+    const cudaError_t status = cudaGraphLaunch(exec, cudaStreamGraphTailLaunch);
+    if(status == cudaSuccess) return true;
+    control->launch_status = static_cast<int>(status);
+    control->frame.result  = frame_fsm::FRAME_RUNTIME_ERROR;
+    frame_fsm::fsm_record_error(&control->frame,
+                                frame_fsm::FRAME_RUNTIME_ERROR,
+                                0,
+                                -1,
+                                -1);
+    return false;
+}
+
+// Terminal node of the trial graph. It snapshots all legacy type counts,
+// handles invalid/overflow without entering a consumer, and dispatches the
+// smallest energy tier whose capacity covers the exact device count.
+__global__ void _ls_trial_dispatch(LsDeviceControl* control,
+                                   const uint32_t* cp_num,
+                                   const int* ground_trial_invalid,
+                                   const int* ground_collapse)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    for(int i = 0; i < 5; ++i) control->cp_counts[i] = cp_num[i];
+    control->gp_count       = cp_num[5];
+    control->frame.cp_count = static_cast<int>(control->cp_counts[0]);
+    control->frame.gp_count = static_cast<int>(control->gp_count);
+    control->frame.phase    = frame_fsm::PHASE_LINE_SEARCH;
+    ++control->frame.ls_trial;
+    ++control->graph_trials;
+
+    const int ground_status = ground_trial_invalid ? *ground_trial_invalid : 0;
+    if(ground_status != 0)
+    {
+        if(control->ground_halves < control->budget)
+        {
+            control->frame.alpha *= 0.5;
+            ++control->ground_halves;
+            (void)_ls_tail_launch(
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(cudaGetCurrentGraphExec())),
+                control);
+            return;
+        }
+        const int primitive = control->frame.err_primitive;
+        control->frame.result = frame_fsm::FRAME_FATAL;
+        control->frame.phase  = frame_fsm::PHASE_POST_LS;
+        frame_fsm::fsm_record_error(&control->frame,
+                                    frame_fsm::FRAME_FATAL,
+                                    frame_fsm::INV_CCD_GROUND,
+                                    -1,
+                                    primitive);
+        return;
+    }
+
+    const int collapsed = ground_collapse ? *ground_collapse : 0;
+    if(collapsed < 0)
+    {
+        const int primitive = -collapsed - 1;
+        control->frame.result = frame_fsm::FRAME_FATAL;
+        control->frame.phase  = frame_fsm::PHASE_POST_LS;
+        frame_fsm::fsm_record_error(&control->frame,
+                                    frame_fsm::FRAME_FATAL,
+                                    frame_fsm::INV_CCD_GROUND,
+                                    -1,
+                                    primitive);
+        return;
+    }
+
+    control->frame.err_primitive = -1;
+    const uint32_t count = control->cp_counts[0];
+    if(count > static_cast<uint32_t>(control->physical_dcd_cap))
+    {
+        control->frame.result = frame_fsm::FRAME_RETRY_REQUIRED;
+        control->frame.phase  = frame_fsm::PHASE_POST_LS;
+        frame_fsm::fsm_record_error(&control->frame,
+                                    frame_fsm::FRAME_RETRY_REQUIRED,
+                                    frame_fsm::OVF_DCD_PAIRS,
+                                    -1,
+                                    -1);
+        return;
+    }
+
+    int tier = 0;
+    while(tier + 1 < kLsTierCount
+          && count > static_cast<uint32_t>(control->tier_caps[tier]))
+        ++tier;
+    control->selected_tier = tier;
+    ++control->tier_hits[tier];
+    (void)_ls_tail_launch(control->energy_exec[tier], control);
+}
+
+// Terminal node of each capacity energy graph. Retry transfers back to the
+// trial executable; accept simply lets the device-launch chain drain so P2 can
+// cross the phase boundary once on the host.
+__global__ void _ls_energy_decide_and_continue(LsDeviceControl* control,
+                                               const double* energy0,
+                                               const double* energy1)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    const double e0    = *energy0;
+    const double e1    = *energy1;
+    const double alpha = control->frame.alpha;
+    control->frame.energy_E0    = e0;
+    control->frame.energy_trial = e1;
+
+    if(!isfinite(e0) || !isfinite(e1) || !isfinite(alpha) || alpha <= 0.0)
+    {
+        control->frame.result = frame_fsm::FRAME_FATAL;
+        control->frame.phase  = frame_fsm::PHASE_POST_LS;
+        frame_fsm::fsm_record_error(&control->frame,
+                                    frame_fsm::FRAME_FATAL,
+                                    frame_fsm::INV_NAN_STATE,
+                                    -1,
+                                    -1);
+        return;
+    }
+
+    const double rhs = __dadd_rn(e0, __dmul_rn(control->c1m, alpha));
+    const double tol = __dadd_rn(
+        control->abs_tol, __dmul_rn(control->rel_tol, fabs(e0)));
+    int decision = e1 > __dadd_rn(rhs, tol) ? 1 : (e1 > rhs ? 2 : 0);
+    const int trial_index = control->energy_trials++;
+    if(trial_index < control->inject_halves) decision = 1;
+    control->frame.ls_decision = decision;
+
+    if(decision == 1 && control->energy_halves < control->budget)
+    {
+        control->frame.alpha *= 0.5;
+        ++control->energy_halves;
+        (void)_ls_tail_launch(control->trial_exec, control);
+        return;
+    }
+
+    if(decision == 1)
+        atomicOr(&control->frame.invalid_bits,
+                 static_cast<uint32_t>(frame_fsm::INV_LS_BUDGET));
+    control->frame.phase = frame_fsm::PHASE_POST_LS;
+}
+
+static void ls_launch_device_step(GIPC& ipc,
+                                  device_TetraData& mesh,
+                                  LsDeviceControl* control)
+{
+    const int fem_count  = static_cast<int>(ipc.abd_fem_count_info.fem_point_num);
+    const int fem_offset = static_cast<int>(ipc.abd_fem_count_info.fem_point_offset);
+    if(fem_count > 0)
+    {
+        const int threads = default_threads;
+        _ls_step_forward_device<<<(fem_count + threads - 1) / threads, threads>>>(
+            mesh.vertexes + fem_offset,
+            mesh.temp_double3Mem + fem_offset,
+            ipc._moveDir + fem_offset,
+            mesh.BoundaryType + fem_offset,
+            control,
+            fem_count);
+    }
+
+    const int abd_count = static_cast<int>(ipc.abd_fem_count_info.abd_body_num);
+    if(ipc.abd_fem_count_info.abd_point_num > 0)
+    {
+        const int threads = 256;
+        _ls_fill_abd_alpha<<<(abd_count + threads - 1) / threads, threads>>>(
+            ipc.m_abd_body_alpha, control, abd_count);
+        auto abd_vertexes = muda::BufferView<double3>{mesh.vertexes, ipc.vertexNum}.subview(
+            ipc.abd_fem_count_info.abd_point_offset,
+            ipc.abd_fem_count_info.abd_point_num);
+        ipc.m_abd_system->step_forward(
+            *ipc.m_abd_sim_data, abd_vertexes, 1.0, ipc.m_abd_body_alpha);
+    }
+
+    if(mesh.n_fem_pins > 0 && ipc.m_d_abd_body_q != nullptr)
+        apply_fem_pins(mesh.vertexes,
+                       mesh.d_fem_pin_fem_vertex,
+                       mesh.d_fem_pin_abd_body_id,
+                       mesh.d_fem_pin_abd_local_pos,
+                       ipc.m_d_abd_body_q,
+                       mesh.n_fem_pins);
+}
+
+static void ls_mark_ground_trial(GIPC& ipc, LsDeviceControl* control)
+{
+    CUDA_SAFE_CALL(cudaMemsetAsync(ipc.m_ground_trial_invalid, 0, sizeof(int)));
+    const int threads = 256;
+    _markGroundTrialInvalid<<<
+        (ipc.surf_vertexNum + threads - 1) / threads, threads>>>(
+        ipc._vertexes,
+        ipc._surfVerts,
+        ipc._groundOffset,
+        ipc._groundNormal,
+        ipc._point_body_id,
+        ipc._ground_skip_body,
+        ipc._ground_body_count,
+        nullptr,
+        nullptr,
+        ipc.m_ground_trial_invalid,
+        0,
+        ipc.surf_vertexNum,
+        &control->frame);
+}
+
+static GIPC::BvhScratch ls_bvh_scratch(lbvh& b)
+{
+    return GIPC::BvhScratch{b._nodes,
+                            b._bvs,
+                            b._MChash,
+                            b._indices,
+                            b._tempLeafBox,
+                            b._flags,
+                            b.m_node_env,
+                            b._sort_tmp,
+                            b._sort_tmp_bytes,
+                            b._mch_alt,
+                            b._idx_alt,
+                            b._sort_cap};
+}
+
+static void ls_swap_bvh_scratch(lbvh& b, GIPC::BvhScratch& s)
+{
+    b._nodes          = s.nodes;
+    b._bvs            = s.bvs;
+    b._MChash         = s.mch;
+    b._indices        = s.idx;
+    b._tempLeafBox    = s.tmp;
+    b._flags          = s.flags;
+    b.m_node_env      = s.node_env;
+    b._sort_tmp       = s.sort_tmp;
+    b._sort_tmp_bytes = s.sort_bytes;
+    b._mch_alt        = s.mch_alt;
+    b._idx_alt        = s.idx_alt;
+    b._sort_cap       = s.sort_cap;
+}
+
+static void ls_launch_perenv_cp(GIPC& ipc,
+                                LsGraphContext* ctx,
+                                bool parallel)
+{
+    const bool skip_f = getenv("STIFF_SKIP_F") != nullptr;
+    const bool skip_e = getenv("STIFF_SKIP_E") != nullptr;
+    int k = 1;
+    if(parallel)
+    {
+        const int requested = getenv("STIFF_PERENV_K")
+                                  ? atoi(getenv("STIFF_PERENV_K"))
+                                  : 8;
+        k = static_cast<int>(ipc.h_perenv_active.size());
+        if(k > requested) k = requested;
+        if(k < 1) k = 1;
+    }
+
+    double3* saved_f_vertexes = ipc.bvh_f._vertexes;
+    double3* saved_e_vertexes = ipc.bvh_e._vertexes;
+    GIPC::BvhScratch saved_f  = ls_bvh_scratch(ipc.bvh_f);
+    GIPC::BvhScratch saved_e  = ls_bvh_scratch(ipc.bvh_e);
+    ipc.bvh_f._vertexes = ipc._vertexes;
+    ipc.bvh_e._vertexes = ipc._vertexes;
+
+    CUDA_SAFE_CALL(cudaMemsetAsync(ipc._cpNum, 0, 5 * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(ipc._gpNum, 0, sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(ipc._gdCollapse, 0, sizeof(int)));
+
+    cudaEvent_t start = nullptr;
+    std::vector<cudaEvent_t> done;
+    if(parallel)
+    {
+        // Events are allocated before cudaStreamBeginCapture by the caller.
+        // Inside capture they become fork/join dependencies only.
+        start = ctx->capture_events[0];
+        done.assign(ctx->capture_events.begin() + 1,
+                    ctx->capture_events.begin() + 1 + k);
+        CUDA_SAFE_CALL(cudaEventRecord(start, cudaStreamPerThread));
+        for(int slot = 0; slot < k; ++slot)
+        {
+            CUDA_SAFE_CALL(cudaStreamWaitEvent(
+                ipc.m_pool_streams[slot], start, 0));
+        }
+    }
+
+    int index = 0;
+    for(int env : ipc.h_perenv_active)
+    {
+        const int slot = parallel ? index % k : 0;
+        const cudaStream_t stream = parallel
+                                        ? ipc.m_pool_streams[slot]
+                                        : cudaStreamPerThread;
+        if(ipc.h_perenv_face_cnt[env] > 0 && !skip_f)
+        {
+            if(parallel) ls_swap_bvh_scratch(ipc.bvh_f, ipc.m_pool_f[slot]);
+            ipc.bvh_f._active_idx = ipc.d_perenv_face_idx
+                                   + ipc.h_perenv_face_off[env];
+            ipc.bvh_f.face_number_active = ipc.h_perenv_face_cnt[env];
+            ipc.bvh_f.Construct(stream);
+            ipc.bvh_f.SelfCollitionDetect(ipc.dHat, stream);
+        }
+        if(ipc.h_perenv_edge_cnt[env] > 0 && !skip_e)
+        {
+            if(parallel) ls_swap_bvh_scratch(ipc.bvh_e, ipc.m_pool_e[slot]);
+            ipc.bvh_e._active_idx = ipc.d_perenv_edge_idx
+                                   + ipc.h_perenv_edge_off[env];
+            ipc.bvh_e.face_number_active = ipc.h_perenv_edge_cnt[env];
+            ipc.bvh_e.Construct(stream);
+            ipc.bvh_e.SelfCollitionDetect(ipc.dHat, stream);
+        }
+        ++index;
+    }
+
+    if(parallel)
+    {
+        for(int slot = 0; slot < k; ++slot)
+        {
+            CUDA_SAFE_CALL(cudaEventRecord(done[slot], ipc.m_pool_streams[slot]));
+            CUDA_SAFE_CALL(cudaStreamWaitEvent(
+                cudaStreamPerThread, done[slot], 0));
+        }
+        ls_swap_bvh_scratch(ipc.bvh_f, saved_f);
+        ls_swap_bvh_scratch(ipc.bvh_e, saved_e);
+    }
+
+    ipc.bvh_f._active_idx = nullptr;
+    ipc.bvh_f.face_number_active = 0;
+    ipc.bvh_e._active_idx = nullptr;
+    ipc.bvh_e.face_number_active = 0;
+    ipc.bvh_f._vertexes = saved_f_vertexes;
+    ipc.bvh_e._vertexes = saved_e_vertexes;
+
+    if(!getenv("STIFF_SKIP_GRND")) ipc.GroundCollisionDetect();
+}
+
+static void ls_launch_merged_cp(GIPC& ipc, bool parallel)
+{
+    CUDA_SAFE_CALL(cudaMemsetAsync(ipc._cpNum, 0, 5 * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(ipc._gpNum, 0, sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(ipc._gdCollapse, 0, sizeof(int)));
+
+    if(parallel)
+    {
+        CUDA_SAFE_CALL(cudaEventRecord(
+            ipc.m_aux_reset_event, cudaStreamPerThread));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(
+            ipc.m_aux_stream, ipc.m_aux_reset_event, 0));
+    }
+    if(!getenv("STIFF_SKIP_F")) ipc.bvh_f.SelfCollitionDetect(ipc.dHat);
+    if(!getenv("STIFF_SKIP_E"))
+        ipc.bvh_e.SelfCollitionDetect(
+            ipc.dHat, parallel ? ipc.m_aux_stream : cudaStreamPerThread);
+    ipc.GroundCollisionDetect();
+    if(parallel)
+    {
+        CUDA_SAFE_CALL(cudaEventRecord(ipc.m_aux_done_event, ipc.m_aux_stream));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(
+            cudaStreamPerThread, ipc.m_aux_done_event, 0));
+    }
+}
+
+static void ls_launch_trial_body(GIPC& ipc,
+                                 device_TetraData& mesh,
+                                 LsGraphContext* ctx,
+                                 LsDeviceControl* control,
+                                 bool parallel)
+{
+    ls_launch_device_step(ipc, mesh, control);
+
+    if(!ipc.m_skip_all_collision && !ipc.m_perenv_bvh)
+    {
+        const int threads = 256;
+        _addEnvOffset<<<(ipc.vertexNum + threads - 1) / threads, threads>>>(
+            ipc.d_bvh_vertexes,
+            ipc._vertexes,
+            ipc.d_env_offset,
+            ipc.vertexNum);
+        ipc.bvh_f.Construct();
+        ipc.bvh_e.Construct();
+    }
+
+    if(!ipc.m_skip_all_collision && ipc.surf_vertexNum > 0)
+        ls_mark_ground_trial(ipc, control);
+    else
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            ipc.m_ground_trial_invalid, 0, sizeof(int)));
+
+    if(ipc.m_skip_all_collision)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(ipc._cpNum, 0, 6 * sizeof(uint32_t)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(ipc._gdCollapse, 0, sizeof(int)));
+    }
+    else if(ipc.m_perenv_bvh && ipc.m_d_p2g)
+        ls_launch_perenv_cp(ipc, ctx, parallel);
+    else
+        ls_launch_merged_cp(ipc, parallel);
+
+    _ls_trial_dispatch<<<1, 1>>>(
+        control, ipc._cpNum, ipc.m_ground_trial_invalid, ipc._gdCollapse);
+}
+
+static std::uint64_t ls_hash_mix(std::uint64_t seed, std::uint64_t value)
+{
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+static std::uint64_t ls_double_bits(double value)
+{
+    std::uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "double bit width");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static std::uint64_t ls_graph_signature(GIPC& ipc,
+                                        device_TetraData& mesh,
+                                        const LsDeviceControl* control)
+{
+    std::uint64_t seed = 0x4c53475241504832ULL;  // "LSGRAPH2"
+    auto ptr = [&](const void* p) {
+        seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(p));
+    };
+    ptr(&ipc);
+    ptr(control);
+    ptr(mesh.vertexes);
+    ptr(mesh.temp_double3Mem);
+    ptr(ipc._moveDir);
+    ptr(ipc._collisonPairs);
+    ptr(ipc._ccd_collisonPairs);
+    ptr(ipc._MatIndex);
+    ptr(ipc._cpNum);
+    ptr(ipc.m_reduce_scratch);
+    ptr(ipc.m_energy_slots);
+    ptr(ipc.m_line_search_energy);
+    ptr(ipc.m_abd_body_alpha);
+    ptr(ipc.bvh_f._nodes);
+    ptr(ipc.bvh_e._nodes);
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.MAX_COLLITION_PAIRS_NUM));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.MAX_CCD_COLLITION_PAIRS_NUM));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.vertexNum));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.surf_vertexNum));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.m_perenv_bvh));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.m_pool_K));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.Kappa));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.dHat));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.IPC_dt));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.animation_fullRate));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.softMotionRate));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.bendStiff));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.stretchStiff));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.shearStiff));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.strainRate));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.frictionRate));
+    seed = ls_hash_mix(seed, ls_double_bits(ipc.gd_frictionRate));
+    return seed;
+}
+
+static std::array<int, kLsTierCount> ls_pair_tiers(int physical_capacity)
+{
+    int blocks = (std::max(physical_capacity, 1) + 255) / 256;
+    int xl_blocks = 1;
+    while(xl_blocks < blocks && xl_blocks <= (1 << 28)) xl_blocks <<= 1;
+    std::array<int, kLsTierCount> caps{};
+    for(int tier = 0; tier < kLsTierCount; ++tier)
+    {
+        const int shift = kLsTierCount - 1 - tier;
+        const int tier_blocks = std::max(1, xl_blocks >> shift);
+        caps[tier] = tier_blocks * 256;
+        if(tier > 0 && caps[tier] < caps[tier - 1]) caps[tier] = caps[tier - 1];
+    }
+    return caps;
+}
+
+static bool ls_graph_nodes_device_legal(cudaGraph_t graph,
+                                        int& node_count,
+                                        int& d2h_count)
+{
+    size_t count = 0;
+    if(cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess) return false;
+    std::vector<cudaGraphNode_t> nodes(count);
+    if(count && cudaGraphGetNodes(graph, nodes.data(), &count) != cudaSuccess)
+        return false;
+    node_count += static_cast<int>(count);
+    for(cudaGraphNode_t node : nodes)
+    {
+        cudaGraphNodeType type{};
+        if(cudaGraphNodeGetType(node, &type) != cudaSuccess) return false;
+        if(type == cudaGraphNodeTypeMemcpy)
+        {
+            cudaMemcpy3DParms params{};
+            if(cudaGraphMemcpyNodeGetParams(node, &params) != cudaSuccess)
+                return false;
+            if(params.kind == cudaMemcpyDeviceToHost)
+                ++d2h_count;
+            continue;
+        }
+        if(type == cudaGraphNodeTypeKernel
+           || type == cudaGraphNodeTypeMemset
+           || type == cudaGraphNodeTypeEmpty
+           || type == cudaGraphNodeTypeGraph)
+            continue;
+        return false;
+    }
+    return d2h_count == 0;
+}
+
+static bool ls_instantiate_device_graph(cudaGraph_t graph,
+                                        cudaGraphExec_t& exec,
+                                        LsGraphContext* ctx)
+{
+    if(!graph || !ls_graph_nodes_device_legal(
+                     graph, ctx->graph_nodes, ctx->graph_d2h_nodes))
+        return false;
+    cudaError_t status = cudaGraphInstantiateWithFlags(
+        &exec, graph, cudaGraphInstantiateFlagDeviceLaunch);
+    if(status == cudaSuccess)
+        status = cudaGraphUpload(exec, cudaStreamPerThread);
+    if(status == cudaSuccess) return true;
+    if(exec)
+    {
+        cudaGraphExecDestroy(exec);
+        exec = nullptr;
+    }
+    cudaGetLastError();
+    return false;
+}
+
+// muda's debug mode synchronizes every ParallelFor at wrapper destruction.
+// That is useful for ordinary launches but illegal inside CUDA stream capture.
+// Keep the exact existing kernels/arithmetic and suppress only the diagnostic
+// synchronization for the short host-side capture window.
+struct LsCaptureDebugSyncGuard
+{
+    bool restore = false;
+
+    LsCaptureDebugSyncGuard()
+        : restore(muda::Debug::is_debug_sync_all())
+    {
+        if(restore) muda::Debug::debug_sync_all(false);
+    }
+
+    ~LsCaptureDebugSyncGuard()
+    {
+        if(restore) muda::Debug::debug_sync_all(true);
+    }
+};
+
+static int ls_max_energy_count(GIPC& ipc);
+
+__global__ void _ccd_tier_dispatch(CcdTierControl* control,
+                                   const uint32_t* pair_count,
+                                   double* out_slot)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    const uint32_t count = pair_count ? *pair_count : 0;
+    control->frame.phase          = frame_fsm::PHASE_CCD;
+    control->frame.ccd_count      = static_cast<int>(count);
+    control->frame.result         = frame_fsm::FRAME_OK;
+    control->selected_tier        = -1;
+    control->launch_status        = 0;
+
+    if(count > static_cast<uint32_t>(control->physical_cap))
+    {
+        if(out_slot)
+            *out_slot = __longlong_as_double(
+                static_cast<long long>(0x7ff8000000000000ULL));
+        control->frame.result = frame_fsm::FRAME_RETRY_REQUIRED;
+        frame_fsm::fsm_record_error(&control->frame,
+                                    frame_fsm::FRAME_RETRY_REQUIRED,
+                                    frame_fsm::OVF_CCD_PAIRS,
+                                    -1,
+                                    -1);
+        return;
+    }
+
+    int tier = 0;
+    while(tier + 1 < kLsTierCount
+          && count > static_cast<uint32_t>(control->tier_caps[tier]))
+        ++tier;
+    control->selected_tier = tier;
+
+    cudaGraphExec_t exec = reinterpret_cast<cudaGraphExec_t>(
+        static_cast<uintptr_t>(control->exec[tier]));
+    const cudaError_t status = exec
+                                   ? cudaGraphLaunch(exec, cudaStreamGraphTailLaunch)
+                                   : cudaErrorInvalidResourceHandle;
+    if(status != cudaSuccess)
+    {
+        control->launch_status = static_cast<int>(status);
+        control->frame.result  = frame_fsm::FRAME_RUNTIME_ERROR;
+        if(out_slot)
+            *out_slot = __longlong_as_double(
+                static_cast<long long>(0x7ff8000000000000ULL));
+        frame_fsm::fsm_record_error(&control->frame,
+                                    frame_fsm::FRAME_RUNTIME_ERROR,
+                                    0,
+                                    -1,
+                                    -1);
+    }
+}
+
+static bool ccd_instantiate_device_graph(cudaGraph_t graph,
+                                         cudaGraphExec_t& exec,
+                                         LsGraphContext* ctx)
+{
+    if(!graph || !ls_graph_nodes_device_legal(
+                     graph, ctx->ccd_graph_nodes, ctx->ccd_graph_d2h_nodes))
+        return false;
+    cudaError_t status = cudaGraphInstantiateWithFlags(
+        &exec, graph, cudaGraphInstantiateFlagDeviceLaunch);
+    if(status == cudaSuccess)
+        status = cudaGraphUpload(exec, cudaStreamPerThread);
+    if(status == cudaSuccess) return true;
+    if(exec)
+    {
+        cudaGraphExecDestroy(exec);
+        exec = nullptr;
+    }
+    cudaGetLastError();
+    return false;
+}
+
+static bool ccd_capture_reduce_graph(GIPC& ipc,
+                                     LsGraphContext* ctx,
+                                     double slackness,
+                                     int capacity,
+                                     cudaGraphExec_t& exec)
+{
+    LsCaptureDebugSyncGuard debug_sync_guard;
+    cudaGraph_t graph = nullptr;
+    cudaError_t status = cudaStreamBeginCapture(
+        cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    if(status == cudaSuccess)
+    {
+        ipc.self_full_largestFeasibleStepSize_DeviceOut(
+            slackness,
+            ipc.m_reduce_scratch,
+            capacity,
+            ipc.m_ccd_alpha_slots + 4,
+            capacity,
+            ipc._cpNum);
+        status = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    }
+    const bool ready = status == cudaSuccess
+                    && ccd_instantiate_device_graph(graph, exec, ctx);
+    if(graph) cudaGraphDestroy(graph);
+    if(!ready) cudaGetLastError();
+    return ready;
+}
+
+static bool ccd_capture_dispatch_graph(GIPC& ipc,
+                                       LsGraphContext* ctx,
+                                       CcdTierControl* control,
+                                       cudaGraphExec_t& exec)
+{
+    cudaGraph_t graph = nullptr;
+    cudaError_t status = cudaStreamBeginCapture(
+        cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    if(status == cudaSuccess)
+    {
+        _ccd_tier_dispatch<<<1, 1>>>(
+            control, ipc._cpNum, ipc.m_ccd_alpha_slots + 4);
+        status = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    }
+    const bool ready = status == cudaSuccess
+                    && ccd_instantiate_device_graph(graph, exec, ctx);
+    if(graph) cudaGraphDestroy(graph);
+    if(!ready) cudaGetLastError();
+    return ready;
+}
+
+static std::uint64_t ccd_tier_signature(GIPC& ipc,
+                                        CcdTierControl* control,
+                                        double slackness)
+{
+    std::uint64_t seed = 0x4343445449455232ULL;  // "CCDTIER2"
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(&ipc));
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(control));
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(ipc._vertexes));
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(ipc._moveDir));
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(ipc._ccd_collisonPairs));
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(ipc._cpNum));
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(ipc.m_reduce_scratch));
+    seed = ls_hash_mix(seed, reinterpret_cast<std::uintptr_t>(ipc.m_ccd_alpha_slots));
+    seed = ls_hash_mix(seed, static_cast<std::uint64_t>(ipc.MAX_CCD_COLLITION_PAIRS_NUM));
+    seed = ls_hash_mix(seed, ls_double_bits(slackness));
+    return seed;
+}
+
+static bool ccd_ensure_tier_graphs(GIPC& ipc, double slackness)
+{
+    auto* ctx = static_cast<LsGraphContext*>(ipc.m_ls_graph_context);
+    if(!ctx)
+    {
+        ctx = new LsGraphContext{};
+        ipc.m_ls_graph_context = ctx;
+    }
+    if(!ipc.m_ccd_tier_control)
+        CUDA_SAFE_CALL(cudaMalloc(
+            &ipc.m_ccd_tier_control, sizeof(CcdTierControl)));
+    auto* control = static_cast<CcdTierControl*>(ipc.m_ccd_tier_control);
+
+    const auto caps = ls_pair_tiers(ipc.MAX_CCD_COLLITION_PAIRS_NUM);
+    const auto dcd_caps = ls_pair_tiers(ipc.MAX_COLLITION_PAIRS_NUM);
+    ipc.ensure_reduce_scratch(std::max(
+        std::max(caps.back(), dcd_caps.back()), ls_max_energy_count(ipc)));
+    const std::uint64_t signature = ccd_tier_signature(ipc, control, slackness);
+    if(ctx->ccd_dispatch_exec && ctx->ccd_signature == signature) return true;
+    if(ctx->ccd_failed_signature == signature) return false;
+
+    destroy_ccd_graph_execs(ctx);
+    for(int i = 0; i < kLsTierCount; ++i) ctx->ccd_tier_caps[i] = caps[i];
+    bool ready = true;
+    for(int tier = 0; tier < kLsTierCount && ready; ++tier)
+        ready = ccd_capture_reduce_graph(ipc,
+                                         ctx,
+                                         slackness,
+                                         ctx->ccd_tier_caps[tier],
+                                         ctx->ccd_exec[tier]);
+    if(ready)
+        ready = ccd_capture_dispatch_graph(
+            ipc, ctx, control, ctx->ccd_dispatch_exec);
+    if(!ready)
+    {
+        destroy_ccd_graph_execs(ctx);
+        ctx->ccd_failed_signature = signature;
+        if(getenv("STIFF_LS_GRAPH_DIAG"))
+            fprintf(stderr,
+                    "[ccd-tier-graph] capture/device-instantiate failed; "
+                    "using exact-count fallback\n");
+        return false;
+    }
+    ctx->ccd_signature = signature;
+    ctx->ccd_failed_signature = 0;
+    if(getenv("STIFF_LS_GRAPH_DIAG"))
+        printf("[ccd-tier-cache] ready cap=%d tiers=%d/%d/%d/%d "
+               "nodes=%d d2h-nodes=%d\n",
+               ipc.MAX_CCD_COLLITION_PAIRS_NUM,
+               caps[0], caps[1], caps[2], caps[3],
+               ctx->ccd_graph_nodes,
+               ctx->ccd_graph_d2h_nodes);
+    return true;
+}
+
+static bool ccd_launch_tiered_refined(GIPC& ipc, double slackness)
+{
+    const char* graph_env = getenv("STIFF_LS_GRAPH");
+    if(graph_env && graph_env[0] && atoi(graph_env) == 0) return false;
+    int driver_version = 0;
+    cudaDriverGetVersion(&driver_version);
+    if(driver_version < 12000 || !ccd_ensure_tier_graphs(ipc, slackness))
+        return false;
+
+    auto* ctx = static_cast<LsGraphContext*>(ipc.m_ls_graph_context);
+    auto* control = static_cast<CcdTierControl*>(ipc.m_ccd_tier_control);
+    CcdTierControl host{};
+    host.frame.phase         = frame_fsm::PHASE_CCD;
+    host.frame.result        = frame_fsm::FRAME_OK;
+    host.frame.err_env       = -1;
+    host.frame.err_primitive = -1;
+    if(ctx->ccd_overflow_seen)
+        host.frame.invalid_bits |= frame_fsm::OVF_CCD_PAIRS;
+    host.physical_cap = ipc.MAX_CCD_COLLITION_PAIRS_NUM;
+    for(int tier = 0; tier < kLsTierCount; ++tier)
+    {
+        host.exec[tier] = static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(ctx->ccd_exec[tier]));
+        host.tier_caps[tier] = ctx->ccd_tier_caps[tier];
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        control, &host, sizeof(host), cudaMemcpyHostToDevice));
+    const cudaError_t status = cudaGraphLaunch(
+        ctx->ccd_dispatch_exec, cudaStreamPerThread);
+    if(status != cudaSuccess)
+    {
+        cudaGetLastError();
+        return false;
+    }
+    if(getenv("STIFF_LS_GRAPH_DIAG"))
+    {
+        int tier = 0;
+        while(tier + 1 < kLsTierCount
+              && ipc.h_ccd_cpNum > static_cast<uint32_t>(ctx->ccd_tier_caps[tier]))
+            ++tier;
+        printf("[ccd-tier-audit] count=%u tier=%d inner-d2h=0 "
+               "graph-d2h-nodes=%d ovf=%d\n",
+               ipc.h_ccd_cpNum,
+               tier,
+               ctx->ccd_graph_d2h_nodes,
+               ctx->ccd_overflow_seen ? 1 : 0);
+    }
+    return true;
+}
+
+static bool ls_capture_energy_graph(GIPC& ipc,
+                                    device_TetraData& mesh,
+                                    LsGraphContext* ctx,
+                                    LsDeviceControl* control,
+                                    int pair_capacity,
+                                    cudaGraphExec_t& exec)
+{
+    LsCaptureDebugSyncGuard debug_sync_guard;
+    cudaGraph_t graph = nullptr;
+    cudaError_t status = cudaStreamBeginCapture(
+        cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    if(status == cudaSuccess)
+    {
+        ipc.computeEnergy_DeviceOut_Capacity(
+            mesh, ipc.m_line_search_energy + 1, pair_capacity);
+        _ls_energy_decide_and_continue<<<1, 1>>>(
+            control, ipc.m_line_search_energy + 0, ipc.m_line_search_energy + 1);
+        status = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    }
+    bool ready = status == cudaSuccess
+              && ls_instantiate_device_graph(graph, exec, ctx);
+    if(graph) cudaGraphDestroy(graph);
+    if(!ready) cudaGetLastError();
+    return ready;
+}
+
+static bool ls_capture_trial_graph(GIPC& ipc,
+                                   device_TetraData& mesh,
+                                   LsGraphContext* ctx,
+                                   LsDeviceControl* control,
+                                   bool parallel,
+                                   cudaGraphExec_t& exec)
+{
+    LsCaptureDebugSyncGuard debug_sync_guard;
+    if(parallel && ipc.m_perenv_bvh)
+    {
+        int k = static_cast<int>(ipc.h_perenv_active.size());
+        const int cap = getenv("STIFF_PERENV_K")
+                            ? atoi(getenv("STIFF_PERENV_K"))
+                            : 8;
+        if(k > cap) k = cap;
+        if(k < 1) k = 1;
+        for(int i = 0; i < k + 1; ++i)
+        {
+            cudaEvent_t event = nullptr;
+            if(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)
+               != cudaSuccess)
+                return false;
+            ctx->capture_events.push_back(event);
+        }
+    }
+    cudaGraph_t graph = nullptr;
+    cudaError_t status = cudaStreamBeginCapture(
+        cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    if(status == cudaSuccess)
+    {
+        ls_launch_trial_body(ipc, mesh, ctx, control, parallel);
+        status = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    }
+    bool ready = status == cudaSuccess
+              && ls_instantiate_device_graph(graph, exec, ctx);
+    if(graph) cudaGraphDestroy(graph);
+    if(!ready) cudaGetLastError();
+    return ready;
+}
+
+static int ls_max_energy_count(GIPC& ipc)
+{
+    int result = std::max(ipc.MAX_COLLITION_PAIRS_NUM,
+                          static_cast<int>(ipc.surf_vertexNum));
+    result = std::max(result, static_cast<int>(ipc.abd_fem_count_info.fem_point_num));
+    result = std::max(result, static_cast<int>(ipc.abd_fem_count_info.fem_tet_num));
+    result = std::max(result, static_cast<int>(ipc.triangleNum));
+    result = std::max(result, static_cast<int>(ipc.tri_edge_num));
+    result = std::max(result, static_cast<int>(ipc.softNum));
+    result = std::max(result, static_cast<int>(ipc.h_cpNum_last[0]));
+    result = std::max(result, static_cast<int>(ipc.h_gpNum_last));
+    return std::max(result, 1);
+}
+
+static bool ls_ensure_graph_family(GIPC& ipc, device_TetraData& mesh)
+{
+    auto* ctx = static_cast<LsGraphContext*>(ipc.m_ls_graph_context);
+    if(!ctx)
+    {
+        ctx = new LsGraphContext{};
+        ipc.m_ls_graph_context = ctx;
+    }
+    if(!ipc.m_ls_device_control)
+        CUDA_SAFE_CALL(cudaMalloc(
+            &ipc.m_ls_device_control, sizeof(LsDeviceControl)));
+    auto* control = static_cast<LsDeviceControl*>(ipc.m_ls_device_control);
+
+    const int abd_count = static_cast<int>(ipc.abd_fem_count_info.abd_body_num);
+    if(abd_count > 0 && !ipc.m_abd_body_alpha)
+        CUDA_SAFE_CALL(cudaMalloc(
+            reinterpret_cast<void**>(&ipc.m_abd_body_alpha),
+            static_cast<size_t>(abd_count) * sizeof(double)));
+
+    // No allocator is reachable once capture starts. Grow the shared first-pass
+    // reduction workspace to the largest fixed/tier launch in advance.
+    const auto prewarm_tiers = ls_pair_tiers(ipc.MAX_COLLITION_PAIRS_NUM);
+    ipc.ensure_reduce_scratch(
+        std::max(ls_max_energy_count(ipc), prewarm_tiers.back()));
+
+    if(ipc.m_perenv_bvh && ipc.m_d_p2g && ipc.m_perenv_bvh_groups == 0)
+        ipc.buildPerEnvBVHIndex(ipc.m_active_group_count, ipc.m_d_p2g);
+
+    const bool requested_parallel = getenv("STIFF_PERENV_PAR")
+                                 && atoi(getenv("STIFF_PERENV_PAR")) != 0;
+    if(ipc.m_perenv_bvh && requested_parallel)
+    {
+        int k = static_cast<int>(ipc.h_perenv_active.size());
+        const int cap = getenv("STIFF_PERENV_K")
+                            ? atoi(getenv("STIFF_PERENV_K"))
+                            : 8;
+        if(k > cap) k = cap;
+        if(k < 1) k = 1;
+        ipc.allocPerEnvPool(k);
+    }
+    if(!ipc.m_perenv_bvh)
+    {
+        if(!ipc.m_aux_stream)
+            CUDA_SAFE_CALL(cudaStreamCreate(&ipc.m_aux_stream));
+        if(!ipc.m_aux_reset_event)
+            CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+                &ipc.m_aux_reset_event, cudaEventDisableTiming));
+        if(!ipc.m_aux_done_event)
+            CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+                &ipc.m_aux_done_event, cudaEventDisableTiming));
+    }
+
+    const std::uint64_t signature = ls_graph_signature(ipc, mesh, control);
+    if(ctx->trial_exec && ctx->signature == signature) return true;
+    if(ctx->failed_signature == signature) return false;
+
+    destroy_ls_graph_execs(ctx);
+    const auto caps = ls_pair_tiers(ipc.MAX_COLLITION_PAIRS_NUM);
+    for(int i = 0; i < kLsTierCount; ++i) ctx->tier_caps[i] = caps[i];
+    ctx->physical_dcd_cap = ipc.MAX_COLLITION_PAIRS_NUM;
+
+    bool ready = true;
+    for(int tier = 0; tier < kLsTierCount && ready; ++tier)
+        ready = ls_capture_energy_graph(ipc,
+                                        mesh,
+                                        ctx,
+                                        control,
+                                        ctx->tier_caps[tier],
+                                        ctx->energy_exec[tier]);
+
+    if(ready)
+    {
+        const bool parallel = ipc.m_perenv_bvh
+                                  ? requested_parallel
+                                  : true;
+        ready = ls_capture_trial_graph(
+            ipc, mesh, ctx, control, parallel, ctx->trial_exec);
+        if(!ready && parallel)
+        {
+            // Some R535 builds reject event nodes in a device-launchable
+            // executable. Retry as a single-stream graph; arithmetic kernels,
+            // device counts and tier dispatch are unchanged.
+            for(cudaEvent_t event : ctx->capture_events)
+                if(event) cudaEventDestroy(event);
+            ctx->capture_events.clear();
+            ctx->graph_nodes = 0;
+            ctx->graph_d2h_nodes = 0;
+            ready = ls_capture_trial_graph(
+                ipc, mesh, ctx, control, false, ctx->trial_exec);
+        }
+    }
+
+    if(!ready)
+    {
+        ++ctx->capture_errors;
+        destroy_ls_graph_execs(ctx);
+        ctx->failed_signature = signature;
+        if(getenv("STIFF_LS_GRAPH_DIAG"))
+            fprintf(stderr,
+                    "[ls-graph] capture/device-instantiate failed; using host fallback\n");
+        return false;
+    }
+
+    ctx->signature = signature;
+    ctx->failed_signature = 0;
+    if(getenv("STIFF_LS_GRAPH_DIAG"))
+        printf("[ls-graph-cache] ready dcd-cap=%d tiers=%d/%d/%d/%d "
+               "nodes=%d d2h-nodes=%d mode=%s\n",
+               ctx->physical_dcd_cap,
+               ctx->tier_caps[0],
+               ctx->tier_caps[1],
+               ctx->tier_caps[2],
+               ctx->tier_caps[3],
+               ctx->graph_nodes,
+               ctx->graph_d2h_nodes,
+               ipc.m_perenv_bvh ? "perenv-global" : "merged-global");
+    return true;
+}
+
+static void ls_fill_host_control(LsDeviceControl& control,
+                                 LsGraphContext& ctx,
+                                 double alpha,
+                                 double cfl_alpha,
+                                 int budget,
+                                 int inject_halves,
+                                 double c1m,
+                                 double abs_tol,
+                                 double rel_tol)
+{
+    control = LsDeviceControl{};
+    control.frame.ls_trial      = 0;
+    control.frame.ls_decision   = 0;
+    control.frame.phase         = frame_fsm::PHASE_LINE_SEARCH;
+    control.frame.result        = frame_fsm::FRAME_OK;
+    control.frame.error_code    = 0;
+    control.frame.invalid_bits  = ctx.ccd_overflow_seen
+                                      ? frame_fsm::OVF_CCD_PAIRS
+                                      : 0;
+    control.frame.err_env       = -1;
+    control.frame.err_primitive = -1;
+    control.frame.alpha         = alpha;
+    control.frame.cfl_alpha     = cfl_alpha;
+    control.budget              = budget;
+    control.inject_halves       = inject_halves;
+    control.physical_dcd_cap    = ctx.physical_dcd_cap;
+    control.c1m                 = c1m;
+    control.abs_tol             = abs_tol;
+    control.rel_tol             = rel_tol;
+    control.trial_exec = static_cast<unsigned long long>(
+        reinterpret_cast<std::uintptr_t>(ctx.trial_exec));
+    for(int tier = 0; tier < kLsTierCount; ++tier)
+    {
+        control.energy_exec[tier] = static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(ctx.energy_exec[tier]));
+        control.tier_caps[tier] = ctx.tier_caps[tier];
+    }
+}
+
+static void ls_throw_device_failure(const LsDeviceControl& control)
+{
+    if(control.frame.result == frame_fsm::FRAME_RUNTIME_ERROR)
+        throw std::runtime_error(
+            "[line-search] device graph tail launch failed (status="
+            + std::to_string(control.launch_status) + ")");
+    if(control.frame.invalid_bits & frame_fsm::INV_CCD_GROUND)
+        throw std::runtime_error(
+            "[StiffGIPC] ground trial step remained outside the strict barrier "
+            "domain after line-search backtracking");
+    if(control.frame.invalid_bits & frame_fsm::INV_NAN_STATE)
+        throw std::runtime_error(
+            "[line-search] non-finite alpha or energy in persistent graph");
+    throw std::runtime_error(
+        "[line-search] persistent graph terminated with an unknown fatal state");
+}
+
+static bool ls_run_graph(GIPC& ipc,
+                         device_TetraData& mesh,
+                         double& alpha,
+                         double cfl_alpha,
+                         int budget,
+                         int inject_halves,
+                         double c1m,
+                         bool& exhausted,
+                         int& decision,
+                         double& energy0,
+                         double& energy1)
+{
+    if(!ls_ensure_graph_family(ipc, mesh)) return false;
+    auto* ctx = static_cast<LsGraphContext*>(ipc.m_ls_graph_context);
+    auto* device_control = static_cast<LsDeviceControl*>(ipc.m_ls_device_control);
+    LsDeviceControl host_control{};
+    ls_fill_host_control(host_control,
+                         *ctx,
+                         alpha,
+                         cfl_alpha,
+                         budget,
+                         inject_halves,
+                         c1m,
+                         ipc.energy_abs_tol,
+                         ipc.energy_rel_tol);
+
+    for(int overflow_retry = 0; overflow_retry < 8; ++overflow_retry)
+    {
+        CUDA_SAFE_CALL(cudaMemcpyAsync(device_control,
+                                       &host_control,
+                                       sizeof(host_control),
+                                       cudaMemcpyHostToDevice));
+        const cudaError_t launch_status = cudaGraphLaunch(
+            ctx->trial_exec, cudaStreamPerThread);
+        if(launch_status != cudaSuccess)
+        {
+            cudaGetLastError();
+            ++ctx->capture_errors;
+            return false;
+        }
+
+        // The sole normal-path LS D2H. It is after the entire self-tail chain,
+        // so every retry/decision and every pair count stayed device-resident.
+        CUDA_SAFE_CALL(cudaMemcpy(&host_control,
+                                  device_control,
+                                  sizeof(host_control),
+                                  cudaMemcpyDeviceToHost));
+        ++ctx->launches;
+        ++ctx->boundary_d2h;
+
+        if(host_control.frame.result != frame_fsm::FRAME_RETRY_REQUIRED)
+            break;
+
+        // Exceptional compatibility path: let the legacy grow-redo routine
+        // resize both DCD and its CCD mirror at the current trial state. The
+        // next launch re-steps the same alpha from the immutable temp state.
+        const uint32_t required = static_cast<uint32_t>(host_control.frame.cp_count);
+        ipc.buildCP();
+        if(static_cast<uint32_t>(ipc.MAX_COLLITION_PAIRS_NUM) < required)
+            throw std::runtime_error(
+                "[line-search] DCD overflow fallback failed to grow pair capacity");
+
+        const uint32_t preserved_bits = host_control.frame.invalid_bits;
+        const int preserved_ground = host_control.ground_halves;
+        const int preserved_energy = host_control.energy_halves;
+        const int preserved_trials = host_control.energy_trials;
+        const int preserved_ls_trials = host_control.frame.ls_trial;
+        const double preserved_alpha = host_control.frame.alpha;
+
+        if(!ls_ensure_graph_family(ipc, mesh))
+            throw std::runtime_error(
+                "[line-search] failed to rebuild graph after DCD capacity growth");
+        ctx = static_cast<LsGraphContext*>(ipc.m_ls_graph_context);
+        ls_fill_host_control(host_control,
+                             *ctx,
+                             preserved_alpha,
+                             cfl_alpha,
+                             budget,
+                             inject_halves,
+                             c1m,
+                             ipc.energy_abs_tol,
+                             ipc.energy_rel_tol);
+        host_control.frame.invalid_bits = preserved_bits;
+        host_control.ground_halves      = preserved_ground;
+        host_control.energy_halves      = preserved_energy;
+        host_control.energy_trials      = preserved_trials;
+        host_control.frame.ls_trial     = preserved_ls_trials;
+    }
+
+    if(host_control.frame.result == frame_fsm::FRAME_RETRY_REQUIRED)
+        throw std::runtime_error(
+            "[line-search] repeated DCD capacity overflow exhausted retry limit");
+    if(host_control.frame.result != frame_fsm::FRAME_OK)
+        ls_throw_device_failure(host_control);
+
+    alpha     = host_control.frame.alpha;
+    decision  = host_control.frame.ls_decision;
+    energy0   = host_control.frame.energy_E0;
+    energy1   = host_control.frame.energy_trial;
+    exhausted = (host_control.frame.invalid_bits & frame_fsm::INV_LS_BUDGET) != 0;
+    std::memcpy(ipc.h_cpNum, host_control.cp_counts, sizeof(ipc.h_cpNum));
+    ipc.h_gpNum = host_control.gp_count;
+    ipc.snapshotDcdCcdPairs();
+
+    if(getenv("STIFF_LS_GRAPH_DIAG"))
+        printf("[ls-graph-audit] launches=%llu trials=%llu halves=%d "
+               "ground-halves=%d tier=%d cp=%u gp=%u inner-d2h=0 "
+               "graph-d2h-nodes=%d boundary-d2h=%llu ovf=%d\n",
+               ctx->launches,
+               host_control.graph_trials,
+               host_control.energy_halves,
+               host_control.ground_halves,
+               host_control.selected_tier,
+               host_control.cp_counts[0],
+               host_control.gp_count,
+               ctx->graph_d2h_nodes,
+               ctx->boundary_d2h,
+               (host_control.frame.invalid_bits & frame_fsm::OVF_DCD_PAIRS) ? 1 : 0);
+    return true;
+}
+}  // namespace
+
 bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha)
 {
     bool   stopped       = false;
@@ -14703,6 +16081,9 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     double alpha_SL = alpha;
     const int line_search_budget =
         line_search_max_iter > 0 ? line_search_max_iter : 64;
+    const int inject_halves = getenv("STIFF_LS_INJECT_HALVES")
+                                  ? std::max(0, atoi(getenv("STIFF_LS_INJECT_HALVES")))
+                                  : 0;
 
     // [multi-env S2/S3] RIGOROUS per-env line search. Step each env by its own
     // CCD-feasible alpha (m_env_alpha, S1-validated safe), then enforce PER-ENV
@@ -14802,6 +16183,56 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         // reference lastEnergyVal is the eager entry computeEnergy (bit-exact original semantics).
     }
 
+    // P2 graph-compatible GLOBAL path. Per-env S3 intentionally remains the
+    // host loop above; if it falls back to a uniform alpha, both merged BVH and
+    // strict/per-env BVH use this same device-resident state machine. Debug
+    // variants whose safety checker allocates/D2Hs retain the legacy path.
+    const char* ls_graph_env = getenv("STIFF_LS_GRAPH");
+    const bool graph_requested = !ls_graph_env || !ls_graph_env[0]
+                              || atoi(ls_graph_env) != 0;
+    int driver_version = 0;
+    if(graph_requested) cudaDriverGetVersion(&driver_version);
+    const bool graph_eligible = graph_requested
+                             && device_ls
+                             && driver_version >= 12000
+                             && !getenv("GIPC_FORCE_CCD_SANITY")
+                             && !getenv("STIFF_DEVICE_LINESEARCH_VALIDATE")
+                             && !getenv("STIFF_PHASE_TIME")
+                             && !getenv("STIFF_ENERGY_VALIDATE");
+    if(graph_eligible)
+    {
+        bool graph_exhausted = false;
+        int  graph_decision  = 0;
+        double graph_e0      = 0.0;
+        double graph_e1      = 0.0;
+        if(ls_run_graph(*this,
+                        TetMesh,
+                        alpha,
+                        cfl_alpha,
+                        line_search_budget,
+                        inject_halves,
+                        c1m,
+                        graph_exhausted,
+                        graph_decision,
+                        graph_e0,
+                        graph_e1))
+        {
+            if(graph_decision == 2)
+                ++energy_tolerance_accept_count;
+            if(graph_exhausted)
+            {
+                fprintf(stderr,
+                        "[line-search][WARN] budget exhausted (%d halvings, alpha=%.3e): "
+                        "energy did NOT decrease (E=%.9e > E0=%.9e). Step accepted anyway "
+                        "-- POTENTIAL SOLVER ERROR: expect contact drift / collapsed "
+                        "barrier distances / iteration blow-up in later frames. Raise "
+                        "Config.line_search_max_iter, reduce dt, or soften the drive.\n",
+                        line_search_budget, alpha, graph_e1, graph_e0);
+            }
+            return stopped;
+        }
+    }
+
     step_forward(TetMesh, alpha, false);
 
     bool rehash = true;
@@ -14855,7 +16286,9 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     double testingE = 0.0;
 
+    int legacy_energy_trial = 0;
     auto evaluate_trial_energy = [&](double trial_alpha) {
+        int decision = 0;
         if(device_ls)
         {
             computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 1);
@@ -14866,7 +16299,6 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                                         energy_abs_tol,
                                         energy_rel_tol,
                                         m_line_search_decision);
-            int decision = 0;
             CUDA_SAFE_CALL(cudaMemcpy(&decision,
                                       m_line_search_decision,
                                       sizeof(int),
@@ -14895,13 +16327,16 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                     first_match = false;
                 }
             }
-            return decision;
         }
-
-        testingE = computeEnergy(TetMesh);
-        const double rhs = lastEnergyVal + c1m * trial_alpha;
-        const double tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
-        return testingE > rhs + tol ? 1 : (testingE > rhs ? 2 : 0);
+        else
+        {
+            testingE = computeEnergy(TetMesh);
+            const double rhs = lastEnergyVal + c1m * trial_alpha;
+            const double tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
+            decision = testingE > rhs + tol ? 1 : (testingE > rhs ? 2 : 0);
+        }
+        if(legacy_energy_trial++ < inject_halves) decision = 1;
+        return decision;
     };
     int energy_decision = evaluate_trial_energy(alpha);
 
@@ -15603,11 +17038,12 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             cfl_largestSpeed_DeviceOut(pcg_data.squeue, m_ccd_alpha_slots + 3);
             // Launch the refined reduction unconditionally. Its raw invalid
             // status becomes effective only if the exact refinement gate fires.
-            self_full_largestFeasibleStepSize_DeviceOut(
-                slackness_m,
-                ensure_reduce_scratch(h_ccd_cpNum),
-                h_ccd_cpNum,
-                m_ccd_alpha_slots + 4);
+            if(!ccd_launch_tiered_refined(*this, slackness_m))
+                self_full_largestFeasibleStepSize_DeviceOut(
+                    slackness_m,
+                    ensure_reduce_scratch(h_ccd_cpNum),
+                    h_ccd_cpNum,
+                    m_ccd_alpha_slots + 4);
         }
         _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
                                            h_ccd_cpNum > 0 ? 1 : 0,

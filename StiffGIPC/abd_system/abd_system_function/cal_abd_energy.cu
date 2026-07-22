@@ -10,7 +10,8 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data, bool copy_to_host)
     using namespace muda;
     auto& abd       = sim_data.device;
     auto  abd_count = sim_data.abd_fem_count_info().abd_body_num;
-    m_kinetic_energy_per_affine_body.resize(abd_count);
+    if(m_kinetic_energy_per_affine_body.size() != abd_count)
+        m_kinetic_energy_per_affine_body.resize(abd_count);
     auto& abd_body_count = sim_data.abd_fem_count_info().abd_body_num;
     auto  boundry_type   = sim_data.body_id_to_boundary_type();
     if(!abd_count)
@@ -172,7 +173,8 @@ Float ABDSystem::cal_abd_shape_energy(ABDSimData& sim_data, bool copy_to_host)
     auto  dt        = parms.dt;
     if(!abd_count)
         return 0;
-    m_shape_energy_per_affine_body.resize(abd_count);
+    if(m_shape_energy_per_affine_body.size() != abd_count)
+        m_shape_energy_per_affine_body.resize(abd_count);
 
     ParallelFor()
         .kernel_name(__FUNCTION__)
@@ -207,7 +209,8 @@ Float ABDSystem::cal_abd_joint_energy(ABDSimData& sim_data, bool copy_to_host)
 
     auto kappa_fallback = parms.joint_strength_ratio;  // fallback; per-joint kappa takes priority
 
-    m_joint_energy_per_joint.resize(num_joints);
+    if(m_joint_energy_per_joint.size() != num_joints)
+        m_joint_energy_per_joint.resize(num_joints);
 
     ParallelFor()
         .kernel_name(__FUNCTION__)
