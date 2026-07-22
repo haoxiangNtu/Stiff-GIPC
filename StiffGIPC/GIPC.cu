@@ -428,21 +428,39 @@ __global__ void _partition_collision_triplets(const uint64_t* sort_hash,
     }
 }
 
-__global__ void _reorder_triplets(int*             row_ids_input,
-                                  int*             col_ids_input,
-                                  Eigen::Matrix3d* triplet_value_inpuit,
-                                  int*             row_ids,
-                                  int*             col_ids,
-                                  Eigen::Matrix3d* triplet_value,
-                                  const uint32_t*  sort_index,
-                                  int              number)
+__global__ void _reorder_triplet_segment(const int*             row_ids_input,
+                                         const int*             col_ids_input,
+                                         const Eigen::Matrix3d* triplet_value_input,
+                                         int*                   row_ids,
+                                         int*                   col_ids,
+                                         Eigen::Matrix3d*       triplet_value,
+                                         const uint32_t*        sort_index,
+                                         int                    sorted_start,
+                                         int                    output_start,
+                                         int                    number)
 {
-    uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
-    row_ids[idx]       = row_ids_input[sort_index[idx]];
-    col_ids[idx]       = col_ids_input[sort_index[idx]];
-    triplet_value[idx] = triplet_value_inpuit[sort_index[idx]];
+    uint32_t source = sort_index[sorted_start + idx];
+    row_ids[output_start + idx]       = row_ids_input[source];
+    col_ids[output_start + idx]       = col_ids_input[source];
+    triplet_value[output_start + idx] = triplet_value_input[source];
+}
+
+__global__ void _compact_triplet_segment(int*             row_ids,
+                                         int*             col_ids,
+                                         Eigen::Matrix3d* triplet_value,
+                                         int              input_start,
+                                         int              output_start,
+                                         int              number)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    row_ids[output_start + idx]       = row_ids[input_start + idx];
+    col_ids[output_start + idx]       = col_ids[input_start + idx];
+    triplet_value[output_start + idx] = triplet_value[input_start + idx];
 }
 
 
@@ -1649,9 +1667,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                                     double*                 lastH,
                                     double                  coef,
                                     const double*           vert_mu,
-                                    int                     cd_offset4,
-                                    int                     cd_offset3,
-                                    int                     cd_offset2,
+                                    int                     global_offset,
                                     int                     f_offset4,
                                     int                     f_offset3,
                                     int                     f_offset2)
@@ -1663,7 +1679,6 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
     const double mu = _pair_mu(MMCVIDI, vert_mu, coef);  // [per-body friction]
     double  eps     = sqrt(eps2);
     double3 relDX3D;
-    int global_offset = cd_offset4 * M12_Off + cd_offset3 * M9_Off + cd_offset2 * M6_Off;
     if(MMCVIDI.x >= 0)
     {
         Friction::computeRelDX_EE(
@@ -9705,7 +9720,7 @@ void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int globa
         return;
     }
     const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
     // offset
     _computeSoftConstraintGradientAndHessian<<<blockNum, threadNum>>>(
         _vertexes,
@@ -9750,7 +9765,8 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         return;
     }
     const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int itemCapacity = gipc::assembly_capacity_tier(numbers);
+    int blockNum     = itemCapacity / threadNum;
     _computeGroundGradientAndHessian<<<blockNum, threadNum>>>(
         _vertexes,
         _groundOffset,
@@ -11617,6 +11633,106 @@ AABB* GIPC::calcuMaxSceneSize()
     return bvh_f.getSceneSize();
 }
 
+namespace
+{
+struct ContactTripletTierLayout
+{
+    int n4 = 0, n3 = 0, n2 = 0;
+    int c4 = 0, c3 = 0, c2 = 0;
+    int exactTriplets = 0;
+    int tierTriplets  = 0;
+};
+
+ContactTripletTierLayout make_contact_triplet_tier(const uint32_t* counts)
+{
+    ContactTripletTierLayout r;
+    r.n4 = static_cast<int>(counts[4]);
+    r.n3 = static_cast<int>(counts[3]);
+    r.n2 = static_cast<int>(counts[2]);
+    r.c4 = r.n4 ? gipc::assembly_capacity_tier(r.n4) : 0;
+    r.c3 = r.n3 ? gipc::assembly_capacity_tier(r.n3) : 0;
+    r.c2 = r.n2 ? gipc::assembly_capacity_tier(r.n2) : 0;
+    long long exact = static_cast<long long>(r.n4) * M12_Off
+                      + static_cast<long long>(r.n3) * M9_Off
+                      + static_cast<long long>(r.n2) * M6_Off;
+    long long tier = static_cast<long long>(r.c4) * M12_Off
+                     + static_cast<long long>(r.c3) * M9_Off
+                     + static_cast<long long>(r.c2) * M6_Off;
+    if(exact > std::numeric_limits<int>::max()
+       || tier > std::numeric_limits<int>::max())
+        throw std::overflow_error("contact triplet tier exceeds 32-bit offsets");
+    r.exactTriplets = static_cast<int>(exact);
+    r.tierTriplets  = static_cast<int>(tier);
+    return r;
+}
+
+int prepare_contact_triplet_tier(GIPCTripletMatrix&            triplets,
+                                 int                           outputStart,
+                                 const ContactTripletTierLayout& layout)
+{
+    int scratchStart = outputStart + layout.exactTriplets;
+    size_t need = static_cast<size_t>(scratchStart)
+                  + static_cast<size_t>(layout.tierTriplets);
+    if(triplets.triplet_capacity() < need)
+    {
+        // Preserve the already assembled prefix (friction follows barrier).
+        triplets.resize_triplets(static_cast<size_t>(scratchStart));
+        triplets.reserve_triplets(need);
+    }
+    CUDA_SAFE_CALL(cudaMemsetAsync(triplets.block_row_indices(scratchStart),
+                                   0,
+                                   static_cast<size_t>(layout.tierTriplets)
+                                       * sizeof(int),
+                                   0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(triplets.block_col_indices(scratchStart),
+                                   0,
+                                   static_cast<size_t>(layout.tierTriplets)
+                                       * sizeof(int),
+                                   0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(triplets.block_values(scratchStart),
+                                   0,
+                                   static_cast<size_t>(layout.tierTriplets)
+                                       * sizeof(Eigen::Matrix3d),
+                                   0));
+    return scratchStart;
+}
+
+void compact_contact_triplet_tier(GIPCTripletMatrix&             triplets,
+                                  int                            outputStart,
+                                  int                            scratchStart,
+                                  const ContactTripletTierLayout& layout)
+{
+    constexpr int threads = 256;
+    auto compact = [&](int input, int output, int count, int capacity)
+    {
+        if(capacity <= 0)
+            return;
+        _compact_triplet_segment<<<capacity / threads, threads>>>(
+            triplets.block_row_indices(),
+            triplets.block_col_indices(),
+            triplets.block_values(),
+            input,
+            output,
+            count);
+    };
+
+    compact(scratchStart,
+            outputStart,
+            layout.n4 * M12_Off,
+            layout.c4 * M12_Off);
+    compact(scratchStart + layout.c4 * M12_Off,
+            outputStart + layout.n4 * M12_Off,
+            layout.n3 * M9_Off,
+            layout.c3 * M9_Off);
+    compact(scratchStart + layout.c4 * M12_Off
+                + layout.c3 * M9_Off,
+            outputStart + layout.n4 * M12_Off
+                + layout.n3 * M9_Off,
+            layout.n2 * M6_Off,
+            layout.c2 * M6_Off);
+}
+}  // namespace
+
 void GIPC::buildBVH_FULLCCD(const double& alpha, const double* alpha_dev)
 {
     if(m_skip_all_collision)
@@ -11635,27 +11751,34 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
     int numbers = h_cpNum[0];
     if(numbers < 1)
         return;
+    ContactTripletTierLayout layout = make_contact_triplet_tier(h_cpNum);
+    int outputStart = gipc_global_triplet.global_triplet_offset;
+    int scratchStart =
+        prepare_contact_triplet_tier(gipc_global_triplet, outputStart, layout);
     const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    int pairCapacity = gipc::assembly_capacity_tier(numbers);
+    int blockNum     = pairCapacity / threadNum;
 
     _calBarrierGradientAndHessian<<<blockNum, threadNum>>>(
         _vertexes,
         _rest_vertexes,
         _collisonPairs,
         _gradient,
-        gipc_global_triplet.block_values(),
-        gipc_global_triplet.block_row_indices(),
-        gipc_global_triplet.block_col_indices(),
+        gipc_global_triplet.block_values(scratchStart),
+        gipc_global_triplet.block_row_indices(scratchStart),
+        gipc_global_triplet.block_col_indices(scratchStart),
         _cpNum,
         _MatIndex,
         dHat,
         mKappa,
-        h_cpNum[4],
-        h_cpNum[3],
-        h_cpNum[2],
+        layout.c4,
+        layout.c3,
+        layout.c2,
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,   // [per-group κ] nullptr → scalar
         m_pergroup_kappa ? m_d_p2g : nullptr);
+    compact_contact_triplet_tier(
+        gipc_global_triplet, outputStart, scratchStart, layout);
 }
 
 
@@ -11665,25 +11788,32 @@ void GIPC::calBarrierHessian()
     int numbers = h_cpNum[0];
     if(numbers < 1)
         return;
+    ContactTripletTierLayout layout = make_contact_triplet_tier(h_cpNum);
+    int outputStart = gipc_global_triplet.global_triplet_offset;
+    int scratchStart =
+        prepare_contact_triplet_tier(gipc_global_triplet, outputStart, layout);
     const unsigned int threadNum = 256;   // [split-GH] parity with the fused kernel launch
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int pairCapacity = gipc::assembly_capacity_tier(numbers);
+    int blockNum     = pairCapacity / threadNum;
 
     _calBarrierHessian<<<blockNum, threadNum>>>(_vertexes,
                                                 _rest_vertexes,
                                                 _collisonPairs,
-                                                gipc_global_triplet.block_values(),
-                                                gipc_global_triplet.block_row_indices(),
-                                                gipc_global_triplet.block_col_indices(),
+                                                gipc_global_triplet.block_values(scratchStart),
+                                                gipc_global_triplet.block_row_indices(scratchStart),
+                                                gipc_global_triplet.block_col_indices(scratchStart),
                                                 _cpNum,
                                                 _MatIndex,
                                                 dHat,
                                                 Kappa,
-                                                h_cpNum[4],
-                                                h_cpNum[3],
-                                                h_cpNum[2],
+                                                layout.c4,
+                                                layout.c3,
+                                                layout.c2,
                                                 numbers,
                                                 m_pergroup_kappa ? m_kappa_group : nullptr,   // [split-GH]
                                                 m_pergroup_kappa ? m_d_p2g : nullptr);
+    compact_contact_triplet_tier(
+        gipc_global_triplet, outputStart, scratchStart, layout);
 }
 
 static void _dbg_ksum(const char*, const void*, size_t);            // [4.3 fwd]
@@ -11694,9 +11824,16 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     int numbers = h_cpNum_last[0];
     //if (numbers < 1) return;
     const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int blockNum = 0;
+    ContactTripletTierLayout layout;
     if(numbers > 0)
     {
+        layout = make_contact_triplet_tier(h_cpNum_last);
+        int outputStart = gipc_global_triplet.global_triplet_offset;
+        int scratchStart =
+            prepare_contact_triplet_tier(gipc_global_triplet, outputStart, layout);
+        int pairCapacity = gipc::assembly_capacity_tier(numbers);
+        blockNum = pairCapacity / threadNum;
         if(getenv("STIFF_KSUM"))
         {
             cudaDeviceSynchronize();
@@ -11711,9 +11848,9 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             _vertexes,
             TetMesh.o_vertexes,
             _collisonPairs_lastH,
-            gipc_global_triplet.block_values(),
-            gipc_global_triplet.block_row_indices(),
-            gipc_global_triplet.block_col_indices(),
+            gipc_global_triplet.block_values(scratchStart),
+            gipc_global_triplet.block_row_indices(scratchStart),
+            gipc_global_triplet.block_col_indices(scratchStart),
             _cpNum,
             numbers,
             IPC_dt,
@@ -11723,12 +11860,12 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             lambda_lastH_scalar,
             frictionRate,
             d_vert_mu,  // [per-body friction]
-            h_cpNum[4],
-            h_cpNum[3],
-            h_cpNum[2],
-            h_cpNum_last[4],
-            h_cpNum_last[3],
-            h_cpNum_last[2]);
+            0,
+            layout.c4,
+            layout.c3,
+            layout.c2);
+        compact_contact_triplet_tier(
+            gipc_global_triplet, outputStart, scratchStart, layout);
     }
 
     numbers = h_gpNum_last;
@@ -11736,9 +11873,10 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     if(numbers < 1)
         return;
 
-    blockNum = (numbers + threadNum - 1) / threadNum;
-    int global_offset = gipc_global_triplet.global_triplet_offset + h_cpNum_last[4] * M12_Off
-                        + h_cpNum_last[3] * M9_Off + h_cpNum_last[2] * M6_Off;
+    int groundCapacity = gipc::assembly_capacity_tier(numbers);
+    blockNum = groundCapacity / threadNum;
+    int global_offset =
+        gipc_global_triplet.global_triplet_offset + layout.exactTriplets;
     _calFrictionHessian_gd<<<blockNum, threadNum>>>(
         _vertexes,
         TetMesh.o_vertexes,
@@ -11904,7 +12042,8 @@ void GIPC::calBarrierGradient(double3* _gradient, double mKappa,
     if(numbers < 1)
         return;
     const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    int pairCapacity = gipc::assembly_capacity_tier(numbers);
+    int blockNum     = pairCapacity / threadNum;
 
 
     _calBarrierGradient<<<blockNum, threadNum>>>(
@@ -12848,34 +12987,11 @@ void GIPC::partitionContactHessian()
         return;
     }
 
-    // Contact partitioning is itself an out-of-place reorder: assembled
-    // triplets live in [0,n), while _reorder_triplets writes [n,2n) before
-    // the ranges are copied back. Dynamic pre-assembly growth only guarantees
-    // [0,n), and the global converter's equivalent safety net runs later.
-    // Grow here from the exact contact count while preserving [0,n).
+    // The classification sort always runs at the global contact tier.  Its
+    // four payload ranges are staged only after the single boundary D2H below,
+    // when their individual capacity tiers are known.
     const int exact_count = gipc_global_triplet.global_collision_triplet_offset;
     const int tier        = gipc::assembly_capacity_tier(exact_count);
-    if(gipc_global_triplet.triplet_capacity() < 2ull * static_cast<size_t>(tier))
-    {
-        gipc_global_triplet.resize_triplets(static_cast<size_t>(exact_count));
-        gipc_global_triplet.reserve_triplets(2ull * static_cast<size_t>(tier));
-    }
-
-    // The tier's out-of-place destination includes canonical zero padding.
-    // Only exact sorted entries are gathered below; copying the whole tier
-    // back therefore never exposes stale payload to later fixed-shape stages.
-    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_row_indices(tier),
-                                   0,
-                                   static_cast<size_t>(tier) * sizeof(int),
-                                   cudaStreamPerThread));
-    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_col_indices(tier),
-                                   0,
-                                   static_cast<size_t>(tier) * sizeof(int),
-                                   cudaStreamPerThread));
-    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_values(tier),
-                                   0,
-                                   static_cast<size_t>(tier) * sizeof(Eigen::Matrix3d),
-                                   cudaStreamPerThread));
 
     muda::DeviceRadixSort().SortPairs(gipc_global_triplet.block_hash_value(),
                                       gipc_global_triplet.block_sort_hash_value(),
@@ -12884,16 +13000,6 @@ void GIPC::partitionContactHessian()
                                       tier);
 
     int threadNum = 256;
-
-    _reorder_triplets<<<tier / threadNum, threadNum>>>(
-        gipc_global_triplet.block_row_indices(),
-        gipc_global_triplet.block_col_indices(),
-        gipc_global_triplet.block_values(),
-        gipc_global_triplet.block_row_indices(tier),
-        gipc_global_triplet.block_col_indices(tier),
-        gipc_global_triplet.block_values(tier),
-        (const uint32_t*)gipc_global_triplet.block_sort_index(),
-        exact_count);
 
     //gipc_global_triplet.d_abd_abd_contact_start_id = -1;
     //gipc_global_triplet.d_abd_fem_contact_start_id = -1;
@@ -13014,23 +13120,83 @@ void GIPC::partitionContactHessian()
     gipc_global_triplet.h_abd_abd_contact_start_id =
         gipc_global_triplet.h_fem_abd_contact_start_id + gipc_global_triplet.fem_abd_contact_num;
 
-    CUDA_SAFE_CALL(
-        cudaMemcpy(gipc_global_triplet.block_row_indices(),
-                   gipc_global_triplet.block_row_indices(tier),
-                   static_cast<size_t>(tier) * sizeof(int),
-                   cudaMemcpyDeviceToDevice));
+    // Four tier-fixed staging starts.  The compact copy is also launched by
+    // each segment's capacity, with its exact length used only as a guard, so
+    // downstream ABD/FEM code keeps the historical contiguous layout and the
+    // final matrix receives no structural padding entries.
+    int segmentStart[4] = {
+        gipc_global_triplet.h_fem_fem_contact_start_id,
+        gipc_global_triplet.h_abd_fem_contact_start_id,
+        gipc_global_triplet.h_fem_abd_contact_start_id,
+        gipc_global_triplet.h_abd_abd_contact_start_id};
+    int segmentCount[4] = {
+        gipc_global_triplet.fem_fem_contact_num,
+        gipc_global_triplet.abd_fem_contact_num,
+        gipc_global_triplet.fem_abd_contact_num,
+        gipc_global_triplet.abd_abd_contact_num};
+    int segmentCapacity[4];
+    int partitionCapacity = 0;
+    for(int s = 0; s < 4; ++s)
+    {
+        segmentCapacity[s] = segmentCount[s]
+                                 ? gipc::assembly_capacity_tier(segmentCount[s])
+                                 : 0;
+        partitionCapacity += segmentCapacity[s];
+    }
+    int stagingStart[4] = {tier,
+                           tier + segmentCapacity[0],
+                           tier + segmentCapacity[0] + segmentCapacity[1],
+                           tier + segmentCapacity[0] + segmentCapacity[1]
+                               + segmentCapacity[2]};
+    size_t needed = static_cast<size_t>(tier)
+                    + static_cast<size_t>(partitionCapacity);
+    if(gipc_global_triplet.triplet_capacity() < needed)
+    {
+        gipc_global_triplet.resize_triplets(static_cast<size_t>(exact_count));
+        gipc_global_triplet.reserve_triplets(needed);
+    }
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_row_indices(tier),
+                                   0,
+                                   static_cast<size_t>(partitionCapacity) * sizeof(int),
+                                   0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_col_indices(tier),
+                                   0,
+                                   static_cast<size_t>(partitionCapacity) * sizeof(int),
+                                   0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_values(tier),
+                                   0,
+                                   static_cast<size_t>(partitionCapacity)
+                                       * sizeof(Eigen::Matrix3d),
+                                   0));
 
-    CUDA_SAFE_CALL(
-        cudaMemcpy(gipc_global_triplet.block_col_indices(),
-                   gipc_global_triplet.block_col_indices(tier),
-                   static_cast<size_t>(tier) * sizeof(int),
-                   cudaMemcpyDeviceToDevice));
-
-    CUDA_SAFE_CALL(cudaMemcpy(
-        gipc_global_triplet.block_values(),
-        gipc_global_triplet.block_values(tier),
-        static_cast<size_t>(tier) * sizeof(Eigen::Matrix3d),
-        cudaMemcpyDeviceToDevice));
+    for(int s = 0; s < 4; ++s)
+    {
+        if(segmentCapacity[s] == 0)
+            continue;
+        _reorder_triplet_segment<<<segmentCapacity[s] / threadNum, threadNum>>>(
+            gipc_global_triplet.block_row_indices(),
+            gipc_global_triplet.block_col_indices(),
+            gipc_global_triplet.block_values(),
+            gipc_global_triplet.block_row_indices(),
+            gipc_global_triplet.block_col_indices(),
+            gipc_global_triplet.block_values(),
+            (const uint32_t*)gipc_global_triplet.block_sort_index(),
+            segmentStart[s],
+            stagingStart[s],
+            segmentCount[s]);
+    }
+    for(int s = 0; s < 4; ++s)
+    {
+        if(segmentCapacity[s] == 0)
+            continue;
+        _compact_triplet_segment<<<segmentCapacity[s] / threadNum, threadNum>>>(
+            gipc_global_triplet.block_row_indices(),
+            gipc_global_triplet.block_col_indices(),
+            gipc_global_triplet.block_values(),
+            stagingStart[s],
+            segmentStart[s],
+            segmentCount[s]);
+    }
 }
 
 static void _dbg_ksum_comm(const char* name, const void* dptr, size_t nbytes);  // [4.3 fwd]
@@ -13199,7 +13365,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             if(_numbers >= 1)
             {
                 const unsigned int _tn = 256;
-                int                _bn = (_numbers + _tn - 1) / _tn;
+                int _pair_capacity = gipc::assembly_capacity_tier(_numbers);
+                int _bn            = _pair_capacity / _tn;
                 _calBarrierGradient<<<_bn, _tn>>>(_vertexes, _rest_vertexes,
                     _collisonPairs, contact_grads, dHat, Kappa, _numbers,
                     m_pergroup_kappa ? m_kappa_group : nullptr,
