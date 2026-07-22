@@ -2,6 +2,31 @@
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <gipc/utils/timer.h>
+#include <cstdlib>
+#include <typeinfo>
+
+namespace
+{
+__global__ void publish_pcg_unique_count(int* out, int count)
+{
+    if(threadIdx.x == 0 && blockIdx.x == 0) *out = count;
+}
+
+int pcg_capacity_tier(int count)
+{
+    if(count <= 0) return 0;
+    unsigned int blocks = (static_cast<unsigned int>(count) + 255u) / 256u;
+    unsigned int tier_blocks = 1;
+    while(tier_blocks < blocks && tier_blocks < (1u << 22))
+        tier_blocks <<= 1;
+    return static_cast<int>(tier_blocks * 256u);
+}
+
+void pcg_hash_combine(std::uint64_t& seed, std::uint64_t value)
+{
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+}
+}  // namespace
 
 namespace gipc
 {
@@ -174,9 +199,81 @@ gipc::SizeT GlobalLinearSystem::solve_linear_system()
         _s4_zero_masked_rhs<<<gn, bs>>>(m_b.view().data(), m_s4_active,
                                         m_s4_dof_to_group, n, m_s4_ng);
     }
+    // Converter P3 will eventually keep this count device-native. During P1
+    // the converter still materializes the exact host count, so publish it
+    // once before PCG; cached SpMV nodes read this stable device address.
+    publish_pcg_unique_count<<<1, 1>>>(
+        gipc_global_triplet->d_unique_key_number,
+        gipc_global_triplet->h_unique_key_number);
     auto iter = m_solver->solve(m_x, m_b);
     distribute_solution();
     return iter;
+}
+
+int GlobalLinearSystem::pcg_dof_tier() const
+{
+    return pcg_capacity_tier(static_cast<int>(m_b.size()));
+}
+
+int GlobalLinearSystem::pcg_unique_tier() const
+{
+    if(!gipc_global_triplet) return 0;
+    const int count = gipc_global_triplet->h_unique_key_number;
+    int tier = pcg_capacity_tier(count);
+
+    // Validation/qualification hook: run identical input in a deliberately
+    // larger tier and compare bytes. Production leaves both variables unset.
+    if(const char* explicit_tier = getenv("STIFF_PCG_UNIQUE_TIER"))
+    {
+        const long long requested = atoll(explicit_tier);
+        if(requested >= count && requested <= (1LL << 30))
+            tier = static_cast<int>((requested + 255LL) / 256LL * 256LL);
+    }
+    if(const char* shift_text = getenv("STIFF_PCG_UNIQUE_TIER_SHIFT"))
+    {
+        int shift = atoi(shift_text);
+        while(shift-- > 0 && tier > 0 && tier <= (1 << 29)) tier <<= 1;
+    }
+    return tier;
+}
+
+std::uint64_t GlobalLinearSystem::pcg_preconditioner_signature() const
+{
+    std::uint64_t seed = 0x504347505245434FULL;  // "PCGPRECO"
+    if(m_global_preconditioner)
+        pcg_hash_combine(seed, typeid(*m_global_preconditioner).hash_code());
+    else
+        pcg_hash_combine(seed, 0);
+    for(const auto& p : m_local_preconditioners)
+    {
+        pcg_hash_combine(seed, typeid(*p).hash_code());
+        pcg_hash_combine(seed, static_cast<std::uint64_t>(p->preconditioner_id));
+    }
+    return seed;
+}
+
+std::uint64_t GlobalLinearSystem::pcg_binding_signature() const
+{
+    std::uint64_t seed = 0x50434742494e4449ULL;  // "PCGBINDI"
+    if(gipc_global_triplet)
+    {
+        pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(
+                                   gipc_global_triplet->block_values()));
+        pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(
+                                   gipc_global_triplet->block_row_indices()));
+        pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(
+                                   gipc_global_triplet->block_col_indices()));
+        pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(
+                                   gipc_global_triplet->d_unique_key_number));
+    }
+    pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(m_s4_active));
+    pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(m_s4_dof_to_group));
+    pcg_hash_combine(seed, m_spmv.graph_binding_token());
+    pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(
+                               m_global_preconditioner.get()));
+    for(const auto& p : m_local_preconditioners)
+        pcg_hash_combine(seed, reinterpret_cast<std::uintptr_t>(p.get()));
+    return seed;
 }
 
 Json GlobalLinearSystem::as_json() const
@@ -273,6 +370,8 @@ void GlobalLinearSystem::spmv(Float                         a,
                                 gipc_global_triplet->block_row_indices(),
                                 gipc_global_triplet->block_col_indices(),
                                 gipc_global_triplet->h_unique_key_number,
+                                pcg_unique_tier(),
+                                gipc_global_triplet->d_unique_key_number,
                                 x,
                                 b,
                                 y,

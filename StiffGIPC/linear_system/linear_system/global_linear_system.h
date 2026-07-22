@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <list>
 #include <linear_system/utils/spmv.h>
 #include <linear_system/utils/converter.h>
@@ -62,6 +63,17 @@ class GlobalLinearSystem
      */
     gipc::SizeT solve_linear_system();
 
+    // Explicit frame/user-boundary telemetry read. The fast solve path only
+    // updates device counters; callers batch the single D2H here after their
+    // frame stream has reached its normal synchronization boundary.
+    IterativeSolverStats collect_solver_stats(
+        bool reset_pending = true,
+        cudaStream_t stream = cudaStreamPerThread)
+    {
+        return m_solver ? m_solver->collect_stats(reset_pending, stream)
+                        : IterativeSolverStats{};
+    }
+
     Json               as_json() const;
     GIPCTripletMatrix* gipc_global_triplet = nullptr;
 
@@ -102,6 +114,18 @@ class GlobalLinearSystem
             if(!p->graph_capturable())
                 return false;
         return true;
+    }
+
+    // P1 cache-key inputs. Counts map to fixed launch-capacity tiers; pointer
+    // and preconditioner signatures prevent an executable from surviving a
+    // topology/reallocation boundary with stale captured kernel arguments.
+    int           pcg_dof_tier() const;
+    int           pcg_unique_tier() const;
+    std::uint64_t pcg_preconditioner_signature() const;
+    std::uint64_t pcg_binding_signature() const;
+    bool          pcg_spmv_workspace_ready() const
+    {
+        return m_spmv.graph_workspace_ready(m_b.size());
     }
     const int* m_s4_active       = nullptr;
     const int* m_s4_dof_to_group = nullptr;

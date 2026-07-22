@@ -12,11 +12,19 @@ Spmv::~Spmv()
         cudaFree(m_ybin);
 }
 
+bool Spmv::graph_workspace_ready(std::size_t scalar_dof_count) const
+{
+    return m_ybin
+           && m_ybin_cap >= scalar_dof_count * static_cast<std::size_t>(BINNED_K);
+}
+
 void Spmv::warp_reduce_sym_spmv(Float                         a,
                                 Eigen::Matrix3d*              triplet_values,
                                 int*                          row_ids,
                                 int*                          col_ids,
                                 int                           triplet_count,
+                                int                           launch_triplet_count,
+                                const int*                    d_triplet_count,
                                 muda::CDenseVectorView<Float> x,
                                 Float                         b,
                                 muda::DenseVectorView<Float>  y,
@@ -72,7 +80,10 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
     constexpr int          warp_size = 32;
     constexpr unsigned int warp_mask = ~0u;
     constexpr int          block_dim = 256;
-    int block_count = (triplet_count + block_dim - 1) / block_dim;
+    const int launch_count = launch_triplet_count > 0
+                                 ? launch_triplet_count
+                                 : triplet_count;
+    int block_count = (launch_count + block_dim - 1) / block_dim;
 
     // [env-det] when set, deposit each row contribution per-entry (fully order-free) instead of
     // warp-segmented-reducing first — the warp reduce sums in lane order, which differs cross-env
@@ -92,6 +103,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
              rows  = row_ids,
              cols  = col_ids,
              triplet_count,
+             d_triplet_count,
              x = x.viewer().name("x"),
              b = b,
              det = det,
@@ -103,7 +115,10 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
             {
                 using WarpReduceFloat = cub::WarpReduce<Float, warp_size>;
                 auto global_thread_id = blockDim.x * blockIdx.x + threadIdx.x;
-                if(global_thread_id >= triplet_count)
+                const int valid_triplet_count = d_triplet_count
+                                                    ? *d_triplet_count
+                                                    : triplet_count;
+                if(global_thread_id >= valid_triplet_count)
                     return;
                 // [multi-env S4] skip triplets whose row env is masked. y[masked]
                 // stays 0 (pre-zeroed when b==0) and masked p is 0 -> result

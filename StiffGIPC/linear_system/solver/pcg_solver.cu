@@ -9,11 +9,31 @@
 #include <cub/iterator/counting_input_iterator.cuh>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 
 // [decouple probe] global (non-namespaced) frame/Newton-iter counters defined in GIPC.cu — used to
 // gate the STIFF_H_DUMP rz0 dump to a specific frame/iteration.
 extern int g_dec_frame;
 extern int g_dec_k;
+
+// STIFF_PCG_GRAPH_DIAG audit counter. All intentional solver-internal D2H
+// sites route through this wrapper; the device continuation path reports zero.
+// The explicit collect_stats() boundary is deliberately outside this scope.
+static thread_local unsigned long long g_pcg_solve_d2h_calls = 0;
+
+static cudaError_t pcg_copy_d2h(void* dst, const void* src, size_t bytes)
+{
+    ++g_pcg_solve_d2h_calls;
+    return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+}
+
+static void pcg_report_d2h_audit(const char* path)
+{
+    if(getenv("STIFF_PCG_GRAPH_DIAG"))
+        printf("[pcg-d2h-audit] path=%s cudaMemcpy-D2H=%llu\n",
+               path,
+               g_pcg_solve_d2h_calls);
+}
 
 // ===================== [multi-env P3] segmented (block-diagonal) PCG kernels =====================
 // Per-env dot via binned deposit (exact, order-independent ⇒ per-env deterministic AND, for
@@ -140,10 +160,11 @@ __global__ void _seg_dot_fused(const double* a, const double* b, const int* d2g,
 // x += α_g c; r -= α_g Ap; α_g = rz_g/dot_g. Converged envs (brk_g) and bad dot are frozen.
 __global__ void _seg_axpy_xr(double* dx, double* r, const double* c, const double* q,
                              const double* rz_g, const double* dot_g, const int* brk_g,
-                             const int* d2g, int ng, int n)
+                             const int* d2g, int ng, int n,
+                             const gipc::PCGDeviceState* graph_state)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i >= n) return;
+    if(i >= n || !graph_state->iteration_active) return;
     int g = d2g[i / 3];
     if(g < 0 || g >= ng || brk_g[g]) return;
     double dot = dot_g[g];
@@ -154,10 +175,11 @@ __global__ void _seg_axpy_xr(double* dx, double* r, const double* c, const doubl
 }
 // p = z + β_g p; β_g = rzn_g/rz_g.
 __global__ void _seg_axpy_p(double* c, const double* z, const double* rzn_g, const double* rz_g,
-                            const int* brk_g, const int* d2g, int ng, int n)
+                            const int* brk_g, const int* d2g, int ng, int n,
+                            const gipc::PCGDeviceState* graph_state)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i >= n) return;
+    if(i >= n || !graph_state->iteration_active) return;
     int g = d2g[i / 3];
     if(g < 0 || g >= ng || brk_g[g]) return;
     double rzo = rz_g[g];
@@ -197,7 +219,8 @@ __global__ void _seg_partial_combine(double* out_g, double* partials, int ng)
 // separate _seg_swap_check launch; the rz swap itself becomes a host-side POINTER ping-pong).
 // tol2_g == nullptr -> scalar tol. Bit-identical values to combine-then-check.
 __global__ void _seg_partial_combine_ck(double* out_g, double* partials, const double* rz0_g,
-                                        const double* tol2_g, double tol, int* brk_g, int ng)
+                                        const double* tol2_g, double tol, int* brk_g, int ng,
+                                        const gipc::PCGDeviceState* graph_state)
 {
     __shared__ double sh[256];
     int g = blockIdx.x;
@@ -213,6 +236,7 @@ __global__ void _seg_partial_combine_ck(double* out_g, double* partials, const d
     }
     if(threadIdx.x == 0)
     {
+        if(!graph_state->iteration_active) return;
         double rzn = sh[0];
         out_g[g]   = rzn;
         double t   = tol2_g ? tol2_g[g] : tol;
@@ -221,7 +245,8 @@ __global__ void _seg_partial_combine_ck(double* out_g, double* partials, const d
 }
 // [micro-fusion (3)] binned-dot combine WITH the check folded in (strict path equivalent).
 __global__ void _seg_dot_combine_ck(double* out_g, double* segbin, const double* rz0_g,
-                                    const double* tol2_g, double tol, int* brk_g, int ng)
+                                    const double* tol2_g, double tol, int* brk_g, int ng,
+                                    const gipc::PCGDeviceState* graph_state)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
@@ -229,6 +254,7 @@ __global__ void _seg_dot_combine_ck(double* out_g, double* segbin, const double*
     double  rzn = binned_combine(b);
 #pragma unroll
     for(int kk = 0; kk < BINNED_K; ++kk) b[kk] = 0.0;
+    if(!graph_state->iteration_active) return;
     out_g[g] = rzn;
     double t = tol2_g ? tol2_g[g] : tol;
     if(fabs(rzn) <= t * rz0_g[g]) brk_g[g] = 1;
@@ -236,10 +262,11 @@ __global__ void _seg_dot_combine_ck(double* out_g, double* segbin, const double*
 // [micro-fusion (3)] check-only variant (fast-path fallback when the precond-fused dot is not
 // armed): brk from an already-combined rzn.
 __global__ void _seg_check_only(const double* rzn_g, const double* rz0_g, const double* tol2_g,
-                                double tol, int* brk_g, int ng)
+                                double tol, int* brk_g, int ng,
+                                const gipc::PCGDeviceState* graph_state)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
-    if(g >= ng) return;
+    if(g >= ng || !graph_state->iteration_active) return;
     double t = tol2_g ? tol2_g[g] : tol;
     if(fabs(rzn_g[g]) <= t * rz0_g[g]) brk_g[g] = 1;
 }
@@ -442,10 +469,11 @@ __global__ void update_vector_c_dev(
 // host-side break check to fire on next K-stride sync.
 __global__ void update_vector_dx_r_fused(
     double* dx, double* r, const double* c, const double* q,
-    const double* d_rz, const double* d_dot_res, int* d_break, int numbers)
+    const double* d_rz, const double* d_dot_res, int* d_break, int numbers,
+    const gipc::PCGDeviceState* graph_state)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if(idx >= numbers) return;
+    if(idx >= numbers || !graph_state->iteration_active) return;
     double dot = *d_dot_res;
     // Soundness: same exit criteria as original compute_alpha_kernel —
     // dot_res<=0 or non-finite means PCG has effectively converged (PD A
@@ -464,10 +492,11 @@ __global__ void update_vector_dx_r_fused(
 // Same trick for beta + axpy on p. Swap (d_rz = d_rz_new) and convergence
 // check are deferred to a tiny <<<1,1>>> post kernel below.
 __global__ void update_vector_c_fused(
-    double* c, const double* s, const double* d_rz_new, const double* d_rz_old, int numbers)
+    double* c, const double* s, const double* d_rz_new, const double* d_rz_old,
+    const int* d_break, int numbers, const gipc::PCGDeviceState* graph_state)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if(idx >= numbers) return;
+    if(idx >= numbers || !graph_state->iteration_active || *d_break) return;
     double rz_old = *d_rz_old;
     // Soundness: rz_old should be > 0 in a healthy PCG (it's |r|_M from
     // previous iter). If it's 0/non-finite, original compute_beta_and_swap
@@ -483,12 +512,14 @@ __global__ void update_vector_c_fused(
 // check_convergence_kernel pair (saves 1 launch per iter).
 __global__ void post_iter_swap_and_check(
     double* d_rz, const double* d_rz_new, const double* d_rz0,
-    double tol_rate, int* d_break)
+    double tol_rate, int* d_break, gipc::PCGDeviceState* graph_state)
 {
+    if(!graph_state->iteration_active) return;
     double new_v = *d_rz_new;
     *d_rz = new_v;
     if(fabs(new_v) <= tol_rate * (*d_rz0))
         *d_break = 1;
+    ++graph_state->iteration;
 }
 
 // alpha = rz / dot_res; if dot_res <= 0 or non-finite, set break flag.
@@ -540,33 +571,101 @@ __global__ void copy_scalar_kernel(double* dst, const double* src)
 // the same as the host K-stride loop while the convergence decision stays on
 // the GPU.  Device graph launch is available before conditional graph nodes
 // (CUDA 12.0 vs 12.3), which keeps this path usable on the A800's R535 driver.
-__global__ void pcg_graph_state_init(unsigned long long* state,
-                                     unsigned long long  first_iteration)
+__global__ void pcg_graph_state_init(gipc::PCGDeviceState* state,
+                                     unsigned long long    max_iteration,
+                                     int                   segmented,
+                                     unsigned long long    successor_exec)
 {
-    state[0] = first_iteration;
-    state[1] = 0;
+    state->iteration      = 1;
+    state->max_iteration  = max_iteration;
+    state->successor_exec = successor_exec;
+    ++state->solve_serial;
+    state->iteration_active = 0;
+    state->converged        = 0;
+    state->terminal         = 0;
+    state->segmented        = segmented;
 }
 
-__global__ void pcg_graph_tail_relaunch(unsigned long long* state,
+__global__ void pcg_iteration_begin(gipc::PCGDeviceState* state,
+                                    const int*             d_break)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    const bool converged = *d_break != 0;
+    state->converged = static_cast<int>(converged);
+    state->iteration_active = static_cast<int>(
+        !converged && state->iteration < state->max_iteration);
+}
+
+__global__ void pcg_seg_iteration_begin(gipc::PCGDeviceState* state,
+                                        const int*             d_break_g,
+                                        int                    ng)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    bool converged = true;
+    for(int g = 0; g < ng; ++g)
+        if(d_break_g[g] == 0)
+        {
+            converged = false;
+            break;
+        }
+    state->converged = static_cast<int>(converged);
+    state->iteration_active = static_cast<int>(
+        !converged && state->iteration < state->max_iteration);
+}
+
+__global__ void pcg_seg_iteration_end(gipc::PCGDeviceState* state)
+{
+    if(threadIdx.x == 0 && blockIdx.x == 0 && state->iteration_active)
+        ++state->iteration;
+}
+
+__device__ __forceinline__ void pcg_graph_continue_or_finish(
+    gipc::PCGDeviceState*    state,
+    gipc::PCGDeviceCounters* counters,
+    bool                     converged)
+{
+    state->converged = static_cast<int>(converged);
+    const bool more = !converged && state->iteration < state->max_iteration;
+    if(more)
+    {
+        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+        return;
+    }
+
+    if(atomicCAS(&state->terminal, 0, 1) == 0)
+    {
+        const unsigned long long iterations = state->iteration;
+        atomicAdd(&counters->total_iterations, iterations);
+        atomicAdd(&counters->pending_iterations, iterations);
+        atomicAdd(&counters->solve_count, 1ULL);
+        atomicAdd(&counters->device_graph_solve_count, 1ULL);
+
+        // P2 continuation hook: zero in P1, otherwise the terminal PCG node
+        // transfers directly to the cached Newton-decision executable.
+        if(state->successor_exec != 0)
+        {
+            cudaGraphExec_t successor = reinterpret_cast<cudaGraphExec_t>(
+                static_cast<uintptr_t>(state->successor_exec));
+            cudaGraphLaunch(successor, cudaStreamGraphTailLaunch);
+        }
+    }
+}
+
+__global__ void pcg_graph_tail_relaunch(gipc::PCGDeviceState*    state,
+                                        gipc::PCGDeviceCounters* counters,
                                         const int*          d_break,
-                                        unsigned long long  max_iter,
-                                        unsigned long long  check_k)
+                                        unsigned long long  /*check_k*/)
 {
     if(threadIdx.x != 0 || blockIdx.x != 0)
         return;
-
-    const unsigned long long next = state[0] + check_k;
-    state[0] = next;
-    state[1] = static_cast<unsigned long long>(*d_break != 0);
-    if(*d_break == 0 && next + check_k <= max_iter)
-        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+    pcg_graph_continue_or_finish(state, counters, *d_break != 0);
 }
 
-__global__ void pcg_seg_graph_tail_relaunch(unsigned long long* state,
+__global__ void pcg_seg_graph_tail_relaunch(gipc::PCGDeviceState*    state,
+                                            gipc::PCGDeviceCounters* counters,
                                             const int*          d_break_g,
                                             int                 ng,
-                                            unsigned long long  max_iter,
-                                            unsigned long long  check_k)
+                                            unsigned long long  /*check_k*/)
 {
     if(threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -579,11 +678,23 @@ __global__ void pcg_seg_graph_tail_relaunch(unsigned long long* state,
             break;
         }
 
-    const unsigned long long next = state[0] + check_k;
-    state[0] = next;
-    state[1] = static_cast<unsigned long long>(all_converged);
-    if(!all_converged && next + check_k <= max_iter)
-        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+    pcg_graph_continue_or_finish(state, counters, all_converged);
+}
+
+__global__ void pcg_record_fallback_result(gipc::PCGDeviceCounters* counters,
+                                           unsigned long long       iterations)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    atomicAdd(&counters->total_iterations, iterations);
+    atomicAdd(&counters->pending_iterations, iterations);
+    atomicAdd(&counters->solve_count, 1ULL);
+    atomicAdd(&counters->fallback_solve_count, 1ULL);
+}
+
+__global__ void pcg_reset_pending_stats(gipc::PCGDeviceCounters* counters)
+{
+    if(threadIdx.x == 0 && blockIdx.x == 0)
+        counters->pending_iterations = 0;
 }
 
 
@@ -690,14 +801,125 @@ PCGSolver::PCGSolver(const PCGSolverConfig& cfg)
 {
 }
 
+bool PCGSolver::GraphCacheKey::operator==(const GraphCacheKey& rhs) const
+{
+    return device == rhs.device
+        && mode == rhs.mode
+        && dof_count == rhs.dof_count
+        && dof_tier == rhs.dof_tier
+        && unique_tier == rhs.unique_tier
+        && group_count == rhs.group_count
+        && check_k == rhs.check_k
+        && preconditioner == rhs.preconditioner
+        && bindings == rhs.bindings
+        && features == rhs.features
+        && tolerance_bits == rhs.tolerance_bits;
+}
+
+PCGSolver::GraphCacheKey PCGSolver::make_graph_cache_key(
+    int mode,
+    muda::DenseVectorView<Float> x,
+    int group_count,
+    SizeT check_k,
+    std::uint64_t features,
+    double tolerance) const
+{
+    GraphCacheKey key{};
+    cudaGetDevice(&key.device);
+    key.mode         = mode;
+    key.dof_count    = static_cast<int>(x.size());
+    key.dof_tier     = system_ptr()->pcg_dof_tier();
+    key.unique_tier  = system_ptr()->pcg_unique_tier();
+    key.group_count  = group_count;
+    key.check_k      = static_cast<int>(check_k);
+    key.preconditioner = system_ptr()->pcg_preconditioner_signature();
+    key.features       = features;
+    static_assert(sizeof(key.tolerance_bits) == sizeof(tolerance),
+                  "double cache-key encoding changed");
+    std::memcpy(&key.tolerance_bits, &tolerance, sizeof(tolerance));
+
+    auto mix = [](std::uint64_t& seed, std::uint64_t value)
+    {
+        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    };
+    key.bindings = system_ptr()->pcg_binding_signature();
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(x.data()));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(z.buffer_view().data()));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(r.buffer_view().data()));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(p.buffer_view().data()));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(Ap.buffer_view().data()));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_rz));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_rz0));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_rz_new));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_dot_res));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_alpha));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_beta));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_graph_state));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_counters));
+    mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_break));
+    if(group_count > 0)
+    {
+        mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_rz_g));
+        mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_rz0_g));
+        mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_rzn_g));
+        mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_dot_g));
+        mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_break_g));
+        mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_segbin));
+        mix(key.bindings, reinterpret_cast<std::uintptr_t>(d_dot_partials));
+    }
+    return key;
+}
+
+PCGSolver::GraphCacheEntry* PCGSolver::find_graph_cache(
+    const GraphCacheKey& key)
+{
+    for(auto& entry : m_graph_cache)
+        if(entry.key == key)
+        {
+            ++m_graph_cache_hits;
+            return &entry;
+        }
+    ++m_graph_cache_misses;
+    return nullptr;
+}
+
+void PCGSolver::clear_graph_cache()
+{
+    for(auto& entry : m_graph_cache)
+        if(entry.exec) cudaGraphExecDestroy(entry.exec);
+    m_graph_cache.clear();
+}
+
+IterativeSolverStats PCGSolver::collect_stats(bool reset_pending,
+                                               cudaStream_t stream)
+{
+    IterativeSolverStats result{};
+    if(!d_scalars_alloced || !d_counters)
+        return result;
+
+    PCGDeviceCounters host{};
+    CUDA_SAFE_CALL(cudaMemcpyAsync(&host,
+                                   d_counters,
+                                   sizeof(host),
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
+    CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
+    if(reset_pending)
+        pcg_reset_pending_stats<<<1, 1, 0, stream>>>(d_counters);
+
+    result.total_iterations          = host.total_iterations;
+    result.pending_iterations        = host.pending_iterations;
+    result.solve_count               = host.solve_count;
+    result.device_graph_solve_count  = host.device_graph_solve_count;
+    result.fallback_solve_count      = host.fallback_solve_count;
+    return result;
+}
+
 PCGSolver::~PCGSolver()
 {
     // Executables retain kernel arguments pointing at the scalar/segmented
     // buffers, so release them before the referenced allocations.
-    if(m_device_loop_exec)
-        cudaGraphExecDestroy(m_device_loop_exec);
-    if(m_seg_device_loop_exec)
-        cudaGraphExecDestroy(m_seg_device_loop_exec);
+    clear_graph_cache();
     if(d_scalars_alloced)
     {
         cudaFree(d_rz);
@@ -708,6 +930,7 @@ PCGSolver::~PCGSolver()
         cudaFree(d_beta);
         cudaFree(d_break);
         cudaFree(d_graph_state);
+        cudaFree(d_counters);
     }
     if(cub_temp_ptr) cudaFree(cub_temp_ptr);
     if(m_seg_alloced)
@@ -720,6 +943,7 @@ PCGSolver::~PCGSolver()
 SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b)
 {
     Timer timer{"pcg"};
+    g_pcg_solve_d2h_calls = 0;
 
     x.buffer_view().fill(0);
     z.resize(b.size());
@@ -737,7 +961,10 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
         cudaMalloc(&d_alpha,   sizeof(Float));
         cudaMalloc(&d_beta,    sizeof(Float));
         cudaMalloc(&d_break,   sizeof(int));
-        cudaMalloc(&d_graph_state, 2 * sizeof(unsigned long long));
+        cudaMalloc(&d_graph_state, sizeof(PCGDeviceState));
+        cudaMalloc(&d_counters, sizeof(PCGDeviceCounters));
+        cudaMemset(d_graph_state, 0, sizeof(PCGDeviceState));
+        cudaMemset(d_counters, 0, sizeof(PCGDeviceCounters));
         d_scalars_alloced = true;
     }
 
@@ -786,7 +1013,10 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     // [perf] convergence-check period: each check is a BLOCKING D2H (host loop needs the flag to
     // break) → the dominant host-bound cost (nsys: cudaMemcpy 68% of API). Larger K = fewer syncs at
     // the cost of ≤K extra iters after convergence. Fixed value → deterministic iter count (strict OK).
-    const SizeT K = getenv("STIFF_PCG_CHECK_K") ? (SizeT)atoi(getenv("STIFF_PCG_CHECK_K")) : 8;
+    const long long requested_K = getenv("STIFF_PCG_CHECK_K")
+                                      ? atoll(getenv("STIFF_PCG_CHECK_K"))
+                                      : 8;
+    const SizeT K = requested_K > 0 ? static_cast<SizeT>(requested_K) : 1;
     const double pcg_tol = getenv("STIFF_PCG_TOL") ? atof(getenv("STIFF_PCG_TOL"))
                                                    : m_config.global_tol_rate;
 
@@ -795,6 +1025,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     // p/rz/brk — x and r are bit-identical to the old mid-iteration-check loop at every exit point.
     auto body = [&]()
     {
+        pcg_iteration_begin<<<1, 1>>>(d_graph_state, d_break);
         // Ap = A * p
         spmv(p.cview(), Ap.view());
         // Step E: cub fused dot(p, Ap) -> d_dot_res (1 launch instead of 2-3).
@@ -806,7 +1037,8 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                                  (const double*)p.buffer_view().data(),
                                  (const double*)Ap.buffer_view().data(),
                                  (const double*)d_rz, (const double*)d_dot_res,
-                                 d_break, (int)z.size());
+                                 d_break, (int)z.size(),
+                                 (const PCGDeviceState*)d_graph_state);
         apply_preconditioner(z, r);
         // Step E: cub fused dot(r, z) -> d_rz_new.
         Cub_PCG_DotReduction(r.buffer_view().data(), z.buffer_view().data(), z.size(),
@@ -814,9 +1046,12 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         // Step E: fused axpy on p re-deriving beta = *d_rz_new / *d_rz per-thread.
         LaunchCudaKernal_default(z.size(), 256, 0, update_vector_c_fused,
                                  p.buffer_view().data(), (const double*)z.buffer_view().data(),
-                                 (const double*)d_rz_new, (const double*)d_rz, (int)z.size());
+                                 (const double*)d_rz_new, (const double*)d_rz,
+                                 (const int*)d_break, (int)z.size(),
+                                 (const PCGDeviceState*)d_graph_state);
         // Step E: combined swap (d_rz = d_rz_new) + convergence check.
-        post_iter_swap_and_check<<<1, 1>>>(d_rz, d_rz_new, d_rz0, pcg_tol, d_break);
+        post_iter_swap_and_check<<<1, 1>>>(
+            d_rz, d_rz_new, d_rz0, pcg_tol, d_break, d_graph_state);
     };
 
     // [pcg-graph] capture K iterations into a CUDA graph and replay between break checks — removes
@@ -851,96 +1086,112 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         cudaDriverGetVersion(&s_driver_version);
     const bool use_device_loop = use_graph && s_device_loop_env
                               && s_driver_version >= 12000
-                              && K > 0 && 1 + K <= max_iter;
+                              && K > 0 && max_iter > 1;
+
+    // The max-iteration budget is solve data, not a captured kernel argument.
+    // This keeps cached graphs valid across solves with different budgets.
+    pcg_graph_state_init<<<1, 1>>>(d_graph_state,
+                                   static_cast<unsigned long long>(max_iter),
+                                   0,
+                                   m_successor_exec);
 
     if(use_device_loop)
     {
-        cudaGraph_t     dg  = nullptr;
-        bool            ready = false;
-        bool            rebuilt = false;
+        std::uint64_t features = 0;
+        if(getenv("STIFF_FAST_GRAD")) features |= 1ULL << 0;
+        if(getenv("STIFF_MAS_FUSE")) features |= 1ULL << 1;
+        if(system_ptr()->m_s4_active) features |= 1ULL << 2;
+        const GraphCacheKey key = make_graph_cache_key(
+            0, x, 0, K, features, pcg_tol);
+        GraphCacheEntry* cached = find_graph_cache(key);
+        cudaGraphExec_t exec = cached ? cached->exec : nullptr;
+        cudaGraph_t     dg   = nullptr;
+        bool            ready = exec != nullptr;
+        const bool      cache_hit = ready;
+        cudaError_t     capture_status = cudaSuccess;
 
-        cudaError_t capture_status = cudaStreamBeginCapture(
-            cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
-        if(capture_status == cudaSuccess)
+        if(!ready)
         {
-            for(SizeT i = 0; i < K; ++i)
-                body();
-            pcg_graph_tail_relaunch<<<1, 1>>>(
-                d_graph_state,
-                d_break,
-                static_cast<unsigned long long>(max_iter),
-                static_cast<unsigned long long>(K));
-            capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
-            if(capture_status == cudaSuccess && dg)
+            capture_status = cudaStreamBeginCapture(
+                cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if(capture_status == cudaSuccess)
             {
-                if(m_device_loop_exec)
-                {
-                    cudaGraphExecUpdateResultInfo update_info{};
-                    capture_status = cudaGraphExecUpdate(
-                        m_device_loop_exec, dg, &update_info);
-                    ready = capture_status == cudaSuccess
-                         && update_info.result == cudaGraphExecUpdateSuccess;
-                    if(!ready)
-                    {
-                        cudaGraphExecDestroy(m_device_loop_exec);
-                        m_device_loop_exec = nullptr;
-                    }
-                }
-                if(!m_device_loop_exec)
+                for(SizeT i = 0; i < K; ++i)
+                    body();
+                pcg_graph_tail_relaunch<<<1, 1>>>(
+                    d_graph_state,
+                    d_counters,
+                    d_break,
+                    static_cast<unsigned long long>(K));
+                capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
+                if(capture_status == cudaSuccess && dg)
                 {
                     capture_status = cudaGraphInstantiateWithFlags(
-                        &m_device_loop_exec,
-                        dg,
-                        cudaGraphInstantiateFlagDeviceLaunch);
-                    ready   = capture_status == cudaSuccess && m_device_loop_exec;
-                    rebuilt = ready;
+                        &exec, dg, cudaGraphInstantiateFlagDeviceLaunch);
+                    ready = capture_status == cudaSuccess && exec;
+                    if(ready)
+                    {
+                        capture_status = cudaGraphUpload(exec, cudaStreamPerThread);
+                        ready = capture_status == cudaSuccess;
+                    }
                 }
             }
-        }
-        else
-        {
-            // A failed BeginCapture does not put the stream into capture mode.
-            cudaGetLastError();
+            else
+            {
+                // A failed BeginCapture does not put the stream into capture mode.
+                cudaGetLastError();
+            }
+
+            if(dg)
+            {
+                cudaGraphDestroy(dg);
+                dg = nullptr;
+            }
+            if(ready)
+                m_graph_cache.push_back(GraphCacheEntry{key, exec});
+            else
+            {
+                ++m_graph_capture_errors;
+                if(exec) cudaGraphExecDestroy(exec);
+                exec = nullptr;
+            }
         }
 
         if(ready)
         {
-            // Device-graph updates must be uploaded again before device launch.
-            // Upload is stream ordered, so no host synchronization is introduced.
-            CUDA_SAFE_CALL(cudaGraphUpload(m_device_loop_exec, cudaStreamPerThread));
-            CUDA_SAFE_CALL(cudaGraphDestroy(dg));
-            dg = nullptr;
-            pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
-            CUDA_SAFE_CALL(cudaGraphLaunch(m_device_loop_exec, cudaStreamPerThread));
-
-            unsigned long long graph_state[2] = {1ULL, 0ULL};
-            CUDA_SAFE_CALL(cudaMemcpy(graph_state,
-                                      d_graph_state,
-                                      sizeof(graph_state),
-                                      cudaMemcpyDeviceToHost));
-            k       = static_cast<SizeT>(graph_state[0]);
-            h_break = static_cast<int>(graph_state[1]);
-
-            static bool once = false;
-            if(!once)
+            const cudaError_t launch_status = cudaGraphLaunch(
+                exec, cudaStreamPerThread);
+            if(launch_status == cudaSuccess)
             {
-                once = true;
-                printf("[pcg-device-loop] self-tail graph active (K=%d, driver=%d)\n",
-                       (int)K,
-                       s_driver_version);
-            }
-            if(rebuilt && getenv("STIFF_PCG_GRAPH_DIAG"))
-                printf("[pcg-device-loop] executable rebuilt\n");
+                if(getenv("STIFF_PCG_GRAPH_DIAG"))
+                    printf("[pcg-graph-cache] scalar %s device=%d dof-tier=%d "
+                           "unique-tier=%d hits=%llu misses=%llu\n",
+                           cache_hit ? "hit" : "miss",
+                           key.device,
+                           key.dof_tier,
+                           key.unique_tier,
+                           m_graph_cache_hits,
+                           m_graph_cache_misses);
 
-            // The device graph stops before a partial final batch.  Preserve the
-            // legacy max-iteration semantics with at most K-1 plain tail steps.
-            if(!h_break)
-                for(; k < max_iter; ++k)
-                    body();
-            return k;
+                static bool once = false;
+                if(!once)
+                {
+                    once = true;
+                    printf("[pcg-device-loop] self-tail graph active (K=%d, driver=%d)\n",
+                           (int)K,
+                           s_driver_version);
+                }
+
+                // Iteration, convergence and telemetry stay on device. The last
+                // graph invocation predicates the short tail inside its K slots.
+                pcg_report_d2h_audit("scalar-device");
+                return 0;
+            }
+            capture_status = launch_status;
+            ++m_graph_capture_errors;
+            cudaGetLastError();
         }
 
-        if(dg)  cudaGraphDestroy(dg);
         cudaGetLastError();
         static bool oncef = false;
         if(!oncef)
@@ -954,13 +1205,24 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     cudaGraph_t     pg  = nullptr;
     cudaGraphExec_t pge = nullptr;
     bool            captured = false;
+    bool            pge_cached = false;
     k = 1;
     while(k < max_iter)
     {
         if(captured && k + K <= (SizeT)max_iter)
         {
-            cudaGraphLaunch(pge, cudaStreamPerThread);   // = K iterations
-            k += K;
+            if(cudaGraphLaunch(pge, cudaStreamPerThread) == cudaSuccess)
+                k += K;
+            else
+            {
+                // Launch failures are non-fatal to the solver: replay this
+                // batch plainly and disable graphs for the remainder.
+                cudaGetLastError();
+                captured = false;
+                use_graph = false;
+                const SizeT stop = (k + K < max_iter) ? k + K : max_iter;
+                for(; k < stop; ++k) body();
+            }
         }
         else
         {
@@ -968,16 +1230,46 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
             for(; k < stop; ++k) body();
             if(use_graph && !captured && k + K <= (SizeT)max_iter)
             {
-                if(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)
-                   == cudaSuccess)
+                std::uint64_t features = 1ULL << 32;  // host-replay executable
+                if(getenv("STIFF_FAST_GRAD")) features |= 1ULL << 0;
+                if(getenv("STIFF_MAS_FUSE")) features |= 1ULL << 1;
+                if(system_ptr()->m_s4_active) features |= 1ULL << 2;
+                const GraphCacheKey host_key = make_graph_cache_key(
+                    16, x, 0, K, features, pcg_tol);
+                if(GraphCacheEntry* entry = find_graph_cache(host_key))
                 {
-                    for(SizeT i = 0; i < K; ++i) body();   // recorded, not executed
-                    if(cudaStreamEndCapture(cudaStreamPerThread, &pg) == cudaSuccess && pg
-                       && cudaGraphInstantiate(&pge, pg, nullptr, nullptr, 0) == cudaSuccess)
+                    pge        = entry->exec;
+                    captured   = pge != nullptr;
+                    pge_cached = captured;
+                }
+                else if(cudaStreamBeginCapture(
+                            cudaStreamPerThread,
+                            cudaStreamCaptureModeThreadLocal) == cudaSuccess)
+                {
+                    for(SizeT i = 0; i < K; ++i) body();  // recorded, not executed
+                    cudaError_t status = cudaStreamEndCapture(
+                        cudaStreamPerThread, &pg);
+                    if(status == cudaSuccess && pg)
+                        status = cudaGraphInstantiate(&pge, pg, nullptr, nullptr, 0);
+                    if(status == cudaSuccess && pge)
+                        status = cudaGraphUpload(pge, cudaStreamPerThread);
+                    if(status == cudaSuccess && pge)
                     {
                         captured = true;
+                        pge_cached = true;
+                        m_graph_cache.push_back(GraphCacheEntry{host_key, pge});
                         static bool once = false;
                         if(!once) { once = true; printf("[pcg-graph] merged loop captured (K=%d)\n", (int)K); }
+                    }
+                    else if(pge)
+                    {
+                        cudaGraphExecDestroy(pge);
+                        pge = nullptr;
+                    }
+                    if(pg)
+                    {
+                        cudaGraphDestroy(pg);
+                        pg = nullptr;
                     }
                 }
                 if(!captured)
@@ -990,17 +1282,21 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                 }
             }
         }
-        cudaMemcpy(&h_break, d_break, sizeof(int), cudaMemcpyDeviceToHost);
-        if(h_break) break;
+        PCGDeviceState host_state{};
+        pcg_copy_d2h(&host_state, d_graph_state, sizeof(host_state));
+        k       = static_cast<SizeT>(host_state.iteration);
+        h_break = host_state.converged;
+        if(h_break || k >= max_iter) break;
     }
-    if(pge) cudaGraphExecDestroy(pge);
+    if(pge && !pge_cached) cudaGraphExecDestroy(pge);
     if(pg) cudaGraphDestroy(pg);
 
-    // Final sync of break flag (in case loop exited on max_iter).
-    cudaMemcpy(&h_break, d_break, sizeof(int), cudaMemcpyDeviceToHost);
     if(getenv("STIFF_SEG_DIAG"))
     { static int _c = 0; if(_c++ < 4) printf("[seg-diag] SCALAR solve#%d: k=%zu (max=%zu)\n",
                                              _c, (size_t)k, (size_t)max_iter); }
+    pcg_record_fallback_result<<<1, 1>>>(
+        d_counters, static_cast<unsigned long long>(k));
+    pcg_report_d2h_audit("scalar-fallback");
     return k;
 }
 
@@ -1051,7 +1347,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         {
             int nb = (int)b.size() / 3;
             std::vector<int> hd(nb);
-            cudaMemcpy(hd.data(), d2g, (size_t)nb * sizeof(int), cudaMemcpyDeviceToHost);
+            pcg_copy_d2h(hd.data(), d2g, (size_t)nb * sizeof(int));
             long nn = (long)b.size(), uni = 0, mix = 0;
             for(long w0 = 0; w0 < nn; w0 += 32)
             {
@@ -1080,8 +1376,9 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     {
         if(m_seg_alloced)
         {
-          if(m_seg_device_loop_exec)
-          { cudaGraphExecDestroy(m_seg_device_loop_exec); m_seg_device_loop_exec = nullptr; }
+          // Segmented cache entries capture all per-group allocations below.
+          // A capacity growth invalidates the whole small per-engine family.
+          clear_graph_cache();
           cudaFree(d_rz_g); cudaFree(d_rz0_g); cudaFree(d_rzn_g); cudaFree(d_dot_g);
           cudaFree(d_segbin); cudaFree(d_break_g); cudaFree(d_dot_partials);
           cudaFree(d_rr_g); cudaFree(d_bb_g); cudaFree(d_use_warm);
@@ -1162,11 +1459,11 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         {
             _once = true;
             std::vector<double> hrz(ng);
-            cudaMemcpy(hrz.data(), d_rz_g, ng * sizeof(double), cudaMemcpyDeviceToHost);
+            pcg_copy_d2h(hrz.data(), d_rz_g, ng * sizeof(double));
             double sumg = 0; for(int g = 0; g < ng; g++) sumg += hrz[g];
             Cub_PCG_DotReduction(r.buffer_view().data(), z.buffer_view().data(), z.size(),
                                  d_rz, &cub_temp_ptr, &cub_temp_bytes);
-            double fullrz = 0; cudaMemcpy(&fullrz, d_rz, sizeof(double), cudaMemcpyDeviceToHost);
+            double fullrz = 0; pcg_copy_d2h(&fullrz, d_rz, sizeof(double));
             printf("[seg-diag] n=%d ng=%d  full_rz=%.10e  sum_rz_g=%.10e  diff=%.3e (nonzero ⇒ ungrouped DOFs!)\n",
                    n, ng, fullrz, sumg, fullrz - sumg);
             printf("[seg-diag] rz_g[0..7]:");
@@ -1210,7 +1507,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         {
             std::vector<double> h0(ng);
             cudaDeviceSynchronize();
-            cudaMemcpy(h0.data(), d_rz0_g, ng * sizeof(Float), cudaMemcpyDeviceToHost);
+            pcg_copy_d2h(h0.data(), d_rz0_g, ng * sizeof(Float));
             printf("[h-dump] frame=%d k=%d rz0_g[0..3]= %.17e %.17e %.17e %.17e\n",
                    g_dec_frame, g_dec_k, h0[0], h0[1], h0[2], h0[3]);
             // [localize] dump z = M⁻¹b (full vector) + d2g. z differs across batches ONLY where the
@@ -1220,9 +1517,9 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
             {
                 int nb = n / 3;   // d2g is per vertex/body BLOCK (indexed by dof/3)
                 std::vector<double> hz(n), hb(n); std::vector<int> hd(nb);
-                cudaMemcpy(hz.data(), z.buffer_view().data(), (size_t)n * sizeof(Float), cudaMemcpyDeviceToHost);
-                cudaMemcpy(hb.data(), r.buffer_view().data(), (size_t)n * sizeof(Float), cudaMemcpyDeviceToHost);  // r == b here
-                cudaMemcpy(hd.data(), d2g, (size_t)nb * sizeof(int), cudaMemcpyDeviceToHost);
+                pcg_copy_d2h(hz.data(), z.buffer_view().data(), (size_t)n * sizeof(Float));
+                pcg_copy_d2h(hb.data(), r.buffer_view().data(), (size_t)n * sizeof(Float));  // r == b here
+                pcg_copy_d2h(hd.data(), d2g, (size_t)nb * sizeof(int));
                 const char* zf = getenv("STIFF_Z_DUMP");
                 FILE* f = fopen(zf, "wb"); if(f){ fwrite(hz.data(), sizeof(double), n, f); fclose(f); }
                 FILE* fb = fopen((std::string(zf) + ".b").c_str(), "wb"); if(fb){ fwrite(hb.data(), sizeof(double), n, fb); fclose(fb); }
@@ -1235,8 +1532,10 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     // [perf] convergence-check period: each check is a BLOCKING D2H (host loop needs the flag to
     // break) → the dominant host-bound cost (nsys: cudaMemcpy 68% of API). Larger K = fewer syncs at
     // the cost of ≤K extra iters after convergence. Fixed value → deterministic iter count (strict OK).
-    const SizeT K = getenv("STIFF_PCG_CHECK_K") ? (SizeT)atoi(getenv("STIFF_PCG_CHECK_K")) : 8;
-    std::vector<int> h_brk(ng);
+    const long long requested_K = getenv("STIFF_PCG_CHECK_K")
+                                      ? atoll(getenv("STIFF_PCG_CHECK_K"))
+                                      : 8;
+    const SizeT K = requested_K > 0 ? static_cast<SizeT>(requested_K) : 1;
     double tol = getenv("STIFF_PCG_TOL") ? atof(getenv("STIFF_PCG_TOL")) : m_config.global_tol_rate;
     if(ew)   // [E-W (2)] per-env tolerance for this solve (floor = the configured tol)
         _ew_eta<<<(ng + bs - 1) / bs, bs>>>(d_rz0_g, d_ew_prev, d_tol2_g, ew_gamma, ew_max2, tol, ng);
@@ -1260,6 +1559,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     double* rz_next = d_rzn_g;
     auto body = [&]()
     {
+        pcg_seg_iteration_begin<<<1, 1>>>(d_graph_state, d_break_g, ng);
         if(fuse_dot) fsys->set_seg_dot_accum(d_dot_partials, ng);   // baked into kernel args on capture
         spmv(p.cview(), Ap.view());
         if(fuse_dot)
@@ -1269,18 +1569,22 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         _seg_axpy_xr<<<gn, bs>>>(x.buffer_view().data(), r.buffer_view().data(),
                                  (const double*)p.buffer_view().data(),
                                  (const double*)Ap.buffer_view().data(),
-                                 rz_cur, d_dot_g, d_break_g, d2g, ng, n);
+                                 rz_cur, d_dot_g, d_break_g, d2g, ng, n,
+                                 d_graph_state);
         // [seg-fused dot] preconditioners accumulate per-env r·z alongside their z-write
         // (final-z exact via the ABD correction); falls back if any preconditioner isn't capable.
         bool rz_armed = fuse_dot && fsys->arm_precond_seg_dot(d_dot_partials, d2g, ng);
         apply_preconditioner(z, r);
         if(rz_armed)
             _seg_partial_combine_ck<<<ng, 256>>>(rz_next, d_dot_partials, d_rz0_g,
-                                                 tol2_arg, tol, d_break_g, ng);
+                                                 tol2_arg, tol, d_break_g, ng,
+                                                 d_graph_state);
         else if(!s_seg_binned_host)
         {   // fast path without armed preconditioners (e.g. MAS): standalone fast dot + check
             seg_dot(r.buffer_view().data(), z.buffer_view().data(), d2g, ng, n, rz_next);
-            _seg_check_only<<<(ng + bs - 1) / bs, bs>>>(rz_next, d_rz0_g, tol2_arg, tol, d_break_g, ng);
+            _seg_check_only<<<(ng + bs - 1) / bs, bs>>>(
+                rz_next, d_rz0_g, tol2_arg, tol, d_break_g, ng,
+                d_graph_state);
         }
         else
         {   // binned (strict) path: deposit + combine-with-check
@@ -1288,10 +1592,13 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
             _seg_dot_deposit<<<gn, bs, shmem>>>(r.buffer_view().data(), z.buffer_view().data(),
                                                 d2g, d_segbin, ng, n);
             _seg_dot_combine_ck<<<(ng + bs - 1) / bs, bs>>>(rz_next, d_segbin, d_rz0_g,
-                                                            tol2_arg, tol, d_break_g, ng);
+                                                            tol2_arg, tol, d_break_g, ng,
+                                                            d_graph_state);
         }
         _seg_axpy_p<<<gn, bs>>>(p.buffer_view().data(), (const double*)z.buffer_view().data(),
-                                rz_next, rz_cur, d_break_g, d2g, ng, n);
+                                rz_next, rz_cur, d_break_g, d2g, ng, n,
+                                d_graph_state);
+        pcg_seg_iteration_end<<<1, 1>>>(d_graph_state);
         std::swap(rz_cur, rz_next);   // pointer ping-pong (replaces the swap kernel)
     };
 
@@ -1307,6 +1614,9 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
                      && !getenv("STIFF_MAS_FUSE_VALIDATE")
                      && !getenv("STIFF_MAS_DUMP")
                      && system_ptr() && system_ptr()->precond_graph_capturable();
+    // A repeated captured batch must restore the compile-time rz pointer
+    // orientation. Odd K remains on the plain compatibility path.
+    if(K & 1) use_graph = false;
 
     // The segmented solver uses two rz buffers with host-side pointer
     // ping-pong.  An even K returns to the same orientation at graph boundaries,
@@ -1324,7 +1634,12 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     const bool use_device_loop = use_graph && s_device_loop_env_seg
                               && s_driver_version_seg >= 12000
                               && K > 0 && (K & 1) == 0
-                              && 1 + K <= max_iter;
+                              && max_iter > 1;
+
+    pcg_graph_state_init<<<1, 1>>>(d_graph_state,
+                                   static_cast<unsigned long long>(max_iter),
+                                   1,
+                                   m_successor_exec);
 
     if(use_device_loop)
     {
@@ -1335,93 +1650,117 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         // changes); the captured body overwrites Ap before consuming it. Work
         // is ordered on the same PTDS stream, so no host synchronization is
         // needed. merged/isolated use the non-binned SpMV and skip this cost.
-        if(getenv("STIFF_SPMV_DET"))
+        if(getenv("STIFF_SPMV_DET")
+           && !system_ptr()->pcg_spmv_workspace_ready())
             spmv(p.cview(), Ap.view());
 
-        cudaGraph_t dg = nullptr;
-        bool ready = false;
-        bool rebuilt = false;
-        cudaError_t capture_status = cudaStreamBeginCapture(
-            cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
-        if(capture_status == cudaSuccess)
+        std::uint64_t features = 0;
+        if(s_seg_binned_host) features |= 1ULL << 0;
+        if(fuse_dot) features |= 1ULL << 1;
+        if(warm) features |= 1ULL << 2;
+        if(ew) features |= 1ULL << 3;
+        if(getenv("STIFF_MAS_FUSE")) features |= 1ULL << 4;
+        if(system_ptr()->m_s4_active) features |= 1ULL << 5;
+        if(const char* warp = getenv("STIFF_SEG_WARP"))
+            features |= (static_cast<std::uint64_t>(atoi(warp)) & 0xffULL) << 8;
+
+        const GraphCacheKey key = make_graph_cache_key(
+            s_seg_binned_host ? 2 : 1,
+            x,
+            ng,
+            K,
+            features,
+            tol);
+        GraphCacheEntry* cached = find_graph_cache(key);
+        cudaGraphExec_t exec = cached ? cached->exec : nullptr;
+        cudaGraph_t     dg   = nullptr;
+        bool            ready = exec != nullptr;
+        const bool      cache_hit = ready;
+        cudaError_t     capture_status = cudaSuccess;
+
+        if(!ready)
         {
-            for(SizeT i = 0; i < K; ++i)
-                body();
-            pcg_seg_graph_tail_relaunch<<<1, 1>>>(
-                d_graph_state,
-                d_break_g,
-                ng,
-                static_cast<unsigned long long>(max_iter),
-                static_cast<unsigned long long>(K));
-            capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
-            if(capture_status == cudaSuccess && dg)
+            capture_status = cudaStreamBeginCapture(
+                cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if(capture_status == cudaSuccess)
             {
-                if(m_seg_device_loop_exec)
-                {
-                    cudaGraphExecUpdateResultInfo update_info{};
-                    capture_status = cudaGraphExecUpdate(
-                        m_seg_device_loop_exec, dg, &update_info);
-                    ready = capture_status == cudaSuccess
-                         && update_info.result == cudaGraphExecUpdateSuccess;
-                    if(!ready)
-                    {
-                        cudaGraphExecDestroy(m_seg_device_loop_exec);
-                        m_seg_device_loop_exec = nullptr;
-                    }
-                }
-                if(!m_seg_device_loop_exec)
+                for(SizeT i = 0; i < K; ++i)
+                    body();
+                pcg_seg_graph_tail_relaunch<<<1, 1>>>(
+                    d_graph_state,
+                    d_counters,
+                    d_break_g,
+                    ng,
+                    static_cast<unsigned long long>(K));
+                capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
+                if(capture_status == cudaSuccess && dg)
                 {
                     capture_status = cudaGraphInstantiateWithFlags(
-                        &m_seg_device_loop_exec,
-                        dg,
-                        cudaGraphInstantiateFlagDeviceLaunch);
-                    ready   = capture_status == cudaSuccess && m_seg_device_loop_exec;
-                    rebuilt = ready;
+                        &exec, dg, cudaGraphInstantiateFlagDeviceLaunch);
+                    ready = capture_status == cudaSuccess && exec;
+                    if(ready)
+                    {
+                        capture_status = cudaGraphUpload(exec, cudaStreamPerThread);
+                        ready = capture_status == cudaSuccess;
+                    }
                 }
             }
-        }
-        else
-        {
-            cudaGetLastError();
+            else
+            {
+                cudaGetLastError();
+            }
+
+            if(dg)
+            {
+                cudaGraphDestroy(dg);
+                dg = nullptr;
+            }
+            if(ready)
+                m_graph_cache.push_back(GraphCacheEntry{key, exec});
+            else
+            {
+                ++m_graph_capture_errors;
+                if(exec) cudaGraphExecDestroy(exec);
+                exec = nullptr;
+            }
         }
 
         if(ready)
         {
-            CUDA_SAFE_CALL(cudaGraphUpload(m_seg_device_loop_exec,
-                                           cudaStreamPerThread));
-            CUDA_SAFE_CALL(cudaGraphDestroy(dg));
-            dg = nullptr;
-            pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
-            CUDA_SAFE_CALL(cudaGraphLaunch(m_seg_device_loop_exec,
-                                           cudaStreamPerThread));
-
-            unsigned long long graph_state[2] = {1ULL, 0ULL};
-            CUDA_SAFE_CALL(cudaMemcpy(graph_state,
-                                      d_graph_state,
-                                      sizeof(graph_state),
-                                      cudaMemcpyDeviceToHost));
-            k = static_cast<SizeT>(graph_state[0]);
-            const bool all_converged = graph_state[1] != 0;
-
-            static bool once = false;
-            if(!once)
+            const cudaError_t launch_status = cudaGraphLaunch(
+                exec, cudaStreamPerThread);
+            if(launch_status == cudaSuccess)
             {
-                once = true;
-                printf("[pcg-device-loop] segmented self-tail graph active "
-                       "(K=%d, driver=%d)\n",
-                       (int)K,
-                       s_driver_version_seg);
-            }
-            if(rebuilt && getenv("STIFF_PCG_GRAPH_DIAG"))
-                printf("[pcg-device-loop] segmented executable rebuilt\n");
+                if(getenv("STIFF_PCG_GRAPH_DIAG"))
+                    printf("[pcg-graph-cache] segmented-%s %s device=%d "
+                           "dof-tier=%d unique-tier=%d groups=%d "
+                           "hits=%llu misses=%llu\n",
+                           s_seg_binned_host ? "strict" : "fast",
+                           cache_hit ? "hit" : "miss",
+                           key.device,
+                           key.dof_tier,
+                           key.unique_tier,
+                           ng,
+                           m_graph_cache_hits,
+                           m_graph_cache_misses);
 
-            if(!all_converged)
-                for(; k < max_iter; ++k)
-                    body();
-            return k;
+                static bool once = false;
+                if(!once)
+                {
+                    once = true;
+                    printf("[pcg-device-loop] segmented self-tail graph active "
+                           "(K=%d, driver=%d)\n",
+                           (int)K,
+                           s_driver_version_seg);
+                }
+                pcg_report_d2h_audit("segmented-device");
+                return 0;
+            }
+            capture_status = launch_status;
+            ++m_graph_capture_errors;
+            cudaGetLastError();
         }
 
-        if(dg) cudaGraphDestroy(dg);
         cudaGetLastError();
         static bool oncef = false;
         if(!oncef)
@@ -1436,13 +1775,22 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     cudaGraph_t     pg  = nullptr;
     cudaGraphExec_t pge = nullptr;
     bool            captured = false;
+    bool            pge_cached = false;
     k = 1;
     while(k < max_iter)
     {
         if(captured && k + K <= max_iter)
         {
-            cudaGraphLaunch(pge, cudaStreamPerThread);   // = K iterations
-            k += K;
+            if(cudaGraphLaunch(pge, cudaStreamPerThread) == cudaSuccess)
+                k += K;
+            else
+            {
+                cudaGetLastError();
+                captured = false;
+                use_graph = false;
+                const SizeT stop = (k + K < max_iter) ? k + K : max_iter;
+                for(; k < stop; ++k) body();
+            }
         }
         else
         {
@@ -1450,16 +1798,56 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
             for(; k < stop; ++k) body();
             if(use_graph && !captured && k + K <= max_iter)
             {
-                if(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)
-                   == cudaSuccess)
+                std::uint64_t features = 1ULL << 32;
+                if(s_seg_binned_host) features |= 1ULL << 0;
+                if(fuse_dot) features |= 1ULL << 1;
+                if(warm) features |= 1ULL << 2;
+                if(ew) features |= 1ULL << 3;
+                if(getenv("STIFF_MAS_FUSE")) features |= 1ULL << 4;
+                if(system_ptr()->m_s4_active) features |= 1ULL << 5;
+                if(const char* warp = getenv("STIFF_SEG_WARP"))
+                    features |= (static_cast<std::uint64_t>(atoi(warp)) & 0xffULL) << 8;
+                const GraphCacheKey host_key = make_graph_cache_key(
+                    16 + (s_seg_binned_host ? 2 : 1),
+                    x,
+                    ng,
+                    K,
+                    features,
+                    tol);
+                if(GraphCacheEntry* entry = find_graph_cache(host_key))
                 {
-                    for(SizeT i = 0; i < K; ++i) body();   // recorded, not executed
-                    if(cudaStreamEndCapture(cudaStreamPerThread, &pg) == cudaSuccess && pg
-                       && cudaGraphInstantiate(&pge, pg, nullptr, nullptr, 0) == cudaSuccess)
+                    pge        = entry->exec;
+                    captured   = pge != nullptr;
+                    pge_cached = captured;
+                }
+                else if(cudaStreamBeginCapture(
+                            cudaStreamPerThread,
+                            cudaStreamCaptureModeThreadLocal) == cudaSuccess)
+                {
+                    for(SizeT i = 0; i < K; ++i) body();  // recorded, not executed
+                    cudaError_t status = cudaStreamEndCapture(
+                        cudaStreamPerThread, &pg);
+                    if(status == cudaSuccess && pg)
+                        status = cudaGraphInstantiate(&pge, pg, nullptr, nullptr, 0);
+                    if(status == cudaSuccess && pge)
+                        status = cudaGraphUpload(pge, cudaStreamPerThread);
+                    if(status == cudaSuccess && pge)
                     {
                         captured = true;
+                        pge_cached = true;
+                        m_graph_cache.push_back(GraphCacheEntry{host_key, pge});
                         static bool once = false;
                         if(!once) { once = true; printf("[pcg-graph] seg loop captured (K=%d)\n", (int)K); }
+                    }
+                    else if(pge)
+                    {
+                        cudaGraphExecDestroy(pge);
+                        pge = nullptr;
+                    }
+                    if(pg)
+                    {
+                        cudaGraphDestroy(pg);
+                        pg = nullptr;
                     }
                 }
                 if(!captured)
@@ -1472,12 +1860,12 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
                 }
             }
         }
-        cudaMemcpy(h_brk.data(), d_break_g, ng * sizeof(int), cudaMemcpyDeviceToHost);
-        bool all = true;
-        for(int g = 0; g < ng; g++) if(!h_brk[g]) { all = false; break; }
-        if(all) break;
+        PCGDeviceState host_state{};
+        pcg_copy_d2h(&host_state, d_graph_state, sizeof(host_state));
+        k = static_cast<SizeT>(host_state.iteration);
+        if(host_state.converged || k >= max_iter) break;
     }
-    if(pge) cudaGraphExecDestroy(pge);
+    if(pge && !pge_cached) cudaGraphExecDestroy(pge);
     if(pg) cudaGraphDestroy(pg);
     if(getenv("STIFF_SEG_DIAG"))   // [P3 debug] converged or ran to max_iter?
     {
@@ -1485,12 +1873,15 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         if(_c++ < 4)
         {
             std::vector<double> hr(ng), h0(ng);
-            cudaMemcpy(hr.data(), d_rz_g,  ng * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h0.data(), d_rz0_g, ng * sizeof(double), cudaMemcpyDeviceToHost);
+            pcg_copy_d2h(hr.data(), d_rz_g, ng * sizeof(double));
+            pcg_copy_d2h(h0.data(), d_rz0_g, ng * sizeof(double));
             printf("[seg-diag] seg solve#%d: k=%zu (max=%zu) tol=%.2e  env0 rz/rz0=%.3e/%.3e ratio=%.3e\n",
                    _c, (size_t)k, (size_t)max_iter, tol, hr[0], h0[0], h0[0]!=0?hr[0]/h0[0]:0.0);
         }
     }
+    pcg_record_fallback_result<<<1, 1>>>(
+        d_counters, static_cast<unsigned long long>(k));
+    pcg_report_d2h_audit("segmented-fallback");
     return k;
 }
 

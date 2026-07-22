@@ -1,8 +1,34 @@
 #pragma once
 #include <linear_system/linear_system/i_linear_system_solver.h>
+#include <cstdint>
+#include <vector>
 
 namespace gipc
 {
+// Stable device ABI for the P1 PCG continuation graph.  The graph owns
+// `iteration` while it is running; a future P2 Newton-decision executable can
+// be supplied through `successor_exec` without changing the cached PCG graph.
+struct alignas(16) PCGDeviceState
+{
+    unsigned long long iteration      = 1;
+    unsigned long long max_iteration  = 0;
+    unsigned long long successor_exec = 0;
+    unsigned long long solve_serial   = 0;
+    int iteration_active = 0;
+    int converged        = 0;
+    int terminal         = 0;
+    int segmented        = 0;
+};
+
+struct alignas(16) PCGDeviceCounters
+{
+    unsigned long long total_iterations        = 0;
+    unsigned long long pending_iterations      = 0;
+    unsigned long long solve_count             = 0;
+    unsigned long long device_graph_solve_count = 0;
+    unsigned long long fallback_solve_count    = 0;
+};
+
 class PCGSolverConfig
 {
   public:
@@ -26,6 +52,18 @@ class PCGSolver : public IterativeSolver
     void config(const PCGSolverConfig& config) { this->m_config = config; }
     const auto& config() const { return this->m_config; }
 
+    IterativeSolverStats collect_stats(
+        bool reset_pending = true,
+        cudaStream_t stream = cudaStreamPerThread) override;
+
+    // P2 hook. The successor must be an uploaded device-launchable executable
+    // owned by the same engine; nullptr keeps the P1 host phase boundary.
+    void set_device_continuation(cudaGraphExec_t successor)
+    {
+        m_successor_exec = static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(successor));
+    }
+
   private:
 
     DeviceDenseVector z;   // preconditioned residual
@@ -44,15 +82,40 @@ class PCGSolver : public IterativeSolver
     Float*     d_alpha    = nullptr;
     Float*     d_beta     = nullptr;
     int*       d_break    = nullptr;
-    // [device-loop graph] {iteration, break} snapshot.  A self-tail-launching
-    // graph updates this pair once per K-iteration batch, allowing one final
-    // D2H read instead of one blocking read after every batch.
-    unsigned long long* d_graph_state = nullptr;
-    // Device-launchable executable is retained across Newton solves.  A fresh
-    // capture updates pointer/grid/kernel arguments; re-instantiation is only
-    // needed when CUDA reports a real topology incompatibility.
-    cudaGraphExec_t m_device_loop_exec = nullptr;
-    cudaGraphExec_t m_seg_device_loop_exec = nullptr;
+    // [device-loop graph] state and counters remain device-resident across
+    // solve() calls. Fast solves never read either allocation back.
+    PCGDeviceState*    d_graph_state = nullptr;
+    PCGDeviceCounters* d_counters    = nullptr;
+    struct GraphCacheKey
+    {
+        int device       = -1;
+        int mode         = 0;
+        int dof_count    = 0;
+        int dof_tier     = 0;
+        int unique_tier  = 0;
+        int group_count  = 0;
+        int check_k      = 0;
+        std::uint64_t preconditioner = 0;
+        std::uint64_t bindings       = 0;
+        std::uint64_t features       = 0;
+        std::uint64_t tolerance_bits = 0;
+
+        bool operator==(const GraphCacheKey& rhs) const;
+    };
+
+    struct GraphCacheEntry
+    {
+        GraphCacheKey key;
+        cudaGraphExec_t exec = nullptr;
+    };
+
+    // Per-engine executable family. Entries are immutable after their first
+    // instantiate+upload; a tier/key hit goes straight to cudaGraphLaunch.
+    std::vector<GraphCacheEntry> m_graph_cache;
+    unsigned long long m_graph_cache_hits     = 0;
+    unsigned long long m_graph_cache_misses   = 0;
+    unsigned long long m_graph_capture_errors = 0;
+    unsigned long long m_successor_exec       = 0;
     int        h_break    = 0;
     bool       d_scalars_alloced = false;
 
@@ -98,5 +161,14 @@ class PCGSolver : public IterativeSolver
                   const int* dof_to_group, int ng);
     // segmented binned dot: out_g[g] = Σ_{i: dof_to_group[i/3]==g} a[i]*b[i] (exact, per-env).
     void seg_dot(const Float* a, const Float* b, const int* d2g, int ng, int n, Float* out_g);
+
+    GraphCacheKey make_graph_cache_key(int mode,
+                                       muda::DenseVectorView<Float> x,
+                                       int group_count,
+                                       SizeT check_k,
+                                       std::uint64_t features,
+                                       double tolerance) const;
+    GraphCacheEntry* find_graph_cache(const GraphCacheKey& key);
+    void clear_graph_cache();
 };
 }  // namespace gipc

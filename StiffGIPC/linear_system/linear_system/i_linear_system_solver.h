@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <list>
 #include <linear_system/linear_system/linear_subsystem.h>
 #include <muda/ext/linear_system.h>
@@ -6,6 +7,20 @@
 namespace gipc
 {
 class GlobalLinearSystem;
+
+// Iterative-solver counters are accumulated on the device and collected only
+// at an explicit frame/user boundary.  `pending_iterations` is the delta since
+// the previous reset; `total_iterations` is monotonic for the solver lifetime.
+// The default implementation below keeps non-PCG solvers source-compatible.
+struct IterativeSolverStats
+{
+    std::uint64_t total_iterations       = 0;
+    std::uint64_t pending_iterations     = 0;
+    std::uint64_t solve_count            = 0;
+    std::uint64_t device_graph_solve_count = 0;
+    std::uint64_t fallback_solve_count   = 0;
+};
+
 class IterativeSolver
 {
     friend class GlobalLinearSystem;
@@ -18,6 +33,15 @@ class IterativeSolver
     // delete copy
     IterativeSolver(const IterativeSolver&)            = delete;
     IterativeSolver& operator=(const IterativeSolver&) = delete;
+
+    // Explicit host boundary for deferred iteration telemetry. Implementations
+    // may synchronize `stream`; solve() itself must not do so on its fast path.
+    virtual IterativeSolverStats collect_stats(
+        bool /*reset_pending*/ = true,
+        cudaStream_t /*stream*/ = cudaStreamPerThread)
+    {
+        return {};
+    }
 
   protected:
     /**
