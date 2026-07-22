@@ -9138,6 +9138,11 @@ void GIPC::FREE_DEVICE_MEM()
         CUDA_SAFE_CALL(cudaFree(m_line_search_decision));
         m_line_search_decision = nullptr;
     }
+    if(m_newton_convergence_decision)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_newton_convergence_decision));
+        m_newton_convergence_decision = nullptr;
+    }
     if(m_ccd_alpha_slots) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_slots)); m_ccd_alpha_slots = nullptr; }
     if(m_ccd_alpha_invalid) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_invalid)); m_ccd_alpha_invalid = nullptr; }
     if(m_ccd_refined_invalid)
@@ -9247,6 +9252,7 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_energy, 2 * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_compatibility_energy, sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_newton_convergence_decision, sizeof(int)));
     // Device-resident CCD alpha/control chain (see slot layout in GIPC.cuh).
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 8 * sizeof(double)));
 
@@ -9411,6 +9417,16 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
 GIPC::~GIPC()
 {
+    if(m_aux_done_event)
+    {
+        cudaEventDestroy(m_aux_done_event);
+        m_aux_done_event = nullptr;
+    }
+    if(m_aux_reset_event)
+    {
+        cudaEventDestroy(m_aux_reset_event);
+        m_aux_reset_event = nullptr;
+    }
     if(m_aux_stream)
     {
         cudaStreamDestroy(m_aux_stream);
@@ -10095,17 +10111,21 @@ void GIPC::buildCP()
     }
 
     if(!m_aux_stream)
-        cudaStreamCreate(&m_aux_stream);
+        CUDA_SAFE_CALL(cudaStreamCreate(&m_aux_stream));
+    if(!m_aux_reset_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_reset_event, cudaEventDisableTiming));
+    if(!m_aux_done_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_done_event, cudaEventDisableTiming));
 
     // Memsets on default stream. Use an event so aux stream observes them
     // before its kernel reads/atomicAdds _cpNum.
     CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
     CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
     CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
-    cudaEvent_t reset_evt;
-    cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
-    cudaEventRecord(reset_evt, 0);
-    cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
 
     // bvh_f on default stream, bvh_e on aux stream -> overlap.
     // Both atomicAdd into _cpNum & _collisionPair; CUDA atomics handle
@@ -10154,8 +10174,11 @@ void GIPC::buildCP()
     if(getenv("STIFF_STACK_DIAG")) { CUDA_SAFE_CALL(cudaDeviceSynchronize());
         static int _sd=0; if(_sd++<3) printf("[stack] max traversal depth = %d (cap 2048)\n", get_max_stack()); }
     GroundCollisionDetect();
-    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-    cudaEventDestroy(reset_evt);
+    // Join the auxiliary detector back into PTDS without blocking the host.
+    // The following count D2H remains the algorithmic host-control wait.
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(
+        cudaStreamPerThread, m_aux_done_event, 0));
 
     {   // [9d28824-port] contiguous _cpNum[0:5]+_gpNum[5]: one 6-int D2H.
         uint32_t cp_gp_buf[6];
@@ -10195,21 +10218,16 @@ void GIPC::buildCP()
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
-        // [redo stream sync] the build uses --default-stream=per-thread, so the
-        // aux-stream detect must NOT be assumed to see the default-stream memset
-        // implicitly — mirror the first-pass event/wait (a grow-redo previously
-        // skipped it, racing the counter reset against the aux detect).
-        {
-            cudaEvent_t redo_evt;
-            cudaEventCreateWithFlags(&redo_evt, cudaEventDisableTiming);
-            cudaEventRecord(redo_evt, 0);
-            cudaStreamWaitEvent(m_aux_stream, redo_evt, 0);
-            bvh_f.SelfCollitionDetect(dHat);
-            bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
-            GroundCollisionDetect();
-            CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-            cudaEventDestroy(redo_evt);
-        }
+        // Preserve the v0.8.4.2 grow-redo ordering, using the same persistent
+        // PTDS↔aux event pair as the first pass.
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
+        bvh_f.SelfCollitionDetect(dHat);
+        bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
+        GroundCollisionDetect();
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(
+            cudaStreamPerThread, m_aux_done_event, 0));
         {   // [9d28824-port] one 6-int D2H
             uint32_t cp_gp_buf[6];
             CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -10944,20 +10962,25 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
     }
 
     if(!m_aux_stream)
-        cudaStreamCreate(&m_aux_stream);
+        CUDA_SAFE_CALL(cudaStreamCreate(&m_aux_stream));
+    if(!m_aux_reset_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_reset_event, cudaEventDisableTiming));
+    if(!m_aux_done_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_done_event, cudaEventDisableTiming));
 
     CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
-    cudaEvent_t reset_evt;
-    cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
-    cudaEventRecord(reset_evt, 0);
-    cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
 
     // Same overlap pattern as buildCP.
     bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha, 0, alpha_dev);
     bvh_e.SelfCollitionFullDetect(
         dHat, _moveDir, alpha, m_aux_stream, alpha_dev);
-    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-    cudaEventDestroy(reset_evt);
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(
+        cudaStreamPerThread, m_aux_done_event, 0));
 
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
@@ -10978,19 +11001,16 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
         bvh_e._ccd_collisionPair = _ccd_collisonPairs;
         set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
-        // [redo stream sync] same per-thread-default-stream hazard as the DCD
-        // grow-redo: make the counter reset visible to the aux-stream detect.
-        {
-            cudaEvent_t redo_evt;
-            cudaEventCreateWithFlags(&redo_evt, cudaEventDisableTiming);
-            cudaEventRecord(redo_evt, 0);
-            cudaStreamWaitEvent(m_aux_stream, redo_evt, 0);
-            bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha, 0, alpha_dev);
-            bvh_e.SelfCollitionFullDetect(
-                dHat, _moveDir, alpha, m_aux_stream, alpha_dev);
-            CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-            cudaEventDestroy(redo_evt);
-        }
+        // Preserve the v0.8.4.2 grow-redo reset ordering without allocating a
+        // temporary event or synchronizing the auxiliary stream on the host.
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
+        bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha, 0, alpha_dev);
+        bvh_e.SelfCollitionFullDetect(
+            dHat, _moveDir, alpha, m_aux_stream, alpha_dev);
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(
+            cudaStreamPerThread, m_aux_done_event, 0));
         CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     }
 }
@@ -12015,6 +12035,39 @@ double calcMinMovement(const double3* _moveDir, double* _queue, const int& numbe
     cudaMemcpy(&minValue, _queue, sizeof(double), cudaMemcpyDeviceToHost);
     //CUDA_SAFE_CALL(cudaFree(_tempMinMovement));
     return minValue;
+}
+
+void calcMinMovement_DeviceOut(const double3* _moveDir,
+                               double* _queue,
+                               const int& number)
+{
+    int numbers = number;
+    if(numbers < 1)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(_queue, 0, sizeof(double)));
+        return;
+    }
+    const unsigned int threadNum   = default_threads;
+    int                blockNum    = (numbers + threadNum - 1) / threadNum;
+    const unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_max_double3_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _moveDir, _queue, numbers);
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(_queue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+}
+
+__global__ void _newton_convergence_decide(const double* max_movement,
+                                            double threshold,
+                                            int* converged)
+{
+    *converged = (*max_movement < threshold) ? 1 : 0;
 }
 
 void stepForward(double3* _vertexes,
@@ -15121,6 +15174,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // energy-reduction roundoff. Per-env modes retain their existing freeze
     // pipeline for now and will be handled separately.
     const bool current_global_exit = (getenv("STIFF_DECOUPLE_THRESH") == nullptr);
+    // Seven per-iteration events are diagnostic-only. Production must not
+    // create/destroy them or force a device-wide synchronization.
+    const bool phase_time = (getenv("STIFF_PHASE_TIME") != nullptr);
 
     for(; k < iterCap; ++k)
     {
@@ -15149,28 +15205,33 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         totalCollisionPairs += h_cpNum[0];
         maxCOllisionPairNum =
             (maxCOllisionPairNum > h_cpNum[0]) ? maxCOllisionPairNum : h_cpNum[0];
-        cudaEvent_t start, end0, end1, end2, end3, end4, e2b;
-        cudaEventCreate(&start);
-        cudaEventCreate(&end0);
-        cudaEventCreate(&end1);
-        cudaEventCreate(&end2);
-        cudaEventCreate(&end3);
-        cudaEventCreate(&end4);
-        cudaEventCreate(&e2b);
+        cudaEvent_t start = nullptr, end0 = nullptr, end1 = nullptr, end2 = nullptr;
+        cudaEvent_t end3 = nullptr, end4 = nullptr, e2b = nullptr;
+        if(phase_time)
+        {
+            CUDA_SAFE_CALL(cudaEventCreate(&start));
+            CUDA_SAFE_CALL(cudaEventCreate(&end0));
+            CUDA_SAFE_CALL(cudaEventCreate(&end1));
+            CUDA_SAFE_CALL(cudaEventCreate(&end2));
+            CUDA_SAFE_CALL(cudaEventCreate(&end3));
+            CUDA_SAFE_CALL(cudaEventCreate(&end4));
+            CUDA_SAFE_CALL(cudaEventCreate(&e2b));
+        }
         auto destroy_iteration_events = [&]()
         {
-            cudaEventDestroy(start);
-            cudaEventDestroy(end0);
-            cudaEventDestroy(end1);
-            cudaEventDestroy(end2);
-            cudaEventDestroy(end3);
-            cudaEventDestroy(end4);
-            cudaEventDestroy(e2b);
+            if(!phase_time) return;
+            CUDA_SAFE_CALL(cudaEventDestroy(start));
+            CUDA_SAFE_CALL(cudaEventDestroy(end0));
+            CUDA_SAFE_CALL(cudaEventDestroy(end1));
+            CUDA_SAFE_CALL(cudaEventDestroy(end2));
+            CUDA_SAFE_CALL(cudaEventDestroy(end3));
+            CUDA_SAFE_CALL(cudaEventDestroy(end4));
+            CUDA_SAFE_CALL(cudaEventDestroy(e2b));
         };
 
         //printf("\n\n\ncollision num  %d\n\n\n", h_cpNum[0]+h_gpNum);
 
-        cudaEventRecord(start);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(start));
         g_dec_k = (int)k;   // [decouple probe] expose k to computeGradientAndHessian's stage dumps
         timemakePd += computeGradientAndHessian(TetMesh);
 
@@ -15193,9 +15254,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             printf("[grad-pre] dumped shape+fb+grp @frame %d k=%d\n", s_dec_frame, (int)k);
         }
 
-        double distToOpt_PN = current_global_exit
-                                  ? DBL_MAX
-                                  : calcMinMovement(_moveDir, pcg_data.squeue, vertexNum);
+        const char* merged_diag_frame = getenv("STIFF_MERGED_DIAG_FRAME");
+        const bool merged_diag_sample = merged_diag_frame
+                                     && s_dec_frame == atoi(merged_diag_frame)
+                                     && ((int)k < 20 || ((int)k % 10) == 0);
+        double distToOpt_PN = DBL_MAX;
 
         // The merged path keeps its historical BVH-scene scale. Merely declaring body groups must
         // not change merged-mode convergence; group-local scales belong to the decoupled path only.
@@ -15213,7 +15276,26 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                  ? (newton_velocity_tol * IPC_dt)
                                  : sqrt(Newton_solver_threshold * Newton_solver_threshold
                                         * thr_bbox2 * IPC_dt * IPC_dt);
-        bool gradVanish = (distToOpt_PN < _newton_thr);
+        auto device_newton_converged = [&](bool retain_movement) {
+            calcMinMovement_DeviceOut(_moveDir, pcg_data.squeue, vertexNum);
+            _newton_convergence_decide<<<1, 1>>>(pcg_data.squeue,
+                                                 _newton_thr,
+                                                 m_newton_convergence_decision);
+            int converged = 0;
+            CUDA_SAFE_CALL(cudaMemcpy(&converged,
+                                      m_newton_convergence_decision,
+                                      sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+            if(retain_movement)
+                CUDA_SAFE_CALL(cudaMemcpy(&distToOpt_PN,
+                                          pcg_data.squeue,
+                                          sizeof(double),
+                                          cudaMemcpyDeviceToHost));
+            return converged != 0;
+        };
+        bool gradVanish = current_global_exit
+                              ? false
+                              : device_newton_converged(merged_diag_sample);
 
         // [multi-env P3a step2] per-env Newton convergence tracking (precursor to
         // mask early-exit). The merged Newton loop currently breaks on the GLOBAL
@@ -15329,9 +15411,10 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         do_break = do_break && drive_ratio >= 1.0;
         if(do_break)
         {
+            destroy_iteration_events();
             break;
         }
-        cudaEventRecord(end0);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end0));
 
         auto cg_count = calculateMovingDirection(TetMesh, h_cpNum[0], pcg_data.P_type);
         //std::cout << "[" << k << "]"
@@ -15339,8 +15422,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         total_Cg_count += cg_count;
         if(current_global_exit)
         {
-            distToOpt_PN = calcMinMovement(_moveDir, pcg_data.squeue, vertexNum);
-            gradVanish = (distToOpt_PN < _newton_thr);
+            gradVanish = device_newton_converged(merged_diag_sample);
             if(k && gradVanish && drive_ratio >= 1.0)
             {
                 destroy_iteration_events();
@@ -15387,7 +15469,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 printf("[abd-dump] %d bodies @frame %d k=%d\n", nb, s_dec_frame, (int)k);
             }
         }
-        cudaEventRecord(end1);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end1));
         double alpha = 1.0, slackness_a = 0.9, slackness_m = 0.8;
         double diag_ground_alpha = 1.0;
         double diag_narrow_alpha = 1.0;
@@ -15529,7 +15611,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         alpha_CFL          = h_ccd_state[6];
         diag_refine_used   = h_ccd_cpNum > 0 && temp_alpha > 2.0 * alpha_CFL;
 
-        cudaEventRecord(end2);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end2));
         //printf("alpha:  %f\n", alpha);
 
         // [multi-env P3a] read-only: per-env alpha_CFL spread. The global alpha
@@ -15830,12 +15912,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             _mask_from_env_alpha<<<(active_group_count + 255) / 256, 256>>>(
                 m_env_active, m_env_alpha, active_group_count);
 
-        cudaEventRecord(e2b);   // [phase-time] end of S1 per-env-alpha block / start of lineSearch
+        if(phase_time)
+            CUDA_SAFE_CALL(cudaEventRecord(e2b));  // end S1 per-env-alpha / start lineSearch
         double alpha_before_line_search = alpha;
-        const char* merged_diag_frame = getenv("STIFF_MERGED_DIAG_FRAME");
-        const bool merged_diag_sample = merged_diag_frame
-                                     && s_dec_frame == atoi(merged_diag_frame)
-                                     && ((int)k < 20 || ((int)k % 10) == 0);
         if(merged_diag_sample)
         {
             std::vector<double3> positions(vertexNum), directions(vertexNum);
@@ -15928,39 +16007,35 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                    alpha_before_line_search > 0.0 ? alpha / alpha_before_line_search : 0.0,
                    (int)h_cpNum[0], (int)h_gpNum);
 
-        cudaEventRecord(end3);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end3));
         postLineSearch(TetMesh, alpha);
         //computeGradientAndHessian(TetMesh);
-        cudaEventRecord(end4);
-
-        CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        float time00, time11, time22, time33, time44;
-        cudaEventElapsedTime(&time00, start, end0);
-        cudaEventElapsedTime(&time11, end0, end1);
-        //total_Cg_time += time1;
-        cudaEventElapsedTime(&time22, end1, end2);
-        cudaEventElapsedTime(&time33, end2, end3);
-        cudaEventElapsedTime(&time44, end3, end4);
-        {   // [phase-time] time3 sub-split: S1 per-env alpha (end2->e2b) vs lineSearch (e2b->end3)
-            float t3a = 0, t3b = 0;
-            cudaEventElapsedTime(&t3a, end2, e2b);
-            cudaEventElapsedTime(&t3b, e2b, end3);
-            g_t3_s1_ms += t3a;
-            g_t3_ls_ms += t3b;
+        if(phase_time)
+        {
+            CUDA_SAFE_CALL(cudaEventRecord(end4));
+            // Waiting for the final timing event is sufficient; avoid stalling
+            // unrelated streams even in diagnostic mode.
+            CUDA_SAFE_CALL(cudaEventSynchronize(end4));
+            float time00 = 0, time11 = 0, time22 = 0, time33 = 0, time44 = 0;
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time00, start, end0));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time11, end0, end1));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time22, end1, end2));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time33, end2, end3));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time44, end3, end4));
+            {   // time3 sub-split: S1 per-env alpha vs lineSearch
+                float t3a = 0, t3b = 0;
+                CUDA_SAFE_CALL(cudaEventElapsedTime(&t3a, end2, e2b));
+                CUDA_SAFE_CALL(cudaEventElapsedTime(&t3b, e2b, end3));
+                g_t3_s1_ms += t3a;
+                g_t3_ls_ms += t3b;
+            }
+            time0 += time00;
+            time1 += time11;
+            time2 += time22;
+            time3 += time33;
+            time4 += time44;
+            destroy_iteration_events();
         }
-        time0 += time00;
-        time1 += time11;
-        time2 += time22;
-        time3 += time33;
-        time4 += time44;
-        ////*cflTime = ptime;
-        //printf("time0 = %f,  time1 = %f,  time2 = %f,  time3 = %f,  time4 = %f\n",
-        //       time00,
-        //       time11,
-        //       time22,
-        //       time33,
-        //       time44);
-        destroy_iteration_events();
         totalTimeStep += alpha;
 
         // Semi-implicit early exit (ref: arXiv 2512.12151, Algorithm 1)
@@ -16303,7 +16378,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
     computeXTilta(TetMesh, 1);
     cudaEventRecord(end0);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // Engine.step remains synchronous, but only waits for this PTDS chain.
+    CUDA_SAFE_CALL(cudaEventSynchronize(end0));
     float tttime;
     cudaEventElapsedTime(&tttime, start, end0);
     cudaEventDestroy(start);

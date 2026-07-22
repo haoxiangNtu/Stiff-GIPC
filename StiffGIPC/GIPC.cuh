@@ -256,6 +256,8 @@ class GIPC
     double* m_compatibility_energy    = nullptr;
     // Line-search decision only: 0=descent, 1=retry, 2=tolerance acceptance.
     int*    m_line_search_decision    = nullptr;
+    // Newton convergence only: 0=continue, 1=converged.
+    int*    m_newton_convergence_decision = nullptr;
     // CCD device-control state: ground, narrow-self, temp alpha, max speed,
     // refined-self, final alpha, CFL alpha, effective-invalid snapshot.
     double* m_ccd_alpha_slots = nullptr;
@@ -387,9 +389,12 @@ class GIPC
     // row/col to the global Hessian (so PCG sees them as disconnected DOFs).
     int* m_d_is_pinned_vertex = nullptr;
 
-    // Auxiliary stream for overlapping bvh_e collision detection with
-    // bvh_f (default stream). Created lazily; destroyed in dtor.
-    cudaStream_t m_aux_stream = nullptr;
+    // Auxiliary stream for overlapping bvh_e collision detection with bvh_f.
+    // Persistent events connect it to the per-thread default stream without
+    // per-Newton event allocation/destruction or a host-wide stream sync.
+    cudaStream_t m_aux_stream      = nullptr;
+    cudaEvent_t  m_aux_reset_event = nullptr;
+    cudaEvent_t  m_aux_done_event  = nullptr;
 
   public:
     GIPC();
