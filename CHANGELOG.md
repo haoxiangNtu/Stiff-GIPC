@@ -4,6 +4,35 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.4.1] — 2026-07-22
+
+Post-release audit hotfixes (two-agent problem audit, 4 review rounds).
+
+### Fixed
+- **`get_vertex_contact_forces` sign**: the export scaled the incremental-
+  potential gradient by +1/dt^2; physical force is **-gradient/dt^2**, so every
+  vector pointed the wrong way. Regression now asserts the SIGNED net vertical
+  force on a resting cube is +mg (verified +627.2 N == weight). NOTE: behavior
+  change for consumers of the v0.8.4 wheel.
+- **Legacy force-API documentation told the wrong units** at seven sites
+  across Python/pybind/C++ (claimed Newtons / "REAL grip force"): all now
+  state the truth — raw dE/dx = -force*dt^2, body-body barrier only, no
+  ground, no friction — and point at `get_vertex_contact_forces`.
+- **merged DCD grow did not grow the CCD mirror**: the DCD detect kernels
+  mirror every pair into `_ccd_collisonPairs` at the same slot; a dynamically
+  grown DCD cap beyond the CCD cap made mirror writes (and the narrow-self
+  snapshot) run out of bounds. Caps now grow in lockstep (per-env already did).
+- **grow-redo stream races**: both merged re-detection passes (DCD and swept
+  CCD) reset the pair counter on the default stream without an event/wait
+  before the aux-stream detect — a race under `--default-stream=per-thread`.
+  Mirrored the first-pass event/wait in both redo paths.
+- `set_vertex_velocities_gpu` docstring now warns it does not rebuild xTilta
+  (use `teleport_fem_vertices` for kinematic state changes).
+
+### Audit
+- Full problem-status matrix vs the requirement lists (what is fixed / partial
+  / open, with per-item evidence): see the release audit document.
+
 ## [0.8.4] — 2026-07-22
 
 Stability, contact-solver consistency, and public API hardening release.

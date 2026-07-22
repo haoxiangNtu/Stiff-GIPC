@@ -899,7 +899,15 @@ class Engine:
             np.ascontiguousarray(positions, dtype=np.float64))
 
     def set_vertex_velocities_gpu(self, velocities: np.ndarray) -> None:
-        """Write vertex velocities to GPU from (N, 3) float64."""
+        """Write vertex velocities to GPU from (N, 3) float64.
+
+        .. warning::
+            This writes the velocity buffer ONLY — it does NOT rebuild the
+            inertial prediction (``xTilta``), so a bare velocity write does not
+            move the body on the next step. To set a full kinematic state
+            (positions and/or velocities) use :meth:`teleport_fem_vertices`,
+            which rebuilds the prediction consistently.
+        """
         self._engine.set_vertex_velocities_gpu(
             np.ascontiguousarray(velocities, dtype=np.float64))
 
