@@ -281,11 +281,11 @@ class SimEngine
     /// path bit-identically.
     void set_body_friction(int body_offset, double mu, double ground_mu = -1.0);
 
-    /// [contact-force distribution] Per-vertex IPC contact gradient (N,3) of
-    /// the CURRENT state — the unsummed buffer behind
-    /// get_body_contact_force_batched (self-contact barrier; ground barrier
-    /// added when include_ground). Rebuilds contacts once (BVH+CP); call
-    /// between frames. Convention matches the batched API (sum of these over a
+    /// [contact-force distribution] Per-vertex physical contact FORCES (N,3)
+    /// in NEWTONS: -gradient/dt^2 (body-body barrier; ground barrier added
+    /// when include_ground; friction NOT included). Rebuilds contacts once
+    /// (BVH+CP); call between frames. NOTE: units deliberately DIFFER from the
+    /// legacy batched API, which returns raw gradients (-force*dt^2) (sum over a
     /// body's vertices = its net contact force). Writes min(n, vertexNum)
     /// triples into out3; returns the number written.
     int get_vertex_contact_forces(double* out3, int n, bool include_ground = true);

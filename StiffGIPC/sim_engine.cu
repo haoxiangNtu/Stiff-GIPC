@@ -2884,10 +2884,10 @@ double SimEngine::get_prismatic_drive_force(int idx) const
 void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,
                                              double* out3) const
 {
-    // [force-control] Net IPC contact (barrier) force on a body, = sum over the
-    // body's vertices of the per-vertex barrier gradient (the repulsion the body
-    // feels from everything it touches). For a gripper finger this is the REAL
-    // grip force (cup reaction), regardless of finray compliance / motion — the
+    // [force-control][LEGACY UNITS] Body-body barrier GRADIENT sum over the
+    // body's vertices: raw dE/dx = -force*dt^2, NOT Newtons; no ground, no
+    // friction. Kept for pre-0.8.4 callers; physical forces in Newtons come
+    // from get_vertex_contact_forces. Historical intent (grip reaction) — the
     // correct signal for true force control. Uses the collision pairs from the
     // last step(); call AFTER eng.step().
     out3[0] = out3[1] = out3[2] = 0.0;

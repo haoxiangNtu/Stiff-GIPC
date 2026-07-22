@@ -404,11 +404,11 @@ PYBIND11_MODULE(pystiffgipc, m)
                 (void)nw;
                 return arr;
             }, py::arg("include_ground") = true,
-            "[contact-force distribution] Per-vertex IPC contact gradient (N,3) "
-            "of the current state (self-contact barrier; + ground barrier when "
-            "include_ground). The unsummed buffer behind "
-            "get_body_contact_force_batched. Rebuilds contacts once; call "
-            "between frames.")
+            "[contact-force distribution] Per-vertex physical contact FORCES "
+            "(N,3) in NEWTONS (= -gradient/dt^2; body-body barrier, + ground "
+            "barrier when include_ground; friction NOT included). NOTE: units "
+            "differ from the legacy batched API, which returns raw gradients "
+            "(-force*dt^2). Rebuilds contacts once; call between frames.")
         .def("get_fem_von_mises_stress", [](SimEngine& e) {
                 int n = e.get_vertex_count();
                 auto arr = py::array_t<double>(n);
