@@ -759,9 +759,11 @@ PYBIND11_MODULE(pystiffgipc, m)
             b(0) = f[0]; b(1) = f[1]; b(2) = f[2];
             return out;
         }, py::arg("vert_offset"), py::arg("vert_count"),
-           "[force-control] Net IPC contact force (3-vector) on a body, summed over "
-           "its vertices [vert_offset, vert_offset+vert_count). For a gripper FEM "
-           "finger this is the REAL grip force (cup reaction). Call AFTER step().")
+           "[force-control][LEGACY UNITS] Sums the body-body barrier GRADIENT over "
+           "[vert_offset, vert_offset+vert_count): raw dE/dx = -force*dt^2, NOT "
+           "Newtons; excludes ground contact and friction. For physical forces in "
+           "Newtons use get_vertex_contact_forces and aggregate per body. "
+           "Call AFTER step().")
         .def("get_pair_contact_force", [](const SimEngine& self, int a_off, int a_cnt,
                                           int b_off, int b_cnt) {
             double f[3] = {0, 0, 0};
@@ -845,11 +847,11 @@ PYBIND11_MODULE(pystiffgipc, m)
                  return arr;
              },
              py::arg("offsets"), py::arg("counts"),
-             "[force-control] BATCHED net IPC contact force: rebuilds contacts ONCE, "
-             "then sums each segment's vertices in ONE kernel launch with ONE D2H -> "
-             "an (n_seg, 3) array of per-finger grip forces. Replaces N serial "
-             "get_body_contact_force calls (each of which rebuilt contacts) at scale. "
-             "Pass every finger of every env as a segment. Call AFTER step().")
+             "[force-control][LEGACY UNITS] BATCHED body-body barrier GRADIENT sums "
+             "(raw dE/dx = -force*dt^2, NOT Newtons; no ground, no friction): one "
+             "contact rebuild + one D2H for all segments -> (n_seg, 3). Kept for "
+             "pre-0.8.4 callers; for physical Newtons use get_vertex_contact_forces "
+             "and aggregate per segment. Call AFTER step().")
 
         .def("get_revolute_current_angles", [](const SimEngine& e) {
             int n = e.get_num_revolute_joints();

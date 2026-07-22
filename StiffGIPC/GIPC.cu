@@ -10046,10 +10046,21 @@ void GIPC::buildCP()
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
-        bvh_f.SelfCollitionDetect(dHat);
-        bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
-        GroundCollisionDetect();
-        CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+        // [redo stream sync] the build uses --default-stream=per-thread, so the
+        // aux-stream detect must NOT be assumed to see the default-stream memset
+        // implicitly — mirror the first-pass event/wait (a grow-redo previously
+        // skipped it, racing the counter reset against the aux detect).
+        {
+            cudaEvent_t redo_evt;
+            cudaEventCreateWithFlags(&redo_evt, cudaEventDisableTiming);
+            cudaEventRecord(redo_evt, 0);
+            cudaStreamWaitEvent(m_aux_stream, redo_evt, 0);
+            bvh_f.SelfCollitionDetect(dHat);
+            bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
+            GroundCollisionDetect();
+            CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+            cudaEventDestroy(redo_evt);
+        }
         {   // [9d28824-port] one 6-int D2H
             uint32_t cp_gp_buf[6];
             CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -10683,9 +10694,18 @@ void GIPC::buildFullCP(const double& alpha)
         bvh_e._ccd_collisionPair = _ccd_collisonPairs;
         set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
-        bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
-        bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, m_aux_stream);
-        CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+        // [redo stream sync] same per-thread-default-stream hazard as the DCD
+        // grow-redo: make the counter reset visible to the aux-stream detect.
+        {
+            cudaEvent_t redo_evt;
+            cudaEventCreateWithFlags(&redo_evt, cudaEventDisableTiming);
+            cudaEventRecord(redo_evt, 0);
+            cudaStreamWaitEvent(m_aux_stream, redo_evt, 0);
+            bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
+            bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, m_aux_stream);
+            CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
+            cudaEventDestroy(redo_evt);
+        }
         CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     }
 }

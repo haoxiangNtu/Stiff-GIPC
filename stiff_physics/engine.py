@@ -1040,7 +1040,7 @@ class Engine:
             for backward compatibility with pre-0.8.4 callers. For physical
             per-vertex contact forces in Newtons (with optional ground term)
             use :meth:`get_vertex_contact_forces` and aggregate per body via
-            :meth:`get_all_load_records` vertex ranges.
+            :meth:`get_load_records` vertex ranges.
 
         Returns a ``(3,)`` float64 array.  Must be called AFTER :meth:`step`.
         """
@@ -1211,9 +1211,17 @@ class Engine:
         return self._engine.get_prismatic_current_distance(idx)
 
     def get_body_contact_force_batched(self, offsets, counts) -> np.ndarray:
-        """BATCHED net IPC contact force: one contact rebuild + one D2H for all
-        segments. `offsets`/`counts` are per-finger vertex ranges; returns an
-        (n_seg, 3) array of per-finger grip forces. Call AFTER step()."""
+        """BATCHED body-body barrier GRADIENT sums — LEGACY UNITS.
+
+        .. warning::
+            Returns raw incremental-potential gradients (``-force x dt^2``, NOT
+            Newtons) and includes ONLY the body-body barrier term (no ground,
+            no friction). Kept for pre-0.8.4 callers. For physical per-vertex
+            forces in Newtons use :meth:`get_vertex_contact_forces` and
+            aggregate per segment.
+
+        `offsets`/`counts` are per-finger vertex ranges; returns (n_seg, 3).
+        Call AFTER step()."""
         return self._engine.get_body_contact_force_batched(
             np.ascontiguousarray(offsets, dtype=np.int32),
             np.ascontiguousarray(counts, dtype=np.int32))
