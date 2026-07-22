@@ -10,12 +10,16 @@
 #include <linear_system/utils/binned_reduce.cuh>  // [4.3] MAS determinism: binned reproducible FP
 #include "cuda_tools/cuda_tools.h"
 #include "device_launch_parameters.h"
+#include <math_constants.h>
 #include <muda/launch/launch.h>
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 
 #include <vector>
 #include <bitset>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -983,6 +987,72 @@ __global__ void __collectFinalZ_new(double3*                  _Z,
     _Z[idx].z = cz.z;
 }
 
+// Fused mZ-bin combine + hierarchy gather. The explicit float cast preserves
+// _mas_comb_mZ's double->float materialization before CollectFinalZ performs
+// its fixed-order level sum.
+__device__ __forceinline__ float _mas_comb_component(const double* bin,
+                                                      int           node,
+                                                      int           component)
+{
+    return static_cast<float>(binned_combine(
+        bin + ((size_t)node * 3 + component) * BINNED_K));
+}
+
+__global__ void __collectFinalZ_binned_new(double3*                  Z,
+                                           const double*             mZbin,
+                                           const __GEIGEN__::itable* coarseTable,
+                                           const int*                realMapPartId,
+                                           int                       levelNum,
+                                           int                       number,
+                                           int                       clusterCount,
+                                           size_t                    clusterCapacity)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+
+    // v0.8.4.2 can pad each environment independently, so table entries are
+    // cumulative hierarchy IDs rather than values bounded by totalNodes.
+    // Check both the current logical range and m_clusterCap's physical range
+    // before dereferencing a binned cluster slot.
+    int  rdx   = realMapPartId[idx];
+    bool valid = rdx >= 0 && rdx < clusterCount
+                 && static_cast<size_t>(rdx) < clusterCapacity;
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+    if(valid)
+    {
+        cx = _mas_comb_component(mZbin, rdx, 0);
+        cy = _mas_comb_component(mZbin, rdx, 1);
+        cz = _mas_comb_component(mZbin, rdx, 2);
+    }
+
+    const int* table = coarseTable[idx].index;
+    for(int level = 1; level < levelNum && valid; ++level)
+    {
+        int node = table[level - 1];
+        valid    = node >= 0 && node < clusterCount
+                   && static_cast<size_t>(node) < clusterCapacity;
+        if(valid)
+        {
+            cx += _mas_comb_component(mZbin, node, 0);
+            cy += _mas_comb_component(mZbin, node, 1);
+            cz += _mas_comb_component(mZbin, node, 2);
+        }
+    }
+
+    // An invalid internally-generated hierarchy must never turn into an OOB
+    // read or a plausible zero correction. Preserve the solver's fail-fast
+    // behavior by surfacing a NaN if an individual table entry is corrupt.
+    if(!valid)
+    {
+        Z[idx] = make_double3(CUDART_NAN, CUDART_NAN, CUDART_NAN);
+        return;
+    }
+    Z[idx] = make_double3(static_cast<double>(cx),
+                          static_cast<double>(cy),
+                          static_cast<double>(cz));
+}
+
 
 
 __global__ void _schwarzLocalXSym3(const __GEIGEN__::MasMatrixSymf* Pred,
@@ -1125,6 +1195,103 @@ __global__ void _schwarzLocalXSym6(const __GEIGEN__::MasMatrixSymf* Pred,
         binned_deposit(g_mZbin + ((size_t)vrid * 3 + 0) * BINNED_K, (double)rdata[0]);
         binned_deposit(g_mZbin + ((size_t)vrid * 3 + 1) * BINNED_K, (double)rdata[1]);
         binned_deposit(g_mZbin + ((size_t)vrid * 3 + 2) * BINNED_K, (double)rdata[2]);
+    }
+}
+
+// Fused coarse-mR combine + Schwarz apply. Each 16-row matrix bank is split
+// into two independent 8-row/128-thread blocks. All threads in a block reach
+// the shared-memory barrier; the launch geometry itself is bounded on the host
+// by the current hierarchy count and m_clusterCap.
+__global__ void _schwarzLocalXSym6_fused8(
+    const __GEIGEN__::MasMatrixSymf* Pred,
+    const Eigen::Vector3f*           mR,
+    const double*                    mRbin,
+    double*                          mZbin,
+    int                              totalMapNodes,
+    int                              clusterCount,
+    size_t                           clusterCapacity)
+{
+    constexpr int rowsPerBlock = 8;
+    const int     matrixId      = blockIdx.x / 2;
+    const int     rowBase       = (blockIdx.x & 1) * rowsPerBlock;
+    const int     localRow      = rowBase + threadIdx.x / BANKSIZE;
+    const int     localCol      = threadIdx.x % BANKSIZE;
+    const int     row           = matrixId * BANKSIZE + localRow;
+
+    // Eigen::Vector3f has a non-trivial constructor, so use a plain shared
+    // layout and load each bank once per half-bank block.
+    __shared__ float smR[BANKSIZE][3];
+    if(threadIdx.x < BANKSIZE)
+    {
+        const int node  = matrixId * BANKSIZE + threadIdx.x;
+        const bool fine = node < totalMapNodes;
+        const bool inRange = node >= 0 && node < clusterCount
+                             && static_cast<size_t>(node) < clusterCapacity;
+        if(inRange && fine)
+        {
+            smR[threadIdx.x][0] = mR[node][0];
+            smR[threadIdx.x][1] = mR[node][1];
+            smR[threadIdx.x][2] = mR[node][2];
+        }
+        else if(inRange)
+        {
+            smR[threadIdx.x][0] = _mas_comb_component(mRbin, node, 0);
+            smR[threadIdx.x][1] = _mas_comb_component(mRbin, node, 1);
+            smR[threadIdx.x][2] = _mas_comb_component(mRbin, node, 2);
+        }
+        else
+        {
+            smR[threadIdx.x][0] = 0.0f;
+            smR[threadIdx.x][1] = 0.0f;
+            smR[threadIdx.x][2] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    Eigen::Vector3f input;
+    input[0] = smR[localCol][0];
+    input[1] = smR[localCol][1];
+    input[2] = smR[localCol][2];
+    Eigen::Vector3f rdata;
+    if(localCol >= localRow)
+    {
+        int index = BANKSIZE * localRow - localRow * (localRow + 1) / 2 + localCol;
+        rdata     = Pred[matrixId].M[index] * input;
+    }
+    else
+    {
+        int index = BANKSIZE * localCol - localCol * (localCol + 1) / 2 + localRow;
+        rdata     = Pred[matrixId].M[index].transpose() * input;
+    }
+
+    // Same static BANKSIZE-aligned segment geometry as v0.8.4.2's corrected
+    // Sym6 kernel. In particular, there is no lane-31 left shift by 32.
+    const int          laneInRow = threadIdx.x % BANKSIZE;
+    const bool         rowHead   = laneInRow == 0;
+    const unsigned int interval  = (BANKSIZE - 1) - laneInRow;
+#pragma unroll
+    for(int offset = 1; offset < BANKSIZE; offset <<= 1)
+    {
+        float x = __shfl_down_sync(0xffffffffu, rdata[0], offset);
+        float y = __shfl_down_sync(0xffffffffu, rdata[1], offset);
+        float z = __shfl_down_sync(0xffffffffu, rdata[2], offset);
+        if(interval >= static_cast<unsigned int>(offset))
+        {
+            rdata[0] += x;
+            rdata[1] += y;
+            rdata[2] += z;
+        }
+    }
+
+    if(rowHead && row < clusterCount
+       && static_cast<size_t>(row) < clusterCapacity)
+    {
+        binned_deposit(mZbin + ((size_t)row * 3 + 0) * BINNED_K,
+                       static_cast<double>(rdata[0]));
+        binned_deposit(mZbin + ((size_t)row * 3 + 1) * BINNED_K,
+                       static_cast<double>(rdata[1]));
+        binned_deposit(mZbin + ((size_t)row * 3 + 2) * BINNED_K,
+                       static_cast<double>(rdata[2]));
     }
 }
 
@@ -2523,14 +2690,41 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
     if(getenv("STIFF_KSUM")) { cudaDeviceSynchronize();
         _mas_ksum("precondMat", d_precondMatMas,
                   (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf)); }
+
+    // Fusion is deliberately opt-in: only the exact value "1" enables it.
+    const char* fuseEnv = getenv("STIFF_MAS_FUSE");
+    const bool  fuse = fuseEnv && fuseEnv[0] == '1' && fuseEnv[1] == '\0';
+    const size_t clusterCapacity = static_cast<size_t>(m_clusterCap)
+                                   * static_cast<size_t>(levelnum);
+    if(totalNumberClusters < 0
+       || static_cast<size_t>(totalNumberClusters) > clusterCapacity
+       || totalNumberClusters % BANKSIZE != 0)
+        throw std::runtime_error(
+            "[MAS] hierarchy exceeds m_clusterCap or is not bank aligned");
+
+    static bool fuseValidated = false;
+    static int  dumped        = 0;
+    const char* dumpDir       = getenv("STIFF_MAS_DUMP");
+    const bool  dumpThisCall  = dumpDir && !dumped;
+    const bool  validateFuse  = fuse && !fuseValidated
+                               && getenv("STIFF_MAS_FUSE_VALIDATE");
+
     // [MAS graph-capture] all Async on the PTDS stream: the sync cudaMemset /
     // cudaMemcpyToSymbol variants broke PCG-graph capture (symbols now bound
     // once at alloc in the MAS malloc routine).
-    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelR + totalMapNodes,
-                              0,
-                              (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f), 0));
-
-    CUDA_SAFE_CALL(cudaMemsetAsync(d_multiLevelZ, 0, (totalNumberClusters) * sizeof(Precision_T3), 0));
+    if(!fuse)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            d_multiLevelR + totalMapNodes,
+            0,
+            (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f),
+            0));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            d_multiLevelZ,
+            0,
+            totalNumberClusters * sizeof(Precision_T3),
+            0));
+    }
 
     // [4.3] zero the binned accumulators. mR: only the COARSE
     // slots accumulate (fine [0,totalMapNodes) is set directly in __buildMultiLevelR); mZ: all.
@@ -2541,36 +2735,119 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
                               (size_t)totalNumberClusters * 3 * BINNED_K * sizeof(double), 0));
 
     BuildMultiLevelR(R);
-    {  // [4.3] combine binned coarse mR back into d_multiLevelR
+
+    auto runLegacyPath = [&]()
+    {
         int n = totalNumberClusters - totalMapNodes;
         if(n > 0)
             _mas_comb_mR<<<(n + 255) / 256, 256>>>(d_multiLevelR, d_mRbin, totalMapNodes,
                                                    totalNumberClusters);
-    }
-
-    SchwarzLocalXSym_block3();
-    {  // [4.3] combine binned mZ back into d_multiLevelZ
-        int n = totalNumberClusters;
+        SchwarzLocalXSym_block3();
+        n = totalNumberClusters;
         if(n > 0)
             _mas_comb_mZ<<<(n + 255) / 256, 256>>>(d_multiLevelZ, d_mZbin, n);
+        CollectFinalZ(Z);
+    };
+
+    if(fuse)
+    {
+        const int matrixCount = totalNumberClusters / BANKSIZE;
+        if(matrixCount > 0)
+            _schwarzLocalXSym6_fused8<<<matrixCount * 2, 128>>>(
+                d_precondMatMas,
+                d_multiLevelR,
+                d_mRbin,
+                d_mZbin,
+                totalMapNodes,
+                totalNumberClusters,
+                clusterCapacity);
+
+        const int blocks = (totalNodes + DEFAULT_BLOCKSIZE - 1) / DEFAULT_BLOCKSIZE;
+        __collectFinalZ_binned_new<<<blocks, DEFAULT_BLOCKSIZE>>>(
+            Z,
+            d_mZbin,
+            d_coarseTable,
+            d_real_map_partId,
+            levelnum,
+            totalNodes,
+            totalNumberClusters,
+            clusterCapacity);
+
+        std::vector<double3> fusedOut;
+        if(validateFuse)
+        {
+            fusedOut.resize(totalNodes);
+            CUDA_SAFE_CALL(cudaMemcpy(fusedOut.data(),
+                                      Z,
+                                      totalNodes * sizeof(double3),
+                                      cudaMemcpyDeviceToHost));
+        }
+
+        // The fused path intentionally does not materialize mlR/mlZ. Replay
+        // the legacy chain for the one-shot equivalence oracle, and also for
+        // the first MAS dump so that its documented diagnostic buffers remain
+        // complete. Both modes are excluded from PCG graph capture.
+        if(validateFuse || dumpThisCall)
+        {
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                d_multiLevelZ,
+                0,
+                totalNumberClusters * sizeof(Precision_T3),
+                0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                d_mZbin,
+                0,
+                (size_t)totalNumberClusters * 3 * BINNED_K * sizeof(double),
+                0));
+            runLegacyPath();
+        }
+
+        if(validateFuse)
+        {
+            std::vector<double3> legacyOut(totalNodes);
+            CUDA_SAFE_CALL(cudaMemcpy(legacyOut.data(),
+                                      Z,
+                                      totalNodes * sizeof(double3),
+                                      cudaMemcpyDeviceToHost));
+
+            size_t mismatches = 0;
+            double maxAbs     = 0.0;
+            for(int i = 0; i < totalNodes; ++i)
+            {
+                if(std::memcmp(&fusedOut[i], &legacyOut[i], sizeof(double3)) != 0)
+                    ++mismatches;
+                maxAbs = std::max(maxAbs, std::fabs(fusedOut[i].x - legacyOut[i].x));
+                maxAbs = std::max(maxAbs, std::fabs(fusedOut[i].y - legacyOut[i].y));
+                maxAbs = std::max(maxAbs, std::fabs(fusedOut[i].z - legacyOut[i].z));
+            }
+            printf("[mas-fuse-validate] nodes=%d mismatches=%zu max_abs=%.3e\n",
+                   totalNodes,
+                   mismatches,
+                   maxAbs);
+            if(mismatches != 0)
+                throw std::runtime_error(
+                    "[MAS] fused Schwarz/collect differs from legacy path");
+            fuseValidated = true;
+        }
+    }
+    else
+    {
+        runLegacyPath();
     }
 
-    CollectFinalZ(Z);
     // [debug] STIFF_MAS_DUMP=<dir>: dump the FIRST preconditioning call's input R,
     // multilevel R/Z buffers and output Z as raw binaries (batch-drift bisection).
     {
-        static int  _dumped = 0;
-        const char* _dd     = getenv("STIFF_MAS_DUMP");
-        if(_dd && !_dumped)
+        if(dumpThisCall)
         {
-            _dumped = 1;
+            dumped = 1;
             cudaDeviceSynchronize();
             auto wr = [&](const char* name, const void* dev, size_t bytes)
             {
                 std::vector<char> h(bytes);
                 cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
                 char p[768];
-                snprintf(p, sizeof(p), "%s/%s.bin", _dd, name);
+                snprintf(p, sizeof(p), "%s/%s.bin", dumpDir, name);
                 FILE* f = fopen(p, "wb");
                 if(f) { fwrite(h.data(), 1, bytes, f); fclose(f); }
             };
@@ -2590,7 +2867,7 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
             wr("mas_map", d_partId_map_real, (size_t)totalMapNodes * sizeof(int));
             wr("mas_levelSize", d_levelSize, (size_t)(levelnum + 1) * sizeof(int2));
             printf("[mas-dump] wrote R/mlR/mlZ/Z to %s (nodes=%d clusters=%d mapNodes=%d levels=%d)\n",
-                   _dd, totalNodes, totalNumberClusters, totalMapNodes, levelnum);
+                   dumpDir, totalNodes, totalNumberClusters, totalMapNodes, levelnum);
         }
     }
     //cudaEventRecord(end2);
