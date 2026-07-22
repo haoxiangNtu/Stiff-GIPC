@@ -13,7 +13,11 @@ if(UNIX)
 endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "89;120")
+    # 80 = A800/A100 (the RL production platform; its CUDA 12.2 toolchain also
+    # rejects the "120" entry, so A800 builds must pass -DCMAKE_CUDA_ARCHITECTURES=80
+    # explicitly if this default list is unsupported there). Native SASS per
+    # target — minor-version compatibility does not JIT new PTX on old drivers.
+    set(CMAKE_CUDA_ARCHITECTURES "80;89;120")
 endif()
 
 project(StiffGIPC LANGUAGES CXX CUDA)
