@@ -6,6 +6,7 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from stiff_physics.engine import Config, Engine
 
 
