@@ -9107,6 +9107,8 @@ void GIPC::FREE_DEVICE_MEM()
     if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
     if(m_ccd_alpha_slots) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_slots)); m_ccd_alpha_slots = nullptr; }
     if(m_ccd_alpha_invalid) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_invalid)); m_ccd_alpha_invalid = nullptr; }
+    if(_dcd_ccd_snapshot) { CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot)); _dcd_ccd_snapshot = nullptr; }
+    m_dcd_snap_count = 0; m_dcd_snap_cap = 0;
     if(m_ground_trial_invalid)
     {
         CUDA_SAFE_CALL(cudaFree(m_ground_trial_invalid));
@@ -9187,6 +9189,14 @@ void GIPC::MALLOC_DEVICE_MEM()
     // (2262b33) writes only PRESENT envs' slots — absent slots must not hold cudaMalloc garbage.
     CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
                               kEnvAlphaSlots * sizeof(double), cudaMemcpyHostToDevice));
+    // [hygiene] m_env_scratch starts NEUTRAL (alpha regions 0-2 = 1.0, max
+    // regions 3-4 = 0.0), never cudaMalloc garbage: the first per-env swept
+    // build reads ta_e from these slots before any S1 pass has filled them.
+    // (Independent defect — not the cross-env root cause, but real.)
+    { std::vector<double> neutral(5 * kEnvAlphaSlots, 0.0);
+      std::fill(neutral.begin(), neutral.begin() + 3 * kEnvAlphaSlots, 1.0);
+      CUDA_SAFE_CALL(cudaMemcpy(m_env_scratch, neutral.data(),
+                                5 * kEnvAlphaSlots * sizeof(double), cudaMemcpyHostToDevice)); }
     { std::vector<int> ones(kEnvAlphaSlots, 1);
       CUDA_SAFE_CALL(cudaMemcpy(m_env_active, ones.data(), kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice)); }
 
@@ -9843,7 +9853,7 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mque
     unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
 
     _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
-        _vertexes, _ccd_collisonPairs, _moveDir, mqueue, slackness, numbers,
+        _vertexes, _dcd_ccd_snapshot /* [narrow-self snapshot] DCD-time mirror, immune to buildFullCP clobbering */, _moveDir, mqueue, slackness, numbers,
         m_ccd_alpha_invalid);
 
     numbers  = blockNum;
@@ -10035,7 +10045,28 @@ void GIPC::buildCP()
         }
     }
 
+    snapshotDcdCcdPairs();   // [narrow-self snapshot] before buildFullCP clobbers the mirror
     throwIfGroundDistanceInvalid();
+}
+
+// [narrow-self snapshot] copy the DCD-time CCD mirror (first h_cpNum[0] slots of
+// _ccd_collisonPairs, written by the DCD detect kernels at the same atomic slot
+// as _collisionPair) into a dedicated immutable buffer. See GIPC.cuh for why.
+void GIPC::snapshotDcdCcdPairs()
+{
+    m_dcd_snap_count = h_cpNum[0];
+    if(m_dcd_snap_count == 0)
+        return;
+    if((int)m_dcd_snap_count > m_dcd_snap_cap)
+    {
+        if(_dcd_ccd_snapshot) CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot));
+        m_dcd_snap_cap = (int)(m_dcd_snap_count + m_dcd_snap_count / 2) + 1;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_dcd_ccd_snapshot,
+                                  (size_t)m_dcd_snap_cap * sizeof(int4)));
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(_dcd_ccd_snapshot, _ccd_collisonPairs,
+                              (size_t)m_dcd_snap_count * sizeof(int4),
+                              cudaMemcpyDeviceToDevice));
 }
 
 // IPC's invariant is ground distance d > 0, maintained by
@@ -11043,6 +11074,7 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
         h_gpNum = cp_gp_buf[5];
     }
 
+    snapshotDcdCcdPairs();   // [narrow-self snapshot] per-env DCD exit (see merged exit)
     throwIfGroundDistanceInvalid();
 }
 
@@ -14929,14 +14961,16 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         else
         {
             bool g_did = (surf_vertexNum >= 1);
-            bool s_did = (h_cpNum[0]     >= 1);
+            // [narrow-self snapshot] gate + count from the DCD snapshot, not the
+            // live CCD buffer (already clobbered by last iteration's swept build).
+            bool s_did = (m_dcd_snap_count >= 1);
             CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_alpha_invalid, 0, sizeof(int)));
             if(g_did) ground_largestFeasibleStepSize_DeviceOut(
                 slackness_a, pcg_data.squeue, m_ccd_alpha_slots + 0);
             // self reduces over PAIR count — squeue is mesh-sized (v0.6.3 OOB fix):
             // must use the pair-capacity scratch, NOT pcg_data.squeue.
             if(s_did) self_largestFeasibleStepSize_DeviceOut(
-                slackness_m, ensure_reduce_scratch(h_cpNum[0]), h_cpNum[0],
+                slackness_m, ensure_reduce_scratch(m_dcd_snap_count), m_dcd_snap_count,
                 m_ccd_alpha_slots + 1);
             if(g_did || s_did)
             {
@@ -14990,10 +15024,14 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 TetMesh.d_point_to_group, m_env_scratch + 0*NG, slackness_a,
                 surf_vertexNum, _point_body_id, _ground_skip_body, _ground_body_count, NG,
                 m_ccd_alpha_invalid);
-            if(h_cpNum[0] >= 1)  // narrow-self over OLD _ccd_collisonPairs[0..h_cpNum[0])
-                _per_env_selfAlpha_min<<<(h_cpNum[0]+bs-1)/bs, bs>>>(
-                    _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
-                    m_env_scratch + 1*NG, slackness_m, h_cpNum[0], NG,
+            // [narrow-self snapshot] sweep the FULL DCD-time snapshot (stable
+            // content, env-balanced by construction) — never the live CCD buffer,
+            // whose prefix is a race-ordered slice of last iteration's swept
+            // emission (the strict cross-env asymmetry root cause).
+            if(m_dcd_snap_count >= 1)
+                _per_env_selfAlpha_min<<<(m_dcd_snap_count+bs-1)/bs, bs>>>(
+                    _vertexes, _dcd_ccd_snapshot, _moveDir, TetMesh.d_point_to_group,
+                    m_env_scratch + 1*NG, slackness_m, m_dcd_snap_count, NG,
                     getenv("STIFF_CCD_CANON") ? m_d_vloc : nullptr,
                     m_ccd_alpha_invalid);
         }

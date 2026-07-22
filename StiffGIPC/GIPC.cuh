@@ -188,6 +188,20 @@ class GIPC
     //uint32_t* _cpNum;
     uint32_t h_cpNum[5]  = {0, 0, 0, 0, 0};
     uint32_t h_ccd_cpNum = 0;
+    // [narrow-self snapshot] immutable copy of the DCD-time CCD pair mirror.
+    // The DCD detect kernels write _collisionPair AND _ccd_collisionPair at the
+    // same atomic slot, so right after buildCP the first h_cpNum[0] entries of
+    // _ccd_collisonPairs ARE the DCD pair set — but buildFullCP later OVERWRITES
+    // the same buffer with the swept list, so by the time S1's narrow-self runs,
+    // the "prefix" is an unrelated slice of the swept emission (race-ordered,
+    // env-unbalanced: the measured strict cross-env asymmetry + N=8 run-to-run
+    // instability). buildCP therefore snapshots the mirror into this dedicated
+    // buffer, and narrow-self consumes ONLY the snapshot (full count, stable
+    // content). Structural fix per the two-agent root-cause analysis.
+    int4*    _dcd_ccd_snapshot = nullptr;
+    uint32_t m_dcd_snap_count  = 0;
+    int      m_dcd_snap_cap    = 0;
+    void     snapshotDcdCcdPairs();
     uint32_t h_gpNum     = 0;
 
     uint32_t h_close_cpNum = 0;
