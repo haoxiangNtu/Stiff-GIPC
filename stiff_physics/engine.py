@@ -1030,16 +1030,19 @@ class Engine:
         return ids
 
     def get_body_contact_force(self, vertex_offset: int, vertex_count: int) -> np.ndarray:
-        """Net IPC contact force (world frame, N) on a body.
+        """Net body-body barrier GRADIENT sum over a vertex range — LEGACY UNITS.
 
-        Sums the per-vertex contact forces over the contiguous global vertex
-        range ``[vertex_offset, vertex_offset + vertex_count)``.  Returns a
-        ``(3,)`` float64 array.  Must be called AFTER :meth:`step` so the
-        contact solver state is current.
+        .. warning::
+            This legacy accessor returns the raw incremental-potential
+            gradient summed over ``[vertex_offset, vertex_offset+vertex_count)``
+            — i.e. ``-force x dt^2``, NOT Newtons — and includes ONLY the
+            body-body barrier term (no ground contact, no friction). It is kept
+            for backward compatibility with pre-0.8.4 callers. For physical
+            per-vertex contact forces in Newtons (with optional ground term)
+            use :meth:`get_vertex_contact_forces` and aggregate per body via
+            :meth:`get_all_load_records` vertex ranges.
 
-        The vertex range for a given body can be looked up from
-        :meth:`get_all_load_records` (``vertex_offset`` / ``vertex_count`` per
-        record) or, for FEM bodies, from the USD-parser ``geometry_dict``.
+        Returns a ``(3,)`` float64 array.  Must be called AFTER :meth:`step`.
         """
         return self._engine.get_body_contact_force(int(vertex_offset), int(vertex_count))
 

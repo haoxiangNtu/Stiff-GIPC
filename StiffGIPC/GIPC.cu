@@ -10027,6 +10027,19 @@ void GIPC::buildCP()
         CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex,      ((size_t)newcap + 1) * sizeof(int)));
         MAX_COLLITION_PAIRS_NUM = newcap;
+        // [mirror-cap sync] the DCD detect kernels write a CCD-mirror copy of
+        // every DCD pair into _ccd_collisonPairs at the SAME slot index. If the
+        // dynamically grown DCD cap exceeds the CCD buffer cap, those mirror
+        // writes (and the narrow-self snapshot taken from them) run past the
+        // CCD allocation. Grow the CCD buffer in lockstep.
+        if(MAX_COLLITION_PAIRS_NUM > MAX_CCD_COLLITION_PAIRS_NUM)
+        {
+            CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs,
+                                      ((size_t)newcap + 1) * sizeof(int4)));
+            MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+            bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
+        }
         bvh_f._collisionPair = bvh_e._collisionPair = _collisonPairs;
         bvh_f._MatIndex      = bvh_e._MatIndex      = _MatIndex;
         set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);

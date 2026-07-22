@@ -3393,11 +3393,15 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
     g.combineBinnedGrad(s_d_grad);
     CUDA_SAFE_CALL(cudaMemcpy(out3, s_d_grad, (size_t)nw * 3 * sizeof(double),
                               cudaMemcpyDeviceToHost));
-    // The buffer holds the incremental-potential gradient (force * dt^2):
-    // measured mg*dt^2 on a resting cube. Scale to physical Newtons.
-    const double inv_dt2 = 1.0 / (g.IPC_dt * g.IPC_dt);
+    // The buffer holds the incremental-potential GRADIENT (dE/dx = -force*dt^2).
+    // Physical contact force = -gradient/dt^2 (same convention as the
+    // per-contact force magnitude path, GIPC.cu _calBarrierForces). The first
+    // release scaled by +1/dt^2, flipping every vector; the resting-cube
+    // regression used |Fy| and hid it. Verified post-fix: resting cube net
+    // vertical force = +mg (upward support).
+    const double neg_inv_dt2 = -1.0 / (g.IPC_dt * g.IPC_dt);
     for(int i = 0; i < nw * 3; ++i)
-        out3[i] *= inv_dt2;
+        out3[i] *= neg_inv_dt2;
     return nw;
 }
 

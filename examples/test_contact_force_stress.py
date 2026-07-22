@@ -48,12 +48,14 @@ print(f"bottom |F| sum = {fb:.3f}, top |F| sum = {ft:.3f}")
 if not (fb > 10 * max(ft, 1e-12)):
     print("FAIL: contact force not concentrated on the ground-facing side"); ok = False
 
-# net vertical reaction vs weight (side length 0.4 -> V=0.064 m^3)
+# net vertical reaction vs weight (side length 0.4 -> V=0.064 m^3).
+# SIGNED assertion: the ground pushes the resting cube UP, so sum(Fy) must be
+# POSITIVE ~ +mg. (An earlier |Fy| check hid a global sign flip in the export.)
 weight = RHO * 0.064 * 9.8
-net_y = abs(F[:, 1].sum())
-print(f"net |Fy| = {net_y:.1f} N  vs weight = {weight:.1f} N")
+net_y = F[:, 1].sum()
+print(f"net Fy = {net_y:+.1f} N  vs weight = {weight:.1f} N (must be +, upward support)")
 if not (0.5 * weight < net_y < 2.0 * weight):
-    print("FAIL: vertical reaction not within 2x of weight"); ok = False
+    print("FAIL: vertical reaction not +mg (sign or magnitude wrong)"); ok = False
 
 if not (S.max() > 0.0):
     print("FAIL: von Mises stress identically zero under self-weight"); ok = False
