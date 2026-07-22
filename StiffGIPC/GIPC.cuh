@@ -251,6 +251,10 @@ class GIPC
     // performs one batched D2H instead of one transfer per term.
     static constexpr int kEnergySlotCount = 15;
     double* m_energy_slots = nullptr;
+    // FEM dot/norm followed by ABD dot/norm for initKappa.  Only this compact
+    // four-scalar packet crosses the device/host boundary; ABD gradient arrays
+    // remain device resident.
+    double* m_kappa_reduction_slots = nullptr;
     // E0/Etrial belong exclusively to line search. Compatibility callers use a
     // separate scalar so diagnostics cannot overwrite an in-flight E0.
     double* m_line_search_energy      = nullptr;

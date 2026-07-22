@@ -9319,6 +9319,11 @@ void GIPC::FREE_DEVICE_MEM()
 
     // Device-resident energy/control scalars.
     if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
+    if(m_kappa_reduction_slots)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_kappa_reduction_slots));
+        m_kappa_reduction_slots = nullptr;
+    }
     if(m_line_search_energy)
     {
         CUDA_SAFE_CALL(cudaFree(m_line_search_energy));
@@ -9445,6 +9450,7 @@ void GIPC::MALLOC_DEVICE_MEM()
 
     // Device energy terms and line-search control state.
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_kappa_reduction_slots, 4 * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_energy, 2 * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_compatibility_energy, sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, sizeof(int)));
@@ -9993,8 +9999,23 @@ double GIPC::cfl_largestSpeed(double* mqueue)
     return minValue;
 }
 
-double reduction2Kappa(int type, const double3* A, const double3* B, double* _queue, int vertexNum)
+__global__ void _copy_kappa_reduction(const double* queue, double* output)
 {
+    if(blockIdx.x == 0 && threadIdx.x == 0) *output = queue[0];
+}
+
+void reduction2KappaDeviceOut(int type,
+                              const double3* A,
+                              const double3* B,
+                              double* _queue,
+                              int vertexNum,
+                              double* output)
+{
+    if(vertexNum <= 0)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(output, 0, sizeof(double), 0));
+        return;
+    }
     int                numbers   = vertexNum;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
@@ -10024,11 +10045,25 @@ double reduction2Kappa(int type, const double3* A, const double3* B, double* _qu
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;
     }
-    //cudaMemcpy(_leafBoxes, _tempLeafBox, sizeof(AABB), cudaMemcpyDeviceToDevice);
-    double dotValue;
-    cudaMemcpy(&dotValue, _queue, sizeof(double), cudaMemcpyDeviceToHost);
-    //CUDA_SAFE_CALL(cudaFree(_queue));
-    return dotValue;
+    _copy_kappa_reduction<<<1, 1>>>(_queue, output);
+}
+
+__global__ void _abd_kappa_reduction(const double* total_gradient,
+                                     const double* non_contact_gradient,
+                                     size_t count,
+                                     double* output)
+{
+    if(blockIdx.x != 0 || threadIdx.x != 0) return;
+    double dot  = 0.0;
+    double norm = 0.0;
+    for(size_t i = 0; i < count; ++i)
+    {
+        const double contact = total_gradient[i] - non_contact_gradient[i];
+        dot += contact * non_contact_gradient[i];
+        norm += contact * contact;
+    }
+    output[0] = dot;
+    output[1] = norm;
 }
 
 double GIPC::ground_largestFeasibleStepSize(double slackness, double* mqueue)
@@ -12840,18 +12875,23 @@ void GIPC::initKappa(device_TetraData& TetMesh)
 
         int fem_offset = abd_fem_count_info.fem_point_offset;
         int fem_count  = abd_fem_count_info.fem_point_num;
-        double gsum    = 0.0;
-        double gsnorm  = 0.0;
-        if(fem_count > 0)
-        {
-            gsum = reduction2Kappa(
-                0, _gc + fem_offset, _GE + fem_offset, pcg_data.squeue, fem_count);
-            gsnorm = reduction2Kappa(
-                1, _gc + fem_offset, _GE + fem_offset, pcg_data.squeue, fem_count);
-        }
+        reduction2KappaDeviceOut(0,
+                                 _gc + fem_offset,
+                                 _GE + fem_offset,
+                                 pcg_data.squeue,
+                                 fem_count,
+                                 m_kappa_reduction_slots + 0);
+        reduction2KappaDeviceOut(1,
+                                 _gc + fem_offset,
+                                 _GE + fem_offset,
+                                 pcg_data.squeue,
+                                 fem_count,
+                                 m_kappa_reduction_slots + 1);
 
-        double abd_gsum   = 0.0;
-        double abd_gsnorm = 0.0;
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_kappa_reduction_slots + 2,
+                                       0,
+                                       2 * sizeof(double),
+                                       0));
         if(abd_fem_count_info.abd_body_num > 0)
         {
             m_abd_system->setup_abd_non_contact_gradient(*m_abd_sim_data);
@@ -12860,20 +12900,21 @@ void GIPC::initKappa(device_TetraData& TetMesh)
                 *m_abd_sim_data,
                 muda::CBufferView<double3>{_gc, abd_fem_count_info.abd_point_num});
 
-            std::vector<double> abd_total_gradient;
-            std::vector<double> abd_non_contact_gradient;
-            m_abd_system->system_gradient.copy_to(abd_total_gradient);
-            m_abd_system->temp_system_gradient.copy_to(abd_non_contact_gradient);
-            for(size_t i = 0; i < abd_total_gradient.size(); ++i)
-            {
-                const double contact =
-                    abd_total_gradient[i] - abd_non_contact_gradient[i];
-                abd_gsum += contact * abd_non_contact_gradient[i];
-                abd_gsnorm += contact * contact;
-            }
-            gsum += abd_gsum;
-            gsnorm += abd_gsnorm;
+            _abd_kappa_reduction<<<1, 1>>>(
+                m_abd_system->system_gradient.buffer_view().data(),
+                m_abd_system->temp_system_gradient.buffer_view().data(),
+                m_abd_system->system_gradient.size(),
+                m_kappa_reduction_slots + 2);
         }
+        double h_kappa_reductions[4] = {0.0, 0.0, 0.0, 0.0};
+        CUDA_SAFE_CALL(cudaMemcpy(h_kappa_reductions,
+                                  m_kappa_reduction_slots,
+                                  sizeof(h_kappa_reductions),
+                                  cudaMemcpyDeviceToHost));
+        const double abd_gsum   = h_kappa_reductions[2];
+        const double abd_gsnorm = h_kappa_reductions[3];
+        const double gsum = h_kappa_reductions[0] + abd_gsum;
+        const double gsnorm = h_kappa_reductions[1] + abd_gsnorm;
         if(getenv("STIFF_SEED_DIAG"))
             printf("[seed-kappa-dof] fem(dot=%.17e,norm=%.17e) "
                    "abd(dot=%.17e,norm=%.17e) total(dot=%.17e,norm=%.17e)\n",
