@@ -9318,7 +9318,9 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     }
     else
     {
-        SceneSize = bvh_f.scene;
+        // [frame-fsm P0] scene bbox is device-resident during frames; pull the
+        // host mirror once here (finalize) for dHat/dTol calibration.
+        SceneSize = bvh_f.sceneToHost();
     }
     bboxDiagSize2 = __GEIGEN__::__squaredNorm(
         __GEIGEN__::__minus(SceneSize.upper, SceneSize.lower));

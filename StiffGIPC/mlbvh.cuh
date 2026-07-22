@@ -77,7 +77,8 @@ class lbvh
     uint32_t* _cpNum;
     int*      _MatIndex;
     uint32_t* _flags;
-    AABB      scene;
+    AABB      scene;   // host mirror; refreshed only via sceneToHost() (finalize)
+    AABB      sceneToHost();
     int*      _btype;
     int*      _bodyId;
     int*      _collision_skip_matrix = nullptr;  // NxN exclusion matrix (null if none)

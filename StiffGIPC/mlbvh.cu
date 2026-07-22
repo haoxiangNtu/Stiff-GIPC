@@ -2679,6 +2679,9 @@ void lbvh::MALLOC_DEVICE_MEM(const int& number)
     CUDA_SAFE_CALL(cudaMalloc((void**)&_bvs, (2 * number - 1) * sizeof(AABB)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_tempLeafBox, number * sizeof(AABB)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_flags, (number - 1) * sizeof(uint32_t)));
+    // [frame-fsm P0] pre-size the CUB Morton-sort scratch here (finalize time)
+    // so the merged Construct paths never allocate inside a frame.
+    ensure_sort_scratch(number);
     //CUDA_SAFE_CALL(cudaMalloc((void**)&_cpNum, sizeof(uint32_t)));ye
     //CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, sizeof(uint32_t)));
 }
@@ -2686,6 +2689,16 @@ void lbvh::MALLOC_DEVICE_MEM(const int& number)
 lbvh::~lbvh()
 {
     //FREE_DEVICE_MEM();
+}
+
+// [frame-fsm P0] Finalize-time accessor for the scene bbox. The per-frame
+// Construct paths keep the root bbox DEVICE-resident in _bvs[0] (written by
+// calcMaxBV_async); the host mirror is only needed once, for dHat/kappa
+// calibration in GIPC::init. Blocking D2H is fine there.
+AABB lbvh::sceneToHost()
+{
+    CUDA_SAFE_CALL(cudaMemcpy(&scene, _bvs, sizeof(AABB), cudaMemcpyDeviceToHost));
+    return scene;
 }
 
 
@@ -2781,14 +2794,14 @@ double lbvh_f::Construct(cudaStream_t stream)
     }
     calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
+    // [frame-fsm P0] device-resident scene bbox + pre-allocated stable CUB sort:
+    // the former calcMaxBV() D2H fed only the host `scene` mirror (consumed once
+    // at finalize via sceneToHost()), and thrust sequence/sort_by_key allocate,
+    // free and device-sync internally — all illegal inside a captured frame.
+    calcMaxBV_async(_bvs, _tempLeafBox, face_number, stream);
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + face_number);
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + face_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    _iota_u32<<<((int)face_number + 255) / 256, 256, 0, stream>>>(_indices, face_number);
+    _mc_sort_active(*this, _MChash, _indices, face_number, stream);
     sortBvs(_indices, _bvs, _tempLeafBox, face_number);
     calcLeafNodes(_nodes, _indices, face_number);
     calcInternalNodes(_nodes, _MChash, face_number);
@@ -2823,14 +2836,11 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
                         _bodyId, _collision_skip_matrix, _collision_body_count,
                         alpha_dev);
-    scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
+    // [frame-fsm P0] see lbvh_f::Construct — no D2H, no thrust alloc/sync.
+    calcMaxBV_async(_bvs, _tempLeafBox, face_number, stream);
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + face_number);
-
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + face_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    _iota_u32<<<((int)face_number + 255) / 256, 256, 0, stream>>>(_indices, face_number);
+    _mc_sort_active(*this, _MChash, _indices, face_number, stream);
     sortBvs(_indices, _bvs, _tempLeafBox, face_number);
 
     calcLeafNodes(_nodes, _indices, face_number);
@@ -2871,15 +2881,11 @@ double lbvh_e::Construct(cudaStream_t stream)
     cudaEventRecord(start);*/
     calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
-    scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
+    // [frame-fsm P0] see lbvh_f::Construct — no D2H, no thrust alloc/sync.
+    calcMaxBV_async(_bvs, _tempLeafBox, edge_number, stream);
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + edge_number);
-    //cudaEventRecord(end0);
-
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + edge_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    _iota_u32<<<((int)edge_number + 255) / 256, 256, 0, stream>>>(_indices, edge_number);
+    _mc_sort_active(*this, _MChash, _indices, edge_number, stream);
     sortBvs(_indices, _bvs, _tempLeafBox, edge_number);
 
     //cudaEventRecord(end1);
@@ -2929,14 +2935,11 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
                         _bodyId, _collision_skip_matrix, _collision_body_count,
                         alpha_dev);
-    scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
+    // [frame-fsm P0] see lbvh_f::Construct — no D2H, no thrust alloc/sync.
+    calcMaxBV_async(_bvs, _tempLeafBox, edge_number, stream);
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + edge_number);
-
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + edge_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    _iota_u32<<<((int)edge_number + 255) / 256, 256, 0, stream>>>(_indices, edge_number);
+    _mc_sort_active(*this, _MChash, _indices, edge_number, stream);
     sortBvs(_indices, _bvs, _tempLeafBox, edge_number);
 
     calcLeafNodes(_nodes, _indices, edge_number);
