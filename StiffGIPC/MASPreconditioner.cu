@@ -12,8 +12,7 @@
 #include "device_launch_parameters.h"
 #include <math_constants.h>
 #include <muda/launch/launch.h>
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
+#include <cub/device/device_scan.cuh>
 
 #include <vector>
 #include <bitset>
@@ -647,6 +646,109 @@ __global__ void _prefixSumLx(int2*         _levelSize,
         _nextConnectMsk[idx] = theLanePrefix;
         _goingNext[idx + levelBegin] =
             theLanePrefix + levelBegin + (number + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
+    }
+}
+
+// [P3a device-level hierarchy] Capacity-shaped companions to the hardened
+// legacy kernels above.  Every launched lane reaches each warp barrier; the
+// current level's exact size is read from d_levelSize and is only a guard.
+// Keeping the legacy kernels intact is important for
+// STIFF_MAS_DEVICE_LEVELS=0 and for the v0.8.4.2 racecheck contract.
+__global__ void _nextLevelCluster_device(unsigned int* _nextConnectedMsk,
+                                         unsigned int* _nextPrefix,
+                                         const int2*   _levelSize,
+                                         int           level,
+                                         int           storageCapacity)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int number = _levelSize[level].x;
+    const bool inRange = idx < storageCapacity && idx < number;
+    int bankId      = idx / BANKSIZE;
+    int localBankId = threadIdx.x / BANKSIZE;
+    int laneId      = idx % BANKSIZE;
+
+    __shared__ int prefixSum[DEFAULT_WARPNUM];
+    __shared__ unsigned int cachedMsk[DEFAULT_BLOCKSIZE];
+    if(laneId == 0)
+        prefixSum[localBankId] = 0;
+
+    unsigned int connMsk = (1U << laneId);
+    if(inRange)
+        connMsk |= _nextConnectedMsk[idx];
+    cachedMsk[threadIdx.x] = connMsk;
+    __syncwarp();
+
+    unsigned int visited = (1U << laneId);
+    while(true)
+    {
+        unsigned int todo = visited ^ connMsk;
+        if(!todo)
+            break;
+        unsigned int nextVisit = __ffs(todo) - 1;
+        visited |= (1U << nextVisit);
+        connMsk |= cachedMsk[nextVisit + localBankId * BANKSIZE];
+    }
+
+    if(inRange)
+        _nextConnectedMsk[idx] = connMsk;
+    unsigned int electedPrefix = __popc(connMsk & _LanemaskLt(laneId));
+    if(inRange && electedPrefix == 0)
+        atomicAdd(prefixSum + localBankId, 1);
+    __syncwarp();
+
+    if(laneId == 0)
+        _nextPrefix[bankId] = prefixSum[localBankId];
+}
+
+__global__ void _prefixSumLx_device(int2*         _levelSize,
+                                    unsigned int* _nextPrefix,
+                                    unsigned int* _nextPrefixSum,
+                                    unsigned int* _nextConnectMsk,
+                                    int*          _goingNext,
+                                    int           level,
+                                    int           storageCapacity)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int number     = _levelSize[level].x;
+    int levelBegin = _levelSize[level].y;
+    const bool inRange = idx < storageCapacity && idx < number;
+    int bankId      = idx / BANKSIZE;
+    int localBankId = threadIdx.x / BANKSIZE;
+    int laneId      = idx % BANKSIZE;
+
+    __shared__ unsigned int electedMask[DEFAULT_WARPNUM];
+    __shared__ unsigned int lanePrefix[DEFAULT_BLOCKSIZE];
+    if(laneId == 0)
+        electedMask[localBankId] = 0;
+
+    if(idx == number - 1 && number <= storageCapacity)
+    {
+        _levelSize[level + 1].x = _nextPrefixSum[bankId] + _nextPrefix[bankId];
+        _levelSize[level + 1].y =
+            levelBegin + (number + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
+    }
+
+    unsigned int connMsk = inRange ? _nextConnectMsk[idx] : (1U << laneId);
+    __syncwarp();
+    unsigned int electedPrefix = __popc(connMsk & _LanemaskLt(laneId));
+    if(inRange && electedPrefix == 0)
+        atomicOr(electedMask + localBankId, (1U << laneId));
+    __syncwarp();
+
+    lanePrefix[threadIdx.x] =
+        __popc(electedMask[localBankId] & _LanemaskLt(laneId))
+        + (inRange ? _nextPrefixSum[bankId] : 0);
+    __syncwarp();
+
+    if(inRange)
+    {
+        unsigned int electedLane = __ffs(connMsk) - 1;
+        unsigned int next =
+            lanePrefix[electedLane + BANKSIZE * localBankId];
+        _nextConnectMsk[idx] = next;
+        _goingNext[idx + levelBegin] =
+            next + levelBegin
+            + (number + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
     }
 }
 
@@ -1856,6 +1958,71 @@ __global__ void _mas_env_setx(int2* levelSizeSlot, const int* padTot)
     if(blockIdx.x == 0 && threadIdx.x == 0)
         levelSizeSlot->x = *padTot;
 }
+
+// Device-sized versions for levels >= 1.  A negative padTot means the
+// homogeneous-env divisibility contract was not met; in that case the global
+// scan is left untouched and the ordinary (unsegmented) level size wins.
+__global__ void _mas_env_base_device(const unsigned int* prefixSum,
+                                     const unsigned int* prefix,
+                                     const int2*         levelSize,
+                                     int                 level,
+                                     int                 bankCapacity,
+                                     int                 n_env,
+                                     int*                envBase,
+                                     int*                envStart,
+                                     int*                padTot)
+{
+    if(blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    int number  = levelSize[level].x;
+    int bankNum = (number + BANKSIZE - 1) / BANKSIZE;
+    if(number <= 0 || n_env <= 1 || bankNum > bankCapacity
+       || bankNum % n_env != 0)
+    {
+        *padTot = -1;
+        return;
+    }
+
+    int banksPerEnv = bankNum / n_env;
+    int base = 0;
+    for(int e = 0; e < n_env; ++e)
+    {
+        int sW = e * banksPerEnv;
+        int eW = (e + 1) * banksPerEnv;
+        envStart[e] = static_cast<int>(prefixSum[sW]);
+        unsigned int count =
+            prefixSum[eW - 1] + prefix[eW - 1] - prefixSum[sW];
+        envBase[e] = base;
+        base += (static_cast<int>(count) + BANKSIZE - 1) / BANKSIZE
+                * BANKSIZE;
+    }
+    *padTot = base;
+}
+
+__global__ void _mas_env_apply_device(unsigned int* prefixSum,
+                                      const int2*   levelSize,
+                                      int           level,
+                                      int           n_env,
+                                      const int*    envBase,
+                                      const int*    envStart,
+                                      const int*    padTot)
+{
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int bankNum = (levelSize[level].x + BANKSIZE - 1) / BANKSIZE;
+    if(*padTot < 0 || w >= bankNum)
+        return;
+    int banksPerEnv = bankNum / n_env;
+    int e = w / banksPerEnv;
+    prefixSum[w] = static_cast<unsigned int>(
+        envBase[e] + (static_cast<int>(prefixSum[w]) - envStart[e]));
+}
+
+__global__ void _mas_env_setx_device(int2* levelSizeSlot,
+                                     const int* padTot)
+{
+    if(blockIdx.x == 0 && threadIdx.x == 0 && *padTot >= 0)
+        levelSizeSlot->x = *padTot;
+}
 // Host-side decision only (getenv + integer arithmetic, no device access → no sync): returns the
 // effective env count to segment by, or <=1 when disabled.
 //   default (STIFF_MAS_SEG unset): ON for multi-env (numEnvs>1) in EVERY mode.
@@ -1867,7 +2034,7 @@ __global__ void _mas_env_setx(int2* levelSizeSlot, const int* padTot)
 //       STIFF_MAS_SEG=0 → force OFF  (measure the old global MAS)
 //       STIFF_MAS_SEG=1 → force ON, use body-group count
 //       STIFF_MAS_SEG=N → force ON, N envs
-static int _mas_envSegN(int warpNum, int numEnvs)
+static int _mas_envConfiguredN(int numEnvs)
 {
     const char* force = getenv("STIFF_MAS_SEG");
     int n_env;
@@ -1896,8 +2063,16 @@ static int _mas_envSegN(int warpNum, int numEnvs)
     {
         n_env = numEnvs;                // default: ON for multi-env, every mode (see rationale above)
     }
+    if(n_env <= 1 || n_env > 4096)
+        return 1;
+    return n_env;
+}
+
+static int _mas_envSegN(int warpNum, int numEnvs)
+{
+    int n_env = _mas_envConfiguredN(numEnvs);
     // 4096 = d_envBase/d_envStart scratch capacity (also enforced host-side).
-    if(n_env <= 1 || n_env > 4096 || warpNum <= 0 || warpNum % n_env != 0)
+    if(n_env <= 1 || warpNum <= 0 || warpNum % n_env != 0)
         return 1;
     return n_env;
 }
@@ -1953,6 +2128,34 @@ void MASPreconditioner::PreparePrefixSumL0()
 #endif
 }
 
+void MASPreconditioner::ExclusiveLevelScan(const int* input,
+                                           int*       output,
+                                           int        count)
+{
+    if(count <= 0)
+        return;
+    CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(d_levelScanTemp,
+                                                  m_levelScanTempBytes,
+                                                  input,
+                                                  output,
+                                                  count,
+                                                  0));
+}
+
+void MASPreconditioner::ExclusiveLevelScan(const unsigned int* input,
+                                           unsigned int*       output,
+                                           int                 count)
+{
+    if(count <= 0)
+        return;
+    CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(d_levelScanTemp,
+                                                  m_levelScanTempBytes,
+                                                  input,
+                                                  output,
+                                                  count,
+                                                  0));
+}
+
 void MASPreconditioner::BuildLevel1()
 {
     //int number = totalNodes;
@@ -1964,9 +2167,7 @@ void MASPreconditioner::BuildLevel1()
     int numBlocks = (number + blockSize - 1) / blockSize;
     //exclusive(d_prefixOriginal, d_prefixSumOriginal); wait to do;
     int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
-    thrust::exclusive_scan(thrust::device_ptr<int>(d_prefixOriginal),
-                           thrust::device_ptr<int>(d_prefixOriginal) + warpNum,
-                           thrust::device_ptr<int>(d_prefixSumOriginal));
+    ExclusiveLevelScan(d_prefixOriginal, d_prefixSumOriginal, warpNum);
     // [per-env MAS] pad each env's level-1 clusters to a BANKSIZE-aligned block (no bank sharing).
     int _segN = _mas_envSegN(warpNum, m_numEnvs);
     if(_segN > 1)
@@ -1993,9 +2194,7 @@ void MASPreconditioner::BuildLevel1()
     int numBlocks = (number + blockSize - 1) / blockSize;
     //exclusive(d_prefixOriginal, d_prefixSumOriginal); wait to do;
     int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
-    thrust::exclusive_scan(thrust::device_ptr<int>(d_prefixOriginal),
-                           thrust::device_ptr<int>(d_prefixOriginal) + warpNum,
-                           thrust::device_ptr<int>(d_prefixSumOriginal));
+    ExclusiveLevelScan(d_prefixOriginal, d_prefixSumOriginal, warpNum);
     _buildLevel1<<<numBlocks, blockSize>>>(d_levelSize,
                                            d_coarseSpaceTables,
                                            d_goingNext,
@@ -2052,6 +2251,29 @@ void MASPreconditioner::NextLevelCluster(int level)
     _nextLevelCluster<<<numBlocks, blockSize>>>(d_nextConnectMask, d_nextPrefix, number);
 }
 
+bool MASPreconditioner::deviceLevelsEnabled() const
+{
+    const char* value = getenv("STIFF_MAS_DEVICE_LEVELS");
+    return !(value && atoi(value) == 0);
+}
+
+void MASPreconditioner::NextLevelClusterDevice(int level)
+{
+    if(m_levelItemCapacity <= 0)
+        return;
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_nextPrefix,
+                                   0,
+                                   static_cast<size_t>(m_levelBankCapacity)
+                                       * sizeof(unsigned int),
+                                   0));
+    _nextLevelCluster_device<<<m_levelItemCapacity / DEFAULT_BLOCKSIZE,
+                               DEFAULT_BLOCKSIZE>>>(d_nextConnectMask,
+                                                   d_nextPrefix,
+                                                   d_levelSize,
+                                                   level,
+                                                   m_clusterCap);
+}
+
 void MASPreconditioner::ComputeNextLevel(int level)
 {
     int number    = totalNodes;
@@ -2073,9 +2295,7 @@ void MASPreconditioner::PrefixSumLx(int level)
     int numBlocks  = (number + blockSize - 1) / blockSize;
 
     int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
-    thrust::exclusive_scan(thrust::device_ptr<unsigned int>(d_nextPrefix),
-                           thrust::device_ptr<unsigned int>(d_nextPrefix) + warpNum,
-                           thrust::device_ptr<unsigned int>(d_nextPrefixSum));
+    ExclusiveLevelScan(d_nextPrefix, d_nextPrefixSum, warpNum);
     // [per-env MAS] pad each env's level-(level+1) clusters to a BANKSIZE-aligned block.
     int _segN = _mas_envSegN(warpNum, m_numEnvs);
     if(_segN > 1)
@@ -2089,6 +2309,50 @@ void MASPreconditioner::PrefixSumLx(int level)
         d_levelSize, d_nextPrefix, d_nextPrefixSum, d_nextConnectMask, d_goingNext, level, levelBegin, number);
     if(_segN > 1)
         _mas_env_setx<<<1, 1>>>(d_levelSize + level + 1, d_padTot);   // padded cluster count (device)
+}
+
+void MASPreconditioner::PrefixSumLxDevice(int level)
+{
+    if(m_levelItemCapacity <= 0)
+        return;
+
+    ExclusiveLevelScan(d_nextPrefix,
+                       d_nextPrefixSum,
+                       m_levelBankCapacity);
+
+    int segN = _mas_envConfiguredN(m_numEnvs);
+    if(segN > 1)
+    {
+        _mas_env_base_device<<<1, 1>>>(d_nextPrefixSum,
+                                       d_nextPrefix,
+                                       d_levelSize,
+                                       level,
+                                       m_levelBankCapacity,
+                                       segN,
+                                       d_envBase,
+                                       d_envStart,
+                                       d_padTot);
+        _mas_env_apply_device<<<(m_levelBankCapacity + 255) / 256, 256>>>(
+            d_nextPrefixSum,
+            d_levelSize,
+            level,
+            segN,
+            d_envBase,
+            d_envStart,
+            d_padTot);
+    }
+
+    _prefixSumLx_device<<<m_levelItemCapacity / DEFAULT_BLOCKSIZE,
+                          DEFAULT_BLOCKSIZE>>>(d_levelSize,
+                                              d_nextPrefix,
+                                              d_nextPrefixSum,
+                                              d_nextConnectMask,
+                                              d_goingNext,
+                                              level,
+                                              m_clusterCap);
+    if(segN > 1)
+        _mas_env_setx_device<<<1, 1>>>(d_levelSize + level + 1,
+                                      d_padTot);
 }
 
 void MASPreconditioner::AggregationKernel()
@@ -2153,7 +2417,7 @@ void MASPreconditioner::BuildCollisionConnection(unsigned int* connectionMsk,
 #include <fstream>
 int MASPreconditioner::ReorderRealtime(int cpNum)
 {
-    CUDA_SAFE_CALL(cudaMemset(d_levelSize, 0, levelnum * sizeof(int2)));
+    CUDA_SAFE_CALL(cudaMemset(d_levelSize, 0, (levelnum + 1) * sizeof(int2)));
 
 
     BuildConnectMaskL0();
@@ -2164,6 +2428,16 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
     PreparePrefixSumL0();
 
     BuildLevel1();
+    const bool deviceLevels = deviceLevelsEnabled();
+    auto readLevelSize = [&](int level)
+    {
+        CUDA_SAFE_CALL(cudaMemcpyAsync(&h_clevelSize,
+                                       d_levelSize + level,
+                                       sizeof(int2),
+                                       cudaMemcpyDeviceToHost,
+                                       0));
+        CUDA_SAFE_CALL(cudaStreamSynchronize(0));
+    };
     for(int level = 1; level < levelnum; level++)
     {
         // clear the FULL cluster-space capacity: padded slots beyond the real
@@ -2176,21 +2450,37 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
         if(cpNum)
             BuildCollisionConnection(d_nextConnectMask, d_coarseSpaceTables, level, cpNum);
 
-        CUDA_SAFE_CALL(cudaMemcpy(&h_clevelSize, d_levelSize + level, sizeof(int2), cudaMemcpyDeviceToHost));
-
-        NextLevelCluster(level);
-
-
-
-        PrefixSumLx(level);
+        if(deviceLevels)
+        {
+            NextLevelClusterDevice(level);
+            PrefixSumLxDevice(level);
+        }
+        else
+        {
+            // Qualification/rollback path: preserve the v0.8.4.2 exact-size
+            // launches and per-level host control.
+            readLevelSize(level);
+            NextLevelCluster(level);
+            PrefixSumLx(level);
+        }
 
         ComputeNextLevel(level);
 
     }
 
-    CUDA_SAFE_CALL(cudaMemcpy(&h_clevelSize, d_levelSize + levelnum, sizeof(int2), cudaMemcpyDeviceToHost));
+    // One assembly-boundary read remains by design: downstream MAS matrix
+    // storage and inversion launches consume the final hierarchy extent.
+    // The default path performs no intermediate level readbacks.
+    readLevelSize(levelnum);
 
     totalNumberClusters = h_clevelSize.y;
+
+    if(getenv("STIFF_MAS_LEVEL_DIAG"))
+        printf("[mas-levels] mode=%s levels=%d clusters=%d cap=%d\n",
+               deviceLevels ? "device" : "host-fallback",
+               levelnum,
+               totalNumberClusters,
+               m_clusterCap * levelnum);
 
     AggregationKernel();
 
@@ -2203,7 +2493,8 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                                             int*             col_ids,
                                             uint32_t*        indices,
                                             int              offset,
-                                            int              triplet_number)
+                                            int              triplet_number,
+                                            const int*       d_triplet_number)
 {
     //cudaEvent_t start, end0, end1, end2;
     //cudaEventCreate(&start);
@@ -2239,8 +2530,11 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                  _invMatrix       = d_inverseMatMas,
                  _real_map_partId = d_real_map_partId,
                  indices,
-                 triplet_values, row_ids, col_ids] __device__(int I) mutable
+                 triplet_values, row_ids, col_ids,
+                 d_triplet_number] __device__(int I) mutable
                 {
+                    if(d_triplet_number && I >= *d_triplet_number)
+                        return;
                     int index                              = indices[I];
                     auto vertRid_real                      = row_ids[index];
                     auto vertCid_real                       = col_ids[index];
@@ -2638,6 +2932,7 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
                                                uint32_t*        indices,
                                                int              offset,
                                                int              triplet_num,
+                                               const int*       d_triplet_num,
                                                int              cpNum)
 {
     if(totalNodes < 1)
@@ -2667,7 +2962,13 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
     CUDA_SAFE_CALL(cudaMemset(
         d_MatMas, 0, totalNumberClusters / BANKSIZE * sizeof(__GEIGEN__::MasMatrixT)));
 #endif
-    PrepareHessian_bcoo(triplet_values, row_ids, col_ids, indices, offset, triplet_num);
+    PrepareHessian_bcoo(triplet_values,
+                        row_ids,
+                        col_ids,
+                        indices,
+                        offset,
+                        triplet_num,
+                        d_triplet_num);
 
     // [debug] STIFF_MAS_DUMP=<dir>: dump the FIRST assembly's raw bcoo triplet
     // input + per-bank cluster prefix, enabling a FULL external CPU oracle
@@ -2680,6 +2981,16 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
         {
             _tdumped = 1;
             cudaDeviceSynchronize();
+            int dump_triplet_num = triplet_num;
+            if(d_triplet_num)
+            {
+                cudaMemcpyAsync(&dump_triplet_num,
+                                d_triplet_num,
+                                sizeof(int),
+                                cudaMemcpyDeviceToHost,
+                                0);
+                cudaStreamSynchronize(0);
+            }
             auto wr = [&](const char* name, const void* dev, size_t bytes)
             {
                 std::vector<char> h(bytes);
@@ -2689,15 +3000,15 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
                 FILE* f = fopen(p, "wb");
                 if(f) { fwrite(h.data(), 1, bytes, f); fclose(f); }
             };
-            wr("mas_trip_rows", row_ids, (size_t)(offset + triplet_num) * sizeof(int));
-            wr("mas_trip_cols", col_ids, (size_t)(offset + triplet_num) * sizeof(int));
+            wr("mas_trip_rows", row_ids, (size_t)(offset + dump_triplet_num) * sizeof(int));
+            wr("mas_trip_cols", col_ids, (size_t)(offset + dump_triplet_num) * sizeof(int));
             wr("mas_trip_vals", triplet_values,
-               (size_t)(offset + triplet_num) * sizeof(Eigen::Matrix3d));
-            wr("mas_trip_idx", indices, (size_t)triplet_num * sizeof(uint32_t));
+               (size_t)(offset + dump_triplet_num) * sizeof(Eigen::Matrix3d));
+            wr("mas_trip_idx", indices, (size_t)dump_triplet_num * sizeof(uint32_t));
             wr("mas_prefix0", d_prefixOriginal,
                (size_t)(totalMapNodes / BANKSIZE) * sizeof(int));
             printf("[mas-dump] wrote triplets (offset=%d num=%d banks=%d)\n",
-                   offset, triplet_num, totalMapNodes / BANKSIZE);
+                   offset, dump_triplet_num, totalMapNodes / BANKSIZE);
         }
     }
 
@@ -2957,6 +3268,10 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
     // [per-env MAS] cluster-space arrays must hold PADDED per-level cluster
     // counts, which can exceed vertNum on small scenes (see m_clusterCap doc).
     m_clusterCap = maxNodes + (std::max(1, m_numEnvs) + 1) * BANKSIZE;
+    m_levelItemCapacity =
+        (m_clusterCap + DEFAULT_BLOCKSIZE - 1) / DEFAULT_BLOCKSIZE
+        * DEFAULT_BLOCKSIZE;
+    m_levelBankCapacity = m_levelItemCapacity / BANKSIZE;
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_goingNext,
                               (size_t)m_clusterCap * levelnum * sizeof(unsigned int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_prefixOriginal, vertNum * sizeof(unsigned int)));
@@ -2977,6 +3292,25 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_envBase,  4096 * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_envStart, 4096 * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_padTot,   sizeof(int)));
+
+    // Query once at the largest fixed hierarchy tier and reuse this storage
+    // for level-1 and every upper-level exclusive scan.
+    size_t intScanBytes = 0;
+    size_t uintScanBytes = 0;
+    CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(nullptr,
+                                                  intScanBytes,
+                                                  d_prefixOriginal,
+                                                  d_prefixSumOriginal,
+                                                  m_levelBankCapacity,
+                                                  0));
+    CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(nullptr,
+                                                  uintScanBytes,
+                                                  d_nextPrefix,
+                                                  d_nextPrefixSum,
+                                                  m_levelBankCapacity,
+                                                  0));
+    m_levelScanTempBytes = std::max(intScanBytes, uintScanBytes);
+    CUDA_SAFE_CALL(cudaMalloc(&d_levelScanTemp, m_levelScanTempBytes));
 }
 
 void MASPreconditioner::initPreconditioner_Matrix()
@@ -3027,6 +3361,7 @@ void MASPreconditioner::FreeMAS()
     CUDA_SAFE_CALL(cudaFree(d_envBase));
     CUDA_SAFE_CALL(cudaFree(d_envStart));
     CUDA_SAFE_CALL(cudaFree(d_padTot));
+    if(d_levelScanTemp) CUDA_SAFE_CALL(cudaFree(d_levelScanTemp));
     CUDA_SAFE_CALL(cudaFree(d_denseLevel));
     CUDA_SAFE_CALL(cudaFree(d_coarseSpaceTables));
     CUDA_SAFE_CALL(cudaFree(d_levelSize));

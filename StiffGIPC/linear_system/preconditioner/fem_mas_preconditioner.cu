@@ -17,16 +17,19 @@ MAS_Preconditioner::MAS_Preconditioner(FEMLinearSubsystem& subsystem,
 
 void MAS_Preconditioner::assemble()
 {
-    double collision_num = *cpNum;
+    int collision_num = static_cast<int>(*cpNum);
     gipc::Timer timer{"precomputing mas Preconditioner"};
-    int         triplet_number  = 0;
-    uint32_t*   indices = calculate_subsystem_bcoo_indices(triplet_number);
+    const bool  device_levels  = MAS_Prec.deviceLevelsEnabled();
+    int         triplet_number = 0;
+    uint32_t*   indices =
+        calculate_subsystem_bcoo_indices(triplet_number, device_levels);
     MAS_Prec.setPreconditioner_bcoo(system_bcoo_matrix(),
                                     system_bcoo_rows(),
                                     system_bcoo_cols(),
                                     indices,
                                     get_offset(),
                                     triplet_number,
+                                    device_levels ? subsystem_bcoo_count_device() : nullptr,
                                     collision_num);
 }
 

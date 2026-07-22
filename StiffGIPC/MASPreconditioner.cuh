@@ -10,6 +10,7 @@
 #include "eigen_data.h"
 #include <muda/ext/linear_system/bcoo_matrix_view.h>
 #include "linear_system/linear_system/global_matrix.h"
+#include <cstddef>
 
 class MASPreconditioner
 {
@@ -48,6 +49,14 @@ class MASPreconditioner
     unsigned int*       d_nextPrefix;
     unsigned int*       d_nextPrefixSum;
 
+    // [P3a] One preallocated CUB scan workspace serves every hierarchy level.
+    // The fixed item/bank capacities define the launch family; d_levelSize is
+    // only a device-side guard on the default path.
+    void*  d_levelScanTemp       = nullptr;
+    size_t m_levelScanTempBytes  = 0;
+    int    m_levelItemCapacity   = 0;
+    int    m_levelBankCapacity   = 0;
+
 
     __GEIGEN__::MasMatrixT*    d_MatMas;
     __GEIGEN__::MasMatrixSymT* d_inverseMatMas;
@@ -81,12 +90,19 @@ class MASPreconditioner
 
 
     int  ReorderRealtime(int cpNum);
+    bool deviceLevelsEnabled() const;
     void BuildConnectMaskL0();           // called in ReorderRealtime
     void PreparePrefixSumL0();           // called in ReorderRealtime
     void BuildLevel1();                  // called in ReorderRealtime
     void BuildConnectMaskLx(int level);  // called in ReorderRealtime
     void NextLevelCluster(int level);    // called in ReorderRealtime
+    void NextLevelClusterDevice(int level);
     void PrefixSumLx(int level);         // called in ReorderRealtime
+    void PrefixSumLxDevice(int level);
+    void ExclusiveLevelScan(const int* input, int* output, int count);
+    void ExclusiveLevelScan(const unsigned int* input,
+                            unsigned int*       output,
+                            int                 count);
     void ComputeNextLevel(int level);    // called in ReorderRealtime
     void AggregationKernel();            // called in ReorderRealtime
     void BuildCollisionConnection(unsigned int* connectionMsk,
@@ -100,13 +116,15 @@ class MASPreconditioner
                                 uint32_t*        indices,
                                 int              offset,
                                 int              triplet_num,
+                                const int*       d_triplet_num,
                                 int              cpNum);
     void PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                              int*             row_ids,
                              int*             col_ids,
                              uint32_t*        indices,
                              int              offset,
-                             int              triplet_number);
+                             int              triplet_number,
+                             const int*       d_triplet_number);
 
     void preconditioning(const double3* R, double3* Z);
     void BuildMultiLevelR(const double3* R);  // called in preconditioning
