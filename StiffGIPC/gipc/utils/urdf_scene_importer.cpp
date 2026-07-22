@@ -3,6 +3,7 @@
 #include <urdf_parser/urdf_parser.h>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -876,11 +877,14 @@ bool UrdfSceneImporter::parse_urdf()
                     prim_count++;
             }
 
+            // Exact-match "0" only: atoi would treat any non-numeric spelling
+            // (or an empty string) as 0 and silently drop collision geometry.
             const char* prim_env = std::getenv("STIFF_URDF_PRIM_PROXY");
-            const bool  prim_proxy_enabled = !(prim_env && std::atoi(prim_env) == 0);
+            const bool  prim_proxy_enabled =
+                !(prim_env && std::strcmp(prim_env, "0") == 0);
             if(!mesh_coll && prim_count > 0 && !prim_proxy_enabled)
             {
-                // Escape hatch for scenes that relied on the pre-0.8.5
+                // Escape hatch for scenes that relied on the pre-0.8.4.2
                 // behavior (primitive collision silently skipped): a link
                 // whose wheels/box now gain a proxy could start intersecting
                 // the ground at finalize(). STIFF_URDF_PRIM_PROXY=0 restores

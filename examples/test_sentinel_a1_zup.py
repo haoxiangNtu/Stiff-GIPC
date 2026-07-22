@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""[M0 sentinel -> v0.8.5 regression] A1 axis-anisotropy sentinel: PASS = Z-up/Y-up iteration ratio < 2x, states match.
+"""[M0 sentinel -> v0.8.4.2 regression] A1 axis-anisotropy sentinel: PASS = Z-up/Y-up iteration ratio < 2x, states match.
 
 M0-4 A1 repro: STRICTLY equivalent Y-up vs Z-up (full rigid rotation of the
 entire scene: mesh transforms, gravity, ground normal). Compare per-frame

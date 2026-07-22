@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""[M0 sentinel -> v0.8.5 regression] D10 large-dhat sentinel: PASS = 250 frames complete, no CUDA crash.
+"""[M0 sentinel -> v0.8.4.2 regression] D10 large-dhat sentinel: PASS = 250 frames complete, no CUDA crash.
 
 M0-3 D10 repro: angular boxes with absolute_dhat=5mm, 250 frames.
 Historical: cudaErrorIllegalAddress. Verdict: completes vs crashes."""

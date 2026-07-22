@@ -1585,20 +1585,87 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     if(ipc.pcg_data.P_type)
     {
         int neighborListSize = tetMesh.getVertNeighbors();
+        // [per-env MAS] #envs = #body groups. The MAS aggregation uses this to keep each env's
+        // clusters in BANKSIZE-aligned banks at every level (intra-env preconditioner). MUST be
+        // set BEFORE initPreconditioner_Neighbor: the hierarchy depth (computeNumLevels) is
+        // derived from the PER-ENV node count so it cannot vary with batch size N.
+        //
+        // HOMOGENEITY GUARD: the segmentation maps env e to warps [e*wpe,(e+1)*wpe), which is
+        // only valid when the FEM vertices are env-major contiguous AND every env owns the same
+        // vertex count ("warpNum % n_env == 0" alone is NOT sufficient — equal totals can hide
+        // unequal groups). Heterogeneous/interleaved scenes fall back to the global hierarchy
+        // (m_numEnvs=1, exact v0.8.4.1 topology). Cap 4096 = d_envBase/d_envStart scratch size.
+        {
+            int  ge   = std::max(1, d_tetMesh.h_group_count);
+            bool homo = ge > 1 && ge <= 4096;
+            if(homo)
+            {
+                const int nFem = ipc.vertexNum - tetMesh.abd_vertexOffset;
+                if(nFem % ge != 0)
+                    homo = false;
+                else
+                {
+                    const int per = nFem / ge;
+                    for(int v = 0; v < nFem && homo; v++)
+                    {
+                        const int gv = tetMesh.abd_vertexOffset + v;
+                        const int b  = (gv < (int)tetMesh.point_id_to_body_id.size())
+                                           ? tetMesh.point_id_to_body_id[gv] : -1;
+                        const int g  = (b >= 0 && b < (int)tetMesh.body_groups.size())
+                                           ? tetMesh.body_groups[b] : -1;
+                        if(g != v / per)   // env-major contiguity + equal size, one test
+                            homo = false;
+                    }
+                }
+                // BANK-level homogeneity: the segmentation unit is the MAS
+                // bank (METIS partition), not the vertex. Equal vertex counts
+                // do NOT imply equal partition counts (nPart follows graph
+                // structure), so verify from the actual partId: every bank
+                // single-group, group bank-ranges contiguous, equal banks per
+                // group. Anything else -> global hierarchy.
+                if(homo)
+                {
+                    if((int)tetMesh.partId.size() != nFem || tetMesh.part_offset <= 0)
+                        homo = false;   // no/partial partition data: cannot prove bank layout
+                    else
+                    {
+                        std::vector<int> bank_group(tetMesh.part_offset, -1);
+                        for(int v = 0; v < nFem && homo; v++)
+                        {
+                            const int bk = (int)tetMesh.partId[v];
+                            const int gv = tetMesh.abd_vertexOffset + v;
+                            const int bd = tetMesh.point_id_to_body_id[gv];
+                            const int g  = tetMesh.body_groups[bd];
+                            if(bk < 0 || bk >= tetMesh.part_offset)
+                                homo = false;
+                            else if(bank_group[bk] == -1)
+                                bank_group[bk] = g;
+                            else if(bank_group[bk] != g)
+                                homo = false;   // one bank spans two envs
+                        }
+                        if(homo && tetMesh.part_offset % ge != 0)
+                            homo = false;       // unequal bank counts per env
+                        if(homo)
+                        {
+                            const int bpe = tetMesh.part_offset / ge;
+                            for(int bk = 0; bk < tetMesh.part_offset && homo; bk++)
+                                if(bank_group[bk] != bk / bpe)
+                                    homo = false;   // non-contiguous / unequal ranges
+                        }
+                    }
+                }
+            }
+            ipc.pcg_data.MP.m_numEnvs = homo ? std::max(1, d_tetMesh.h_group_count) : 1;
+            if(d_tetMesh.h_group_count > 1 && !homo)
+                printf("[per-env MAS] heterogeneous/non-contiguous FEM groups -> global "
+                       "MAS hierarchy (segmentation disabled)\n");
+        }
         ipc.pcg_data.MP.initPreconditioner_Neighbor(
             ipc.vertexNum - tetMesh.abd_vertexOffset,
             tetMesh.abd_vertexOffset,
             neighborListSize,
             ipc._collisonPairs,
             tetMesh.part_offset * BANKSIZE);
-
-        // [per-env MAS] #envs = #body groups. The MAS aggregation uses this to keep each env's
-        // clusters in BANKSIZE-aligned banks at every level (intra-env preconditioner). Homogeneous
-        // multi-env only; the aggregation self-disables (falls back to the global hierarchy) when
-        // the per-env warp split does not divide evenly.
-        {
-            ipc.pcg_data.MP.m_numEnvs = std::max(1, d_tetMesh.h_group_count);
-        }
 
         ipc.pcg_data.MP.neighborListSize = neighborListSize;
 

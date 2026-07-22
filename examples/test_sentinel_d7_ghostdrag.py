@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""[M0 sentinel -> v0.8.5 regression] D7 ghost-friction sentinel: PASS = post-release travel < 5 mm, no dt growth.
+"""[M0 sentinel -> v0.8.4.2 regression] D7 ghost-friction sentinel: PASS = post-release travel < 5 mm, no dt growth.
 
 M0-2 D7 repro: finger presses a cube's top and drags it sideways via friction,
 then LIFTS OFF while continuing to move. Watch the cube's post-release travel.

@@ -7,20 +7,22 @@ coordinates -> identical rounding), separated only by virtual BVH offsets +
 body-group exclusions; absolute_dhat pinned so contact width cannot inflate
 with the all-env bounding box. This is the v0.8.3 bitwise-trio configuration.
 
-Four gates, all BIT-IDENTICAL requirements:
+Five gates, all BIT-IDENTICAL requirements:
   G1 run-to-run @ N=2 : two full runs agree exactly
   G2 run-to-run @ N=8 : two full runs agree exactly
   G3 cross-env  @ N=8 : env_i == env_0 exactly (co-located)
   G4 batch-invariance : env_0 @ N=2 == env_0 @ N=8 exactly
-  G5 MAS drift watch  : preconditioner_type=1 batch drift stays < 1e-6
+  G5 diagonal-PC cross-check: batch-invariance + cross-env repeat under
+     preconditioner_type=0 (run-to-run is owned by G1/G2 on the MAS path)
 
-KNOWN LIMITATION (v0.8.5): the MAS preconditioner (preconditioner_type=1)
-aggregates across the whole system, so its structure changes with total env
-count N; PCG then converges along a different path and the solution moves
-~1e-9 between batch sizes (within pcg_tol; run-to-run and cross-env stay
-bit-identical at fixed N). G1-G4 therefore run with preconditioner_type=0
-(diagonal), where all four gates are bit-exact; G5 pins the MAS drift so a
-regression past rounding level is caught.
+G1-G4 run under the DEFAULT preconditioner (MAS, preconditioner_type=1).
+v0.8.4.2 made MAS itself batch-invariant: hierarchy depth is computed from
+the per-env node count, and the two coarse-aggregation fast paths whose
+warp-shuffle trees produced launch-shape-dependent partial sums (one of them
+reading CUDA-undefined lanes outside __activemask) were replaced on the
+STRICT path with exact order-independent binned deposits (non-strict keeps a
+corrected full-participation tree). Before that fix env_0 drifted ~1e-9
+between N=2 and N=8; any regression re-fires G4 bit-exactly.
 
 These four caught the v0.8.4 DCD/CCD shared-buffer race (fixed by the DCD
 snapshot); any regression in per-env alpha isolation re-fires here.
@@ -78,9 +80,9 @@ def bitwise(a, b):
 
 
 def main():
-    a2, b2 = run(2), run(2)
-    a8, b8 = run(8), run(8)
-    m2, m8 = run(2, pc_type=1), run(8, pc_type=1)
+    a2, b2 = run(2, pc_type=1), run(2, pc_type=1)
+    a8, b8 = run(8, pc_type=1), run(8, pc_type=1)
+    d2, d8 = run(2, pc_type=0), run(8, pc_type=0)
 
     g1 = bitwise(a2, b2)
     g2 = bitwise(a8, b8)
@@ -99,10 +101,9 @@ def main():
     report("G3 cross-env  N=8   ", g3, env_slice(a8, 8, 1), env_slice(a8, 8, 0))
     report("G4 batch N=2 vs N=8 ", g4, env_slice(a2, 2, 0), env_slice(a8, 8, 0))
 
-    mas_drift = float(np.abs(env_slice(m2, 2, 0) - env_slice(m8, 8, 0)).max())
-    g5 = mas_drift < 1e-6
-    print(f"G5 MAS batch drift    : {'PASS' if g5 else 'FAIL'} "
-          f"(|diff| = {mas_drift:.3e}, known N-dependent aggregation, limit 1e-6)")
+    g5 = (bitwise(env_slice(d2, 2, 0), env_slice(d8, 8, 0))
+          and all(bitwise(env_slice(d8, 8, i), env_slice(d8, 8, 0)) for i in range(1, 8)))
+    print(f"G5 diag-PC cross-check: {'PASS (bit-identical)' if g5 else 'FAIL'}")
 
     ok = g1 and g2 and g3 and g4 and g5
     print("QUAD-GATE:", "PASS" if ok else "FAIL")

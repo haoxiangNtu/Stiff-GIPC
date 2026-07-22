@@ -4,6 +4,108 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.4.2] — 2026-07-22
+
+Versioning note: this train uses a 4th "hotfix/consolidation" digit on top of
+SemVer's three (0.MINOR.PATCH.HOTFIX); 0.8.4.2 consolidates the M1 quick-win
+plan onto the 0.8.4 line. Scope is larger than a narrow hotfix — it adds
+public API surface and changes two defaults — the highlights below are the
+migration-relevant items.
+
+### ⚠ Behavior changes
+- **URDF primitive collision (box/sphere/cylinder) now COLLIDES.** Previously
+  such links were silently skipped (no collision body at all — e.g. the
+  ridgeback base wheels). The importer now generates conservative,
+  circumscribed proxy meshes (box exact; icosphere subdiv-2, faces pushed to
+  >= r, ~2.4% inflation; 24-seg circumscribed cylinder, ~0.9%), merges all
+  collision elements of a link into one body (per-element origins baked), and
+  loads them through the normal mesh path. A scene that relied on primitive
+  links being non-colliding (e.g. wheels resting through the ground plane)
+  will now throw at finalize(). Escape hatch: `STIFF_URDF_PRIM_PROXY=0`
+  (exact literal `0`) disables proxy generation and restores the old skip for
+  primitive-only links. Mixed [primitive, mesh] links now use the first MESH
+  element in BOTH modes (<=0.8.4 dropped the whole link's collision when the
+  first element was a primitive).
+- **MAS preconditioner numerics moved (within pcg_tol).** The batch-
+  determinism fix below changes floating-point summation paths for every
+  scene using the default `preconditioner_type=1`; solutions move ~1e-9-level
+  relative to 0.8.4.1. Bit-exact comparisons against pre-0.8.4.2 goldens will
+  differ; physics is equivalent.
+
+### Fixed
+- **MAS batch-invariance (strict determinism contract).** The same env
+  produced ~1e-9-different results in an N=2 vs an N=8 batch. Three root
+  causes, all fixed: (1) hierarchy depth was computed from the GLOBAL node
+  count, so the level count itself changed with batch size — now derived from
+  the per-env node count when env segmentation is active; (2) the multilevel-
+  residual fast path issued `__shfl_down_sync` reads from padding lanes
+  OUTSIDE its `__activemask()` — CUDA-undefined register garbage (~1e-21)
+  that varied with launch shape — strict mode now uses the deterministic
+  ascending-lane reduction; non-strict keeps a CORRECTED tree (no early
+  return, all 32 lanes participate, padding contributes exact zeros, static
+  bank-segment geometry replaces the former `mark << 32` shift UB); (3) the coarse-matrix fast path
+  pre-summed segment blocks with plain double adds (layout-dependent
+  rounding) and ran its warp collectives divergently under a full mask (UB
+  on partially filled banks, present since <=v0.7) — replaced by exact
+  order-independent binned deposits on the strict path and a corrected
+  all-lanes tree on the non-strict fast path. examples/test_strict_quadgate.py
+  now asserts run-to-run, cross-env AND batch-size bit-identity under the
+  DEFAULT MAS preconditioner (plus a diagonal-PC cross-check gate).
+- **MAS cluster-space arrays could overflow on small multi-env scenes**: the
+  per-env padding can push a level's cluster count above vertNum; the scratch
+  arrays (nextConnectMask/nextPrefix/goingNext) are now sized for the padded
+  capacity and fully zeroed (found by compute-sanitizer memcheck; 0 errors
+  after the fix, synccheck also clean).
+- **Heterogeneous multi-env guard**: MAS env segmentation now verifies the
+  FEM vertices are env-major contiguous with equal per-env counts before
+  engaging (total divisibility alone was not sufficient); otherwise it falls
+  back to the global hierarchy with a printed notice.
+- **Unbounded intersection backtracking** (line-search type 0/1, boundary
+  move): the three `while(isIntersected())` loops now share the line-search
+  budget (`line_search_max_iter`, default 64) and throw a diagnosed
+  initial-infeasibility error instead of halving alpha forever when the step
+  already started intersecting.
+- **von Mises export now shares the solver's constitutive model** (USE_SNK1:
+  P = mu*F + r*(J-1-mu/r)*cofF): exported stress matches what the solver
+  actually computes; degenerate elements (J~0) export NaN instead of a
+  silent 0 that polluted statistics.
+- **semi-implicit beta timing** (`semi_implicit_enabled=True` only; default
+  stays off): the per-env beta decay now reads the PREVIOUS iteration's
+  ACCEPTED line-search alpha (not the current iteration's unvalidated CCD
+  candidate), and freeze flags take effect the NEXT iteration.
+
+### Added
+- **`get_vertex_contact_forces(components=...)`**: `"normal"` (barrier),
+  `"friction_lagged"` (the frozen lastH friction force the solver actually
+  used this frame; read-only, never rebuilds friction sets), `"total"`.
+  Newtons; additivity normal+friction==total asserted at 0 error.
+- **Joint tuning guide** `docs/JOINT_TUNING_v0.8.4.2_zh.md` (audit items
+  A3/B3): why prismatic needs 20-40x the revolute ratio, symptoms of
+  joint_strength_ratio=100 under load, three verified profiles.
+- **Regression suite**: four-bar closed-loop (coupler-stays-translating
+  assertion), gd_friction_rate direct assertion, strict quad-gate (5 gates),
+  four M0 sentinels (D2 press / D7 ghost-drag / D10 dhat=5mm / A1 Z-up)
+  promoted to exit-code regressions, URDF primitive containment + escape-
+  hatch checks.
+- **A1 (Z-up 10x slowdown) closed permanently**: strictly-equivalent rotated
+  scenes (minimal + real fr3 URDF grasp contact) show a 1.000x iteration
+  ratio (121 vs 121); the historical claim was a non-equivalent A/B
+  measurement artifact. Sentinel guards against future axis bias.
+
+### Fixed (continued)
+- **MAS reorder kernels: intra-warp shared-memory races closed.** The six
+  reorder kernels relied on pre-Volta warp lockstep for their shared-memory
+  handshakes (zero -> vote -> publish -> cross-lane read with no
+  synchronization; <=v0.7 legacy). All are now no-early-return with explicit
+  `__syncwarp()` phase barriers. compute-sanitizer: racecheck 40 hazards ->
+  **0**, memcheck/synccheck 0 errors (strict + non-strict, N=2/N=3 odd-bank,
+  and a 19k-vertex 5-level hierarchy).
+- **MAS env-segmentation hardening**: bank-range homogeneity guard (every
+  METIS bank single-env, contiguous equal ranges — equal vertex counts alone
+  are not sufficient); `STIFF_MAS_SEG` forced values that contradict the
+  verified env count are ignored with a notice; 4096-env scratch cap
+  enforced; env scratch freed in FreeMAS.
+
 ## [0.8.4.1] — 2026-07-22
 
 Post-release audit hotfixes (two-agent problem audit, 4 review rounds).

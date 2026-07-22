@@ -17,6 +17,13 @@ class MASPreconditioner
     int totalNodes = 0;
     int totalMapNodes = 0;
     int levelnum;
+    // [per-env MAS] capacity of the cluster-space scratch arrays
+    // (d_nextConnectMask / d_nextPrefix / d_nextPrefixSum / d_goingNext-per-level).
+    // Per-env padding can push a level's cluster count ABOVE vertNum on small
+    // scenes (each env padded to a BANKSIZE multiple), so vertNum-sized arrays
+    // overflow (caught by compute-sanitizer). Sized as
+    // max(vertNum, partMapSize) + (m_numEnvs+1)*BANKSIZE.
+    int m_clusterCap = 0;
   public:
     int m_numEnvs = 1;   // [per-env MAS] #body-groups (envs); set at setup from tetMesh.body_groups
   private:

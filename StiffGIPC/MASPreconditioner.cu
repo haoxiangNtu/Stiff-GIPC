@@ -201,29 +201,33 @@ __global__ void _preparePrefixSumL0_new(int*          _prefixOriginal,
                                         int vertNum)
 {
     int tdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(tdx >= vertNum)
-        return;
-    int warpId      = tdx / BANKSIZE;
-    int localWarpId = threadIdx.x / BANKSIZE;
-    int laneId      = tdx % BANKSIZE;
+    // [racecheck] no early return: the intra-warp shared-memory handshakes
+    // below need __syncwarp() with a mask every named lane actually reaches
+    // (independent-thread scheduling on sm_70+ gives no implicit lockstep).
+    // Out-of-range lanes carry idx=-1 and never touch global memory.
+    const bool inRange     = tdx < vertNum;
+    int        warpId      = tdx / BANKSIZE;
+    int        localWarpId = threadIdx.x / BANKSIZE;
+    int        laneId      = tdx % BANKSIZE;
 
-    int idx = _partId_map_real[tdx];
+    int idx = inRange ? _partId_map_real[tdx] : -1;
 
 
     //unsigned int connectMsk = cacheMask1;
     __shared__ int unsigned cacheMask[DEFAULT_BLOCKSIZE];
     __shared__ int          prefixSum[DEFAULT_WARPNUM];
 
+    unsigned int connectMsk = (idx >= 0) ? _fineConnectedMsk[idx] : 0u;
+    if(laneId == 0)
+    {
+        prefixSum[localWarpId] = 0;
+    }
+    cacheMask[threadIdx.x] = connectMsk;
+    __syncwarp();   // publish cacheMask + zeroed prefixSum to the whole warp
+
     if(idx >= 0)
     {
-
-        unsigned int connectMsk = _fineConnectedMsk[idx];
-        if(laneId == 0)
-        {
-            prefixSum[localWarpId] = 0;
-        }
-        cacheMask[threadIdx.x] = connectMsk;
-        unsigned int visited   = (1U << laneId);
+        unsigned int visited = (1U << laneId);
         while(connectMsk != -1)
         {
             unsigned int todo = visited ^ connectMsk;
@@ -245,11 +249,11 @@ __global__ void _preparePrefixSumL0_new(int*          _prefixOriginal,
             //prefixSum[warpId]++;
             atomicAdd(prefixSum + localWarpId, 1);
         }
-
-        if(laneId == 0)
-        {
-            _prefixOriginal[warpId] = prefixSum[localWarpId];
-        }
+    }
+    __syncwarp();   // all cluster-count atomics land before lane 0 reads
+    if(idx >= 0 && laneId == 0)
+    {
+        _prefixOriginal[warpId] = prefixSum[localWarpId];
     }
 }
 
@@ -318,11 +322,13 @@ __global__ void _buildLevel1_new(int2*               _levelSize,
                                  int                 number)
 {
     int tdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(tdx >= number)
-        return;
-    int warpId      = tdx / BANKSIZE;
-    int localWarpId = threadIdx.x / BANKSIZE;
-    int laneId      = tdx % BANKSIZE;
+    // [racecheck] no early return + explicit __syncwarp() between the three
+    // shared-memory phases (zero electedMask -> atomicOr votes -> lanePrefix
+    // publish -> cross-lane read). Out-of-range lanes carry idx=-1.
+    const bool inRange     = tdx < number;
+    int        warpId      = tdx / BANKSIZE;
+    int        localWarpId = threadIdx.x / BANKSIZE;
+    int        laneId      = tdx % BANKSIZE;
 
     __shared__ unsigned int electedMask[BANKSIZE];
     __shared__ unsigned int lanePrefix[BANKSIZE * BANKSIZE];
@@ -335,28 +341,26 @@ __global__ void _buildLevel1_new(int2*               _levelSize,
         _levelSize[1].x = _prefixSumOriginal[warpId] + _prefixOriginal[warpId];
         _levelSize[1].y = (number + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
     }
-    int idx = _partId_map_real[tdx];
+    int          idx     = inRange ? _partId_map_real[tdx] : -1;
+    unsigned int connMsk = (idx >= 0) ? _fineConnectedMsk[idx] : 0u;
+    __syncwarp();   // electedMask zeros visible warp-wide
+
     if(idx >= 0)
     {
-
-        unsigned int connMsk = _fineConnectedMsk[idx];
-
         unsigned int electedPrefix = __popc(connMsk & _LanemaskLt(laneId));
-
         if(electedPrefix == 0)
         {
             atomicOr(electedMask + localWarpId, (1U << laneId));
         }
+    }
+    __syncwarp();   // all election votes landed
 
-        //unsigned int lanePrefix2 = __popc(electedMask[localWarpId] & _LanemaskLt(laneId));
-        //lanePrefix2 += _prefixSumOriginal[warpId];
+    lanePrefix[threadIdx.x] = __popc(electedMask[localWarpId] & _LanemaskLt(laneId))
+                              + (inRange ? _prefixSumOriginal[warpId] : 0);
+    __syncwarp();   // lanePrefix published before cross-lane reads
 
-        //unsigned int elected_lane = __ffs(connMsk) - 1;
-        //unsigned int theLanePrefix = __shfl_sync(0xffffffff, lanePrefix2, elected_lane);
-
-        lanePrefix[threadIdx.x] = __popc(electedMask[localWarpId] & _LanemaskLt(laneId));
-        lanePrefix[threadIdx.x] += _prefixSumOriginal[warpId];
-
+    if(idx >= 0)
+    {
         unsigned int elected_lane = __ffs(connMsk) - 1;
         unsigned int theLanePrefix =
             lanePrefix[elected_lane + BANKSIZE * localWarpId];  //__shfl_sync(0xffffffff, lanePrefix, elected_lane);
@@ -451,22 +455,28 @@ __global__ void _buildConnectMaskLx_new(const unsigned int* _neighborStart,
                                         int number)
 {
     int tdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(tdx >= number)
-        return;
+    // [racecheck] no early return; the shared cacheMsk handshake is split into
+    // zero -> vote -> read phases separated by full-warp __syncwarp().
+    const bool     inRange     = tdx < number;
     int            warpId      = tdx / BANKSIZE;
     int            localWarpId = threadIdx.x / BANKSIZE;
     int            laneId      = tdx % BANKSIZE;
     __shared__ int cacheMsk[DEFAULT_BLOCKSIZE];
-    int            idx = _partId_map_real[tdx];
+    int            idx = inRange ? _partId_map_real[tdx] : -1;
+
+    cacheMsk[threadIdx.x] = 0;
+    __syncwarp();   // zeros visible before any vote
+
+    unsigned int prefixMsk = 0;
+    unsigned int connMsk   = 0;
+    unsigned int coarseIdx = 0;
     if(idx >= 0)
     {
-
-        unsigned int prefixMsk = _fineConnectedMsk[idx];
-        unsigned int connMsk   = 0;
-        unsigned int coarseIdx = _coarseSpaceTable[(level - 1) * vertNum + idx];
-        int          kn        = _neighborNum[idx];
-        int          nk        = 0;
-        int          startId   = _neighborStart[idx];
+        prefixMsk = _fineConnectedMsk[idx];
+        coarseIdx = _coarseSpaceTable[(level - 1) * vertNum + idx];
+        int kn      = _neighborNum[idx];
+        int nk      = 0;
+        int startId = _neighborStart[idx];
         for(int i = 0; i < kn; i++)
         {
             unsigned int connect = _neighborList[startId + i];
@@ -486,16 +496,9 @@ __global__ void _buildConnectMaskLx_new(const unsigned int* _neighborStart,
 
         _neighborNum[idx] = nk;
 
-
-        cacheMsk[threadIdx.x] = 0;
-
         if(__popc(prefixMsk) == BANKSIZE)
         {
             atomicOr(cacheMsk + localWarpId * BANKSIZE, connMsk);
-            connMsk = cacheMsk[localWarpId * BANKSIZE];
-            //if (laneId == 0) {
-            //	cacheMsk[localWarpId] = 0;
-            //}
         }
         else
         {
@@ -504,6 +507,19 @@ __global__ void _buildConnectMaskLx_new(const unsigned int* _neighborStart,
             {
                 atomicOr(cacheMsk + localWarpId * BANKSIZE + electedLane, connMsk);
             }
+        }
+    }
+    __syncwarp();   // all votes landed before the cross-lane reads
+
+    if(idx >= 0)
+    {
+        if(__popc(prefixMsk) == BANKSIZE)
+        {
+            connMsk = cacheMsk[localWarpId * BANKSIZE];
+        }
+        else
+        {
+            unsigned int electedLane = __ffs(prefixMsk) - 1;
             connMsk = cacheMsk[localWarpId * BANKSIZE + electedLane];
         }
 
@@ -520,8 +536,10 @@ __global__ void _buildConnectMaskLx_new(const unsigned int* _neighborStart,
 __global__ void _nextLevelCluster(unsigned int* _nextConnectedMsk, unsigned int* _nextPrefix, int number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= number)
-        return;
+    // [racecheck] no early return + __syncwarp() around the cachedMsk /
+    // prefixSum handshakes. Out-of-range lanes stay self-connected zeros and
+    // never touch global memory.
+    const bool     inRange     = idx < number;
     int            warpId      = idx / BANKSIZE;
     int            localWarpId = threadIdx.x / BANKSIZE;
     int            laneId      = idx % BANKSIZE;
@@ -532,13 +550,16 @@ __global__ void _nextLevelCluster(unsigned int* _nextConnectedMsk, unsigned int*
     }
     unsigned int connMsk = (1U << laneId);
 
-    connMsk |= _nextConnectedMsk[idx];
+    if(inRange)
+        connMsk |= _nextConnectedMsk[idx];
 
     //unsigned int cachedMsk = connMsk;
 
     __shared__ unsigned int cachedMsk[DEFAULT_BLOCKSIZE];
     cachedMsk[threadIdx.x] = connMsk;
-    unsigned int visited   = (1U << laneId);
+    __syncwarp();   // cachedMsk + zeroed prefixSum published warp-wide
+
+    unsigned int visited = (1U << laneId);
 
     while(true)
     {
@@ -554,16 +575,18 @@ __global__ void _nextLevelCluster(unsigned int* _nextConnectedMsk, unsigned int*
         connMsk |= cachedMsk[nextVisit + localWarpId * BANKSIZE];  //__shfl_sync(0xffffffff, cachedMsk, nextVisit);
     }
 
-    _nextConnectedMsk[idx] = connMsk;
+    if(inRange)
+        _nextConnectedMsk[idx] = connMsk;
 
     unsigned int electedPrefix = __popc(connMsk & _LanemaskLt(laneId));
 
-    if(electedPrefix == 0)
+    if(inRange && electedPrefix == 0)
     {
         atomicAdd(prefixSum + localWarpId, 1);
     }
+    __syncwarp();   // cluster-count votes landed before lane 0 reads
 
-    if(laneId == 0)
+    if(inRange && laneId == 0)
         _nextPrefix[warpId] = prefixSum[localWarpId];
 }
 
@@ -577,11 +600,12 @@ __global__ void _prefixSumLx(int2*         _levelSize,
                              int           number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= number)
-        return;
-    int warpId      = idx / BANKSIZE;
-    int localWarpId = threadIdx.x / BANKSIZE;
-    int laneId      = idx % BANKSIZE;
+    // [racecheck] no early return + __syncwarp() between the zero / vote /
+    // publish / read phases of the electedMask & lanePrefix handshakes.
+    const bool inRange     = idx < number;
+    int        warpId      = idx / BANKSIZE;
+    int        localWarpId = threadIdx.x / BANKSIZE;
+    int        laneId      = idx % BANKSIZE;
 
     __shared__ unsigned int electedMask[BANKSIZE];
     __shared__ unsigned int lanePrefix[BANKSIZE * BANKSIZE];
@@ -596,24 +620,30 @@ __global__ void _prefixSumLx(int2*         _levelSize,
         _levelSize[level + 1].y = levelBegin + (number + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
     }
 
-    unsigned int connMsk = _nextConnectMsk[idx];
+    unsigned int connMsk = inRange ? _nextConnectMsk[idx] : (1U << laneId);
+    __syncwarp();   // electedMask zeros visible
 
     unsigned int electedPrefix = __popc(connMsk & _LanemaskLt(laneId));
 
-    if(electedPrefix == 0)
+    if(inRange && electedPrefix == 0)
     {
         atomicOr(electedMask + localWarpId, (1U << laneId));
     }
+    __syncwarp();   // votes landed
 
-    lanePrefix[threadIdx.x] = __popc(electedMask[localWarpId] & _LanemaskLt(laneId));
-    lanePrefix[threadIdx.x] += _nextPrefixSum[warpId];
+    lanePrefix[threadIdx.x] = __popc(electedMask[localWarpId] & _LanemaskLt(laneId))
+                              + (inRange ? _nextPrefixSum[warpId] : 0);
+    __syncwarp();   // lanePrefix published before cross-lane reads
 
-    unsigned int elected_lane = __ffs(connMsk) - 1;
-    unsigned int theLanePrefix = lanePrefix[elected_lane + BANKSIZE * localWarpId];  //__shfl_sync(0xffffffff, lanePrefix, elected_lane);
+    if(inRange)
+    {
+        unsigned int elected_lane = __ffs(connMsk) - 1;
+        unsigned int theLanePrefix = lanePrefix[elected_lane + BANKSIZE * localWarpId];  //__shfl_sync(0xffffffff, lanePrefix, elected_lane);
 
-    _nextConnectMsk[idx] = theLanePrefix;
-    _goingNext[idx + levelBegin] =
-        theLanePrefix + levelBegin + (number + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
+        _nextConnectMsk[idx] = theLanePrefix;
+        _goingNext[idx + levelBegin] =
+            theLanePrefix + levelBegin + (number + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
+    }
 }
 
 __global__ void _computeNextLevel(int*          _coarseSpaceTable,
@@ -776,11 +806,14 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
                                                  int  numbers)
 {
     int pdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(pdx >= numbers)
-        return;
+    // NO early return: the fast path below runs full-warp collectives, so every
+    // lane (including out-of-range tail lanes, idx=-1, zero contribution) must
+    // reach them. numbers is a multiple of BANKSIZE, so out-of-range coverage
+    // is whole banks, never a partial bank.
+    const bool inRange = pdx < numbers;
 
     Eigen::Vector3f r;
-    int             idx = _partId_map_real[pdx];
+    int             idx = inRange ? _partId_map_real[pdx] : -1;
     if(idx >= 0)
     {
 
@@ -800,7 +833,8 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
     int gwarpId     = pdx / BANKSIZE;
     int level       = 0;
     //int rdx         = _real_map_partId[idx];
-    _multiLR[pdx] = r;
+    if(inRange)
+        _multiLR[pdx] = r;
 
     __shared__ FloatP c_sumResidual[DEFAULT_BLOCKSIZE * 3];
 
@@ -814,7 +848,59 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
 
     if(laneId == 0)
     {
-        prefixSum[localWarpId] = _prefixOrigin[gwarpId];
+        // out-of-range banks: mark tree-compatible (their lanes carry zeros)
+        prefixSum[localWarpId] = inRange ? _prefixOrigin[gwarpId] : 1;
+    }
+    __syncwarp();   // publish prefixSum to the whole warp (no early return above)
+
+    // [fast path, corrected] non-strict only: when every bank of this warp is a
+    // single cluster, an interval shuffle-tree (segments delimited by bank
+    // starts) + one deposit per bank is the cheap aggregation. The OLD tree ran
+    // with mask=__activemask() while padding lanes had already diverged out —
+    // __shfl_down_sync then sourced lanes OUTSIDE the mask: CUDA-undefined
+    // register garbage that varied with launch shape (the batch-drift bug).
+    // Corrected: no early return, ALL 32 lanes participate under a full mask,
+    // padding/out-of-range lanes contribute exact zeros. Strict mode
+    // (g_det_reduce) keeps the deterministic ascending-lane reduction below —
+    // its per-cluster sums feed exact order-independent binned deposits.
+    const bool warpTree =
+        (!g_det_reduce)
+        && __all_sync(0xffffffffu, prefixSum[localWarpId] == 1);
+    if(warpTree)
+    {
+        // Banks are BANKSIZE-aligned within the physical warp, so the segment
+        // geometry is static: no ballot/brev/clz needed (the old
+        // `mark << (warpId+1)` computed a 32-bit shift by 32 on physical
+        // lane 31 — C++ UB). interval = distance to my bank's end.
+        const bool     bBoundary = (laneId == 0);
+        const unsigned interval  = (BANKSIZE - 1) - laneId;
+
+        for(int iter = 1; iter < BANKSIZE; iter <<= 1)
+        {
+            float tmpx = __shfl_down_sync(0xffffffffu, r[0], iter);
+            float tmpy = __shfl_down_sync(0xffffffffu, r[1], iter);
+            float tmpz = __shfl_down_sync(0xffffffffu, r[2], iter);
+            if(interval >= (unsigned)iter)
+            {
+                r[0] += tmpx;
+                r[1] += tmpy;
+                r[2] += tmpz;
+            }
+        }
+        // bank-start lanes hold their bank's sum; the map fills real slots
+        // from lane 0, so an in-range bank start always has idx >= 0.
+        if(bBoundary && idx >= 0)
+        {
+            while(level < levelNum - 1)
+            {
+                level++;
+                idx = _goingNext[idx];
+                binned_deposit(g_mRbin + ((size_t)idx * 3 + 0) * BINNED_K, (double)r[0]);
+                binned_deposit(g_mRbin + ((size_t)idx * 3 + 1) * BINNED_K, (double)r[1]);
+                binned_deposit(g_mRbin + ((size_t)idx * 3 + 2) * BINNED_K, (double)r[2]);
+            }
+        }
+        return;
     }
 
     if(idx >= 0)
@@ -822,46 +908,9 @@ __global__ void __buildMultiLevelR_optimized_new(const double3* _R,
 
         unsigned int connectMsk = _fineConnectMsk[idx];
 
-        if(prefixSum[localWarpId] == 1)
-        {
-            auto mask_val  = __activemask();
-            int  warpId    = threadIdx.x & 0x1f;
-            bool bBoundary = (laneId == 0) || (warpId == 0);
-
-            unsigned int mark     = __ballot_sync(mask_val, bBoundary);
-            mark                  = __brev(mark);
-            int          clzlen   = __clz(mark << (warpId + 1));
-            unsigned int interval = std::min(clzlen, 31 - warpId);
-
-
-            for(int iter = 1; iter < BANKSIZE; iter <<= 1)
-            {
-                float tmpx = __shfl_down_sync(mask_val, r[0], iter);
-                float tmpy = __shfl_down_sync(mask_val, r[1], iter);
-                float tmpz = __shfl_down_sync(mask_val, r[2], iter);
-                if(interval >= iter)
-                {
-                    r[0] += tmpx;
-                    r[1] += tmpy;
-                    r[2] += tmpz;
-                }
-            }
-            //int level = 0;
-
-            if(bBoundary)
-            {
-                while(level < levelNum - 1)
-                {
-                    level++;
-                    idx = _goingNext[idx];
-                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 0) * BINNED_K, (double)r[0]);
-                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 1) * BINNED_K, (double)r[1]);
-                    binned_deposit(g_mRbin + ((size_t)idx * 3 + 2) * BINNED_K, (double)r[2]);
-                }
-            }
-            return;
-        }
-        else
+        // Strict mode, or a warp whose banks are not all single-cluster:
+        // deterministic ascending-lane reduction (handles prefix==1 too, since
+        // connectMsk is then the bank's full real-slot mask).
         {
             // [MAS determinism] Deterministic replacement for the old order-dependent
             //   atomicAdd(c_sumResidual + warp*BANKSIZE + elected_lane, r)
@@ -983,14 +1032,12 @@ __global__ void _schwarzLocalXSym3(const __GEIGEN__::MasMatrixSymf* Pred,
                 + Pred[Hid].M[index](2, r3id) * smR[lvcid][2];
     }
     //__syncthreads();
-    int  warpId    = threadIdx.x & 0x1f;
-    int  landidx   = threadIdx.x % BANKSIZE;
-    bool bBoundary = (landidx == 0) || (warpId == 0);
-
-    unsigned int mark     = __ballot_sync(0xffffffff, bBoundary);  // a bit-mask
-    mark                  = __brev(mark);
-    int          clzlen   = __clz(mark << (warpId + 1));
-    unsigned int interval = std::min(clzlen, 31 - warpId);
+    int landidx = threadIdx.x % BANKSIZE;
+    // Static segment geometry (BANKSIZE-aligned rows inside the warp): the
+    // former ballot/brev/clz path computed `mark << 32` on physical lane 31,
+    // which is C++ undefined behavior. interval = distance to my row's end.
+    bool         bBoundary = (landidx == 0);
+    unsigned int interval  = (BANKSIZE - 1) - landidx;
 
     int maxSize = std::min(32, BANKSIZE);
     for(int iter = 1; iter < maxSize; iter <<= 1)
@@ -1050,14 +1097,12 @@ __global__ void _schwarzLocalXSym6(const __GEIGEN__::MasMatrixSymf* Pred,
         rdata     = Pred[Hid].M[index].transpose() * smR[lvcid];
     }
     //__syncthreads();
-    int  warpId    = threadIdx.x & 0x1f;
-    int  landidx   = threadIdx.x % BANKSIZE;
-    bool bBoundary = (landidx == 0) || (warpId == 0);
-
-    unsigned int mark     = __ballot_sync(0xffffffff, bBoundary);  // a bit-mask
-    mark                  = __brev(mark);
-    int          clzlen   = __clz(mark << (warpId + 1));
-    unsigned int interval = std::min(clzlen, 31 - warpId);
+    int landidx = threadIdx.x % BANKSIZE;
+    // Static segment geometry (BANKSIZE-aligned rows inside the warp): the
+    // former ballot/brev/clz path computed `mark << 32` on physical lane 31,
+    // which is C++ undefined behavior. interval = distance to my row's end.
+    bool         bBoundary = (landidx == 0);
+    unsigned int interval  = (BANKSIZE - 1) - landidx;
 
     int maxSize = std::min(32, BANKSIZE);
     for(int iter = 1; iter < maxSize; iter <<= 1)
@@ -1148,9 +1193,13 @@ __global__ void _schwarzLocalXSym9(const __GEIGEN__::MasMatrixSymf* Pred,
     bool bBoundary = (warpId == 0) || (prev_i != vrid);
     auto mask_val  = __activemask();
 
-    unsigned int mark     = __ballot_sync(mask_val, bBoundary);  // a bit-mask
-    mark                  = __brev(mark);
-    int          clzlen   = __clz(mark << (warpId + 1));
+    unsigned int mark = __ballot_sync(mask_val, bBoundary);  // a bit-mask
+    mark              = __brev(mark);
+    // guard the lane-31 case: a 32-bit shift by 32 is C++ UB (this kernel is
+    // currently uncalled but kept compilable and UB-free; its segment
+    // boundary is data-dependent so the static-geometry rewrite of Sym3/Sym6
+    // does not apply here)
+    int          clzlen   = (warpId >= 31) ? 32 : __clz(mark << (warpId + 1));
     unsigned int interval = std::min(clzlen, 31 - warpId);
 
     mark = interval;
@@ -1657,15 +1706,31 @@ static int _mas_envSegN(int warpNum, int numEnvs)
     int n_env;
     if(force)
     {
-        n_env = atoi(force);            // 0=off, 1=auto(body-group count), N=force N
-        if(n_env == 1)
-            n_env = numEnvs;
+        n_env = atoi(force);            // 0=off, 1=auto(body-group count)
+        if(n_env == 0)
+            return 1;
+        if(n_env != 1 && n_env != numEnvs)
+        {
+            // A forced N different from the host-verified env count would
+            // bypass the bank-range homogeneity guard in sim_engine.cu and
+            // segment through env boundaries. Honor only the verified count.
+            static int warned = 0;
+            if(!warned)
+            {
+                warned = 1;
+                printf("[per-env MAS] STIFF_MAS_SEG=%d ignored (verified env "
+                       "count is %d); using the verified count\n",
+                       n_env, numEnvs);
+            }
+        }
+        n_env = numEnvs;
     }
     else
     {
         n_env = numEnvs;                // default: ON for multi-env, every mode (see rationale above)
     }
-    if(n_env <= 1 || warpNum <= 0 || warpNum % n_env != 0)
+    // 4096 = d_envBase/d_envStart scratch capacity (also enforced host-side).
+    if(n_env <= 1 || n_env > 4096 || warpNum <= 0 || warpNum % n_env != 0)
         return 1;
     return n_env;
 }
@@ -1934,7 +1999,10 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
     BuildLevel1();
     for(int level = 1; level < levelnum; level++)
     {
-        CUDA_SAFE_CALL(cudaMemset(d_nextConnectMask, 0, totalNodes * sizeof(int)));
+        // clear the FULL cluster-space capacity: padded slots beyond the real
+        // cluster count are read by _nextLevelCluster/_prefixSumLx and must be
+        // deterministic zeros, not stale/uninitialized memory.
+        CUDA_SAFE_CALL(cudaMemset(d_nextConnectMask, 0, m_clusterCap * sizeof(int)));
 
         BuildConnectMaskLx(level);
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -2143,56 +2211,93 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                         mat3 = _invMatrix[Hid].M[index].transpose();
                     }
 
-                    if((rdx >= 0) && (cdx >= 0))
+                    // prefix==1: every fine pair of this bank maps to ONE coarse
+                    // diagonal block. Two aggregation paths:
+                    //
+                    //  * fast (non-strict): warp-tree sum + one deposit per warp.
+                    //    The OLD tree ran its collectives INSIDE the validPair
+                    //    branch with mask=0xffffffff, so padding lanes never
+                    //    executed the collective they were named in -> CUDA UB on
+                    //    partially filled banks (the real historical defect; a
+                    //    32-lane warp covers two ROWS of the SAME bank - it never
+                    //    spans two banks, blockDim 256 == one bank). Corrected:
+                    //    ALL lanes participate unconditionally, padding pairs
+                    //    contribute exact zeros.
+                    //
+                    //  * strict (g_det_reduce): per-pair binned deposits - exact,
+                    //    order-independent, hence layout- and batch-size-invariant
+                    //    (the v0.8.4.2 batch-determinism contract). No plain-double
+                    //    partial sums survive on this path.
+                    const bool validPair = (rdx >= 0) && (cdx >= 0);
+                    if(prefix == 1 && !g_det_reduce)
+                    {
+                        Eigen::Matrix3d mat3_c;
+                        if(validPair)
+                            mat3_c = mat3;
+                        else
+                            mat3_c.setZero();
+                        for(int iter = 1; iter < 32; iter <<= 1)
+                        {
+                            for(int i = 0; i < 3; i++)
+                                for(int j = 0; j < 3; j++)
+                                {
+                                    double t = __shfl_down_sync(0xffffffffu,
+                                                                mat3_c(i, j), iter);
+                                    mat3_c(i, j) += t;
+                                }
+                        }
+                        unsigned validMsk = __ballot_sync(0xffffffffu, validPair);
+                        int      leadLane = validMsk ? (__ffs(validMsk) - 1) : 0;
+                        int      leadRdx  = __shfl_sync(0xffffffffu, rdx, leadLane);
+                        if((threadIdx.x & 0x1f) == 0 && validMsk)
+                        {
+                            int level  = 0;
+                            int nextId = leadRdx;
+                            while(level < levelNum - 1)
+                            {
+                                level++;
+                                nextId    = _goingNext[nextId];
+                                int cPid  = nextId / BANKSIZE;
+                                int bvRid = nextId % BANKSIZE;
+                                int index = BANKSIZE * bvRid
+                                            - bvRid * (bvRid + 1) / 2 + bvRid;
+                                for(int i = 0; i < 3; i++)
+                                    for(int j = 0; j < 3; j++)
+                                        binned_deposit(
+                                            g_matbin
+                                                + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j)
+                                                      * BINNED_K,
+                                            mat3_c(i, j));
+                            }
+                        }
+                    }
+                    else if(validPair)
                     {
                         if(prefix == 1)
                         {
-                            int warpId = threadIdx.x & 0x1f;
-                            bool bBoundary = (warpId == 0) || (rdx < 0) || (cdx < 0);
-                            unsigned int mark = __ballot_sync(0xffffffff, bBoundary);
-                            mark = __brev(mark);
-                            int clzlen = __clz(mark << (warpId + 1));
-                            unsigned int interval = std::min(clzlen, 31 - warpId);
-                            for(int iter = 1; iter < 32; iter <<= 1)
+                            // strict: deposit this pair's own block. rdx and cdx
+                            // share the goingNext chain (single cluster), so rdx's
+                            // chain diagonal slot is the correct target.
+                            int level  = 0;
+                            int nextId = rdx;
+                            while(level < levelNum - 1)
                             {
-                                Eigen::Matrix3d matTemp;
+                                level++;
+                                nextId    = _goingNext[nextId];
+                                int cPid  = nextId / BANKSIZE;
+                                int bvRid = nextId % BANKSIZE;
+                                int index = BANKSIZE * bvRid
+                                            - bvRid * (bvRid + 1) / 2 + bvRid;
                                 for(int i = 0; i < 3; i++)
                                 {
                                     for(int j = 0; j < 3; j++)
                                     {
-                                        matTemp(i, j) =
-                                            __shfl_down_sync(0xffffffff, mat3(i, j), iter);
+                                        binned_deposit(
+                                            g_matbin
+                                                + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j)
+                                                      * BINNED_K,
+                                            mat3(i, j));
                                     }
-                                }
-                                if(interval >= iter)
-                                {
-                                    mat3 = mat3 + matTemp;
-                                }
-                            }
-                            int level = 0;
-                            if(bBoundary)
-                            {
-                                int nextId = _goingNext[rdx];
-                                while(level < levelNum - 1)
-                                {
-                                    level++;
-                                    int cPid  = nextId / BANKSIZE;
-                                    int bvRid = nextId % BANKSIZE;
-                                    int bvCid = nextId % BANKSIZE;
-                                    int index = BANKSIZE * bvRid
-                                                - bvRid * (bvRid + 1) / 2 + bvCid;
-                                    for(int i = 0; i < 3; i++)
-                                    {
-                                        for(int j = 0; j < 3; j++)
-                                        {
-                                            binned_deposit(
-                                                g_matbin
-                                                    + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j)
-                                                          * BINNED_K,
-                                                mat3(i, j));
-                                        }
-                                    }
-                                    nextId = _goingNext[nextId];
                                 }
                             }
                         }
@@ -2451,6 +2556,43 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
     }
 
     CollectFinalZ(Z);
+    // [debug] STIFF_MAS_DUMP=<dir>: dump the FIRST preconditioning call's input R,
+    // multilevel R/Z buffers and output Z as raw binaries (batch-drift bisection).
+    {
+        static int  _dumped = 0;
+        const char* _dd     = getenv("STIFF_MAS_DUMP");
+        if(_dd && !_dumped)
+        {
+            _dumped = 1;
+            cudaDeviceSynchronize();
+            auto wr = [&](const char* name, const void* dev, size_t bytes)
+            {
+                std::vector<char> h(bytes);
+                cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
+                char p[768];
+                snprintf(p, sizeof(p), "%s/%s.bin", _dd, name);
+                FILE* f = fopen(p, "wb");
+                if(f) { fwrite(h.data(), 1, bytes, f); fclose(f); }
+            };
+            wr("mas_R",   R,             (size_t)totalNodes * sizeof(double3));
+            wr("mas_mlR", d_multiLevelR, (size_t)totalNumberClusters * sizeof(Eigen::Vector3f));
+            wr("mas_mlZ", d_multiLevelZ, (size_t)totalNumberClusters * sizeof(Precision_T3));
+            wr("mas_Z",   Z,             (size_t)totalNodes * sizeof(double3));
+            wr("mas_pmat", d_precondMatMas,
+               (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf));
+#ifdef SYME
+            wr("mas_imat", d_inverseMatMas,
+               (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymT));
+#endif
+            // topology for external (CPU) multi-level oracles
+            wr("mas_goingNext", d_goingNext,
+               (size_t)totalNumberClusters * sizeof(unsigned int));
+            wr("mas_map", d_partId_map_real, (size_t)totalMapNodes * sizeof(int));
+            wr("mas_levelSize", d_levelSize, (size_t)(levelnum + 1) * sizeof(int2));
+            printf("[mas-dump] wrote R/mlR/mlZ/Z to %s (nodes=%d clusters=%d mapNodes=%d levels=%d)\n",
+                   _dd, totalNodes, totalNumberClusters, totalMapNodes, levelnum);
+        }
+    }
     //cudaEventRecord(end2);
 
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -2481,7 +2623,18 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
         return;
     }
     int maxNodes = partMapSize > vertNum ? partMapSize : vertNum;
-    computeNumLevels(maxNodes);
+    // [per-env MAS] Hierarchy DEPTH from the per-env node count whenever env
+    // segmentation will be active (same predicate as the aggregation,
+    // _mas_envSegN). A depth computed from the GLOBAL count grows with batch
+    // size N (e.g. 16 verts/env: N=2 -> 2 levels, N=8 -> 3 levels), so the
+    // same physical env gets a different preconditioner in different batch
+    // sizes -> PCG converges along a different path -> ~1e-9 batch drift.
+    // m_numEnvs must therefore be set BEFORE this call (see sim_engine.cu).
+    {
+        const int warpNumL0 = (maxNodes + BANKSIZE - 1) / BANKSIZE;
+        const int segN      = _mas_envSegN(warpNumL0, m_numEnvs);
+        computeNumLevels(segN > 1 ? maxNodes / segN : maxNodes);
+    }
     totalMapNodes         = partMapSize;
     collision_node_Offset = mCollision_node_offset;
     _collisonPairs        = m_collisonPairs;
@@ -2492,14 +2645,17 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_coarseSpaceTables,
                               vertNum * levelnum * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_levelSize, (levelnum + 1) * sizeof(int2)));
+    // [per-env MAS] cluster-space arrays must hold PADDED per-level cluster
+    // counts, which can exceed vertNum on small scenes (see m_clusterCap doc).
+    m_clusterCap = maxNodes + (std::max(1, m_numEnvs) + 1) * BANKSIZE;
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_goingNext,
-                              vertNum * levelnum * sizeof(unsigned int)));
+                              (size_t)m_clusterCap * levelnum * sizeof(unsigned int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_prefixOriginal, vertNum * sizeof(unsigned int)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_nextPrefix, vertNum * sizeof(unsigned int)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_nextPrefixSum, vertNum * sizeof(unsigned int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_nextPrefix, m_clusterCap * sizeof(unsigned int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_nextPrefixSum, m_clusterCap * sizeof(unsigned int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_prefixSumOriginal, vertNum * sizeof(unsigned int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_fineConnectMask, vertNum * sizeof(unsigned int)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_nextConnectMask, vertNum * sizeof(unsigned int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_nextConnectMask, m_clusterCap * sizeof(unsigned int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_neighborList, totalNeighborNum * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_neighborStart, vertNum * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_neighborStartTemp, vertNum * sizeof(int)));
@@ -2558,6 +2714,10 @@ void MASPreconditioner::FreeMAS()
 {
     if(totalNodes < 1)
         return;
+    // [per-env MAS] env-segmentation scratch (allocated unconditionally in init)
+    CUDA_SAFE_CALL(cudaFree(d_envBase));
+    CUDA_SAFE_CALL(cudaFree(d_envStart));
+    CUDA_SAFE_CALL(cudaFree(d_padTot));
     CUDA_SAFE_CALL(cudaFree(d_denseLevel));
     CUDA_SAFE_CALL(cudaFree(d_coarseSpaceTables));
     CUDA_SAFE_CALL(cudaFree(d_levelSize));

@@ -2,7 +2,7 @@
 """[B1] regression: URDF primitive collision -> conservative proxy meshes.
 
 v0.8.4 skipped box/sphere/cylinder collision elements with a warning (the link
-silently lost its collision shape).  v0.8.5 converts them to watertight,
+silently lost its collision shape).  v0.8.4.2 converts them to watertight,
 conservatively CIRCUMSCRIBED triangle meshes (proxy contains the exact
 primitive, so contact can only fire early, never be missed):
 
@@ -132,5 +132,104 @@ def main():
     print("B1 URDF primitive proxy: ALL PASS")
 
 
+MIXED_URDF_XML = """<?xml version="1.0"?>
+<robot name="mixed_test">
+  <link name="pm">
+    <collision>
+      <geometry><cylinder radius="0.03" length="0.1"/></geometry>
+    </collision>
+    <collision>
+      <geometry><mesh filename="MESHFILE"/></geometry>
+    </collision>
+  </link>
+  <link name="mp">
+    <collision>
+      <geometry><mesh filename="MESHFILE"/></geometry>
+    </collision>
+    <collision>
+      <geometry><sphere radius="0.03"/></geometry>
+    </collision>
+  </link>
+  <joint name="j1" type="fixed">
+    <parent link="pm"/>
+    <child link="mp"/>
+    <origin xyz="0 0 0.4" rpy="0 0 0"/>
+  </joint>
+</robot>
+"""
+
+
+def _write_unit_cube_obj(path):
+    v = [(-.05,-.05,-.05),(.05,-.05,-.05),(.05,.05,-.05),(-.05,.05,-.05),
+         (-.05,-.05,.05),(.05,-.05,.05),(.05,.05,.05),(-.05,.05,.05)]
+    f = [(1,3,2),(1,4,3),(5,6,7),(5,7,8),(1,2,6),(1,6,5),
+         (3,4,8),(3,8,7),(2,3,7),(2,7,6),(4,1,5),(4,5,8)]
+    with open(path, "w") as fp:
+        for x in v: fp.write(f"v {x[0]} {x[1]} {x[2]}\n")
+        for t in f: fp.write(f"f {t[0]} {t[1]} {t[2]}\n")
+
+
+def mixed_link_checks():
+    """[primitive, mesh] and [mesh, primitive] links must BOTH pick the first
+    MESH element, with proxy generation ON and OFF alike (<=0.8.4 dropped the
+    whole link when the FIRST element was a primitive)."""
+    import subprocess
+    tmpdir = tempfile.mkdtemp(prefix="stiffgipc_mixed_urdf_")
+    mesh = os.path.join(tmpdir, "box.obj")
+    _write_unit_cube_obj(mesh)
+    urdf = os.path.join(tmpdir, "mixed.urdf")
+    with open(urdf, "w") as f:
+        f.write(MIXED_URDF_XML.replace("MESHFILE", mesh))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from stiff_physics.engine import Engine, Config\n"
+        "eng = Engine(Config(ground_offset=0.0))\n"
+        "eng.load_urdf(%r, translation=(0.0, 0.6, 0.0), root_fixed=True)\n"
+        "print('BODIES', eng._engine.get_abd_body_count())\n"
+        "print('VERTS', eng._engine.get_vertex_count_host())\n"
+    ) % (root, urdf)
+    for hatch in (None, "0"):
+        env = dict(os.environ)
+        if hatch is not None:
+            env["STIFF_URDF_PRIM_PROXY"] = hatch
+        r = subprocess.run([sys.executable, "-c", code], env=env,
+                           capture_output=True, text=True, timeout=300)
+        got = {l.split()[0]: int(l.split()[1]) for l in r.stdout.splitlines()
+               if l.startswith(("BODIES", "VERTS"))}
+        assert got.get("BODIES") == 2, f"hatch={hatch}: mixed links must load 2 mesh bodies, got {got}"
+        assert got.get("VERTS") == 16, f"hatch={hatch}: 8 obj verts x2 expected, got {got}"
+        assert "primitive element(s) IGNORED" in r.stderr, f"hatch={hatch}: mixed-link warning missing"
+    print("mixed [primitive,mesh] / [mesh,primitive]: first MESH wins in both hatch states  PASS")
+
+
+def escape_hatch_checks():
+    """STIFF_URDF_PRIM_PROXY=0 restores the <=0.8.4 primitive SKIP; mixed
+    [primitive, mesh] links pick the first MESH regardless of the switch
+    (the pre-0.8.4.2 'first element primitive drops the whole link' behavior
+    is NOT restored — the hatch only disables proxy generation)."""
+    import subprocess
+    tmpdir = tempfile.mkdtemp(prefix="stiffgipc_prim_urdf_")
+    urdf = os.path.join(tmpdir, "prim_test.urdf")
+    with open(urdf, "w") as f:
+        f.write(URDF_XML)
+    code = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from stiff_physics.engine import Engine, Config\n"
+        "eng = Engine(Config(ground_offset=0.0))\n"
+        "eng.load_urdf(%r, translation=(0.0, 0.6, 0.0), root_fixed=True)\n"
+        "print('BODIES', eng._engine.get_abd_body_count())\n"
+    ) % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))), urdf)
+    env = dict(os.environ, STIFF_URDF_PRIM_PROXY="0")
+    r = subprocess.run([sys.executable, "-c", code], env=env,
+                       capture_output=True, text=True, timeout=300)
+    n = [l for l in r.stdout.splitlines() if l.startswith("BODIES")]
+    assert n and n[0] == "BODIES 0", f"hatch=0 must skip all primitive-only links, got {n}"
+    assert "DISABLED (STIFF_URDF_PRIM_PROXY=0)" in r.stderr, "hatch warning missing"
+    print("escape hatch (=0): primitive-only links skipped as <=0.8.4  PASS")
+
+
 if __name__ == "__main__":
     main()
+    escape_hatch_checks()
+    mixed_link_checks()

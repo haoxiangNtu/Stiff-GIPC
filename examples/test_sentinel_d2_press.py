@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""[M0 sentinel -> v0.8.5 regression] D2 ground-collapse sentinel: PASS = no collapse OR loud engine throw.
+"""[M0 sentinel -> v0.8.4.2 regression] D2 ground-collapse sentinel: PASS = no collapse OR loud engine throw.
 
 M0-1 D2 repro: rigid press plate driven INTO a soft block resting on ground.
 Watch: per-frame min ground distance of the soft block + Newton iters.
