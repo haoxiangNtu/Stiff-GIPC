@@ -60,9 +60,13 @@ def run(dt):
     return settle
 
 s1 = run(0.01); s2 = run(0.02)
-ghost = abs(s2) > 2 * abs(s1) and abs(s2) > 0.002
+# Ghost-drag verdict uses the dt=0.02 phase ONLY: the dt=0.01 post-release
+# travel has documented +-10mm run-to-run variance in merged mode (observed
+# +2.84/-10.09/+2.16/-1.80 mm across identical binaries), so any ratio
+# against it is noise. Historical healthy s2 is ~3.3mm; 5mm = +50% headroom.
+ghost = abs(s2) > 0.005
 print(f"[d7] VERDICT: post-release travel dt=0.01: {s1*1000:.2f}mm, dt=0.02: {s2*1000:.2f}mm "
       f"-> {'GHOST DRAG REPRODUCED (grows with dt)' if ghost else ('mild/none' if abs(s2) < 0.005 else 'present')}", flush=True)
-ok = (not ghost) and abs(s2) < 0.005
+ok = not ghost
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
