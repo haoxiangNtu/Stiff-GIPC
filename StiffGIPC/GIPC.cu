@@ -34,6 +34,7 @@
 #include <gipc/utils/timer.h>
 
 #include <muda/cub/device/device_radix_sort.h>
+#include <linear_system/utils/capacity_tier.h>
 #include <cub/device/device_radix_sort.cuh>   // [perenv-parallel #2] pool sort-scratch sizing
 using namespace Eigen;
 
@@ -12852,35 +12853,47 @@ void GIPC::partitionContactHessian()
     // the ranges are copied back. Dynamic pre-assembly growth only guarantees
     // [0,n), and the global converter's equivalent safety net runs later.
     // Grow here from the exact contact count while preserving [0,n).
-    const size_t contact_triplet_count = static_cast<size_t>(
-        gipc_global_triplet.global_collision_triplet_offset);
-    if(gipc_global_triplet.triplet_capacity() < 2 * contact_triplet_count)
+    const int exact_count = gipc_global_triplet.global_collision_triplet_offset;
+    const int tier        = gipc::assembly_capacity_tier(exact_count);
+    if(gipc_global_triplet.triplet_capacity() < 2ull * static_cast<size_t>(tier))
     {
-        gipc_global_triplet.resize_triplets(contact_triplet_count);
-        gipc_global_triplet.reserve_triplets(contact_triplet_count * 26 / 10);
+        gipc_global_triplet.resize_triplets(static_cast<size_t>(exact_count));
+        gipc_global_triplet.reserve_triplets(2ull * static_cast<size_t>(tier));
     }
+
+    // The tier's out-of-place destination includes canonical zero padding.
+    // Only exact sorted entries are gathered below; copying the whole tier
+    // back therefore never exposes stale payload to later fixed-shape stages.
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_row_indices(tier),
+                                   0,
+                                   static_cast<size_t>(tier) * sizeof(int),
+                                   cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_col_indices(tier),
+                                   0,
+                                   static_cast<size_t>(tier) * sizeof(int),
+                                   cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_values(tier),
+                                   0,
+                                   static_cast<size_t>(tier) * sizeof(Eigen::Matrix3d),
+                                   cudaStreamPerThread));
 
     muda::DeviceRadixSort().SortPairs(gipc_global_triplet.block_hash_value(),
                                       gipc_global_triplet.block_sort_hash_value(),
                                       gipc_global_triplet.block_index(),
                                       gipc_global_triplet.block_sort_index(),
-                                      gipc_global_triplet.global_collision_triplet_offset);
+                                      tier);
 
     int threadNum = 256;
 
-    LaunchCudaKernal_default(
-        gipc_global_triplet.global_collision_triplet_offset,
-        threadNum,
-        0,
-        _reorder_triplets,
+    _reorder_triplets<<<tier / threadNum, threadNum>>>(
         gipc_global_triplet.block_row_indices(),
         gipc_global_triplet.block_col_indices(),
         gipc_global_triplet.block_values(),
-        gipc_global_triplet.block_row_indices(gipc_global_triplet.global_collision_triplet_offset),
-        gipc_global_triplet.block_col_indices(gipc_global_triplet.global_collision_triplet_offset),
-        gipc_global_triplet.block_values(gipc_global_triplet.global_collision_triplet_offset),
+        gipc_global_triplet.block_row_indices(tier),
+        gipc_global_triplet.block_col_indices(tier),
+        gipc_global_triplet.block_values(tier),
         (const uint32_t*)gipc_global_triplet.block_sort_index(),
-        gipc_global_triplet.global_collision_triplet_offset);
+        exact_count);
 
     //gipc_global_triplet.d_abd_abd_contact_start_id = -1;
     //gipc_global_triplet.d_abd_fem_contact_start_id = -1;
@@ -12893,17 +12906,13 @@ void GIPC::partitionContactHessian()
     CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_fem_fem_contact_start_id, -1, sizeof(int)));
 
     size_t shareMem = (threadNum + 1) * sizeof(int);
-    LaunchCudaKernal_default(gipc_global_triplet.global_collision_triplet_offset,
-                             threadNum,
-                             shareMem,
-                             _partition_collision_triplets,
-                             (const uint64_t*)gipc_global_triplet.block_sort_hash_value(),
-                             gipc_global_triplet.d_abd_abd_contact_start_id,
-                             gipc_global_triplet.d_abd_fem_contact_start_id,
-                             gipc_global_triplet.d_fem_abd_contact_start_id,
-                             gipc_global_triplet.d_fem_fem_contact_start_id,
-                             //abd_fem_count_info.abd_point_num,
-                             gipc_global_triplet.global_collision_triplet_offset);
+    _partition_collision_triplets<<<tier / threadNum, threadNum, shareMem>>>(
+        (const uint64_t*)gipc_global_triplet.block_sort_hash_value(),
+        gipc_global_triplet.d_abd_abd_contact_start_id,
+        gipc_global_triplet.d_abd_fem_contact_start_id,
+        gipc_global_triplet.d_fem_abd_contact_start_id,
+        gipc_global_triplet.d_fem_fem_contact_start_id,
+        exact_count);
 
 
     //gipc_global_triplet.h_abd_abd_contact_start_id =
@@ -13007,20 +13016,20 @@ void GIPC::partitionContactHessian()
 
     CUDA_SAFE_CALL(
         cudaMemcpy(gipc_global_triplet.block_row_indices(),
-                   gipc_global_triplet.block_row_indices() + gipc_global_triplet.global_collision_triplet_offset,
-                   gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+                   gipc_global_triplet.block_row_indices(tier),
+                   static_cast<size_t>(tier) * sizeof(int),
                    cudaMemcpyDeviceToDevice));
 
     CUDA_SAFE_CALL(
         cudaMemcpy(gipc_global_triplet.block_col_indices(),
-                   gipc_global_triplet.block_col_indices() + gipc_global_triplet.global_collision_triplet_offset,
-                   gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+                   gipc_global_triplet.block_col_indices(tier),
+                   static_cast<size_t>(tier) * sizeof(int),
                    cudaMemcpyDeviceToDevice));
 
     CUDA_SAFE_CALL(cudaMemcpy(
         gipc_global_triplet.block_values(),
-        gipc_global_triplet.block_values() + gipc_global_triplet.global_collision_triplet_offset,
-        gipc_global_triplet.global_collision_triplet_offset * sizeof(Eigen::Matrix3d),
+        gipc_global_triplet.block_values(tier),
+        static_cast<size_t>(tier) * sizeof(Eigen::Matrix3d),
         cudaMemcpyDeviceToDevice));
 }
 

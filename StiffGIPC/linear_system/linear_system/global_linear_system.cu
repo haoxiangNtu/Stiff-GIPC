@@ -2,6 +2,7 @@
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <gipc/utils/timer.h>
+#include <linear_system/utils/capacity_tier.h>
 #include <cstdlib>
 #include <typeinfo>
 
@@ -73,24 +74,24 @@ bool GlobalLinearSystem::build_linear_system()
     CUDA_SAFE_CALL(cudaMemset(m_x.view().data(), 0,
                               total_rhs_count * sizeof(Float)));
 
-    // [P0-mem pre-grow] grow the triplet storage BEFORE assembly. At this point
-    // global_triplet_offset (exact count) is known from report_subsystem_info()
-    // and the buffer holds only LAST iteration's dead triplets -> free+malloc
-    // (no copy). This replaces the post-assembly copying safety net in
-    // convert_new() as the primary growth path (that net still exists, but
-    // should no longer fire). Hash scratch moved here too (same reasoning:
-    // update_hash_value fully rewrites it).
+    // [P3a assembly tier] The Hessian triplets were produced by GIPC before
+    // entering this linear-system wrapper, so a late tier crossing must
+    // preserve [0,length).  Normal runs are already at the high-water tier and
+    // take the no-op branch; a first crossing grows once at this assembly
+    // boundary, before converter/CUB nodes are issued.
     {
         auto*           gt     = gipc_global_triplet;
-        const long long length = gt->global_triplet_offset;
-        gt->ensure_capacity_discard((size_t)(2LL * length));
-        if(gt->global_external_max_capcity < length)
+        const int       length = gt->global_triplet_offset;
+        const int       tier   = assembly_capacity_tier(length);
+        if(gt->triplet_capacity() < static_cast<size_t>(2LL * tier))
         {
-            long long hm = length * 3 / 10;
-            long long hcap_bytes = 512ll * 1024 * 1024 / (long long)sizeof(uint64_t);
-            if(hm > hcap_bytes) hm = hcap_bytes;
-            gt->resize_collision_hash_size((size_t)(length + hm));
-            gt->global_external_max_capcity = (int)(length + hm);
+            gt->resize_triplets(static_cast<size_t>(length));
+            gt->reserve_triplets(static_cast<size_t>(2LL * tier));
+        }
+        if(gt->global_external_max_capcity < tier)
+        {
+            gt->resize_collision_hash_size((size_t)tier);
+            gt->global_external_max_capcity = tier;
         }
     }
 
@@ -324,25 +325,29 @@ void GlobalLinearSystem::convert_new()
     // (worst-case hybrid alloc) -> byte-for-byte unchanged for hybrid scenes.
     {
         auto*           gt     = gipc_global_triplet;
-        const long long length = gt->global_triplet_offset;
+        const int       length = gt->global_triplet_offset;
+        const int       tier   = assembly_capacity_tier(length);
         if(length >= 1)
         {
-            if((long long)gt->triplet_capacity() < 2LL * length)
+            if((long long)gt->triplet_capacity() < 2LL * tier)
             {
                 gt->resize_triplets((size_t)length);
-                gt->reserve_triplets((size_t)(2LL * length * 13 / 10));
+                gt->reserve_triplets((size_t)(2LL * tier));
             }
-            if(gt->global_external_max_capcity < length)
+            if(gt->global_external_max_capcity < tier)
             {
-                gt->resize_collision_hash_size((size_t)((long long)length * 13 / 10));
-                gt->global_external_max_capcity = (int)((long long)length * 13 / 10);
+                gt->resize_collision_hash_size((size_t)tier);
+                gt->global_external_max_capcity = tier;
             }
         }
     }
+    const int length = gipc_global_triplet->global_triplet_offset;
+    const int tier   = assembly_capacity_tier(length);
     m_converter.convert(*gipc_global_triplet,
                         0,
-                        gipc_global_triplet->global_triplet_offset,
-                        gipc_global_triplet->global_triplet_offset);
+                        length,
+                        tier,
+                        tier);
 //#ifndef SymGH
 //    m_converter.ge2sym(*gipc_global_triplet);
 //#endif
