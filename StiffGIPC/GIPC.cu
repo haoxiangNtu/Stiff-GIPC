@@ -16387,6 +16387,15 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     updateVelocities(TetMesh);
 
     computeXTilta(TetMesh, 1);
+    // [frame-fsm P1 wiring] device-loop PCG solves return 0 from solve() (zero
+    // D2H on the hot path); their iteration counts accumulate in device
+    // counters. Fold the pending delta into total_Cg_count here — the frame
+    // boundary is the one place we synchronize anyway, so this read is free.
+    if(m_global_linear_system)
+    {
+        auto st = m_global_linear_system->collect_solver_stats(true);
+        total_Cg_count += (int)st.pending_iterations;
+    }
     if(frame_timing)
     {
         cudaEventRecord(end0);
