@@ -44,3 +44,9 @@ Assets/sorted_mesh/*.idx
 # Demo media — too large for git
 *.mp4
 dist_*/
+
+# URDF primitive proxy cache (auto-generated at load, B1)
+.stiffgipc_prim_cache/
+Assets/sorted_mesh/*.16.obj
+Assets/sorted_mesh/*.16.part
+Assets/sorted_mesh/*.16.msh

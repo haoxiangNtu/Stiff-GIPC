@@ -2,6 +2,7 @@
 #include <gipc/utils/simple_scene_importer.h>
 #include <urdf_parser/urdf_parser.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -875,7 +876,21 @@ bool UrdfSceneImporter::parse_urdf()
                     prim_count++;
             }
 
-            if(!mesh_coll && prim_count > 0)
+            const char* prim_env = std::getenv("STIFF_URDF_PRIM_PROXY");
+            const bool  prim_proxy_enabled = !(prim_env && std::atoi(prim_env) == 0);
+            if(!mesh_coll && prim_count > 0 && !prim_proxy_enabled)
+            {
+                // Escape hatch for scenes that relied on the pre-0.8.5
+                // behavior (primitive collision silently skipped): a link
+                // whose wheels/box now gain a proxy could start intersecting
+                // the ground at finalize(). STIFF_URDF_PRIM_PROXY=0 restores
+                // the old skip (with the old loud warning).
+                std::cerr << "[UrdfSceneImporter] WARNING: link '" << name
+                          << "' has primitive collision but proxy generation is "
+                          << "DISABLED (STIFF_URDF_PRIM_PROXY=0); collision "
+                          << "SKIPPED as in <=0.8.4." << std::endl;
+            }
+            else if(!mesh_coll && prim_count > 0)
             {
                 // [B1] Primitive-only collision: merge every element into one
                 // conservative proxy mesh, each element's origin baked into
