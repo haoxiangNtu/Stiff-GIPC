@@ -13,15 +13,18 @@ and the per-level chain on every goingNext transition.
 Scope note: the oracle re-derives the INTRA-bank aggregation (kernel-2 path),
 so scenes are built from mutually disconnected single-bank bodies — no
 cross-bank triplets (kernel-1 path) exist to contaminate the coarse blocks.
-The kernel-1 (cross-bank triplet) path is NOT independently covered here:
-strict and non-strict share its goingNext / same-bank / transpose structure,
-so their mutual agreement cannot rule out a common indexing error. A
-dedicated two-bank cross-Hessian CPU fixture is future work.
+The kernel-1 (cross-bank triplet) path IS covered by the full-rebuild
+scene below: the raw bcoo triplets are dumped and the CPU independently
+replays fine writes, the kernel-1 cross-bank ladder AND kernel-2, comparing
+every packed block of every level. Catastrophic-cancellation entries (the
+top-level root block sums ~4e5 terms of mass ~1e7 down to ~1e-11) are
+adjudicated with math.fsum against the GPU's exact binned sums.
 
 Scenes (all preconditioner_type=1):
   cube k=8   partial bank, 2 levels      - strict
   k7   k=7   non-power-of-two partial    - strict   [generated .msh]
   20x cube   disconnected, 4 levels      - strict (exact) + merged (tree)
+  bunny 19k  FULL rebuild incl. kernel-1 - strict (52k cross-bank triplets)
 
 Run:  python3 examples/test_mas_oracle.py
 """
@@ -164,6 +167,178 @@ def oracle(dumpdir, tag, tol, expect_levels=None, expect_blocks=None):
     return ok
 
 
+def full_rebuild_oracle(dumpdir, tag):
+    """Rebuild fine + kernel-1 ladder + kernel-2 from raw triplets; compare all
+    banks all levels; fsum-adjudicate any vectorized-rounding mismatches."""
+    imat = np.fromfile(f"{dumpdir}/mas_imat.bin", dtype=np.float64).reshape(-1, NB, 3, 3).transpose(0, 1, 3, 2)
+    gnext = np.fromfile(f"{dumpdir}/mas_goingNext.bin", dtype=np.uint32).astype(np.int64)
+    pmap = np.fromfile(f"{dumpdir}/mas_map.bin", dtype=np.int32).astype(np.int64)
+    lsz = np.fromfile(f"{dumpdir}/mas_levelSize.bin", dtype=np.int32).reshape(-1, 2)
+    pre0 = np.fromfile(f"{dumpdir}/mas_prefix0.bin", dtype=np.int32)
+    rows = np.fromfile(f"{dumpdir}/mas_trip_rows.bin", dtype=np.int32).astype(np.int64)
+    cols = np.fromfile(f"{dumpdir}/mas_trip_cols.bin", dtype=np.int32).astype(np.int64)
+    vals = np.fromfile(f"{dumpdir}/mas_trip_vals.bin", dtype=np.float64).reshape(-1, 3, 3).transpose(0, 2, 1)
+    tidx = np.fromfile(f"{dumpdir}/mas_trip_idx.bin", dtype=np.uint32).astype(np.int64)
+
+    map_nodes = pmap.shape[0]
+    n_fine = map_nodes // BANK
+    levels = lsz.shape[0] - 1
+    total_banks = imat.shape[0]
+    n_real = int(pmap.max()) + 1
+    r2s = np.full(n_real, -1, dtype=np.int64)
+    vsl = np.where(pmap >= 0)[0]
+    r2s[pmap[vsl]] = vsl
+
+    T_r, T_c, T_H = rows[tidx], cols[tidx], vals[tidx]
+    sr, sc = r2s[T_r], r2s[T_c]
+    same = (sr // BANK) == (sc // BANK)
+    cpu = np.zeros((total_banks, NB, 3, 3))
+    contrib = {}   # (bank,pk,i,j) -> list for fsum adjudication
+
+    def dep(bank, pk, blocks, record=False):
+        np.add.at(cpu.reshape(-1, 3, 3), bank * NB + pk, blocks)
+        if record:
+            for b_, p_, B_ in zip(bank, pk, blocks):
+                for i in range(3):
+                    for j in range(3):
+                        contrib.setdefault((int(b_), int(p_), i, j), []).append(float(B_[i, j]))
+
+    m = same & (sc >= sr)
+    r0, c0 = sr[m] % BANK, sc[m] % BANK
+    cpu[sr[m] // BANK, BANK * r0 - r0 * (r0 + 1) // 2 + c0] = T_H[m]
+
+    def ladder_two(cr, cc, H):
+        for lv in range(1, levels):
+            if lv > 1:
+                cr, cc = gnext[cr], gnext[cc]
+            sb = (cr // BANK) == (cc // BANK)
+            up = sb & (cc >= cr)
+            if up.any():
+                r_, c_ = cr[up] % BANK, cc[up] % BANK
+                dep(cc[up] // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + c_, H[up])
+                dg = up & (cc == cr)
+                if dg.any():
+                    r_ = cr[dg] % BANK
+                    dep(cc[dg] // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + r_,
+                        H[dg].transpose(0, 2, 1))
+            dn = sb & (cc < cr)
+            if dn.any():
+                r_, c_ = cr[dn] % BANK, cc[dn] % BANK
+                dep(cc[dn] // BANK, BANK * c_ - c_ * (c_ + 1) // 2 + r_,
+                    H[dn].transpose(0, 2, 1))
+
+    xm = ~same
+    ladder_two(gnext[T_r[xm]], gnext[T_c[xm]], T_H[xm])
+
+    Hid = np.repeat(np.arange(n_fine), BANK * BANK)
+    LMR = np.tile(np.repeat(np.arange(BANK), BANK), n_fine)
+    LMC = np.tile(np.tile(np.arange(BANK), BANK), n_fine)
+    rdx, cdx = pmap[Hid * BANK + LMR], pmap[Hid * BANK + LMC]
+    vp = (rdx >= 0) & (cdx >= 0)
+    upper = LMC >= LMR
+    pkd = np.where(upper, BANK * LMR - LMR * (LMR + 1) // 2 + LMC,
+                   BANK * LMC - LMC * (LMC + 1) // 2 + LMR)
+    blocks = cpu[Hid, pkd].copy()
+    blocks[~upper] = blocks[~upper].transpose(0, 2, 1)
+    pfx = pre0[Hid]
+
+    m1 = vp & (pfx == 1)
+    cur = gnext[rdx[m1]]
+    B1 = blocks[m1]
+    for lv in range(1, levels):
+        if lv > 1:
+            cur = gnext[cur]
+        r_ = cur % BANK
+        dep(cur // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + r_, B1)
+    m2 = vp & (pfx != 1)
+    if m2.any():
+        cr, cc = gnext[rdx[m2]], gnext[cdx[m2]]
+        B2 = blocks[m2]
+        for lv in range(1, levels):
+            if lv > 1:
+                cr, cc = gnext[cr], gnext[cc]
+            sb = (cr // BANK) == (cc // BANK)
+            up = sb & (cc >= cr)
+            if up.any():
+                r_, c_ = cr[up] % BANK, cc[up] % BANK
+                dep(cc[up] // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + c_, B2[up])
+
+    fine_ok = bool(np.array_equal(cpu[:n_fine], imat[:n_fine]))
+    d = np.abs(cpu[n_fine:] - imat[n_fine:])
+    s_ = np.maximum(np.maximum(np.abs(cpu[n_fine:]), np.abs(imat[n_fine:])), 1e-12)
+    rel = d / s_
+    bad = np.argwhere(rel > 1e-9)
+    # fsum-adjudicate residual mismatches (vectorized-sum rounding on
+    # catastrophic cancellation): replay contributions for those slots only
+    adjudicated = 0
+    if len(bad):
+        want = {(int(n_fine + b), int(p)) for b, p, _, _ in bad}
+        cpu2 = np.zeros_like(cpu)  # noqa: F841 (re-run with recording)
+        contrib.clear()
+
+        def dep_rec(bank, pk, blocks):
+            sel = np.array([(int(b_), int(p_)) in want for b_, p_ in zip(bank, pk)])
+            if sel.any():
+                for b_, p_, B_ in zip(bank[sel], pk[sel], blocks[sel]):
+                    for i in range(3):
+                        for j in range(3):
+                            contrib.setdefault((int(b_), int(p_), i, j), []).append(float(B_[i, j]))
+
+        globals()['_dep_backup'] = None
+        # replay all three deposit passes with recording
+        xr2, xc2 = gnext[T_r[xm]], gnext[T_c[xm]]
+        H2 = T_H[xm]
+        cr, cc = xr2, xc2
+        for lv in range(1, levels):
+            if lv > 1:
+                cr, cc = gnext[cr], gnext[cc]
+            sb = (cr // BANK) == (cc // BANK)
+            up = sb & (cc >= cr)
+            if up.any():
+                r_, c_ = cr[up] % BANK, cc[up] % BANK
+                dep_rec(cc[up] // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + c_, H2[up])
+                dg = up & (cc == cr)
+                if dg.any():
+                    r_ = cr[dg] % BANK
+                    dep_rec(cc[dg] // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + r_,
+                            H2[dg].transpose(0, 2, 1))
+            dn = sb & (cc < cr)
+            if dn.any():
+                r_, c_ = cr[dn] % BANK, cc[dn] % BANK
+                dep_rec(cc[dn] // BANK, BANK * c_ - c_ * (c_ + 1) // 2 + r_,
+                        H2[dn].transpose(0, 2, 1))
+        cur = gnext[rdx[m1]]
+        for lv in range(1, levels):
+            if lv > 1:
+                cur = gnext[cur]
+            r_ = cur % BANK
+            dep_rec(cur // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + r_, B1)
+        if m2.any():
+            cr, cc = gnext[rdx[m2]], gnext[cdx[m2]]
+            for lv in range(1, levels):
+                if lv > 1:
+                    cr, cc = gnext[cr], gnext[cc]
+                sb = (cr // BANK) == (cc // BANK)
+                up = sb & (cc >= cr)
+                if up.any():
+                    r_, c_ = cr[up] % BANK, cc[up] % BANK
+                    dep_rec(cc[up] // BANK, BANK * r_ - r_ * (r_ + 1) // 2 + c_, B2[up])
+        for (b, p, i, j) in [(int(n_fine + b), int(p), int(i), int(j)) for b, p, i, j in bad]:
+            terms = contrib.get((b, p, i, j), [])
+            f = math.fsum(terms)
+            g = imat[b, p, i, j]
+            mass = math.fsum(abs(x) for x in terms)
+            if abs(f - g) <= max(1e-9, mass * 1e-15):
+                adjudicated += 1
+            else:
+                print(f"[{tag}] FSUM FAIL bank={b} pk={p} ({i},{j}) fsum={f:.6e} gpu={g:.6e}")
+    ok = fine_ok and adjudicated == len(bad)
+    print(f"[{tag}] triplets={len(tidx)} cross-bank={int((~same).sum())} "
+          f"fine bit-equal={fine_ok} coarse_mismatch={len(bad)} fsum-adjudicated={adjudicated} "
+          f"{'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     ok = True
     k7dir = tempfile.mkdtemp(prefix="mas_k7_")
@@ -177,6 +352,8 @@ def main():
                  "20x cube 4-level strict", 1e-11, expect_levels=4, expect_blocks=60)
     ok &= oracle(dump_scene("tetMesh/cube.msh", "merged", nbodies=20),
                  "20x cube 4-level tree", 1e-8, expect_levels=4, expect_blocks=60)
+    ok &= full_rebuild_oracle(dump_scene("tetMesh/bunny2.msh", "strict"),
+                              "bunny FULL rebuild (kernel-1+2)")
     print("MAS ORACLE:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
