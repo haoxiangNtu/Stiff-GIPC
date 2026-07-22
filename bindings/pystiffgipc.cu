@@ -59,7 +59,10 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readonly("cfl_alpha", &frame_fsm::FrameStatus::cfl_alpha)
         .def_readonly("kappa", &frame_fsm::FrameStatus::kappa)
         .def_readonly("frame_id", &frame_fsm::FrameStatus::frame_id)
-        .def_readonly("attempt", &frame_fsm::FrameStatus::attempt);
+        .def_readonly("attempt", &frame_fsm::FrameStatus::attempt)
+        .def_readonly("retry_count", &frame_fsm::FrameStatus::retry_count)
+        .def_readonly("retry_invalid_bits",
+                      &frame_fsm::FrameStatus::retry_invalid_bits);
 
     // ---- SimEngineConfig ----
     py::class_<SimEngineConfig>(m, "Config")

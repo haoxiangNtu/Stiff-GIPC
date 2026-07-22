@@ -281,6 +281,13 @@ class GIPC
     bool                     m_frame_graph_active  = false;
     bool                     m_frame_terminal_emitted = false;
     frame_fsm::FrameStatus   m_last_frame_status{};
+    uint32_t                 m_frame_retry_bits = 0;
+    int                      m_frame_retry_count = 0;
+    int                      m_frame_retry_required_dcd = 0;
+    int                      m_frame_retry_required_ccd = 0;
+    int                      m_frame_retry_required_triplets = 0;
+    int                      m_frame_retry_required_unique = 0;
+    int                      m_frame_retry_required_mas = 0;
 
     // [0be8da3-port, grow-only] element capacities of the persistent friction /
     // close-constraint buffers. cudaMalloc/cudaFree device-sync, so the per-step

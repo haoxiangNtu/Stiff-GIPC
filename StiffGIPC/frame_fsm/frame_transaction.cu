@@ -60,6 +60,9 @@ struct alignas(16) FrameTerminalInput
     int32_t  root_d2h_nodes = 0;
     int32_t  terminal_graph_nodes = 0;
     int32_t  terminal_d2h_nodes = 0;
+    int32_t  retry_count = 0;
+    uint32_t retry_invalid_bits = 0;
+    int32_t  inject_nan_vertex = -1;
     uint32_t path_flags_or = 0;
     int32_t  _pad_path = 0;
     double   final_alpha   = 1.0;
@@ -340,6 +343,17 @@ __global__ void frame_validate_finite(frame_fsm::FrameDeviceState* state,
     state->phase = frame_fsm::PHASE_ROLLBACK;
 }
 
+__global__ void frame_inject_nonfinite_for_test(double3* positions,
+                                                int count,
+                                                const FrameTerminalInput* input)
+{
+    if(blockIdx.x || threadIdx.x) return;
+    const int vertex = input->inject_nan_vertex;
+    if(vertex >= 0 && vertex < count)
+        positions[vertex].x = __longlong_as_double(
+            static_cast<long long>(0x7ff8000000000000ULL));
+}
+
 __global__ void frame_restore_fem(frame_fsm::FrameDeviceState* state,
                                   double3* positions,
                                   double3* old_positions,
@@ -452,6 +466,8 @@ __global__ void frame_serialize_status(const frame_fsm::FrameDeviceState* state,
     out.kappa          = state->kappa;
     out.frame_id       = state->frame_id;
     out.attempt        = state->attempt;
+    out.retry_count    = input->retry_count;
+    out.retry_invalid_bits = input->retry_invalid_bits;
     *status = out;
 }
 
@@ -566,6 +582,10 @@ void capture_terminal_graph(GIPC& ipc,
     if(ctx.vertex_count)
     {
         const int blocks = static_cast<int>((ctx.vertex_count + 255) / 256);
+        frame_inject_nonfinite_for_test<<<1, 1, 0, cudaStreamPerThread>>>(
+            mesh.vertexes,
+            static_cast<int>(ctx.vertex_count),
+            ctx.d_terminal);
         frame_validate_finite<<<blocks, 256, 0, cudaStreamPerThread>>>(
             ctx.d_state,
             mesh.vertexes,
@@ -920,6 +940,16 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     FrameGraphContext& ctx = context(*this);
     snapshot_host_attempt(*this, ctx);
     ctx.attempt = attempt;
+    if(attempt == 0)
+    {
+        m_frame_retry_bits = 0;
+        m_frame_retry_count = 0;
+        m_frame_retry_required_dcd = 0;
+        m_frame_retry_required_ccd = 0;
+        m_frame_retry_required_triplets = 0;
+        m_frame_retry_required_unique = 0;
+        m_frame_retry_required_mas = 0;
+    }
     ctx.pending_result = frame_fsm::FRAME_OK;
     ctx.pending_error = frame_fsm::ERR_NONE;
     ctx.pending_bits = 0;
@@ -941,6 +971,7 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     ctx.h_begin->path_flags = frame_fsm::PATH_GRAPH_REQUESTED
                             | frame_fsm::PATH_GRAPH_ACTIVE
                             | frame_fsm::PATH_P3B1_HOST_NEWTON;
+    if(attempt > 0) ctx.h_begin->path_flags |= frame_fsm::PATH_RETRIED;
     ctx.h_begin->kappa = Kappa;
     ctx.h_begin->animation_full_rate = animation_fullRate;
 
@@ -1111,16 +1142,31 @@ void GIPC::frame_graph_enqueue_terminal(device_TetraData& /*mesh*/,
     in.hw_triplets = ctx.hw_triplets;
     in.hw_unique_blocks = ctx.hw_unique;
     in.hw_mas_clusters = ctx.hw_mas;
-    in.required_dcd_pairs = ctx.required_dcd;
-    in.required_ccd_pairs = ctx.required_ccd;
-    in.required_triplets = ctx.required_triplets;
-    in.required_unique_blocks = ctx.required_unique;
-    in.required_mas_clusters = ctx.required_mas;
+    in.required_dcd_pairs = std::max(ctx.required_dcd,
+                                     m_frame_retry_required_dcd);
+    in.required_ccd_pairs = std::max(ctx.required_ccd,
+                                     m_frame_retry_required_ccd);
+    in.required_triplets = std::max(ctx.required_triplets,
+                                    m_frame_retry_required_triplets);
+    in.required_unique_blocks = std::max(ctx.required_unique,
+                                         m_frame_retry_required_unique);
+    in.required_mas_clusters = std::max(ctx.required_mas,
+                                        m_frame_retry_required_mas);
+    in.retry_count = m_frame_retry_count;
+    in.retry_invalid_bits = m_frame_retry_bits;
     in.final_alpha = ctx.alpha;
     in.final_energy = ctx.energy;
     in.max_movement = ctx.max_movement;
     in.cfl_alpha = ctx.cfl_alpha;
     in.kappa = Kappa;
+    if(result == frame_fsm::FRAME_OK && ctx.attempt == 0)
+    {
+        if(const char* value = std::getenv("STIFF_FRAME_TEST_NAN_VERTEX"))
+        {
+            in.inject_nan_vertex = std::atoi(value);
+            in.path_flags_or |= frame_fsm::PATH_TEST_INJECTION;
+        }
+    }
     in.root_graph_nodes = ctx.root_nodes;
     in.root_d2h_nodes = ctx.root_d2h;
     in.terminal_graph_nodes = ctx.terminal_nodes;
@@ -1153,7 +1199,29 @@ int GIPC::frame_graph_finish_terminal()
     if(m_last_frame_status.result == frame_fsm::FRAME_OK)
         total_Cg_count += m_last_frame_status.pcg_iters;
     else
+    {
         restore_host_attempt(*this, ctx);
+        if(m_last_frame_status.result == frame_fsm::FRAME_RETRY_REQUIRED)
+        {
+            ++m_frame_retry_count;
+            m_frame_retry_bits |= m_last_frame_status.invalid_bits;
+            m_frame_retry_required_dcd = std::max(
+                m_frame_retry_required_dcd,
+                m_last_frame_status.required_dcd_pairs);
+            m_frame_retry_required_ccd = std::max(
+                m_frame_retry_required_ccd,
+                m_last_frame_status.required_ccd_pairs);
+            m_frame_retry_required_triplets = std::max(
+                m_frame_retry_required_triplets,
+                m_last_frame_status.required_triplets);
+            m_frame_retry_required_unique = std::max(
+                m_frame_retry_required_unique,
+                m_last_frame_status.required_unique_blocks);
+            m_frame_retry_required_mas = std::max(
+                m_frame_retry_required_mas,
+                m_last_frame_status.required_mas_clusters);
+        }
+    }
     m_frame_graph_active = false;
     return m_last_frame_status.result;
 }

@@ -77,6 +77,7 @@ enum FramePathFlags : uint32_t
     PATH_P3B2_FULL_TAIL        = 1u << 4,
     PATH_TERMINAL_ROLLBACK     = 1u << 5,
     PATH_TEST_INJECTION        = 1u << 6,
+    PATH_RETRIED               = 1u << 7,
 };
 
 enum FrameErrorCode : int32_t
@@ -87,6 +88,7 @@ enum FrameErrorCode : int32_t
     ERR_SOLVER_EXCEPTION  = 3,
     ERR_RETRY_EXHAUSTED   = 4,
     ERR_GRAPH_LAUNCH      = 5,
+    ERR_CCD_INVALID       = 6,
 };
 
 // ---- per-frame status block (device writes, host reads once per frame) -----
@@ -145,6 +147,8 @@ struct alignas(16) FrameStatus
     // frame identity (host writes before launch, device echoes back)
     int64_t  frame_id;
     int32_t  attempt;         // 0 = first attempt, >0 = retry count
+    int32_t  retry_count;     // completed rollback attempts before this result
+    uint32_t retry_invalid_bits; // overflow origins accumulated across retries
     int32_t  _pad0;
 };
 static_assert(sizeof(FrameStatus) <= 256, "FrameStatus must stay one D2H packet");

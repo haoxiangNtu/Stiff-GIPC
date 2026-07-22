@@ -15103,7 +15103,7 @@ __device__ __forceinline__ bool _ls_tail_launch(unsigned long long handle,
         control->launch_status = static_cast<int>(cudaErrorInvalidResourceHandle);
         control->frame.result  = frame_fsm::FRAME_RUNTIME_ERROR;
         frame_fsm::fsm_record_error(&control->frame,
-                                    frame_fsm::FRAME_RUNTIME_ERROR,
+                                    frame_fsm::ERR_GRAPH_LAUNCH,
                                     0,
                                     -1,
                                     -1);
@@ -15116,7 +15116,7 @@ __device__ __forceinline__ bool _ls_tail_launch(unsigned long long handle,
     control->launch_status = static_cast<int>(status);
     control->frame.result  = frame_fsm::FRAME_RUNTIME_ERROR;
     frame_fsm::fsm_record_error(&control->frame,
-                                frame_fsm::FRAME_RUNTIME_ERROR,
+                                frame_fsm::ERR_GRAPH_LAUNCH,
                                 0,
                                 -1,
                                 -1);
@@ -15158,7 +15158,7 @@ __global__ void _ls_trial_dispatch(LsDeviceControl* control,
         control->frame.result = frame_fsm::FRAME_FATAL;
         control->frame.phase  = frame_fsm::PHASE_POST_LS;
         frame_fsm::fsm_record_error(&control->frame,
-                                    frame_fsm::FRAME_FATAL,
+                                    frame_fsm::ERR_CCD_INVALID,
                                     frame_fsm::INV_CCD_GROUND,
                                     -1,
                                     primitive);
@@ -15172,7 +15172,7 @@ __global__ void _ls_trial_dispatch(LsDeviceControl* control,
         control->frame.result = frame_fsm::FRAME_FATAL;
         control->frame.phase  = frame_fsm::PHASE_POST_LS;
         frame_fsm::fsm_record_error(&control->frame,
-                                    frame_fsm::FRAME_FATAL,
+                                    frame_fsm::ERR_CCD_INVALID,
                                     frame_fsm::INV_CCD_GROUND,
                                     -1,
                                     primitive);
@@ -15186,7 +15186,7 @@ __global__ void _ls_trial_dispatch(LsDeviceControl* control,
         control->frame.result = frame_fsm::FRAME_RETRY_REQUIRED;
         control->frame.phase  = frame_fsm::PHASE_POST_LS;
         frame_fsm::fsm_record_error(&control->frame,
-                                    frame_fsm::FRAME_RETRY_REQUIRED,
+                                    frame_fsm::ERR_CAPACITY,
                                     frame_fsm::OVF_DCD_PAIRS,
                                     -1,
                                     -1);
@@ -15221,7 +15221,7 @@ __global__ void _ls_energy_decide_and_continue(LsDeviceControl* control,
         control->frame.result = frame_fsm::FRAME_FATAL;
         control->frame.phase  = frame_fsm::PHASE_POST_LS;
         frame_fsm::fsm_record_error(&control->frame,
-                                    frame_fsm::FRAME_FATAL,
+                                    frame_fsm::ERR_NONFINITE_STATE,
                                     frame_fsm::INV_NAN_STATE,
                                     -1,
                                     -1);
@@ -15691,7 +15691,7 @@ __global__ void _ccd_tier_dispatch(CcdTierControl* control,
                 static_cast<long long>(0x7ff8000000000000ULL));
         control->frame.result = frame_fsm::FRAME_RETRY_REQUIRED;
         frame_fsm::fsm_record_error(&control->frame,
-                                    frame_fsm::FRAME_RETRY_REQUIRED,
+                                    frame_fsm::ERR_CAPACITY,
                                     frame_fsm::OVF_CCD_PAIRS,
                                     -1,
                                     -1);
@@ -15717,7 +15717,7 @@ __global__ void _ccd_tier_dispatch(CcdTierControl* control,
             *out_slot = __longlong_as_double(
                 static_cast<long long>(0x7ff8000000000000ULL));
         frame_fsm::fsm_record_error(&control->frame,
-                                    frame_fsm::FRAME_RUNTIME_ERROR,
+                                    frame_fsm::ERR_GRAPH_LAUNCH,
                                     0,
                                     -1,
                                     -1);
