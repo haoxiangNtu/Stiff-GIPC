@@ -6,7 +6,8 @@ pairs).  That did not exercise an independently growing friction last-H buffer
 after the LS graph family had already been cached.  This worker drives the
 single-env finray jaw long enough to cross both boundaries:
 
-* at least two CCD grow-redo passes with a required count above three million;
+* at least two CCD capacity growths with a required count above three million
+  (legacy grow-redo or frame-FSM tier-family rebuild);
 * a second friction-buffer growth, followed by an LS graph-family rebuild;
 * a finite accepted state after the old stale-address failure point.
 
@@ -91,10 +92,36 @@ def _parent() -> None:
         r"\[CCD-grow\] h_ccd_cpNum=(\d+) > cap=(\d+) -> grow to (\d+)",
         output,
     )
-    if len(ccd_grows) < 2:
-        raise AssertionError(f"expected repeated CCD grow-redo, saw {ccd_grows}")
-    if max(int(required) for required, _, _ in ccd_grows) < 3_000_000:
-        raise AssertionError(f"growth stayed in synthetic-small range: {ccd_grows}")
+    ccd_tier_caps = [
+        int(cap) for cap in re.findall(r"\[ccd-tier-cache\] ready cap=(\d+)", output)
+    ]
+    ccd_tier_counts = [
+        int(count) for count in re.findall(r"\[ccd-tier-audit\] count=(\d+)", output)
+    ]
+    distinct_tier_caps = []
+    for cap in ccd_tier_caps:
+        if not distinct_tier_caps or cap != distinct_tier_caps[-1]:
+            distinct_tier_caps.append(cap)
+
+    if ccd_grows:
+        if len(ccd_grows) < 2:
+            raise AssertionError(f"expected repeated CCD grow-redo, saw {ccd_grows}")
+        if max(int(required) for required, _, _ in ccd_grows) < 3_000_000:
+            raise AssertionError(f"growth stayed in synthetic-small range: {ccd_grows}")
+    else:
+        # The frame transaction catches overflow at its boundary and rebuilds
+        # the persistent CCD tier family.  The initial family plus two larger
+        # distinct caps is the same coverage as two legacy grow-redo passes.
+        if len(distinct_tier_caps) < 3:
+            raise AssertionError(
+                "expected repeated CCD tier-family growth, saw caps "
+                f"{distinct_tier_caps}"
+            )
+        if not ccd_tier_counts or max(ccd_tier_counts) < 3_000_000:
+            raise AssertionError(
+                "tier-family growth stayed in synthetic-small range: "
+                f"counts={ccd_tier_counts}"
+            )
 
     friction_grows = [
         match.start() for match in re.finditer(r"\[friction-grow\]", output)
@@ -111,6 +138,9 @@ def _parent() -> None:
 
     for required, old_cap, new_cap in ccd_grows:
         print(f"CCD grow {required} > {old_cap} -> {new_cap}")
+    if not ccd_grows:
+        print(f"CCD tier caps {' -> '.join(map(str, distinct_tier_caps))}; "
+              f"max count={max(ccd_tier_counts)}")
     print(f"friction grows={len(friction_grows)}, post-grow LS rebind=yes")
     print("LS LARGE-GROW: PASS")
 
