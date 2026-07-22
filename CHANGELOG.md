@@ -82,6 +82,22 @@ Stability, contact-solver consistency, and public API hardening release.
   of silently skipping it.
 
 ### Fixed (post-candidate, final release)
+- **strict cross-env bit-identity restored: DCD-time CCD snapshot.**
+  `_ccd_collisonPairs` has two producers — the DCD detect kernels write a
+  mirror copy of every DCD pair at the same atomic slot, and the swept-CCD
+  build overwrites the whole buffer every Newton iteration. The S1 narrow-self
+  feasibility sweep was designed to read "the first h_cpNum[0] entries = the
+  DCD mirror" but actually swept a race-ordered, env-unbalanced prefix of the
+  PREVIOUS swept emission. Measured consequences: strict cross-env broken
+  (two bit-identical envs forked ~1e-2 by frame 200 via an asymmetric
+  narrow-self alpha), strict N=8 run-to-run unstable (concurrent-emission
+  race), and a self-sustaining hs -> ta_e feedback loop. The latent defect
+  predates v0.8.3, which passed its gates on emission-timing luck. buildCP now
+  snapshots the mirror into a dedicated immutable buffer consumed in full by
+  both narrow-self paths. Release gates after the fix: run-to-run N=2 and N=8,
+  cross-env, and batch-invariance ALL BIT-IDENTICAL (N=8 run-to-run stable for
+  the first time). Per-env direct-alpha scratch is also neutrally initialized
+  (independent defect: the first swept build read cudaMalloc garbage).
 - **One-sided revolute limits: lagged active-set.** The limit term re-tested
   theta every Newton iteration, so at an active bound the active set CHATTERED
   (inactive-side Hessian has no limit curvature -> huge free-fall direction ->
