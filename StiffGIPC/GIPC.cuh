@@ -241,13 +241,17 @@ class GIPC
     uint32_t* _collisonPairs_lastH_gd = nullptr;
     uint32_t  h_gpNum_last;
 
-    // ②-D2H: persistent 9-slot device buffer for batched energy reductions.
-    // computeEnergy() previously did 9 blocking cudaMemcpy(D2H) — one per
-    // Energy_Add_Reduction_Algorithm call. Now each reduction writes its
-    // final scalar into m_energy_slots[i] via D2D (queued, async), then
-    // ONE blocking D2H grabs all 9 doubles at the end.
-    static constexpr int kEnergySlotCount = 9;
+    // Persistent device slots for 9 FEM/contact terms plus 6 ABD terms. The
+    // line-search path combines these on device; diagnostic computeEnergy()
+    // performs one batched D2H instead of one transfer per term.
+    static constexpr int kEnergySlotCount = 15;
     double* m_energy_slots = nullptr;
+    // E0/Etrial belong exclusively to line search. Compatibility callers use a
+    // separate scalar so diagnostics cannot overwrite an in-flight E0.
+    double* m_line_search_energy      = nullptr;
+    double* m_compatibility_energy    = nullptr;
+    // Line-search decision only: 0=descent, 1=retry, 2=tolerance acceptance.
+    int*    m_line_search_decision    = nullptr;
     // ②-D2H: direct ground/self feasible-alpha results. Both first-stage and
     // final reductions use MIN, so callers consume these values without inversion.
     double* m_ccd_alpha_slots = nullptr;
@@ -457,6 +461,9 @@ class GIPC
 
     void   computeSoftConstraintGradient(double3* _gradient);
     double computeEnergy(device_TetraData& TetMesh);
+    // Queue all FEM/contact/ABD reductions and the exact-order device combine
+    // into out_scalar. No D2H or host synchronization.
+    void computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
     // [backport] standalone per-env energy dispatcher: writes the reduced global

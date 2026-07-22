@@ -21,6 +21,7 @@
 #include <thrust/device_ptr.h>
 #include "FrictionUtils.cuh"
 #include <cfloat>
+#include <cstring>
 #include <fstream>
 #include <cstdlib>   // std::getenv for STIFF_SKIP_CCD_SANITY
 #include "Eigen/Eigen"
@@ -9103,8 +9104,23 @@ void GIPC::FREE_DEVICE_MEM()
     }
     m_fric_cp_cap = 0; m_fric_gd_cap = 0; m_close_gp_cap = 0; m_close_cp_cap = 0;
 
-    // ②-D2H: free energy slots
+    // Device-resident energy/control scalars.
     if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
+    if(m_line_search_energy)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_line_search_energy));
+        m_line_search_energy = nullptr;
+    }
+    if(m_compatibility_energy)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_compatibility_energy));
+        m_compatibility_energy = nullptr;
+    }
+    if(m_line_search_decision)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_line_search_decision));
+        m_line_search_decision = nullptr;
+    }
     if(m_ccd_alpha_slots) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_slots)); m_ccd_alpha_slots = nullptr; }
     if(m_ccd_alpha_invalid) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_invalid)); m_ccd_alpha_invalid = nullptr; }
     if(_dcd_ccd_snapshot) { CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot)); _dcd_ccd_snapshot = nullptr; }
@@ -9200,8 +9216,11 @@ void GIPC::MALLOC_DEVICE_MEM()
     { std::vector<int> ones(kEnvAlphaSlots, 1);
       CUDA_SAFE_CALL(cudaMemcpy(m_env_active, ones.data(), kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice)); }
 
-    // ②-D2H: 9-slot device buffer for batched energy reductions in computeEnergy.
+    // Device energy terms and line-search control state.
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_energy, 2 * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_compatibility_energy, sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, sizeof(int)));
     // ②-D2H: direct ground+self feasible-alpha slots.
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 2 * sizeof(double)));
 
@@ -13623,22 +13642,43 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
 }
 
 
-double GIPC::computeEnergy(device_TetraData& TetMesh)
+// Preserve the original host expression's operation order explicitly.  The
+// project is compiled with --use_fast_math, so round-mode intrinsics also keep
+// the compiler from reassociating a near-boundary line-search comparison.
+__global__ void _global_energy_combine(const double* slots,
+                                       double        dt2,
+                                       double        Kappa,
+                                       double        friction_rate,
+                                       double        ground_friction_rate,
+                                       double*       out)
 {
-    // ②-D2H: batch the 9 Energy_Add_Reduction_Algorithm calls (types
-    // 0,1,2,4,5,6,8,9,10) into a single D2H. Each reduction writes its scalar
-    // to a device slot via D2D (queued, async); ONE blocking D2H grabs all 9
-    // at the end. Saves 8 blocking syncs per energy evaluation (called every
-    // line-search trial).
-    //
-    // ABD energies (m_abd_system->cal_abd_*) are NOT batched here — they have
-    // their own internal scratch + D2H. Future refactor target. We KEEP the
-    // ORIGINAL host-side summation ORDER below so vertex checksum stays
-    // bit-identical (FP add is non-associative).
-    //
-    // slot indices: 0=fem_kinetic 1=fem 2=tri_fem 3=bend 4=constraint
-    //               5=barrier   6=ground 7=fric  8=fric_ground
+    double e = 0.0;
+    e = __dadd_rn(e, slots[0]);   // FEM kinetic
+    e = __dadd_rn(e, slots[9]);   // ABD kinetic
+    e = __dadd_rn(e, slots[10]);  // ABD shape
+    e = __dadd_rn(e, slots[11]);  // ABD joint
+    e = __dadd_rn(e, slots[12]);  // ABD revolute driving
+    e = __dadd_rn(e, slots[13]);  // ABD prismatic
+    e = __dadd_rn(e, slots[14]);  // ABD prismatic driving
+    e = __dadd_rn(e, __dmul_rn(dt2, slots[1]));
+    e = __dadd_rn(e, __dmul_rn(dt2, slots[2]));
+    e = __dadd_rn(e, __dmul_rn(dt2, slots[3]));
+    e = __dadd_rn(e, slots[4]);
+    e = __dadd_rn(e, slots[5]);
+    e = __dadd_rn(e, __dmul_rn(Kappa, slots[6]));
+#ifdef USE_FRICTION
+    e = __dadd_rn(e, __dmul_rn(friction_rate, slots[7]));
+    e = __dadd_rn(e, __dmul_rn(ground_friction_rate, slots[8]));
+#else
+    (void)friction_rate;
+    (void)ground_friction_rate;
+#endif
+    *out = e;
+}
 
+void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar)
+{
+    // slots: 0..8 FEM/contact, 9..14 ABD in the exact order consumed above.
     Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, m_energy_slots + 0);
     Energy_Add_Reduction_Algorithm_DeviceOut(1,  TetMesh, m_energy_slots + 1);
     Energy_Add_Reduction_Algorithm_DeviceOut(8,  TetMesh, m_energy_slots + 2);
@@ -13650,64 +13690,73 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
     Energy_Add_Reduction_Algorithm_DeviceOut(5,  TetMesh, m_energy_slots + 7);
     Energy_Add_Reduction_Algorithm_DeviceOut(6,  TetMesh, m_energy_slots + 8);
 #endif
+    m_abd_system->cal_abd_energy_DeviceOut(*m_abd_sim_data, m_energy_slots + 9);
 
-    double h_slots[9] = {0,0,0,0,0,0,0,0,0};
+    _global_energy_combine<<<1, 1>>>(m_energy_slots,
+                                     IPC_dt * IPC_dt,
+                                     Kappa,
+                                     frictionRate,
+                                     gd_frictionRate,
+                                     out_scalar);
+
+    static bool energy_validated = false;
+    if(!energy_validated && getenv("STIFF_ENERGY_VALIDATE"))
+    {
+        double slots[kEnergySlotCount] = {};
+        double device_energy = 0.0;
+        CUDA_SAFE_CALL(cudaMemcpy(slots,
+                                  m_energy_slots,
+                                  sizeof(slots),
+                                  cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(&device_energy,
+                                  out_scalar,
+                                  sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+        const double dt2 = IPC_dt * IPC_dt;
+        double host_energy = 0.0;
+        host_energy += slots[0];
+        host_energy += slots[9];
+        host_energy += slots[10];
+        host_energy += slots[11];
+        host_energy += slots[12];
+        host_energy += slots[13];
+        host_energy += slots[14];
+        host_energy += dt2 * slots[1];
+        host_energy += dt2 * slots[2];
+        host_energy += dt2 * slots[3];
+        host_energy += slots[4];
+        host_energy += slots[5];
+        host_energy += Kappa * slots[6];
 #ifdef USE_FRICTION
-    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 9 * sizeof(double),
-                              cudaMemcpyDeviceToHost));
-#else
-    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 7 * sizeof(double),
-                              cudaMemcpyDeviceToHost));
+        host_energy += frictionRate * slots[7];
+        host_energy += gd_frictionRate * slots[8];
 #endif
+        const bool exact = std::memcmp(&host_energy,
+                                       &device_energy,
+                                       sizeof(double)) == 0;
+        printf("[energy-device-validate] exact=%d host=%.17e device=%.17e\n",
+               exact ? 1 : 0,
+               host_energy,
+               device_energy);
+        if(!exact)
+            throw std::runtime_error(
+                "[line-search] device energy combine differs from host order");
+        energy_validated = true;
+    }
+}
 
-    double Energy      = 0.0;
-    auto   fem_kinetic = h_slots[0];
-    Energy += fem_kinetic;
-
-    auto abd_kinetic = m_abd_system->cal_abd_kinetic_energy(*m_abd_sim_data);
-    Energy += abd_kinetic;
-
-    auto abd_shape = m_abd_system->cal_abd_shape_energy(*m_abd_sim_data);
-    Energy += abd_shape;
-
-    auto abd_joint = m_abd_system->cal_abd_joint_energy(*m_abd_sim_data);
-    Energy += abd_joint;
-
-    auto abd_revolute_driving = m_abd_system->cal_abd_revolute_driving_energy(*m_abd_sim_data);
-    Energy += abd_revolute_driving;
-
-    auto abd_prismatic = m_abd_system->cal_abd_prismatic_energy(*m_abd_sim_data);
-    Energy += abd_prismatic;
-
-    auto abd_prismatic_driving = m_abd_system->cal_abd_prismatic_driving_energy(*m_abd_sim_data);
-    Energy += abd_prismatic_driving;
-
-    auto fem = IPC_dt * IPC_dt * h_slots[1];
-    Energy += fem;
-
-    auto tri_fem = IPC_dt * IPC_dt * h_slots[2];
-    Energy += tri_fem;
-
-    auto bend = IPC_dt * IPC_dt * h_slots[3];
-    Energy += bend;
-
-    auto constraint = h_slots[4];
-    Energy += constraint;
-
-    auto barrier = h_slots[5];
-    Energy += barrier;
-
-    auto ground = Kappa * h_slots[6];
-    Energy += ground;
-
-#ifdef USE_FRICTION
-    auto fric = frictionRate * h_slots[7];
-    Energy += fric;
-    auto fric_ground = gd_frictionRate * h_slots[8];
-    Energy += fric_ground;
-#endif
-
-    return Energy;
+double GIPC::computeEnergy(device_TetraData& TetMesh)
+{
+    // Diagnostics and legacy callers still receive a host scalar, but all 15
+    // reductions and their combine now incur only this single D2H. This
+    // compatibility scalar is deliberately separate from line-search E0/Etrial.
+    computeEnergy_DeviceOut(TetMesh, m_compatibility_energy);
+    double energy = 0.0;
+    CUDA_SAFE_CALL(cudaMemcpy(&energy,
+                              m_compatibility_energy,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
+    return energy;
 }
 
 // [multi-env S3] per-env total energy E_g into env_out[kEnvAlphaSlots].
@@ -13773,6 +13822,24 @@ __global__ void _s3_decide(const double* Eg0,
     else if(Eg1[g] > Eg0[g])
         atomicAdd(decision_counts + 1, 1);
 }
+
+// Standard (uniform-alpha) line-search decision.  Status: 0=descent,
+// 1=retry/exhausted, 2=accepted only by configured roundoff tolerance.
+__global__ void _global_ls_decide(const double* energy0,
+                                  const double* energy1,
+                                  double        c1m,
+                                  double        alpha,
+                                  double        energy_abs_tol,
+                                  double        energy_rel_tol,
+                                  int*          status)
+{
+    const double e0  = *energy0;
+    const double e1  = *energy1;
+    const double rhs = __dadd_rn(e0, __dmul_rn(c1m, alpha));
+    const double tol = __dadd_rn(energy_abs_tol,
+                                 __dmul_rn(energy_rel_tol, fabs(e0)));
+    *status = e1 > __dadd_rn(rhs, tol) ? 1 : (e1 > rhs ? 2 : 0);
+}
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)
 {
@@ -13829,7 +13896,11 @@ double* GIPC::_launch_perenv_energy_terms(device_TetraData& TetMesh, bool& peren
     // [S3] per-env ABD energy (segment-summed by body_to_group in the subsystem) → slice 10.
     CUDA_SAFE_CALL(cudaMemsetAsync(slice(10), 0, NG * sizeof(double)));
     double abd_total = m_abd_system->cal_abd_energy_perenv(
-        *m_abd_sim_data, TetMesh.d_body_to_group, NG, slice(10));
+        *m_abd_sim_data,
+        TetMesh.d_body_to_group,
+        NG,
+        slice(10),
+        false);  // per-env/device line search does not need the global host scalar
 
     (void)abd_total;
     perenv_k_out = perenv_k;
@@ -14216,16 +14287,18 @@ struct _LsTimer {
 
 bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha)
 {
-    muda::wait_device();
     bool   stopped       = false;
-    // NOTE(perf, rejected): a "lazy" variant skipped this global entry energy on the per-env (S3)
-    // path (it is only read by the rare uniform FALLBACK) and used full_sum(Eg0) there instead —
-    // mathematically the same quantity (per-env decomposition is a partition; S3-validated equal to
-    // machine precision) but its atomicAdd summation is bit-wobbly run-to-run and can change a
-    // comparison at the acceptance boundary, risking strict bit-identity for ~1ms/iter
-    // (ls-inner: energy is ~6% of lineSearch; buildCP is 94%).
-    // Not worth it: keep the eager entry energy = bit-exact original semantics on ALL paths.
-    double lastEnergyVal = computeEnergy(TetMesh);
+    const char* device_ls_env = getenv("STIFF_DEVICE_LINESEARCH");
+    const bool device_ls = !device_ls_env || !device_ls_env[0]
+                        || device_ls_env[0] != '0';
+    // The preceding CCD/buildFullCP path already joins its auxiliary stream and
+    // reads its counts on the host.  All energy work below is ordered on PTDS,
+    // so the former full-device wait here was redundant.
+    double lastEnergyVal = 0.0;
+    if(device_ls)
+        computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
+    else
+        lastEnergyVal = computeEnergy(TetMesh);
     bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
                        && TetMesh.h_groups_present
                        && abd_fem_count_info.fem_point_num > 0
@@ -14407,7 +14480,57 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     buildCP();
 
-    double testingE = computeEnergy(TetMesh);
+    double testingE = 0.0;
+
+    auto evaluate_trial_energy = [&](double trial_alpha) {
+        if(device_ls)
+        {
+            computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 1);
+            _global_ls_decide<<<1, 1>>>(m_line_search_energy + 0,
+                                        m_line_search_energy + 1,
+                                        c1m,
+                                        trial_alpha,
+                                        energy_abs_tol,
+                                        energy_rel_tol,
+                                        m_line_search_decision);
+            int decision = 0;
+            CUDA_SAFE_CALL(cudaMemcpy(&decision,
+                                      m_line_search_decision,
+                                      sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+            if(getenv("STIFF_DEVICE_LINESEARCH_VALIDATE"))
+            {
+                double h_energy[2] = {0.0, 0.0};
+                CUDA_SAFE_CALL(cudaMemcpy(h_energy,
+                                          m_line_search_energy,
+                                          sizeof(h_energy),
+                                          cudaMemcpyDeviceToHost));
+                const double rhs = h_energy[0] + c1m * trial_alpha;
+                const double tol = energy_abs_tol
+                                 + energy_rel_tol * fabs(h_energy[0]);
+                const int host_decision = h_energy[1] > rhs + tol
+                                              ? 1
+                                              : (h_energy[1] > rhs ? 2 : 0);
+                if(host_decision != decision)
+                    throw std::runtime_error(
+                        "[line-search] device and host decisions differ");
+                static bool first_match = true;
+                if(first_match)
+                {
+                    printf("[line-search-device-validate] first decision matched (%d)\n",
+                           decision);
+                    first_match = false;
+                }
+            }
+            return decision;
+        }
+
+        testingE = computeEnergy(TetMesh);
+        const double rhs = lastEnergyVal + c1m * trial_alpha;
+        const double tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
+        return testingE > rhs + tol ? 1 : (testingE > rhs ? 2 : 0);
+    };
+    int energy_decision = evaluate_trial_energy(alpha);
 
     int    numOfLineSearch = 0;
     double LFStepSize      = alpha;
@@ -14417,9 +14540,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     // limit from silently accepting a non-descent step in difficult contact.
     // Exhaustion remains loud because the current engine policy accepts the
     // final candidate so callers can decide whether to abort the simulation.
-    const double energy_tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
-    while((testingE > lastEnergyVal + c1m * alpha + energy_tol)
-          && numOfLineSearch < line_search_budget)
+    while(energy_decision == 1 && numOfLineSearch < line_search_budget)
     {
         //std::cout << "[" << numOfLineSearch << "]   testE:    " << testingE
         //          << "      lastEnergyVal:        " << lastEnergyVal << std::endl;
@@ -14429,16 +14550,23 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         step_forward(TetMesh, alpha, false);
         buildBVH();
         buildCP();
-        testingE = computeEnergy(TetMesh);
+        energy_decision = evaluate_trial_energy(alpha);
     }
-    const bool line_search_exhausted =
-        testingE > lastEnergyVal + c1m * alpha + energy_tol;
-    if(!line_search_exhausted
-       && testingE > lastEnergyVal + c1m * alpha
-       && testingE <= lastEnergyVal + c1m * alpha + energy_tol)
+    const bool line_search_exhausted = energy_decision == 1;
+    if(energy_decision == 2)
         ++energy_tolerance_accept_count;
     if(line_search_exhausted)
     {
+        if(device_ls)
+        {
+            double h_energy[2] = {0.0, 0.0};
+            CUDA_SAFE_CALL(cudaMemcpy(h_energy,
+                                      m_line_search_energy,
+                                      2 * sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+            lastEnergyVal = h_energy[0];
+            testingE      = h_energy[1];
+        }
         // [T1] Monotonicity NOT achieved within budget: the accepted step raises
         // the incremental potential. Loud and unconditional — a silent
         // non-descent step corrupts contact state downstream.

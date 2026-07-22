@@ -5,7 +5,7 @@
 #include <linear_system/utils/binned_reduce.cuh>  // [decouple] order-free per-env energy
 namespace gipc
 {
-Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
+Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data, bool copy_to_host)
 {
     using namespace muda;
     auto& abd       = sim_data.device;
@@ -161,9 +161,9 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data)
     muda::DeviceReduce().Sum(m_kinetic_energy_per_affine_body.data(),
                              m_kinetic_energy.data(),
                              abd_count);
-    return m_kinetic_energy;
+    return copy_to_host ? Float(m_kinetic_energy) : 0.0;
 }
-Float ABDSystem::cal_abd_shape_energy(ABDSimData& sim_data)
+Float ABDSystem::cal_abd_shape_energy(ABDSimData& sim_data, bool copy_to_host)
 {
     using namespace muda;
     auto& abd       = sim_data.device;
@@ -193,10 +193,10 @@ Float ABDSystem::cal_abd_shape_energy(ABDSimData& sim_data)
     muda::DeviceReduce().Sum(
         m_shape_energy_per_affine_body.data(), m_shape_energy.data(), abd_count);
 
-    return m_shape_energy;
+    return copy_to_host ? Float(m_shape_energy) : 0.0;
 }
 
-Float ABDSystem::cal_abd_joint_energy(ABDSimData& sim_data)
+Float ABDSystem::cal_abd_joint_energy(ABDSimData& sim_data, bool copy_to_host)
 {
     using namespace muda;
     auto& abd       = sim_data.device;
@@ -226,23 +226,56 @@ Float ABDSystem::cal_abd_joint_energy(ABDSimData& sim_data)
     muda::DeviceReduce().Sum(
         m_joint_energy_per_joint.data(), m_joint_energy.data(), num_joints);
 
-    return m_joint_energy;
+    return copy_to_host ? Float(m_joint_energy) : 0.0;
+}
+
+void ABDSystem::cal_abd_energy_DeviceOut(ABDSimData& sim_data, Float* out_six)
+{
+    const auto abd_count = sim_data.abd_fem_count_info().abd_body_num;
+
+    cal_abd_kinetic_energy(sim_data, false);
+    cal_abd_shape_energy(sim_data, false);
+    cal_abd_joint_energy(sim_data, false);
+    cal_abd_revolute_driving_energy(sim_data, false);
+    cal_abd_prismatic_energy(sim_data, false);
+    cal_abd_prismatic_driving_energy(sim_data, false);
+
+    // Keep zero-size terms explicit: their DeviceVars may retain the previous
+    // scene/step value because no reduction was launched for them.
+    auto stage = [out_six](int i, const Float* src, bool present) {
+        if(present)
+            CUDA_SAFE_CALL(cudaMemcpyAsync(out_six + i,
+                                           src,
+                                           sizeof(Float),
+                                           cudaMemcpyDeviceToDevice));
+        else
+            CUDA_SAFE_CALL(cudaMemsetAsync(out_six + i, 0, sizeof(Float)));
+    };
+    stage(0, m_kinetic_energy.data(), abd_count > 0);
+    stage(1, m_shape_energy.data(), abd_count > 0);
+    stage(2, m_joint_energy.data(), m_num_joints > 0);
+    stage(3, m_revolute_driving_energy.data(), m_num_revolute_driving > 0);
+    stage(4, m_prismatic_energy.data(), m_num_prismatic > 0);
+    stage(5, m_prismatic_driving_energy.data(), m_num_prismatic_driving > 0);
 }
 
 // [multi-env S3] per-env ABD energy: segment-sum each per-element energy array by
 // env. body-keyed terms (kinetic, shape) use body i; constraint terms use
 // parent_body_id. atomicAdd into env_out (raw device double*, size ng).
-double ABDSystem::cal_abd_energy_perenv(ABDSimData& sim_data, const int* body_to_group,
-                                        int ng, double* env_out)
+double ABDSystem::cal_abd_energy_perenv(ABDSimData& sim_data,
+                                        const int*  body_to_group,
+                                        int         ng,
+                                        double*     env_out,
+                                        bool        copy_total_to_host)
 {
     using namespace muda;
     double total = 0.0;
-    total += cal_abd_kinetic_energy(sim_data);
-    total += cal_abd_shape_energy(sim_data);
-    total += cal_abd_joint_energy(sim_data);
-    total += cal_abd_revolute_driving_energy(sim_data);
-    total += cal_abd_prismatic_energy(sim_data);
-    total += cal_abd_prismatic_driving_energy(sim_data);
+    total += cal_abd_kinetic_energy(sim_data, copy_total_to_host);
+    total += cal_abd_shape_energy(sim_data, copy_total_to_host);
+    total += cal_abd_joint_energy(sim_data, copy_total_to_host);
+    total += cal_abd_revolute_driving_energy(sim_data, copy_total_to_host);
+    total += cal_abd_prismatic_energy(sim_data, copy_total_to_host);
+    total += cal_abd_prismatic_driving_energy(sim_data, copy_total_to_host);
 
     auto abd_count = sim_data.abd_fem_count_info().abd_body_num;
     if(!env_out || !body_to_group) return total;

@@ -1479,7 +1479,8 @@ void ABDSystem::update_revolute_driving_targets(
 // Revolute Driving Energy
 // ============================================================================
 
-Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data)
+Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data,
+                                                  bool copy_to_host)
 {
     using namespace muda;
     if(m_num_revolute_driving == 0)
@@ -1510,7 +1511,7 @@ Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data)
         m_revolute_driving_energy_per.data(), m_revolute_driving_energy.data(),
         m_num_revolute_driving);
 
-    return m_revolute_driving_energy;
+    return copy_to_host ? Float(m_revolute_driving_energy) : 0.0;
 }
 
 
@@ -1683,7 +1684,7 @@ void ABDSystem::init_prismatic_constraints(
 // Prismatic Joint Constraint Energy
 // ============================================================================
 
-Float ABDSystem::cal_abd_prismatic_energy(ABDSimData& sim_data)
+Float ABDSystem::cal_abd_prismatic_energy(ABDSimData& sim_data, bool copy_to_host)
 {
     using namespace muda;
     if(m_num_prismatic == 0)
@@ -1711,7 +1712,7 @@ Float ABDSystem::cal_abd_prismatic_energy(ABDSimData& sim_data)
     muda::DeviceReduce().Sum(
         m_prismatic_energy_per.data(), m_prismatic_energy.data(), m_num_prismatic);
 
-    return m_prismatic_energy;
+    return copy_to_host ? Float(m_prismatic_energy) : 0.0;
 }
 
 
@@ -1964,7 +1965,8 @@ void ABDSystem::update_prismatic_driving_targets(
 // Prismatic Driving Energy
 // ============================================================================
 
-Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data)
+Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data,
+                                                   bool copy_to_host)
 {
     using namespace muda;
     if(m_num_prismatic_driving == 0)
@@ -1989,7 +1991,7 @@ Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data)
         m_prismatic_driving_energy_per.data(), m_prismatic_driving_energy.data(),
         m_num_prismatic_driving);
 
-    return m_prismatic_driving_energy;
+    return copy_to_host ? Float(m_prismatic_driving_energy) : 0.0;
 }
 
 
