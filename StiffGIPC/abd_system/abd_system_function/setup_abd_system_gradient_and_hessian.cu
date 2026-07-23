@@ -324,7 +324,10 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
 {
     fem_boundary_type = fbtype;
     setup_abd_system_gradient_hessian(sim_data, global_triplets, vertex_barrier_gradient);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // Single-stream (PTDS) submission order already sequences the kernels;
+    // this barrier only stalls the host. Kept on the legacy path.
+    if(!GIPCTripletMatrix::device_count_mode())
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     converter3x3.convert(global_triplets,
                          global_triplets.h_abd_abd_contact_start_id,
@@ -695,7 +698,9 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
         global_triplets.block_col_indices(h_abd_abd_contact_start_id
                                           + new_triplet_offset + write_offset),
         (int)body_hessian_size);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // Same single-stream ordering argument as the gradient-path barrier above.
+    if(!GIPCTripletMatrix::device_count_mode())
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
     if(bcooNum)
     {
         {

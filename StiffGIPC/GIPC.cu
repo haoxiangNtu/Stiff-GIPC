@@ -11912,6 +11912,11 @@ ContactTripletTierLayout make_contact_triplet_tier(const uint32_t* counts)
 // span, or the full tier span when the tier layout IS the final layout.
 static int contact_tier_extent(const ContactTripletTierLayout& layout)
 {
+    if(getenv("STIFF_TIER_DIAG"))
+        printf("[tier-diag] layout n={%d,%d,%d} c={%d,%d,%d} exact=%d tier=%d mode=%d\n",
+               layout.n4, layout.n3, layout.n2, layout.c4, layout.c3, layout.c2,
+               layout.exactTriplets, layout.tierTriplets,
+               (int)contact_tier_layout_mode());
     return contact_tier_layout_mode() ? layout.tierTriplets
                                       : layout.exactTriplets;
 }
@@ -13521,7 +13526,11 @@ void GIPC::partitionContactHessian()
 static void _dbg_ksum_comm(const char* name, const void* dptr, size_t nbytes);  // [4.3 fwd]
 #define KSEG(nm) if(getenv("STIFF_KSUM")) { cudaDeviceSynchronize(); \
     _dbg_ksum_comm(nm, gipc_global_triplet.block_values(), \
-        (size_t)gipc_global_triplet.global_triplet_offset * 9 * sizeof(double)); }
+        (size_t)gipc_global_triplet.global_triplet_offset * 9 * sizeof(double)); } \
+    if(getenv("STIFF_TIER_DIAG")) \
+        printf("[tier-diag] %-18s offset=%d cp={%u,%u,%u,%u,%u} gp=%u cpL0=%u gpL=%u\n", nm, \
+               gipc_global_triplet.global_triplet_offset, h_cpNum[0], h_cpNum[1], \
+               h_cpNum[2], h_cpNum[3], h_cpNum[4], h_gpNum, h_cpNum_last[0], h_gpNum_last);
 
 // [decouple probe] file-scope frame/k counters so computeGradientAndHessian can gate per-stage
 // shape-gradient dumps (set by solve_subIP). STIFF_SHAPE_STAGE dumps shape_grads after kinetic

@@ -43,6 +43,11 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
     gipc::Timer timer("convert3x3");
     if(length < 1)
         return;
+    if(getenv("STIFF_TIER_DIAG"))
+        printf("[tier-diag] convert start=%d len=%d cap=%d out=%d bv_cap=%zu idx_cap=%zu\n",
+               start, length, capacity, out_start_id,
+               global_triplets.m_block_values.capacity(),
+               global_triplets.m_block_index.capacity());
     MUDA_ASSERT(capacity >= length, "converter tier must cover exact triplet count");
     // [P3b-2/contact-tier] own the hash/sort scratch envelope: the hash-build
     // writes index/hash over the FULL capacity. Callers historically sized
@@ -54,6 +59,19 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
         global_triplets.resize_collision_hash_size(static_cast<size_t>(capacity));
         if(global_triplets.global_external_max_capcity < capacity)
             global_triplets.global_external_max_capcity = capacity;
+    }
+    // Same self-guarantee for the triplet payload: stage 2 writes the FULL
+    // [out_start_id, out_start_id + capacity) range. Under the bound layout
+    // the ABD expansion multiplies a bound count by the per-pair block count,
+    // which can outgrow every upstream reservation formula; grow here where
+    // the true requirement is exact. muda reserve preserves contents.
+    {
+        const size_t need_bv =
+            static_cast<size_t>(out_start_id) + static_cast<size_t>(capacity);
+        if(global_triplets.m_block_values.capacity() < need_bv
+           || global_triplets.m_block_row_indices.capacity() < need_bv
+           || global_triplets.m_block_col_indices.capacity() < need_bv)
+            global_triplets.reserve_triplets(need_bv + need_bv / 16);
     }
     _radix_sort_indices_and_blocks(global_triplets, start, length, capacity, out_start_id);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -232,16 +250,18 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                    [d_cnt, d_src] __device__(int) mutable
                    { *d_cnt = *d_src + 1; });
     }
-    if(GIPCTripletMatrix::device_count_mode())
+    // [P3b-1/convert-count] The bound layout (host mirror = pre-merge LENGTH,
+    // true count only in d_unique_key_number) is valid ONLY for the FINAL
+    // global convert (start == 0): its consumers all guard by the device
+    // count and nothing lays out storage from its result. The ABD chain's
+    // slice/mid converts (start > 0) feed the ×16 hessian expansion — there
+    // the unique merge is the CONTRACTION step of a per-frame expand/merge
+    // cycle, and a bound would compound ×16 every frame (1.4M → 22M → 353M).
+    // Those boundaries keep the exact readback until tier-dispatch lands.
+    const bool bound_layout =
+        GIPCTripletMatrix::device_count_mode() && start == 0;
+    if(bound_layout)
     {
-        // [P3b-1/convert-count] no assembly-boundary readback: the host
-        // mirror keeps the pre-merge LENGTH as a layout upper bound and the
-        // true unique count lives only in d_unique_key_number. Pad slots
-        // [nuniq, length) keep zero VALUES (cleared below) and get their ids
-        // neutralized to (0,0) after the merge, so downstream consumers
-        // either guard by the device count (spmv/diag/MAS input) or deposit
-        // bitwise-invisible +0.0 into the always-present (0,0) key during
-        // the next binned merge.
         global_triplets.h_unique_key_number = length;
     }
     else
@@ -316,7 +336,7 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                    });
     }
 
-    if(GIPCTripletMatrix::device_count_mode())
+    if(bound_layout)
     {
         // [P3b-1/convert-count] neutralize pad ids in [nuniq, length): the
         // scatter above writes ids only at real segment starts, so these
