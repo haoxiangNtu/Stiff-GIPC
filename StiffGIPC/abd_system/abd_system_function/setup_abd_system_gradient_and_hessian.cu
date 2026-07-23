@@ -41,14 +41,16 @@ void ABDSystem::_abd_binned_open(ABDSimData& sim_data)
     int N = sim_data.abd_fem_count_info().abd_body_num;
     if(N < 1) return;
     size_t sg = (size_t)N * 12 * BINNED_K, hb = (size_t)N * 144 * BINNED_K;
+    // Symbols are (re)bound only when the buffer address changes — a per-call
+    // cudaMemcpyToSymbol would break graph capture of the assembly phase.
     if(sg > m_abd_sysbin_cap)
-    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg; }
+    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg;
+      cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*)); }
     if(hb > m_abd_hessbin_cap)
-    { if(m_abd_hessbin) cudaFree(m_abd_hessbin); cudaMalloc((void**)&m_abd_hessbin, hb * sizeof(double)); m_abd_hessbin_cap = hb; }
-    cudaMemset(m_abd_sysbin, 0, sg * sizeof(double));
-    cudaMemset(m_abd_hessbin, 0, hb * sizeof(double));
-    cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*));
-    cudaMemcpyToSymbol(g_abd_hessbin, &m_abd_hessbin, sizeof(double*));
+    { if(m_abd_hessbin) cudaFree(m_abd_hessbin); cudaMalloc((void**)&m_abd_hessbin, hb * sizeof(double)); m_abd_hessbin_cap = hb;
+      cudaMemcpyToSymbol(g_abd_hessbin, &m_abd_hessbin, sizeof(double*)); }
+    cudaMemsetAsync(m_abd_sysbin, 0, sg * sizeof(double), 0);
+    cudaMemsetAsync(m_abd_hessbin, 0, hb * sizeof(double), 0);
 }
 void ABDSystem::_abd_binned_close(ABDSimData& sim_data)
 {
@@ -67,9 +69,9 @@ void ABDSystem::couple_bin_open(int n_dofs)
     if(n_dofs < 1) return;
     size_t sg = (size_t)n_dofs * BINNED_K;
     if(sg > m_abd_sysbin_cap)
-    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg; }
-    cudaMemset(m_abd_sysbin, 0, sg * sizeof(double));
-    cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*));
+    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg;
+      cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*)); }
+    cudaMemsetAsync(m_abd_sysbin, 0, sg * sizeof(double), 0);
 }
 void ABDSystem::couple_bin_close(int n_dofs)
 {

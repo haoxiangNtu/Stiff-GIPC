@@ -2572,10 +2572,11 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
         int startC = totalMapNodes / BANKSIZE;
         int endC   = totalNumberClusters / BANKSIZE;
         if(endC > startC)
-            CUDA_SAFE_CALL(cudaMemset(
+            CUDA_SAFE_CALL(cudaMemsetAsync(
                 d_matbin + (size_t)startC * MAS_NB * 9 * BINNED_K, 0,
-                (size_t)(endC - startC) * MAS_NB * 9 * BINNED_K * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_matbin, &d_matbin, sizeof(double*)));
+                (size_t)(endC - startC) * MAS_NB * 9 * BINNED_K * sizeof(double), 0));
+        // g_matbin is bound once in initPreconditioner_Matrix (d_matbin never
+        // reallocates); a per-call cudaMemcpyToSymbol would break graph capture.
     }
     if(true)
     {
@@ -3431,6 +3432,7 @@ void MASPreconditioner::initPreconditioner_Matrix()
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_matbin,
                               (size_t)(totalCluster / BANKSIZE) * MAS_NB * 9 * BINNED_K
                                   * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_matbin, &d_matbin, sizeof(double*)));
 }
 
 void MASPreconditioner::FreeMAS()

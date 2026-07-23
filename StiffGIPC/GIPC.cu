@@ -3361,6 +3361,12 @@ __device__ int g_bar_trace = 0;
 __device__ int g_tgt0 = -1;
 __device__ int g_tgt1 = -1;
 static void set_bar_targets(int t, int a, int b){
+    // Value-cached: without STIFF_BAR_TRACE the values never change after the
+    // first call, and per-iteration cudaMemcpyToSymbol breaks graph capture.
+    static int lt = INT_MIN, la = INT_MIN, lb = INT_MIN;
+    if(t == lt && a == la && b == lb)
+        return;
+    lt = t; la = a; lb = b;
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bar_trace, &t, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt0, &a, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt1, &b, sizeof(int))); }
