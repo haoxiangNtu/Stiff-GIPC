@@ -4,6 +4,48 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.5] — 2026-07-24
+
+Stability-focused release on top of 0.8.4.2: the GPU control-flow
+optimization line, a friction correctness fix, and a validated per-env
+isolation recommendation. Validated by an interleaved A/B matrix on both a
+local RTX 4090 (container plate replay, fold-shirt full trajectory,
+env-quarantine gate) and a remote A800 (ModelScope plate replay): all runs
+completed with zero NaN/aborts and per-frame Newton peaks ≤28 (guideline:
+>100 sustained = instability signal).
+
+### ⚠ Behavior changes
+- **Friction Hessian rank fix.** `_calFrictionHessian` ranked its triplet
+  slots with counters still holding the SAME frame's barrier type counts,
+  so displaced friction blocks landed outside the friction segment and were
+  silently lost or overwritten (present since at least 0.8.3). Frames with
+  both barrier and lagged friction contacts now assemble the COMPLETE
+  friction Hessian; trajectories with friction change (more accurate).
+
+### Added
+- **GPU control-flow fast path** (ported onto the 0.8.4.2 correctness base
+  and re-reviewed): device-side PCG tail-launch loop (zero mid-solve D2H in
+  K-iteration batches), device line-search energy chain, device CCD alpha
+  chain, asynchronous MAS assembly, strict-mode capture prewarm. Per-step
+  host↔device round-trips drop from ~150k to a few thousand. Wall-clock: at
+  parity to small gains vs 0.8.4.2 (the big historical win was vs 0.8.4);
+  MAS kernel fusion remains opt-in (`STIFF_MAS_FUSE=1`).
+- **Env-quarantine gate** (`examples/test_env_quarantine.py`): a
+  pathological env frozen by `env_newton_iter_cap` must leave healthy envs
+  within micrometers of a reference run without it. Calibrated facts are in
+  the test docstring (deep interpenetration is invisible to the IPC barrier;
+  a frozen env shifts the global Newton schedule so healthy-env disturbance
+  is ~1e-4 m scale, not zero; bitwise isolation holds for homogeneous envs
+  only).
+- **A800/sm_80 wheels**: default build architectures now `80;89;120`, so
+  release wheels run on A800 without a source build.
+
+### Recommended stability configuration
+For multi-env production: `per_env_exit=True, env_newton_iter_cap=100`.
+An env exceeding the cap freezes (status 2) and a non-finite env is
+quarantined (status 3) without stopping the batch; inspect with
+`get_per_env_newton_iters()` / `get_per_env_status()`.
+
 ## [0.8.4.2] — 2026-07-22
 
 Versioning note: this train uses a 4th "hotfix/consolidation" digit on top of

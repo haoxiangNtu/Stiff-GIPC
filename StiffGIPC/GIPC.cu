@@ -11501,6 +11501,12 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
     if(numbers > 0)
     {
+        // [v0.8.5 fix] _calFrictionHessian ranks its M12/M9/M6 slots via
+        // atomicAdd(_cpNum+4/3/2), but those counters still hold THIS frame's
+        // barrier type counts here, so friction ranks started at n4/n3/n2 and
+        // the displaced blocks landed outside the friction segment (silently
+        // lost/overwritten). Zero the rank counters first.
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum + 2, 0, 3 * sizeof(uint32_t), 0));
         if(getenv("STIFF_KSUM"))
         {
             cudaDeviceSynchronize();
