@@ -354,20 +354,33 @@ class ABDSystem
                       const double*              per_body_alpha = nullptr);
 
     // when doing line search, we need calculate abd energy from q
-    Float cal_abd_kinetic_energy(ABDSimData& sim_data);
-    Float cal_abd_shape_energy(ABDSimData& sim_data);
-    Float cal_abd_joint_energy(ABDSimData& sim_data);
-    Float cal_abd_revolute_driving_energy(ABDSimData& sim_data);
-    Float cal_abd_prismatic_energy(ABDSimData& sim_data);
-    Float cal_abd_prismatic_driving_energy(ABDSimData& sim_data);
+    // copy_to_host=false leaves the reduced scalar on the device and avoids
+    // DeviceVar's implicit blocking D2H conversion.  The default preserves the
+    // public API used by diagnostics and non-line-search callers.
+    Float cal_abd_kinetic_energy(ABDSimData& sim_data, bool copy_to_host = true);
+    Float cal_abd_shape_energy(ABDSimData& sim_data, bool copy_to_host = true);
+    Float cal_abd_joint_energy(ABDSimData& sim_data, bool copy_to_host = true);
+    Float cal_abd_revolute_driving_energy(ABDSimData& sim_data,
+                                          bool copy_to_host = true);
+    Float cal_abd_prismatic_energy(ABDSimData& sim_data, bool copy_to_host = true);
+    Float cal_abd_prismatic_driving_energy(ABDSimData& sim_data,
+                                           bool copy_to_host = true);
+
+    // Launch all six ABD energy reductions and queue their scalar results into
+    // out_six[0..5] (kinetic, shape, joint, revolute drive, prismatic,
+    // prismatic drive).  No device-to-host transfer is performed.
+    void cal_abd_energy_DeviceOut(ABDSimData& sim_data, Float* out_six);
 
     // [multi-env S3] per-env ABD energy. Calls the 6 energy terms (filling their
     // per-element arrays), then segment-sums each by env (env = body_to_group of
     // the element's body; constraints keyed by parent_body_id) and ADDS into
     // env_out (device, size ng; caller pre-zeros). Returns the global ABD total.
     // body_to_group is indexed by ABD body id (== collision body id for ABD).
-    double cal_abd_energy_perenv(ABDSimData& sim_data, const int* body_to_group,
-                                 int ng, double* env_out);
+    double cal_abd_energy_perenv(ABDSimData& sim_data,
+                                 const int*  body_to_group,
+                                 int         ng,
+                                 double*     env_out,
+                                 bool        copy_total_to_host = true);
 
     // Joint constraint setup: upload from host data, compute material coords
     void init_joint_constraints(ABDSimData& sim_data,

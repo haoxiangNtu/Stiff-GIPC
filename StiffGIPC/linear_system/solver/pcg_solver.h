@@ -44,6 +44,15 @@ class PCGSolver : public IterativeSolver
     Float*     d_alpha    = nullptr;
     Float*     d_beta     = nullptr;
     int*       d_break    = nullptr;
+    // [device-loop graph] {iteration, break} snapshot.  A self-tail-launching
+    // graph updates this pair once per K-iteration batch, allowing one final
+    // D2H read instead of one blocking read after every batch.
+    unsigned long long* d_graph_state = nullptr;
+    // Device-launchable executable is retained across Newton solves.  A fresh
+    // capture updates pointer/grid/kernel arguments; re-instantiation is only
+    // needed when CUDA reports a real topology incompatibility.
+    cudaGraphExec_t m_device_loop_exec = nullptr;
+    cudaGraphExec_t m_seg_device_loop_exec = nullptr;
     int        h_break    = 0;
     bool       d_scalars_alloced = false;
 

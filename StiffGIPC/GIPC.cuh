@@ -157,7 +157,11 @@ class GIPC
     // Ground-distance invariant flag: zero = none; otherwise the first vertex
     // with a non-finite or non-positive distance encoded as -(id + 1).
     int*      _gdCollapse  = nullptr;
-    int*      m_ccd_alpha_invalid = nullptr;  // bit 0: ground alpha, bit 1: self-CCD alpha
+    // Effective CCD-invalid bits: global/per-env x ground/narrow/refined.
+    // Refined candidates are first recorded in m_ccd_refined_invalid and are
+    // promoted here only when the corresponding refinement gate consumes them.
+    int*      m_ccd_alpha_invalid   = nullptr;
+    int*      m_ccd_refined_invalid = nullptr;  // [0]=global, [1+g]=per-env raw status
     int*      m_ground_trial_invalid = nullptr;
     int*      m_env_ground_trial_invalid = nullptr;
     // [per-body friction] per-vertex mu tables (device, size vertexNum), built
@@ -241,15 +245,21 @@ class GIPC
     uint32_t* _collisonPairs_lastH_gd = nullptr;
     uint32_t  h_gpNum_last;
 
-    // ②-D2H: persistent 9-slot device buffer for batched energy reductions.
-    // computeEnergy() previously did 9 blocking cudaMemcpy(D2H) — one per
-    // Energy_Add_Reduction_Algorithm call. Now each reduction writes its
-    // final scalar into m_energy_slots[i] via D2D (queued, async), then
-    // ONE blocking D2H grabs all 9 doubles at the end.
-    static constexpr int kEnergySlotCount = 9;
+    // Persistent device slots for 9 FEM/contact terms plus 6 ABD terms. The
+    // line-search path combines these on device; diagnostic computeEnergy()
+    // performs one batched D2H instead of one transfer per term.
+    static constexpr int kEnergySlotCount = 15;
     double* m_energy_slots = nullptr;
-    // ②-D2H: direct ground/self feasible-alpha results. Both first-stage and
-    // final reductions use MIN, so callers consume these values without inversion.
+    // E0/Etrial belong exclusively to line search. Compatibility callers use a
+    // separate scalar so diagnostics cannot overwrite an in-flight E0.
+    double* m_line_search_energy      = nullptr;
+    double* m_compatibility_energy    = nullptr;
+    // Line-search decision only: 0=descent, 1=retry, 2=tolerance acceptance.
+    int*    m_line_search_decision    = nullptr;
+    // Newton convergence only: 0=continue, 1=converged.
+    int*    m_newton_convergence_decision = nullptr;
+    // CCD device-control state: ground, narrow-self, temp alpha, max speed,
+    // refined-self, final alpha, CFL alpha, effective-invalid snapshot.
     double* m_ccd_alpha_slots = nullptr;
 
     // [0be8da3-port, grow-only] element capacities of the persistent friction /
@@ -379,9 +389,12 @@ class GIPC
     // row/col to the global Hessian (so PCG sees them as disconnected DOFs).
     int* m_d_is_pinned_vertex = nullptr;
 
-    // Auxiliary stream for overlapping bvh_e collision detection with
-    // bvh_f (default stream). Created lazily; destroyed in dtor.
-    cudaStream_t m_aux_stream = nullptr;
+    // Auxiliary stream for overlapping bvh_e collision detection with bvh_f.
+    // Persistent events connect it to the per-thread default stream without
+    // per-Newton event allocation/destruction or a host-wide stream sync.
+    cudaStream_t m_aux_stream      = nullptr;
+    cudaEvent_t  m_aux_reset_event = nullptr;
+    cudaEvent_t  m_aux_done_event  = nullptr;
 
   public:
     GIPC();
@@ -403,7 +416,7 @@ class GIPC
     void init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer, double buffScale = 1);
 
     void buildCP();
-    void buildFullCP(const double& alpha);
+    void buildFullCP(const double& alpha, const double* alpha_dev = nullptr);
     void buildBVH();
     // [multi-env P2] build the per-env face/edge index lists (once; topology static). NG = #groups.
     void buildPerEnvBVHIndex(int NG, const int* d_point_to_group);
@@ -412,11 +425,13 @@ class GIPC
     void buildBVH_and_CP_perenv(double dHat);
     // [multi-env P2] per-env CCD Construct+FullDetect loop (line-search feasible-alpha). Same
     // idea on the swept BVH so the per-env feasible alpha is full-precision / per-env identical.
-    void buildBVH_and_CP_perenv_CCD(double alpha);
+    void buildBVH_and_CP_perenv_CCD(double alpha,
+                                    const double* alpha_dev = nullptr);
 
     AABB* calcuMaxSceneSize();
 
-    void buildBVH_FULLCCD(const double& alpha);
+    void buildBVH_FULLCCD(const double& alpha,
+                          const double* alpha_dev = nullptr);
     void step_forward(device_TetraData& TetMesh, double alpha = 1.0, bool move_boundary = false);
 
 
@@ -457,6 +472,9 @@ class GIPC
 
     void   computeSoftConstraintGradient(double3* _gradient);
     double computeEnergy(device_TetraData& TetMesh);
+    // Queue all FEM/contact/ABD reductions and the exact-order device combine
+    // into out_scalar. No D2H or host synchronization.
+    void computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
     // [backport] standalone per-env energy dispatcher: writes the reduced global
@@ -481,6 +499,11 @@ class GIPC
     // Caller applies MIN and handles m_skip_all_collision / numbers<1 guards.
     void   ground_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, double* out_slot);
     void   self_largestFeasibleStepSize_DeviceOut(double slackness, double* mqueue, int numbers, double* out_slot);
+    void   self_full_largestFeasibleStepSize_DeviceOut(double slackness,
+                                                       double* mqueue,
+                                                       int numbers,
+                                                       double* out_slot);
+    void   cfl_largestSpeed_DeviceOut(double* mqueue, double* out_slot);
 
     double ground_largestFeasibleStepSize(double slackness, double* mqueue);
 
@@ -568,5 +591,9 @@ class GIPC
     struct PendingInertia { double mass; double com[3]; double inertia[9]; };
     std::unordered_map<int, PendingInertia>   m_pending_abd_inertia;
 };
+
+// Internal regression hook: exercises the real device CCD tail with a NaN
+// max-speed candidate and must throw before an invalid step can be accepted.
+void stiff_test_ccd_nan_max_speed_fail_fast();
 
 #endif

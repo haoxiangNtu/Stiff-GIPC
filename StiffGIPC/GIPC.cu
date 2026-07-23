@@ -21,8 +21,10 @@
 #include <thrust/device_ptr.h>
 #include "FrictionUtils.cuh"
 #include <cfloat>
+#include <cstring>
 #include <fstream>
 #include <cstdlib>   // std::getenv for STIFF_SKIP_CCD_SANITY
+#include <limits>
 #include "Eigen/Eigen"
 #include <gipc/statistics.h>
 #include <gipc_path.h>
@@ -40,6 +42,18 @@ using namespace Eigen;
 int g_gipc_log_level = 1;
 #define RANK 2
 #define NEWF
+
+enum CcdAlphaInvalidBits : int
+{
+    kCcdInvalidGlobalGround  = 1 << 0,
+    kCcdInvalidGlobalNarrow  = 1 << 1,
+    kCcdInvalidGlobalRefined = 1 << 2,
+    kCcdInvalidPerEnvGround  = 1 << 3,
+    kCcdInvalidPerEnvNarrow  = 1 << 4,
+    kCcdInvalidPerEnvRefined = 1 << 5,
+};
+static constexpr int kCcdInvalidEffectiveMask = (1 << 6) - 1;
+static constexpr int kCcdRawInvalid           = 1;
 
 template <typename Scalar, int size>
 __device__ __host__ void makePDGeneral(Eigen::Matrix<Scalar, size, size>& symMtr)
@@ -7348,7 +7362,8 @@ __global__ void _reduct_min_groundAlpha_to_double(const double3* vertexes,
             double  coef   = __GEIGEN__::__v_vec_dot(normal, moveDir[svI]);
             if(!isfinite(coef))
             {
-                if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                if(ccd_alpha_invalid)
+                    atomicOr(ccd_alpha_invalid, kCcdInvalidGlobalGround);
                 temp = 0.0;
             }
             else if(coef > 0.0)
@@ -7356,7 +7371,8 @@ __global__ void _reduct_min_groundAlpha_to_double(const double3* vertexes,
                 double dist = __GEIGEN__::__v_vec_dot(normal, vertexes[svI]) - *g_offset;
                 if(!isfinite(dist) || dist <= 0.0)
                 {
-                    if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                    if(ccd_alpha_invalid)
+                        atomicOr(ccd_alpha_invalid, kCcdInvalidGlobalGround);
                     temp = 0.0;
                 }
                 else
@@ -7366,7 +7382,8 @@ __global__ void _reduct_min_groundAlpha_to_double(const double3* vertexes,
                         temp = fmin(1.0, candidate);
                     else
                     {
-                        if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                        if(ccd_alpha_invalid)
+                            atomicOr(ccd_alpha_invalid, kCcdInvalidGlobalGround);
                         temp = 0.0;
                     }
                 }
@@ -7494,7 +7511,8 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
                                                 double*        minStepSizes,
                                                 double         slackness,
                                                 int            number,
-                                                int*           ccd_alpha_invalid)
+                                                int*           ccd_alpha_invalid,
+                                                int            invalid_bit)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -7536,7 +7554,7 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
         }
         if(!isfinite(temp) || temp <= 0.0)
         {
-            if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 2);
+            if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, invalid_bit);
             temp = 0.0;
         }
         else
@@ -9103,10 +9121,35 @@ void GIPC::FREE_DEVICE_MEM()
     }
     m_fric_cp_cap = 0; m_fric_gd_cap = 0; m_close_gp_cap = 0; m_close_cp_cap = 0;
 
-    // ②-D2H: free energy slots
+    // Device-resident energy/control scalars.
     if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
+    if(m_line_search_energy)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_line_search_energy));
+        m_line_search_energy = nullptr;
+    }
+    if(m_compatibility_energy)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_compatibility_energy));
+        m_compatibility_energy = nullptr;
+    }
+    if(m_line_search_decision)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_line_search_decision));
+        m_line_search_decision = nullptr;
+    }
+    if(m_newton_convergence_decision)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_newton_convergence_decision));
+        m_newton_convergence_decision = nullptr;
+    }
     if(m_ccd_alpha_slots) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_slots)); m_ccd_alpha_slots = nullptr; }
     if(m_ccd_alpha_invalid) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_invalid)); m_ccd_alpha_invalid = nullptr; }
+    if(m_ccd_refined_invalid)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_ccd_refined_invalid));
+        m_ccd_refined_invalid = nullptr;
+    }
     if(_dcd_ccd_snapshot) { CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot)); _dcd_ccd_snapshot = nullptr; }
     m_dcd_snap_count = 0; m_dcd_snap_cap = 0;
     if(m_ground_trial_invalid)
@@ -9167,6 +9210,10 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMemset(_gdCollapse, 0, sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_invalid, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemset(m_ccd_alpha_invalid, 0, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc(
+        (void**)&m_ccd_refined_invalid, (1 + kEnvAlphaSlots) * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(
+        m_ccd_refined_invalid, 0, (1 + kEnvAlphaSlots) * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ground_trial_invalid, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemset(m_ground_trial_invalid, 0, sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc(
@@ -9200,10 +9247,14 @@ void GIPC::MALLOC_DEVICE_MEM()
     { std::vector<int> ones(kEnvAlphaSlots, 1);
       CUDA_SAFE_CALL(cudaMemcpy(m_env_active, ones.data(), kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice)); }
 
-    // ②-D2H: 9-slot device buffer for batched energy reductions in computeEnergy.
+    // Device energy terms and line-search control state.
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
-    // ②-D2H: direct ground+self feasible-alpha slots.
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 2 * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_energy, 2 * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_compatibility_energy, sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_newton_convergence_decision, sizeof(int)));
+    // Device-resident CCD alpha/control chain (see slot layout in GIPC.cuh).
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 8 * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -9366,6 +9417,16 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
 GIPC::~GIPC()
 {
+    if(m_aux_done_event)
+    {
+        cudaEventDestroy(m_aux_done_event);
+        m_aux_done_event = nullptr;
+    }
+    if(m_aux_reset_event)
+    {
+        cudaEventDestroy(m_aux_reset_event);
+        m_aux_reset_event = nullptr;
+    }
     if(m_aux_stream)
     {
         cudaStreamDestroy(m_aux_stream);
@@ -9679,7 +9740,7 @@ double GIPC::self_largestFeasibleStepSize(double slackness, double* mqueue, int 
     //CUDA_SAFE_CALL(cudaMemcpy(_tempMinMovement, _moveDir, number * sizeof(AABB), cudaMemcpyDeviceToDevice));
     _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
         _vertexes, _ccd_collisonPairs, _moveDir, mqueue, slackness, numbers,
-        m_ccd_alpha_invalid);
+        m_ccd_alpha_invalid, kCcdInvalidGlobalRefined);
     //_reduct_min_double3_to_double << <blockNum, threadNum, sharedMsize >> > (_moveDir, _tempMinMovement, numbers);
 
     numbers  = blockNum;
@@ -9854,7 +9915,7 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mque
 
     _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
         _vertexes, _dcd_ccd_snapshot /* [narrow-self snapshot] DCD-time mirror, immune to buildFullCP clobbering */, _moveDir, mqueue, slackness, numbers,
-        m_ccd_alpha_invalid);
+        m_ccd_alpha_invalid, kCcdInvalidGlobalNarrow);
 
     numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;
@@ -9865,6 +9926,110 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mque
         blockNum = (numbers + threadNum - 1) / threadNum;
     }
     CUDA_SAFE_CALL(cudaMemcpyAsync(out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+void GIPC::self_full_largestFeasibleStepSize_DeviceOut(double slackness,
+                                                       double* mqueue,
+                                                       int numbers,
+                                                       double* out_slot)
+{
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    const unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    // Refined candidates are provisional: record their raw status separately.
+    // The final device gate promotes it only if refinement is actually consumed.
+    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes,
+        _ccd_collisonPairs,
+        _moveDir,
+        mqueue,
+        slackness,
+        numbers,
+        m_ccd_refined_invalid,
+        kCcdRawInvalid);
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_min_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+void GIPC::cfl_largestSpeed_DeviceOut(double* mqueue, double* out_slot)
+{
+    int                numbers   = surf_vertexNum;
+    const unsigned int threadNum = default_threads;
+    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    const unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_max_cfl_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _moveDir, mqueue, _surfVerts, numbers);
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+__global__ void _ccd_initial_alpha_combine(double* slots,
+                                           int have_ground,
+                                           int have_self,
+                                           int* invalid)
+{
+    const double ground = have_ground ? slots[0] : 1.0;
+    const double self   = have_self ? slots[1] : 1.0;
+    slots[0] = ground;
+    slots[1] = self;
+    if(have_ground && (!isfinite(ground) || ground <= 0.0 || ground > 1.0))
+        atomicOr(invalid, kCcdInvalidGlobalGround);
+    if(have_self && (!isfinite(self) || self <= 0.0 || self > 1.0))
+        atomicOr(invalid, kCcdInvalidGlobalNarrow);
+    slots[2] = ground < self ? ground : self;
+}
+
+__global__ void _ccd_final_alpha_combine(double* slots,
+                                         int have_ccd_pairs,
+                                         double d_hat,
+                                         double ccd_size,
+                                         int* invalid,
+                                         const int* refined_invalid)
+{
+    const double temp_alpha = slots[2];
+    double refined   = 1.0;
+    double alpha_cfl = temp_alpha;
+    double alpha     = temp_alpha;
+    if(have_ccd_pairs)
+    {
+        const double max_speed = slots[3];
+        refined  = slots[4];
+        alpha_cfl = __dmul_rn(__ddiv_rn(__dsqrt_rn(d_hat), max_speed), 0.5);
+        // Keep comparison semantics deliberate: a NaN alpha_cfl propagates to
+        // alpha and is rejected by the single host validation below.
+        alpha = temp_alpha < alpha_cfl ? temp_alpha : alpha_cfl;
+        if(temp_alpha > __dmul_rn(2.0, alpha_cfl))
+        {
+            if((refined_invalid && (*refined_invalid & kCcdRawInvalid))
+               || !isfinite(refined) || refined <= 0.0 || refined > 1.0)
+                atomicOr(invalid, kCcdInvalidGlobalRefined);
+            const double refined_scaled = __dmul_rn(refined, ccd_size);
+            alpha = temp_alpha < refined_scaled ? temp_alpha : refined_scaled;
+            alpha = alpha > alpha_cfl ? alpha : alpha_cfl;
+        }
+    }
+    slots[4] = refined;
+    slots[5] = alpha;
+    slots[6] = alpha_cfl;
+    slots[7] = static_cast<double>(*invalid & kCcdInvalidEffectiveMask);
 }
 
 
@@ -9946,17 +10111,21 @@ void GIPC::buildCP()
     }
 
     if(!m_aux_stream)
-        cudaStreamCreate(&m_aux_stream);
+        CUDA_SAFE_CALL(cudaStreamCreate(&m_aux_stream));
+    if(!m_aux_reset_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_reset_event, cudaEventDisableTiming));
+    if(!m_aux_done_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_done_event, cudaEventDisableTiming));
 
     // Memsets on default stream. Use an event so aux stream observes them
     // before its kernel reads/atomicAdds _cpNum.
     CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
     CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
     CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
-    cudaEvent_t reset_evt;
-    cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
-    cudaEventRecord(reset_evt, 0);
-    cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
 
     // bvh_f on default stream, bvh_e on aux stream -> overlap.
     // Both atomicAdd into _cpNum & _collisionPair; CUDA atomics handle
@@ -10005,8 +10174,11 @@ void GIPC::buildCP()
     if(getenv("STIFF_STACK_DIAG")) { CUDA_SAFE_CALL(cudaDeviceSynchronize());
         static int _sd=0; if(_sd++<3) printf("[stack] max traversal depth = %d (cap 2048)\n", get_max_stack()); }
     GroundCollisionDetect();
-    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-    cudaEventDestroy(reset_evt);
+    // Join the auxiliary detector back into PTDS without blocking the host.
+    // The following count D2H remains the algorithmic host-control wait.
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(
+        cudaStreamPerThread, m_aux_done_event, 0));
 
     {   // [9d28824-port] contiguous _cpNum[0:5]+_gpNum[5]: one 6-int D2H.
         uint32_t cp_gp_buf[6];
@@ -10046,21 +10218,16 @@ void GIPC::buildCP()
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
-        // [redo stream sync] the build uses --default-stream=per-thread, so the
-        // aux-stream detect must NOT be assumed to see the default-stream memset
-        // implicitly — mirror the first-pass event/wait (a grow-redo previously
-        // skipped it, racing the counter reset against the aux detect).
-        {
-            cudaEvent_t redo_evt;
-            cudaEventCreateWithFlags(&redo_evt, cudaEventDisableTiming);
-            cudaEventRecord(redo_evt, 0);
-            cudaStreamWaitEvent(m_aux_stream, redo_evt, 0);
-            bvh_f.SelfCollitionDetect(dHat);
-            bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
-            GroundCollisionDetect();
-            CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-            cudaEventDestroy(redo_evt);
-        }
+        // Preserve the v0.8.4.2 grow-redo ordering, using the same persistent
+        // PTDS↔aux event pair as the first pass.
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
+        bvh_f.SelfCollitionDetect(dHat);
+        bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
+        GroundCollisionDetect();
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(
+            cudaStreamPerThread, m_aux_done_event, 0));
         {   // [9d28824-port] one 6-int D2H
             uint32_t cp_gp_buf[6];
             CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -10160,6 +10327,65 @@ void GIPC::throwIfGroundDistanceInvalid()
     }
 }
 
+static std::string ccdInvalidSources(int invalid)
+{
+    struct Source
+    {
+        int bit;
+        const char* name;
+    };
+    static constexpr Source sources[] = {
+        {kCcdInvalidGlobalGround, "global-ground"},
+        {kCcdInvalidGlobalNarrow, "global-narrow-self"},
+        {kCcdInvalidGlobalRefined, "global-refined-self"},
+        {kCcdInvalidPerEnvGround, "per-env-ground"},
+        {kCcdInvalidPerEnvNarrow, "per-env-narrow-self"},
+        {kCcdInvalidPerEnvRefined, "per-env-refined-self"},
+    };
+    std::string result;
+    for(const Source& source : sources)
+    {
+        if(!(invalid & source.bit)) continue;
+        if(!result.empty()) result += "+";
+        result += source.name;
+    }
+    return result.empty() ? "unknown" : result;
+}
+
+static void throwForInvalidCcdMask(int invalid, const char* context)
+{
+    invalid &= kCcdInvalidEffectiveMask;
+    if(invalid == 0) return;
+    throw std::runtime_error(
+        std::string("[StiffGIPC] invalid direct CCD alpha in ") + context
+        + " (source=" + ccdInvalidSources(invalid)
+        + "): candidate was non-finite, non-positive, or outside [0,1]. "
+          "Refined candidates are effective only when their refinement gate consumes them; "
+          "aborting instead of accepting an invalid Newton step.");
+}
+
+static void validateFinalCcdStateOrThrow(const double* state, const char* context)
+{
+    throwForInvalidCcdMask(static_cast<int>(state[7]), context);
+    const double alpha = state[5];
+    if(std::isfinite(alpha) && alpha > 0.0 && alpha <= 1.0) return;
+
+    char message[768];
+    snprintf(message,
+             sizeof(message),
+             "[StiffGIPC] invalid final CCD alpha in %s: alpha=%.17e "
+             "temp=%.17e maxSpeed=%.17e refined=%.17e alphaCFL=%.17e. "
+             "A non-finite maxSpeed/CFL result is intentionally fail-fast; "
+             "the step will not continue with a discarded NaN.",
+             context,
+             state[5],
+             state[2],
+             state[3],
+             state[4],
+             state[6]);
+    throw std::runtime_error(message);
+}
+
 void GIPC::throwIfInvalidCcdAlpha(const char* context)
 {
     if(!m_ccd_alpha_invalid)
@@ -10167,17 +10393,45 @@ void GIPC::throwIfInvalidCcdAlpha(const char* context)
     int invalid = 0;
     CUDA_SAFE_CALL(cudaMemcpy(
         &invalid, m_ccd_alpha_invalid, sizeof(int), cudaMemcpyDeviceToHost));
-    if(invalid == 0)
-        return;
+    throwForInvalidCcdMask(invalid, context);
+}
 
-    std::string source;
-    if(invalid & 1) source += "ground";
-    if(invalid & 2) source += source.empty() ? "self" : "+self";
+void stiff_test_ccd_nan_max_speed_fail_fast()
+{
+    double host_state[8] = {
+        0.5,
+        0.5,
+        0.5,
+        std::numeric_limits<double>::quiet_NaN(),
+        1.0,
+        1.0,
+        1.0,
+        0.0,
+    };
+    double* device_state = nullptr;
+    int* device_invalid = nullptr;
+    int* device_refined_invalid = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc((void**)&device_state, sizeof(host_state)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&device_invalid, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&device_refined_invalid, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemcpy(
+        device_state, host_state, sizeof(host_state), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemset(device_invalid, 0, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(device_refined_invalid, 0, sizeof(int)));
+    _ccd_final_alpha_combine<<<1, 1>>>(device_state,
+                                      1,
+                                      1.0,
+                                      1.0,
+                                      device_invalid,
+                                      device_refined_invalid);
+    CUDA_SAFE_CALL(cudaMemcpy(
+        host_state, device_state, sizeof(host_state), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaFree(device_refined_invalid));
+    CUDA_SAFE_CALL(cudaFree(device_invalid));
+    CUDA_SAFE_CALL(cudaFree(device_state));
+    validateFinalCcdStateOrThrow(host_state, "NaN max-speed regression");
     throw std::runtime_error(
-        std::string("[StiffGIPC] invalid direct CCD alpha in ") + context
-        + " (source=" + source
-        + "): candidate was non-finite or non-positive. Aborting instead of "
-          "letting reciprocal infinities or zero steps silently freeze Newton.");
+        "[StiffGIPC] NaN max-speed regression did not trigger fail-fast");
 }
 
 // [multi-env P3a] segmented per-env reduction PRIMITIVE — the core machinery the
@@ -10306,17 +10560,22 @@ __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir,
 // (cudaDeviceSynchronize + 5x256-double D2H + 256-env host loop + H2D) that made the per-env path
 // host-bound. scratch layout: [0*ng)=ground, [1*ng)=narrow-self, [2*ng)=refined-self,
 // [3*ng)=surface cfl-max, [4*ng)=all-vertex Newton max-move.
-// Writes env_alpha[g] directly (device), atomics n_env/n_frozen into cnt[2]. Math is bit-identical to
+// Writes env_alpha[g] directly (device), atomics n_env/n_frozen into cnt[0:2],
+// and returns the effective invalid mask in cnt[2]. Math is bit-identical to
 // the host loop (same per-env formulas, no reduction) → preserves strict cross-env bit-identity.
 __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng,
                                        double sq, double ccd_size, int have_ccd,
                                        double temp_alpha, double alpha_CFL, int decouple,
                                        int no_refine, double thr_cv,
                                        const double* env_bbox2, double ntol_dt, double vtol_dt,
+                                       const int* refined_invalid,
+                                       const int* ccd_alpha_invalid,
                                        int* cnt)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
+    if(g == 0 && ccd_alpha_invalid)
+        atomicOr(&cnt[2], *ccd_alpha_invalid & kCcdInvalidEffectiveMask);
     double hmx = scratch[3 * ng + g];
     double nmx = scratch[4 * ng + g];
     bool present = nmx > 0.0 || (env_bbox2 && env_bbox2[g] > 0.0);
@@ -10332,6 +10591,9 @@ __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch,
         double gate_rhs = decouple ? acfl : alpha_CFL;
         if(!no_refine && gate_lhs > 2.0 * gate_rhs)
         {
+            if((refined_invalid && (refined_invalid[g] & kCcdRawInvalid))
+               || !isfinite(hr) || hr <= 0.0 || hr > 1.0)
+                atomicOr(&cnt[2], kCcdInvalidPerEnvRefined);
             a              = fmin(ta, hr * ccd_size);
             a              = fmax(a, acfl);
         }
@@ -10345,6 +10607,36 @@ __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch,
     env_alpha[g] = a;
     atomicAdd(&cnt[0], 1);                   // n_env (present)
     if(a == 0.0) atomicAdd(&cnt[1], 1);      // n_frozen
+}
+
+// Diagnostic host mode retains its existing telemetry D2Hs. Promote a raw
+// refined failure only for an environment whose exact refinement gate fires.
+__global__ void _promote_per_env_refined_invalid(const double* scratch,
+                                                 int ng,
+                                                 int have_ccd,
+                                                 double sq,
+                                                 double temp_alpha,
+                                                 double alpha_CFL,
+                                                 int decouple,
+                                                 int no_refine,
+                                                 const int* refined_invalid,
+                                                 int* ccd_alpha_invalid)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng || !have_ccd || no_refine) return;
+    const double hmx = scratch[3 * ng + g];
+    if(!(hmx > 0.0)) return;
+    const double hg = scratch[0 * ng + g];
+    const double hs = scratch[1 * ng + g];
+    const double hr = scratch[2 * ng + g];
+    const double ta = fmin(hg, hs);
+    const double acfl = sq / hmx * 0.5;
+    const double gate_lhs = decouple ? ta : temp_alpha;
+    const double gate_rhs = decouple ? acfl : alpha_CFL;
+    if(gate_lhs > 2.0 * gate_rhs
+       && ((refined_invalid && (refined_invalid[g] & kCcdRawInvalid))
+           || !isfinite(hr) || hr <= 0.0 || hr > 1.0))
+        atomicOr(ccd_alpha_invalid, kCcdInvalidPerEnvRefined);
 }
 
 // [de-CPU] per-env CCD search-inflation alpha ta_e = min(ground_e, narrowSelf_e),
@@ -10456,7 +10748,8 @@ __global__ void _per_env_groundAlpha_min(const double3* vertexes,
         double  coef   = __GEIGEN__::__v_vec_dot(normal, moveDir[svI]);
         if(!isfinite(coef))
         {
-            if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+            if(ccd_alpha_invalid)
+                atomicOr(ccd_alpha_invalid, kCcdInvalidPerEnvGround);
             temp = 0.0;
         }
         else if(coef > 0.0)
@@ -10464,7 +10757,8 @@ __global__ void _per_env_groundAlpha_min(const double3* vertexes,
             double dist = __GEIGEN__::__v_vec_dot(normal, vertexes[svI]) - *g_offset;
             if(!isfinite(dist) || dist <= 0.0)
             {
-                if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                if(ccd_alpha_invalid)
+                    atomicOr(ccd_alpha_invalid, kCcdInvalidPerEnvGround);
                 temp = 0.0;
             }
             else
@@ -10474,7 +10768,8 @@ __global__ void _per_env_groundAlpha_min(const double3* vertexes,
                     temp = fmin(1.0, candidate);
                 else
                 {
-                    if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 1);
+                    if(ccd_alpha_invalid)
+                        atomicOr(ccd_alpha_invalid, kCcdInvalidPerEnvGround);
                     temp = 0.0;
                 }
             }
@@ -10486,7 +10781,8 @@ __global__ void _per_env_groundAlpha_min(const double3* vertexes,
 __global__ void _per_env_selfAlpha_min(const double3* vertexes, const int4* pairs,
                                        const double3* moveDir, const int* p2g,
                                        double* per_env_alpha, double slackness, int number, int ng,
-                                       const int* vloc, int* ccd_alpha_invalid)
+                                       const int* vloc, int* ccd_alpha_invalid,
+                                       int invalid_bit, int* refined_invalid)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number) return;
@@ -10531,20 +10827,23 @@ __global__ void _per_env_selfAlpha_min(const double3* vertexes, const int4* pair
                              __GEIGEN__::__s_vec_multiply(moveDir[e1b], -1),
                              CCDDistRatio, 0);
     }
+    const int g = p2g[v0];
+    if(g < 0 || g >= ng) return;
     if(!isfinite(temp) || temp <= 0.0)
     {
-        if(ccd_alpha_invalid) atomicOr(ccd_alpha_invalid, 2);
+        if(refined_invalid)
+            atomicOr(&refined_invalid[g], kCcdRawInvalid);
+        else if(ccd_alpha_invalid)
+            atomicOr(ccd_alpha_invalid, invalid_bit);
         temp = 0.0;
     }
     else
         temp = fmin(1.0, temp);
-    int g = p2g[v0];
-    if(g < 0 || g >= ng) return;
     _atomicMinNonnegativeDouble(&per_env_alpha[g], temp);
 }
 
 // [multi-env P2] per-env CCD: build each env's swept tree on LOCAL verts + full-detect, looped.
-void GIPC::buildBVH_and_CP_perenv_CCD(double alpha)
+void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
 {
     if(m_skip_all_collision) { h_ccd_cpNum = 0; return; }
     int NG = m_perenv_bvh_groups;
@@ -10573,7 +10872,9 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha)
         _compute_perenv_ta<<<(KNG + 255) / 256, 256>>>(m_env_scratch, d_perenv_ta, KNG);
     }
     // scalar fallback (kernels use it when alpha_dev == nullptr)
-    auto env_alpha_dev = [&](int e) -> const double* { return perenv_ta ? d_perenv_ta + e : nullptr; };
+    auto env_alpha_dev = [&](int e) -> const double* {
+        return perenv_ta ? d_perenv_ta + e : alpha_dev;
+    };
     // [perenv-parallel #2] STIFF_PERENV_PAR: run the per-env SWEPT (CCD) builds+queries concurrently
     // on the K-stream scratch pool — mirrors the DCD loop. The 6-7ms _selfQuery_*_ccd kernels are
     // occupancy-starved at 1-env size (~25 blocks); overlapping K envs fills the GPU.
@@ -10645,7 +10946,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha)
     bvh_e._vertexes = se;
 }
 
-void GIPC::buildFullCP(const double& alpha)
+void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
 {
     if(m_skip_all_collision)
     {
@@ -10656,24 +10957,30 @@ void GIPC::buildFullCP(const double& alpha)
     // [multi-env P2] per-env CCD path (the swept-BVH equivalent of the per-env DCD path).
     if(m_perenv_bvh && m_d_p2g && m_perenv_bvh_groups > 0)
     {
-        buildBVH_and_CP_perenv_CCD(alpha);
+        buildBVH_and_CP_perenv_CCD(alpha, alpha_dev);
         return;
     }
 
     if(!m_aux_stream)
-        cudaStreamCreate(&m_aux_stream);
+        CUDA_SAFE_CALL(cudaStreamCreate(&m_aux_stream));
+    if(!m_aux_reset_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_reset_event, cudaEventDisableTiming));
+    if(!m_aux_done_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+            &m_aux_done_event, cudaEventDisableTiming));
 
     CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
-    cudaEvent_t reset_evt;
-    cudaEventCreateWithFlags(&reset_evt, cudaEventDisableTiming);
-    cudaEventRecord(reset_evt, 0);
-    cudaStreamWaitEvent(m_aux_stream, reset_evt, 0);
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
 
     // Same overlap pattern as buildCP.
-    bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
-    bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, m_aux_stream);
-    CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-    cudaEventDestroy(reset_evt);
+    bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha, 0, alpha_dev);
+    bvh_e.SelfCollitionFullDetect(
+        dHat, _moveDir, alpha, m_aux_stream, alpha_dev);
+    CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(
+        cudaStreamPerThread, m_aux_done_event, 0));
 
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
@@ -10694,18 +11001,16 @@ void GIPC::buildFullCP(const double& alpha)
         bvh_e._ccd_collisionPair = _ccd_collisonPairs;
         set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
-        // [redo stream sync] same per-thread-default-stream hazard as the DCD
-        // grow-redo: make the counter reset visible to the aux-stream detect.
-        {
-            cudaEvent_t redo_evt;
-            cudaEventCreateWithFlags(&redo_evt, cudaEventDisableTiming);
-            cudaEventRecord(redo_evt, 0);
-            cudaStreamWaitEvent(m_aux_stream, redo_evt, 0);
-            bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha);
-            bvh_e.SelfCollitionFullDetect(dHat, _moveDir, alpha, m_aux_stream);
-            CUDA_SAFE_CALL(cudaStreamSynchronize(m_aux_stream));
-            cudaEventDestroy(redo_evt);
-        }
+        // Preserve the v0.8.4.2 grow-redo reset ordering without allocating a
+        // temporary event or synchronizing the auxiliary stream on the host.
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_reset_event, cudaStreamPerThread));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(m_aux_stream, m_aux_reset_event, 0));
+        bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha, 0, alpha_dev);
+        bvh_e.SelfCollitionFullDetect(
+            dHat, _moveDir, alpha, m_aux_stream, alpha_dev);
+        CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
+        CUDA_SAFE_CALL(cudaStreamWaitEvent(
+            cudaStreamPerThread, m_aux_done_event, 0));
         CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     }
 }
@@ -11116,7 +11421,7 @@ AABB* GIPC::calcuMaxSceneSize()
     return bvh_f.getSceneSize();
 }
 
-void GIPC::buildBVH_FULLCCD(const double& alpha)
+void GIPC::buildBVH_FULLCCD(const double& alpha, const double* alpha_dev)
 {
     if(m_skip_all_collision)
         return;
@@ -11125,8 +11430,8 @@ void GIPC::buildBVH_FULLCCD(const double& alpha)
         return;
     { int bs = 256, gs = (vertexNum + bs - 1) / bs;
       _addEnvOffset<<<gs, bs>>>(d_bvh_vertexes, _vertexes, d_env_offset, vertexNum); }
-    bvh_f.ConstructFullCCD(_moveDir, alpha);
-    bvh_e.ConstructFullCCD(_moveDir, alpha);
+    bvh_f.ConstructFullCCD(_moveDir, alpha, 0, alpha_dev);
+    bvh_e.ConstructFullCCD(_moveDir, alpha, 0, alpha_dev);
 }
 
 void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
@@ -11196,6 +11501,12 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
     if(numbers > 0)
     {
+        // [v0.8.5 fix] _calFrictionHessian ranks its M12/M9/M6 slots via
+        // atomicAdd(_cpNum+4/3/2), but those counters still hold THIS frame's
+        // barrier type counts here, so friction ranks started at n4/n3/n2 and
+        // the displaced blocks landed outside the friction segment (silently
+        // lost/overwritten). Zero the rank counters first.
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum + 2, 0, 3 * sizeof(uint32_t), 0));
         if(getenv("STIFF_KSUM"))
         {
             cudaDeviceSynchronize();
@@ -11730,6 +12041,39 @@ double calcMinMovement(const double3* _moveDir, double* _queue, const int& numbe
     cudaMemcpy(&minValue, _queue, sizeof(double), cudaMemcpyDeviceToHost);
     //CUDA_SAFE_CALL(cudaFree(_tempMinMovement));
     return minValue;
+}
+
+void calcMinMovement_DeviceOut(const double3* _moveDir,
+                               double* _queue,
+                               const int& number)
+{
+    int numbers = number;
+    if(numbers < 1)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(_queue, 0, sizeof(double)));
+        return;
+    }
+    const unsigned int threadNum   = default_threads;
+    int                blockNum    = (numbers + threadNum - 1) / threadNum;
+    const unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_max_double3_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _moveDir, _queue, numbers);
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(_queue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+}
+
+__global__ void _newton_convergence_decide(const double* max_movement,
+                                            double threshold,
+                                            int* converged)
+{
+    *converged = (*max_movement < threshold) ? 1 : 0;
 }
 
 void stepForward(double3* _vertexes,
@@ -13623,22 +13967,43 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
 }
 
 
-double GIPC::computeEnergy(device_TetraData& TetMesh)
+// Preserve the original host expression's operation order explicitly.  The
+// project is compiled with --use_fast_math, so round-mode intrinsics also keep
+// the compiler from reassociating a near-boundary line-search comparison.
+__global__ void _global_energy_combine(const double* slots,
+                                       double        dt2,
+                                       double        Kappa,
+                                       double        friction_rate,
+                                       double        ground_friction_rate,
+                                       double*       out)
 {
-    // ②-D2H: batch the 9 Energy_Add_Reduction_Algorithm calls (types
-    // 0,1,2,4,5,6,8,9,10) into a single D2H. Each reduction writes its scalar
-    // to a device slot via D2D (queued, async); ONE blocking D2H grabs all 9
-    // at the end. Saves 8 blocking syncs per energy evaluation (called every
-    // line-search trial).
-    //
-    // ABD energies (m_abd_system->cal_abd_*) are NOT batched here — they have
-    // their own internal scratch + D2H. Future refactor target. We KEEP the
-    // ORIGINAL host-side summation ORDER below so vertex checksum stays
-    // bit-identical (FP add is non-associative).
-    //
-    // slot indices: 0=fem_kinetic 1=fem 2=tri_fem 3=bend 4=constraint
-    //               5=barrier   6=ground 7=fric  8=fric_ground
+    double e = 0.0;
+    e = __dadd_rn(e, slots[0]);   // FEM kinetic
+    e = __dadd_rn(e, slots[9]);   // ABD kinetic
+    e = __dadd_rn(e, slots[10]);  // ABD shape
+    e = __dadd_rn(e, slots[11]);  // ABD joint
+    e = __dadd_rn(e, slots[12]);  // ABD revolute driving
+    e = __dadd_rn(e, slots[13]);  // ABD prismatic
+    e = __dadd_rn(e, slots[14]);  // ABD prismatic driving
+    e = __dadd_rn(e, __dmul_rn(dt2, slots[1]));
+    e = __dadd_rn(e, __dmul_rn(dt2, slots[2]));
+    e = __dadd_rn(e, __dmul_rn(dt2, slots[3]));
+    e = __dadd_rn(e, slots[4]);
+    e = __dadd_rn(e, slots[5]);
+    e = __dadd_rn(e, __dmul_rn(Kappa, slots[6]));
+#ifdef USE_FRICTION
+    e = __dadd_rn(e, __dmul_rn(friction_rate, slots[7]));
+    e = __dadd_rn(e, __dmul_rn(ground_friction_rate, slots[8]));
+#else
+    (void)friction_rate;
+    (void)ground_friction_rate;
+#endif
+    *out = e;
+}
 
+void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar)
+{
+    // slots: 0..8 FEM/contact, 9..14 ABD in the exact order consumed above.
     Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, m_energy_slots + 0);
     Energy_Add_Reduction_Algorithm_DeviceOut(1,  TetMesh, m_energy_slots + 1);
     Energy_Add_Reduction_Algorithm_DeviceOut(8,  TetMesh, m_energy_slots + 2);
@@ -13650,64 +14015,73 @@ double GIPC::computeEnergy(device_TetraData& TetMesh)
     Energy_Add_Reduction_Algorithm_DeviceOut(5,  TetMesh, m_energy_slots + 7);
     Energy_Add_Reduction_Algorithm_DeviceOut(6,  TetMesh, m_energy_slots + 8);
 #endif
+    m_abd_system->cal_abd_energy_DeviceOut(*m_abd_sim_data, m_energy_slots + 9);
 
-    double h_slots[9] = {0,0,0,0,0,0,0,0,0};
+    _global_energy_combine<<<1, 1>>>(m_energy_slots,
+                                     IPC_dt * IPC_dt,
+                                     Kappa,
+                                     frictionRate,
+                                     gd_frictionRate,
+                                     out_scalar);
+
+    static bool energy_validated = false;
+    if(!energy_validated && getenv("STIFF_ENERGY_VALIDATE"))
+    {
+        double slots[kEnergySlotCount] = {};
+        double device_energy = 0.0;
+        CUDA_SAFE_CALL(cudaMemcpy(slots,
+                                  m_energy_slots,
+                                  sizeof(slots),
+                                  cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(&device_energy,
+                                  out_scalar,
+                                  sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+        const double dt2 = IPC_dt * IPC_dt;
+        double host_energy = 0.0;
+        host_energy += slots[0];
+        host_energy += slots[9];
+        host_energy += slots[10];
+        host_energy += slots[11];
+        host_energy += slots[12];
+        host_energy += slots[13];
+        host_energy += slots[14];
+        host_energy += dt2 * slots[1];
+        host_energy += dt2 * slots[2];
+        host_energy += dt2 * slots[3];
+        host_energy += slots[4];
+        host_energy += slots[5];
+        host_energy += Kappa * slots[6];
 #ifdef USE_FRICTION
-    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 9 * sizeof(double),
-                              cudaMemcpyDeviceToHost));
-#else
-    CUDA_SAFE_CALL(cudaMemcpy(h_slots, m_energy_slots, 7 * sizeof(double),
-                              cudaMemcpyDeviceToHost));
+        host_energy += frictionRate * slots[7];
+        host_energy += gd_frictionRate * slots[8];
 #endif
+        const bool exact = std::memcmp(&host_energy,
+                                       &device_energy,
+                                       sizeof(double)) == 0;
+        printf("[energy-device-validate] exact=%d host=%.17e device=%.17e\n",
+               exact ? 1 : 0,
+               host_energy,
+               device_energy);
+        if(!exact)
+            throw std::runtime_error(
+                "[line-search] device energy combine differs from host order");
+        energy_validated = true;
+    }
+}
 
-    double Energy      = 0.0;
-    auto   fem_kinetic = h_slots[0];
-    Energy += fem_kinetic;
-
-    auto abd_kinetic = m_abd_system->cal_abd_kinetic_energy(*m_abd_sim_data);
-    Energy += abd_kinetic;
-
-    auto abd_shape = m_abd_system->cal_abd_shape_energy(*m_abd_sim_data);
-    Energy += abd_shape;
-
-    auto abd_joint = m_abd_system->cal_abd_joint_energy(*m_abd_sim_data);
-    Energy += abd_joint;
-
-    auto abd_revolute_driving = m_abd_system->cal_abd_revolute_driving_energy(*m_abd_sim_data);
-    Energy += abd_revolute_driving;
-
-    auto abd_prismatic = m_abd_system->cal_abd_prismatic_energy(*m_abd_sim_data);
-    Energy += abd_prismatic;
-
-    auto abd_prismatic_driving = m_abd_system->cal_abd_prismatic_driving_energy(*m_abd_sim_data);
-    Energy += abd_prismatic_driving;
-
-    auto fem = IPC_dt * IPC_dt * h_slots[1];
-    Energy += fem;
-
-    auto tri_fem = IPC_dt * IPC_dt * h_slots[2];
-    Energy += tri_fem;
-
-    auto bend = IPC_dt * IPC_dt * h_slots[3];
-    Energy += bend;
-
-    auto constraint = h_slots[4];
-    Energy += constraint;
-
-    auto barrier = h_slots[5];
-    Energy += barrier;
-
-    auto ground = Kappa * h_slots[6];
-    Energy += ground;
-
-#ifdef USE_FRICTION
-    auto fric = frictionRate * h_slots[7];
-    Energy += fric;
-    auto fric_ground = gd_frictionRate * h_slots[8];
-    Energy += fric_ground;
-#endif
-
-    return Energy;
+double GIPC::computeEnergy(device_TetraData& TetMesh)
+{
+    // Diagnostics and legacy callers still receive a host scalar, but all 15
+    // reductions and their combine now incur only this single D2H. This
+    // compatibility scalar is deliberately separate from line-search E0/Etrial.
+    computeEnergy_DeviceOut(TetMesh, m_compatibility_energy);
+    double energy = 0.0;
+    CUDA_SAFE_CALL(cudaMemcpy(&energy,
+                              m_compatibility_energy,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
+    return energy;
 }
 
 // [multi-env S3] per-env total energy E_g into env_out[kEnvAlphaSlots].
@@ -13773,6 +14147,24 @@ __global__ void _s3_decide(const double* Eg0,
     else if(Eg1[g] > Eg0[g])
         atomicAdd(decision_counts + 1, 1);
 }
+
+// Standard (uniform-alpha) line-search decision.  Status: 0=descent,
+// 1=retry/exhausted, 2=accepted only by configured roundoff tolerance.
+__global__ void _global_ls_decide(const double* energy0,
+                                  const double* energy1,
+                                  double        c1m,
+                                  double        alpha,
+                                  double        energy_abs_tol,
+                                  double        energy_rel_tol,
+                                  int*          status)
+{
+    const double e0  = *energy0;
+    const double e1  = *energy1;
+    const double rhs = __dadd_rn(e0, __dmul_rn(c1m, alpha));
+    const double tol = __dadd_rn(energy_abs_tol,
+                                 __dmul_rn(energy_rel_tol, fabs(e0)));
+    *status = e1 > __dadd_rn(rhs, tol) ? 1 : (e1 > rhs ? 2 : 0);
+}
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)
 {
@@ -13829,7 +14221,11 @@ double* GIPC::_launch_perenv_energy_terms(device_TetraData& TetMesh, bool& peren
     // [S3] per-env ABD energy (segment-summed by body_to_group in the subsystem) → slice 10.
     CUDA_SAFE_CALL(cudaMemsetAsync(slice(10), 0, NG * sizeof(double)));
     double abd_total = m_abd_system->cal_abd_energy_perenv(
-        *m_abd_sim_data, TetMesh.d_body_to_group, NG, slice(10));
+        *m_abd_sim_data,
+        TetMesh.d_body_to_group,
+        NG,
+        slice(10),
+        false);  // per-env/device line search does not need the global host scalar
 
     (void)abd_total;
     perenv_k_out = perenv_k;
@@ -14216,16 +14612,18 @@ struct _LsTimer {
 
 bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha)
 {
-    muda::wait_device();
     bool   stopped       = false;
-    // NOTE(perf, rejected): a "lazy" variant skipped this global entry energy on the per-env (S3)
-    // path (it is only read by the rare uniform FALLBACK) and used full_sum(Eg0) there instead —
-    // mathematically the same quantity (per-env decomposition is a partition; S3-validated equal to
-    // machine precision) but its atomicAdd summation is bit-wobbly run-to-run and can change a
-    // comparison at the acceptance boundary, risking strict bit-identity for ~1ms/iter
-    // (ls-inner: energy is ~6% of lineSearch; buildCP is 94%).
-    // Not worth it: keep the eager entry energy = bit-exact original semantics on ALL paths.
-    double lastEnergyVal = computeEnergy(TetMesh);
+    const char* device_ls_env = getenv("STIFF_DEVICE_LINESEARCH");
+    const bool device_ls = !device_ls_env || !device_ls_env[0]
+                        || device_ls_env[0] != '0';
+    // The preceding CCD/buildFullCP path already joins its auxiliary stream and
+    // reads its counts on the host.  All energy work below is ordered on PTDS,
+    // so the former full-device wait here was redundant.
+    double lastEnergyVal = 0.0;
+    if(device_ls)
+        computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
+    else
+        lastEnergyVal = computeEnergy(TetMesh);
     bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
                        && TetMesh.h_groups_present
                        && abd_fem_count_info.fem_point_num > 0
@@ -14407,7 +14805,57 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     buildCP();
 
-    double testingE = computeEnergy(TetMesh);
+    double testingE = 0.0;
+
+    auto evaluate_trial_energy = [&](double trial_alpha) {
+        if(device_ls)
+        {
+            computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 1);
+            _global_ls_decide<<<1, 1>>>(m_line_search_energy + 0,
+                                        m_line_search_energy + 1,
+                                        c1m,
+                                        trial_alpha,
+                                        energy_abs_tol,
+                                        energy_rel_tol,
+                                        m_line_search_decision);
+            int decision = 0;
+            CUDA_SAFE_CALL(cudaMemcpy(&decision,
+                                      m_line_search_decision,
+                                      sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+            if(getenv("STIFF_DEVICE_LINESEARCH_VALIDATE"))
+            {
+                double h_energy[2] = {0.0, 0.0};
+                CUDA_SAFE_CALL(cudaMemcpy(h_energy,
+                                          m_line_search_energy,
+                                          sizeof(h_energy),
+                                          cudaMemcpyDeviceToHost));
+                const double rhs = h_energy[0] + c1m * trial_alpha;
+                const double tol = energy_abs_tol
+                                 + energy_rel_tol * fabs(h_energy[0]);
+                const int host_decision = h_energy[1] > rhs + tol
+                                              ? 1
+                                              : (h_energy[1] > rhs ? 2 : 0);
+                if(host_decision != decision)
+                    throw std::runtime_error(
+                        "[line-search] device and host decisions differ");
+                static bool first_match = true;
+                if(first_match)
+                {
+                    printf("[line-search-device-validate] first decision matched (%d)\n",
+                           decision);
+                    first_match = false;
+                }
+            }
+            return decision;
+        }
+
+        testingE = computeEnergy(TetMesh);
+        const double rhs = lastEnergyVal + c1m * trial_alpha;
+        const double tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
+        return testingE > rhs + tol ? 1 : (testingE > rhs ? 2 : 0);
+    };
+    int energy_decision = evaluate_trial_energy(alpha);
 
     int    numOfLineSearch = 0;
     double LFStepSize      = alpha;
@@ -14417,9 +14865,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     // limit from silently accepting a non-descent step in difficult contact.
     // Exhaustion remains loud because the current engine policy accepts the
     // final candidate so callers can decide whether to abort the simulation.
-    const double energy_tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
-    while((testingE > lastEnergyVal + c1m * alpha + energy_tol)
-          && numOfLineSearch < line_search_budget)
+    while(energy_decision == 1 && numOfLineSearch < line_search_budget)
     {
         //std::cout << "[" << numOfLineSearch << "]   testE:    " << testingE
         //          << "      lastEnergyVal:        " << lastEnergyVal << std::endl;
@@ -14429,16 +14875,23 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         step_forward(TetMesh, alpha, false);
         buildBVH();
         buildCP();
-        testingE = computeEnergy(TetMesh);
+        energy_decision = evaluate_trial_energy(alpha);
     }
-    const bool line_search_exhausted =
-        testingE > lastEnergyVal + c1m * alpha + energy_tol;
-    if(!line_search_exhausted
-       && testingE > lastEnergyVal + c1m * alpha
-       && testingE <= lastEnergyVal + c1m * alpha + energy_tol)
+    const bool line_search_exhausted = energy_decision == 1;
+    if(energy_decision == 2)
         ++energy_tolerance_accept_count;
     if(line_search_exhausted)
     {
+        if(device_ls)
+        {
+            double h_energy[2] = {0.0, 0.0};
+            CUDA_SAFE_CALL(cudaMemcpy(h_energy,
+                                      m_line_search_energy,
+                                      2 * sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+            lastEnergyVal = h_energy[0];
+            testingE      = h_energy[1];
+        }
         // [T1] Monotonicity NOT achieved within budget: the accepted step raises
         // the incremental potential. Loud and unconditional — a silent
         // non-descent step corrupts contact state downstream.
@@ -14727,6 +15180,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // energy-reduction roundoff. Per-env modes retain their existing freeze
     // pipeline for now and will be handled separately.
     const bool current_global_exit = (getenv("STIFF_DECOUPLE_THRESH") == nullptr);
+    // Seven per-iteration events are diagnostic-only. Production must not
+    // create/destroy them or force a device-wide synchronization.
+    const bool phase_time = (getenv("STIFF_PHASE_TIME") != nullptr);
 
     for(; k < iterCap; ++k)
     {
@@ -14755,28 +15211,33 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         totalCollisionPairs += h_cpNum[0];
         maxCOllisionPairNum =
             (maxCOllisionPairNum > h_cpNum[0]) ? maxCOllisionPairNum : h_cpNum[0];
-        cudaEvent_t start, end0, end1, end2, end3, end4, e2b;
-        cudaEventCreate(&start);
-        cudaEventCreate(&end0);
-        cudaEventCreate(&end1);
-        cudaEventCreate(&end2);
-        cudaEventCreate(&end3);
-        cudaEventCreate(&end4);
-        cudaEventCreate(&e2b);
+        cudaEvent_t start = nullptr, end0 = nullptr, end1 = nullptr, end2 = nullptr;
+        cudaEvent_t end3 = nullptr, end4 = nullptr, e2b = nullptr;
+        if(phase_time)
+        {
+            CUDA_SAFE_CALL(cudaEventCreate(&start));
+            CUDA_SAFE_CALL(cudaEventCreate(&end0));
+            CUDA_SAFE_CALL(cudaEventCreate(&end1));
+            CUDA_SAFE_CALL(cudaEventCreate(&end2));
+            CUDA_SAFE_CALL(cudaEventCreate(&end3));
+            CUDA_SAFE_CALL(cudaEventCreate(&end4));
+            CUDA_SAFE_CALL(cudaEventCreate(&e2b));
+        }
         auto destroy_iteration_events = [&]()
         {
-            cudaEventDestroy(start);
-            cudaEventDestroy(end0);
-            cudaEventDestroy(end1);
-            cudaEventDestroy(end2);
-            cudaEventDestroy(end3);
-            cudaEventDestroy(end4);
-            cudaEventDestroy(e2b);
+            if(!phase_time) return;
+            CUDA_SAFE_CALL(cudaEventDestroy(start));
+            CUDA_SAFE_CALL(cudaEventDestroy(end0));
+            CUDA_SAFE_CALL(cudaEventDestroy(end1));
+            CUDA_SAFE_CALL(cudaEventDestroy(end2));
+            CUDA_SAFE_CALL(cudaEventDestroy(end3));
+            CUDA_SAFE_CALL(cudaEventDestroy(end4));
+            CUDA_SAFE_CALL(cudaEventDestroy(e2b));
         };
 
         //printf("\n\n\ncollision num  %d\n\n\n", h_cpNum[0]+h_gpNum);
 
-        cudaEventRecord(start);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(start));
         g_dec_k = (int)k;   // [decouple probe] expose k to computeGradientAndHessian's stage dumps
         timemakePd += computeGradientAndHessian(TetMesh);
 
@@ -14799,9 +15260,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             printf("[grad-pre] dumped shape+fb+grp @frame %d k=%d\n", s_dec_frame, (int)k);
         }
 
-        double distToOpt_PN = current_global_exit
-                                  ? DBL_MAX
-                                  : calcMinMovement(_moveDir, pcg_data.squeue, vertexNum);
+        const char* merged_diag_frame = getenv("STIFF_MERGED_DIAG_FRAME");
+        const bool merged_diag_sample = merged_diag_frame
+                                     && s_dec_frame == atoi(merged_diag_frame)
+                                     && ((int)k < 20 || ((int)k % 10) == 0);
+        double distToOpt_PN = DBL_MAX;
 
         // The merged path keeps its historical BVH-scene scale. Merely declaring body groups must
         // not change merged-mode convergence; group-local scales belong to the decoupled path only.
@@ -14819,7 +15282,26 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                  ? (newton_velocity_tol * IPC_dt)
                                  : sqrt(Newton_solver_threshold * Newton_solver_threshold
                                         * thr_bbox2 * IPC_dt * IPC_dt);
-        bool gradVanish = (distToOpt_PN < _newton_thr);
+        auto device_newton_converged = [&](bool retain_movement) {
+            calcMinMovement_DeviceOut(_moveDir, pcg_data.squeue, vertexNum);
+            _newton_convergence_decide<<<1, 1>>>(pcg_data.squeue,
+                                                 _newton_thr,
+                                                 m_newton_convergence_decision);
+            int converged = 0;
+            CUDA_SAFE_CALL(cudaMemcpy(&converged,
+                                      m_newton_convergence_decision,
+                                      sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+            if(retain_movement)
+                CUDA_SAFE_CALL(cudaMemcpy(&distToOpt_PN,
+                                          pcg_data.squeue,
+                                          sizeof(double),
+                                          cudaMemcpyDeviceToHost));
+            return converged != 0;
+        };
+        bool gradVanish = current_global_exit
+                              ? false
+                              : device_newton_converged(merged_diag_sample);
 
         // [multi-env P3a step2] per-env Newton convergence tracking (precursor to
         // mask early-exit). The merged Newton loop currently breaks on the GLOBAL
@@ -14935,9 +15417,10 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         do_break = do_break && drive_ratio >= 1.0;
         if(do_break)
         {
+            destroy_iteration_events();
             break;
         }
-        cudaEventRecord(end0);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end0));
 
         auto cg_count = calculateMovingDirection(TetMesh, h_cpNum[0], pcg_data.P_type);
         //std::cout << "[" << k << "]"
@@ -14945,8 +15428,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         total_Cg_count += cg_count;
         if(current_global_exit)
         {
-            distToOpt_PN = calcMinMovement(_moveDir, pcg_data.squeue, vertexNum);
-            gradVanish = (distToOpt_PN < _newton_thr);
+            gradVanish = device_newton_converged(merged_diag_sample);
             if(k && gradVanish && drive_ratio >= 1.0)
             {
                 destroy_iteration_events();
@@ -14993,7 +15475,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 printf("[abd-dump] %d bodies @frame %d k=%d\n", nb, s_dec_frame, (int)k);
             }
         }
-        cudaEventRecord(end1);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end1));
         double alpha = 1.0, slackness_a = 0.9, slackness_m = 0.8;
         double diag_ground_alpha = 1.0;
         double diag_narrow_alpha = 1.0;
@@ -15001,54 +15483,30 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         int    diag_narrow_pairs = h_cpNum[0];
         bool   diag_refine_used = false;
 
-        // ②-D2H: batch the two back-to-back CCD step-size reductions (ground +
-        // self) into one D2H of 2 doubles. Preserves original early-return
-        // semantics: m_skip_all_collision skips ALL reductions; surf_vertexNum<1
-        // skips ground; h_cpNum[0]<1 skips self. Each "did" branch only queues
-        // kernels when its preconditions are met.
-        if(m_skip_all_collision)
-        {
-            // both functions short-circuit to 1.0 -> no change to alpha
-        }
-        else
-        {
-            bool g_did = (surf_vertexNum >= 1);
-            // [narrow-self snapshot] gate + count from the DCD snapshot, not the
-            // live CCD buffer (already clobbered by last iteration's swept build).
-            bool s_did = (m_dcd_snap_count >= 1);
-            CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_alpha_invalid, 0, sizeof(int)));
-            if(g_did) ground_largestFeasibleStepSize_DeviceOut(
+        // Keep the complete scalar CCD chain on device. The first two
+        // reductions feed temp_alpha directly into swept BVH construction.
+        const bool g_did = !m_skip_all_collision && surf_vertexNum >= 1;
+        // Gate/count from the stable DCD snapshot, not the live CCD buffer.
+        const bool s_did = !m_skip_all_collision && m_dcd_snap_count >= 1;
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_alpha_invalid, 0, sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_ccd_refined_invalid, 0, (1 + kEnvAlphaSlots) * sizeof(int)));
+        if(g_did)
+            ground_largestFeasibleStepSize_DeviceOut(
                 slackness_a, pcg_data.squeue, m_ccd_alpha_slots + 0);
-            // self reduces over PAIR count — squeue is mesh-sized (v0.6.3 OOB fix):
-            // must use the pair-capacity scratch, NOT pcg_data.squeue.
-            if(s_did) self_largestFeasibleStepSize_DeviceOut(
-                slackness_m, ensure_reduce_scratch(m_dcd_snap_count), m_dcd_snap_count,
+        if(s_did)
+            self_largestFeasibleStepSize_DeviceOut(
+                slackness_m,
+                ensure_reduce_scratch(m_dcd_snap_count),
+                m_dcd_snap_count,
                 m_ccd_alpha_slots + 1);
-            if(g_did || s_did)
-            {
-                double h_alpha[2] = {1.0, 1.0};
-                CUDA_SAFE_CALL(cudaMemcpy(
-                    h_alpha, m_ccd_alpha_slots, 2 * sizeof(double), cudaMemcpyDeviceToHost));
-                throwIfInvalidCcdAlpha("batched ground/self CCD reduction");
-                if(g_did)
-                {
-                    if(!std::isfinite(h_alpha[0]) || h_alpha[0] <= 0.0 || h_alpha[0] > 1.0)
-                        throw std::runtime_error("[StiffGIPC] invalid batched ground alpha");
-                    diag_ground_alpha = h_alpha[0];
-                    alpha = std::min(alpha, h_alpha[0]);
-                }
-                if(s_did)
-                {
-                    if(!std::isfinite(h_alpha[1]) || h_alpha[1] <= 0.0 || h_alpha[1] > 1.0)
-                        throw std::runtime_error("[StiffGIPC] invalid batched self-CCD alpha");
-                    diag_narrow_alpha = h_alpha[1];
-                    alpha = std::min(alpha, h_alpha[1]);
-                }
-            }
-        }
+        _ccd_initial_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
+                                             g_did ? 1 : 0,
+                                             s_did ? 1 : 0,
+                                             m_ccd_alpha_invalid);
         //alpha = std::min(alpha, InjectiveStepSize(0.2, 1e-6, pcg_data.squeue, TetMesh.tetrahedras));
-        double temp_alpha = alpha;
-        double alpha_CFL  = alpha;
+        double temp_alpha = 1.0;
+        double alpha_CFL  = 1.0;
 
         double ccd_size = 1.0;
         //#ifdef USE_FRICTION
@@ -15085,29 +15543,81 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     _vertexes, _dcd_ccd_snapshot, _moveDir, TetMesh.d_point_to_group,
                     m_env_scratch + 1*NG, slackness_m, m_dcd_snap_count, NG,
                     getenv("STIFF_CCD_CANON") ? m_d_vloc : nullptr,
-                    m_ccd_alpha_invalid);
+                    m_ccd_alpha_invalid,
+                    kCcdInvalidPerEnvNarrow,
+                    nullptr);
         }
 
-        buildBVH_FULLCCD(temp_alpha);
-        buildFullCP(temp_alpha);
+        buildBVH_FULLCCD(1.0, m_ccd_alpha_slots + 2);
+        buildFullCP(1.0, m_ccd_alpha_slots + 2);
         if(h_ccd_cpNum > 0)
         {
-            double maxSpeed = cfl_largestSpeed(pcg_data.squeue);
-            alpha_CFL       = sqrt(dHat) / maxSpeed * 0.5;
-            alpha           = std::min(alpha, alpha_CFL);
-            if(temp_alpha > 2 * alpha_CFL)
+            cfl_largestSpeed_DeviceOut(pcg_data.squeue, m_ccd_alpha_slots + 3);
+            // Launch the refined reduction unconditionally. Its raw invalid
+            // status becomes effective only if the exact refinement gate fires.
+            self_full_largestFeasibleStepSize_DeviceOut(
+                slackness_m,
+                ensure_reduce_scratch(h_ccd_cpNum),
+                h_ccd_cpNum,
+                m_ccd_alpha_slots + 4);
+        }
+        _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
+                                           h_ccd_cpNum > 0 ? 1 : 0,
+                                           dHat,
+                                           ccd_size,
+                                           m_ccd_alpha_invalid,
+                                           m_ccd_refined_invalid);
+
+        // One scalar-chain D2H after every global decision and validation bit.
+        double h_ccd_state[8] = {1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0};
+        CUDA_SAFE_CALL(cudaMemcpy(h_ccd_state,
+                                  m_ccd_alpha_slots,
+                                  sizeof(h_ccd_state),
+                                  cudaMemcpyDeviceToHost));
+        validateFinalCcdStateOrThrow(h_ccd_state, "device CCD chain");
+        if(getenv("STIFF_CCD_VALIDATE"))
+        {
+            const double host_temp = h_ccd_state[0] < h_ccd_state[1]
+                                         ? h_ccd_state[0]
+                                         : h_ccd_state[1];
+            double host_cfl   = host_temp;
+            double host_alpha = host_temp;
+            if(h_ccd_cpNum > 0)
             {
-                /*buildBVH_FULLCCD(temp_alpha);
-                buildFullCP(temp_alpha);*/
-                diag_refined_alpha = self_largestFeasibleStepSize(
-                    slackness_m, ensure_reduce_scratch(h_ccd_cpNum), h_ccd_cpNum);
-                diag_refine_used = true;
-                alpha = std::min(temp_alpha, diag_refined_alpha * ccd_size);
-                alpha = std::max(alpha, alpha_CFL);
+                host_cfl = sqrt(dHat) / h_ccd_state[3] * 0.5;
+                host_alpha = host_temp < host_cfl ? host_temp : host_cfl;
+                if(host_temp > 2.0 * host_cfl)
+                {
+                    const double refined = h_ccd_state[4] * ccd_size;
+                    host_alpha = host_temp < refined ? host_temp : refined;
+                    host_alpha = host_alpha > host_cfl ? host_alpha : host_cfl;
+                }
+            }
+            const bool temp_exact = std::memcmp(
+                &host_temp, &h_ccd_state[2], sizeof(double)) == 0;
+            const bool cfl_exact = std::memcmp(
+                &host_cfl, &h_ccd_state[6], sizeof(double)) == 0;
+            const bool alpha_exact = std::memcmp(
+                &host_alpha, &h_ccd_state[5], sizeof(double)) == 0;
+            if(!temp_exact || !cfl_exact || !alpha_exact)
+                throw std::runtime_error(
+                    "[CCD] device alpha chain differs from host formula");
+            static bool first_ccd_match = true;
+            if(first_ccd_match)
+            {
+                printf("[ccd-device-validate] temp/CFL/final alpha exact\n");
+                first_ccd_match = false;
             }
         }
+        diag_ground_alpha  = h_ccd_state[0];
+        diag_narrow_alpha  = h_ccd_state[1];
+        temp_alpha         = h_ccd_state[2];
+        diag_refined_alpha = h_ccd_state[4];
+        alpha              = h_ccd_state[5];
+        alpha_CFL          = h_ccd_state[6];
+        diag_refine_used   = h_ccd_cpNum > 0 && temp_alpha > 2.0 * alpha_CFL;
 
-        cudaEventRecord(end2);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end2));
         //printf("alpha:  %f\n", alpha);
 
         // [multi-env P3a] read-only: per-env alpha_CFL spread. The global alpha
@@ -15159,7 +15669,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
                     m_env_scratch + 2*NG, slackness_m, h_ccd_cpNum, NG,
                     getenv("STIFF_CCD_CANON") ? m_d_vloc : nullptr,
-                    m_ccd_alpha_invalid);
+                    m_ccd_alpha_invalid,
+                    kCcdInvalidPerEnvRefined,
+                    m_ccd_refined_invalid + 1);
             _per_env_max_cfl<<<(surf_vertexNum+bs-1)/bs, bs>>>(
                 TetMesh.d_point_to_group, _moveDir, _surfVerts, m_env_scratch + 3*NG,
                 surf_vertexNum, NG);
@@ -15167,7 +15679,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 TetMesh.d_point_to_group, _moveDir, m_env_scratch + 4*NG,
                 vertexNum, NG);
             // [perf] DEVICE-SIDE per-env alpha + freeze (no cudaDeviceSynchronize, no 5x256 D2H, no
-            // host loop, no H2D) — writes m_env_alpha directly + a 2-int counter D2H for all_env_frozen.
+            // host loop, no H2D) — writes m_env_alpha directly + one 3-int D2H
+            // (two freeze counters and the already-needed CCD status word).
             // Bit-identical to the host loop (same per-env formulas). Host path kept only under a
             // diagnostic flag.
             const double _sq_    = sqrt(dHat);
@@ -15184,22 +15697,37 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             if(!_s1diag_)
             {
                 static int* d_env_cnt = nullptr;
-                if(!d_env_cnt) CUDA_SAFE_CALL(cudaMalloc((void**)&d_env_cnt, 2 * sizeof(int)));
-                CUDA_SAFE_CALL(cudaMemsetAsync(d_env_cnt, 0, 2 * sizeof(int)));
+                if(!d_env_cnt)
+                    CUDA_SAFE_CALL(cudaMalloc((void**)&d_env_cnt, 3 * sizeof(int)));
+                CUDA_SAFE_CALL(cudaMemsetAsync(d_env_cnt, 0, 3 * sizeof(int)));
                 _per_env_alpha_compute<<<(NG + bs - 1) / bs, bs>>>(
                     m_env_alpha, m_env_scratch, NG, _sq_, 1.0, (h_ccd_cpNum > 0) ? 1 : 0,
                     temp_alpha, alpha_CFL, getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
                     getenv("STIFF_NO_REFINE") ? 1 : 0, _thrcv_,
                     d_env_bbox2, Newton_solver_threshold * IPC_dt, newton_velocity_tol * IPC_dt,
+                    m_ccd_refined_invalid + 1,
+                    m_ccd_alpha_invalid,
                     d_env_cnt);
-                int _hc_[2];
-                CUDA_SAFE_CALL(cudaMemcpy(_hc_, d_env_cnt, 2 * sizeof(int), cudaMemcpyDeviceToHost));
-                throwIfInvalidCcdAlpha("per-env CCD reduction");
+                int _hc_[3];
+                CUDA_SAFE_CALL(cudaMemcpy(
+                    _hc_, d_env_cnt, 3 * sizeof(int), cudaMemcpyDeviceToHost));
+                throwForInvalidCcdMask(_hc_[2], "per-env CCD reduction");
                 m_env_alpha_valid = true;
                 all_env_frozen    = (_hc_[0] > 0 && _hc_[1] == _hc_[0]);
             }
             else
             {
+            _promote_per_env_refined_invalid<<<(NG + bs - 1) / bs, bs>>>(
+                m_env_scratch,
+                NG,
+                (h_ccd_cpNum > 0) ? 1 : 0,
+                _sq_,
+                temp_alpha,
+                alpha_CFL,
+                getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
+                getenv("STIFF_NO_REFINE") ? 1 : 0,
+                m_ccd_refined_invalid + 1,
+                m_ccd_alpha_invalid);
             cudaDeviceSynchronize();
             throwIfInvalidCcdAlpha("per-env CCD reduction");
             std::vector<double> hg(NG), hs(NG), hr(NG), hmx(NG), hnm(NG);
@@ -15390,12 +15918,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             _mask_from_env_alpha<<<(active_group_count + 255) / 256, 256>>>(
                 m_env_active, m_env_alpha, active_group_count);
 
-        cudaEventRecord(e2b);   // [phase-time] end of S1 per-env-alpha block / start of lineSearch
+        if(phase_time)
+            CUDA_SAFE_CALL(cudaEventRecord(e2b));  // end S1 per-env-alpha / start lineSearch
         double alpha_before_line_search = alpha;
-        const char* merged_diag_frame = getenv("STIFF_MERGED_DIAG_FRAME");
-        const bool merged_diag_sample = merged_diag_frame
-                                     && s_dec_frame == atoi(merged_diag_frame)
-                                     && ((int)k < 20 || ((int)k % 10) == 0);
         if(merged_diag_sample)
         {
             std::vector<double3> positions(vertexNum), directions(vertexNum);
@@ -15488,39 +16013,35 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                    alpha_before_line_search > 0.0 ? alpha / alpha_before_line_search : 0.0,
                    (int)h_cpNum[0], (int)h_gpNum);
 
-        cudaEventRecord(end3);
+        if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end3));
         postLineSearch(TetMesh, alpha);
         //computeGradientAndHessian(TetMesh);
-        cudaEventRecord(end4);
-
-        CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        float time00, time11, time22, time33, time44;
-        cudaEventElapsedTime(&time00, start, end0);
-        cudaEventElapsedTime(&time11, end0, end1);
-        //total_Cg_time += time1;
-        cudaEventElapsedTime(&time22, end1, end2);
-        cudaEventElapsedTime(&time33, end2, end3);
-        cudaEventElapsedTime(&time44, end3, end4);
-        {   // [phase-time] time3 sub-split: S1 per-env alpha (end2->e2b) vs lineSearch (e2b->end3)
-            float t3a = 0, t3b = 0;
-            cudaEventElapsedTime(&t3a, end2, e2b);
-            cudaEventElapsedTime(&t3b, e2b, end3);
-            g_t3_s1_ms += t3a;
-            g_t3_ls_ms += t3b;
+        if(phase_time)
+        {
+            CUDA_SAFE_CALL(cudaEventRecord(end4));
+            // Waiting for the final timing event is sufficient; avoid stalling
+            // unrelated streams even in diagnostic mode.
+            CUDA_SAFE_CALL(cudaEventSynchronize(end4));
+            float time00 = 0, time11 = 0, time22 = 0, time33 = 0, time44 = 0;
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time00, start, end0));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time11, end0, end1));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time22, end1, end2));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time33, end2, end3));
+            CUDA_SAFE_CALL(cudaEventElapsedTime(&time44, end3, end4));
+            {   // time3 sub-split: S1 per-env alpha vs lineSearch
+                float t3a = 0, t3b = 0;
+                CUDA_SAFE_CALL(cudaEventElapsedTime(&t3a, end2, e2b));
+                CUDA_SAFE_CALL(cudaEventElapsedTime(&t3b, e2b, end3));
+                g_t3_s1_ms += t3a;
+                g_t3_ls_ms += t3b;
+            }
+            time0 += time00;
+            time1 += time11;
+            time2 += time22;
+            time3 += time33;
+            time4 += time44;
+            destroy_iteration_events();
         }
-        time0 += time00;
-        time1 += time11;
-        time2 += time22;
-        time3 += time33;
-        time4 += time44;
-        ////*cflTime = ptime;
-        //printf("time0 = %f,  time1 = %f,  time2 = %f,  time3 = %f,  time4 = %f\n",
-        //       time00,
-        //       time11,
-        //       time22,
-        //       time33,
-        //       time44);
-        destroy_iteration_events();
         totalTimeStep += alpha;
 
         // Semi-implicit early exit (ref: arXiv 2512.12151, Algorithm 1)
@@ -15863,7 +16384,8 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
     computeXTilta(TetMesh, 1);
     cudaEventRecord(end0);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // Engine.step remains synchronous, but only waits for this PTDS chain.
+    CUDA_SAFE_CALL(cudaEventSynchronize(end0));
     float tttime;
     cudaEventElapsedTime(&tttime, start, end0);
     cudaEventDestroy(start);
