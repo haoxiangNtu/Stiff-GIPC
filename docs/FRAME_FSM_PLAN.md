@@ -85,3 +85,37 @@ substep+未消费的 min/max D2H；telemetry event/文件写。
 - [x] tools/probe_conditional_graph.cu（A800 探测工具，待百度云执行）
 - [ ] A800 gap profile（需 A800 窗口）
 - [ ] R535 → 受支持分支的迁移规划（运维项）
+
+## P3b-1 六边界消除状态（2026-07-23）
+
+| 边界 | 状态 | 提交 | 机制 |
+|---|---|---|---|
+| Newton 收敛决策 | ✓ codex | d8035e6 | phase 链 + FrameDeviceState |
+| CCD α / LS 试步 | ✓ codex | d8035e6 | PHASE_CCD→LINE_SEARCH→POST 链 |
+| MAS 层级 extent | ✓ | 9bee717 | 分配背书上界 m_allocClusterTotal + 消费 kernel 读 d_levelSize[levelnum] 裁切（可空 extent 指针，legacy 位级不变） |
+| converter unique | ✓ | 41aff31 | bound 布局 + pad 中性化（值零 + (0,0) id）→ binned 归并吸收 +0.0（位级不可见）；消费端 *d_unique 守卫 |
+| per-env S3 freeze | codex 进行中 | p3b1/s3-freeze 分支 | S4 mask 先例扩展 |
+| contact counts / 装配图化 | 未开工（P3b-2） | — | 见下节 |
+
+锚 hash f7fb5a786c2d7935 全程保持（devlevels 0/1 × convert-count 0/1 × graph 0/1）。
+
+## P3b-2 剩余工作（1+1+1 终态）
+
+现状（4090, strict quad, FG=1 稳态）：6.2 graphLaunch + 43.6 streamSync +
+7.7 deviceSync + 29.7 blocking memcpy + 35.5 memcpyToSymbol / 帧。
+
+1. contact counts D2H（h_cpNum/h_gpNum/partition 四段起点）→ 段起点按
+   capacity-tier 前缀静态化（同 convert-count 的 absorption 论证）或设备
+   起点指针贯穿 convert(start,...)。
+2. 装配段图化：per-frame cudaMemcpyToSymbol 全部迁到 alloc/grow 一次绑定
+   （g_matbin 在 PrepareHessian_bcoo:2578 每调一次 — 迁到
+   initPreconditioner_Matrix；setup_abd g_abd_sysbin/hessbin :50/:72、
+   cal_q_tilde g_abd_wrenchbin :58、pcg set_seg_* 同类）。muda/CUB 封装
+   capture-safe 化后 ASSEMBLY phase 捕获为 tier 图族。
+3. phase 链闭合：ASSEMBLY→PCG→NEWTON_DECIDE→CCD→LS→POST_LS→next NEWTON
+   全部 device cudaGraphLaunch 尾链；终端图唯一 FrameStatus D2H；
+   step() 单 cudaStreamSynchronize。
+4. 归因工具：STIFF_API_AUDIT=1 + 两步差分（tools 提交 d0e81bf）。
+
+⚠️ 判定基准不变：strict 锚 f7fb5a786c2d7935；nsys 1+1+1 结构验证；
+compute-sanitizer memcheck/racecheck 零报告。
