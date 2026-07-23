@@ -32,7 +32,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from stiff_physics.engine import Engine, Config
 
-ASSETS   = os.path.join(ROOT, "Assets") + "/"
+ASSETS   = next((os.path.join(ROOT, n) + "/" for n in ("Assets", "assets")
+                 if os.path.isdir(os.path.join(ROOT, n, "triMesh"))),
+                os.path.join(ROOT, "Assets") + "/")
 OUT_NPY  = "/tmp/towel_scrambled.npy"
 OUT_CKPT = "/tmp/towel_scrambled.ckpt"
 SEED     = 7
