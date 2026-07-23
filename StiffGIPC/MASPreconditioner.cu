@@ -38,24 +38,35 @@ __device__ double* g_mRbin  = nullptr;
 __device__ double* g_mZbin  = nullptr;
 __device__ double* g_matbin = nullptr;
 
-__global__ void _mas_comb_mZ(Precision_T3* mZ, const double* bin, int n)
+// [P3b-1/MAS-extent] extent != nullptr overrides the host count with the true
+// device-resident hierarchy extent (d_levelSize[levelnum]); the launch is then
+// sized by the allocation-backed upper bound and pad threads exit here. The
+// guard line is unchanged, so legacy exact launches (extent == nullptr) keep
+// their bitwise-identical control flow.
+__global__ void _mas_comb_mZ(Precision_T3* mZ, const double* bin, int n, const int2* extent)
 {
+    if(extent)
+        n = extent->y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if(i >= n) return;
     mZ[i].x = binned_combine(bin + ((size_t)i * 3 + 0) * BINNED_K);
     mZ[i].y = binned_combine(bin + ((size_t)i * 3 + 1) * BINNED_K);
     mZ[i].z = binned_combine(bin + ((size_t)i * 3 + 2) * BINNED_K);
 }
-__global__ void _mas_comb_mR(Eigen::Vector3f* mR, const double* bin, int start, int end)
+__global__ void _mas_comb_mR(Eigen::Vector3f* mR, const double* bin, int start, int end, const int2* extent)
 {
+    if(extent)
+        end = extent->y;
     int i = start + blockIdx.x * blockDim.x + threadIdx.x;
     if(i >= end) return;
     mR[i][0] = (float)binned_combine(bin + ((size_t)i * 3 + 0) * BINNED_K);
     mR[i][1] = (float)binned_combine(bin + ((size_t)i * 3 + 1) * BINNED_K);
     mR[i][2] = (float)binned_combine(bin + ((size_t)i * 3 + 2) * BINNED_K);
 }
-__global__ void _mas_comb_mat(__GEIGEN__::MasMatrixSymT* mat, const double* bin, int startC, int endC)
+__global__ void _mas_comb_mat(__GEIGEN__::MasMatrixSymT* mat, const double* bin, int startC, int endC, const int2* extent)
 {
+    if(extent)
+        endC = extent->y / BANKSIZE;
     int t    = blockIdx.x * blockDim.x + threadIdx.x;
     int nblk = (endC - startC) * MAS_NB;
     if(t >= nblk) return;
@@ -805,8 +816,15 @@ __global__ void _aggregationKernel(int*                _denseLevel,
 
 __global__ void __inverse6_P96x96(__GEIGEN__::MasMatrixSymf* _preMatrix,
                                   __GEIGEN__::MasMatrixSymT* _invMatrix,
-                                  int                        numbers)
+                                  int                        numbers,
+                                  const int2*                extent)
 {
+    // [P3b-1/MAS-extent] the device extent cut lands on a matId (48-thread)
+    // boundary exactly like the legacy exact-size launch, so ragged-tail
+    // behaviour inside a 96-thread block is the shape this kernel already
+    // handles today.
+    if(extent)
+        numbers = extent->y * 3;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= numbers)
         return;
@@ -1232,8 +1250,13 @@ __global__ void _schwarzLocalXSym3(const __GEIGEN__::MasMatrixSymf* Pred,
 __global__ void _schwarzLocalXSym6(const __GEIGEN__::MasMatrixSymf* Pred,
                                    const Eigen::Vector3f*           mR,
                                    Precision_T3*                    mZ,
-                                   int                              number)
+                                   int                              number,
+                                   const int2*                      extent)
 {
+    // [P3b-1/MAS-extent] cluster counts are BANKSIZE-aligned, so number is a
+    // multiple of 256 under both cut sources: pad blocks retire whole.
+    if(extent)
+        number = extent->y * BANKSIZE;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -1311,10 +1334,18 @@ __global__ void _schwarzLocalXSym6_fused8(
     double*                          mZbin,
     int                              totalMapNodes,
     int                              clusterCount,
-    size_t                           clusterCapacity)
+    size_t                           clusterCapacity,
+    const int2*                      extent)
 {
+    if(extent)
+        clusterCount = extent->y;
     constexpr int rowsPerBlock = 8;
     const int     matrixId      = blockIdx.x / 2;
+    // [P3b-1/MAS-extent] with an upper-bound grid, blocks whose matrix lies
+    // beyond the true extent retire uniformly here, before any shared-memory
+    // publication or barrier.
+    if(matrixId * BANKSIZE >= clusterCount)
+        return;
     const int     rowBase       = (blockIdx.x & 1) * rowsPerBlock;
     const int     localRow      = rowBase + threadIdx.x / BANKSIZE;
     const int     localCol      = threadIdx.x % BANKSIZE;
@@ -2257,6 +2288,22 @@ bool MASPreconditioner::deviceLevelsEnabled() const
     return !(value && atoi(value) == 0);
 }
 
+bool MASPreconditioner::deviceExtentActive() const
+{
+    return m_allocClusterTotal > 0 && deviceLevelsEnabled();
+}
+
+// Debug/dump helper only: the production path never reads the extent back.
+int MASPreconditioner::exactClusterCountBlocking()
+{
+    if(!deviceExtentActive())
+        return totalNumberClusters;
+    int2 realExt;
+    CUDA_SAFE_CALL(cudaMemcpy(
+        &realExt, d_levelSize + levelnum, sizeof(int2), cudaMemcpyDeviceToHost));
+    return realExt.y;
+}
+
 void MASPreconditioner::NextLevelClusterDevice(int level)
 {
     if(m_levelItemCapacity <= 0)
@@ -2468,12 +2515,24 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
 
     }
 
-    // One assembly-boundary read remains by design: downstream MAS matrix
-    // storage and inversion launches consume the final hierarchy extent.
-    // The default path performs no intermediate level readbacks.
-    readLevelSize(levelnum);
-
-    totalNumberClusters = h_clevelSize.y;
+    if(deviceLevels && m_allocClusterTotal > 0)
+    {
+        // [P3b-1/MAS-extent] no assembly-boundary readback at all: the true
+        // extent stays in d_levelSize[levelnum] on device. Host-side launches
+        // size by the allocation-backed bound and every consumer kernel cuts
+        // at the device extent, so pad work retires before any store.
+        // Collision connections only merge clusters, so runtime extents stay
+        // within the init-time bound (the same 1.05 contract the multiLevel
+        // buffer allocations themselves rely on).
+        totalNumberClusters = m_allocClusterTotal;
+    }
+    else
+    {
+        // Init-time sizing dry-run and the qualification/rollback path keep
+        // the exact readback.
+        readLevelSize(levelnum);
+        totalNumberClusters = h_clevelSize.y;
+    }
 
     if(getenv("STIFF_MAS_LEVEL_DIAG"))
         printf("[mas-levels] mode=%s levels=%d clusters=%d cap=%d\n",
@@ -2814,15 +2873,18 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
         return;
     int numBlocks2 = (number2 + blockSize2 - 1) / blockSize2;
 
+    const int2* extentPtr = deviceExtentActive() ? d_levelSize + levelnum : nullptr;
     {  // [4.3] combine binned coarse aggregation back into d_inverseMatMas (before inversion)
         int startC = totalMapNodes / BANKSIZE;
         int endC   = totalNumberClusters / BANKSIZE;
         int nblk   = (endC - startC) * MAS_NB;
         if(nblk > 0)
-            _mas_comb_mat<<<(nblk + 255) / 256, 256>>>(d_inverseMatMas, d_matbin, startC, endC);
+            _mas_comb_mat<<<(nblk + 255) / 256, 256>>>(
+                d_inverseMatMas, d_matbin, startC, endC, extentPtr);
     }
 
-    __inverse6_P96x96<<<numBlocks2, blockSize2>>>(d_precondMatMas, d_inverseMatMas, number2);
+    __inverse6_P96x96<<<numBlocks2, blockSize2>>>(
+        d_precondMatMas, d_inverseMatMas, number2, extentPtr);
 
     //cudaEventRecord(end1);
 
@@ -2891,7 +2953,11 @@ void MASPreconditioner::SchwarzLocalXSym_block3()
 
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym6<<<numBlocks, blockSize>>>(
-        d_precondMatMas, d_multiLevelR, d_multiLevelZ, number);
+        d_precondMatMas,
+        d_multiLevelR,
+        d_multiLevelZ,
+        number,
+        deviceExtentActive() ? d_levelSize + levelnum : nullptr);
 }
 
 void MASPreconditioner::SchwarzLocalXSym_sym()
@@ -3031,8 +3097,10 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
     if(totalNodes < 1)
         return;
     if(getenv("STIFF_KSUM")) { cudaDeviceSynchronize();
+        // Debug-only exact readback: with the device-resident extent the host
+        // count is an upper bound and pad matrices hold stale bytes.
         _mas_ksum("precondMat", d_precondMatMas,
-                  (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf)); }
+                  (size_t)(exactClusterCountBlocking() / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf)); }
 
     // Fusion is deliberately opt-in: only the exact value "1" enables it.
     const char* fuseEnv = getenv("STIFF_MAS_FUSE");
@@ -3079,16 +3147,17 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
 
     BuildMultiLevelR(R);
 
+    const int2* extentPtr = deviceExtentActive() ? d_levelSize + levelnum : nullptr;
     auto runLegacyPath = [&]()
     {
         int n = totalNumberClusters - totalMapNodes;
         if(n > 0)
             _mas_comb_mR<<<(n + 255) / 256, 256>>>(d_multiLevelR, d_mRbin, totalMapNodes,
-                                                   totalNumberClusters);
+                                                   totalNumberClusters, extentPtr);
         SchwarzLocalXSym_block3();
         n = totalNumberClusters;
         if(n > 0)
-            _mas_comb_mZ<<<(n + 255) / 256, 256>>>(d_multiLevelZ, d_mZbin, n);
+            _mas_comb_mZ<<<(n + 255) / 256, 256>>>(d_multiLevelZ, d_mZbin, n, extentPtr);
         CollectFinalZ(Z);
     };
 
@@ -3103,7 +3172,8 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
                 d_mZbin,
                 totalMapNodes,
                 totalNumberClusters,
-                clusterCapacity);
+                clusterCapacity,
+                extentPtr);
 
         const int blocks = (totalNodes + DEFAULT_BLOCKSIZE - 1) / DEFAULT_BLOCKSIZE;
         __collectFinalZ_binned_new<<<blocks, DEFAULT_BLOCKSIZE>>>(
@@ -3185,6 +3255,10 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
         {
             dumped = 1;
             cudaDeviceSynchronize();
+            // Debug-only exact readback keeps dump artifacts identical whether
+            // the extent lives on host or device (CPU oracles size buffers
+            // from these files).
+            const int dumpClusters = exactClusterCountBlocking();
             auto wr = [&](const char* name, const void* dev, size_t bytes)
             {
                 std::vector<char> h(bytes);
@@ -3195,22 +3269,22 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
                 if(f) { fwrite(h.data(), 1, bytes, f); fclose(f); }
             };
             wr("mas_R",   R,             (size_t)totalNodes * sizeof(double3));
-            wr("mas_mlR", d_multiLevelR, (size_t)totalNumberClusters * sizeof(Eigen::Vector3f));
-            wr("mas_mlZ", d_multiLevelZ, (size_t)totalNumberClusters * sizeof(Precision_T3));
+            wr("mas_mlR", d_multiLevelR, (size_t)dumpClusters * sizeof(Eigen::Vector3f));
+            wr("mas_mlZ", d_multiLevelZ, (size_t)dumpClusters * sizeof(Precision_T3));
             wr("mas_Z",   Z,             (size_t)totalNodes * sizeof(double3));
             wr("mas_pmat", d_precondMatMas,
-               (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf));
+               (size_t)(dumpClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf));
 #ifdef SYME
             wr("mas_imat", d_inverseMatMas,
-               (size_t)(totalNumberClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymT));
+               (size_t)(dumpClusters / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymT));
 #endif
             // topology for external (CPU) multi-level oracles
             wr("mas_goingNext", d_goingNext,
-               (size_t)totalNumberClusters * sizeof(unsigned int));
+               (size_t)dumpClusters * sizeof(unsigned int));
             wr("mas_map", d_partId_map_real, (size_t)totalMapNodes * sizeof(int));
             wr("mas_levelSize", d_levelSize, (size_t)(levelnum + 1) * sizeof(int2));
             printf("[mas-dump] wrote R/mlR/mlZ/Z to %s (nodes=%d clusters=%d mapNodes=%d levels=%d)\n",
-                   dumpDir, totalNodes, totalNumberClusters, totalMapNodes, levelnum);
+                   dumpDir, totalNodes, dumpClusters, totalMapNodes, levelnum);
         }
     }
     //cudaEventRecord(end2);
@@ -3327,7 +3401,13 @@ void MASPreconditioner::initPreconditioner_Matrix()
                               totalNodes * sizeof(unsigned int),
                               cudaMemcpyDeviceToDevice));
 
+    m_allocClusterTotal = 0;  // force the sizing dry-run below to read the real extent
     int totalCluster = ReorderRealtime(0) * 1.05;
+    // [P3b-1/MAS-extent] BANKSIZE-aligned launch upper bound backed by the
+    // allocations below. Real extents are BANKSIZE-aligned and never exceed
+    // totalCluster, so flooring keeps bound >= extent while staying inside
+    // every buffer allocated from totalCluster.
+    m_allocClusterTotal = totalCluster / BANKSIZE * BANKSIZE;
 #ifdef SYME
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_inverseMatMas,
                               totalCluster / BANKSIZE * sizeof(__GEIGEN__::MasMatrixSymT)));

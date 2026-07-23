@@ -33,6 +33,11 @@ class MASPreconditioner
     int* d_padTot   = nullptr;   //   per-env-padded cluster total (written to d_levelSize on device)
     int collision_node_Offset;
     int totalNumberClusters;
+    // [P3b-1/MAS-extent] BANKSIZE-aligned launch upper bound backed by the
+    // initPreconditioner_Matrix allocations (0 until those buffers exist).
+    // When deviceExtentActive(), totalNumberClusters holds this bound and the
+    // true per-frame extent lives only in d_levelSize[levelnum] on device.
+    int m_allocClusterTotal = 0;
     //int bankSize;
     int2  h_clevelSize;
     int4* _collisonPairs;
@@ -91,6 +96,8 @@ class MASPreconditioner
 
     int  ReorderRealtime(int cpNum);
     bool deviceLevelsEnabled() const;
+    bool deviceExtentActive() const;   // extent stays device-resident (no assembly readback)
+    int  exactClusterCountBlocking();  // debug/dump only: reads the true extent back
     void BuildConnectMaskL0();           // called in ReorderRealtime
     void PreparePrefixSumL0();           // called in ReorderRealtime
     void BuildLevel1();                  // called in ReorderRealtime
