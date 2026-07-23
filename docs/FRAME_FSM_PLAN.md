@@ -104,9 +104,15 @@ substep+未消费的 min/max D2H；telemetry event/文件写。
 现状（4090, strict quad, FG=1 稳态）：6.2 graphLaunch + 43.6 streamSync +
 7.7 deviceSync + 29.7 blocking memcpy + 35.5 memcpyToSymbol / 帧。
 
-1. contact counts D2H（h_cpNum/h_gpNum/partition 四段起点）→ 段起点按
-   capacity-tier 前缀静态化（同 convert-count 的 absorption 论证）或设备
-   起点指针贯穿 convert(start,...)。
+1. contact counts D2H（h_cpNum/h_gpNum/partition 四段起点）：
+   - [x] 接触 triplet tier 布局（406e4a5）：staging 即最终布局、无压实
+     D2D；converter scratch 自保容量；bound 公式动态项 ×2；diag 零块守卫。
+     途中修出潜伏 bug 966afa1（friction rank 计数被同帧 barrier 污染 →
+     exact 时代摩擦 hessian 块静默丢失）。
+   - [ ] 5-int/4-int 检测计数 D2H 本身的图内消除：需 tier dispatch
+     （conditional graph 族按设备计数选 tier 子图）或每-tier 图重放，
+     归入全链闭合子块。launch guard 的设备计数化（kernel 读 *_cpNum
+     取代 host number 参数）随全链一起做。
 2. 装配段图化：per-frame cudaMemcpyToSymbol 全部迁到 alloc/grow 一次绑定
    （g_matbin 在 PrepareHessian_bcoo:2578 每调一次 — 迁到
    initPreconditioner_Matrix；setup_abd g_abd_sysbin/hessbin :50/:72、
