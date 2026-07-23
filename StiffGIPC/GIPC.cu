@@ -3354,6 +3354,14 @@ __device__ int g_ground_hess_legacy = 0;
 // foldshirt strict by f0k2; default 1 restores 17-digit reproducibility). The latch only RELAXES
 // to 0 for merged/isolated.
 __device__ int g_det_reduce = 1;
+// [P3b-2/contact-tier] one switch family with the converter bound layout:
+// exact counts stay on device, host mirrors hold tier bounds, and the next
+// binned merge absorbs the zeroed (0,0) pads bitwise-invisibly.
+static bool contact_tier_layout_mode()
+{
+    return GIPCTripletMatrix::device_count_mode();
+}
+
 static void set_det_reduce(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_det_reduce, &v, sizeof(int))); }
 static void set_binned_on(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_binned_on, &v, sizeof(int))); }
 // [xenv crack] target verts for the reliable (low-volume) deposit trace — set via env.
@@ -9829,6 +9837,19 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
     const unsigned int threadNum = default_threads;
     int itemCapacity = gipc::assembly_capacity_tier(numbers);
     int blockNum     = itemCapacity / threadNum;
+    if(contact_tier_layout_mode() && itemCapacity > numbers)
+    {
+        // Ground writes [offset, +numbers); neutralize the tier pad tail.
+        size_t padBase = static_cast<size_t>(gipc_global_triplet.global_triplet_offset)
+                         + numbers;
+        size_t padLen = static_cast<size_t>(itemCapacity - numbers);
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            gipc_global_triplet.block_row_indices() + padBase, 0, padLen * sizeof(int), 0));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            gipc_global_triplet.block_col_indices() + padBase, 0, padLen * sizeof(int), 0));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            gipc_global_triplet.block_values() + padBase, 0, padLen * sizeof(Eigen::Matrix3d), 0));
+    }
     _computeGroundGradientAndHessian<<<blockNum, threadNum>>>(
         _vertexes,
         _groundOffset,
@@ -11887,11 +11908,23 @@ ContactTripletTierLayout make_contact_triplet_tier(const uint32_t* counts)
     return r;
 }
 
+// Extent this layout occupies in the assembled matrix: the compacted exact
+// span, or the full tier span when the tier layout IS the final layout.
+static int contact_tier_extent(const ContactTripletTierLayout& layout)
+{
+    return contact_tier_layout_mode() ? layout.tierTriplets
+                                      : layout.exactTriplets;
+}
+
 int prepare_contact_triplet_tier(GIPCTripletMatrix&            triplets,
                                  int                           outputStart,
                                  const ContactTripletTierLayout& layout)
 {
-    int scratchStart = outputStart + layout.exactTriplets;
+    // [P3b-2/contact-tier] tier-layout mode stages IN PLACE: the cleared tier
+    // region at outputStart is the final layout (no compaction copy), pads
+    // stay (0,0)/zero from the clears below.
+    int scratchStart = outputStart
+                       + (contact_tier_layout_mode() ? 0 : layout.exactTriplets);
     size_t need = static_cast<size_t>(scratchStart)
                   + static_cast<size_t>(layout.tierTriplets);
     if(triplets.triplet_capacity() < need)
@@ -11923,6 +11956,8 @@ void compact_contact_triplet_tier(GIPCTripletMatrix&             triplets,
                                   int                            scratchStart,
                                   const ContactTripletTierLayout& layout)
 {
+    if(contact_tier_layout_mode())
+        return;  // tier layout is final — nothing to compact
     constexpr int threads = 256;
     auto compact = [&](int input, int output, int count, int capacity)
     {
@@ -12055,6 +12090,14 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             prepare_contact_triplet_tier(gipc_global_triplet, outputStart, layout);
         int pairCapacity = gipc::assembly_capacity_tier(numbers);
         blockNum = pairCapacity / threadNum;
+        // The kernel ranks its M12/M9/M6 slots via atomicAdd(_cpNum+4/3/2).
+        // Those counters still hold THIS frame's barrier type counts here, so
+        // ranks started at n4/n3/n2 instead of 0: under the exact-era compact
+        // the misplaced blocks were silently dropped (friction Hessian blocks
+        // zeroed whenever the barrier type count was nonzero); under the tier
+        // layout they overflow the segment. Zero the rank counters like
+        // buildFrictionSets does before its own rebuild.
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum + 2, 0, 3 * sizeof(uint32_t), 0));
         if(getenv("STIFF_KSUM"))
         {
             cudaDeviceSynchronize();
@@ -12097,7 +12140,24 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     int groundCapacity = gipc::assembly_capacity_tier(numbers);
     blockNum = groundCapacity / threadNum;
     int global_offset =
-        gipc_global_triplet.global_triplet_offset + layout.exactTriplets;
+        gipc_global_triplet.global_triplet_offset + contact_tier_extent(layout);
+    if(contact_tier_layout_mode())
+    {
+        // Ground-friction writes [global_offset, +numbers); neutralize the
+        // tier pad tail so the bound layout stays (0,0)/zero everywhere.
+        int gtier = gipc::assembly_capacity_tier(numbers);
+        if(gtier > numbers)
+        {
+            size_t padBase = static_cast<size_t>(global_offset) + numbers;
+            size_t padLen  = static_cast<size_t>(gtier - numbers);
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_row_indices() + padBase, 0, padLen * sizeof(int), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_col_indices() + padBase, 0, padLen * sizeof(int), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_values() + padBase, 0, padLen * sizeof(Eigen::Matrix3d), 0));
+        }
+    }
     _calFrictionHessian_gd<<<blockNum, threadNum>>>(
         _vertexes,
         TetMesh.o_vertexes,
@@ -13581,15 +13641,20 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // the worst-case finalize allocation. Provable: bound >= actual length always.
     if(m_dynamic_triplet)
     {
+        // [P3b-2/contact-tier] under the tier layout every contact segment
+        // occupies its capacity tier, and tier(n) < 2n + 256, so the dynamic
+        // terms double (plus per-segment alignment slack) to stay a provable
+        // upper bound on this step's layout extent.
+        const long long tierInfl = contact_tier_layout_mode() ? 2 : 1;
         long long bound = m_fixed_triplet_base
             + static_cast<long long>(abd_fem_count_info.fem_point_num)
-            + static_cast<long long>(h_cpNum[0]) * M12_Off     // all contact pairs x max blocks
-            + static_cast<long long>(h_gpNum) * M6_Off;        // ground (generous)
+            + tierInfl * static_cast<long long>(h_cpNum[0]) * M12_Off  // all contact pairs x max blocks
+            + tierInfl * static_cast<long long>(h_gpNum) * M6_Off;     // ground (generous)
 #ifdef USE_FRICTION
-        bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
-               + static_cast<long long>(h_gpNum_last) * M6_Off;
+        bound += tierInfl * static_cast<long long>(h_cpNum_last[0]) * M12_Off
+               + tierInfl * static_cast<long long>(h_gpNum_last) * M6_Off;
 #endif
-        bound += 4096;                                          // fixed slack
+        bound += 4096 + tierInfl * 2048;                        // fixed + tier-alignment slack
         // The ABD hessian staging region writes [new_triplet_offset,
         // 2*new_triplet_offset - fem_fem) BEFORE the convert-site grow runs
         // (setup_abd_system_gradient_and_hessian.cu tail D2D compaction), and
@@ -13643,7 +13708,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         calBarrierGradientAndHessian(contact_grads, Kappa);
         set_bar_targets(0, -1, -1);
         gipc_global_triplet.global_triplet_offset +=
-            h_cpNum[4] * M12_Off + h_cpNum[3] * M9_Off + h_cpNum[2] * M6_Off;
+            contact_tier_extent(make_contact_triplet_tier(h_cpNum));
     }
     KSEG("seg_contact")
 
@@ -13659,8 +13724,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         calFrictionHessian(TetMesh);
         }
         gipc_global_triplet.global_triplet_offset +=
-            h_cpNum_last[4] * M12_Off + h_cpNum_last[3] * M9_Off
-            + h_cpNum_last[2] * M6_Off + h_gpNum_last;
+            contact_tier_extent(make_contact_triplet_tier(h_cpNum_last))
+            + (contact_tier_layout_mode()
+                   ? (h_gpNum_last ? gipc::assembly_capacity_tier(h_gpNum_last) : 0)
+                   : static_cast<int>(h_gpNum_last));
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     }
 #endif
@@ -13709,7 +13776,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         }
         xenvDiff(contact_grads, "  b.barrier+fric+grnd");
     }
-    gipc_global_triplet.global_triplet_offset += h_gpNum;
+    gipc_global_triplet.global_triplet_offset +=
+        contact_tier_layout_mode()
+            ? (h_gpNum ? gipc::assembly_capacity_tier(static_cast<int>(h_gpNum)) : 0)
+            : static_cast<int>(h_gpNum);
     KSEG("seg_thru_ground")
     gipc_global_triplet.global_collision_triplet_offset =
         gipc_global_triplet.global_triplet_offset;
