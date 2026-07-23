@@ -153,6 +153,12 @@ def parent() -> None:
     assert physical_small["retry_invalid_bits"] & (1 << 17)
     assert graph_a["root_d2h_nodes"] == 0
     assert graph_a["terminal_d2h_nodes"] == 1
+    # This fixture has one accepted Newton step followed by the terminal
+    # convergence probe.  P3b-1 leaves exactly one phase-only host stitch for
+    # each probe; the former grad/CCD/LS decision payloads are not boundaries.
+    assert graph_a["newton_iters"] == graph_a["ls_trials"] == 1
+    assert graph_a["host_boundaries"] == 2
+    assert graph_b["host_boundaries"] == graph_a["host_boundaries"]
 
     assert nan["result"] == 2
     assert nan["phase"] == 9
@@ -164,7 +170,9 @@ def parent() -> None:
 
     print("FRAME TRANSACTION: PASS (four-way byte identity + NaN rollback)")
     print(f"GRAPH AUDIT: root D2H=0, terminal D2H=1, "
-          f"launches={graph_a['graph_launches']}")
+          f"launches={graph_a['graph_launches']}, "
+          f"phase stitches={graph_a['host_boundaries']}, "
+          f"newton={graph_a['newton_iters']}, ls={graph_a['ls_trials']}")
 
 
 if __name__ == "__main__":
