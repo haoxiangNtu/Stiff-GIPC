@@ -13590,12 +13590,16 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                + static_cast<long long>(h_gpNum_last) * M6_Off;
 #endif
         bound += 4096;                                          // fixed slack
-        // Pre-assembly only needs capacity >= this step's length (assembly writes [0:length));
-        // bound is a provable upper bound on length, so 1*bound is assembly-safe. The
-        // converter's 2*length region is grown exactly at the convert site
-        // (global_linear_system.cu), so the peak capacity = 2*length (the irreducible
-        // out-of-place-converter floor), not 2*bound. Saves ~20% of the grasp-peak buffer.
-        long long bv_need = bound;
+        // The ABD hessian staging region writes [new_triplet_offset,
+        // 2*new_triplet_offset - fem_fem) BEFORE the convert-site grow runs
+        // (setup_abd_system_gradient_and_hessian.cu tail D2D compaction), and
+        // new_triplet_offset <= bound. The former 1*bound reservation relied
+        // on the PREVIOUS frame's convert-site 2*tier high-water to cover this
+        // frame's staging — a latent overflow window on contact surges, and a
+        // guaranteed overflow under the P3b-1 bound layout (h_unique holds the
+        // pre-merge length, widening the staging span). 2*bound restores the
+        // provable envelope for every assembly write of this step.
+        long long bv_need = 2 * bound;
         frame_graph_guard_triplets(static_cast<int>(std::min<long long>(
             bv_need, static_cast<long long>(INT_MAX))));
         if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(bv_need))

@@ -660,6 +660,21 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
     int h_abd_abd_contact_start_id =
         h_abd_fem_contact_start_id + global_triplets.abd_fem_contact_num * 4;
 
+    // The writers below stage into [new_triplet_offset,
+    // 2*new_triplet_offset - fem_fem) and the tail compaction copies that
+    // whole span. Guarantee the envelope HERE, where new_triplet_offset is
+    // exact, instead of relying on the pre-assembly bound formula upstream
+    // (which under-covered by ~1.5% on contact-heavy scenes once the P3b-1
+    // bound layout widened the abd-abd slice). muda reserve keeps contents.
+    {
+        // The tail compaction's SOURCE spans [new + fem_fem, 2*new): the
+        // staging mirror sits at +new_triplet_offset, so the last source
+        // element is 2*new - 1, not 2*new - fem_fem - 1.
+        const size_t staging_need = static_cast<size_t>(2LL * new_triplet_offset);
+        if(global_triplets.triplet_capacity() < staging_need)
+            global_triplets.reserve_triplets(staging_need
+                                             + staging_need / 8);
+    }
 
     int write_offset = 0;
 
@@ -1006,6 +1021,27 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
     global_triplets.global_collision_triplet_offset = new_triplet_offset;
     global_triplets.global_triplet_offset = global_triplets.global_collision_triplet_offset;
 
+    // Staging compaction requires capacity >= 2*new_triplet_offset - fem_fem.
+    // Loud first-failure context: the D2D below reports only "invalid argument".
+    if(static_cast<size_t>(2LL * new_triplet_offset)
+           > global_triplets.m_block_values.capacity()
+       || static_cast<size_t>(2LL * new_triplet_offset)
+              > global_triplets.m_block_row_indices.capacity()
+       || static_cast<size_t>(2LL * new_triplet_offset)
+              > global_triplets.m_block_col_indices.capacity())
+    {
+        fprintf(stderr,
+                "[abd-staging] OVERFLOW new=%d fem_fem=%u abd_fem=%u bcoo=%u "
+                "capV=%zu capR=%zu capC=%zu need=%lld\n",
+                new_triplet_offset,
+                global_triplets.fem_fem_contact_num,
+                global_triplets.abd_fem_contact_num,
+                global_triplets.abd_abd_contact_num,
+                global_triplets.m_block_values.capacity(),
+                global_triplets.m_block_row_indices.capacity(),
+                global_triplets.m_block_col_indices.capacity(),
+                2LL * new_triplet_offset);
+    }
 
     CUDA_SAFE_CALL(cudaMemcpy(
         global_triplets.block_values() + global_triplets.fem_fem_contact_num,
