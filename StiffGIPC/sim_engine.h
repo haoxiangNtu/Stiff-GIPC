@@ -303,7 +303,7 @@ class SimEngine
 
     /// [per-env productization] Newton iter at which each env froze last solve
     /// (converged / timeout / diverged; -1 = ran to loop end or absent).
-    /// 256 slots. Host per-env path only (per_env_exit / STIFF_PERENV_ALPHA).
+    /// 256 slots. Frame-graph mode copies device telemetry only when queried.
     std::vector<int> get_per_env_newton_iters() const;
     /// [per-env productization] Per-env status of the last solve:
     /// 0 active/absent, 1 converged, 2 timeout, 3 diverged. 256 slots.

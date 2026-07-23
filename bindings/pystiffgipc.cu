@@ -483,7 +483,7 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_total_newton_iters", &SimEngine::get_total_newton_iters)
         .def("get_per_env_newton_iters", &SimEngine::get_per_env_newton_iters,
              "[per-env] Newton iter at which each env froze last solve (-1 = ran "
-             "to loop end / absent). 256 slots. Host per-env path only.")
+             "to loop end / absent). 256 slots; device telemetry is copied on query.")
         .def("get_per_env_status", &SimEngine::get_per_env_status,
              "[per-env] Status of the last solve per env: 0 active/absent, "
              "1 converged, 2 timeout (env_newton_iter_cap), 3 diverged. 256 slots.")

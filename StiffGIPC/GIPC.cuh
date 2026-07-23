@@ -174,10 +174,12 @@ class GIPC
     double*   d_vert_mu    = nullptr;
     double*   d_vert_mu_gd = nullptr;
     // [per-env productization] per-env solve telemetry, reset each solve_subIP.
-    // Filled by the HOST S1 path (per_env_exit / STIFF_PERENV_ALPHA without the
-    // dev-mask fast path). frozen_iter[g]: Newton iter at which env g froze
-    // (-1 = ran to loop end). status[g]: 0 active/absent, 1 converged,
-    // 2 timeout (env_newton_iter_cap), 3 diverged (NaN/inf max-move).
+    // Legacy execution fills these host mirrors directly. Frame-graph execution
+    // keeps the corresponding truth in the dedicated S3 device arrays below;
+    // the public query copies it only on demand, never to make an in-frame
+    // freeze decision. frozen_iter[g]: Newton iter at which env g froze (-1 =
+    // ran to loop end). status[g]: 0 active/absent, 1 converged, 2 timeout
+    // (env_newton_iter_cap), 3 diverged (NaN/inf max-move).
     std::vector<int> m_env_frozen_iter;
     std::vector<int> m_env_status;
     int              env_newton_iter_cap = 0;  // per-env iter budget; 0 = off
@@ -328,6 +330,18 @@ class GIPC
     // populated; lineSearch only does the per-env try when this is true (guards
     // against applying stale per-env alpha on iters where S1 didn't run).
     bool                m_env_alpha_valid = false;
+    // [P3b-1/S3-freeze] Device-owned early-Newton freeze state. Every pointer is
+    // a dedicated cudaMalloc allocation: in particular m_s3_frozen never aliases
+    // an existing control/scratch block (see the unique-count aliasing incident
+    // in docs/FRAME_FSM_PLAN.md). Graph consumers receive m_s3_frozen explicitly;
+    // nullptr preserves the legacy alpha==0 control path byte-for-byte.
+    int*                m_s3_frozen       = nullptr;  // 1=frozen, 0=active
+    int*                m_s3_frozen_iter  = nullptr;  // first freeze iter, -1=none
+    int*                m_s3_status       = nullptr;  // telemetry status code
+    double*             m_s3_semi_beta    = nullptr;  // per-env semi-implicit beta
+    int*                m_s3_semi_freeze_next = nullptr;  // host latch equivalent
+    bool                m_s3_device_freeze_active = false;
+    bool                m_s3_device_telemetry_valid = false;
     // [multi-env S4] per-env active flag (1=active/solve, 0=masked/converged).
     // An env is masked once its Newton max-move < thr*margin; periodically all
     // are unmasked + re-checked to catch non-monotonic bounce-back. Read by the
