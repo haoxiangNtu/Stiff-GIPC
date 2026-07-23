@@ -109,10 +109,21 @@ substep+未消费的 min/max D2H；telemetry event/文件写。
      D2D；converter scratch 自保容量；bound 公式动态项 ×2；diag 零块守卫。
      途中修出潜伏 bug 966afa1（friction rank 计数被同帧 barrier 污染 →
      exact 时代摩擦 hessian 块静默丢失）。
-   - [ ] 5-int/4-int 检测计数 D2H 本身的图内消除：需 tier dispatch
-     （conditional graph 族按设备计数选 tier 子图）或每-tier 图重放，
-     归入全链闭合子块。launch guard 的设备计数化（kernel 读 *_cpNum
-     取代 host number 参数）随全链一起做。
+   - [ ] 5-int/4-int 检测计数 D2H 本身的图内消除——定案设计
+     「tier 稳态重放 + OVF-RETRY 跨档重建」（无需 conditional graph，
+     A800/R535 兼容）：
+     * 帧内 launch 全部按当前 tier 向量（host 静态），kernel guard 读
+       设备计数（*_cpNum / d_levelSize / d_unique_key_number）；
+     * 检测 kernel 后接 tiny 比较 kernel：设备计数 > 当前 tier 上限 →
+       fsm_record_error(OVF_DCD_PAIRS 等) → 终端 FrameStatus 回读时
+       host grow + 重建受影响 tier 图 + 同帧重试（既有 RETRY 契约）；
+     * partition 四段起点 = class tier 前缀（tier 稳态下 host 静态），
+       跨档同走 RETRY；
+     * muda TempBuffer 容量单调（resize ≤ capacity 零开销）→ CUB temp
+       预热后 capture-safe；growth 帧走图外路径并重建 exec。
+     配套机械项：launch guard 设备化（number 参数→设备计数）、
+     setup_abd 两处单流冗余 cudaDeviceSynchronize 删除、
+     MAS BuildCollisionConnection 的 cpNum tier 化。
 2. 装配段图化：per-frame cudaMemcpyToSymbol 全部迁到 alloc/grow 一次绑定
    （g_matbin 在 PrepareHessian_bcoo:2578 每调一次 — 迁到
    initPreconditioner_Matrix；setup_abd g_abd_sysbin/hessbin :50/:72、
