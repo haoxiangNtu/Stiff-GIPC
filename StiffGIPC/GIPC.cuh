@@ -155,6 +155,14 @@ class GIPC
 
     uint32_t* _gpNum       = nullptr;
     uint32_t* _close_gpNum = nullptr;
+    // [P3b-2/guard] READ-ONLY pair-count snapshots for kernel-side launch
+    // guards: [0..4] = cp type counts, [5] = gp. Dedicated allocations —
+    // _cpNum itself is reused as a rank scratch mid-frame (memset + atomic
+    // ranking), so guards must never read it (see the d_unique_key_number
+    // aliasing lesson). Cur = this frame's detection; Last = the lagged
+    // friction set (snapshotted in buildFrictionSets).
+    uint32_t* d_pairSnapCur  = nullptr;
+    uint32_t* d_pairSnapLast = nullptr;
     // Ground-distance invariant flag: zero = none; otherwise the first vertex
     // with a non-finite or non-positive distance encoded as -(id + 1).
     int*      _gdCollapse  = nullptr;

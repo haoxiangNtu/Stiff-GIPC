@@ -1564,8 +1564,11 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        double*          lastH,
                                        int              global_offset,
                                        double           coef,
-                                       const double*    vert_mu_gd)
+                                       const double*    vert_mu_gd,
+                                       const uint32_t*  d_count = nullptr)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -1679,8 +1682,11 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                                     int                     global_offset,
                                     int                     f_offset4,
                                     int                     f_offset3,
-                                    int                     f_offset2)
+                                    int                     f_offset2,
+                                    const uint32_t*         d_count = nullptr)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -3464,8 +3470,13 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                               int              offset2,
                                               int              number,
                                               const double*    kappa_grp = nullptr,
-                                              const int*       p2g       = nullptr)
+                                              const int*       p2g       = nullptr,
+                                              const uint32_t*  d_count   = nullptr)
 {
+    // [P3b-2/guard] d_count overrides the host count (capacity launch reads
+    // the device truth); nullptr keeps legacy control flow bitwise.
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -6980,8 +6991,11 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  int    global_offset,
                                                  int    number,
                                                  const double* kappa_grp = nullptr,
-                                                 const int*    p2g       = nullptr)
+                                                 const int*    p2g       = nullptr,
+                                                 const uint32_t* d_count = nullptr)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -9300,6 +9314,8 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_collisonPairs));
     CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
     CUDA_SAFE_CALL(cudaFree(_cpNum));
+    CUDA_SAFE_CALL(cudaFree(d_pairSnapCur));
+    CUDA_SAFE_CALL(cudaFree(d_pairSnapLast));
     CUDA_SAFE_CALL(cudaFree(_close_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_gpNum));
     if(_gdCollapse) { CUDA_SAFE_CALL(cudaFree(_gdCollapse)); _gdCollapse = nullptr; }
@@ -9433,6 +9449,10 @@ void GIPC::MALLOC_DEVICE_MEM()
     // paired cpNum+gpNum reads become ONE 6-int D2H.
     CUDA_SAFE_CALL(cudaMalloc((void**)&_cpNum, 6 * sizeof(uint32_t)));
     _gpNum = _cpNum + 5;
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_pairSnapCur, 6 * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_pairSnapLast, 6 * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemset(d_pairSnapCur, 0, 6 * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemset(d_pairSnapLast, 0, 6 * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundNormal, 5 * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundOffset, 5 * sizeof(double)));
     double  h_offset[5] = {ground_offset_cfg, -1, 1, -1, 1};
@@ -9767,6 +9787,15 @@ void GIPC::buildFrictionSets()
                                                       m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     h_gpNum_last = h_gpNum;
+    // [P3b-2/guard] snapshot the lagged friction counts for kernel guards.
+    // Host mirrors are authoritative here (they define this frame's layout),
+    // so publish them; the graph-captured path will swap this for a D2D.
+    {
+        uint32_t snapLast[6] = {h_cpNum_last[0], h_cpNum_last[1], h_cpNum_last[2],
+                                h_cpNum_last[3], h_cpNum_last[4], h_gpNum_last};
+        CUDA_SAFE_CALL(cudaMemcpy(d_pairSnapLast, snapLast,
+                                  6 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    }
 }
 
 
@@ -9865,7 +9894,8 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         gipc_global_triplet.global_triplet_offset,
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,
-        m_pergroup_kappa ? m_d_p2g : nullptr);
+        m_pergroup_kappa ? m_d_p2g : nullptr,
+        contact_tier_layout_mode() ? d_pairSnapCur + 5 : nullptr);
 }
 
 void GIPC::computeCloseGroundVal()
@@ -12037,7 +12067,8 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
         layout.c2,
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,   // [per-group κ] nullptr → scalar
-        m_pergroup_kappa ? m_d_p2g : nullptr);
+        m_pergroup_kappa ? m_d_p2g : nullptr,
+        contact_tier_layout_mode() ? d_pairSnapCur : nullptr);
     compact_contact_triplet_tier(
         gipc_global_triplet, outputStart, scratchStart, layout);
 }
@@ -12132,7 +12163,8 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             0,
             layout.c4,
             layout.c3,
-            layout.c2);
+            layout.c2,
+            contact_tier_layout_mode() ? d_pairSnapLast : nullptr);
         compact_contact_triplet_tier(
             gipc_global_triplet, outputStart, scratchStart, layout);
     }
@@ -12176,7 +12208,8 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
         fDhat * IPC_dt * IPC_dt,
         lambda_lastH_scalar_gd,
         global_offset,
-        gd_frictionRate, d_vert_mu_gd);  // [per-body friction]
+        gd_frictionRate, d_vert_mu_gd,  // [per-body friction]
+        contact_tier_layout_mode() ? d_pairSnapLast + 5 : nullptr);
 }
 
 void GIPC::computeSelfCloseVal()
@@ -13687,6 +13720,14 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
+        // [P3b-2/guard] publish this frame's detection counts for kernel
+        // guards BEFORE _cpNum becomes the rank scratch.
+        {
+            uint32_t snapCur[6] = {h_cpNum[0], h_cpNum[1], h_cpNum[2],
+                                   h_cpNum[3], h_cpNum[4], h_gpNum};
+            CUDA_SAFE_CALL(cudaMemcpy(d_pairSnapCur, snapCur,
+                                      6 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        }
         CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
         //calBarrierHessian();
         //calBarrierGradient(contact_grads, Kappa);
