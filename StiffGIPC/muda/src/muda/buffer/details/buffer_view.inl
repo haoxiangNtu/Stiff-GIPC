@@ -97,9 +97,11 @@ MUDA_HOST void BufferViewT<IsConst, T>::fill(const T& v) const MUDA_REQUIRES(!Is
 {
     static_assert(!IsConst, "This must be non-const");
 
+    // [stiffgipc P3b-2] device-only operation: stream order is sufficient, a
+    // host wait here only stalls the pipeline (one hidden StreamSynchronize
+    // per call). Host-memory copy_from/copy_to below keep their waits.
     BufferLaunch()
-        .template fill<T>(*this, v)  //
-        .wait();
+        .template fill<T>(*this, v);
 }
 
 template <bool IsConst, typename T>
@@ -108,9 +110,9 @@ MUDA_HOST void BufferViewT<IsConst, T>::copy_from(const BufferViewT<true, T>& ot
 {
     static_assert(!IsConst, "This must be non-const");
 
+    // [stiffgipc P3b-2] D2D copy: stream-ordered, no host wait needed.
     BufferLaunch()
-        .template copy<T>(*this, other)  //
-        .wait();
+        .template copy<T>(*this, other);
 }
 
 template <bool IsConst, typename T>

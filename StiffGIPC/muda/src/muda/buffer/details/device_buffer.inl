@@ -132,9 +132,10 @@ void DeviceBuffer<T>::copy_from(const std::vector<T>& host)
 template <typename T>
 void DeviceBuffer<T>::resize(size_t new_size)
 {
+    // [stiffgipc P3b-2] stream-ordered device op: the wait only stalls the
+    // host (a hidden StreamSynchronize per call on hot paths).
     BufferLaunch()
-        .resize(*this, new_size)  //
-        .wait();
+        .resize(*this, new_size);
 }
 
 template <typename T>
@@ -156,9 +157,9 @@ void DeviceBuffer<T>::reserve(size_t new_capacity)
 template <typename T>
 void DeviceBuffer<T>::clear()
 {
+    // [stiffgipc P3b-2] see resize(): no host wait for device-only ops.
     BufferLaunch()
-        .clear(*this)  //
-        .wait();
+        .clear(*this);
 }
 
 template <typename T>
