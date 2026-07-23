@@ -6,6 +6,7 @@
 // Copyright (c) 2024 Kemeng Huang. All rights reserved.
 //
 
+#include <climits>
 #include "mlbvh.cuh"
 #include <cub/device/device_radix_sort.cuh>   // [perenv-parallel #2] malloc-free Morton sort
 #include <cmath>
@@ -31,16 +32,19 @@ __device__ int g_ccd_cp_cap = 0x7fffffff;
 // If counts become env-symmetric ⇒ the dedup line is the asymmetry; if still asymmetric ⇒
 // the edge-tree candidate enumeration (Morton) is.
 __device__ int g_ee_nodedup = 0;
-void set_ee_nodedup(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_nodedup, &v, sizeof(int))); }
+void set_ee_nodedup(int v) { static int last = INT_MIN; if(v == last) return; last = v;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_nodedup, &v, sizeof(int))); }
 // [xenv pin/fix] when 1, canonicalize each EE edge's endpoint order by POSITION before _dType_EE
 // (env-invariant since geometry is bit-identical) → kills the flipped-edge-order asymmetry.
 __device__ int g_ee_canon = 0;
-void set_ee_canon(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_canon, &v, sizeof(int))); }
+void set_ee_canon(int v) { static int last = INT_MIN; if(v == last) return; last = v;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_canon, &v, sizeof(int))); }
 __device__ __forceinline__ bool _pos_lt(const double3& a, const double3& b)
 { if(a.x != b.x) return a.x < b.x; if(a.y != b.y) return a.y < b.y; return a.z < b.z; }
 // [env-det] global→env-local vertex id (mirror across identical envs); FINAL tie-break in canon.
 __device__ const int* g_vloc = nullptr;
-void set_ee_vloc(const int* p) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_vloc, &p, sizeof(int*))); }
+void set_ee_vloc(const int* p) { static const int* last = (const int*)-1; if(p == last) return; last = p;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_vloc, &p, sizeof(int*))); }
 // [env-det] TOTAL env-invariant vertex order: position lexicographic, ties broken by env-local id.
 __device__ __forceinline__ bool _vless(const double3& a, uint32_t ia, const double3& b, uint32_t ib)
 { if(a.x != b.x) return a.x < b.x; if(a.y != b.y) return a.y < b.y; if(a.z != b.z) return a.z < b.z;
@@ -67,7 +71,8 @@ __device__ __forceinline__ double _seg_seg_d(double3 p1,double3 q1,double3 p2,do
 // [xenv pin] when 1, force the near-parallel EE mollifier OFF (add_e=-1) → drops the -obj_idx-2
 // global-edge-index encoding. Tests whether the residual barrier-gradient asymmetry is the mollifier.
 __device__ int g_ee_nomollify = 0;
-void set_ee_nomollify(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_nomollify, &v, sizeof(int))); }
+void set_ee_nomollify(int v) { static int last = INT_MIN; if(v == last) return; last = v;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_nomollify, &v, sizeof(int))); }
 // [xenv crack] log near-threshold EE candidate TESTS (full 4 ids = both edges) to localize the
 // membership residual: did env1 TEST a candidate env0 emitted? (enumeration vs classification)
 __device__ int g_ee_trace = 0;
@@ -79,9 +84,11 @@ __device__ int g_bvh_audit = 0;
 void set_bvh_audit(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_audit,&v,sizeof(int))); }
 void reset_max_stack(){ int z=0; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_max_stack,&z,sizeof(int))); }
 int get_max_stack(){ int v=0; CUDA_SAFE_CALL(cudaMemcpyFromSymbol(&v,g_max_stack,sizeof(int))); return v; }
-void set_ee_trace(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); }
+void set_ee_trace(int v) { static int last = INT_MIN; if(v == last) return; last = v;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); }
 __device__ int g_ee_tgt0 = -1; __device__ int g_ee_tgt1 = -1;
-void set_ee_tgt(int a, int b){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt0,&a,sizeof(int))); CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt1,&b,sizeof(int))); }
+void set_ee_tgt(int a, int b){ static int la = INT_MIN, lb = INT_MIN; if(a == la && b == lb) return; la = a; lb = b;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt0,&a,sizeof(int))); CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt1,&b,sizeof(int))); }
 // [env-det] env-LOCAL EE dedup: the once-only ownership `obj < self` uses GLOBAL edge indices, which
 // are not env-mirror ⇒ co-located envs keep different directed instances. Compare the two edges by
 // their env-local vertex-id key instead (mirror-invariant). g_ee_canon gates; needs g_vloc.
@@ -96,7 +103,8 @@ __device__ __forceinline__ uint64_t _edge_lkey(const uint2& e)
 // distance (geometric) instead of the order-sensitive dtype-selected sub-distance ⇒ identical-geometry
 // envs make the SAME emit decision for near-dHat-threshold contacts (the last bit-identity layer).
 __device__ int g_ee_detgate = 0;
-void set_ee_detgate(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_detgate, &v, sizeof(int))); }
+void set_ee_detgate(int v) { static int last = INT_MIN; if(v == last) return; last = v;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_detgate, &v, sizeof(int))); }
 // [env-det BVH] Morton sort for the per-env (active) build. Default = thrust::sort_by_key (unstable:
 // equal-Morton ties resolved by index VALUE ⇒ env-asymmetric for co-located near-degenerate geometry).
 // STIFF_BVH_ENVDET ⇒ stable_sort_by_key: equal-Morton ties keep the (env-local-canonical) active-list
@@ -1655,13 +1663,17 @@ __global__ void _sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, 
 
 // [env-part B] traversal pruning gate: skip other-env subtrees by env-id (no cross-env candidates).
 __device__ int g_bvh_envpart = 0;
-void set_bvh_envpart(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envpart, &v, sizeof(int))); }
+void set_bvh_envpart(int v) { static int last = INT_MIN; if(v == last) return; last = v;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envpart, &v, sizeof(int))); }
 
 // [perenv-par] per-vertex env id (= d_point_to_group); cross-env self-collision pairs skipped at
 // emission when set. -1 = ungrouped/static (never skipped). Null = gate off (byte-for-byte legacy).
 __device__ const int* g_self_p2g = nullptr;
 __device__ unsigned long long g_xskip = 0;   // [debug] count of cross-env pairs skipped
 void set_self_p2g(const int* p){
+    static const int* last = (const int*)-1;
+    if(p == last) return;
+    last = p;
     if(getenv("STIFF_XSKIP_DBG")) fprintf(stderr, "[self_p2g] set to %p\n", (const void*)p);
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_self_p2g, &p, sizeof(const int*)));
 }
