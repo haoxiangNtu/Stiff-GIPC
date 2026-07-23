@@ -221,10 +221,25 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                    [d_cnt, d_src] __device__(int) mutable
                    { *d_cnt = *d_src + 1; });
     }
-    CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
-                              global_triplets.d_unique_key_number,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
+    if(GIPCTripletMatrix::device_count_mode())
+    {
+        // [P3b-1/convert-count] no assembly-boundary readback: the host
+        // mirror keeps the pre-merge LENGTH as a layout upper bound and the
+        // true unique count lives only in d_unique_key_number. Pad slots
+        // [nuniq, length) keep zero VALUES (cleared below) and get their ids
+        // neutralized to (0,0) after the merge, so downstream consumers
+        // either guard by the device count (spmv/diag/MAS input) or deposit
+        // bitwise-invisible +0.0 into the always-present (0,0) key during
+        // the next binned merge.
+        global_triplets.h_unique_key_number = length;
+    }
+    else
+    {
+        CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
+                                  global_triplets.d_unique_key_number,
+                                  sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+    }
 
     // Upper-bound (nuniq <= length) async clear: legal inside capture and
     // independent of the host mirror.  Keep this at the exact sub-range
@@ -287,6 +302,27 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
 #pragma unroll
                        for(int c = 0; c < 9; ++c)
                            dd[c] = binned_combine(mbin + ((size_t)u * 9 + c) * BINNED_K);
+                   });
+    }
+
+    if(GIPCTripletMatrix::device_count_mode())
+    {
+        // [P3b-1/convert-count] neutralize pad ids in [nuniq, length): the
+        // scatter above writes ids only at real segment starts, so these
+        // slots would otherwise hold stale indices. Values are already zero
+        // from the range clear above.
+        auto* d_uniq_pad = global_triplets.d_unique_key_number;
+        auto  pad_rows   = global_triplets.block_row_indices(start);
+        auto  pad_cols   = global_triplets.block_col_indices(start);
+        ParallelFor(256)
+            .kernel_name("neutralize_pad_unique_ids")
+            .apply(capacity,
+                   [pad_rows, pad_cols, d_uniq_pad, length] __device__(int u) mutable
+                   {
+                       if(u < *d_uniq_pad || u >= length)
+                           return;
+                       pad_rows[u] = 0;
+                       pad_cols[u] = 0;
                    });
     }
 }

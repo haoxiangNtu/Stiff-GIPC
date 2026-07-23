@@ -17,8 +17,13 @@ namespace details
                    [diag = diag_inv.viewer().name("diag"),
                     hessian = global_triplets.block_values(),
                     rows = global_triplets.block_row_indices(),
-                    cols = global_triplets.block_col_indices()] __device__(int I) mutable
+                    cols = global_triplets.block_col_indices(),
+                    d_uniq = global_triplets.d_unique_key_number] __device__(int I) mutable
                    {
+                       // [P3b-1/convert-count] the host count may be a layout
+                       // upper bound; the device count is exact (legacy: equal).
+                       if(I >= *d_uniq)
+                           return;
                        auto i           = rows[I];
                        auto j           = cols[I];
                        auto H           = hessian[I];

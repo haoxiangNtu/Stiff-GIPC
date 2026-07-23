@@ -197,6 +197,19 @@ class GIPCTripletMatrix
     int* d_unique_key_number     = nullptr;
     int* d_assembly_scratch_count = nullptr;
 
+    // [P3b-1/convert-count] device-count mode: the abd-abd unique count and
+    // the global triplet count stay on device; host mirrors hold layout
+    // UPPER BOUNDS only. Kill-switch: STIFF_CONVERT_DEVICE_COUNT=0.
+    static bool device_count_mode()
+    {
+        static const bool on = []
+        {
+            const char* v = getenv("STIFF_CONVERT_DEVICE_COUNT");
+            return !(v && atoi(v) == 0);
+        }();
+        return on;
+    }
+
     // ②-D2H: one contiguous [4] block (abd_abd, abd_fem, fem_abd, fem_fem)
     // so partitionContactHessian reads the four start ids in one blocking D2H.
     // The unique count deliberately has its own allocation above.
