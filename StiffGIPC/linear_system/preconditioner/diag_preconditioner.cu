@@ -29,6 +29,12 @@ namespace details
                        auto H           = hessian[I];
                        if(i != j)
                            return;
+                       // [P3b-2/contact-tier] a (0,0) pad that survives as its
+                       // own unique key is a zero block — inverting it would
+                       // poison diag(0). Legacy never has zero diagonal blocks,
+                       // so this guard is behavior-neutral there.
+                       if(H.isZero(0.0))
+                           return;
 
                        diag(i) = eigen::inverse(H);
                    });

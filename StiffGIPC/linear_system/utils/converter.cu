@@ -44,6 +44,17 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
     if(length < 1)
         return;
     MUDA_ASSERT(capacity >= length, "converter tier must cover exact triplet count");
+    // [P3b-2/contact-tier] own the hash/sort scratch envelope: the hash-build
+    // writes index/hash over the FULL capacity. Callers historically sized
+    // these buffers transitively (pre-assembly bound*1.1); the tier layout
+    // widens slice capacities past that implicit contract, so grow here by
+    // the ACTUAL buffer capacity, not the external bookkeeping mirror.
+    if(global_triplets.m_block_index.capacity() < static_cast<size_t>(capacity))
+    {
+        global_triplets.resize_collision_hash_size(static_cast<size_t>(capacity));
+        if(global_triplets.global_external_max_capcity < capacity)
+            global_triplets.global_external_max_capcity = capacity;
+    }
     _radix_sort_indices_and_blocks(global_triplets, start, length, capacity, out_start_id);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
