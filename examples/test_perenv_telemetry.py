@@ -8,6 +8,8 @@ Config(per_env_exit=True):
   B) env_newton_iter_cap=1: both envs must report status=timeout (2) and the
      sim must survive (finite vertices) — a single env exceeding its budget is
      frozen, not fatal.
+  C) frame-graph runs expose PATH_S3_DEVICE_FREEZE and report zero host
+     boundaries for the normal device-owned freeze path.
 
 Run:  python3 examples/test_perenv_telemetry.py
 """
@@ -41,12 +43,13 @@ def run(env_cap, semi=False):
     V = np.asarray(eng.get_vertices())
     iters  = np.asarray(eng.native.get_per_env_newton_iters())[:2]
     status = np.asarray(eng.native.get_per_env_status())[:2]
-    return V, iters, status
+    frame = eng.get_frame_status()
+    return V, iters, status, frame
 
 
 ok = True
 
-V, iters, status = run(env_cap=0)
+V, iters, status, frame = run(env_cap=0)
 print(f"A normal : per-env iters={iters.tolist()} status={status.tolist()}")
 if not np.isfinite(V).all():
     print("FAIL: A diverged"); ok = False
@@ -54,15 +57,21 @@ if not (status == 1).all():
     print("FAIL: A envs did not report converged (1)"); ok = False
 if not (iters >= 0).all():
     print("FAIL: A freeze iters not recorded"); ok = False
+if os.environ.get("STIFF_FRAME_GRAPH") == "1":
+    s3_device_flag = bool(int(frame.path_flags) & (1 << 9))
+    print(f"  graph audit: host_boundaries={int(frame.host_boundaries)} "
+          f"s3_device_freeze={s3_device_flag}")
+    if int(frame.host_boundaries) != 0 or not s3_device_flag:
+        print("FAIL: graph S3 freeze did not remain device-owned"); ok = False
 
-V, iters, status = run(env_cap=1)
+V, iters, status, _ = run(env_cap=1)
 print(f"B cap=1  : per-env iters={iters.tolist()} status={status.tolist()}")
 if not np.isfinite(V).all():
     print("FAIL: B diverged after timeout freeze"); ok = False
 if not (status == 2).any():
     print("FAIL: B no env reported timeout (2) despite cap=1"); ok = False
 
-V, iters, status = run(env_cap=0, semi=True)
+V, iters, status, _ = run(env_cap=0, semi=True)
 print(f"C semi   : per-env iters={iters.tolist()} status={status.tolist()}")
 if not np.isfinite(V).all():
     print("FAIL: C diverged"); ok = False
