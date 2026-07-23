@@ -80,6 +80,11 @@ struct alignas(16) FrameAuxState
     int32_t _pad               = 0;
 };
 
+struct alignas(16) FramePhaseCounts
+{
+    uint32_t cp_gp[6] = {0, 0, 0, 0, 0, 0};
+};
+
 struct HostAttemptSnapshot
 {
     int    total_nt       = 0;
@@ -120,6 +125,8 @@ struct FrameGraphContext
     FrameBeginInput*    h_begin    = nullptr;
     FrameTerminalInput* h_terminal = nullptr;
     frame_fsm::FrameStatus* h_status = nullptr;
+    FramePhaseCounts*       h_phase_counts = nullptr;
+    FramePhaseCounts*       d_phase_counts = nullptr;  // mapped alias
 
     double3* fem_vertexes   = nullptr;
     double3* fem_o_vertexes = nullptr;
@@ -229,6 +236,7 @@ void destroy_context(FrameGraphContext* ctx)
     if(ctx->h_begin) cudaFreeHost(ctx->h_begin);
     if(ctx->h_terminal) cudaFreeHost(ctx->h_terminal);
     if(ctx->h_status) cudaFreeHost(ctx->h_status);
+    if(ctx->h_phase_counts) cudaFreeHost(ctx->h_phase_counts);
     delete ctx;
 }
 
@@ -283,14 +291,22 @@ __global__ void frame_post_pcg_continuation(
     state->phase = frame_fsm::PHASE_NEWTON_DECIDE;
 }
 
+__global__ void frame_publish_phase_counts(const uint32_t* counts,
+                                           FramePhaseCounts* mapped)
+{
+    if(blockIdx.x || threadIdx.x || !counts || !mapped) return;
+    for(int i = 0; i < 6; ++i) mapped->cp_gp[i] = counts[i];
+    __threadfence_system();
+}
+
 __global__ void frame_terminal_apply(frame_fsm::FrameDeviceState* state,
                                      const FrameTerminalInput* input,
                                      double* kappa,
                                      FrameAuxState* aux)
 {
     if(blockIdx.x || threadIdx.x) return;
-    state->newton_iter     = input->newton_iters;
-    state->ls_trial        = input->ls_trials;
+    state->newton_iter     = max(state->newton_iter, input->newton_iters);
+    state->ls_trial        = max(state->ls_trial, input->ls_trials);
     state->substep         = input->substeps;
     state->host_boundaries = input->host_boundaries;
     state->path_flags |= input->path_flags_or;
@@ -304,10 +320,16 @@ __global__ void frame_terminal_apply(frame_fsm::FrameDeviceState* state,
     state->required_triplets = input->required_triplets;
     state->required_unique_blocks = input->required_unique_blocks;
     state->required_mas_clusters = input->required_mas_clusters;
-    state->alpha        = input->final_alpha;
-    state->cfl_alpha    = input->cfl_alpha;
-    state->energy_trial = input->final_energy;
-    state->max_movement = input->max_movement;
+    // Phase transitions own these observability scalars in frame-graph mode.
+    // Keep the host terminal packet as a compatibility fallback only when no
+    // device phase has published a value.
+    if(!(state->path_flags & frame_fsm::PATH_GRAPH_ACTIVE))
+    {
+        state->alpha        = input->final_alpha;
+        state->cfl_alpha    = input->cfl_alpha;
+        state->energy_trial = input->final_energy;
+        state->max_movement = input->max_movement;
+    }
     state->kappa        = input->kappa;
     *kappa              = input->kappa;
     aux->substep        = input->substeps;
@@ -944,9 +966,18 @@ void GIPC::prepare_frame_graph(device_TetraData& mesh)
         CUDA_SAFE_CALL(cudaHostAlloc(reinterpret_cast<void**>(&ctx->h_status),
                                      sizeof(frame_fsm::FrameStatus),
                                      cudaHostAllocPortable));
+        CUDA_SAFE_CALL(cudaHostAlloc(
+            reinterpret_cast<void**>(&ctx->h_phase_counts),
+            sizeof(FramePhaseCounts),
+            cudaHostAllocPortable | cudaHostAllocMapped));
+        CUDA_SAFE_CALL(cudaHostGetDevicePointer(
+            reinterpret_cast<void**>(&ctx->d_phase_counts),
+            ctx->h_phase_counts,
+            0));
         *ctx->h_begin = FrameBeginInput{};
         *ctx->h_terminal = FrameTerminalInput{};
         *ctx->h_status = frame_fsm::FrameStatus{};
+        *ctx->h_phase_counts = FramePhaseCounts{};
 
         capture_pcg_continuation_graph(*ctx);
         if(m_global_linear_system)
@@ -1138,10 +1169,19 @@ int GIPC::frame_graph_read_phase()
 {
     FrameGraphContext& ctx = context(*this);
     int phase = frame_fsm::PHASE_IDLE;
+    frame_publish_phase_counts<<<1, 1, 0, cudaStreamPerThread>>>(
+        _cpNum, ctx.d_phase_counts);
     CUDA_SAFE_CALL(cudaMemcpy(&phase,
                               &ctx.d_state->phase,
                               sizeof(phase),
                               cudaMemcpyDeviceToHost));
+    std::memcpy(h_cpNum,
+                ctx.h_phase_counts->cp_gp,
+                5 * sizeof(uint32_t));
+    h_gpNum = ctx.h_phase_counts->cp_gp[5];
+    ctx.hw_dcd = std::max(ctx.hw_dcd, static_cast<int>(h_cpNum[0]));
+    if(phase == frame_fsm::PHASE_ASSEMBLY)
+        snapshotDcdCcdPairs();
     ++ctx.host_boundaries;
     return phase;
 }
