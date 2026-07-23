@@ -93,7 +93,7 @@ substep+未消费的 min/max D2H；telemetry event/文件写。
 | Newton 收敛决策 | ✓ codex | d8035e6 | phase 链 + FrameDeviceState |
 | CCD α / LS 试步 | ✓ codex | d8035e6 | PHASE_CCD→LINE_SEARCH→POST 链 |
 | MAS 层级 extent | ✓ | 9bee717 | 分配背书上界 m_allocClusterTotal + 消费 kernel 读 d_levelSize[levelnum] 裁切（可空 extent 指针，legacy 位级不变） |
-| converter unique | ✓ | 41aff31 | bound 布局 + pad 中性化（值零 + (0,0) id）→ binned 归并吸收 +0.0（位级不可见）；消费端 *d_unique 守卫 |
+| converter unique | ◐ 全局 convert 已消；ABD 链保留 | 41aff31 + 8229166 | bound 布局仅限 start==0 的最终全局 convert（消费端 *d_unique 守卫 + pad 中性化）。ABD slice/中段 convert 是 展开×16/归并收缩 循环的收缩步，bound 会每帧 ×16 复利（part3_fem 1.38M→22M→353M），保留 exact 回读，待 tier-dispatch 收编 |
 | per-env S3 freeze | codex 进行中 | p3b1/s3-freeze 分支 | S4 mask 先例扩展 |
 | contact counts / 装配图化 | 未开工（P3b-2） | — | 见下节 |
 
