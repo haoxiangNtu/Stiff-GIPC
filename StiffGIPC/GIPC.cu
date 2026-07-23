@@ -11363,9 +11363,14 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
         b._mch_alt=s.mch_alt; b._idx_alt=s.idx_alt; b._sort_cap=s.sort_cap; };
   ccd_redo:
     CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, sizeof(uint32_t)));
-    // memset is on the DEFAULT stream; pool-stream detects atomicAdd _cpNum → make the zero globally
-    // visible before any pool-stream work (same fix as the DCD loop).
-    if(ccd_par) CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // Device-side fork (same as the DCD loop): pool streams wait on a PTDS
+    // event instead of a host-blocking device-wide synchronize.
+    if(ccd_par)
+    {
+        CUDA_SAFE_CALL(cudaEventRecord(m_pool_fork_event, cudaStreamPerThread));
+        for(int k = 0; k < ccd_K; ++k)
+            CUDA_SAFE_CALL(cudaStreamWaitEvent(m_pool_streams[k], m_pool_fork_event, 0));
+    }
     {
         int ci = 0;
         for(int e : h_perenv_active)
@@ -11391,7 +11396,10 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
             ++ci;
         }
     }
-    if(ccd_par) { for(int k2 = 0; k2 < ccd_K; ++k2) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k2]));
+    if(ccd_par) { // device-side join: pool -> PTDS (the count D2H below orders after it)
+                  for(int k2 = 0; k2 < ccd_K; ++k2)
+                  { CUDA_SAFE_CALL(cudaEventRecord(m_pool_join_events[k2], m_pool_streams[k2]));
+                    CUDA_SAFE_CALL(cudaStreamWaitEvent(cudaStreamPerThread, m_pool_join_events[k2], 0)); }
                   cswapIn(bvh_f, cof); cswapIn(bvh_e, coe); }  // restore original scratch
     CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     frame_graph_guard_pairs(0, static_cast<int>(h_ccd_cpNum));
@@ -11787,7 +11795,16 @@ void GIPC::allocPerEnvPool(int K)
             allocSort(s, nE); }
     }
     m_pool_streams.resize(K);
-    for(int k = 0; k < K; ++k) CUDA_SAFE_CALL(cudaStreamCreate(&m_pool_streams[k]));
+    m_pool_join_events.resize(K);
+    for(int k = 0; k < K; ++k)
+    {
+        CUDA_SAFE_CALL(cudaStreamCreate(&m_pool_streams[k]));
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(&m_pool_join_events[k],
+                                                cudaEventDisableTiming));
+    }
+    if(!m_pool_fork_event)
+        CUDA_SAFE_CALL(cudaEventCreateWithFlags(&m_pool_fork_event,
+                                                cudaEventDisableTiming));
     m_pool_K = K;
 }
 
@@ -11821,9 +11838,15 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
   perenv_redo:
     CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_gpNum, 0, sizeof(uint32_t)));
-    // [FIX] memsets are on DEFAULT stream; per-env detects on POOL streams. Sync once so the zero is
-    // globally visible before any pool-stream detect atomicAdds to _cpNum (else garbage slot -> OOB).
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // memsets are on the PTDS stream; per-env detects run on POOL streams.
+    // Device-side fork: pool streams wait on a PTDS event so the zeros (and
+    // all earlier PTDS writes) are visible without stalling the host.
+    if(par)
+    {
+        CUDA_SAFE_CALL(cudaEventRecord(m_pool_fork_event, cudaStreamPerThread));
+        for(int k = 0; k < K; ++k)
+            CUDA_SAFE_CALL(cudaStreamWaitEvent(m_pool_streams[k], m_pool_fork_event, 0));
+    }
     int i = 0;
     for(int e : h_perenv_active)
     {
@@ -11846,7 +11869,10 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
         }
         ++i;
     }
-    if(par) { for(int k = 0; k < K; ++k) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k]));
+    if(par) { // device-side join: pool -> PTDS (the count D2H below orders after it)
+              for(int k = 0; k < K; ++k)
+              { CUDA_SAFE_CALL(cudaEventRecord(m_pool_join_events[k], m_pool_streams[k]));
+                CUDA_SAFE_CALL(cudaStreamWaitEvent(cudaStreamPerThread, m_pool_join_events[k], 0)); }
               swapIn(bvh_f, of); swapIn(bvh_e, oe); }  // restore original scratch
     CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     frame_graph_guard_pairs(static_cast<int>(h_cpNum[0]),

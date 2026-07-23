@@ -59,6 +59,10 @@ class GIPC
                         uint64_t* mch_alt=nullptr; uint32_t* idx_alt=nullptr; int sort_cap=0; };
     std::vector<BvhScratch>   m_pool_f, m_pool_e;
     std::vector<cudaStream_t> m_pool_streams;
+    // [P3b-2] fork-join events: pool streams join back into PTDS via
+    // StreamWaitEvent instead of host StreamSynchronize (K syncs/detection).
+    std::vector<cudaEvent_t>  m_pool_join_events;
+    cudaEvent_t               m_pool_fork_event = nullptr;
     int               m_pool_K = 0;                  // 0 = pool not allocated
     void allocPerEnvPool(int K);                     // alloc K scratch sets + streams (once)
     const int*        m_d_p2g = nullptr;             // captured TetMesh.d_point_to_group (for lazy index build)
