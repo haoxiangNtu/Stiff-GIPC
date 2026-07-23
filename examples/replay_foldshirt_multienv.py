@@ -173,6 +173,19 @@ def apply_frame(robot, ej, raw, close_r):
 def main():
     ep = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else DEFAULT_EP
     num_envs = int(os.environ.get("CASE39ME_NUM_ENVS", "4"))
+    # [v0.8.5] Mode-driven env-layout policy: in strict mode the layout is a
+    # FIXED strategy, not a scene choice — physics loads CO-LOCATED (so envs
+    # are bitwise comparable), the engine separates envs for the broad phase
+    # via d_env_offset, and visual separation is applied at DISPLAY time only
+    # (never touching physics). Explicit CASE39ME_SPACING/BVH_OFFSET still
+    # override for experiments.
+    _mode = os.environ.get("STIFF_MULTIENV_MODE", "merged").strip().lower()
+    _strict = _mode in ("strict", "2", "deterministic", "c")
+    if _strict and "CASE39ME_SPACING" not in os.environ        and "CASE39ME_BVH_OFFSET" not in os.environ:
+        os.environ["CASE39ME_SPACING"] = "0"
+        os.environ["CASE39ME_BVH_OFFSET"] = "4.0"
+        print("[fs] strict mode -> co-located physics + BVH-domain separation "
+              "+ display-only visual offsets (fixed policy)", flush=True)
     spacing  = float(os.environ.get("CASE39ME_SPACING", "4.0"))
     close_r  = float(os.environ.get("CASE39_CLOSE_RATIO", "0.0"))
 
@@ -249,6 +262,19 @@ def main():
     # d_env_offset (BVH sees offset copies; physics stays on local vertices).
     # This is the v0.8.3 bitwise-trio configuration.
     bvh_off = float(os.environ.get("CASE39ME_BVH_OFFSET", "0"))
+    disp_off = None
+    if bvh_off > 0.0 and num_envs > 1:
+        # display-only per-vertex offsets (same grid as the BVH domains)
+        recs_all = eng.get_load_records()
+        per_env = len(recs_all) // num_envs
+        doffs = make_env_offsets(num_envs, bvh_off)
+        import numpy as _np
+        disp_off = _np.zeros((int(eng.get_vertices().shape[0]), 3), dtype=_np.float64)
+        for e in range(num_envs):
+            o3 = (float(doffs[e][0, 3]), 0.0, float(doffs[e][2, 3]))
+            for r in recs_all[e * per_env:(e + 1) * per_env]:
+                a, b = int(r.vertex_offset), int(r.vertex_offset) + int(r.vertex_count)
+                disp_off[a:b] = o3
     if bvh_off > 0.0 and num_envs > 1:
         boffs = make_env_offsets(num_envs, bvh_off)
         flat = []
@@ -307,7 +333,8 @@ def main():
         return
 
     import polyscope as ps, polyscope.imgui as psim
-    v = eng.get_vertices(); fa = eng.get_surface_faces()
+    _disp = (lambda x: x + disp_off) if disp_off is not None else (lambda x: x)
+    v = _disp(eng.get_vertices()); fa = eng.get_surface_faces()
     ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("shadow_only")
     st = dict(idx=0, run=False, ms=0., fps=0., mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6,0.7,0.8)), v=v, f=fa)
     def cb():
@@ -327,7 +354,7 @@ def main():
         t=time.perf_counter(); eng.step(); st['ms']=(time.perf_counter()-t)*1000.0
         inst = 1000.0/st['ms'] if st['ms']>0 else 0.0
         st['fps'] = inst if st['fps']==0. else 0.9*st['fps'] + 0.1*inst
-        v=eng.get_vertices(); fa=eng.get_surface_faces()
+        v=_disp(eng.get_vertices()); fa=eng.get_surface_faces()
         if v.shape[0]!=st['v'].shape[0] or fa.shape!=st['f'].shape:
             st['mesh']=ps.register_surface_mesh("scene", v, fa, color=(0.6,0.7,0.8)); st['v'],st['f']=v,fa
         else: st['mesh'].update_vertex_positions(v)
