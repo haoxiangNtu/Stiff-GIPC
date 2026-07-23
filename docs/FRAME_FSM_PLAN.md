@@ -160,3 +160,12 @@ compute-sanitizer memcheck/racecheck 零报告。
   graph 审计——从未失败。批内 FAIL(1) 偶发为测试退出路径问题，与 hash 无关。
 - 结论：多态不构成 abd-tier 转默认的阻塞。转默认前置 = STIFF_ABD_TIER=1
   的全量门（37 回归 + strict 锚 16/16 + sanitizer）绿。
+
+## v0.9 定位（2026-07-24，用户决策）
+
+本分支冻结为 v0.9 系列预研基线。已达成：P3b-1 六边界 + P3b-2 结构里程碑
+（6.2 launch + 4.8 sync + ~0 deviceSync/帧，muda 隐藏 wait 铲除、event
+fork-join、tier 布局、D2D 快照、ABD tier opt-in + OVF-RETRY）。
+剩余（v0.9 续做）：ABD_TIER=1 大场景 FG=1 复验（上轮门被并行重编译污染）、
+检测计数稳态跳读（快照/guard 已备，缺回读条件化+OVF 终端）、装配段图捕获、
+全链尾链闭合 1+1+1。近期主线回到 v0.8 系列（perf/v0842-gpu-control）实测。
