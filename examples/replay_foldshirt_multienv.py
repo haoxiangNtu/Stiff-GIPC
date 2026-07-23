@@ -263,18 +263,20 @@ def main():
     # This is the v0.8.3 bitwise-trio configuration.
     bvh_off = float(os.environ.get("CASE39ME_BVH_OFFSET", "0"))
     disp_off = None
-    if bvh_off > 0.0 and num_envs > 1:
-        # display-only per-vertex offsets (same grid as the BVH domains)
+    if bvh_off > 0.0 and num_envs > 1 and 'groups' in locals():
+        # Display-only per-vertex offsets. Bodies are loaded in TWO phases
+        # (all-ABD then all-FEM), so never assume env-contiguous records —
+        # use the same per-body groups list that set_body_groups() gets
+        # (records order == body order).
         recs_all = eng.get_load_records()
-        per_env = len(recs_all) // num_envs
+        assert len(recs_all) == len(groups), (len(recs_all), len(groups))
         doffs = make_env_offsets(num_envs, bvh_off)
         import numpy as _np
         disp_off = _np.zeros((int(eng.get_vertices().shape[0]), 3), dtype=_np.float64)
-        for e in range(num_envs):
-            o3 = (float(doffs[e][0, 3]), 0.0, float(doffs[e][2, 3]))
-            for r in recs_all[e * per_env:(e + 1) * per_env]:
-                a, b = int(r.vertex_offset), int(r.vertex_offset) + int(r.vertex_count)
-                disp_off[a:b] = o3
+        for r, g in zip(recs_all, groups):
+            o3 = (float(doffs[g][0, 3]), 0.0, float(doffs[g][2, 3]))
+            a, b = int(r.vertex_offset), int(r.vertex_offset) + int(r.vertex_count)
+            disp_off[a:b] = o3
     if bvh_off > 0.0 and num_envs > 1:
         boffs = make_env_offsets(num_envs, bvh_off)
         flat = []
