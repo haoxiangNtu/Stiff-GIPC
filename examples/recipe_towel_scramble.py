@@ -88,7 +88,7 @@ assert np.isfinite(P_scrambled).all(), "scramble diverged"
 # crumple metric: ground footprint vs the FLAT towel's area (the towel is
 # loaded tilted, so use its largest extent — the unshrunk edge — as flat side)
 flat_side = float((P0.max(0) - P0.min(0)).max())
-crumple = (P_scrambled[:, 0].ptp() * P_scrambled[:, 2].ptp()) / (flat_side * flat_side)
+crumple = (np.ptp(P_scrambled[:, 0]) * np.ptp(P_scrambled[:, 2])) / (flat_side * flat_side)
 print(f"[scramble] footprint ratio vs flat = {crumple:.3f} (smaller = more folded)")
 
 # ---------------- Phase 2: save ----------------
