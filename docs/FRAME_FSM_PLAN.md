@@ -101,8 +101,21 @@ substep+未消费的 min/max D2H；telemetry event/文件写。
 
 ## P3b-2 剩余工作（1+1+1 终态）
 
-现状（4090, strict quad, FG=1 稳态）：6.2 graphLaunch + 43.6 streamSync +
-7.7 deviceSync + 29.7 blocking memcpy + 35.5 memcpyToSymbol / 帧。
+现状（4090, strict quad, FG=1 稳态, 33f33b7 后）：
+**6.2 graphLaunch + 4.8 streamSync + ~0 deviceSync + 35.5 blocking memcpy
++ 1.2 memcpyToSymbol / 帧**（起点 6.2/43.6/7.7/29.7/35.5）。
+已消：muda 便捷方法隐藏 wait（fill/D2D copy/resize/clear —— vendored muda
+去 wait，host 内存传输保留）、per-env BVH 池 event fork-join（racecheck 0）、
+接触四件套 guard 设备化（d_pairSnapCur/Last 专用快照槽）、ToSymbol
+alloc-once。全量门 37 PASS + 锚 16/16 + sanitizer 0 + 双引擎（dewait_gates）。
+
+剩余 35.5 blocking memcpy 构成（DtoH: 6.7×4B 计数 + 2.4×8B 标量 +
+2.2×20B cp5 + 2.1×12B + 1.3×16B + 1.2×24B cp_gp6 + 0.5×32B）= 检测计数
+回读 + ABD 链 exact 收缩 + 分段起点 —— 全部归 tier-dispatch 子块：
+ABD 链 tier 化要点：host 反馈值 = tier(nuniq)（稳态常量，无 ×16 复利，
+区别于第一版反馈 length 的事故），kernel 按 *d_uniq 精确展开 + pad 中性化
+到 tier 边界，OVF 比较 kernel 超档走 required_unique_blocks RETRY（通道已
+存在 frame_transaction.cu:1236）。
 
 1. contact counts D2H（h_cpNum/h_gpNum/partition 四段起点）：
    - [x] 接触 triplet tier 布局（406e4a5）：staging 即最终布局、无压实
