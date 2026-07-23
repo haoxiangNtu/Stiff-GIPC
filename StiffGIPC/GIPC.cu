@@ -7270,10 +7270,12 @@ __global__ void _markGroundTrialInvalid(const double3* vertexes,
 
 __global__ void _halveGroundInvalidEnvAlpha(double* env_alpha,
                                             const int* env_invalid,
+                                            const int* s3_frozen,
                                             int group_count)
 {
     int group = blockIdx.x * blockDim.x + threadIdx.x;
     if(group >= group_count || env_invalid[group] == 0) return;
+    if(s3_frozen && s3_frozen[group]) return;
     env_alpha[group] *= 0.5;
 }
 
@@ -8623,6 +8625,7 @@ __global__ void _stepForward_perenv(double3*       _vertexes,
                                     const int*     bType,
                                     const int*     p2g,
                                     const double*  env_alpha,
+                                    const int*     s3_frozen,
                                     double         alpha,
                                     bool           moveBoundary,
                                     int            numbers)
@@ -8633,6 +8636,7 @@ __global__ void _stepForward_perenv(double3*       _vertexes,
     {
         int    g = p2g[idx];
         double a = (g >= 0 && env_alpha[g] >= 0.0) ? env_alpha[g] : alpha;
+        if(s3_frozen && g >= 0 && s3_frozen[g]) a = 0.0;
         _vertexes[idx] =
             __GEIGEN__::__minus(_vertexesTemp[idx],
                                 __GEIGEN__::__s_vec_multiply(_moveDir[idx], a));
@@ -8641,13 +8645,19 @@ __global__ void _stepForward_perenv(double3*       _vertexes,
 
 // [multi-env S2] gather per-ABD-body alpha: body b (0..abd_body_num) belongs to
 // collision body b -> group body_to_group[b] -> env_alpha[group]. -1 if ungrouped.
-__global__ void _gather_abd_body_alpha(const int* body_to_group, const double* env_alpha,
-                                       double* abd_body_alpha, int abd_body_num, int ng)
+__global__ void _gather_abd_body_alpha(const int* body_to_group,
+                                       const double* env_alpha,
+                                       const int* s3_frozen,
+                                       double* abd_body_alpha,
+                                       int abd_body_num,
+                                       int ng)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if(b >= abd_body_num) return;
     int g = body_to_group[b];
-    abd_body_alpha[b] = (g >= 0 && g < ng) ? env_alpha[g] : -1.0;
+    abd_body_alpha[b] = (g >= 0 && g < ng)
+                            ? ((s3_frozen && s3_frozen[g]) ? 0.0 : env_alpha[g])
+                            : -1.0;
 }
 
 __global__ void _updateVelocities(double3* _vertexes,
@@ -9294,6 +9304,17 @@ void GIPC::FREE_DEVICE_MEM()
     if(m_env_scratch)  { CUDA_SAFE_CALL(cudaFree(m_env_scratch));  m_env_scratch  = nullptr; }
     if(m_abd_body_alpha) { CUDA_SAFE_CALL(cudaFree(m_abd_body_alpha)); m_abd_body_alpha = nullptr; }
     if(m_env_active)   { CUDA_SAFE_CALL(cudaFree(m_env_active));   m_env_active   = nullptr; }
+    if(m_s3_frozen)      { CUDA_SAFE_CALL(cudaFree(m_s3_frozen));      m_s3_frozen = nullptr; }
+    if(m_s3_frozen_iter) { CUDA_SAFE_CALL(cudaFree(m_s3_frozen_iter)); m_s3_frozen_iter = nullptr; }
+    if(m_s3_status)      { CUDA_SAFE_CALL(cudaFree(m_s3_status));      m_s3_status = nullptr; }
+    if(m_s3_semi_beta)   { CUDA_SAFE_CALL(cudaFree(m_s3_semi_beta));   m_s3_semi_beta = nullptr; }
+    if(m_s3_semi_freeze_next)
+    {
+        CUDA_SAFE_CALL(cudaFree(m_s3_semi_freeze_next));
+        m_s3_semi_freeze_next = nullptr;
+    }
+    m_s3_device_freeze_active = false;
+    m_s3_device_telemetry_valid = false;
 
     // [0be8da3-port] free the persistent (grow-only) friction/close buffers and
     // reset capacities so engine.reset() starts clean.
@@ -9441,6 +9462,15 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_alpha, kEnvAlphaSlots * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_scratch, 5 * kEnvAlphaSlots * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_active, kEnvAlphaSlots * sizeof(int)));
+    // [P3b-1/S3-freeze] These are deliberately independent allocations. Do not
+    // tuck the mask into m_env_scratch or another shared control block: several
+    // assembly/CCD kernels reuse those blocks during the same Newton iteration.
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_s3_frozen, kEnvAlphaSlots * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_s3_frozen_iter, kEnvAlphaSlots * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_s3_status, kEnvAlphaSlots * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_s3_semi_beta, kEnvAlphaSlots * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc(
+        (void**)&m_s3_semi_freeze_next, kEnvAlphaSlots * sizeof(int)));
     h_env_alpha.assign(kEnvAlphaSlots, 1.0);
     h_env_active.assign(kEnvAlphaSlots, 1);
     // [batch-size hygiene] m_env_alpha starts at 1.0 like the host mirror: the device fast path
@@ -9457,6 +9487,14 @@ void GIPC::MALLOC_DEVICE_MEM()
                                 5 * kEnvAlphaSlots * sizeof(double), cudaMemcpyHostToDevice)); }
     { std::vector<int> ones(kEnvAlphaSlots, 1);
       CUDA_SAFE_CALL(cudaMemcpy(m_env_active, ones.data(), kEnvAlphaSlots * sizeof(int), cudaMemcpyHostToDevice)); }
+    CUDA_SAFE_CALL(cudaMemset(m_s3_frozen, 0, kEnvAlphaSlots * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(m_s3_frozen_iter, 0xff, kEnvAlphaSlots * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(m_s3_status, 0, kEnvAlphaSlots * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemset(
+        m_s3_semi_freeze_next, 0, kEnvAlphaSlots * sizeof(int)));
+    { std::vector<double> ones(kEnvAlphaSlots, 1.0);
+      CUDA_SAFE_CALL(cudaMemcpy(m_s3_semi_beta, ones.data(),
+                                kEnvAlphaSlots * sizeof(double), cudaMemcpyHostToDevice)); }
 
     // Device energy terms and line-search control state.
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
@@ -10833,13 +10871,94 @@ __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir,
     _atomicMaxPosDouble(&per_env_max[g], __GEIGEN__::__norm(moveDir[v]));
 }
 
-// [perf] DEVICE-SIDE per-env feasible alpha + freeze — replaces the per-Newton-iter host round-trip
-// (cudaDeviceSynchronize + 5x256-double D2H + 256-env host loop + H2D) that made the per-env path
-// host-bound. scratch layout: [0*ng)=ground, [1*ng)=narrow-self, [2*ng)=refined-self,
+// [P3b-1/S3-freeze] Derive the early per-env Newton freeze decision directly
+// from the device max-movement slots. The output is a dedicated allocation,
+// never an alias into the feasibility scratch/control blocks. Telemetry stays
+// device-resident as well; explicit API queries may copy it after the frame.
+__global__ void _s3_derive_freeze_mask(int*                         frozen,
+                                       int*                         frozen_iter,
+                                       int*                         status,
+                                       double*                      semi_beta,
+                                       int*                         semi_freeze_next,
+                                       const double*                previous_alpha,
+                                       const double*                scratch,
+                                       int                          ng,
+                                       int                          iter,
+                                       int                          decouple,
+                                       double                       thr_cv,
+                                       const double*                env_bbox2,
+                                       double                       ntol_dt,
+                                       double                       vtol_dt,
+                                       int                          env_iter_cap,
+                                       int                          semi_enabled,
+                                       int                          semi_min_iter,
+                                       double                       semi_tol,
+                                       frame_fsm::FrameDeviceState* frame)
+{
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    if(g == 0 && frame)
+        atomicOr(&frame->path_flags,
+                 static_cast<uint32_t>(frame_fsm::PATH_S3_DEVICE_FREEZE));
+
+    // Match the host ordering exactly: beta is updated and may arm a sticky
+    // freeze-next latch before this iteration's convergence/timeout decision.
+    // A normal convergence in the same iteration therefore does not discard a
+    // newly armed semi-implicit exit if a later S4 recheck wakes the env.
+    if(semi_enabled && iter >= semi_min_iter + 1 && status[g] == 0)
+    {
+        double beta = semi_beta[g] * fmax(0.0, 1.0 - previous_alpha[g]);
+        semi_beta[g] = beta;
+        if(beta <= semi_tol) semi_freeze_next[g] = 1;
+    }
+    // The host clears its static latch at k==0 after the optional beta update.
+    if(iter == 0) semi_freeze_next[g] = 0;
+
+    const double nmx = scratch[4 * ng + g];
+    const bool present = nmx > 0.0 || (env_bbox2 && env_bbox2[g] > 0.0);
+    if(!present)
+    {
+        frozen[g] = 0;
+        return;
+    }
+
+    double thr_g = thr_cv;
+    if(env_bbox2 && env_bbox2[g] > 0.0)
+        thr_g = (vtol_dt > 0.0) ? vtol_dt : ntol_dt * sqrt(env_bbox2[g]);
+
+    bool freeze = decouple && nmx < thr_g;
+    int  reason = freeze ? 1 : 0;
+    if(!freeze && !isfinite(nmx))
+    {
+        freeze = true;
+        reason = 3;
+    }
+    else if(!freeze && env_iter_cap > 0 && iter + 1 >= env_iter_cap)
+    {
+        freeze = true;
+        reason = 2;
+    }
+
+    if(!freeze && semi_enabled && semi_freeze_next[g])
+    {
+        freeze = true;
+        reason = 1;
+    }
+
+    frozen[g] = freeze ? 1 : 0;
+    if(freeze && frozen_iter[g] < 0)
+    {
+        frozen_iter[g] = iter;
+        if(status[g] == 0) status[g] = reason ? reason : 1;
+    }
+}
+
+// [perf] DEVICE-SIDE per-env feasible alpha. scratch layout:
+// [0*ng)=ground, [1*ng)=narrow-self, [2*ng)=refined-self,
 // [3*ng)=surface cfl-max, [4*ng)=all-vertex Newton max-move.
-// Writes env_alpha[g] directly (device), atomics n_env/n_frozen into cnt[0:2],
-// and returns the effective invalid mask in cnt[2]. Math is bit-identical to
-// the host loop (same per-env formulas, no reduction) → preserves strict cross-env bit-identity.
+// With s3_frozen==nullptr this retains the legacy alpha-zero freeze and exact
+// control flow. Graph mode keeps feasible alpha separate and consumers apply
+// the dedicated mask explicitly.
 __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng,
                                        double sq, double ccd_size, int have_ccd,
                                        double temp_alpha, double alpha_CFL, int decouple,
@@ -10848,7 +10967,8 @@ __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch,
                                        const int* refined_invalid,
                                        const int* ccd_alpha_invalid,
                                        int* cnt,
-                                       const double* global_slots = nullptr)
+                                       const double* global_slots = nullptr,
+                                       const int* s3_frozen = nullptr)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
@@ -10886,10 +11006,13 @@ __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch,
     double thr_g = thr_cv;
     if(env_bbox2 && env_bbox2[g] > 0.0)
         thr_g = (vtol_dt > 0.0) ? vtol_dt : (ntol_dt * sqrt(env_bbox2[g]));
-    if(decouple && nmx < thr_g) a = 0.0;   // freeze by ALL vertices, not surface-only CFL
+    const bool freeze = s3_frozen ? (s3_frozen[g] != 0)
+                                  : (decouple && nmx < thr_g);
+    if(!s3_frozen && freeze) a = 0.0;   // legacy: freeze by zeroing feasible alpha
     env_alpha[g] = a;
     atomicAdd(&cnt[0], 1);                   // n_env (present)
-    if(a == 0.0) atomicAdd(&cnt[1], 1);      // n_frozen
+    if(freeze || (!s3_frozen && a == 0.0))
+        atomicAdd(&cnt[1], 1);               // n_frozen
 }
 
 // Diagnostic host mode retains its existing telemetry D2Hs. Promote a raw
@@ -10933,23 +11056,25 @@ __global__ void _compute_perenv_ta(const double* scratch, double* ta, int ng)
     ta[g] = fmin(gs, ns);
 }
 
-// [S4-dev] device-derived per-env active mask — replaces the S4 host detection (own max-move
-// kernel + D2H + host loop + H2D per iter) with ZERO added D2H: the freeze decision is already on
-// device in m_env_alpha (set by _per_env_alpha_compute from a REAL solve). active = (alpha != 0).
-// A masked env's next moveDir is 0 (RHS zeroed) -> hmx=0 -> _per_env_alpha_compute treats it as
-// absent and leaves env_alpha unchanged (stays 0) -> stays masked until the periodic all-active
-// recheck (top of loop) re-solves it for bounce-back detection. Deterministic (fixed cadence,
-// per-env decision) -> strict/batch-invariance safe.
+// [S4-dev] Device-derived per-env active mask. The S3 graph path consumes its dedicated freeze
+// mask; the legacy device-mask experiment falls back to alpha==0. Either source replaces S4's own
+// max-move D2H + host loop + H2D. A masked env's next moveDir is zero (RHS zeroed) until the
+// periodic all-active recheck at the top of the loop. Deterministic fixed cadence keeps the strict
+// and batch-invariance paths stable.
 __global__ void _mask_fill(int* m, int v, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if(i < n) m[i] = v;
 }
-__global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, int ng)
+__global__ void _mask_from_env_alpha(int* env_active,
+                                     const double* env_alpha,
+                                     const int* s3_frozen,
+                                     int ng)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
-    env_active[g] = (env_alpha[g] == 0.0) ? 0 : 1;
+    env_active[g] = s3_frozen ? (s3_frozen[g] ? 0 : 1)
+                              : ((env_alpha[g] == 0.0) ? 0 : 1);
 }
 
 // [perf] DEVICE-SIDE per-group κ doubling (postLineSearch) — replaces the per-Newton host round-trip
@@ -10957,7 +11082,9 @@ __global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, i
 // close contact (capped at kappaMax, host scalar), and atomicMax's the envelope into maxK_out (init =
 // current Kappa). Bit-identical to the host loop (same double+cap; max is order-free) → strict OK.
 __global__ void _per_group_kappa_double(double* kappa_group, const int* close_grp,
-                                        const double* env_alpha, int ng,
+                                        const double* env_alpha,
+                                        const int* s3_frozen,
+                                        int ng,
                                         double kappaMax, double* maxK_out)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
@@ -10965,7 +11092,9 @@ __global__ void _per_group_kappa_double(double* kappa_group, const int* close_gr
     // A frozen environment must freeze its contact parameters as well as its state. Otherwise,
     // extra Newton iterations required by batch-mates keep doubling this group's kappa and can
     // reactivate it at a different optimum, making strict env0 depend on batch size.
-    if(close_grp[g] && (!env_alpha || env_alpha[g] != 0.0))
+    const bool active = s3_frozen ? (s3_frozen[g] == 0)
+                                  : (!env_alpha || env_alpha[g] != 0.0);
+    if(close_grp[g] && active)
     {
         double k = kappa_group[g] * 2.0;
         if(k > kappaMax) k = kappaMax;
@@ -12615,7 +12744,11 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
             _stepForward_perenv<<<bn, tn>>>(
                 fem_vertexes.data(), fem_vertexes_temp.data(), fem_move_dir.data(),
                 btype.data(), TetMesh.d_point_to_group + abd_fem_count_info.fem_point_offset,
-                m_env_alpha, alpha, move_boundary, n);
+                m_env_alpha,
+                m_s3_device_freeze_active ? m_s3_frozen : nullptr,
+                alpha,
+                move_boundary,
+                n);
         }
         else
         {
@@ -14657,6 +14790,7 @@ __global__ void _perenv_energy_combine(const double* pe,
 __global__ void _s3_decide(const double* Eg0,
                            const double* Eg1,
                            double*       env_alpha,
+                           const int*    s3_frozen,
                            int*          decision_counts,
                            int           ng,
                            double        energy_abs_tol,
@@ -14664,6 +14798,7 @@ __global__ void _s3_decide(const double* Eg0,
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
+    if(s3_frozen && s3_frozen[g]) return;
     if(env_alpha[g] <= 0.0) return;               // absent (or frozen) env
     double tol = energy_abs_tol + energy_rel_tol * fabs(Eg0[g]);
     if(Eg1[g] > Eg0[g] + tol)
@@ -14693,10 +14828,11 @@ __global__ void _global_ls_decide(const double* energy0,
     *status = e1 > __dadd_rn(rhs, tol) ? 1 : (e1 > rhs ? 2 : 0);
 }
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
-__global__ void _s3_halve_all(double* env_alpha, int ng)
+__global__ void _s3_halve_all(double* env_alpha, const int* s3_frozen, int ng)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
+    if(s3_frozen && s3_frozen[g]) return;
     if(env_alpha[g] > 0.0) env_alpha[g] *= 0.5;
 }
 
@@ -15076,7 +15212,10 @@ void GIPC::halveGroundInvalidEnvAlpha(int group_count)
         return;
     const int threads = 256;
     _halveGroundInvalidEnvAlpha<<<(group_count + threads - 1) / threads, threads>>>(
-        m_env_alpha, m_env_ground_trial_invalid, group_count);
+        m_env_alpha,
+        m_env_ground_trial_invalid,
+        m_s3_device_freeze_active ? m_s3_frozen : nullptr,
+        group_count);
 }
 
 bool GIPC::isIntersected(device_TetraData& TetMesh)
@@ -16635,8 +16774,13 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                 if(!m_abd_body_alpha)
                     CUDA_SAFE_CALL(cudaMalloc((void**)&m_abd_body_alpha, abdN * sizeof(double)));
                 int tn = 256, bn = (abdN + tn - 1) / tn;
-                _gather_abd_body_alpha<<<bn, tn>>>(TetMesh.d_body_to_group, m_env_alpha,
-                                                   m_abd_body_alpha, abdN, NG);
+                _gather_abd_body_alpha<<<bn, tn>>>(
+                    TetMesh.d_body_to_group,
+                    m_env_alpha,
+                    m_s3_device_freeze_active ? m_s3_frozen : nullptr,
+                    m_abd_body_alpha,
+                    abdN,
+                    NG);
             }
             _LsTimer _ts(&g_ls_step_ms);
             m_perenv_apply = true;
@@ -16660,7 +16804,10 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
             _tb.stop();
             if(_isect)   // CCD-safe alpha should prevent this; safety net
             {
-                _s3_halve_all<<<(NG + 255) / 256, 256>>>(m_env_alpha, NG);
+                _s3_halve_all<<<(NG + 255) / 256, 256>>>(
+                    m_env_alpha,
+                    m_s3_device_freeze_active ? m_s3_frozen : nullptr,
+                    NG);
                 continue;
             }
             _LsTimer _tc(&g_ls_cp_ms);
@@ -16674,7 +16821,12 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
             _t1.stop();
             CUDA_SAFE_CALL(cudaMemsetAsync(d_decision_counts, 0, 2 * sizeof(int)));
             _s3_decide<<<(NG + 255) / 256, 256>>>(
-                d_Eg0, d_Eg1, m_env_alpha, d_decision_counts, NG,
+                d_Eg0,
+                d_Eg1,
+                m_env_alpha,
+                m_s3_device_freeze_active ? m_s3_frozen : nullptr,
+                d_decision_counts,
+                NG,
                 energy_abs_tol, energy_rel_tol);
             int decision_counts[2] = {0, 0};
             CUDA_SAFE_CALL(cudaMemcpy(decision_counts, d_decision_counts,
@@ -16994,7 +17146,13 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
                         ? m_env_alpha
                         : nullptr;
                 _per_group_kappa_double<<<(NG + bs - 1) / bs, bs>>>(
-                    m_kappa_group, m_d_close_grp, frozen_alpha, NG, kappaMax, d_maxK);
+                    m_kappa_group,
+                    m_d_close_grp,
+                    frozen_alpha,
+                    m_s3_device_freeze_active ? m_s3_frozen : nullptr,
+                    NG,
+                    kappaMax,
+                    d_maxK);
             }
             CUDA_SAFE_CALL(cudaMemcpy(&Kappa, d_maxK, sizeof(double), cudaMemcpyDeviceToHost));  // scalar envelope
             tempFree_closeConstraint();
@@ -17135,6 +17293,16 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     g_ls_e_ms = 0.0; g_ls_bvh_ms = 0.0; g_ls_cp_ms = 0.0; g_ls_step_ms = 0.0;
     const int active_group_count = TetMesh.h_group_count;
     m_active_group_count = active_group_count;
+    frame_fsm::FrameDeviceState* frame_state = frame_graph_device_state();
+    // Only the frame-graph path opts into the new mask. A null consumer pointer
+    // below therefore remains the exact legacy host/alpha-zero behavior.
+    m_s3_device_freeze_active = frame_state && m_s3_frozen
+                              && m_s3_frozen_iter && m_s3_status && m_s3_semi_beta
+                              && m_s3_semi_freeze_next
+                              && TetMesh.d_point_to_group && TetMesh.h_groups_present
+                              && getenv("STIFF_DECOUPLE_THRESH")
+                              && getenv("STIFF_PERENV_ALPHA");
+    m_s3_device_telemetry_valid = m_s3_device_freeze_active;
     // [env-det] capture p2g at entry so the canon env-local-id tiebreak (g_vloc) is built BEFORE the
     // first buildCP of this frame (buildCP runs before computeGradientAndHessian sets m_d_p2g).
     if(getenv("STIFF_EE_CANON") && TetMesh.d_point_to_group) m_d_p2g = TetMesh.d_point_to_group;
@@ -17144,6 +17312,19 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // [per-env productization] reset per-env telemetry for this solve
     m_env_frozen_iter.assign(kEnvAlphaSlots, -1);
     m_env_status.assign(kEnvAlphaSlots, 0);
+    if(m_s3_device_freeze_active)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_s3_frozen, 0, kEnvAlphaSlots * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_s3_frozen_iter, 0xff, kEnvAlphaSlots * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_s3_status, 0, kEnvAlphaSlots * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_s3_semi_freeze_next, 0, kEnvAlphaSlots * sizeof(int)));
+        _fill_double<<<(kEnvAlphaSlots + 255) / 256, 256>>>(
+            m_s3_semi_beta, 1.0, kEnvAlphaSlots);
+    }
     // [semi-implicit per-env] beta_g for the decoupled/host path: each env
     // accumulates its OWN line-search progress (candidate alpha_g from S1)
     // and exits by freezing ITSELF — the per-env analogue of Alg.1 that the
@@ -17173,7 +17354,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                              && (getenv("STIFF_PERENV_MASK") || getenv("STIFF_PERENV_MASK_DEV")));
     // [S4-dev] device-derived mask (from m_env_alpha, zero D2H). Requires the per-env alpha
     // machinery (m_env_alpha filled by the S1 line-search block each iter).
-    const bool s4_dev_mask = s4_mask_on && m_env_alpha && getenv("STIFF_PERENV_MASK_DEV")
+    const bool s4_dev_mask = s4_mask_on && m_env_alpha
+                             && (getenv("STIFF_PERENV_MASK_DEV")
+                                 || m_s3_device_freeze_active)
                              && getenv("STIFF_PERENV_ALPHA");
     if(s4_mask_on)
     {
@@ -17310,7 +17493,6 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                  ? (newton_velocity_tol * IPC_dt)
                                  : sqrt(Newton_solver_threshold * Newton_solver_threshold
                                         * thr_bbox2 * IPC_dt * IPC_dt);
-        frame_fsm::FrameDeviceState* frame_state = frame_graph_device_state();
         auto device_newton_converged = [&](bool retain_movement) {
             calcMinMovement_DeviceOut(_moveDir, pcg_data.squeue, vertexNum);
             _newton_convergence_decide<<<1, 1>>>(pcg_data.squeue,
@@ -17453,6 +17635,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // If this mode still uses the scalar Newton criterion, the device
         // transition owns the branch and the host only stitches by phase.
         const bool frame_scalar_exit = frame_state && !current_global_exit
+                                    && !m_s3_device_freeze_active
                                     && !(getenv("STIFF_DECOUPLE_THRESH")
                                          && m_env_alpha_valid);
         if(frame_scalar_exit)
@@ -17497,8 +17680,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         }
         else if(frame_state && !frame_scalar_exit)
         {
-            // Per-env convergence is still host-managed until its dedicated
-            // FSM subblock. A surviving iteration always advances into CCD.
+            // The dedicated S3 mask owns each per-env freeze on device. This
+            // iteration has survived the aggregate loop-exit check, so its FSM
+            // phase advances into CCD without reading back the mask.
             _newton_decide_transition<<<1, 1>>>(frame_state, 0);
         }
         // [decouple probe] full-precision moveDir dump (engine order) + d_point_to_group (engine
@@ -17628,7 +17812,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     h_ccd_cpNum,
                     m_ccd_alpha_slots + 4);
         }
-        const bool s1_host_diag = s1_on
+        const bool s1_host_diag = s1_on && !m_s3_device_freeze_active
                                && (getenv("STIFF_PENV_STATS")
                                    || getenv("STIFF_A0_DUMP")
                                    || getenv("STIFF_S1_DEBUG")
@@ -17769,11 +17953,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             _per_env_max_move<<<(vertexNum+bs-1)/bs, bs>>>(
                 TetMesh.d_point_to_group, _moveDir, m_env_scratch + 4*NG,
                 vertexNum, NG);
-            // [perf] DEVICE-SIDE per-env alpha + freeze (no cudaDeviceSynchronize, no 5x256 D2H, no
-            // host loop, no H2D) — writes m_env_alpha directly + one 3-int D2H
-            // (two freeze counters and the already-needed CCD status word).
-            // Bit-identical to the host loop (same per-env formulas). Host path kept only under a
-            // diagnostic flag.
+            // [perf] DEVICE-SIDE per-env alpha + freeze (no cudaDeviceSynchronize, no per-env D2H,
+            // no host mask loop, no mask H2D). The existing three-int aggregate packet is only for
+            // Newton-loop termination and CCD fail-fast; it never selects or feeds a frozen env.
+            // Bit-identical to the host loop (same per-env formulas). Host path is retained only
+            // outside the frame graph.
             const double _sq_    = sqrt(dHat);
             const double _thrcv_ = getenv("STIFF_DECOUPLE_THRESH") ? ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt)) : 0.0;
             const bool _s1diag_ = s1_host_diag;
@@ -17783,6 +17967,27 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 if(!d_env_cnt)
                     CUDA_SAFE_CALL(cudaMalloc((void**)&d_env_cnt, 3 * sizeof(int)));
                 CUDA_SAFE_CALL(cudaMemsetAsync(d_env_cnt, 0, 3 * sizeof(int)));
+                if(m_s3_device_freeze_active)
+                    _s3_derive_freeze_mask<<<(NG + bs - 1) / bs, bs>>>(
+                        m_s3_frozen,
+                        m_s3_frozen_iter,
+                        m_s3_status,
+                        m_s3_semi_beta,
+                        m_s3_semi_freeze_next,
+                        m_env_alpha,
+                        m_env_scratch,
+                        NG,
+                        k,
+                        getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
+                        _thrcv_,
+                        d_env_bbox2,
+                        Newton_solver_threshold * IPC_dt,
+                        newton_velocity_tol * IPC_dt,
+                        env_newton_iter_cap,
+                        semi_implicit_enabled ? 1 : 0,
+                        semi_implicit_min_iter,
+                        semi_implicit_beta_tol,
+                        frame_state);
                 _per_env_alpha_compute<<<(NG + bs - 1) / bs, bs>>>(
                     m_env_alpha, m_env_scratch, NG, _sq_, 1.0, (h_ccd_cpNum > 0) ? 1 : 0,
                     temp_alpha, alpha_CFL, getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
@@ -17793,7 +17998,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     d_env_cnt,
                     (frame_state && !ccd_host_packet)
                         ? m_ccd_alpha_slots
-                        : nullptr);
+                        : nullptr,
+                    m_s3_device_freeze_active ? m_s3_frozen : nullptr);
                 int _hc_[3];
                 CUDA_SAFE_CALL(cudaMemcpy(
                     _hc_, d_env_cnt, 3 * sizeof(int), cudaMemcpyDeviceToHost));
@@ -17997,12 +18203,15 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             break;
         }
 
-        // [S4-dev] derive next iter's active mask from the freeze decision already on device
-        // (m_env_alpha == 0 ⇔ env converged this iter). Zero D2H — replaces the S4 host detection.
-        // Frozen set is final here: the S3 per-env backtrack only halves nonzero alphas (never → 0).
+        // [S4-dev] derive next iter's active mask from the S3 freeze decision already on device.
+        // The nullptr legacy branch derives it from alpha==0. Zero D2H replaces S4 host detection;
+        // S3 per-env backtracking only halves active alphas and cannot manufacture a freeze.
         if(s4_dev_mask && m_env_alpha_valid)
             _mask_from_env_alpha<<<(active_group_count + 255) / 256, 256>>>(
-                m_env_active, m_env_alpha, active_group_count);
+                m_env_active,
+                m_env_alpha,
+                m_s3_device_freeze_active ? m_s3_frozen : nullptr,
+                active_group_count);
 
         if(phase_time)
             CUDA_SAFE_CALL(cudaEventRecord(e2b));  // end S1 per-env-alpha / start lineSearch

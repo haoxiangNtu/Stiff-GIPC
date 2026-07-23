@@ -406,10 +406,9 @@ class Engine:
             os.environ.setdefault("STIFF_DECOUPLE_THRESH", "1")
             os.environ.setdefault("STIFF_PERENV_ALPHA", "1")
             os.environ.setdefault("STIFF_PERENV_MASK", "1")
-            # telemetry (per-env iters/status, NaN quarantine) lives in the host
-            # S1 path — make it part of the productized switch. Set
-            # STIFF_PERENV_TELEM=0 explicitly to opt back into the zero-D2H
-            # device fast path (no telemetry).
+            # Request per-env iters/status/NaN-quarantine telemetry. Legacy mode
+            # fills the host mirrors; frame-graph mode keeps it on device and
+            # copies it only if one of the telemetry query APIs is called.
             os.environ.setdefault("STIFF_PERENV_TELEM", "1")
         self._engine.set_config(self._config.native)
         self._engine.init_cuda()
@@ -1127,8 +1126,7 @@ class Engine:
 
     def get_per_env_newton_iters(self) -> np.ndarray:
         """Newton iter at which each env froze last solve (-1 = ran to loop
-        end / absent). Requires the host per-env path (``per_env_exit=True``
-        plus ``env_newton_iter_cap`` or STIFF_PERENV_TELEM=1)."""
+        end / absent). Frame-graph telemetry is copied from device on query."""
         return np.asarray(self._engine.get_per_env_newton_iters())
 
     def get_per_env_status(self) -> np.ndarray:

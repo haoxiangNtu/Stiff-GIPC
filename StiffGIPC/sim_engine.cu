@@ -519,12 +519,32 @@ void SimEngine::set_per_tet_young_for_body(int body_offset,
 
 std::vector<int> SimEngine::get_per_env_newton_iters() const
 {
-    return m_impl->ipc.m_env_frozen_iter;
+    const GIPC& ipc = m_impl->ipc;
+    if(ipc.m_s3_device_telemetry_valid && ipc.m_s3_frozen_iter)
+    {
+        std::vector<int> result(GIPC::kEnvAlphaSlots, -1);
+        CUDA_SAFE_CALL(cudaMemcpy(result.data(),
+                                  ipc.m_s3_frozen_iter,
+                                  result.size() * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+        return result;
+    }
+    return ipc.m_env_frozen_iter;
 }
 
 std::vector<int> SimEngine::get_per_env_status() const
 {
-    return m_impl->ipc.m_env_status;
+    const GIPC& ipc = m_impl->ipc;
+    if(ipc.m_s3_device_telemetry_valid && ipc.m_s3_status)
+    {
+        std::vector<int> result(GIPC::kEnvAlphaSlots, 0);
+        CUDA_SAFE_CALL(cudaMemcpy(result.data(),
+                                  ipc.m_s3_status,
+                                  result.size() * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+        return result;
+    }
+    return ipc.m_env_status;
 }
 
 void SimEngine::set_body_friction(int body_offset, double mu, double ground_mu)

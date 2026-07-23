@@ -80,6 +80,9 @@ enum FramePathFlags : uint32_t
     PATH_TEST_INJECTION        = 1u << 6,
     PATH_RETRIED               = 1u << 7,
     PATH_PCG_DEVICE_CONTINUATION = 1u << 8,
+    // The per-env early-Newton freeze decision was derived and consumed on the
+    // device through the dedicated S3 mask (not a host movement-array mirror).
+    PATH_S3_DEVICE_FREEZE      = 1u << 9,
 };
 
 enum FrameErrorCode : int32_t
