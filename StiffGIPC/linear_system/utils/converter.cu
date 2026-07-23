@@ -258,11 +258,25 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
     // the unique merge is the CONTRACTION step of a per-frame expand/merge
     // cycle, and a bound would compound ×16 every frame (1.4M → 22M → 353M).
     // Those boundaries keep the exact readback until tier-dispatch lands.
-    const bool bound_layout =
+    bool bound_layout =
         GIPCTripletMatrix::device_count_mode() && start == 0;
     if(bound_layout)
     {
         global_triplets.h_unique_key_number = length;
+    }
+    else if(GIPCTripletMatrix::device_count_mode()
+            && global_triplets.m_abd_tier_txn_ok
+            && global_triplets.m_abd_uniq_tier > 0
+            && global_triplets.m_abd_uniq_tier <= length)
+    {
+        // [P3b-2/abd-tier] steady state: layout by the armed tier constant,
+        // true count stays on device (consumers guard by *d_unique). The
+        // expansion feedback becomes tier -> tier (fixed point), so the ×16
+        // compounding of the naive bound layout cannot occur. A verify
+        // kernel re-arms via exact readback when nuniq outgrows the tier
+        // (checked below after the merge publishes d_unique_key_number).
+        global_triplets.h_unique_key_number = global_triplets.m_abd_uniq_tier;
+        bound_layout                        = true;  // pad-neutralize [nuniq, tier)
     }
     else
     {
@@ -270,6 +284,13 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                                   global_triplets.d_unique_key_number,
                                   sizeof(int),
                                   cudaMemcpyDeviceToHost));
+        if(GIPCTripletMatrix::device_count_mode() && start > 0)
+        {
+            // Arm (or re-arm) the steady-state tier from the exact count.
+            const int t = gipc::assembly_capacity_tier(
+                global_triplets.h_unique_key_number);
+            global_triplets.m_abd_uniq_tier = t;
+        }
     }
 
     // Upper-bound (nuniq <= length) async clear: legal inside capture and
@@ -334,6 +355,23 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                        for(int c = 0; c < 9; ++c)
                            dd[c] = binned_combine(mbin + ((size_t)u * 9 + c) * BINNED_K);
                    });
+    }
+
+    if(start > 0 && GIPCTripletMatrix::device_count_mode()
+       && global_triplets.m_abd_uniq_tier > 0)
+    {
+        // [P3b-2/abd-tier] OVF check: if the true nuniq outgrew the armed
+        // tier, this frame's tier layout under-covers — latch the flag; the
+        // frame boundary disarms the tier and retries transactionally.
+        auto* d_uniq_chk = global_triplets.d_unique_key_number;
+        auto* d_ovf      = global_triplets.d_abd_tier_ovf;
+        const int tier_now = global_triplets.m_abd_uniq_tier;
+        ParallelFor(1).kernel_name("abd_tier_ovf_check").apply(1,
+            [d_uniq_chk, d_ovf, tier_now] __device__(int) mutable
+            {
+                if(*d_uniq_chk > tier_now)
+                    *d_ovf = *d_uniq_chk;
+            });
     }
 
     if(bound_layout)

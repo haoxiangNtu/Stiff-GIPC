@@ -1004,6 +1004,11 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     FrameGraphContext& ctx = context(*this);
     snapshot_host_attempt(*this, ctx);
     ctx.attempt = attempt;
+    // [P3b-2/abd-tier] steady-state ABD unique tier is safe only under this
+    // transactional path (OVF -> rollback + retry). Reset the flag per attempt.
+    gipc_global_triplet.m_abd_tier_txn_ok = true;
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        gipc_global_triplet.d_abd_tier_ovf, 0, sizeof(int), cudaStreamPerThread));
     if(attempt == 0)
     {
         m_frame_retry_bits = 0;
@@ -1288,6 +1293,25 @@ int GIPC::frame_graph_finish_terminal()
     if(!m_frame_terminal_emitted)
         throw std::logic_error("frame terminal not emitted");
     m_last_frame_status = *ctx.h_status;
+    // [P3b-2/abd-tier] tier undershoot latched during assembly: this frame's
+    // ABD layout under-covered. Disarm the tier (next attempt re-reads exact
+    // and re-arms) and force a transactional retry of the SAME frame.
+    if(gipc_global_triplet.m_abd_uniq_tier > 0)
+    {
+        int ovf = 0;
+        CUDA_SAFE_CALL(cudaMemcpy(&ovf, gipc_global_triplet.d_abd_tier_ovf,
+                                  sizeof(int), cudaMemcpyDeviceToHost));
+        if(ovf > 0)
+        {
+            gipc_global_triplet.m_abd_uniq_tier = 0;
+            if(m_last_frame_status.result == frame_fsm::FRAME_OK)
+            {
+                m_last_frame_status.result = frame_fsm::FRAME_RETRY_REQUIRED;
+                m_last_frame_status.invalid_bits |= frame_fsm::OVF_UNIQUE_BLOCKS;
+                m_last_frame_status.required_unique_blocks = ovf;
+            }
+        }
+    }
     Kappa = m_last_frame_status.kappa;
     if(m_last_frame_status.result == frame_fsm::FRAME_OK)
         total_Cg_count += m_last_frame_status.pcg_iters;

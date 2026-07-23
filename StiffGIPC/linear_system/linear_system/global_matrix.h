@@ -185,6 +185,19 @@ class GIPCTripletMatrix
     int global_external_max_capcity     = 0;
     int global_internal_capcity         = 0;
 
+    // [P3b-2/abd-tier] steady-state unique-count tier for the ABD slice/mid
+    // converts (start > 0). 0 = unarmed (exact readback, then arm). When the
+    // true nuniq fits the tier, the host mirror gets the TIER (a constant in
+    // steady state — no ×16 compounding, unlike feeding back length) and the
+    // readback is skipped; a grown nuniq re-reads exactly and re-arms.
+    // Clamped to the slice length so pads stay inside the cleared range.
+    // Armed ONLY under transactional protection (m_abd_tier_txn_ok, set by
+    // the frame-graph path): a tier undershoot is detected by the OVF check
+    // kernel and must roll the frame back — legacy has no rollback.
+    int  m_abd_uniq_tier    = 0;
+    bool m_abd_tier_txn_ok  = false;
+    int* d_abd_tier_ovf     = nullptr;  // device flag: nuniq observed > tier
+
     int* d_abd_abd_contact_start_id = nullptr;
     int* d_abd_fem_contact_start_id = nullptr;
     int* d_fem_abd_contact_start_id = nullptr;
@@ -220,6 +233,8 @@ class GIPCTripletMatrix
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_contact_start_block, 4 * sizeof(int)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_unique_key_number, sizeof(int)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_assembly_scratch_count, sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_abd_tier_ovf, sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(d_abd_tier_ovf, 0, sizeof(int)));
         d_abd_abd_contact_start_id = d_contact_start_block + 0;
         d_abd_fem_contact_start_id = d_contact_start_block + 1;
         d_fem_abd_contact_start_id = d_contact_start_block + 2;
@@ -231,6 +246,7 @@ class GIPCTripletMatrix
         CUDA_SAFE_CALL(cudaFree(d_contact_start_block));
         CUDA_SAFE_CALL(cudaFree(d_unique_key_number));
         CUDA_SAFE_CALL(cudaFree(d_assembly_scratch_count));
+        CUDA_SAFE_CALL(cudaFree(d_abd_tier_ovf));
     }
 
     int h_abd_abd_contact_start_id = -1;
