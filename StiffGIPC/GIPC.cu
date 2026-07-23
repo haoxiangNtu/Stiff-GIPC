@@ -9769,6 +9769,12 @@ void GIPC::buildFrictionSets()
                                                               m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     CUDA_SAFE_CALL(cudaMemcpy(h_cpNum_last, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // [P3b-2/guard] lagged snapshot, device truth: [0..4] = the re-ranked
+    // lagged counts, [5] = the detection gp (untouched by the ranking memset,
+    // and h_gpNum_last is assigned from h_gpNum below).
+    CUDA_SAFE_CALL(cudaMemcpyAsync(d_pairSnapLast, _cpNum,
+                                   6 * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice, 0));
     numbers = h_gpNum;
     if(numbers > 0)
     {
@@ -9787,15 +9793,6 @@ void GIPC::buildFrictionSets()
                                                       m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     h_gpNum_last = h_gpNum;
-    // [P3b-2/guard] snapshot the lagged friction counts for kernel guards.
-    // Host mirrors are authoritative here (they define this frame's layout),
-    // so publish them; the graph-captured path will swap this for a D2D.
-    {
-        uint32_t snapLast[6] = {h_cpNum_last[0], h_cpNum_last[1], h_cpNum_last[2],
-                                h_cpNum_last[3], h_cpNum_last[4], h_gpNum_last};
-        CUDA_SAFE_CALL(cudaMemcpy(d_pairSnapLast, snapLast,
-                                  6 * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    }
 }
 
 
@@ -10554,6 +10551,12 @@ void GIPC::buildCP()
     {   // [9d28824-port] contiguous _cpNum[0:5]+_gpNum[5]: one 6-int D2H.
         uint32_t cp_gp_buf[6];
         CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        // [P3b-2/guard] device-truth snapshot for kernel guards (survives the
+        // later rank-scratch reuse of _cpNum); D2D so it never depends on the
+        // host mirror.
+        CUDA_SAFE_CALL(cudaMemcpyAsync(d_pairSnapCur, _cpNum,
+                                       6 * sizeof(uint32_t),
+                                       cudaMemcpyDeviceToDevice, 0));
         memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
     }
@@ -11875,6 +11878,9 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
                 CUDA_SAFE_CALL(cudaStreamWaitEvent(cudaStreamPerThread, m_pool_join_events[k], 0)); }
               swapIn(bvh_f, of); swapIn(bvh_e, oe); }  // restore original scratch
     CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(d_pairSnapCur, _cpNum,
+                                   6 * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice, 0));
     frame_graph_guard_pairs(static_cast<int>(h_cpNum[0]),
                             static_cast<int>(h_cpNum[0]));
     // [perenv-parallel #1 FIX] the per-env path (like the merged path) MUST grow the pair buffers on
@@ -11918,6 +11924,12 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     {   // [9d28824-port] one 6-int D2H
         uint32_t cp_gp_buf[6];
         CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        // [P3b-2/guard] device-truth snapshot for kernel guards (survives the
+        // later rank-scratch reuse of _cpNum); D2D so it never depends on the
+        // host mirror.
+        CUDA_SAFE_CALL(cudaMemcpyAsync(d_pairSnapCur, _cpNum,
+                                       6 * sizeof(uint32_t),
+                                       cudaMemcpyDeviceToDevice, 0));
         memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
     }
@@ -13746,14 +13758,6 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
-        // [P3b-2/guard] publish this frame's detection counts for kernel
-        // guards BEFORE _cpNum becomes the rank scratch.
-        {
-            uint32_t snapCur[6] = {h_cpNum[0], h_cpNum[1], h_cpNum[2],
-                                   h_cpNum[3], h_cpNum[4], h_gpNum};
-            CUDA_SAFE_CALL(cudaMemcpy(d_pairSnapCur, snapCur,
-                                      6 * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        }
         CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
         //calBarrierHessian();
         //calBarrierGradient(contact_grads, Kappa);
