@@ -1005,8 +1005,15 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     snapshot_host_attempt(*this, ctx);
     ctx.attempt = attempt;
     // [P3b-2/abd-tier] steady-state ABD unique tier is safe only under this
-    // transactional path (OVF -> rollback + retry). Reset the flag per attempt.
-    gipc_global_triplet.m_abd_tier_txn_ok = true;
+    // transactional path (OVF -> rollback + retry). Currently opt-in
+    // (STIFF_ABD_TIER=1): the tier layout is a DIFFERENT deterministic
+    // float trajectory on retry-heavy ABD scenes (frame_transaction hash
+    // f2293e9f -> a2d17fd0; strict anchor unaffected), so default FG=1
+    // stays bitwise-equal to legacy until the dedicated bitwise audit.
+    {
+        const char* v = getenv("STIFF_ABD_TIER");
+        gipc_global_triplet.m_abd_tier_txn_ok = v && v[0] == '1' && v[1] == '\0';
+    }
     CUDA_SAFE_CALL(cudaMemsetAsync(
         gipc_global_triplet.d_abd_tier_ovf, 0, sizeof(int), cudaStreamPerThread));
     if(attempt == 0)
@@ -1347,6 +1354,10 @@ void GIPC::record_legacy_frame_status(bool graph_requested,
                                       bool callback_fallback,
                                       int newton_iterations)
 {
+    // [P3b-2/abd-tier] a frame that ran without transactional protection
+    // must not leave the steady-state tier armed for a later FG=1 frame
+    // with a stale flag, nor stay armed if the mode flips mid-run.
+    gipc_global_triplet.m_abd_tier_txn_ok = false;
     frame_fsm::FrameStatus st{};
     st.result = frame_fsm::FRAME_OK;
     st.phase  = frame_fsm::PHASE_COMMIT;

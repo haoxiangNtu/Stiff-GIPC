@@ -149,3 +149,12 @@ ABD 链 tier 化要点：host 反馈值 = tier(nuniq)（稳态常量，无 ×16 
 
 ⚠️ 判定基准不变：strict 锚 f7fb5a786c2d7935；nsys 1+1+1 结构验证；
 compute-sanitizer memcheck/racecheck 零报告。
+
+## 待定性观察（2026-07-24）
+
+- test_frame_transaction 场景 hash 呈双态（f2293e9f… / a2d17fd0…），与
+  STIFF_ABD_TIER 开关无关（off 也出 a2d17fd0），每态内部四比（legacy/
+  graphA/graphB/rollback/cap-retry）字节一致，strict 锚恒定。疑测试场景
+  自身对某初始化时序敏感。专项定性后再决定 abd-tier 是否转默认开。
+- STIFF_ABD_TIER=1（opt-in）：ABD 链稳态 tier 布局（零回读）+ OVF-RETRY
+  已实装（1615f9f）；默认 off 保持 FG=1 与 legacy 位级一致。
