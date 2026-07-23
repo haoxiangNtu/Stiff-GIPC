@@ -15097,10 +15097,18 @@ int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int pre
     if(getenv("STIFF_KSUM"))
     {
         cudaDeviceSynchronize();
+        // Debug-only exact readback: under the P3b-1 bound layout the host
+        // mirror is an upper bound; hash the true unique range so the ksum
+        // stays mode-invariant (same treatment as the MAS dumps).
+        int ksum_nuniq = gipc_global_triplet.h_unique_key_number;
+        CUDA_SAFE_CALL(cudaMemcpy(&ksum_nuniq,
+                                  gipc_global_triplet.d_unique_key_number,
+                                  sizeof(int),
+                                  cudaMemcpyDeviceToHost));
         // merged matrix (converter output, what the spmv used) + the solve result
         _dbg_ksum("matrix_merged", gipc_global_triplet.block_values(),
-                  (size_t)gipc_global_triplet.h_unique_key_number * 9 * sizeof(double));
-        printf("[ksum] nuniq_merged=%d\n", gipc_global_triplet.h_unique_key_number);
+                  (size_t)ksum_nuniq * 9 * sizeof(double));
+        printf("[ksum] nuniq_merged=%d\n", ksum_nuniq);
         _dbg_ksum("moveDir_out", _moveDir, (size_t)vertexNum * sizeof(double3));
     }
 

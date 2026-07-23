@@ -3439,6 +3439,9 @@ void MASPreconditioner::FreeMAS()
 {
     if(totalNodes < 1)
         return;
+    // [P3b-1 hardening] deviceExtentActive() must never be true against freed
+    // buffers if a future caller reorders teardown/re-init.
+    m_allocClusterTotal = 0;
     // [per-env MAS] env-segmentation scratch (allocated unconditionally in init)
     CUDA_SAFE_CALL(cudaFree(d_envBase));
     CUDA_SAFE_CALL(cudaFree(d_envStart));
