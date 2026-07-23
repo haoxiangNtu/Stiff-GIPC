@@ -618,6 +618,11 @@ class GIPC
                                       double alpha,
                                       double energy0,
                                       double energy1);
+    // P3b-1 host bridge: phase graphs share the transaction-owned state.  The
+    // only normal-path read permitted between phase graphs is `phase`; the
+    // helper also accounts that stitch in FrameStatus.host_boundaries.
+    frame_fsm::FrameDeviceState* frame_graph_device_state() const;
+    int  frame_graph_read_phase();
     void record_legacy_frame_status(bool graph_requested,
                                     bool callback_fallback,
                                     int newton_iterations = 0);

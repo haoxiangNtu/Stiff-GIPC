@@ -168,6 +168,7 @@ struct FrameGraphContext
     int substeps = 0;
     int newton_iters = 0;
     int ls_trials = 0;
+    int host_boundaries = 0;
     int hw_dcd = 0;
     int hw_ccd = 0;
     int hw_triplets = 0;
@@ -990,6 +991,7 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     ctx.required_dcd = ctx.required_ccd = ctx.required_triplets = 0;
     ctx.required_unique = ctx.required_mas = 0;
     ctx.substeps = ctx.newton_iters = ctx.ls_trials = 0;
+    ctx.host_boundaries = 0;
     ctx.hw_dcd = static_cast<int>(h_cpNum[0]);
     ctx.hw_ccd = static_cast<int>(h_ccd_cpNum);
     ctx.hw_triplets = ctx.hw_unique = ctx.hw_mas = 0;
@@ -1126,6 +1128,24 @@ void GIPC::frame_graph_note_line_search(int trials,
     ctx.energy = energy1;
 }
 
+frame_fsm::FrameDeviceState* GIPC::frame_graph_device_state() const
+{
+    auto* ctx = static_cast<FrameGraphContext*>(m_frame_graph_context);
+    return m_frame_graph_active && ctx ? ctx->d_state : nullptr;
+}
+
+int GIPC::frame_graph_read_phase()
+{
+    FrameGraphContext& ctx = context(*this);
+    int phase = frame_fsm::PHASE_IDLE;
+    CUDA_SAFE_CALL(cudaMemcpy(&phase,
+                              &ctx.d_state->phase,
+                              sizeof(phase),
+                              cudaMemcpyDeviceToHost));
+    ++ctx.host_boundaries;
+    return phase;
+}
+
 void GIPC::frame_graph_enqueue_terminal(device_TetraData& /*mesh*/,
                                         int result,
                                         int error_code,
@@ -1169,7 +1189,7 @@ void GIPC::frame_graph_enqueue_terminal(device_TetraData& /*mesh*/,
     in.substeps = ctx.substeps;
     in.newton_iters = ctx.newton_iters;
     in.ls_trials = ctx.ls_trials;
-    in.host_boundaries = ctx.newton_iters;
+    in.host_boundaries = ctx.host_boundaries;
     in.hw_dcd_pairs = ctx.hw_dcd;
     in.hw_ccd_pairs = ctx.hw_ccd;
     in.hw_triplets = ctx.hw_triplets;

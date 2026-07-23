@@ -12442,9 +12442,35 @@ void calcMinMovement_DeviceOut(const double3* _moveDir,
 
 __global__ void _newton_convergence_decide(const double* max_movement,
                                             double threshold,
-                                            int* converged)
+                                            int* converged,
+                                            frame_fsm::FrameDeviceState* frame = nullptr)
 {
-    *converged = (*max_movement < threshold) ? 1 : 0;
+    const double movement = *max_movement;
+    const int decision = (movement < threshold) ? 1 : 0;
+    if(converged) *converged = decision;
+    if(frame)
+    {
+        frame->newton_converged = decision;
+        frame->max_movement = movement;
+        frame->phase = frame_fsm::PHASE_NEWTON_DECIDE;
+    }
+}
+
+// Device-owned NEWTON_DECIDE transition.  The host may observe only `phase`
+// while P3b-1 still stitches phase graphs; it never consumes the convergence
+// decision itself on the frame-graph path.
+__global__ void _newton_decide_transition(frame_fsm::FrameDeviceState* frame,
+                                          int convergence_exit_enabled)
+{
+    if(blockIdx.x || threadIdx.x || !frame) return;
+    if(frame->result != frame_fsm::FRAME_OK)
+    {
+        frame->phase = frame_fsm::PHASE_ROLLBACK;
+        return;
+    }
+    frame->phase = convergence_exit_enabled && frame->newton_converged
+                       ? frame_fsm::PHASE_COMMIT
+                       : frame_fsm::PHASE_CCD;
 }
 
 void stepForward(double3* _vertexes,
@@ -17034,16 +17060,23 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                  ? (newton_velocity_tol * IPC_dt)
                                  : sqrt(Newton_solver_threshold * Newton_solver_threshold
                                         * thr_bbox2 * IPC_dt * IPC_dt);
+        frame_fsm::FrameDeviceState* frame_state = frame_graph_device_state();
         auto device_newton_converged = [&](bool retain_movement) {
             calcMinMovement_DeviceOut(_moveDir, pcg_data.squeue, vertexNum);
             _newton_convergence_decide<<<1, 1>>>(pcg_data.squeue,
                                                  _newton_thr,
-                                                 m_newton_convergence_decision);
+                                                 frame_state
+                                                     ? nullptr
+                                                     : m_newton_convergence_decision,
+                                                 frame_state);
             int converged = 0;
-            CUDA_SAFE_CALL(cudaMemcpy(&converged,
-                                      m_newton_convergence_decision,
-                                      sizeof(int),
-                                      cudaMemcpyDeviceToHost));
+            // Frame-FSM owns the decision on device.  The temporary host bridge
+            // below reads only FrameDeviceState.phase after the transition.
+            if(!frame_state)
+                CUDA_SAFE_CALL(cudaMemcpy(&converged,
+                                          m_newton_convergence_decision,
+                                          sizeof(int),
+                                          cudaMemcpyDeviceToHost));
             if(retain_movement)
                 CUDA_SAFE_CALL(cudaMemcpy(&distToOpt_PN,
                                           pcg_data.squeue,
@@ -17167,6 +17200,21 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // [drive-substep] no convergence exit until the driving ramp completes
         // (uipc: animation_reach_target gates convergence_check).
         do_break = do_break && drive_ratio >= 1.0;
+        // If this mode still uses the scalar Newton criterion, the device
+        // transition owns the branch and the host only stitches by phase.
+        const bool frame_scalar_exit = frame_state && !current_global_exit
+                                    && !(getenv("STIFF_DECOUPLE_THRESH")
+                                         && m_env_alpha_valid);
+        if(frame_scalar_exit)
+        {
+            _newton_decide_transition<<<1, 1>>>(
+                frame_state, (k && drive_ratio >= 1.0) ? 1 : 0);
+            const int next_phase = frame_graph_read_phase();
+            do_break = next_phase == frame_fsm::PHASE_COMMIT;
+            if(next_phase == frame_fsm::PHASE_ROLLBACK)
+                throw std::runtime_error(
+                    "frame NEWTON_DECIDE transition requested rollback");
+        }
         if(do_break)
         {
             destroy_iteration_events();
@@ -17181,7 +17229,18 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         if(current_global_exit)
         {
             gradVanish = device_newton_converged(merged_diag_sample);
-            if(k && gradVanish && drive_ratio >= 1.0)
+            bool newton_done = k && gradVanish && drive_ratio >= 1.0;
+            if(frame_state)
+            {
+                _newton_decide_transition<<<1, 1>>>(
+                    frame_state, (k && drive_ratio >= 1.0) ? 1 : 0);
+                const int next_phase = frame_graph_read_phase();
+                newton_done = next_phase == frame_fsm::PHASE_COMMIT;
+                if(next_phase == frame_fsm::PHASE_ROLLBACK)
+                    throw std::runtime_error(
+                        "frame NEWTON_DECIDE transition requested rollback");
+            }
+            if(newton_done)
             {
                 destroy_iteration_events();
                 break;
