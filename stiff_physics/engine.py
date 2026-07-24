@@ -216,10 +216,40 @@ _MULTIENV_MODE_ALIASES = {
 }
 
 
+# [audit v0.8.5.1] os.environ.setdefault is PROCESS-global: with two Engines in
+# one process, flags set for the first silently leaked into the second (e.g.
+# Engine(strict) then Engine(merged) ran the second engine with strict flags).
+# Track exactly the key:value pairs THIS module set — per feature group, so the
+# mode flags and the per_env_exit flags retract independently — and retract only
+# ours: user-set or user-modified env vars are never touched (an explicit
+# STIFF_* env var still always wins).
+_MODE_FLAGS_SET_BY_US: dict = {}
+_PEE_FLAGS_SET_BY_US: dict = {}
+
+
+def _setdefault_tracked(registry: dict, key: str, value: str) -> None:
+    import os
+    if key not in os.environ:
+        os.environ[key] = value
+        registry[key] = value
+
+
+def _retract_our_flags(registry: dict, keep: set = frozenset()) -> None:
+    import os
+    for key, val in list(registry.items()):
+        if key in keep:
+            continue
+        if os.environ.get(key) == val:   # untouched since we set it
+            del os.environ[key]
+        del registry[key]                # user changed it -> it is theirs now
+
+
 def resolve_multienv_mode(mode: str = "merged") -> str:
     """Set the STIFF_* env flags for the requested multi-env mode (setdefault, so
     explicit STIFF_* env vars win). STIFF_MULTIENV_MODE overrides `mode`. Returns
-    the canonical mode name. Idempotent; safe to call once per Engine."""
+    the canonical mode name. Idempotent; safe to call once per Engine. Flags this
+    module itself set for a PREVIOUS mode in the same process are retracted first
+    (multi-Engine processes no longer leak the first engine's mode into the next)."""
     import os
     raw = os.environ.get("STIFF_MULTIENV_MODE", mode)
     canon = _MULTIENV_MODE_ALIASES.get(str(raw).strip().lower())
@@ -231,8 +261,10 @@ def resolve_multienv_mode(mode: str = "merged") -> str:
         flags = _MULTIENV_ISOLATED_FLAGS + _MULTIENV_ISOLATED_ONLY
     elif canon == "strict":
         flags = _MULTIENV_ISOLATED_FLAGS + _MULTIENV_STRICT_EXTRA
+    mode_keep = set(flags) | ({"STIFF_EE_LB"} if canon == "merged" else set())
+    _retract_our_flags(_MODE_FLAGS_SET_BY_US, keep=mode_keep)
     for f in flags:
-        os.environ.setdefault(f, "1")
+        _setdefault_tracked(_MODE_FLAGS_SET_BY_US, f, "1")
     # [0.8.2] determinism is POSITIVE-gated in the binary now (strict sets STIFF_SPMV_DET above;
     # merged/isolated run the fast paths by default) — the old STIFF_FAST_GRAD hint is no longer
     # read by the engine and is not set anymore.
@@ -240,7 +272,7 @@ def resolve_multienv_mode(mode: str = "merged") -> str:
     # measured -5.6%/frame). NOT defaulted for strict (measured no gain: seg/binned atomics own
     # the L2 there) nor isolated (unmeasured); both can opt in explicitly.
     if canon == "merged":
-        os.environ.setdefault("STIFF_EE_LB", "2")
+        _setdefault_tracked(_MODE_FLAGS_SET_BY_US, "STIFF_EE_LB", "2")
     return canon
 
 
@@ -395,16 +427,22 @@ class Engine:
         # gated engine paths (finalize meanMass, per-frame κ/BVH/PCG) see them. Env vars win.
         self.multienv_mode = resolve_multienv_mode(getattr(self._config, "multienv_mode", "merged"))
         if getattr(self._config, "per_env_exit", False):
-            # [per-env exit] productized switch — see Config docstring. setdefault
-            # so explicitly-set env vars (incl. "0" overrides) still win.
-            os.environ.setdefault("STIFF_DECOUPLE_THRESH", "1")
-            os.environ.setdefault("STIFF_PERENV_ALPHA", "1")
-            os.environ.setdefault("STIFF_PERENV_MASK", "1")
+            # [per-env exit] productized switch — see Config docstring. Tracked
+            # setdefault so explicitly-set env vars (incl. "0" overrides) still
+            # win, AND a later Engine(per_env_exit=False) in the same process
+            # retracts these instead of silently inheriting them.
+            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_DECOUPLE_THRESH", "1")
+            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_PERENV_ALPHA", "1")
+            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_PERENV_MASK", "1")
             # telemetry (per-env iters/status, NaN quarantine) lives in the host
             # S1 path — make it part of the productized switch. Set
             # STIFF_PERENV_TELEM=0 explicitly to opt back into the zero-D2H
             # device fast path (no telemetry).
-            os.environ.setdefault("STIFF_PERENV_TELEM", "1")
+            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_PERENV_TELEM", "1")
+        else:
+            # per_env_exit=False: retract only flags WE set for a previous
+            # engine in this process (user-set env vars are untouched).
+            _retract_our_flags(_PEE_FLAGS_SET_BY_US)
         self._engine.set_config(self._config.native)
         self._engine.init_cuda()
         self._finalized = False

@@ -14234,7 +14234,13 @@ __global__ void _global_ls_decide(const double* energy0,
     const double rhs = __dadd_rn(e0, __dmul_rn(c1m, alpha));
     const double tol = __dadd_rn(energy_abs_tol,
                                  __dmul_rn(energy_rel_tol, fabs(e0)));
-    *status = e1 > __dadd_rn(rhs, tol) ? 1 : (e1 > rhs ? 2 : 0);
+    // [NaN-quarantine gap fix] any comparison against NaN is false, so a
+    // NaN trial energy used to fall through to status 0 = "accepted descent"
+    // — the one path where a diverged env's NaN could slip past the per-env
+    // quarantine. Non-finite trial ⇒ status 1 (keep backtracking; on budget
+    // exhaustion the loud non-descent warning fires instead of silence).
+    *status = !isfinite(e1) ? 1
+              : (e1 > __dadd_rn(rhs, tol) ? 1 : (e1 > rhs ? 2 : 0));
 }
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)
@@ -14904,9 +14910,11 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                 const double rhs = h_energy[0] + c1m * trial_alpha;
                 const double tol = energy_abs_tol
                                  + energy_rel_tol * fabs(h_energy[0]);
-                const int host_decision = h_energy[1] > rhs + tol
-                                              ? 1
-                                              : (h_energy[1] > rhs ? 2 : 0);
+                const int host_decision =
+                    !std::isfinite(h_energy[1])   // mirror the kernel's NaN guard
+                        ? 1
+                        : (h_energy[1] > rhs + tol ? 1
+                                                   : (h_energy[1] > rhs ? 2 : 0));
                 if(host_decision != decision)
                     throw std::runtime_error(
                         "[line-search] device and host decisions differ");
@@ -14924,6 +14932,10 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         testingE = computeEnergy(TetMesh);
         const double rhs = lastEnergyVal + c1m * trial_alpha;
         const double tol = energy_abs_tol + energy_rel_tol * fabs(lastEnergyVal);
+        // [NaN-quarantine gap fix] see _global_ls_decide: NaN must read as
+        // "not a descent" (backtrack), never as silent acceptance.
+        if(!std::isfinite(testingE))
+            return 1;
         return testingE > rhs + tol ? 1 : (testingE > rhs ? 2 : 0);
     };
     int energy_decision = evaluate_trial_energy(alpha);

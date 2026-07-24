@@ -133,13 +133,19 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
     using namespace muda;
 
     auto sorted_partition_input = global_triplets.block_temp_buffer();
+    // [audit v0.8.5.1] cover element [length-1] too: it was never written but
+    // the ExclusiveSum below reads all `length` inputs. The last input feeds no
+    // output (exclusive scan), so results were always correct — this only
+    // silences the uninitialized-read (compute-sanitizer initcheck noise).
     ParallelFor()
         .file_line(__FILE__, __LINE__)
-        .apply(length - 1,
+        .apply(length,
                [sorted_partition_input,
+                n       = length,
                 ij_hash = global_triplets.block_sort_hash_value()] __device__(int i) mutable
                {
-                   sorted_partition_input[i] = ij_hash[i] != ij_hash[i + 1] ? 1 : 0;
+                   sorted_partition_input[i] =
+                       (i + 1 < n) ? (ij_hash[i] != ij_hash[i + 1] ? 1 : 0) : 0;
                });
     auto sorted_partition_output = global_triplets.block_index();
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());

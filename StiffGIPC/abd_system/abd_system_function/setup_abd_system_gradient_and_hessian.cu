@@ -1293,6 +1293,24 @@ void ABDSystem::init_revolute_driving(
         // shift by initial_angle_offset.
         drv.lower_limit = static_cast<Float>(ctrl.lower_limit - ctrl.initial_angle_offset);
         drv.upper_limit = static_cast<Float>(ctrl.upper_limit - ctrl.initial_angle_offset);
+        // [audit v0.8.5.1] the runtime angle is atan2-based, range (-pi, pi].
+        // A REAL limit (not the +-1e30 "none" sentinel) shifted outside that
+        // range by a large initial_angle_offset can never fire — warn loudly at
+        // init instead of silently disabling one side of the limit.
+        {
+            const double kPi = 3.14159265358979323846;
+            const bool real_lo = std::abs(ctrl.lower_limit) < 1e29;
+            const bool real_up = std::abs(ctrl.upper_limit) < 1e29;
+            if((real_lo && drv.lower_limit < -kPi) || (real_up && drv.upper_limit > kPi))
+                fprintf(stderr,
+                        "[revolute-limit][WARN] joint %d: limit(s) shifted by "
+                        "initial_angle_offset=%.6f land outside the atan2 angle "
+                        "range (-pi, pi]: lower=%.6f upper=%.6f — the out-of-range "
+                        "side(s) can NEVER trigger. Re-express the limits relative "
+                        "to the initial pose.\n",
+                        ji, ctrl.initial_angle_offset,
+                        (double)drv.lower_limit, (double)drv.upper_limit);
+        }
     }
 
     m_revolute_driving_data.resize(m_num_revolute_driving);

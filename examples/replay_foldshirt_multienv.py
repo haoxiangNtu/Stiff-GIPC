@@ -209,7 +209,9 @@ def main():
         joint_strength_ratio=100.0, revolute_driving_strength_ratio=100.0,
         prismatic_strength_ratio=2000.0, semi_implicit_enabled=False,
         semi_implicit_beta_tol=5e-2, semi_implicit_min_iter=1, newton_tol=5e-2,
-        newton_iter_cap=50, preconditioner_type=1,
+        newton_iter_cap=50,
+        # CASE39_PRECOND: 1 = MAS (historical default), 0 = diagonal — A/B knob.
+        preconditioner_type=int(os.environ.get("CASE39_PRECOND", "1")),
         ground_offset=float(ec.get("ground_offset", 0.75)), assets_dir=_ASSETS_DIR)
     cfg._cfg.collision_detection_buff_scale = float(os.environ.get("CASE39ME_BUFF_SCALE", "4.0"))
     cfg._cfg.linear_system_buff_scale       = float(os.environ.get("CASE39ME_LSYS_SCALE", "2.0"))

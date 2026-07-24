@@ -150,6 +150,17 @@ __device__ __forceinline__ uint32_t _emit_slot(uint32_t* cnt, int cap)
 }
 void set_emit_caps(int dcd_cap, int ccd_cap)
 {
+    // [audit v0.8.5.1] centralize the DCD<=CCD cap invariant at the single
+    // publish point. The detect kernels dual-write the CCD mirror at the
+    // DCD-clamped slot index, so dcd_cap > ccd_cap means the mirror write can
+    // run past its allocation (the exact OOB class bdd0776 closed at the two
+    // known grow sites — this catches any FUTURE third grow site loudly).
+    if(dcd_cap > ccd_cap)
+        fprintf(stderr,
+                "[set_emit_caps][INVARIANT VIOLATION] dcd_cap=%d > ccd_cap=%d: "
+                "the CCD mirror buffer can overflow. A pair-buffer grow site "
+                "raised the DCD cap without growing the CCD mirror.\n",
+                dcd_cap, ccd_cap);
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_dcd_cp_cap, &dcd_cap, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ccd_cp_cap, &ccd_cap, sizeof(int)));
 }
