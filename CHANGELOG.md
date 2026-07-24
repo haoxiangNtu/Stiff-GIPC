@@ -27,6 +27,20 @@ bit-identical to 0.8.5 on every scene that does not trigger the fixed path
   contact count across the boundary — it is not itself defective (det-only runs
   never crashed).
 
+### Memory (follow-up commit)
+- **Frame-start discard-grow**: the triplet buffer's routine growth moved to the one
+  point where discarding is provably legal (frame start, right after the stream
+  offset reset — the buffer holds no live data there), sized for both consumers:
+  `max(assembly bound, 2 × previous iteration's exact length)`. The preserving grow
+  at the build point — whose malloc+copy+free transiently holds old+new — becomes a
+  rare backstop (only >~1.3× single-iteration triplet jumps), restoring the
+  [P0-mem] no-transient property for the common growth path at high env counts.
+- `ensure_capacity_preserve` now fails loudly (throw) if the live prefix exceeds
+  capacity instead of silently destroying it via `resize()`'s free→malloc growth;
+  `ensure_capacity_discard` carries an explicit legality contract, and
+  `CudaDeviceBuffer::resize()` documents its non-`std::vector` destroy-on-grow
+  semantics.
+
 ### Hardening (found during the investigation; not the crash cause)
 - Three `if(I1==0) return;` early-outs in `_calBarrierGradientAndHessian` left
   their emission-reserved triplet slots at the whole-buffer memset's `(0,0)`,

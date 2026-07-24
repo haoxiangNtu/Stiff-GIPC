@@ -12979,6 +12979,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         printf("[shape-stage] s1 (kinetic) dumped @frame %d k=%d\n", g_dec_frame, g_dec_k);
     }
 
+    // [v0.8.5.1 frame-start grow] Capture the previous iteration's EXACT stream length
+    // before the reset — it predicts this iteration's converter need (2*length) far
+    // more tightly than the M12_Off-blocks-per-pair worst-case bound can.
+    const long long prev_triplet_len = gipc_global_triplet.global_triplet_offset;
     gipc_global_triplet.global_triplet_offset = 0;
 
     // [P1-dyn] Grow the global triplet buffer BEFORE any assembly writes, to a PROVABLE
@@ -12986,12 +12990,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // NEVER overflow — not merely "usually fit"). The bound:
     //   - fixed (topology) internal triplets: m_fixed_triplet_base + fem_point (exact)
     //   - collision: h_cpNum[0] is the EXACT number of contact pairs calBarrier iterates;
-    //     any pair writes at most M12_Off(=16) 3x3 blocks, so 16*h_cpNum[0] >= the real
+    //     any pair writes at most M12_Off 3x3 blocks, so M12_Off*h_cpNum[0] >= the real
     //     collision-triplet count for ANY type mix (PP/PE/PT/EE). Same for lagged
     //     friction (h_cpNum_last[0]) and ground (h_gpNum, generous *M6_Off).
-    // block_values needs 2*bound (converter writes scratch/output to [length:2*length),
-    // global_linear_system.cu); hash scratch needs bound. Non-hybrid only; hybrid keeps
-    // the worst-case finalize allocation. Provable: bound >= actual length always.
+    // Non-hybrid only; hybrid keeps the worst-case finalize allocation.
     if(m_dynamic_triplet)
     {
         long long bound = m_fixed_triplet_base
@@ -13003,14 +13005,32 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                + static_cast<long long>(h_gpNum_last) * M6_Off;
 #endif
         bound += 4096;                                          // fixed slack
-        // Pre-assembly only needs capacity >= this step's length (assembly writes [0:length));
-        // bound is a provable upper bound on length, so 1*bound is assembly-safe. The
-        // converter's 2*length region is grown exactly at the convert site
-        // (global_linear_system.cu), so the peak capacity = 2*length (the irreducible
-        // out-of-place-converter floor), not 2*bound. Saves ~20% of the grasp-peak buffer.
-        long long bv_need = bound;
-        if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(bv_need))
-            gipc_global_triplet.reserve_triplets(static_cast<size_t>(bv_need * 1.1));
+        // [v0.8.5.1] This is the ONE point where the triplet buffer provably holds no
+        // live data (offset just reset; the previous stream was fully consumed by its
+        // solve) — so growth here may legally DISCARD (free→malloc, no copy, no
+        // old+new transient): the [P0-mem] memory property, at the location where its
+        // "nothing to preserve" premise is actually true. Size for BOTH consumers:
+        //   - assembly writes [0:length): 1*bound covers it (provable upper bound);
+        //   - the converter needs 2*length_now at the build point. length_now is
+        //     unknown here; predict from the previous iteration's EXACT length with
+        //     35% jump headroom (2.7 = 2 x 1.35). A plain 2*prev misses exactly the
+        //     frames that matter: the towel-strict trigger was a +26% single-frame
+        //     contact jump (2*prev=267864 < cap while 2*length_now=336938 > cap).
+        // Jumps >35% per Newton iteration fall through to ensure_capacity_preserve
+        // at the build point — the correctness backstop: rare, one transient copy,
+        // always correct. Margin (30% capped at 512MB) lives in the callee.
+        long long conv_pred = 27 * prev_triplet_len / 10;
+        long long target    = bound > conv_pred ? bound : conv_pred;
+        if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(target))
+        {
+            gipc_global_triplet.ensure_capacity_discard(static_cast<size_t>(target));
+            // The whole-buffer determinism memset above ran on the OLD allocation;
+            // re-zero the fresh one (grow iterations only, so effectively free).
+            size_t cap = gipc_global_triplet.triplet_capacity();
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int)));
+        }
         if(gipc_global_triplet.global_external_max_capcity < bound)
         {
             gipc_global_triplet.resize_collision_hash_size(static_cast<size_t>(bound * 1.1));

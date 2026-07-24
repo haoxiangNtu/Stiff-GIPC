@@ -2,6 +2,8 @@
 
 #include"cuda_tools/cuda_device_buffer.h"
 #include"Eigen/Eigen"
+#include <stdexcept>
+#include <string>
 
 #define SymGH   // [symgh-validate] block-level upper-triangular storage (-37.5% triplets); half-finished per author — this branch is the strict validation run
 #ifdef SymGH
@@ -54,12 +56,16 @@ class GIPCTripletMatrix
         m_block_col_indices.resize(nonzero_count);
     }
 
-    // [P0-mem] pre-assembly growth: contents need NOT survive (assembly fully
-    // rewrites [0:len) and the converter's scratch [len:2len) is written before read),
-    // so grow free->malloc (no copy, no double residency). Margin is CAPPED in
-    // absolute bytes (512MB of blocks) instead of a pure ratio: a 30% ratio on a
-    // multi-GB buffer over-reserves by GBs, and that overshoot is what tips 24GB
-    // cards over the edge at high env counts.
+    // [P0-mem] DISCARDING growth: free old THEN malloc new — no copy, no old+new
+    // double residency. Margin is CAPPED in absolute bytes (512MB of blocks) instead
+    // of a pure ratio: a 30% ratio on a multi-GB buffer over-reserves by GBs, and
+    // that overshoot is what tips 24GB cards over the edge at high env counts.
+    //
+    // LEGALITY CONTRACT (v0.8.5.1): contents are DESTROYED. The only legal call site
+    // is one where the buffer provably holds NO live data — i.e. the frame-start grow
+    // in computeGradientAndHessian, right after global_triplet_offset is reset and
+    // before any assembly write. NEVER call between assembly and the solve: that
+    // exact misuse at the build point was the towel-strict SpMV OOB (b6c1f09).
     void ensure_capacity_discard(size_t need)
     {
         if(m_block_values.capacity() >= need)
@@ -93,6 +99,18 @@ class GIPCTripletMatrix
     {
         if(m_block_values.capacity() >= need)
             return;
+        // Invariant: the live prefix must already fit. CudaDeviceBuffer::resize()
+        // DESTROYS contents when it must grow (free→malloc, unlike std::vector), so
+        // live_count > capacity would wipe the very data this call must preserve.
+        // Assembly-side growth (frame-start bound grow + the partition grow)
+        // guarantees the invariant; fail loudly rather than solve a corrupt matrix.
+        if(live_count > m_block_values.capacity())
+            throw std::runtime_error(
+                "GIPCTripletMatrix::ensure_capacity_preserve: live_count "
+                + std::to_string(live_count) + " exceeds capacity "
+                + std::to_string(m_block_values.capacity())
+                + " — live triplets already overflowed an earlier grow; refusing "
+                  "to continue with a corrupt matrix.");
         size_t margin_cap = (size_t)(512ull * 1024 * 1024) / sizeof(BlockMatrix);
         size_t margin     = need * 3 / 10;
         if(margin > margin_cap) margin = margin_cap;

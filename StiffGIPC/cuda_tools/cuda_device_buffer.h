@@ -31,6 +31,10 @@ class CudaDeviceBuffer
     void copy_to_host(std::vector<T>& host) const;
     void copy_from_host(const std::vector<T>& host);
 
+    // WARNING (v0.8.5.1 audit): unlike std::vector::resize, growing PAST the current
+    // capacity DESTROYS the contents (free → malloc, no copy). Within capacity it
+    // only updates the size field. If contents must survive a growth, reserve()
+    // (copying) first — see GIPCTripletMatrix::ensure_capacity_preserve.
     void resize(size_t new_size);
     void reserve(size_t new_capacity);
     // [P0-mem] grow WITHOUT preserving contents: free old THEN malloc new.
