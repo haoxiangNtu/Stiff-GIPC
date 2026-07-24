@@ -24,6 +24,15 @@ class MASPreconditioner
     // overflow (caught by compute-sanitizer). Sized as
     // max(vertNum, partMapSize) + (m_numEnvs+1)*BANKSIZE.
     int m_clusterCap = 0;
+    // [audit lens-A fix] TRUE allocation size of the OUTPUT-layer buffers
+    // (d_multiLevelR/Z, d_mRbin/mZbin, d_matbin, d_precondMatMas,
+    // d_inverseMatMas/d_MatMas). These were sized ONCE at init from the
+    // zero-contact cluster count (*1.05) and the size was never stored — the
+    // per-frame totalNumberClusters (real contact connectivity) was written
+    // into them with the ONLY assertion checking m_clusterCap*levelnum, the
+    // capacity of a DIFFERENT (much larger, per-level-padded) scratch group.
+    int m_outputClusterCap = 0;
+    void ensureOutputClusterCapacity(int need);
   public:
     int m_numEnvs = 1;   // [per-env MAS] #body-groups (envs); set at setup from tetMesh.body_groups
   private:

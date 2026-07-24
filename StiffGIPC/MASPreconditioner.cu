@@ -706,8 +706,15 @@ __global__ void __inverse6_P96x96(__GEIGEN__::MasMatrixSymf* _preMatrix,
                                   int                        numbers)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= numbers)
-        return;
+    // [audit lens-B fix] NO early return: the Gauss-Jordan loop below runs 7
+    // __syncthreads() per pivot. With 96 threads/block handling 2 matrices, a
+    // half-full last block (numbers % 96 == 48, i.e. an odd bank count — a
+    // natural coarse-level terminal state) would have lanes 48-95 exit before
+    // the barriers while lanes 0-47 keep hitting them: barrier-divergence UB
+    // (documented hang). Out-of-range threads stay resident on an identity
+    // phantom matrix in their own shared slab and skip only the global reads
+    // and the final writeback (the inRange idiom of the _new kernels).
+    const bool inRange = idx < numbers;
 
     int matId       = idx / (BANKSIZE * 3);
     int i           = idx % (BANKSIZE * 3);
@@ -721,7 +728,12 @@ __global__ void __inverse6_P96x96(__GEIGEN__::MasMatrixSymf* _preMatrix,
         int rowId = j / 3;
         int colId = i / 3;
         int index = 0;
-        if(colId >= rowId)
+        if(!inRange)
+        {   // phantom slab: zeros (diagonal fixed to 1 below) — Gauss-Jordan
+            // on the identity, every pivot rt = 1, no NaN, no global access.
+            sPMas[block_matId][j][i] = 0.0;
+        }
+        else if(colId >= rowId)
         {
             index = BANKSIZE * rowId - rowId * (rowId + 1) / 2 + colId;
             sPMas[block_matId][j][i] = _invMatrix[matId].M[index](j % 3, i % 3);
@@ -791,7 +803,7 @@ __global__ void __inverse6_P96x96(__GEIGEN__::MasMatrixSymf* _preMatrix,
         int rowId = j / 3;
         int colId = i / 3;
         int index = 0;
-        if(colId >= rowId)
+        if(inRange && colId >= rowId)   // [audit lens-B fix] phantom threads never write back
         {
             index = BANKSIZE * rowId - rowId * (rowId + 1) / 2 + colId;
             _preMatrix[matId].M[index](j % 3, i % 3) = sPMas[block_matId][j][i];
@@ -2657,6 +2669,11 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
 
     ReorderRealtime(cpNum);
 
+    // [audit lens-A fix] the per-frame cluster count (real contact
+    // connectivity) can exceed the init-time zero-contact allocation of the
+    // output-layer buffers — grow them BEFORE the memsets/deposits below.
+    ensureOutputClusterCapacity(totalNumberClusters);
+
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
 #ifdef SYME
@@ -3017,6 +3034,55 @@ void MASPreconditioner::initPreconditioner_Matrix()
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_matbin,
                               (size_t)(totalCluster / BANKSIZE) * MAS_NB * 9 * BINNED_K
                                   * sizeof(double)));
+    m_outputClusterCap = totalCluster;   // [audit lens-A fix] remember the TRUE size
+}
+
+// [audit lens-A fix] Grow the OUTPUT-layer buffer group when the per-frame
+// cluster count exceeds the init-time allocation. The init sizing used the
+// ZERO-contact hierarchy (*1.05) and was never stored; per-frame counts from
+// real contact connectivity can exceed it, and the only assertion checked
+// m_clusterCap*levelnum — the capacity of a DIFFERENT scratch group — so the
+// overflow was silent OOB. All these buffers are fully rewritten every
+// setPreconditioner/PrepareHessian, so a DISCARDING grow is legal; the binned
+// device symbols must be re-bound after the realloc (they cache raw pointers).
+void MASPreconditioner::ensureOutputClusterCapacity(int need)
+{
+    if(need <= m_outputClusterCap)
+        return;
+    int newCap = need + need / 16 + BANKSIZE;             // ~6% headroom
+    newCap     = ((newCap + BANKSIZE - 1) / BANKSIZE) * BANKSIZE;
+    printf("[MAS][grow] output cluster buffers: %d -> %d (frame cluster count %d "
+           "exceeded the init-time allocation)\n",
+           m_outputClusterCap, newCap, need);
+#ifdef SYME
+    CUDA_SAFE_CALL(cudaFree(d_inverseMatMas));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_inverseMatMas,
+                              (size_t)(newCap / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymT)));
+#else
+    CUDA_SAFE_CALL(cudaFree(d_MatMas));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_MatMas,
+                              (size_t)(newCap / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixT)));
+#endif
+    CUDA_SAFE_CALL(cudaFree(d_precondMatMas));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_precondMatMas,
+                              (size_t)(newCap / BANKSIZE) * sizeof(__GEIGEN__::MasMatrixSymf)));
+    CUDA_SAFE_CALL(cudaFree(d_multiLevelR));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_multiLevelR, (size_t)newCap * sizeof(Eigen::Vector3f)));
+    CUDA_SAFE_CALL(cudaFree(d_multiLevelZ));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_multiLevelZ, (size_t)newCap * sizeof(Precision_T3)));
+    CUDA_SAFE_CALL(cudaFree(d_mRbin));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_mRbin,
+                              (size_t)3 * newCap * BINNED_K * sizeof(double)));
+    CUDA_SAFE_CALL(cudaFree(d_mZbin));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_mZbin,
+                              (size_t)3 * newCap * BINNED_K * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mRbin, &d_mRbin, sizeof(double*)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_mZbin, &d_mZbin, sizeof(double*)));
+    CUDA_SAFE_CALL(cudaFree(d_matbin));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_matbin,
+                              (size_t)(newCap / BANKSIZE) * MAS_NB * 9 * BINNED_K
+                                  * sizeof(double)));
+    m_outputClusterCap = newCap;
 }
 
 void MASPreconditioner::FreeMAS()

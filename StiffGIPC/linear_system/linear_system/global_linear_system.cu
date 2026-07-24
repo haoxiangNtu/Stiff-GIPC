@@ -237,19 +237,18 @@ void GlobalLinearSystem::convert_new()
     // ensure it holds the converter's [length:2*length) scratch/output region and the
     // hash scratch holds `length`. length here is EXACT (= assembled
     // global_triplet_offset), so this guarantees the converter never overflows.
-    // resize_triplets(length) sets m_size so the subsequent reserve preserves the
-    // assembled triplets in [0:length). No-op when the buffer is already large
-    // (worst-case hybrid alloc) -> byte-for-byte unchanged for hybrid scenes.
+    // [audit lens-A fix] guarded preserve API instead of the bare
+    // resize+reserve pair: on a growth where length itself already exceeded
+    // the capacity, resize_triplets() would have silently DESTROYED the live
+    // matrix (free->malloc) — reachable in hybrid mode, which skips the
+    // [P1-dyn] frame-start bound grow. The guarded call throws loudly instead.
+    // No-op when the buffer is already large -> byte-for-byte unchanged.
     {
         auto*           gt     = gipc_global_triplet;
         const long long length = gt->global_triplet_offset;
         if(length >= 1)
         {
-            if((long long)gt->triplet_capacity() < 2LL * length)
-            {
-                gt->resize_triplets((size_t)length);
-                gt->reserve_triplets((size_t)(2LL * length * 13 / 10));
-            }
+            gt->ensure_capacity_preserve((size_t)length, (size_t)(2LL * length));
             if(gt->global_external_max_capcity < length)
             {
                 gt->resize_collision_hash_size((size_t)((long long)length * 13 / 10));

@@ -38,7 +38,13 @@ void ABDSystem::step_forward(ABDSimData&                sim_data,
                    // with env g's FEM verts); fall back to scalar alpha if <0.
                    double a = alpha;
                    if(per_body_alpha && per_body_alpha[i] >= 0.0) a = per_body_alpha[i];
-                   qs(i) = q_temps(i) - a * dqs(i);
+                   // [audit lens-D fix] frozen body (a==0) keeps its last
+                   // accepted q: with NaN/Inf dq, q_temp - dq*0 = NaN — the
+                   // freeze failed exactly when needed. Bit-neutral for a != 0.
+                   if(a == 0.0)
+                       qs(i) = q_temps(i);
+                   else
+                       qs(i) = q_temps(i) - a * dqs(i);
                });
 
     ParallelFor(256)

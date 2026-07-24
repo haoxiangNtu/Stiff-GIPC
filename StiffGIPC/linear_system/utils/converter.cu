@@ -203,13 +203,15 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
         int    nuniq = global_triplets.h_unique_key_number;
         size_t need  = (size_t)nuniq * 9 * BINNED_K;
         if(need > m_mergebin_cap)
-        {
+        {   // [audit lens-A fix] CUDA_SAFE_CALL: a swallowed cudaMalloc failure
+            // left m_mergebin dangling while m_mergebin_cap claimed the new
+            // size — every later call would then memset/scatter through it.
             if(m_mergebin)
-                cudaFree(m_mergebin);
-            cudaMalloc((void**)&m_mergebin, need * sizeof(double));
+                CUDA_SAFE_CALL(cudaFree(m_mergebin));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_mergebin, need * sizeof(double)));
             m_mergebin_cap = need;
         }
-        cudaMemset(m_mergebin, 0, need * sizeof(double));
+        CUDA_SAFE_CALL(cudaMemset(m_mergebin, 0, need * sizeof(double)));
 
         auto* src_blocks = global_triplets.block_values(out_start_id);  // sorted src (length)
         auto* dst_blocks = global_triplets.block_values(start);         // unique out (nuniq)

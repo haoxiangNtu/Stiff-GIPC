@@ -1276,10 +1276,20 @@ __global__ void _reduct_max_box(AABB* _leafBoxes, int number)
 
     extern __shared__ AABB tep[];
 
-    if(idx >= number)
-        return;
-    //int cfid = tid + CONFLICT_FREE_OFFSET(tid);
-    AABB temp = _leafBoxes[idx];
+    // [audit lens-B fix] NO early return: the exited lanes of a partial last
+    // warp fed UNDEFINED register values into the full-mask __shfl_down_sync
+    // below (participation-mismatch UB), and AABB::combines() min/max-absorbs
+    // whatever comes back — on this HW typically 0.0, which silently clamps the
+    // scene box to include the origin (visible only for scenes whose true box
+    // excludes it; the box feeds Morton quantization AND bboxDiagSize2→dHat).
+    // c3087a7 swept this template in GIPC.cu but this mlbvh.cu twin was missed.
+    // All lanes now stay resident; out-of-range lanes carry the NEUTRAL
+    // (inverted 1e32) AABB so every shuffle reads a defined absorbing value.
+    // Shared tep[] is sized blockDim/32 (calcMaxBV), so phantom-warp lane-0
+    // writes stay in bounds and are never read (stage 2 reads [0, warpNum)).
+    AABB temp;   // default ctor = (+1e32, -1e32) = neutral element for combines
+    if(idx < number)
+        temp = _leafBoxes[idx];
 
     __threadfence();
 
@@ -1323,15 +1333,18 @@ __global__ void _reduct_max_box(AABB* _leafBoxes, int number)
         tep[warpId] = temp;
     }
     __syncthreads();
-    if(threadIdx.x >= warpNum)
+    // [audit lens-B fix] stage 2: whole warps other than warp 0 may retire (no
+    // barrier and no cross-warp op remains), but EVERY lane of warp 0 must stay
+    // resident for the full-mask shuffles — padding lanes read the neutral AABB
+    // instead of the old `threadIdx.x >= warpNum` early return that exited
+    // warp-0 lanes mid-warp (same participation-mismatch UB as stage 1).
+    if(warpId != 0)
         return;
     if(warpNum > 1)
     {
-        //	tidNum = warpNum;
-        temp = tep[threadIdx.x];
+        temp = (warpTid < warpNum) ? tep[warpTid] : AABB();
         xmin = temp.lower.x, ymin = temp.lower.y, zmin = temp.lower.z;
         xmax = temp.upper.x, ymax = temp.upper.y, zmax = temp.upper.z;
-        //	warpNum = ((tidNum + 31) >> 5);
         for(int i = 1; i < warpNum; i = (i << 1))
         {
             temp.combines(__shfl_down_sync(0xffffffff, xmin, i),
@@ -1340,7 +1353,7 @@ __global__ void _reduct_max_box(AABB* _leafBoxes, int number)
                           __shfl_down_sync(0xffffffff, xmax, i),
                           __shfl_down_sync(0xffffffff, ymax, i),
                           __shfl_down_sync(0xffffffff, zmax, i));
-            if(threadIdx.x + i < warpNum)
+            if(warpTid + i < warpNum)
             {
                 xmin = temp.lower.x, ymin = temp.lower.y, zmin = temp.lower.z;
                 xmax = temp.upper.x, ymax = temp.upper.y, zmax = temp.upper.z;

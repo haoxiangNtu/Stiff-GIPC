@@ -8480,9 +8480,16 @@ __global__ void _stepForward(double3* _vertexes,
         return;
     if(abs(bType[idx]) == 0 || moveBoundary)
     {
-        _vertexes[idx] =
-            __GEIGEN__::__minus(_vertexesTemp[idx],
-                                __GEIGEN__::__s_vec_multiply(_moveDir[idx], alpha));
+        // [audit lens-D fix] alpha==0 must mean "do not move" LITERALLY: with a
+        // NaN/Inf moveDir (diverged env), temp - dir*0 = NaN — the freeze
+        // decision failed to stop the very write it was made for. Keep the
+        // last-accepted position instead. Bit-neutral for alpha != 0.
+        if(alpha == 0.0)
+            _vertexes[idx] = _vertexesTemp[idx];
+        else
+            _vertexes[idx] =
+                __GEIGEN__::__minus(_vertexesTemp[idx],
+                                    __GEIGEN__::__s_vec_multiply(_moveDir[idx], alpha));
     }
 }
 
@@ -8506,9 +8513,15 @@ __global__ void _stepForward_perenv(double3*       _vertexes,
     {
         int    g = p2g[idx];
         double a = (g >= 0 && env_alpha[g] >= 0.0) ? env_alpha[g] : alpha;
-        _vertexes[idx] =
-            __GEIGEN__::__minus(_vertexesTemp[idx],
-                                __GEIGEN__::__s_vec_multiply(_moveDir[idx], a));
+        // [audit lens-D fix] a frozen env (a==0) must KEEP its last-accepted
+        // position: with a NaN/Inf moveDir, temp - dir*0 = NaN — the freeze
+        // failed exactly when it mattered. Bit-neutral for a != 0.
+        if(a == 0.0)
+            _vertexes[idx] = _vertexesTemp[idx];
+        else
+            _vertexes[idx] =
+                __GEIGEN__::__minus(_vertexesTemp[idx],
+                                    __GEIGEN__::__s_vec_multiply(_moveDir[idx], a));
     }
 }
 
@@ -12651,7 +12664,15 @@ void GIPC::initKappa(device_TetraData& TetMesh)
         m_active_group_count = NG;
         CUDA_SAFE_CALL(cudaMalloc((void**)&m_kappa_group, NG * sizeof(double)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_close_grp, NG * sizeof(int)));
-        h_kappa_group.assign(NG, 0.0);
+        // [audit lens-E fix] initialize BOTH device buffers at the enable
+        // point: whichever enable site fires first, the freshly-malloc'ed
+        // m_kappa_group must never be consumed as garbage — seed it with the
+        // current scalar Kappa (the per-env initKappa overwrites it when it
+        // runs); m_d_close_grp likewise starts as a defined all-zero mask.
+        h_kappa_group.assign(NG, Kappa);
+        CUDA_SAFE_CALL(cudaMemcpy(m_kappa_group, h_kappa_group.data(),
+                                  NG * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemset(m_d_close_grp, 0, NG * sizeof(int)));
         printf("[pergroup-kappa] enabled (early, in initKappa) NG=%d\n", NG);
     }
     bool perenv_kappa_filled = false;   // [decouple] set when per-env κ replaces the stub broadcast
@@ -12850,13 +12871,16 @@ void GIPC::partitionContactHessian()
     // the ranges are copied back. Dynamic pre-assembly growth only guarantees
     // [0,n), and the global converter's equivalent safety net runs later.
     // Grow here from the exact contact count while preserving [0,n).
+    // [audit lens-A fix] use the GUARDED preserve API: the old bare
+    // resize_triplets+reserve_triplets pair silently DESTROYED the live
+    // triplets whenever contact_triplet_count exceeded the current capacity
+    // (resize() is free->malloc on growth) — reachable in hybrid mode, which
+    // skips the [P1-dyn] frame-start bound grow entirely. The guarded call
+    // throws loudly instead of ever corrupting the matrix.
     const size_t contact_triplet_count = static_cast<size_t>(
         gipc_global_triplet.global_collision_triplet_offset);
-    if(gipc_global_triplet.triplet_capacity() < 2 * contact_triplet_count)
-    {
-        gipc_global_triplet.resize_triplets(contact_triplet_count);
-        gipc_global_triplet.reserve_triplets(contact_triplet_count * 26 / 10);
-    }
+    gipc_global_triplet.ensure_capacity_preserve(contact_triplet_count,
+                                                 2 * contact_triplet_count);
 
     muda::DeviceRadixSort().SortPairs(gipc_global_triplet.block_hash_value(),
                                       gipc_global_triplet.block_sort_hash_value(),
@@ -13083,7 +13107,15 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         m_active_group_count = NG;
         CUDA_SAFE_CALL(cudaMalloc((void**)&m_kappa_group, NG * sizeof(double)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_close_grp, NG * sizeof(int)));
-        h_kappa_group.assign(NG, 0.0);
+        // [audit lens-E fix] initialize BOTH device buffers at the enable
+        // point: whichever enable site fires first, the freshly-malloc'ed
+        // m_kappa_group must never be consumed as garbage — seed it with the
+        // current scalar Kappa (the per-env initKappa overwrites it when it
+        // runs); m_d_close_grp likewise starts as a defined all-zero mask.
+        h_kappa_group.assign(NG, Kappa);
+        CUDA_SAFE_CALL(cudaMemcpy(m_kappa_group, h_kappa_group.data(),
+                                  NG * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemset(m_d_close_grp, 0, NG * sizeof(int)));
         printf("[pergroup-kappa] enabled, NG=%d\n", NG);
     }
 
