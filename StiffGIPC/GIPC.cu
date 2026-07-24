@@ -163,6 +163,27 @@ __device__ inline void write_triplet(Eigen::Matrix3d*    triplet_value,
     }
 }
 
+// [contact-slot hygiene] Contact triplet slots are RESERVED at emission time
+// (mlbvh MatIndex = atomicAdd on the per-type counter), so an assembly-side
+// early-out must still deposit its blocks. The whole-buffer memset in
+// computeGradientAndHessian already zeros unwritten slots to (0,0,0), which
+// keeps the SpMV in-bounds — but (0,0) MISCLASSIFIES as abd_abd in mixed
+// ABD+FEM scenes (both indices < abd_vert_num) where the real pair is
+// fem_*/fem_fem. Exactly-parallel edge pairs (I1==0) carry zero mollified
+// barrier energy, so depositing a zero 12x12 block at the pair's DECODED
+// (valid) vertex ids is the correct contribution and classifies correctly.
+// (Not the towel-strict OOB root cause — that was the pre-solve grow, see
+// GlobalLinearSystem::build; this is the reserved-slot correctness contract.)
+__device__ inline void write_zero_triplet12(Eigen::Matrix3d* triplet_value,
+                                            int*             row_ids,
+                                            int*             col_ids,
+                                            const uint4&     gidx,
+                                            int              offset)
+{
+    double Z[12][12] = {};
+    write_triplet<12, 12>(triplet_value, row_ids, col_ids, &(gidx.x), Z, offset);
+}
+
 
 __device__ __host__ inline uint32_t expand_bits(std::uint32_t v) noexcept
 {
@@ -3554,7 +3575,12 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
             double c = __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(v0, v1)) /*/ __GEIGEN__::__norm(v0)*/;
             double I1 = c * c;
             if(I1 == 0)
+            {   // slots already reserved at emission -> deposit zeros, not garbage
+                uint4 gidx = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+                write_zero_triplet12(triplet_values, row_ids, col_ids, gidx,
+                                     matIndex[idx] * M12_Off);
                 return;
+            }
             double dis;
             _d_EE(_vertexes[MMCVIDI.x],
                   _vertexes[MMCVIDI.y],
@@ -3816,7 +3842,12 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                 double c = __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(v0, v1)) /*/ __GEIGEN__::__norm(v0)*/;
                 double I1 = c * c;
                 if(I1 == 0)
+                {   // slots already reserved at emission -> deposit zeros, not garbage
+                    uint4 gidx = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+                    write_zero_triplet12(triplet_values, row_ids, col_ids, gidx,
+                                         matIndex[idx] * M12_Off);
                     return;
+                }
                 double dis;
                 _d_PP(_vertexes[MMCVIDI.x], _vertexes[MMCVIDI.y], dis);
                 double I2 = dis / dHat;
@@ -4316,7 +4347,12 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                 double c = __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(v0, v1)) /*/ __GEIGEN__::__norm(v0)*/;
                 double I1 = c * c;
                 if(I1 == 0)
+                {   // slots already reserved at emission -> deposit zeros, not garbage
+                    uint4 gidx = make_uint4(MMCVIDI.x, MMCVIDI.y, MMCVIDI.z, MMCVIDI.w);
+                    write_zero_triplet12(triplet_values, row_ids, col_ids, gidx,
+                                         matIndex[idx] * M12_Off);
                     return;
+                }
                 double dis;
                 _d_PE(_vertexes[MMCVIDI.x],
                       _vertexes[MMCVIDI.y],
@@ -12993,7 +13029,22 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
           int t0 = getenv("STIFF_BAR_TGT0") ? atoi(getenv("STIFF_BAR_TGT0")) : -1;
           int t1 = getenv("STIFF_BAR_TGT1") ? atoi(getenv("STIFF_BAR_TGT1")) : -1;
           set_bar_targets(on, t0, t1); }
-        if(getenv("STIFF_SPLIT_GH"))
+        bool _split_gh = getenv("STIFF_SPLIT_GH") != nullptr;
+#ifdef SymGH
+        if(_split_gh)
+        {   // [towel-strict audit] _calBarrierHessian still uses legacy 16/9/4 triplet
+            // strides (+ bare I1==0 returns) — incompatible with the SymGH 10/6/3
+            // layout: it would deposit garbage slots. Fall back to the fused kernel.
+            static bool _split_gh_warned = false;
+            if(!_split_gh_warned)
+            {
+                _split_gh_warned = true;
+                printf("[split-GH] DISABLED under SymGH layout; using fused kernel.\n");
+            }
+            _split_gh = false;
+        }
+#endif
+        if(_split_gh)
         {   // [split-GH experiment] launch gradient(152reg) + hessian-only kernels
             // instead of the fused 254-reg kernel; gradient lands in the SAME _gfx
             // accumulator (both kernels scatter via _gfxAdd). A/B flag, default off.
@@ -13297,7 +13348,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
             // Reset counter device-side.  Reuse the existing
             // d_unique_key_number scratch int* on GIPCTripletMatrix.
-            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_unique_key_number,
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_assembly_scratch_count,
                                            0, sizeof(int)));
 
             muda::ParallelFor(256)
@@ -13309,7 +13360,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                         ext_rows = gipc_global_triplet.block_row_indices(ext_start),
                         ext_cols = gipc_global_triplet.block_col_indices(ext_start),
                         ext_vals = gipc_global_triplet.block_values(ext_start),
-                        ext_count = gipc_global_triplet.d_unique_key_number,
+                        ext_count = gipc_global_triplet.d_assembly_scratch_count,
                         BDType   = TetMesh.BoundaryType,
                         v2pin    = TetMesh.vertex_to_pin_idx,
                         pin_body = TetMesh.d_fem_pin_abd_body_id,
@@ -13469,7 +13520,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             // Read final extension count and bump triplet offset.
             int h_ext_count = 0;
             CUDA_SAFE_CALL(cudaMemcpy(&h_ext_count,
-                                      gipc_global_triplet.d_unique_key_number,
+                                      gipc_global_triplet.d_assembly_scratch_count,
                                       sizeof(int),
                                       cudaMemcpyDeviceToHost));
             if(h_ext_count > ext_capacity)

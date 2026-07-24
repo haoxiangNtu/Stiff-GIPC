@@ -53,17 +53,23 @@ bool GlobalLinearSystem::build_linear_system()
     CUDA_SAFE_CALL(cudaMemset(m_x.view().data(), 0,
                               total_rhs_count * sizeof(Float)));
 
-    // [P0-mem pre-grow] grow the triplet storage BEFORE assembly. At this point
-    // global_triplet_offset (exact count) is known from report_subsystem_info()
-    // and the buffer holds only LAST iteration's dead triplets -> free+malloc
-    // (no copy). This replaces the post-assembly copying safety net in
-    // convert_new() as the primary growth path (that net still exists, but
-    // should no longer fire). Hash scratch moved here too (same reasoning:
-    // update_hash_value fully rewrites it).
+    // [P0-mem pre-grow → towel-strict root fix] grow the triplet storage before
+    // the solve. The original [P0-mem] version used ensure_capacity_discard here
+    // on the assumption that the buffer held "last iteration's dead triplets" —
+    // WRONG: GIPC assembles the full triplet stream in computeGradientAndHessian
+    // BEFORE solve_linear_system(), so this point sits AFTER assembly and the
+    // buffer holds the live matrix. The discarding grow destroyed it the first
+    // time 2*length crossed the current allocation (towel strict frame 26:
+    // 2*168469=336938 > oldcap 336199 → matrix row/col replaced by stale pages,
+    // all (0,0) → unique-key reduction collapses to 32 → SpMV reads garbage rows
+    // like 105631 ≫ dof=961 → illegal address). Now grows PRESERVING [0:length)
+    // with the same absolute
+    // margin cap; the converter scratch [length:2length) needs no preservation.
+    // Hash scratch stays discard-resized (update_hash_value/convert rewrite it).
     {
         auto*           gt     = gipc_global_triplet;
         const long long length = gt->global_triplet_offset;
-        gt->ensure_capacity_discard((size_t)(2LL * length));
+        gt->ensure_capacity_preserve((size_t)length, (size_t)(2LL * length));
         if(gt->global_external_max_capcity < length)
         {
             long long hm = length * 3 / 10;

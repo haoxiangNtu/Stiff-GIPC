@@ -4,6 +4,43 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.5.1] — 2026-07-24
+
+Patch release: fixes a rare strict-mode illegal-memory crash. No API changes;
+bit-identical to 0.8.5 on every scene that does not trigger the fixed path
+(the strict cross-env determinism anchor is unchanged: `f7fb5a786c2d7935`).
+
+### Fixed
+- **Strict-mode SpMV out-of-bounds when the contact-triplet count first exceeds
+  the current allocation** (crashed `recipe_towel_scramble` under
+  `STIFF_EE_CANON=1 STIFF_SPMV_DET=1`; a folded 30×30 cloth at frame 26). The
+  pre-solve triplet-buffer grow in `GlobalLinearSystem::build()` used a
+  *discarding* reallocation (`ensure_capacity_discard`, free+malloc, no copy) on
+  the assumption that the buffer held only the previous iteration's dead
+  triplets. But assembly (`computeGradientAndHessian`) runs BEFORE the solve, so
+  the grow point holds THIS iteration's live matrix; discarding it the first
+  time `2·length` crossed the current capacity replaced the whole matrix with
+  stale pages (all-zero row/col), collapsing the deterministic converter's
+  unique-key count and driving the deterministic SpMV to read out-of-range rows.
+  Now grows **preserving** `[0:length)` (`ensure_capacity_preserve`), keeping the
+  0.8.5 absolute 512 MB margin cap. `EE_CANON` was only the nudge that pushed the
+  contact count across the boundary — it is not itself defective (det-only runs
+  never crashed).
+
+### Hardening (found during the investigation; not the crash cause)
+- Three `if(I1==0) return;` early-outs in `_calBarrierGradientAndHessian` left
+  their emission-reserved triplet slots at the whole-buffer memset's `(0,0)`,
+  which misclassifies as an `abd_abd` block in mixed ABD+FEM scenes; they now
+  deposit a zero 12×12 block at the pair's decoded vertex ids (a parallel edge
+  carries zero mollified-barrier energy, so this is the correct contribution).
+- The converter-published unique-block count (`d_unique_key_number`) no longer
+  aliases the contact-start scratch block shared by the local-preconditioner
+  `DeviceSelect` count and the pinned-FEM extension counter (dedicated
+  allocation + a separate scratch counter).
+- The opt-in `STIFF_SPLIT_GH` experimental path (`_calBarrierHessian`, legacy
+  16/9/4 strides) now falls back to the fused kernel under the `SymGH` layout it
+  is incompatible with.
+
 ## [0.8.5] — 2026-07-24
 
 Stability-focused release on top of 0.8.4.2: the GPU control-flow

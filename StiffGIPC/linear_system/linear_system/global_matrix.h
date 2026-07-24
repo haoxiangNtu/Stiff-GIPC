@@ -80,6 +80,27 @@ class GIPCTripletMatrix
         m_block_col_indices.reserve(nonzero_count);
     }
 
+    // [towel-strict root fix] PRESERVING growth for the solve-time capacity
+    // guarantee. The triplet stream is assembled in computeGradientAndHessian
+    // BEFORE solve_linear_system()/build() runs, so at the pre-solve grow point
+    // the buffer holds THIS iteration's LIVE matrix — a discarding grow there
+    // destroys it the first time 2*live crosses the current capacity (observed:
+    // towel strict, frame 26, 2*168469 > oldcap 336199 → whole matrix replaced
+    // by stale pages → 32 phantom unique keys → SpMV OOB). Keeps the
+    // [P0-mem] absolute margin cap so the fix does not reintroduce the multi-GB
+    // over-reservation this call replaced.
+    void ensure_capacity_preserve(size_t live_count, size_t need)
+    {
+        if(m_block_values.capacity() >= need)
+            return;
+        size_t margin_cap = (size_t)(512ull * 1024 * 1024) / sizeof(BlockMatrix);
+        size_t margin     = need * 3 / 10;
+        if(margin > margin_cap) margin = margin_cap;
+        size_t cap = need + margin;
+        resize_triplets(live_count);   // publish the live size: reserve()'s copy covers [0:live)
+        reserve_triplets(cap);
+    }
+
     void resize(int row, int col, size_t nonzero_count)
     {
         reshape(row, col);
@@ -189,7 +210,14 @@ class GIPCTripletMatrix
     int* d_abd_fem_contact_start_id;
     int* d_fem_abd_contact_start_id;
     int* d_fem_fem_contact_start_id;
+    // [v0.8.5.1] The converter-published unique count is a persistent solver
+    // input. It must never alias a scratch counter: the local-preconditioner
+    // DeviceSelect count and the pinned-FEM extension counter both legitimately
+    // overwrite their scratch after convert — with the old aliased layout
+    // (d_contact_start_block + 4) that clobbered the unique count and a stale
+    // host mirror could pick the garbage up (towel-strict OOB, 2026-07-24).
     int* d_unique_key_number;
+    int* d_assembly_scratch_count = nullptr;
 
     // ②-D2H: one contiguous [5] block (abd_abd, abd_fem, fem_abd, fem_fem,
     // unique_key) so partitionContactHessian reads the 4 start-ids in a SINGLE
@@ -205,12 +233,15 @@ class GIPCTripletMatrix
         d_abd_fem_contact_start_id = d_contact_start_block + 1;
         d_fem_abd_contact_start_id = d_contact_start_block + 2;
         d_fem_fem_contact_start_id = d_contact_start_block + 3;
-        d_unique_key_number        = d_contact_start_block + 4;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_unique_key_number, sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_assembly_scratch_count, sizeof(int)));
     }
 
     void free_var()
     {
         CUDA_SAFE_CALL(cudaFree(d_contact_start_block));
+        CUDA_SAFE_CALL(cudaFree(d_unique_key_number));
+        CUDA_SAFE_CALL(cudaFree(d_assembly_scratch_count));
     }
 
     int h_abd_abd_contact_start_id = -1;
