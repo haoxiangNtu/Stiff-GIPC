@@ -61,6 +61,12 @@ class GIPC
     int               m_pool_K = 0;                  // 0 = pool not allocated
     void allocPerEnvPool(int K);                     // alloc K scratch sets + streams (once)
     const int*        m_d_p2g = nullptr;             // captured TetMesh.d_point_to_group (for lazy index build)
+    // [iron-law] captured for mid-run env quarantine: body→group map + body count
+    // (to mark a quarantined env's bodies in the ground-skip table), plus
+    // ownership of a lazily-allocated skip table (normally d_tetMesh owns it).
+    const int*        m_d_b2g = nullptr;             // captured TetMesh.d_body_to_group
+    int               m_collision_body_count = 0;    // captured TetMesh.collision_body_num
+    bool              m_ground_skip_owned = false;   // we cudaMalloc'ed _ground_skip_body
     // [multi-env cross-env DIAGNOSTIC] find the upstream env-asymmetry seed: compare env0 vs env1
     // (identical envs, local-frame coords) of any per-vertex buffer via a per-env local-id
     // correspondence. STIFF_XENV gates. xenvDiff returns max|env0[k]-env1[k]|.
@@ -179,6 +185,13 @@ class GIPC
     // 2 timeout (env_newton_iter_cap), 3 diverged (NaN/inf max-move).
     std::vector<int> m_env_frozen_iter;
     std::vector<int> m_env_status;
+    // [iron-law] PERSISTENT per-env quarantine (unlike m_env_status, survives
+    // across frames): set when an env becomes ground-infeasible MID-RUN — the
+    // env is pinned (alpha=0, status=3) every iteration of every later solve
+    // instead of a whole-process throw killing the healthy envs. Empty until
+    // first quarantine. Init-time violations (before per-env machinery is
+    // live) still throw, preserving the finalize-validation contract.
+    std::vector<uint8_t> m_env_quarantined;
     int              env_newton_iter_cap = 0;  // per-env iter budget; 0 = off
     // [T1] line-search backtracking budget (halvings); 0 = engine default (64).
     int              line_search_max_iter = 64;
@@ -186,6 +199,10 @@ class GIPC
     double           energy_rel_tol       = 0.0;
     uint64_t         energy_tolerance_accept_count = 0;
     void      throwIfGroundDistanceInvalid();
+    // [iron-law] mid-run env quarantine (see GIPC.cu): demote an env-attributable
+    // ground infeasibility to a persistent per-env freeze instead of a throw.
+    bool      quarantineEnvOfVertex(int vertex, double distance);
+    void      quarantineGroundInfeasibleAtFrameStart();
     void      throwIfInvalidCcdAlpha(const char* context);
     int       groundTrialStatus(const int* point_to_group, int group_count);
     void      halveGroundInvalidEnvAlpha(int group_count);
