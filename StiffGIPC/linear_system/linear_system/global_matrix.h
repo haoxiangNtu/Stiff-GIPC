@@ -143,6 +143,19 @@ class GIPCTripletMatrix
 
     void update_hash_value(int fem_offset);
 
+    // [3c slot audit, STIFF_SLOT_AUDIT=1] "every reserved slot must be written"
+    // contract check for one assembly pass. arm() sentinel-fills the row-index
+    // buffer (0xFF -> row == -1, no legal writer produces negative rows) right
+    // after the frame-start offset reset; check_and_restore() scans
+    // [0, global_triplet_offset) for surviving sentinels — a hit is a
+    // reserved-but-unwritten slot (the "stitch reserves slots that are never
+    // written -> garbage in the preconditioner" class) and throws naming the
+    // context — then re-zeroes the tail [live, capacity) so the buffer matches
+    // the known-benign post-grow state. Both are no-ops unless the env var is
+    // set; audit-off behavior is bit-identical by construction.
+    void slot_audit_arm();
+    void slot_audit_check_and_restore(const char* context);
+
     auto block_values(int offset = 0) { return m_block_values.data() + offset; }
     auto block_values(int offset = 0) const
     {

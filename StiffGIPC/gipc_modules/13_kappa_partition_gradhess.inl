@@ -626,6 +626,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             gipc_global_triplet.global_external_max_capcity = static_cast<int>(bound * 1.1);
         }
     }
+    // [3c] offsets are reset and no assembly write has happened yet — the one
+    // place arming the slot audit is legal (mirrors the discard-grow legality).
+    gipc_global_triplet.slot_audit_arm();
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
@@ -1296,6 +1299,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                    });
         gipc_global_triplet.global_triplet_offset += TetMesh.n_fem_pins * 10;
     }
+
+    // [3c] every triplet slot in [0, global_triplet_offset) must have been
+    // written by exactly this pass; survivors throw, tail restored to zeros.
+    gipc_global_triplet.slot_audit_check_and_restore("computeGradientAndHessian");
 
     return time00;
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
