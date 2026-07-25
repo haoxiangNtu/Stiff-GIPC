@@ -5,7 +5,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `ipc_solver.inl` | `GIPC::IPC_Solver`（帧循环）、`GIPC::solve_subIP`（Newton 循环+隔离冻结）、`GIPC::lineSearch` / `GIPC::postLineSearch`，及其 file-scope 计时/计数状态。从 gipc_modules/14 逐字迁入（2d），作为 GIPC.cu 复合 TU 的**最后一个 include** |
+| `ipc_solver.cu` + `ipc_solver.inl` | `GIPC::IPC_Solver`（帧循环）、`GIPC::solve_subIP`（Newton 循环+隔离冻结）、`GIPC::lineSearch` / `GIPC::postLineSearch`，及其 file-scope 计时/计数状态。从 gipc_modules/14 逐字迁入（2d）；**2d step 2 起为独立 TU**（`ipc_solver.cu` 提供 extern kernel/全局声明外壳，kernel 定义全部留在机制模块） |
 | `frame_pipeline.h` | 帧内阶段顺序的**唯一**权威文档（纯注释头）。改 ipc_solver.inl 的阶段顺序必须同 commit 改它 |
 
 规则：

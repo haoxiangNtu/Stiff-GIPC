@@ -5,12 +5,14 @@
 // GIPC::solve_subIP (Newton loop), GIPC::lineSearch / GIPC::postLineSearch.
 // Stage order is documented in core/frame_pipeline.h — change them TOGETHER.
 //
-// Compiled as part of the GIPC.cu composite TU, included AFTER gipc_modules/14
-// (order is load-bearing — orchestration references file-scope state of the
-// mechanism modules). Bodies below are verbatim moves from gipc_modules/14;
-// the cross-TU counters (totalNT/total_Frames/... consumed via extern by
-// engine_modules/04) keep external linkage, and module 14's checkpoint code
-// reaches total_Frames through its pre-existing forward extern decl.
+// Since Phase 2d step 2 this file is the body of core/ipc_solver.cu — its OWN
+// translation unit (the refactor's first physical TU separation). The .cu
+// shell provides the context: extern decls for every kernel launched here
+// (definitions stay in their mechanism modules, composite TU) and for the
+// composite-owned globals (g_gipc_log_level, g_dec_k/g_dec_frame). Bodies are
+// verbatim moves from gipc_modules/14; the counters defined here
+// (totalNT/total_Frames/...) keep external linkage — engine_modules/04 and
+// module 14's checkpoint code consume them via extern.
 //
 // Mechanics live with their owners and are CALLED from here, never inlined
 // here: pair growth = contact/pair_buffers.cuh, iron-law quarantine =

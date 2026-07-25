@@ -27,4 +27,4 @@
 #include "gipc_modules/12_host_wrappers_fem.inl"
 #include "gipc_modules/13_kappa_partition_gradhess.inl"
 #include "gipc_modules/14_energy_linesearch_solver.inl"
-#include "core/ipc_solver.inl"
+// core/ipc_solver.cu is its OWN TU since Phase 2d step 2 (orchestration split out).

@@ -346,7 +346,7 @@ static std::string ccdInvalidSources(int invalid)
     return result.empty() ? "unknown" : result;
 }
 
-static void throwForInvalidCcdMask(int invalid, const char* context)
+void throwForInvalidCcdMask(int invalid, const char* context)
 {
     invalid &= kCcdInvalidEffectiveMask;
     if(invalid == 0) return;
@@ -358,7 +358,7 @@ static void throwForInvalidCcdMask(int invalid, const char* context)
           "aborting instead of accepting an invalid Newton step.");
 }
 
-static void validateFinalCcdStateOrThrow(const double* state, const char* context)
+void validateFinalCcdStateOrThrow(const double* state, const char* context)
 {
     throwForInvalidCcdMask(static_cast<int>(state[7]), context);
     const double alpha = state[5];
