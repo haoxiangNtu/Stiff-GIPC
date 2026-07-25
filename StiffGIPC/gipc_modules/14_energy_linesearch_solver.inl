@@ -1810,9 +1810,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // the pure-device fast path is the documented contract: isolation
         // promises require per_env_exit / STIFF_PERENV_TELEM.
         {
-            const bool quar_gate = m_d_p2g && m_active_group_count > 1
-                && (env_newton_iter_cap > 0 || getenv("STIFF_PERENV_TELEM"))
-                && getenv("STIFF_PERENV_ALPHA");
+            const bool quar_gate = m_d_p2g && perEnvIsolationLive();
             if(quar_gate)
             {
                 const int NGq = m_active_group_count;

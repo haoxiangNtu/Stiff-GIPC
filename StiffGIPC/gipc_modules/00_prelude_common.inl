@@ -16,6 +16,7 @@
 #include "fem_parameters.h"
 #include "device_common/reductions.cuh"   // [v0.8.6 2a] unified block reductions
 #include "contact/pair_buffers.cuh"       // [v0.8.6 2b] pair-buffer growth mechanics owner
+#include "multienv/isolation.cuh"        // [v0.8.6 2c] env-isolation machinery owner
 #include "ACCD.cuh"
 #include "femEnergy.cuh"
 #include <thrust/sort.h>

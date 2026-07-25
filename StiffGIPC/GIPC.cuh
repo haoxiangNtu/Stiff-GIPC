@@ -208,6 +208,7 @@ class GIPC
     bool      quarantineEnvOfVertex(int vertex, double distance);
     bool      quarantineEnv(int env, int vertex, double distance);
     void      quarantineGroundInfeasibleAtFrameStart();
+    bool      perEnvIsolationLive();   // [2c] THE availability gate (multienv/isolation.cuh)
     void      throwIfInvalidCcdAlpha(const char* context);
     int       groundTrialStatus(const int* point_to_group, int group_count);
     void      halveGroundInvalidEnvAlpha(int group_count);
