@@ -47,6 +47,7 @@ int g_gipc_log_level = 1;
 #define NEWF
 
 #include "contact/ccd_invalid_bits.h"   // CCD invalid-mask contract (hoisted, 2d step 2)
+#include "contact/encoding.h"           // int4 pair-encoding contract (doc-only, 3a)
 
 template <typename Scalar, int size>
 __device__ __host__ void makePDGeneral(Eigen::Matrix<Scalar, size, size>& symMtr)

@@ -1,3 +1,5 @@
+// [3a] int4 encodings emitted below are CONTRACT — table in contact/encoding.h;
+// change an encoding there and here in the same commit.
 __device__ inline bool _checkPTintersection(const double3*  _vertexes,
                                             const uint32_t& id0,
                                             const uint32_t& id1,
