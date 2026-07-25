@@ -1077,7 +1077,7 @@ void GIPC::computeXTilta(device_TetraData& TetMesh, const double& rate)
     m_abd_system->cal_q_tilde(*m_abd_sim_data);
 }
 
-extern int total_Frames;   // file-scope frame counter (defined below); drives the stitch/soft target
+#include "core/solver_stats.h"  // [phase4] total_Frames decl (defined in core/ipc_solver.inl); drives the stitch/soft target
                            // (update_soft_constraint_target_position(total_Frames+1)) → MUST be in the
                            // checkpoint or the restart's stitch target is for the wrong frame.
 

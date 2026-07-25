@@ -122,11 +122,9 @@ const BodyLoadRecord& SimEngine::get_load_record(int idx) const
 
 
 // ======================== Per-step counters (perf debugging) ========================
-extern int    totalNT;
-extern double total_Cg_count;
-extern double totalCollisionPairs;
-extern double maxCOllisionPairNum;
-extern int    total_Frames;
+// [phase4] counters declared ONCE in core/solver_stats.h (defined in
+// core/ipc_solver.inl) — no hand-rolled externs here.
+#include "core/solver_stats.h"
 
 namespace gipc {
 int    SimEngine::get_total_newton_iters() const     { return totalNT; }

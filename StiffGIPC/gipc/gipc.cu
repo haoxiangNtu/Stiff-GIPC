@@ -4,6 +4,7 @@
 #include <gipc/utils/json.h>
 #include <load_mesh.h>
 #include <fstream>
+#include <stdexcept>
 
 void GIPC::build_gipc_system(device_TetraData& tet)
 {
@@ -52,7 +53,25 @@ void GIPC::build_gipc_system(device_TetraData& tet)
         ? std::string(GIPC_ASSETS_DIR) + "scene/abd_system_config.json"
         : assets_dir_cfg + "scene/abd_system_config.json";
 
-    gipc::Json json = gipc::Json::parse(std::ifstream(std::string{config_dir}));
+    // [phase4] fail with a nameable error instead of nlohmann's
+    // "parse_error.101 ... unexpected end of input" when the file is absent
+    // (the exact failure that burned an A800 deployment: bundles must ship
+    // Assets/scene/abd_system_config.json).
+    std::ifstream config_in{std::string{config_dir}};
+    if(!config_in.is_open())
+        throw std::runtime_error(
+            "[finalize] required config file missing or unreadable: " + std::string{config_dir}
+            + " — the deployment bundle must include Assets/scene/abd_system_config.json"
+              " (or set assets_dir to a tree that has it)");
+    gipc::Json json;
+    try
+    {
+        json = gipc::Json::parse(config_in);
+    }
+    catch(const std::exception& e)
+    {
+        throw std::runtime_error("[finalize] failed to parse " + std::string{config_dir} + ": " + e.what());
+    }
     
 
     m_abd_system->parms.motor_speed = json["motor_speed"].get<double>();

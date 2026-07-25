@@ -28,6 +28,7 @@
 #include <gipc/utils/timer.h>           // gipc::GlobalTimer
 
 #include "contact/ccd_invalid_bits.h"  // CCD invalid-mask contract
+#include "solver_stats.h"  // [phase4] decl/def type-check for the cross-TU counters
 
 // ---- file-scope globals owned by the composite TU ----
 extern int g_gipc_log_level;   // gipc_modules/00 (log verbosity)
