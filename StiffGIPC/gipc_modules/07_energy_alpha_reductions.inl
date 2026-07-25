@@ -176,41 +176,8 @@ __global__ void _reduct_min_groundAlpha_to_double(const double3* vertexes,
     }
     __syncthreads();*/
     //printf("%f\n", temp);
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-        //printf("warpNum %d\n", warpNum);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-        temp           = std::min(temp, tempMin);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId == 0)
-    {
-        temp = (warpTid < warpNum) ? tep[warpTid] : 1.0;
-        for(int i = 1; i < 32; i = (i << 1))
-        {
-            double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-            temp           = std::min(temp, tempMin);
-        }
-        if(warpTid == 0)
-            minStepSizes[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_min_full_to(temp, tep, number, idof, 1.0, minStepSizes + blockIdx.x);
 }
 
 __global__ void _reduct_min_InjectiveTimeStep_to_double(const double3* vertexes,
@@ -240,50 +207,8 @@ __global__ void _reduct_min_InjectiveTimeStep_to_double(const double3* vertexes,
                                               ratio,
                                               errorRate);
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-        //printf("warpNum %d\n", warpNum);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-        temp           = std::max(temp, tempMin);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-            temp           = std::max(temp, tempMin);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        minStepSizes[blockIdx.x] = temp;
-        //printf("%f   %d\n", temp, blockIdx.x);
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_max_tail_to(temp, tep, number, idof, minStepSizes + blockIdx.x);
 }
 
 __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
@@ -342,40 +267,8 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
             temp = fmin(1.0, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-        temp           = std::min(temp, tempMin);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId == 0)
-    {
-        temp = (warpTid < warpNum) ? tep[warpTid] : 1.0;
-        for(int i = 1; i < 32; i = (i << 1))
-        {
-            double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-            temp           = std::min(temp, tempMin);
-        }
-        if(warpTid == 0)
-            minStepSizes[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_min_full_to(temp, tep, number, idof, 1.0, minStepSizes + blockIdx.x);
 }
 
 __global__ void _reduct_max_cfl_to_double(const double3* moveDir,
@@ -391,48 +284,8 @@ __global__ void _reduct_max_cfl_to_double(const double3* moveDir,
     double temp = idx < number ? __GEIGEN__::__norm(moveDir[mSVI[idx]]) : 0.0;
 
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        double tempMax = __shfl_down_sync(0xffffffff, temp, i);
-        temp           = std::max(temp, tempMax);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            double tempMax = __shfl_down_sync(0xffffffff, temp, i);
-            temp           = std::max(temp, tempMax);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        max_double_val[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_max_tail_to(temp, tep, number, idof, max_double_val + blockIdx.x);
 }
 
 __global__ void _reduct_double3Sqn_to_double(const double3* A, double* D, int number)

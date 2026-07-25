@@ -524,40 +524,8 @@ __global__ void _reduct_max_double3_to_double(const double3* _double3Dim, double
         temp = std::max(std::max(abs(tempMove.x), abs(tempMove.y)), abs(tempMove.z));
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-        temp           = std::max(temp, tempMin);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId == 0)
-    {
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        for(int i = 1; i < 32; i = (i << 1))
-        {
-            double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-            temp           = std::max(temp, tempMin);
-        }
-        if(warpTid == 0)
-            _double1Dim[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_max_full_to(temp, tep, number, idof, 0.0, _double1Dim + blockIdx.x);
 }
 
 __global__ void _reduct_min_double(double* _double1Dim, int number)
@@ -574,40 +542,8 @@ __global__ void _reduct_min_double(double* _double1Dim, int number)
     __threadfence();
 
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-        temp           = std::min(temp, tempMin);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId == 0)
-    {
-        temp = (warpTid < warpNum) ? tep[warpTid] : DBL_MAX;
-        for(int i = 1; i < 32; i = (i << 1))
-        {
-            double tempMin = __shfl_down_sync(0xffffffff, temp, i);
-            temp           = std::min(temp, tempMin);
-        }
-        if(warpTid == 0)
-            _double1Dim[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_min_full_to(temp, tep, number, idof, DBL_MAX, _double1Dim + blockIdx.x);
 }
 
 __global__ void _reduct_M_double2(double2* _double2Dim, int number)
@@ -682,39 +618,7 @@ __global__ void _reduct_max_double(double* _double1Dim, int number)
     __threadfence();
 
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        double tempMax = __shfl_down_sync(0xffffffff, temp, i);
-        temp           = std::max(temp, tempMax);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId == 0)
-    {
-        temp = (warpTid < warpNum) ? tep[warpTid] : -DBL_MAX;
-        for(int i = 1; i < 32; i = (i << 1))
-        {
-            double tempMax = __shfl_down_sync(0xffffffff, temp, i);
-            temp           = std::max(temp, tempMax);
-        }
-        if(warpTid == 0)
-            _double1Dim[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_max_full_to(temp, tep, number, idof, -DBL_MAX, _double1Dim + blockIdx.x);
 }
 
