@@ -15,6 +15,7 @@
 #include "device_fem_data.cuh"
 
 #include "PCG_SOLVER.cuh"
+#include "device_common/device_buffer.cuh"  // [3d] RAII device-buffer owner
 #include <gipc/abd_fem_count_info.h>
 namespace gipc
 {
@@ -257,14 +258,16 @@ class GIPC
     std::string assets_dir_cfg;
 
     // for friction
-    double*                 lambda_lastH_scalar  = nullptr;
-    double2*                distCoord            = nullptr;
-    __GEIGEN__::Matrix3x2d* tanBasis             = nullptr;
-    int4*                   _collisonPairs_lastH = nullptr;
+    // [3d pilot] friction lastH family: RAII-owned (implicit T* views keep
+    // every kernel-arg/memset site unchanged; policy caps m_fric_*_cap below)
+    DeviceBuffer<double>                 lambda_lastH_scalar;
+    DeviceBuffer<double2>                distCoord;
+    DeviceBuffer<__GEIGEN__::Matrix3x2d> tanBasis;
+    DeviceBuffer<int4>                   _collisonPairs_lastH;
     uint32_t                h_cpNum_last[5]      = {0, 0, 0, 0, 0};
 
-    double*   lambda_lastH_scalar_gd  = nullptr;
-    uint32_t* _collisonPairs_lastH_gd = nullptr;
+    DeviceBuffer<double>   lambda_lastH_scalar_gd;
+    DeviceBuffer<uint32_t> _collisonPairs_lastH_gd;
     uint32_t  h_gpNum_last;
 
     // Persistent device slots for 9 FEM/contact terms plus 6 ABD terms. The

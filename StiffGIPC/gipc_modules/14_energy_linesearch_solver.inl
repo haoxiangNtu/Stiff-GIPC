@@ -1003,30 +1003,18 @@ void GIPC::ensure_frictionBuffers()
     // same way), keeping the [4.3] frame-0 lag fix value-identical.
     if((size_t)h_cpNum[0] > m_fric_cp_cap)
     {
-        if(lambda_lastH_scalar)
-        {
-            CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
-            CUDA_SAFE_CALL(cudaFree(distCoord));
-            CUDA_SAFE_CALL(cudaFree(tanBasis));
-            CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
-        }
-        size_t n = (size_t)h_cpNum[0] + h_cpNum[0] / 4;
-        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar, n * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&distCoord, n * sizeof(double2)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&tanBasis, n * sizeof(__GEIGEN__::Matrix3x2d)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH, n * sizeof(int4)));
+        size_t n = (size_t)h_cpNum[0] + h_cpNum[0] / 4;   // growth policy stays HERE
+        lambda_lastH_scalar.resize_discard(n);            // [3d] release-then-alloc
+        distCoord.resize_discard(n);
+        tanBasis.resize_discard(n);
+        _collisonPairs_lastH.resize_discard(n);
         m_fric_cp_cap = n;
     }
     if((size_t)h_gpNum > m_fric_gd_cap)
     {
-        if(lambda_lastH_scalar_gd)
-        {
-            CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
-            CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
-        }
-        size_t n = (size_t)h_gpNum + h_gpNum / 4;
-        CUDA_SAFE_CALL(cudaMalloc((void**)&lambda_lastH_scalar_gd, n * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs_lastH_gd, n * sizeof(uint32_t)));
+        size_t n = (size_t)h_gpNum + h_gpNum / 4;         // growth policy stays HERE
+        lambda_lastH_scalar_gd.resize_discard(n);
+        _collisonPairs_lastH_gd.resize_discard(n);
         m_fric_gd_cap = n;
     }
     if(h_cpNum[0])

@@ -186,21 +186,12 @@ void GIPC::FREE_DEVICE_MEM()
 
     // [0be8da3-port] free the persistent (grow-only) friction/close buffers and
     // reset capacities so engine.reset() starts clean.
-    if(lambda_lastH_scalar)
-    {
-        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar));
-        CUDA_SAFE_CALL(cudaFree(distCoord));
-        CUDA_SAFE_CALL(cudaFree(tanBasis));
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
-        lambda_lastH_scalar = nullptr; distCoord = nullptr; tanBasis = nullptr;
-        _collisonPairs_lastH = nullptr;
-    }
-    if(lambda_lastH_scalar_gd)
-    {
-        CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH_gd));
-        lambda_lastH_scalar_gd = nullptr; _collisonPairs_lastH_gd = nullptr;
-    }
+    lambda_lastH_scalar.release();      // [3d] free+null+idempotence are class
+    distCoord.release();                //      invariants now, not a call-site
+    tanBasis.release();                 //      discipline
+    _collisonPairs_lastH.release();
+    lambda_lastH_scalar_gd.release();
+    _collisonPairs_lastH_gd.release();
     if(_closeConstraintID)
     {
         CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
