@@ -443,6 +443,17 @@ class Engine:
             # per_env_exit=False: retract only flags WE set for a previous
             # engine in this process (user-set env vars are untouched).
             _retract_our_flags(_PEE_FLAGS_SET_BY_US)
+        # [audit] half-configuration traps (documented in the engine): warn
+        # loudly instead of running with silently-degraded semantics.
+        if os.environ.get("STIFF_DECOUPLE_THRESH") and not os.environ.get("STIFF_PERENV_ALPHA"):
+            print("[stiff-physics][WARN] STIFF_DECOUPLE_THRESH without "
+                  "STIFF_PERENV_ALPHA: per-env freezing cannot run, so the Newton "
+                  "loop runs to its iteration cap EVERY frame (worse than default). "
+                  "Set both, or use multienv_mode='isolated'/'strict'.")
+        if os.environ.get("STIFF_PERGROUP_KAPPA") and not os.environ.get("STIFF_DECOUPLE_THRESH"):
+            print("[stiff-physics][WARN] STIFF_PERGROUP_KAPPA without "
+                  "STIFF_DECOUPLE_THRESH: per-group kappa is only a broadcast of "
+                  "the global kappa (stub) — environments are NOT kappa-isolated.")
         self._engine.set_config(self._config.native)
         self._engine.init_cuda()
         self._finalized = False

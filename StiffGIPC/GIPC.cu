@@ -6774,6 +6774,31 @@ __global__ void _mark_env_ground_skip(int* skip, const int* b2g, int env, int nb
     if(b2g[b] == env) skip[b] = 1;
 }
 
+// [iron-law completion] per-env non-finite-direction scan: flags[g]=1 when any
+// vertex of env g has a NaN/Inf PCG direction component — the trigger to
+// quarantine a naturally-diverging env BEFORE the CCD chain trips on its NaNs.
+__global__ void _scan_dir_nonfinite(const double3* dir, const int* p2g, int* flags, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    double3 d = dir[i];
+    if(isfinite(d.x) && isfinite(d.y) && isfinite(d.z)) return;
+    int g = p2g[i];
+    if(g >= 0) atomicOr(flags + g, 1);
+}
+
+// [iron-law completion] zero the direction of every quarantined env: its
+// positions stay frozen (alpha==0 keeps temp verbatim) and a ZERO direction
+// gives neutral CCD candidates — the quarantined env becomes fully inert to
+// every downstream consumer (CCD alpha fail-fast, global convergence norm).
+__global__ void _zero_dir_quarantined(double3* dir, const int* p2g, const int* quar, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    int g = p2g[i];
+    if(g >= 0 && quar[g]) dir[i] = make_double3(0.0, 0.0, 0.0);
+}
+
 // [iron-law] FLAG-ONLY infeasibility probe (no pair-list side effects): the
 // frame-start quarantine scan must run BEFORE any CCD-alpha kernel of the new
 // frame — teleports/drives can make an env infeasible between frames, and the
@@ -9166,6 +9191,8 @@ void GIPC::FREE_DEVICE_MEM()
         CUDA_SAFE_CALL(cudaFree(_ground_skip_body));
         _ground_skip_body = nullptr; m_ground_skip_owned = false;
     }
+    if(m_d_env_quarantined) { CUDA_SAFE_CALL(cudaFree(m_d_env_quarantined)); m_d_env_quarantined = nullptr; }
+    if(m_d_env_dirnan)      { CUDA_SAFE_CALL(cudaFree(m_d_env_dirnan));      m_d_env_dirnan = nullptr; }
     CUDA_SAFE_CALL(cudaFree(_environment_collisionPair));
     // [9d28824-port] _gpNum aliases (_cpNum + 5) — freed above with _cpNum.
     _gpNum = nullptr;
@@ -10378,30 +10405,42 @@ void GIPC::snapshotDcdCcdPairs()
 // throw). Gates: m_d_p2g set (= at least one computeGradientAndHessian ran →
 // NOT initial-state validation), host telemetry path + per-env alpha active
 // (isolated/strict). merged mode has no isolation machinery → false.
-bool GIPC::quarantineEnvOfVertex(int vertex, double distance)
+bool GIPC::quarantineEnv(int env, int vertex, double distance)
 {
-    if(!(m_d_p2g && m_active_group_count > 1
+    if(!(m_active_group_count > 1
          && (env_newton_iter_cap > 0 || getenv("STIFF_PERENV_TELEM"))
-         && getenv("STIFF_PERENV_ALPHA")
-         && vertex >= 0 && vertex < static_cast<int>(vertexNum)))
+         && getenv("STIFF_PERENV_ALPHA")))
         return false;
-    int env = -1;
-    CUDA_SAFE_CALL(cudaMemcpy(&env, m_d_p2g + vertex, sizeof(int), cudaMemcpyDeviceToHost));
     if(env < 0 || env >= kEnvAlphaSlots)
         return false;
     if(m_env_quarantined.empty())
         m_env_quarantined.assign(kEnvAlphaSlots, 0);
+    if(!m_d_env_quarantined)
+    {   // device mirror for the direction-zero kernel
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_env_quarantined, kEnvAlphaSlots * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(m_d_env_quarantined, 0, kEnvAlphaSlots * sizeof(int)));
+    }
     if(!m_env_quarantined[env])
     {
         m_env_quarantined[env] = 1;
+        const int one = 1;
+        CUDA_SAFE_CALL(cudaMemcpy(m_d_env_quarantined + env, &one, sizeof(int),
+                                  cudaMemcpyHostToDevice));
         int body = -1;
-        if(_point_body_id)
+        if(vertex >= 0 && _point_body_id)
             CUDA_SAFE_CALL(cudaMemcpy(&body, _point_body_id + vertex, sizeof(int), cudaMemcpyDeviceToHost));
-        fprintf(stderr,
-                "[per-env][QUARANTINE] env %d became ground-infeasible MID-RUN "
-                "(vertex=%d body=%d distance=%.6e): this env is frozen from now "
-                "on; healthy envs continue. (Initial-state violations still throw.)\n",
-                env, vertex, body, distance);
+        if(vertex >= 0)
+            fprintf(stderr,
+                    "[per-env][QUARANTINE] env %d became ground-infeasible MID-RUN "
+                    "(vertex=%d body=%d distance=%.6e): this env is frozen from now "
+                    "on; healthy envs continue. (Initial-state violations still throw.)\n",
+                    env, vertex, body, distance);
+        else
+            fprintf(stderr,
+                    "[per-env][QUARANTINE] env %d produced a NON-FINITE Newton "
+                    "direction MID-RUN: this env is frozen from now on (direction "
+                    "zeroed each iteration); healthy envs continue.\n",
+                    env);
         if(m_d_b2g && m_collision_body_count > 0)
         {
             if(!_ground_skip_body)
@@ -10422,6 +10461,15 @@ bool GIPC::quarantineEnvOfVertex(int vertex, double distance)
         }
     }
     return true;
+}
+
+bool GIPC::quarantineEnvOfVertex(int vertex, double distance)
+{
+    if(!(m_d_p2g && vertex >= 0 && vertex < static_cast<int>(vertexNum)))
+        return false;
+    int env = -1;
+    CUDA_SAFE_CALL(cudaMemcpy(&env, m_d_p2g + vertex, sizeof(int), cudaMemcpyDeviceToHost));
+    return quarantineEnv(env, vertex, distance);
 }
 
 // [iron-law] Frame-start quarantine scan: runs BEFORE any CCD-alpha work of
@@ -15694,6 +15742,55 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         //std::cout << "[" << k << "]"
         //          << "cg_count = " << cg_count << std::endl;
         total_Cg_count += cg_count;
+
+        // [iron-law completion] make quarantined envs fully INERT before any
+        // downstream consumer of this iteration's direction. The CCD alpha
+        // kernels flag !isfinite(dot(n, dir)) into the shared invalid mask and
+        // the device-chain validation would THROW — killing healthy envs.
+        // (1) scan the fresh PCG direction per env: a naturally-diverging env
+        //     is quarantined HERE, before the CCD chain trips on its NaNs
+        //     (the NaN max-move quarantine in the freeze loop runs AFTER the
+        //     CCD chain — too late for the throw);
+        // (2) zero every quarantined env's direction: positions stay frozen
+        //     (alpha==0 keeps temp verbatim), CCD candidates go neutral, the
+        //     global convergence norm no longer sees the dead env.
+        // Same gate as the NaN/timeout quarantine (host telemetry path);
+        // the pure-device fast path is the documented contract: isolation
+        // promises require per_env_exit / STIFF_PERENV_TELEM.
+        {
+            const bool quar_gate = m_d_p2g && m_active_group_count > 1
+                && (env_newton_iter_cap > 0 || getenv("STIFF_PERENV_TELEM"))
+                && getenv("STIFF_PERENV_ALPHA");
+            if(quar_gate)
+            {
+                const int NGq = m_active_group_count;
+                if(!m_d_env_dirnan)
+                    CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_env_dirnan,
+                                              kEnvAlphaSlots * sizeof(int)));
+                CUDA_SAFE_CALL(cudaMemsetAsync(m_d_env_dirnan, 0, NGq * sizeof(int), 0));
+                {
+                    int bs = 256, gs = ((int)vertexNum + bs - 1) / bs;
+                    _scan_dir_nonfinite<<<gs, bs>>>(_moveDir, m_d_p2g,
+                                                    m_d_env_dirnan, (int)vertexNum);
+                }
+                std::vector<int> hnan(NGq);
+                CUDA_SAFE_CALL(cudaMemcpy(hnan.data(), m_d_env_dirnan,
+                                          NGq * sizeof(int), cudaMemcpyDeviceToHost));
+                for(int g = 0; g < NGq; ++g)
+                    if(hnan[g] && (m_env_quarantined.empty() || !m_env_quarantined[g]))
+                        quarantineEnv(g, -1, 0.0);
+                bool any_quar = false;
+                if(!m_env_quarantined.empty())
+                    for(int g = 0; g < NGq; ++g)
+                        any_quar |= (m_env_quarantined[g] != 0);
+                if(any_quar && m_d_env_quarantined)
+                {
+                    int bs = 256, gs = ((int)vertexNum + bs - 1) / bs;
+                    _zero_dir_quarantined<<<gs, bs>>>(_moveDir, m_d_p2g,
+                                                      m_d_env_quarantined, (int)vertexNum);
+                }
+            }
+        }
         if(current_global_exit)
         {
             gradVanish = device_newton_converged(merged_diag_sample);
@@ -16083,22 +16180,25 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 }
                 // [per-env productization] quarantine + budget, evaluated per iter
                 // (no latch needed: NaN persists, k only grows).
-                if(h_env_alpha[g] != 0.0)
-                {
-                    if(!m_env_quarantined.empty() && g < (int)m_env_quarantined.size()
-                       && m_env_quarantined[g])
-                    {   // [iron-law] persistently quarantined env (mid-run ground-
-                        // infeasible, see throwIfGroundDistanceInvalid): pin it in
-                        // EVERY iteration of EVERY later solve — it must never move
-                        // again, and must never gate the healthy envs.
-                        h_env_alpha[g] = 0.0;
-                        if(m_env_status[g] < 2)
-                        {
-                            m_env_status[g]      = 3;
+                if(!m_env_quarantined.empty() && g < (int)m_env_quarantined.size()
+                   && m_env_quarantined[g])
+                {   // [iron-law] persistently quarantined env: pin it in EVERY
+                    // iteration of EVERY later solve. Checked OUTSIDE the
+                    // alpha!=0 gate — the direction-zero pass makes a
+                    // quarantined env's max-move 0, so the convergence freeze
+                    // above zeroes its alpha first and would otherwise mislabel
+                    // it status 1 (converged); status 3 must win the telemetry.
+                    h_env_alpha[g] = 0.0;
+                    if(m_env_status[g] != 3)
+                    {
+                        m_env_status[g] = 3;
+                        if(m_env_frozen_iter[g] < 0)
                             m_env_frozen_iter[g] = (int)k;
-                        }
                     }
-                    else if(std::isnan(hnm[g]) || std::isinf(hnm[g]))
+                }
+                else if(h_env_alpha[g] != 0.0)
+                {
+                    if(std::isnan(hnm[g]) || std::isinf(hnm[g]))
                     {   // diverged env: freeze it so its NaN cannot poison the batch
                         h_env_alpha[g] = 0.0;
                         if(m_env_status[g] < 2)

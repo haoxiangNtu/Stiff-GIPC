@@ -192,6 +192,10 @@ class GIPC
     // first quarantine. Init-time violations (before per-env machinery is
     // live) still throw, preserving the finalize-validation contract.
     std::vector<uint8_t> m_env_quarantined;
+    // [iron-law completion] device mirror of m_env_quarantined + per-env
+    // non-finite-direction scan flags (both lazy, kEnvAlphaSlots ints).
+    int* m_d_env_quarantined = nullptr;
+    int* m_d_env_dirnan      = nullptr;
     int              env_newton_iter_cap = 0;  // per-env iter budget; 0 = off
     // [T1] line-search backtracking budget (halvings); 0 = engine default (64).
     int              line_search_max_iter = 64;
@@ -202,6 +206,7 @@ class GIPC
     // [iron-law] mid-run env quarantine (see GIPC.cu): demote an env-attributable
     // ground infeasibility to a persistent per-env freeze instead of a throw.
     bool      quarantineEnvOfVertex(int vertex, double distance);
+    bool      quarantineEnv(int env, int vertex, double distance);
     void      quarantineGroundInfeasibleAtFrameStart();
     void      throwIfInvalidCcdAlpha(const char* context);
     int       groundTrialStatus(const int* point_to_group, int group_count);
