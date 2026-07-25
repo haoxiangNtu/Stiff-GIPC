@@ -24,6 +24,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 2
 GOLD_ANCHOR="f7fb5a786c2d7935"
 QUICK="${1:-}"
+
+# G0: the suite MUST test the tree it is invoked on. Without this step a
+# stale build/ silently validates old binaries (exactly what happened for
+# the 2026-07-25 P5..phase4 runs — the armed-audit "validations" tested a
+# lib that contained none of the audited code). Build failure = hard stop.
+echo "== G0 build =="
+if cmake --build build -j"$(nproc)" > /tmp/vg_build.log 2>&1; then
+  echo "BUILD OK"
+else
+  echo "BUILD FAIL — tail of /tmp/vg_build.log:"
+  tail -25 /tmp/vg_build.log
+  exit 2
+fi
 declare -a NAMES RESULTS DETAILS
 fail_total=0
 
