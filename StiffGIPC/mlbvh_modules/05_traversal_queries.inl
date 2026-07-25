@@ -202,7 +202,6 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                           _faces[obj_idx].x,
                                           _faces[obj_idx].y,
                                           _faces[obj_idx].z);
-                            //_checkPTintersection_fullCCD(_vertexes, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, dHat, _cpNum, _ccd_collisionPair);
                         }
                 }
             }
@@ -233,7 +232,6 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                           _faces[obj_idx].x,
                                           _faces[obj_idx].y,
                                           _faces[obj_idx].z);
-                            //_checkPTintersection_fullCCD(_vertexes, idx, _faces[obj_idx].x, _faces[obj_idx].y, _faces[obj_idx].z, dHat, _cpNum, _ccd_collisionPair);
                         }
                 }
             }

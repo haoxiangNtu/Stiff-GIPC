@@ -260,9 +260,6 @@ void GlobalLinearSystem::convert_new()
                         0,
                         gipc_global_triplet->global_triplet_offset,
                         gipc_global_triplet->global_triplet_offset);
-//#ifndef SymGH
-//    m_converter.ge2sym(*gipc_global_triplet);
-//#endif
 }
 
 

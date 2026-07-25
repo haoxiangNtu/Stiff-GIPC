@@ -70,7 +70,6 @@ double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueu
 
     while(numbers > 1)
     {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
         _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;

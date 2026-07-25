@@ -4,6 +4,8 @@
 ORIGINAL_SHA256.txt）。include 顺序禁止重排；新代码写进语义所属模块。
 ⚠️ 本文件族与 KemengHuang 上游同源——移植上游 patch 时先 `cat 00..06 > mlbvh.cu`
 还原单文件、应用 patch、再重跑拆分脚本（字节等价性质保证往返无损）。
+⚠️ v0.8.6 P5 起还原产物 ≠ Phase-1 快照：03 已删死码 `_checkPTintersection_fullCCD`、
+05 已删其 2 处注释调用行。上游 patch 若命中这些位置附近的 hunk 需手动对齐。
 
 | 模块 | 内容 |
 |---|---|

@@ -192,9 +192,8 @@ void GIPC::FREE_DEVICE_MEM()
         CUDA_SAFE_CALL(cudaFree(distCoord));
         CUDA_SAFE_CALL(cudaFree(tanBasis));
         CUDA_SAFE_CALL(cudaFree(_collisonPairs_lastH));
-        CUDA_SAFE_CALL(cudaFree(_MatIndex_last));
         lambda_lastH_scalar = nullptr; distCoord = nullptr; tanBasis = nullptr;
-        _collisonPairs_lastH = nullptr; _MatIndex_last = nullptr;
+        _collisonPairs_lastH = nullptr;
     }
     if(lambda_lastH_scalar_gd)
     {
@@ -743,7 +742,6 @@ double2 GIPC::minMaxGroundDist()
 
     while(numbers > 1)
     {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
         _reduct_M_double2<<<blockNum, threadNum, sharedMsize>>>(_queue, numbers);
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;
@@ -838,7 +836,6 @@ double GIPC::self_largestFeasibleStepSize(double slackness, double* mqueue, int 
 
     while(numbers > 1)
     {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
         _reduct_min_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;
@@ -872,7 +869,6 @@ double GIPC::cfl_largestSpeed(double* mqueue)
 
     while(numbers > 1)
     {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
         _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;
@@ -910,7 +906,6 @@ double reduction2Kappa(int type, const double3* A, const double3* B, double* _qu
 
     while(numbers > 1)
     {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
         __add_reduction<<<blockNum, threadNum, sharedMsize>>>(_queue, numbers);
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;
@@ -922,54 +917,6 @@ double reduction2Kappa(int type, const double3* A, const double3* B, double* _qu
     return dotValue;
 }
 
-double GIPC::ground_largestFeasibleStepSize(double slackness, double* mqueue)
-{
-    if(m_skip_all_collision)
-        return 1.0;
-
-    int numbers = surf_vertexNum;
-    if(numbers < 1)
-        return 1;
-    const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
-
-    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
-    CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_alpha_invalid, 0, sizeof(int)));
-
-    //double* _minSteps;
-    //CUDA_SAFE_CALL(cudaMalloc((void**)&_minSteps, numbers * sizeof(double)));
-
-    //if (h_cpNum[0] > 0) {
-    //    double3* mvd = new double3[vertexNum];
-    //    cudaMemcpy(mvd, _moveDir, sizeof(double3) * vertexNum, cudaMemcpyDeviceToHost);
-    //    for (int i = 0;i < vertexNum;i++) {
-    //        printf("%f  %f  %f\n", mvd[i].x, mvd[i].y, mvd[i].z);
-    //    }
-    //    delete[] mvd;
-    //}
-    _reduct_min_groundAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
-        _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir, mqueue, slackness, numbers,
-        _point_body_id, _ground_skip_body, _ground_body_count, m_ccd_alpha_invalid);
-
-
-    numbers  = blockNum;
-    blockNum = (numbers + threadNum - 1) / threadNum;
-
-    while(numbers > 1)
-    {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
-        _reduct_min_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
-        numbers  = blockNum;
-        blockNum = (numbers + threadNum - 1) / threadNum;
-    }
-    //cudaMemcpy(_leafBoxes, _tempLeafBox, sizeof(AABB), cudaMemcpyDeviceToDevice);
-    double minValue;
-    cudaMemcpy(&minValue, mqueue, sizeof(double), cudaMemcpyDeviceToHost);
-    throwIfInvalidCcdAlpha("ground CCD reduction");
-    if(!std::isfinite(minValue) || minValue <= 0.0 || minValue > 1.0)
-        throw std::runtime_error("[StiffGIPC] invalid direct ground-CCD alpha");
-    return minValue;
-}
 
 // ②-D2H batched variants for the two CCD reductions that fire back-to-back
 // at the top of each line search. Each writes a direct feasible alpha via D2D;

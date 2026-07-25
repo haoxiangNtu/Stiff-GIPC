@@ -116,37 +116,6 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
     }
 }
 
-__device__ inline bool _checkPTintersection_fullCCD(const double3*  _vertexes,
-                                                    const uint32_t& id0,
-                                                    const uint32_t& id1,
-                                                    const uint32_t& id2,
-                                                    const uint32_t& id3,
-                                                    const double&   dHat,
-                                                    uint32_t*       _cpNum,
-                                                    int4* _ccd_collisionPair) noexcept
-{
-    double3 v0 = _vertexes[id0];
-    double3 v1 = _vertexes[id1];
-    double3 v2 = _vertexes[id2];
-    double3 v3 = _vertexes[id3];
-
-    int dtype = _dType_PT(v0, v1, v2, v3);
-
-    double3 basis0 = __GEIGEN__::__minus(v2, v1);
-    double3 basis1 = __GEIGEN__::__minus(v3, v1);
-    double3 basis2 = __GEIGEN__::__minus(v0, v1);
-
-    const double3 nVec = __GEIGEN__::__v_vec_cross(basis0, basis1);
-
-    double sign = __GEIGEN__::__v_vec_dot(nVec, basis2);
-
-    if(dtype == 6 && (sign < 0))
-    {
-        return;
-    }
-
-    _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] = make_int4(-id0 - 1, id1, id2, id3);
-}
 
 __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                             const double3*  _rest_vertexes,

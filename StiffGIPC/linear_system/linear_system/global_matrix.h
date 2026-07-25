@@ -211,14 +211,6 @@ class GIPCTripletMatrix
     auto triplet_count() const { return m_block_values.size(); }
     auto triplet_capacity() const { return m_block_values.capacity(); }
 
-    void clear()
-    {
-        m_block_rows = 0;
-        m_block_cols = 0;
-        m_block_values.clear();
-        m_block_row_indices.clear();
-        m_block_col_indices.clear();
-    }
     int global_triplet_offset           = 0;
     int global_collision_triplet_offset = 0;
     int global_external_max_capcity     = 0;

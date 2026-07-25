@@ -33,7 +33,6 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
 
-    //_make_unique_indices(global_triplets, start, length, out_start_id);
 
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -90,38 +89,6 @@ void Converter::_radix_sort_indices_and_blocks(GIPCTripletMatrix& global_triplet
 }
 
 
-void Converter::_make_unique_indices(GIPCTripletMatrix& global_triplets,
-                                     const int&         start,
-                                     const int&         length,
-                                     const int&         out_start_id)
-{
-    auto row_indices = global_triplets.block_row_indices(start);
-    auto col_indices = global_triplets.block_col_indices(start);
-
-    auto unique_key = global_triplets.block_hash_value();
-    auto sort_key   = global_triplets.block_sort_hash_value();
-
-    muda::DeviceRunLengthEncode().Encode(sort_key,
-                                         unique_key,
-                                         global_triplets.block_temp_buffer(),
-                                         global_triplets.d_unique_key_number,
-                                         length);
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
-                              global_triplets.d_unique_key_number,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-
-    muda::ParallelFor(256)
-        .kernel_name(__FUNCTION__)
-        .apply(global_triplets.h_unique_key_number,
-
-               [row_indices, col_indices, unique_key] __device__(int i) mutable
-               {
-                   row_indices[i] = unique_key[i] >> 32;
-                   col_indices[i] = unique_key[i] & 0xffffffff;
-               });
-}
 
 
 
@@ -248,70 +215,5 @@ Converter::~Converter()
         cudaFree(m_mergebin);
 }
 
-void Converter::ge2sym(GIPCTripletMatrix& global_triplets)
-{
-    using namespace muda;
-
-    auto counts  = global_triplets.block_index();
-    auto offsets = global_triplets.block_sort_index();
-    auto block_temp = global_triplets.block_values(global_triplets.h_unique_key_number);
-    auto blocks      = global_triplets.block_values();
-    auto ij_hash     = global_triplets.block_hash_value();
-    auto row_indices = global_triplets.block_row_indices();
-    auto col_indices = global_triplets.block_col_indices();
-
-    ParallelFor(256)
-        .file_line(__FILE__, __LINE__)
-        .apply(global_triplets.h_unique_key_number,
-               [row_indices, col_indices, ij_hash, blocks, block_temp, counts] __device__(int i) mutable
-               {
-                   counts[i] = row_indices[i] <= col_indices[i] ? 1 : 0;
-                   ij_hash[i] =
-                       (uint64_t{row_indices[i]} << 32) + uint64_t{col_indices[i]};
-                   block_temp[i] = blocks[i];
-               });
-
-    // exclusive sum
-    DeviceScan().ExclusiveSum(counts, offsets, global_triplets.h_unique_key_number);
-
-    // set the values
-    auto dst_blocks = global_triplets.block_values();
-
-    ParallelFor(256)
-        .file_line(__FILE__, __LINE__)
-        .apply(global_triplets.h_unique_key_number,
-               [dst_blocks,
-                block_temp,
-                ij_hash,
-                row_indices,
-                col_indices,
-                counts,
-                offsets,
-                total_count = global_triplets.d_unique_key_number,
-                number = global_triplets.h_unique_key_number] __device__(int i) mutable
-               {
-                   auto count  = counts[i];
-                   auto offset = offsets[i];
-
-                   if(count != 0)
-                   {
-                       dst_blocks[offset]  = block_temp[i];
-                       auto ij             = ij_hash[i];
-                       row_indices[offset] = ij >> 32;
-                       col_indices[offset] = ij & 0xffffffff;
-                   }
-
-                   if(i == number - 1)
-                   {
-                       *total_count = offsets[i] + counts[i];
-                   }
-               });
-
-
-    CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
-                              global_triplets.d_unique_key_number,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-}
 
 }  // namespace gipc

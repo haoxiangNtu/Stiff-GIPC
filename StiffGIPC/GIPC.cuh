@@ -262,7 +262,6 @@ class GIPC
     __GEIGEN__::Matrix3x2d* tanBasis             = nullptr;
     int4*                   _collisonPairs_lastH = nullptr;
     uint32_t                h_cpNum_last[5]      = {0, 0, 0, 0, 0};
-    int*                    _MatIndex_last       = nullptr;
 
     double*   lambda_lastH_scalar_gd  = nullptr;
     uint32_t* _collisonPairs_lastH_gd = nullptr;
@@ -527,8 +526,6 @@ class GIPC
                                                        int numbers,
                                                        double* out_slot);
     void   cfl_largestSpeed_DeviceOut(double* mqueue, double* out_slot);
-
-    double ground_largestFeasibleStepSize(double slackness, double* mqueue);
 
     double self_largestFeasibleStepSize(double slackness, double* mqueue, int numbers);
 

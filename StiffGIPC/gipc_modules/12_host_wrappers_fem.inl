@@ -298,7 +298,6 @@ double2 GIPC::minMaxSelfDist()
 
     while(numbers > 1)
     {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
         _reduct_M_double2<<<blockNum, threadNum, sharedMsize>>>(_queue, numbers);
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;
@@ -709,7 +708,6 @@ double calcMinMovement(const double3* _moveDir, double* _queue, const int& numbe
 
     while(numbers > 1)
     {
-        //_reduct_max_box << <blockNum, threadNum, sharedMsize >> > (_tempLeafBox, numbers);
         _reduct_max_double<<<blockNum, threadNum, sharedMsize>>>(_queue, numbers);
         numbers  = blockNum;
         blockNum = (numbers + threadNum - 1) / threadNum;

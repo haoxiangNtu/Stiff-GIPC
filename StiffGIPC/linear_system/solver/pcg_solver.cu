@@ -295,100 +295,9 @@ __global__ void _ew_eta(const double* rz0_g, double* prev_g, double* tol2_g,
 
 
 
-__global__ void PCG_vdv_Reduction(double* squeue, const double* a, const double* b, int numbers)
-{
-    int idof = blockIdx.x * blockDim.x;
-    int idx  = threadIdx.x + idof;
-
-    extern __shared__ double tep[];
-
-    if(idx >= numbers)
-        return;
-
-    double temp = a[idx] * b[idx];
-
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    //double nextTp;
-    int    warpNum;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(threadIdx.x >= warpNum)
-        return;
-    if(warpNum > 1)
-    {
-        temp = tep[threadIdx.x];
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
-}
 
 
 
-__global__ void add_reduction(double* mem, int numbers)
-{
-    int idof = blockIdx.x * blockDim.x;
-    int idx  = threadIdx.x + idof;
-    extern __shared__ double tep[];
-    if(idx >= numbers)
-        return;
-    double temp = mem[idx];
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    int    warpNum;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(threadIdx.x >= warpNum)
-        return;
-    if(warpNum > 1)
-    {
-        temp = tep[threadIdx.x];
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        mem[blockIdx.x] = temp;
-    }
-}
 
 
 
@@ -587,38 +496,12 @@ __global__ void pcg_seg_graph_tail_relaunch(unsigned long long* state,
 }
 
 
-double My_PCG_General_v_v_Reduction_Algorithm(double* temp, double* A, double* B, int vertexNum)
-{
-
-    int numbers = vertexNum;
-    if(numbers < 1)
-        return 0;
-    const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
-
-    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
-    PCG_vdv_Reduction<<<blockNum, threadNum, sharedMsize>>>(temp, A, B, numbers);
-
-
-    numbers  = blockNum;
-    blockNum = (numbers + threadNum - 1) / threadNum;
-
-    while(numbers > 1)
-    {
-        add_reduction<<<blockNum, threadNum, sharedMsize>>>(temp, numbers);
-        numbers  = blockNum;
-        blockNum = (numbers + threadNum - 1) / threadNum;
-    }
-    double result;
-    cudaMemcpy(&result, temp, sizeof(double), cudaMemcpyDeviceToHost);
-    return result;
-}
 
 // === Step E: cub-based fused dot product ===
 // Uses cub::DeviceReduce::Sum + a TransformInputIterator that fuses the
 // elementwise multiply (a[i] * b[i]) with the tree reduction, into a
-// single kernel launch (instead of the 2-3 launches of the manual
-// PCG_vdv_Reduction + add_reduction loop).
+// single kernel launch (instead of the 2-3 launches of the old manual
+// two-kernel tree-reduction loop, removed in v0.8.6 P5).
 struct DotProductOp
 {
     const double* a;
@@ -650,38 +533,6 @@ void Cub_PCG_DotReduction(double* A, double* B, int n, double* d_out,
     cub::DeviceReduce::Sum(*cub_temp_ptr, *cub_temp_bytes, input, d_out, n);
 }
 
-// Device-output variant: leaves the reduced scalar in *d_out (which can be
-// `temp` itself or any device address). Skips the final cudaMemcpy/D2H.
-void My_PCG_General_v_v_Reduction_DeviceOut(double* temp, double* A, double* B,
-                                            int vertexNum, double* d_out)
-{
-    int numbers = vertexNum;
-    if(numbers < 1) {
-        cudaMemset(d_out, 0, sizeof(double));
-        return;
-    }
-    const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
-
-    unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
-    PCG_vdv_Reduction<<<blockNum, threadNum, sharedMsize>>>(temp, A, B, numbers);
-
-    numbers  = blockNum;
-    blockNum = (numbers + threadNum - 1) / threadNum;
-
-    while(numbers > 1)
-    {
-        add_reduction<<<blockNum, threadNum, sharedMsize>>>(temp, numbers);
-        numbers  = blockNum;
-        blockNum = (numbers + threadNum - 1) / threadNum;
-    }
-
-    if(d_out != temp)
-        cudaMemcpyAsync(d_out, temp, sizeof(double), cudaMemcpyDeviceToDevice);
-}
-
-extern void My_PCG_General_v_v_Reduction_DeviceOut(double* temp, double* A, double* B,
-                                                   int vertexNum, double* d_out);
 
 namespace gipc
 {
