@@ -27,4 +27,4 @@
 | 11_perenv_machinery | per-env kernel 全家（kappa/alpha/mask/ground/self min）、per-env BVH 构建、pool | multienv |
 | 12_host_wrappers_fem | per-env build、装配宿主包装、FEM 单元 G/H 计算、step_forward 宿主、排序/更新宿主、minMovement | core + abd/fem |
 | 13_kappa_partition_gradhess | suggest/upperBound/initKappa、partitionContactHessian、**computeGradientAndHessian**（帧首扩容在此） | core/frame_pipeline |
-| 14_energy_linesearch_solver | 能量宿主聚合（含 DeviceOut/perenv）、_global_ls_decide（NaN 守卫）、lineSearch、**solve_subIP**（隔离冻结循环）、postLineSearch、IPC_Solver（帧首探针调用） | core/ipc_solver |
+| 14_energy_linesearch_solver | 能量宿主聚合（含 DeviceOut/perenv）、_global_ls_decide（NaN 守卫）、close 临时缓冲/摩擦缓冲 malloc、updateVelocities/xTilta、checkpoint。**2d 起编排已迁出**：lineSearch/postLineSearch/solve_subIP/IPC_Solver → `core/ipc_solver.inl`（复合 TU 最后一个 include） | core/ipc_solver（已完成） |
