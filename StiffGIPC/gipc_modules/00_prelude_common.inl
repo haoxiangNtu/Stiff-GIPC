@@ -14,6 +14,7 @@
 #include "cuda_tools/cuda_tools.h"
 #include "GIPC_PDerivative.cuh"
 #include "fem_parameters.h"
+#include "device_common/reductions.cuh"   // [v0.8.6 2a] unified block reductions
 #include "ACCD.cuh"
 #include "femEnergy.cuh"
 #include <thrust/sort.h>

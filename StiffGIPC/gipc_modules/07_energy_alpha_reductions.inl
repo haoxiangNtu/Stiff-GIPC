@@ -36,45 +36,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
         _penv_energy_accum(penv, p2g, v0, ng, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
 __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
@@ -109,45 +72,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
         _penv_energy_accum(penv, p2g, _collisionPair_gd[idx], ng, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
 __global__ void _computeGroundEnergy_Reduction(double*        squeue,
@@ -176,46 +102,8 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
         _penv_energy_accum(penv, p2g, gidx, ng, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, number, idof, squeue + blockIdx.x);
 }
 
 __global__ void _reduct_min_groundAlpha_to_double(const double3* vertexes,
@@ -557,47 +445,8 @@ __global__ void _reduct_double3Sqn_to_double(const double3* A, double* D, int nu
     double temp = idx < number ? __GEIGEN__::__squaredNorm(A[idx]) : 0.0;
 
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        //double tempMax = __shfl_down_sync(0xffffffff, temp, i);
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        D[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, number, idof, D + blockIdx.x);
 }
 
 __global__ void _reduct_double3Dot_to_double(const double3* A, const double3* B, double* D, int number)
@@ -610,47 +459,8 @@ __global__ void _reduct_double3Dot_to_double(const double3* A, const double3* B,
     double temp = idx < number ? __GEIGEN__::__v_vec_dot(A[idx], B[idx]) : 0.0;
 
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        //double tempMax = __shfl_down_sync(0xffffffff, temp, i);
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        D[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, number, idof, D + blockIdx.x);
 }
 
 
@@ -671,46 +481,8 @@ __global__ void _getKineticEnergy_Reduction_3D(
         _penv_energy_accum(penv, p2g, idx, ng, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        _energy[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, number, idof, _energy + blockIdx.x);
 }
 
 #ifdef USE_QUADRATIC_BENDING
@@ -738,41 +510,8 @@ __global__ void _getQuadBendingEnergy_Reduction(double*        squeue,
         _penv_energy_accum(penv, p2g, edges[idx].x, ng, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 #endif
 
@@ -802,45 +541,8 @@ __global__ void _getBendingEnergy_Reduction(double*        squeue,
     }
     //double temp = 0;
     //printf("%f    %f\n\n\n", lenRate, volRate);
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
 
@@ -876,45 +578,8 @@ __global__ void _getFEMEnergy_Reduction_3D(double*        squeue,
     }
 
     //printf("%f    %f\n\n\n", lenRate, volRate);
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 __global__ void _computeSoftConstraintEnergy_Reduction(double*        squeue,
                                                        const double3* vertexes,
@@ -954,46 +619,8 @@ __global__ void _computeSoftConstraintEnergy_Reduction(double*        squeue,
         _penv_energy_accum(penv, p2g, vInd, ng, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((number - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, number, idof, squeue + blockIdx.x);
 }
 __global__ void _get_triangleFEMEnergy_Reduction_3D(double*        squeue,
                                                     const double3* vertexes,
@@ -1020,45 +647,8 @@ __global__ void _get_triangleFEMEnergy_Reduction_3D(double*        squeue,
     }
 
     //printf("%f    %f\n\n\n", lenRate, volRate);
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 __global__ void _getRestStableNHKEnergy_Reduction_3D(double*       squeue,
                                                      const double* volume,
@@ -1077,45 +667,8 @@ __global__ void _getRestStableNHKEnergy_Reduction_3D(double*       squeue,
                  - 0.5 * lenRate * log(4.0)))
                 * volume[idx];
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
 __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
@@ -1142,45 +695,8 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
         _penv_energy_accum(penv, p2g, v0, ng, temp);
     }
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
 __global__ void _getDeltaEnergy_Reduction(double* squeue, const double3* b, const double3* dx, int vertexNum)
@@ -1192,45 +708,8 @@ __global__ void _getDeltaEnergy_Reduction(double* squeue, const double3* b, cons
     int                      numbers = vertexNum;
     double                   temp = idx < numbers ? __GEIGEN__::__v_vec_dot(b[idx], dx[idx]) : 0.0;
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        squeue[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
 __global__ void __add_reduction(double* mem, int numbers)
@@ -1244,44 +723,7 @@ __global__ void __add_reduction(double* mem, int numbers)
 
     __threadfence();
 
-    int    warpTid = threadIdx.x % 32;
-    int    warpId  = (threadIdx.x >> 5);
-    double nextTp;
-    int    warpNum;
-    //int tidNum = 32;
-    if(blockIdx.x == gridDim.x - 1)
-    {
-        //tidNum = numbers - idof;
-        warpNum = ((numbers - idof + 31) >> 5);
-    }
-    else
-    {
-        warpNum = ((blockDim.x) >> 5);
-    }
-    for(int i = 1; i < 32; i = (i << 1))
-    {
-        temp += __shfl_down_sync(0xffffffff, temp, i);
-    }
-    if(warpTid == 0)
-    {
-        tep[warpId] = temp;
-    }
-    __syncthreads();
-    if(warpId != 0)
-        return;
-    if(warpNum > 1)
-    {
-        //	tidNum = warpNum;
-        temp = (warpTid < warpNum) ? tep[warpTid] : 0.0;
-        //	warpNum = ((tidNum + 31) >> 5);
-        for(int i = 1; i < warpNum; i = (i << 1))
-        {
-            temp += __shfl_down_sync(0xffffffff, temp, i);
-        }
-    }
-    if(threadIdx.x == 0)
-    {
-        mem[blockIdx.x] = temp;
-    }
+    // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
+    gipc_block_sum_to(temp, tep, numbers, idof, mem + blockIdx.x);
 }
 
