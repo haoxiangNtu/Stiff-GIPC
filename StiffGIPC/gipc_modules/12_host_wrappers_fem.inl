@@ -65,18 +65,16 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
         int newcap = (int)(h_cpNum[0] + h_cpNum[0] / 2) + 1;
         printf("[perenv DCD-grow] h_cpNum=%u > cap(dcd=%d,ccd=%d) -> grow to %d, redo\n",
                h_cpNum[0], MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs));
-        CUDA_SAFE_CALL(cudaFree(_MatIndex));
-        CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs,     ((size_t)newcap + 1) * sizeof(int4)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex,          ((size_t)newcap + 1) * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
-        MAX_COLLITION_PAIRS_NUM     = newcap;
-        if(newcap > MAX_CCD_COLLITION_PAIRS_NUM) MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        // [v0.8.6 2b FIX] the old inline block reallocated the CCD mirror at
+        // newcap+1 UNCONDITIONALLY while raising ccd_cap only when newcap
+        // exceeded it — on the first per-env overflow (newcap < initial
+        // CCD cap) the allocation SHRANK below the published cap, and the
+        // next swept-CCD detection (clamped by the stale larger cap) could
+        // write past it. pair_buffers_grow_dcd never shrinks the mirror.
+        pair_buffers_grow_dcd(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM}, newcap);
         bvh_f._collisionPair     = bvh_e._collisionPair     = _collisonPairs;
         bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
         bvh_f._MatIndex          = bvh_e._MatIndex          = _MatIndex;
-        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
         goto perenv_redo;
     }
     bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;

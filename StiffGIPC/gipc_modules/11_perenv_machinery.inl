@@ -491,11 +491,8 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
         int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
         printf("[perenv CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo\n",
                h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
-        CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
-        MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        pair_buffers_grow_ccd(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM}, newcap);   // [v0.8.6 2b]
         bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
-        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
         goto ccd_redo;
     }
     bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;
@@ -552,12 +549,9 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
         int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
         printf("[CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo detection\n",
                h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
-        CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
-        MAX_CCD_COLLITION_PAIRS_NUM = newcap;
+        pair_buffers_grow_ccd(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM}, newcap);   // [v0.8.6 2b]
         bvh_f._ccd_collisionPair = _ccd_collisonPairs;
         bvh_e._ccd_collisionPair = _ccd_collisonPairs;
-        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, sizeof(uint32_t), 0));
         // Preserve the v0.8.4.2 grow-redo reset ordering without allocating a
         // temporary event or synchronizing the auxiliary stream on the host.

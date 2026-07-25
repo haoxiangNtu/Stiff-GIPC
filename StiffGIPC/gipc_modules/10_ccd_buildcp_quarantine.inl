@@ -211,27 +211,12 @@ void GIPC::buildCP()
         int newcap = (int)(h_cpNum[0] + h_cpNum[0] / 2) + 1;
         printf("[DCD-grow] h_cpNum=%u > cap=%d -> grow to %d, redo detection\n",
                h_cpNum[0], MAX_COLLITION_PAIRS_NUM, newcap);
-        CUDA_SAFE_CALL(cudaFree(_collisonPairs));
-        CUDA_SAFE_CALL(cudaFree(_MatIndex));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs, ((size_t)newcap + 1) * sizeof(int4)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex,      ((size_t)newcap + 1) * sizeof(int)));
-        MAX_COLLITION_PAIRS_NUM = newcap;
-        // [mirror-cap sync] the DCD detect kernels write a CCD-mirror copy of
-        // every DCD pair into _ccd_collisonPairs at the SAME slot index. If the
-        // dynamically grown DCD cap exceeds the CCD buffer cap, those mirror
-        // writes (and the narrow-self snapshot taken from them) run past the
-        // CCD allocation. Grow the CCD buffer in lockstep.
-        if(MAX_COLLITION_PAIRS_NUM > MAX_CCD_COLLITION_PAIRS_NUM)
-        {
-            CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
-            CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs,
-                                      ((size_t)newcap + 1) * sizeof(int4)));
-            MAX_CCD_COLLITION_PAIRS_NUM = newcap;
-            bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
-        }
-        bvh_f._collisionPair = bvh_e._collisionPair = _collisonPairs;
-        bvh_f._MatIndex      = bvh_e._MatIndex      = _MatIndex;
-        set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
+        // [v0.8.6 2b] mechanics (alloc, +1 trash, DCD<=CCD lockstep, cap
+        // publication) live in contact/pair_buffers.cuh; policy stays here.
+        pair_buffers_grow_dcd(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM}, newcap);
+        bvh_f._collisionPair     = bvh_e._collisionPair     = _collisonPairs;
+        bvh_f._MatIndex          = bvh_e._MatIndex          = _MatIndex;
+        bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
         CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gpNum, 0, sizeof(uint32_t), 0));
         CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection

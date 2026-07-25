@@ -155,10 +155,8 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 /// </summary>
 void GIPC::FREE_DEVICE_MEM()
 {
-    CUDA_SAFE_CALL(cudaFree(_MatIndex));
+    pair_buffers_free(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM});   // [v0.8.6 2b] guarded + null-set
     if(m_reduce_scratch) { CUDA_SAFE_CALL(cudaFree(m_reduce_scratch)); m_reduce_scratch=nullptr; m_reduce_cap=0; }
-    CUDA_SAFE_CALL(cudaFree(_collisonPairs));
-    CUDA_SAFE_CALL(cudaFree(_ccd_collisonPairs));
     CUDA_SAFE_CALL(cudaFree(_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_gpNum));
@@ -270,12 +268,7 @@ void GIPC::MALLOC_DEVICE_MEM()
 {
     // +1 trash slot: pair-emit overflow is redirected to index==cap (see _emit_slot
     // in mlbvh.cu) so detection never writes out of bounds; the host then grows.
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex, ((size_t)MAX_COLLITION_PAIRS_NUM + 1) * sizeof(int)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs,
-                              ((size_t)MAX_COLLITION_PAIRS_NUM + 1) * sizeof(int4)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_ccd_collisonPairs,
-                              ((size_t)MAX_CCD_COLLITION_PAIRS_NUM + 1) * sizeof(int4)));
-    set_emit_caps(MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
+    pair_buffers_alloc(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM});   // [v0.8.6 2b] mechanics owner
     CUDA_SAFE_CALL(cudaMalloc((void**)&_environment_collisionPair,
                               surf_vertexNum * sizeof(int)));
     //CUDA_SAFE_CALL(cudaMalloc((void**)&_moveDir, vertexNum * sizeof(double3)));
