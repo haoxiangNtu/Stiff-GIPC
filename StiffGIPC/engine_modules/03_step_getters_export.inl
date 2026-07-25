@@ -569,7 +569,7 @@ void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,
     g.buildCP();
     if(getenv("STIFF_CONTACT_DBG"))
         fprintf(stderr, "[contact_dbg] h_cpNum0=%u h_gpNum=%u Kappa=%g dHat=%g nv=%d\n",
-                g.h_cpNum[0], g.h_gpNum, g.Kappa, g.dHat, nv);
+                g.h_cpNum[0], g.h_gpNum.get(), g.Kappa, g.dHat, nv);
     if(g.h_cpNum[0] < 1 && g.h_gpNum < 1)
         return;  // nothing in contact (neither body-body nor ground)
 
@@ -780,12 +780,12 @@ void SimEngine::get_pair_contact_force(int a_off, int a_cnt, int b_off, int b_cn
     int4*    saved_pairs = g._collisonPairs;
     uint32_t saved_cpNum = g.h_cpNum[0];
     g._collisonPairs = d_filtered;
-    g.h_cpNum[0]     = static_cast<uint32_t>(filtered.size());
+    g.h_cpNum.set(0, static_cast<uint32_t>(filtered.size()));  // [3b] export-time override
     g.zeroBinnedGrad();                      // [4.3] calBarrierGradient scatters to binned buf
     g.calBarrierGradient(d_grad, g.Kappa);
     g.combineBinnedGrad(d_grad);             // [4.3] fold binned contact force into d_grad
     g._collisonPairs = saved_pairs;
-    g.h_cpNum[0]     = saved_cpNum;
+    g.h_cpNum.set(0, saved_cpNum);  // [3b] restore
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     std::vector<double3> hg(a_cnt);

@@ -1,5 +1,9 @@
 void GIPC::buildBVH_and_CP_perenv(double dHat)
 {
+    // [3b] per-env DCD re-emission ahead (also clobbers the ccd-mirror prefix)
+    h_cpNum.invalidate();
+    h_gpNum.invalidate();
+    h_ccd_cpNum.invalidate();
     if(m_skip_all_collision) return;
     int NG = m_perenv_bvh_groups;
     // point the BVH at LOCAL verts (the whole reason this kills cross-env divergence)
@@ -55,7 +59,7 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     }
     if(par) { for(int k = 0; k < K; ++k) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k]));
               swapIn(bvh_f, of); swapIn(bvh_e, oe); }  // restore original scratch
-    CUDA_SAFE_CALL(cudaMemcpy(&h_cpNum, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(h_cpNum.refresh_dst(), _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     // [perenv-parallel #1 FIX] the per-env path (like the merged path) MUST grow the pair buffers on
     // overflow + redo — else at large N the pair count exceeds the cap and consumers (line-search,
     // gradient) read OOB → illegal access. Per-env DCD fills BOTH _collisonPairs and _ccd_collisonPairs
@@ -86,7 +90,7 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     {   // [9d28824-port] one 6-int D2H
         uint32_t cp_gp_buf[6];
         CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
+        memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
     }
 

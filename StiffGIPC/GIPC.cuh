@@ -16,6 +16,7 @@
 
 #include "PCG_SOLVER.cuh"
 #include "device_common/device_buffer.cuh"  // [3d] RAII device-buffer owner
+#include "device_common/mirrors.h"           // [3b] audited host mirrors
 #include <gipc/abd_fem_count_info.h>
 namespace gipc
 {
@@ -214,8 +215,10 @@ class GIPC
     int       groundTrialStatus(const int* point_to_group, int group_count);
     void      halveGroundInvalidEnvAlpha(int group_count);
     //uint32_t* _cpNum;
-    uint32_t h_cpNum[5]  = {0, 0, 0, 0, 0};
-    uint32_t h_ccd_cpNum = 0;
+    // [3b pilot] counts-after-build mirrors: audited via STIFF_MIRROR_AUDIT=1
+    // (writers invalidate at build entries, refresh at the D2H copy-backs)
+    HostMirrorArray<uint32_t, 5> h_cpNum{"h_cpNum"};
+    HostMirror<uint32_t>         h_ccd_cpNum{"h_ccd_cpNum"};
     // [narrow-self snapshot] immutable copy of the DCD-time CCD pair mirror.
     // The DCD detect kernels write _collisionPair AND _ccd_collisionPair at the
     // same atomic slot, so right after buildCP the first h_cpNum[0] entries of
@@ -230,7 +233,7 @@ class GIPC
     uint32_t m_dcd_snap_count  = 0;
     int      m_dcd_snap_cap    = 0;
     void     snapshotDcdCcdPairs();
-    uint32_t h_gpNum     = 0;
+    HostMirror<uint32_t>         h_gpNum{"h_gpNum"};
 
     uint32_t h_close_cpNum = 0;
     uint32_t h_close_gpNum = 0;

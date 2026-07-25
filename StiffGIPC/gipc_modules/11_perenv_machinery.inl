@@ -403,6 +403,7 @@ __global__ void _per_env_selfAlpha_min(const double3* vertexes, const int4* pair
 // [multi-env P2] per-env CCD: build each env's swept tree on LOCAL verts + full-detect, looped.
 void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
 {
+    h_ccd_cpNum.invalidate();  // [3b] swept re-emission ahead
     if(m_skip_all_collision) { h_ccd_cpNum = 0; return; }
     int NG = m_perenv_bvh_groups;
     double3* sf = bvh_f._vertexes;
@@ -482,7 +483,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     }
     if(ccd_par) { for(int k2 = 0; k2 < ccd_K; ++k2) CUDA_SAFE_CALL(cudaStreamSynchronize(m_pool_streams[k2]));
                   cswapIn(bvh_f, cof); cswapIn(bvh_e, coe); }  // restore original scratch
-    CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(h_ccd_cpNum.refresh_dst(), _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     // [perenv-parallel #1 FIX] the per-env CCD path (like the merged buildFullCP) MUST grow + redo on
     // overflow — else at the grasp h_ccd_cpNum exceeds the cap and the line-search per-env alpha reads
     // _ccd_collisonPairs OOB → illegal access (the N>4 crash). Emits past cap went to the trash slot.
@@ -490,7 +491,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     {
         int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
         printf("[perenv CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo\n",
-               h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
+               h_ccd_cpNum.get(), MAX_CCD_COLLITION_PAIRS_NUM, newcap);
         pair_buffers_grow_ccd(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM}, newcap);   // [v0.8.6 2b]
         bvh_f._ccd_collisionPair = bvh_e._ccd_collisionPair = _ccd_collisonPairs;
         goto ccd_redo;
@@ -503,6 +504,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
 
 void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
 {
+    h_ccd_cpNum.invalidate();  // [3b] swept re-emission ahead
     if(m_skip_all_collision)
     {
         h_ccd_cpNum = 0;
@@ -537,7 +539,7 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
     CUDA_SAFE_CALL(cudaStreamWaitEvent(
         cudaStreamPerThread, m_aux_done_event, 0));
 
-    CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(h_ccd_cpNum.refresh_dst(), _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
     // Overflow → grow CCD pair buffer + redo detection. The swept BVH
     // (ConstructFullCCD) is unchanged, so we only re-run the query into the
@@ -548,7 +550,7 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
     {
         int newcap = (int)(h_ccd_cpNum + h_ccd_cpNum / 2) + 1;
         printf("[CCD-grow] h_ccd_cpNum=%u > cap=%d -> grow to %d, redo detection\n",
-               h_ccd_cpNum, MAX_CCD_COLLITION_PAIRS_NUM, newcap);
+               h_ccd_cpNum.get(), MAX_CCD_COLLITION_PAIRS_NUM, newcap);
         pair_buffers_grow_ccd(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM}, newcap);   // [v0.8.6 2b]
         bvh_f._ccd_collisionPair = _ccd_collisonPairs;
         bvh_e._ccd_collisionPair = _ccd_collisonPairs;
@@ -563,7 +565,7 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
         CUDA_SAFE_CALL(cudaEventRecord(m_aux_done_event, m_aux_stream));
         CUDA_SAFE_CALL(cudaStreamWaitEvent(
             cudaStreamPerThread, m_aux_done_event, 0));
-        CUDA_SAFE_CALL(cudaMemcpy(&h_ccd_cpNum, _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(h_ccd_cpNum.refresh_dst(), _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     }
 }
 

@@ -87,9 +87,15 @@ double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueu
 
 void GIPC::buildCP()
 {
+    // [3b] device truth changes below: DCD re-emission rewrites _cpNum/_gpNum
+    // AND clobbers the _ccd_collisonPairs prefix (the documented narrow-self
+    // hazard) — all three mirrors stale until their refresh points.
+    h_cpNum.invalidate();
+    h_gpNum.invalidate();
+    h_ccd_cpNum.invalidate();
     if(m_skip_all_collision)
     {
-        memset(h_cpNum, 0, sizeof(h_cpNum));
+        memset(h_cpNum.refresh_dst(), 0, 5 * sizeof(uint32_t));
         h_gpNum = 0;
         return;
     }
@@ -199,7 +205,7 @@ void GIPC::buildCP()
     {   // [9d28824-port] contiguous _cpNum[0:5]+_gpNum[5]: one 6-int D2H.
         uint32_t cp_gp_buf[6];
         CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
+        memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
     }
 
@@ -232,7 +238,7 @@ void GIPC::buildCP()
         {   // [9d28824-port] one 6-int D2H
             uint32_t cp_gp_buf[6];
             CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-            memcpy(h_cpNum, cp_gp_buf, 5 * sizeof(uint32_t));
+            memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
             h_gpNum = cp_gp_buf[5];
         }
     }

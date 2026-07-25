@@ -176,7 +176,8 @@ void GIPC::create_LinearSystem(device_TetraData& tet)
     {
 
         m_global_linear_system->create<gipc::MAS_Preconditioner>(
-            fem, pcg_data.MP, tet.masses, h_cpNum);
+            fem, pcg_data.MP, tet.masses, h_cpNum.raw_alias());  // [3b] MAS keeps this
+            // uint32_t* for its lifetime; reads happen post-build only (audit-invisible)
     }
     else
     {
