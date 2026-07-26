@@ -134,7 +134,7 @@ bool GIPC::quarantineEnv(int env, int vertex, double distance)
         m_env_quarantined.assign(kEnvAlphaSlots, 0);
     if(!m_d_env_quarantined)
     {   // device mirror for the direction-zero kernel
-        CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_env_quarantined, kEnvAlphaSlots * sizeof(int)));
+        m_d_env_quarantined.resize_discard(kEnvAlphaSlots);  // [3d-2]
         CUDA_SAFE_CALL(cudaMemset(m_d_env_quarantined, 0, kEnvAlphaSlots * sizeof(int)));
     }
     if(!m_env_quarantined[env])

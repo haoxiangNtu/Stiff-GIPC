@@ -149,7 +149,7 @@ class GIPC
     // (h_cpNum / h_ccd_cpNum, up to MAX_*_PAIRS) overflow it. This buffer grows
     // to ceil(count/default_threads) on demand so no pair-count reduction can
     // ever overflow; after warmup the capacity stabilizes (no further realloc).
-    double*   m_reduce_scratch   = nullptr;
+    DeviceBuffer<double> m_reduce_scratch;  // [3d-2] grow-only reduce scratch
     size_t    m_reduce_cap       = 0;
 
     uint32_t* _environment_collisionPair = nullptr;
@@ -196,8 +196,8 @@ class GIPC
     std::vector<uint8_t> m_env_quarantined;
     // [iron-law completion] device mirror of m_env_quarantined + per-env
     // non-finite-direction scan flags (both lazy, kEnvAlphaSlots ints).
-    int* m_d_env_quarantined = nullptr;
-    int* m_d_env_dirnan      = nullptr;
+    DeviceBuffer<int> m_d_env_quarantined;  // [3d-2]
+    DeviceBuffer<int> m_d_env_dirnan;       // [3d-2]
     int              env_newton_iter_cap = 0;  // per-env iter budget; 0 = off
     // [T1] line-search backtracking budget (halvings); 0 = engine default (64).
     int              line_search_max_iter = 64;
@@ -267,11 +267,14 @@ class GIPC
     DeviceBuffer<double2>                distCoord;
     DeviceBuffer<__GEIGEN__::Matrix3x2d> tanBasis;
     DeviceBuffer<int4>                   _collisonPairs_lastH;
-    uint32_t                h_cpNum_last[5]      = {0, 0, 0, 0, 0};
+    // [3b-2] lagged-friction snapshot mirrors: value semantics = "as of the
+    // last buildFrictionSets snapshot" — no invalidation sites by design
+    // (never stale between snapshots); wrapped for uniformity + type-check.
+    HostMirrorArray<uint32_t, 5> h_cpNum_last{"h_cpNum_last"};
 
     DeviceBuffer<double>   lambda_lastH_scalar_gd;
     DeviceBuffer<uint32_t> _collisonPairs_lastH_gd;
-    uint32_t  h_gpNum_last;
+    HostMirror<uint32_t> h_gpNum_last{"h_gpNum_last"};  // [3b-2] was UNINITIALIZED — T{} now
 
     // Persistent device slots for 9 FEM/contact terms plus 6 ABD terms. The
     // line-search path combines these on device; diagnostic computeEnergy()
@@ -310,13 +313,13 @@ class GIPC
     // is the host mirror S2 will read to drive per-env step_forward.
     static constexpr int kEnvAlphaSlots = device_TetraData::kGroupSlotCapacity;
     int                 m_active_group_count = 0;
-    double*             m_env_alpha   = nullptr;   // device, size kEnvAlphaSlots
+    DeviceBuffer<double> m_env_alpha;    // [3d-2] device, size kEnvAlphaSlots
     std::vector<double> h_env_alpha;               // host mirror
     // scratch for the per-env feasibility reductions split across two phases of
     // one Newton iter: direct-alpha regions [0]=ground [1]=self-narrow
     // [2]=refined-self, [3]=surface cfl-maxspeed, [4]=all-vertex Newton max-move.
     // Alpha regions are initialized to 1 and MIN-reduced; max regions start at 0.
-    double*             m_env_scratch = nullptr;   // device, size 5*kEnvAlphaSlots
+    DeviceBuffer<double> m_env_scratch;  // [3d-2] device, size 5*kEnvAlphaSlots
     // [multi-env S2] per-env step apply. When m_perenv_apply is true, step_forward
     // moves FEM vert v by m_env_alpha[point_to_group[v]] and ABD body b by
     // m_abd_body_alpha[b] (gathered = m_env_alpha[body_to_group[b]]). The scalar
@@ -324,7 +327,7 @@ class GIPC
     // STIFF_PERENV_ALPHA; the caller (lineSearch) flips m_perenv_apply off to
     // fall back to a uniform global step when the global energy safety-check fails.
     bool                m_perenv_apply    = false;
-    double*             m_abd_body_alpha  = nullptr;  // device, size abd_body_num
+    DeviceBuffer<double> m_abd_body_alpha;  // [3d-2] device, size abd_body_num
     // set true by the S1 block each Newton iter once m_env_alpha is freshly
     // populated; lineSearch only does the per-env try when this is true (guards
     // against applying stale per-env alpha on iters where S1 didn't run).
@@ -335,7 +338,7 @@ class GIPC
     // assembly/PCG/SpMV masking (RHS-zero + triplet-skip) to skip converged envs.
     // Gated STIFF_PERENV_MASK. h_env_active mirror; m_recheck_counter drives the
     // periodic full re-check.
-    int*                m_env_active      = nullptr;  // device, size kEnvAlphaSlots
+    DeviceBuffer<int>    m_env_active;      // [3d-2] device, size kEnvAlphaSlots
     std::vector<int>    h_env_active;                 // host mirror
     int                 m_recheck_counter = 0;
 

@@ -698,7 +698,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     }
 #endif
     KSEG("seg_thru_friction")
-    if(getenv("STIFF_KSUM")) printf("[ksum] cpNumLast=%u gpNumLast=%u\n", h_cpNum_last[0], h_gpNum_last);
+    if(getenv("STIFF_KSUM")) printf("[ksum] cpNumLast=%u gpNumLast=%u\n", h_cpNum_last[0], h_gpNum_last.get());
 
     computeGroundGradientAndHessian(contact_grads);
     // [multi-env determinism 4.3] combine the binned contact+friction gradient into

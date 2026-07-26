@@ -156,7 +156,7 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 void GIPC::FREE_DEVICE_MEM()
 {
     pair_buffers_free(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM});   // [v0.8.6 2b] guarded + null-set
-    if(m_reduce_scratch) { CUDA_SAFE_CALL(cudaFree(m_reduce_scratch)); m_reduce_scratch=nullptr; m_reduce_cap=0; }
+    m_reduce_scratch.release(); m_reduce_cap = 0;  // [3d-2]
     CUDA_SAFE_CALL(cudaFree(_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_gpNum));
@@ -166,8 +166,8 @@ void GIPC::FREE_DEVICE_MEM()
         CUDA_SAFE_CALL(cudaFree(_ground_skip_body));
         _ground_skip_body = nullptr; m_ground_skip_owned = false;
     }
-    if(m_d_env_quarantined) { CUDA_SAFE_CALL(cudaFree(m_d_env_quarantined)); m_d_env_quarantined = nullptr; }
-    if(m_d_env_dirnan)      { CUDA_SAFE_CALL(cudaFree(m_d_env_dirnan));      m_d_env_dirnan = nullptr; }
+    m_d_env_quarantined.release();
+    m_d_env_dirnan.release();
     CUDA_SAFE_CALL(cudaFree(_environment_collisionPair));
     // [9d28824-port] _gpNum aliases (_cpNum + 5) — freed above with _cpNum.
     _gpNum = nullptr;
@@ -179,10 +179,10 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_surfVerts));
 
     // [multi-env S1] free per-env line-search substrate
-    if(m_env_alpha)    { CUDA_SAFE_CALL(cudaFree(m_env_alpha));    m_env_alpha    = nullptr; }
-    if(m_env_scratch)  { CUDA_SAFE_CALL(cudaFree(m_env_scratch));  m_env_scratch  = nullptr; }
-    if(m_abd_body_alpha) { CUDA_SAFE_CALL(cudaFree(m_abd_body_alpha)); m_abd_body_alpha = nullptr; }
-    if(m_env_active)   { CUDA_SAFE_CALL(cudaFree(m_env_active));   m_env_active   = nullptr; }
+    m_env_alpha.release();
+    m_env_scratch.release();
+    m_abd_body_alpha.release();
+    m_env_active.release();
 
     // [0be8da3-port] free the persistent (grow-only) friction/close buffers and
     // reset capacities so engine.reset() starts clean.
@@ -307,9 +307,9 @@ void GIPC::MALLOC_DEVICE_MEM()
     }
 
     // [multi-env S1] per-env feasible-alpha substrate (physics-neutral until S2).
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_alpha, kEnvAlphaSlots * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_scratch, 5 * kEnvAlphaSlots * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_env_active, kEnvAlphaSlots * sizeof(int)));
+    m_env_alpha.resize_discard(kEnvAlphaSlots);
+    m_env_scratch.resize_discard(5 * kEnvAlphaSlots);
+    m_env_active.resize_discard(kEnvAlphaSlots);
     h_env_alpha.assign(kEnvAlphaSlots, 1.0);
     h_env_active.assign(kEnvAlphaSlots, 1);
     // [batch-size hygiene] m_env_alpha starts at 1.0 like the host mirror: the device fast path
@@ -521,11 +521,7 @@ GIPC::GIPC()
     animation_subRate = 1.0;
     animation         = false;
 
-    h_cpNum_last[0] = 0;
-    h_cpNum_last[1] = 0;
-    h_cpNum_last[2] = 0;
-    h_cpNum_last[3] = 0;
-    h_cpNum_last[4] = 0;
+    // h_cpNum_last zero-init happens in the HostMirrorArray member ctor [3b-2]
 }
 
 static void _dbg_ksum(const char*, const void*, size_t);  // [4.3 fwd]
@@ -562,7 +558,7 @@ void GIPC::buildFrictionSets()
                                                               m_pergroup_kappa ? m_kappa_group : nullptr,
                                                               m_pergroup_kappa ? m_d_p2g : nullptr);
     }
-    CUDA_SAFE_CALL(cudaMemcpy(h_cpNum_last, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(h_cpNum_last.refresh_dst(), _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     numbers = h_gpNum;
     if(numbers > 0)
     {
@@ -793,10 +789,8 @@ double* GIPC::ensure_reduce_scratch(int count)
     size_t need = (size_t)((count + default_threads - 1) / default_threads) + 1;
     if(need > m_reduce_cap)
     {
-        if(m_reduce_scratch)
-            CUDA_SAFE_CALL(cudaFree(m_reduce_scratch));
         m_reduce_cap = need + need / 2;  // 1.5x slack → no realloc churn after warmup
-        CUDA_SAFE_CALL(cudaMalloc((void**)&m_reduce_scratch, m_reduce_cap * sizeof(double)));
+        m_reduce_scratch.resize_discard(m_reduce_cap);  // [3d-2]
     }
     return m_reduce_scratch;
 }

@@ -115,7 +115,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
             if(abdN > 0 && TetMesh.d_body_to_group)   // refresh per-body ABD alpha
             {
                 if(!m_abd_body_alpha)
-                    CUDA_SAFE_CALL(cudaMalloc((void**)&m_abd_body_alpha, abdN * sizeof(double)));
+                    m_abd_body_alpha.resize_discard(abdN);  // [3d-2]
                 int tn = 256, bn = (abdN + tn - 1) / tn;
                 _gather_abd_body_alpha<<<bn, tn>>>(TetMesh.d_body_to_group, m_env_alpha,
                                                    m_abd_body_alpha, abdN, NG);
@@ -400,7 +400,7 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
                 int bs = 256;
                 const double* frozen_alpha =
                     (getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid)
-                        ? m_env_alpha
+                        ? m_env_alpha.data()
                         : nullptr;
                 _per_group_kappa_double<<<(NG + bs - 1) / bs, bs>>>(
                     m_kappa_group, m_d_close_grp, frozen_alpha, NG, kappaMax, d_maxK);
@@ -805,8 +805,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             {
                 const int NGq = m_active_group_count;
                 if(!m_d_env_dirnan)
-                    CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_env_dirnan,
-                                              kEnvAlphaSlots * sizeof(int)));
+                    m_d_env_dirnan.resize_discard(kEnvAlphaSlots);  // [3d-2]
                 CUDA_SAFE_CALL(cudaMemsetAsync(m_d_env_dirnan, 0, NGq * sizeof(int), 0));
                 {
                     int bs = 256, gs = ((int)vertexNum + bs - 1) / bs;

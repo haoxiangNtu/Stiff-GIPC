@@ -25,8 +25,10 @@
 // (needed for long-lived consumers like MAS_Preconditioner's uint32_t*).
 // Every raw_alias() call site must justify itself in a comment.
 //
-// Pilot family (3b): h_cpNum[5] / h_gpNum / h_ccd_cpNum — the counts-after-
-// build family. h_*_last snapshots keep their own lifecycle, not wrapped.
+// Families: (3b) h_cpNum[5]/h_gpNum/h_ccd_cpNum — counts-after-build,
+// invalidated at build entries; (3b-2) h_cpNum_last[5]/h_gpNum_last —
+// lagged-friction snapshots, value = "as of last snapshot", refresh-only
+// lifecycle (no invalidation sites by design, never stale between snapshots).
 // ============================================================================
 #pragma once
 #include <cstdlib>
@@ -65,6 +67,12 @@ class HostMirror
         return m_v;
     }
     T get() const { return static_cast<T>(*this); }  // for variadic (printf) sites
+    const T* read_ptr() const  // audited address-of read (e.g. H2D upload source)
+    {
+        if(gipc_mirror_detail::audit_enabled() && !m_fresh)
+            gipc_mirror_detail::stale(m_name);
+        return &m_v;
+    }
 
     HostMirror& operator=(T v)  // assignment IS a refresh (writer states truth)
     {
