@@ -20,7 +20,7 @@
 #include "energy/03_barrier_fused_assembly.inl"
 #include "gipc_modules/05_close_gradients.inl"
 #include "gipc_modules/06_kinetic_soft_ground.inl"
-#include "energy/10_kinetic.inl"
+#include "energy/composite_externs.cuh"  // [E3] kernels moved to term TUs
 #include "energy/11_fem_elastic.inl"
 #include "energy/12_triangle_membrane.inl"
 #include "energy/13_bending.inl"

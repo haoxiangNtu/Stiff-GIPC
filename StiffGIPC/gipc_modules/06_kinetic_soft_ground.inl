@@ -272,10 +272,5 @@ __global__ void _halveGroundInvalidEnvAlpha(double* env_alpha,
 // the env bucket. penv==nullptr -> no-op (global-only callers stay byte-identical).
 // vid is a GLOBAL vertex id (p2g is the full point_to_group), except the kinetic
 // caller passes p2g already offset to the FEM region and vid local.
-__device__ inline void _penv_energy_accum(double* penv, const int* p2g, int vid, int ng, double e)
-{
-    if(!penv || !p2g) return;
-    int g = p2g[vid];
-    if(g >= 0 && g < ng) atomicAdd(&penv[g], e);
-}
+#include "energy/term_common.cuh"  // [E3] _penv_energy_accum hoisted (shared with term TUs)
 
