@@ -1,3 +1,6 @@
+#pragma once
+#include "contact/barrier_rank.h"
+#include "FrictionUtils.cuh"
 // ============================================================================
 // energy/02_contact_energy_device.inl — contact-term ENERGY device functions
 // (v0.8.6 energy separation E1d): __cal_Barrier_energy (frozen smooth
@@ -6,7 +9,7 @@
 // consumers are the term reductions (energy/15/16) and the gradient kernels;
 // definition must precede module 05's gradient kernels.
 // ============================================================================
-__device__ double __cal_Barrier_energy(const double3* _vertexes,
+__device__ inline double __cal_Barrier_energy(const double3* _vertexes,
                                        const double3* _rest_vertexes,
                                        int4           MMCVIDI,
                                        double         _Kappa,
@@ -266,7 +269,7 @@ __device__ double __cal_Barrier_energy(const double3* _vertexes,
 
 
 // ── friction energy device functions (pre-E1d gipc_modules/01 lines 552..677) ──
-__device__ double __cal_Friction_gd_energy(const double3* _vertexes,
+__device__ inline double __cal_Friction_gd_energy(const double3* _vertexes,
                                            const double3* _o_vertexes,
                                            const double3* _normal,
                                            uint32_t       gidx,
@@ -291,7 +294,7 @@ __device__ double __cal_Friction_gd_energy(const double3* _vertexes,
 }
 
 
-__device__ double __cal_Friction_energy(const double3*         _vertexes,
+__device__ inline double __cal_Friction_energy(const double3*         _vertexes,
                                         const double3*         _o_vertexes,
                                         int4                   MMCVIDI,
                                         double                 dt,

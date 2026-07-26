@@ -26,7 +26,7 @@
 // [E3.3] 13_bending.inl -> energy/bending.cu (own TU)
 // [E3.2] 14_soft_constraints.inl -> energy/soft_constraints.cu (own TU)
 #include "energy/15_barrier.inl"
-#include "energy/16_friction.inl"
+// [E3.5] 16_friction.inl -> energy/friction.cu (own TU)
 // [E3.2] 17_ground.inl -> energy/ground.cu (own TU)
 // [E3.2] 18_delta.inl -> energy/delta.cu (own TU)
 #include "gipc_modules/07_energy_alpha_reductions.inl"
