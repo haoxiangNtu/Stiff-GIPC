@@ -15,3 +15,83 @@ extern __global__ void _getKineticEnergy_Reduction_3D(
     double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
 extern __global__ void _calKineticGradient(
     double3* vertexes, double3* xTilta, double3* gradient, double* masses, int numbers);
+
+// ── rung 2: ground (energy/ground.cu) ──
+extern __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
+                                                 const double*  g_offset,
+                                                 const double3* g_normal,
+                                                 const uint32_t* _environment_collisionPair,
+                                                 double3*  gradient,
+                                                 uint32_t* _gpNum,
+                                                 Eigen::Matrix3d* triplet_values,
+                                                 int*   row_ids,
+                                                 int*   col_ids,
+                                                 double dHat,
+                                                 double Kappa_scalar,
+                                                 int    global_offset,
+                                                 int    number,
+                                                 const double* kappa_grp = nullptr,
+                                                 const int*    p2g       = nullptr);
+extern __global__ void _computeGroundGradient(const double3* vertexes,
+                                       const double*  g_offset,
+                                       const double3* g_normal,
+                                       const uint32_t* _environment_collisionPair,
+                                       double3*  gradient,
+                                       uint32_t* _gpNum,
+                                       double    dHat,
+                                       double    Kappa_scalar,
+                                       int       number,
+                                       const double* kappa_grp = nullptr,
+                                       const int*    p2g       = nullptr);
+extern __global__ void _computeGroundEnergy_Reduction(double*        squeue,
+                                               const double3* vertexes,
+                                               const double*  g_offset,
+                                               const double3* g_normal,
+                                               const uint32_t* _environment_collisionPair,
+                                               double dHat,
+                                               double Kappa,
+                                               int    number,
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0);  // reduction: blocking-dispatcher launch, defaults carried
+
+// ── rung 2: soft_constraints (energy/soft_constraints.cu) ──
+extern __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes,
+                                                         const double3* targetVert,
+                                                         const uint32_t* targetInd,
+                                                         double3*  gradient,
+                                                         uint32_t* _gpNum,
+                                                         Eigen::Matrix3d* triplet_values,
+                                                         int*   row_ids,
+                                                         int*   col_ids,
+                                                         double motionRate,
+                                                         double rate,
+                                                         int    global_offset,
+                                                         int global_hessian_fem_offset,
+                                                         const int*     stitch_paired_vertex,
+                                                         const double3* stitch_rest_offset,
+                                                         const int*     stitch_abd_body_id,
+                                                         const __GEIGEN__::Vector12* abd_body_q,
+                                                         int number);
+extern __global__ void _computeSoftConstraintGradient(const double3*  vertexes,
+                                               const double3*  targetVert,
+                                               const uint32_t* targetInd,
+                                               double3*        gradient,
+                                               double          motionRate,
+                                               double          rate,
+                                               const int*      stitch_paired_vertex,
+                                               const double3*  stitch_rest_offset,
+                                               const int*      stitch_abd_body_id,
+                                               const __GEIGEN__::Vector12* abd_body_q,
+                                               int             number);
+extern __global__ void _computeSoftConstraintEnergy_Reduction(double*        squeue,
+                                                       const double3* vertexes,
+                                                       const double3* targetVert,
+                                                       const uint32_t* targetInd,
+                                                       double motionRate,
+                                                       double rate,
+                                                       const int*     stitch_paired_vertex,
+                                                       const double3* stitch_rest_offset,
+                                                       int    number,
+                                                       double* penv = nullptr, const int* p2g = nullptr, int ng = 0);  // reduction: blocking-dispatcher launch, defaults carried
+
+// ── rung 2: delta (energy/delta.cu) ──
+extern __global__ void _getDeltaEnergy_Reduction(double* squeue, const double3* b, const double3* dx, int vertexNum);  // reduction: blocking-dispatcher launch, defaults carried

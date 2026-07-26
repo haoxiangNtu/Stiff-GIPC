@@ -29,37 +29,7 @@ static void set_bar_targets(int t, int a, int b){
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bar_trace, &t, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt0, &a, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt1, &b, sizeof(int))); }
-__device__ inline void _gfxAdd(int v, int comp, double val)
-{
-    if(g_bar_trace && (v == g_tgt0 || v == g_tgt1))
-        printf("DEP %d %d %.17e\n", v, comp, val);
-    double x    = val;
-    size_t base = ((size_t)v * 3 + comp) * BINNED_K;
-    if(!g_binned_on)
-    {
-        atomicAdd(&g_gbin[base], val);   // fast path: raw plain-atomic into bin 0 (correct, non-det order)
-        return;
-    }
-#pragma unroll
-    for(int k = 0; k < BINNED_K; ++k)
-    {
-        double M  = ldexp(1.5, BINNED_E0 - k * BINNED_W);   // constant args → folded
-        double q  = __dadd_rn(M, x);
-        double hi = __dsub_rn(q, M);
-        atomicAdd(&g_gbin[base + k], hi);                   // same-grid exact ⇒ order-free
-        x         = __dsub_rn(x, hi);
-    }
-}
-// [4.3] base-pointer binned deposit (for the ABD FEM-pin coupling into g_abd_sysbin).
-extern __device__ double* g_abd_sysbin;
-__device__ inline void _binDepBase(double* bins, double val)
-{
-    double x = val;
-#pragma unroll
-    for(int k = 0; k < BINNED_K; ++k)
-    { double M = ldexp(1.5, BINNED_E0 - k * BINNED_W); double q = __dadd_rn(M, x);
-      double hi = __dsub_rn(q, M); atomicAdd(&bins[k], hi); x = __dsub_rn(x, hi); }
-}
+#include "energy/binned_grad_common.cuh"  // [E3.2] _gfxAdd/_binDepBase hoisted
 // combine the K bins per vertex back into the (double3) contact gradient (+= onto ground grad).
 __global__ void _gfxToGrad(double3* _grad, const double* gbin, int n)
 {

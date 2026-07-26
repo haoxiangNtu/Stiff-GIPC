@@ -24,11 +24,11 @@
 #include "energy/11_fem_elastic.inl"
 #include "energy/12_triangle_membrane.inl"
 #include "energy/13_bending.inl"
-#include "energy/14_soft_constraints.inl"
+// [E3.2] 14_soft_constraints.inl -> energy/soft_constraints.cu (own TU)
 #include "energy/15_barrier.inl"
 #include "energy/16_friction.inl"
-#include "energy/17_ground.inl"
-#include "energy/18_delta.inl"
+// [E3.2] 17_ground.inl -> energy/ground.cu (own TU)
+// [E3.2] 18_delta.inl -> energy/delta.cu (own TU)
 #include "gipc_modules/07_energy_alpha_reductions.inl"
 #include "gipc_modules/08_step_update_topology.inl"
 #include "gipc_modules/09_friction_sets_host_mem.inl"
