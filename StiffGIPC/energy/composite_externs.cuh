@@ -126,3 +126,19 @@ extern __global__ void _get_triangleFEMEnergy_Reduction_3D(double*        squeue
                                                     double        shearStiff,
                                                     double        strainRate,
                                                     double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
+
+// ── rung 4: fem_elastic (energy/fem_elastic.cu) ──
+extern __global__ void _getFEMEnergy_Reduction_3D(double*        squeue,
+                                           const double3* vertexes,
+                                           const uint4*   tetrahedras,
+                                           const __GEIGEN__::Matrix3x3d* DmInverses,
+                                           const double* volume,
+                                           int           tetrahedraNum,
+                                           double*       lenRate,
+                                           double*       volRate,
+                                           double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
+extern __global__ void _getRestStableNHKEnergy_Reduction_3D(double*       squeue,
+                                                     const double* volume,
+                                                     int    tetrahedraNum,
+                                                     double lenRate,
+                                                     double volRate);
