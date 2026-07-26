@@ -25,3 +25,29 @@ __global__ void _getKineticEnergy_Reduction_3D(
     gipc_block_sum_to(temp, tep, number, idof, _energy + blockIdx.x);
 }
 
+
+// ── verbatim from gipc_modules/06 (pre-E1c lines 1..24) ──
+__global__ void _calKineticGradient(
+    double3* vertexes, double3* xTilta, double3* gradient, double* masses, int numbers)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= numbers)
+        return;
+    double3 deltaX = __GEIGEN__::__minus(vertexes[idx], xTilta[idx]);
+    //masses[idx] = 1;
+    gradient[idx] = make_double3(
+        deltaX.x * masses[idx], deltaX.y * masses[idx], deltaX.z * masses[idx]);
+    //printf("%f  %f  %f\n", gradient[idx].x, gradient[idx].y, gradient[idx].z);
+}
+
+__global__ void _calKineticEnergy(
+    double3* vertexes, double3* xTilta, double3* gradient, double* masses, int numbers)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= numbers)
+        return;
+    double3 deltaX = __GEIGEN__::__minus(vertexes[idx], xTilta[idx]);
+    gradient[idx]  = make_double3(
+        deltaX.x * masses[idx], deltaX.y * masses[idx], deltaX.z * masses[idx]);
+}
+
