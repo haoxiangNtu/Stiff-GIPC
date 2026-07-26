@@ -915,6 +915,8 @@ def run_replay(scene_name, default_envs=1):
             else:
                 drive_frame(eng, robot, ejs, groups, prep, actions[fr], mode, gstate, P, stitch_seg)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter() - t) * 1000.0)
+            if os.environ.get("STIFF_BENCH_STATS"):
+                print(f"[bench] frame {fr} newton {eng.native.get_total_newton_iters()} ms {ms[-1]:.1f}", flush=True)
             if _sc and fr == _scf:   # [decouple debug] save full state AFTER this frame's step
                 eng.native.save_checkpoint(_sc); print(f"[ckpt] saved {_sc} @frame {fr}", flush=True)
                 import pickle   # also save the force-mode latch state (gstate), minus rebuildable cache

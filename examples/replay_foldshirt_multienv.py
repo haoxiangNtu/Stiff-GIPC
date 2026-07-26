@@ -318,6 +318,8 @@ def main():
             for e, ej in enumerate(ejs):
                 apply_frame(robot, ej, actions[(fr + e*phase) % L], close_r)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter()-t)*1000.0)
+            if os.environ.get("STIFF_BENCH_STATS"):
+                print(f"[bench] frame {fr} newton {eng.native.get_total_newton_iters()} ms {ms[-1]:.1f}", flush=True)
             if fr % 20 == 0:
                 v = eng.get_vertices()
                 cz = [float(v[o:o+c,1].mean()) for (o,c) in cloth_ranges]

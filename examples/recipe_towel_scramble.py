@@ -80,8 +80,11 @@ P0 = np.asarray(eng.get_vertices()).copy()
 n = P0.shape[0]
 print(f"[scramble] towel verts = {n}, drop pose: tilt={tilt:.1f} yaw={yaw:.1f} h={h:.2f}")
 
+import time as _bt
 for fr in range(SETTLE):
-    eng.step()
+    _t0 = _bt.perf_counter(); eng.step()
+    if os.environ.get("STIFF_BENCH_STATS"):
+        print(f"[bench] frame {fr} newton {eng.native.get_total_newton_iters()} ms {(_bt.perf_counter()-_t0)*1000:.1f}", flush=True)
 
 P_scrambled = np.asarray(eng.get_vertices()).copy()
 assert np.isfinite(P_scrambled).all(), "scramble diverged"
