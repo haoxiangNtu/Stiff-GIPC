@@ -35,6 +35,7 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data, bool copy_to_host)
                    auto& M       = Ms(i);
 
 
+                   // [nan-hunt diag, temporary]
                    if(boundary_type(i) == BodyBoundaryType::Fixed)
                    {
                        K = 0.0;
@@ -156,6 +157,15 @@ Float ABDSystem::cal_abd_kinetic_energy(ABDSimData& sim_data, bool copy_to_host)
 
                            K += 0.5 * dq.dot(PowMass * dq);
                        }
+                   }
+               
+                   if(!isfinite(K))
+                   {
+                       Vector12 dqd = q - q_tilde;
+                       Vector12 Mdq = M * dqd;
+                       printf("[abd-kinetic-nan] body %d btype=%d K=%f |q|=%f |qt|=%f |dq|=%f |Mdq|=%f\n",
+                              i, (int)boundary_type(i), K, q.norm(), q_tilde.norm(),
+                              dqd.norm(), Mdq.norm());
                    }
                });
     muda::DeviceReduce().Sum(m_kinetic_energy_per_affine_body.data(),

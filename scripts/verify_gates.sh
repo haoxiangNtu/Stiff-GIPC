@@ -109,6 +109,15 @@ echo "== G9 mode envelope + equivalence =="
 rc=$?; v=$(grep -E '^MODE-GATES' /tmp/vg_modes.log | tail -1)
 if [ $rc -eq 0 ]; then record mode-gates PASS ""; else record mode-gates FAIL "rc=$rc $v"; fi
 
+echo "== G10 bad-mesh ABD kinetic (case-26 root cause) =="
+(timeout 600 python3 examples/test_abd_badmesh_kinetic.py > /tmp/vg_badmesh.log 2>&1)
+rc=$?
+if [ $rc -eq 0 ] && grep -q "ABD-BADMESH-KINETIC: PASS" /tmp/vg_badmesh.log    && ! grep -qE "budget exhausted.*nan|abd-kinetic-nan" /tmp/vg_badmesh.log; then
+  record abd-badmesh PASS ""
+else
+  record abd-badmesh FAIL "rc=$rc"
+fi
+
 echo "== G8 foldshirt 30f smoke =="
 env CASE39ME_HEADLESS=1 CASE39ME_NUM_ENVS=4 CASE39_FRICTION=0.8 CASE39_FRAME_END=30 \
     STIFF_MULTIENV_MODE=merged STIFF_LOG_LEVEL=0 timeout 600 \

@@ -978,7 +978,20 @@ void ABDSystem::_apply_surface_mesh_body_overrides(ABDSimData& data)
                         "quads?). Clamping to PSD; rotational inertia will be "
                         "approximate. FIX THE MESH.\n",
                         smb.body_id, lmin, m_xx_centered.trace());
-                Eigen::Vector3d ev = es.eigenvalues().cwiseMax(0.0);
+                // [case26 nan root-cause] clamping to ZERO leaves a SINGULAR
+                // second moment when only some modes are negative (body 8 of
+                // xarm7: min eig -0.095, only partially degenerate — the
+                // point-cloud fallback below never fired). A singular affine
+                // mass makes M^-1 produce NaN q_tilde -> NaN kinetic energy;
+                // pre-fa0cd63 the NaN was silently ACCEPTED by line search
+                // (scene "worked" by accident), post-fix it is correctly
+                // rejected (alpha->0, scene freezes). Clamp to a POSITIVE
+                // floor relative to the dominant mode instead: invertible,
+                // still approximate, still loudly warned.
+                Eigen::Vector3d ev  = es.eigenvalues();
+                const double    emax = ev.maxCoeff();
+                const double    floor_ = (emax > 0.0) ? 1e-6 * emax : 0.0;
+                ev = ev.cwiseMax(floor_);
                 m_xx_centered = es.eigenvectors() * ev.asDiagonal()
                                 * es.eigenvectors().transpose();
                 // fully degenerate (all modes clamped ~0): fall back to a

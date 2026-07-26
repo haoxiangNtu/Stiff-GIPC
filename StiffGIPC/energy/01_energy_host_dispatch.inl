@@ -357,6 +357,14 @@ void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar
         host_energy += frictionRate * slots[7];
         host_energy += gd_frictionRate * slots[8];
 #endif
+        static const char* kSlotNames[15] = {
+            "FEM_kinetic", "FEM_elastic(dt2)", "membrane(dt2)", "bending(dt2)",
+            "soft", "ground", "barrier(xKappa)", "friction(xmu)", "gfriction(xmu)",
+            "ABD_kinetic", "ABD_shape", "ABD_joint", "ABD_rev_drive",
+            "ABD_prismatic", "ABD_pri_drive"};
+        for(int si = 0; si < kEnergySlotCount; ++si)
+            printf("[energy-slot] %-16s = %.17e%s\n", kSlotNames[si], slots[si],
+                   std::isnan(slots[si]) ? "   <-- NaN" : "");
         const bool exact = std::memcmp(&host_energy,
                                        &device_energy,
                                        sizeof(double)) == 0;
