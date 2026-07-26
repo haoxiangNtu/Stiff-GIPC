@@ -13,10 +13,11 @@
 //    templates) are ALLOWED for now — they are what Phase 2 will untangle.
 // ============================================================================
 #include "gipc_modules/00_prelude_common.inl"
+#include "energy/02_contact_energy_device.inl"
 #include "gipc_modules/01_contact_energy_device.inl"
 #include "gipc_modules/02_friction_assembly.inl"
 #include "gipc_modules/03_barrier_assembly_split.inl"
-#include "gipc_modules/04_binned_grad_fused_assembly.inl"
+#include "energy/03_barrier_fused_assembly.inl"
 #include "gipc_modules/05_close_gradients.inl"
 #include "gipc_modules/06_kinetic_soft_ground.inl"
 #include "energy/10_kinetic.inl"

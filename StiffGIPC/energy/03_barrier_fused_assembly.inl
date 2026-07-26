@@ -1,3 +1,9 @@
+// ============================================================================
+// energy/03_barrier_fused_assembly.inl — the barrier G/H heart (v0.8.6 E1d):
+// binned-gradient mechanism (g_gbin/_gfxAdd) + the fused
+// _calBarrierGradientAndHessian. WHOLE-FILE relocation of gipc_modules/04
+// (zero reordering); frozen smooth branches inside travel verbatim.
+// ============================================================================
 __device__ double* g_gbin = nullptr;
 // [multienv-mode] binned (Demmel-Nguyen order-free) gradient is a DETERMINISM feature (strict mode).
 // merged/isolated don't need bit-identical gradients → fast plain-atomic path (bin 0 as a raw

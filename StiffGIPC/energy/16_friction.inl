@@ -559,3 +559,238 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
     }
 }
 
+
+// ── verbatim from gipc_modules/05 (pre-E1d lines 109..341): friction gradients ──
+__global__ void _calFrictionGradient_gd(const double3* _vertexes,
+                                        const double3* _o_vertexes,
+                                        const double3* _normal,
+                                        const const uint32_t* _last_collisionPair_gd,
+                                        double3* _gradient,
+                                        int      number,
+                                        double   dt,
+                                        double   eps2,
+                                        double*  lastH,
+                                        double   coef,
+                                        const double* vert_mu_gd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    double   eps    = sqrt(eps2);
+    double3  normal = *_normal;
+    uint32_t gidx   = _last_collisionPair_gd[idx];
+    double3  Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
+    double3  VProj  = __GEIGEN__::__minus(
+        Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
+    double VProjMag2 = __GEIGEN__::__squaredNorm(VProj);
+    if(VProjMag2 > eps2)
+    {
+        double3 gdf =
+            __GEIGEN__::__s_vec_multiply(VProj, (vert_mu_gd ? vert_mu_gd[gidx] : coef) * lastH[idx] / sqrt(VProjMag2));
+        /*_gfxAdd(gidx, 0, gdf.x);
+        _gfxAdd(gidx, 1, gdf.y);
+        _gfxAdd(gidx, 2, gdf.z);*/
+        _gradient[gidx] = __GEIGEN__::__add(_gradient[gidx], gdf);
+    }
+    else
+    {
+        double3 gdf = __GEIGEN__::__s_vec_multiply(VProj, (vert_mu_gd ? vert_mu_gd[gidx] : coef) * lastH[idx] / eps);
+        /*_gfxAdd(gidx, 0, gdf.x);
+        _gfxAdd(gidx, 1, gdf.y);
+        _gfxAdd(gidx, 2, gdf.z);*/
+        _gradient[gidx] = __GEIGEN__::__add(_gradient[gidx], gdf);
+    }
+}
+
+__global__ void _calFrictionGradient(const double3*    _vertexes,
+                                     const double3*    _o_vertexes,
+                                     const const int4* _last_collisionPair,
+                                     double3*          _gradient,
+                                     int               number,
+                                     double            dt,
+                                     double2*          distCoord,
+                                     __GEIGEN__::Matrix3x2d* tanBasis,
+                                     double                  eps2,
+                                     double*                 lastH,
+                                     double                  coef,
+                                     const double*           vert_mu)
+{
+    double eps = std::sqrt(eps2);
+    int    idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    int4    MMCVIDI = _last_collisionPair[idx];
+    const double mu = _pair_mu(MMCVIDI, vert_mu, coef);  // [per-body friction]
+    double3 relDX3D;
+    if(MMCVIDI.x >= 0)
+    {
+        Friction::computeRelDX_EE(
+            __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
+            __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+            __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
+            __GEIGEN__::__minus(_vertexes[MMCVIDI.w], _o_vertexes[MMCVIDI.w]),
+            distCoord[idx].x,
+            distCoord[idx].y,
+            relDX3D);
+
+        __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
+        double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
+        double  relDXSqNorm = __GEIGEN__::__squaredNorm(relDX);
+        if(relDXSqNorm > eps2)
+        {
+            relDX = __GEIGEN__::__s_vec_multiply(relDX, 1.0 / sqrt(relDXSqNorm));
+        }
+        else
+        {
+            double f1_div_relDXNorm;
+            Friction::f1_SF_div_relDXNorm(relDXSqNorm, eps, f1_div_relDXNorm);
+            relDX = __GEIGEN__::__s_vec_multiply(relDX, f1_div_relDXNorm);
+        }
+        __GEIGEN__::Vector12 TTTDX;
+        Friction::liftRelDXTanToMesh_EE(
+            relDX, tanBasis[idx], distCoord[idx].x, distCoord[idx].y, TTTDX);
+        TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * mu);
+        {
+            _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+            _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+            _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+            _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+            _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+            _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
+            _gfxAdd(MMCVIDI.z, 0, TTTDX.v[6]);
+            _gfxAdd(MMCVIDI.z, 1, TTTDX.v[7]);
+            _gfxAdd(MMCVIDI.z, 2, TTTDX.v[8]);
+            _gfxAdd(MMCVIDI.w, 0, TTTDX.v[9]);
+            _gfxAdd(MMCVIDI.w, 1, TTTDX.v[10]);
+            _gfxAdd(MMCVIDI.w, 2, TTTDX.v[11]);
+        }
+    }
+    else
+    {
+        int v0I = -MMCVIDI.x - 1;
+        if(MMCVIDI.z < 0)
+        {
+            MMCVIDI.x = v0I;
+
+            Friction::computeRelDX_PP(
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+                relDX3D);
+
+            __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
+            double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
+            double  relDXSqNorm = __GEIGEN__::__squaredNorm(relDX);
+            if(relDXSqNorm > eps2)
+            {
+                relDX = __GEIGEN__::__s_vec_multiply(relDX, 1.0 / sqrt(relDXSqNorm));
+            }
+            else
+            {
+                double f1_div_relDXNorm;
+                Friction::f1_SF_div_relDXNorm(relDXSqNorm, eps, f1_div_relDXNorm);
+                relDX = __GEIGEN__::__s_vec_multiply(relDX, f1_div_relDXNorm);
+            }
+
+            __GEIGEN__::Vector6 TTTDX;
+            Friction::liftRelDXTanToMesh_PP(relDX, tanBasis[idx], TTTDX);
+            TTTDX = __GEIGEN__::__s_vec6_multiply(TTTDX, lastH[idx] * mu);
+            {
+                _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
+            }
+        }
+        else if(MMCVIDI.w < 0)
+        {
+            MMCVIDI.x = v0I;
+            Friction::computeRelDX_PE(
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
+                distCoord[idx].x,
+                relDX3D);
+
+            __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
+            double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
+            double  relDXSqNorm = __GEIGEN__::__squaredNorm(relDX);
+            if(relDXSqNorm > eps2)
+            {
+                relDX = __GEIGEN__::__s_vec_multiply(relDX, 1.0 / sqrt(relDXSqNorm));
+            }
+            else
+            {
+                double f1_div_relDXNorm;
+                Friction::f1_SF_div_relDXNorm(relDXSqNorm, eps, f1_div_relDXNorm);
+                relDX = __GEIGEN__::__s_vec_multiply(relDX, f1_div_relDXNorm);
+            }
+            __GEIGEN__::Vector9 TTTDX;
+            Friction::liftRelDXTanToMesh_PE(relDX, tanBasis[idx], distCoord[idx].x, TTTDX);
+            TTTDX = __GEIGEN__::__s_vec9_multiply(TTTDX, lastH[idx] * mu);
+            {
+                _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+                _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+                _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+                _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+                _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+                _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
+                _gfxAdd(MMCVIDI.z, 0, TTTDX.v[6]);
+                _gfxAdd(MMCVIDI.z, 1, TTTDX.v[7]);
+                _gfxAdd(MMCVIDI.z, 2, TTTDX.v[8]);
+            }
+        }
+        else
+        {
+            MMCVIDI.x = v0I;
+            Friction::computeRelDX_PT(
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.w], _o_vertexes[MMCVIDI.w]),
+                distCoord[idx].x,
+                distCoord[idx].y,
+                relDX3D);
+
+            __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
+            double2 relDX = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
+
+            double relDXSqNorm = __GEIGEN__::__squaredNorm(relDX);
+            if(relDXSqNorm > eps2)
+            {
+                relDX = __GEIGEN__::__s_vec_multiply(relDX, 1.0 / sqrt(relDXSqNorm));
+            }
+            else
+            {
+                double f1_div_relDXNorm;
+                Friction::f1_SF_div_relDXNorm(relDXSqNorm, eps, f1_div_relDXNorm);
+                relDX = __GEIGEN__::__s_vec_multiply(relDX, f1_div_relDXNorm);
+            }
+            __GEIGEN__::Vector12 TTTDX;
+            Friction::liftRelDXTanToMesh_PT(
+                relDX, tanBasis[idx], distCoord[idx].x, distCoord[idx].y, TTTDX);
+            TTTDX = __GEIGEN__::__s_vec12_multiply(TTTDX, lastH[idx] * mu);
+
+            _gfxAdd(MMCVIDI.x, 0, TTTDX.v[0]);
+            _gfxAdd(MMCVIDI.x, 1, TTTDX.v[1]);
+            _gfxAdd(MMCVIDI.x, 2, TTTDX.v[2]);
+            _gfxAdd(MMCVIDI.y, 0, TTTDX.v[3]);
+            _gfxAdd(MMCVIDI.y, 1, TTTDX.v[4]);
+            _gfxAdd(MMCVIDI.y, 2, TTTDX.v[5]);
+            _gfxAdd(MMCVIDI.z, 0, TTTDX.v[6]);
+            _gfxAdd(MMCVIDI.z, 1, TTTDX.v[7]);
+            _gfxAdd(MMCVIDI.z, 2, TTTDX.v[8]);
+            _gfxAdd(MMCVIDI.w, 0, TTTDX.v[9]);
+            _gfxAdd(MMCVIDI.w, 1, TTTDX.v[10]);
+            _gfxAdd(MMCVIDI.w, 2, TTTDX.v[11]);
+        }
+    }
+}
+
+
+// [Step B] optional per-contact export hook. When _ec_out_pair != nullptr, each
+// contact also writes (bodyA,bodyB) and the physical contact force on bodyA
+// (N) = -(sum of this contact's gradient over bodyA's verts)/dt^2. bodyA = body
+// of the first vertex; same-body (self) contacts get bodyB==bodyA (consumer
+// skips). nullptr -> no-op (solve path unchanged).
