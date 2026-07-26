@@ -38,12 +38,15 @@ type↔槽位↔kernel↔属主）。冻结分支逐字随行、绊线锚同 com
 "加一个本构"的工作流成文：新文件实现 energy/gradient/hessian 三件套 + 项表
 加一行。ARAP/SNK 等多本构从 #ifdef 择一走向注册表择一（此步先文档化，不改行为）。
 
-**E3 — 物理 TU 分离（真深水）**：每项一个 .cu，一次一项，**三态判定工具箱先
-备齐再动**（STIFF_KSUM 逐阶段对照 / nvdisasm SASS diff / CPU oracle / 多平台
-换金值流程）。安全阶梯（FP 密度从低到高）：
-kinetic → ground → soft/stitch → delta → bending → 三角膜 → FEM 弹性(ARAP/SNK)
-→ 摩擦 → barrier（最重，冻结毗邻，最后动）。
-每步 = 一 commit + G0..G9 全绿；锚变即停，走三态判定，禁止静默换锚。
+**E3 — 物理 TU 分离 ✅ 完成（2026-07-27，六梯级）**：九项全部独立 .cu
+（kinetic→ground+soft+delta→bending+triangle→fem_elastic→friction→barrier），
+**锚六级全程逐位不动**（FMA 漂移理论未兑现——项核的融合决策核内自足）。
+成文例外：**融合装配 energy/03 留复合 TU**（encode/decode 依赖树深，
+物理迁移是独立未来战役，需单独性能/锚裁决）。
+路上清账：FrictionUtils.cuh 34 函数 + GIPC_PDerivative.cuh 41 函数 inline 化
+（头文件定义无 inline 的历史欠账，双 TU 时代由 nvlink/ld 逼出）；RANK 单源化
+contact/barrier_rank.h；makePDGeneral/write_triplet/_ec_emit/_penv_energy_accum
+/_gfxAdd 提升共享头。
 
 ## 明确不做
 

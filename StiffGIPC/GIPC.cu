@@ -25,7 +25,7 @@
 // [E3.3] 12_triangle_membrane.inl -> energy/triangle_membrane.cu (own TU)
 // [E3.3] 13_bending.inl -> energy/bending.cu (own TU)
 // [E3.2] 14_soft_constraints.inl -> energy/soft_constraints.cu (own TU)
-#include "energy/15_barrier.inl"
+// [E3.6] 15_barrier.inl -> energy/barrier.cu (own TU)
 // [E3.5] 16_friction.inl -> energy/friction.cu (own TU)
 // [E3.2] 17_ground.inl -> energy/ground.cu (own TU)
 // [E3.2] 18_delta.inl -> energy/delta.cu (own TU)

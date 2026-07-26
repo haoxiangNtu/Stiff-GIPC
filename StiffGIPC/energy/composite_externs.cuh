@@ -230,3 +230,26 @@ extern __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
                                                    const double* vert_mu_gd = nullptr, double mu_global = 1.0
 
 );
+
+// ── rung 6: barrier (energy/barrier.cu) ──
+extern __global__ void _calBarrierGradient(const double3*    _vertexes,
+                                    const double3*    _rest_vertexes,
+                                    const const int4* _collisionPair,
+                                    double3*          _gradient,
+                                    double            dHat,
+                                    double            Kappa_scalar,
+                                    int               number,
+                                    const double*     kappa_grp = nullptr,
+                                    const int*        p2g       = nullptr,
+                                    int2*             _ec_out_pair  = nullptr,
+                                    double3*          _ec_out_force = nullptr,
+                                    const int*        _ec_pbid      = nullptr,
+                                    double            _ec_inv_dt2   = 0.0);
+extern __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
+                                               const double3* vertexes,
+                                               const double3* rest_vertexes,
+                                               int4*          _collisionPair,
+                                               double         _Kappa,
+                                               double         _dHat,
+                                               int            cpNum,
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
