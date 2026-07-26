@@ -22,8 +22,8 @@
 #include "gipc_modules/06_kinetic_soft_ground.inl"
 #include "energy/composite_externs.cuh"  // [E3] kernels moved to term TUs
 #include "energy/11_fem_elastic.inl"
-#include "energy/12_triangle_membrane.inl"
-#include "energy/13_bending.inl"
+// [E3.3] 12_triangle_membrane.inl -> energy/triangle_membrane.cu (own TU)
+// [E3.3] 13_bending.inl -> energy/bending.cu (own TU)
 // [E3.2] 14_soft_constraints.inl -> energy/soft_constraints.cu (own TU)
 #include "energy/15_barrier.inl"
 #include "energy/16_friction.inl"

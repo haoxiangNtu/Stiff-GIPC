@@ -95,3 +95,34 @@ extern __global__ void _computeSoftConstraintEnergy_Reduction(double*        squ
 
 // ── rung 2: delta (energy/delta.cu) ──
 extern __global__ void _getDeltaEnergy_Reduction(double* squeue, const double3* b, const double3* dx, int vertexNum);  // reduction: blocking-dispatcher launch, defaults carried
+
+// ── rung 3: bending (energy/bending.cu) ──
+extern __global__ void _getQuadBendingEnergy_Reduction(double*        squeue,
+                                                const double3* vertexes,
+                                                const double3* rest_vertexex,
+                                                const uint2*   edges,
+                                                const uint2*   edge_adj_vertex,
+                                                const Eigen::Matrix4d* quad_bending_Q,
+                                                int    edgesNum,
+                                                double bendStiff,
+                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
+extern __global__ void _getBendingEnergy_Reduction(double*        squeue,
+                                            const double3* vertexes,
+                                            const double3* rest_vertexex,
+                                            const uint2*   edges,
+                                            const uint2*   edge_adj_vertex,
+                                            int            edgesNum,
+                                            double         bendStiff,
+                                            double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
+
+// ── rung 3: triangle_membrane (energy/triangle_membrane.cu) ──
+extern __global__ void _get_triangleFEMEnergy_Reduction_3D(double*        squeue,
+                                                    const double3* vertexes,
+                                                    const uint3*   triangles,
+                                                    const __GEIGEN__::Matrix2x2d* triDmInverses,
+                                                    const double* area,
+                                                    int           trianglesNum,
+                                                    double        stretchStiff,
+                                                    double        shearStiff,
+                                                    double        strainRate,
+                                                    double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
