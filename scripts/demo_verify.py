@@ -42,8 +42,10 @@ DEMOS = {
                            "CASE39_FRAME_END": F}, 2400, None),
     "finray_beaker_1env":("examples/replay_beaker_finray.py",
                           {"CASE39_HEADLESS": "1", "CASE39_FRAME_END": F}, 1800, None),
+    # isolation machinery is an ISOLATED/STRICT promise; in merged the engine
+    # correctly throws fail-fast (the ratified contract) — not a valid mode here
     "midrun_quarantine": ("examples/test_env_midrun_quarantine.py", {}, 1200,
-                          "MIDRUN-QUARANTINE: PASS"),
+                          "MIDRUN-QUARANTINE: PASS", ("isolated", "strict")),
     "abd_badmesh":       ("examples/test_abd_badmesh_kinetic.py", {}, 600,
                           "ABD-BADMESH-KINETIC: PASS"),
     "bench_case26":      ("examples/bench_case26_simple.py", {}, 1800, None),
@@ -52,7 +54,8 @@ DEMOS = {
 BAD = re.compile(r"budget exhausted.*nan|abd-kinetic-nan|Traceback|CUDA error", re.I)
 
 def run(name, mode):
-    script, extra, tmo, marker = DEMOS[name]
+    entry = DEMOS[name]
+    script, extra, tmo, marker = entry[:4]
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("STIFF_") or k in ("STIFF_MIRROR_AUDIT", "STIFF_SLOT_AUDIT")}
     env.update(extra)
@@ -77,7 +80,10 @@ results = []
 for name in DEMOS:
     if ONLY and name not in ONLY:
         continue
+    allowed = DEMOS[name][4] if len(DEMOS[name]) > 4 else None
     for mode in MODES:
+        if allowed and mode not in allowed:
+            continue
         r = run(name, mode)
         results.append(r)
         print(f"{name:18s} {mode:8s} {'PASS' if r['ok'] else 'FAIL':4s} "
