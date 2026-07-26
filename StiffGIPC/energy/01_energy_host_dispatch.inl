@@ -215,20 +215,15 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
     const int  ng  = TetMesh.h_group_count;
     if(pe) CUDA_SAFE_CALL(cudaMemsetAsync(pe, 0, ng * sizeof(double)));
     int tet_offset   = abd_fem_count_info.fem_tet_offset;
-    int tet_count    = abd_fem_count_info.fem_tet_num;
     int point_offset = abd_fem_count_info.fem_point_offset;
-    int point_count  = abd_fem_count_info.fem_point_num;
 
-    int numbers = tet_count;
-    if(type == 0 || type == 3)      numbers = point_count;
-    else if(type == 2)              numbers = h_cpNum[0];
-    else if(type == 4)              numbers = h_gpNum;
-    else if(type == 5)              numbers = h_cpNum_last[0];
-    else if(type == 6)              numbers = h_gpNum_last;
-    else if(type == 7 || type == 1) numbers = tet_count;
-    else if(type == 8 || type == 11)numbers = triangleNum;
-    else if(type == 9)              numbers = softNum;
-    else if(type == 10)             numbers = tri_edge_num;
+    // [E2] registry-driven sizing: each term owns its size in ITS file; the
+    // X-macro table (energy/energy_terms.h) is the single list. Unknown type
+    // (incl. the removed vestigial 11) sizes to 0 -> zeroed slot, no launch.
+    int numbers = 0;
+#define GIPC_ENERGY_SIZE_CASE(id, name) case id: numbers = energy_size_##name(); break;
+    switch(type) { GIPC_ENERGY_TERMS(GIPC_ENERGY_SIZE_CASE) default: break; }
+#undef GIPC_ENERGY_SIZE_CASE
 
     if(numbers == 0)
     {
@@ -245,84 +240,16 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
     int                blockNum    = (numbers + threadNum - 1) / threadNum;
     unsigned int       sharedMsize = sizeof(double) * (threadNum >> 5);
 
-    switch(type)
-    {
-        case 0:
-            _getKineticEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                TetMesh.vertexes + point_offset, TetMesh.xTilta + point_offset,
-                queue, TetMesh.masses + point_offset, numbers,
-                pe, pe ? p2g + point_offset : nullptr, ng);
-            break;
-        case 1:
-            _getFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.tetrahedras + tet_offset,
-                TetMesh.DmInverses + tet_offset, TetMesh.volum + tet_offset,
-                numbers, TetMesh.lengthRate + tet_offset, TetMesh.volumeRate + tet_offset,
-                pe, pe ? p2g : nullptr, ng);
-            break;
-        case 2:
-            _getBarrierEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs,
-                energy_kappa >= 0.0 ? energy_kappa : Kappa, dHat, numbers,
-                pe, pe ? p2g : nullptr, ng);
-            break;
-        case 3:
-            _getDeltaEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.fb + point_offset, _moveDir + point_offset, numbers);
-            break;
-        case 4:
-            _computeGroundEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, _groundOffset, _groundNormal,
-                _environment_collisionPair, dHat, Kappa, numbers,
-                pe, pe ? p2g : nullptr, ng);
-            break;
-        case 5:
-            _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
-                numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
-                fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
-                pe, pe ? p2g : nullptr, ng,
-                d_vert_mu, frictionRate);  // [per-body friction]
-            break;
-        case 6:
-            _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
-                _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
-                sqrt(fDhat) * IPC_dt,
-                pe, pe ? p2g : nullptr, ng,
-                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
-            break;
-        case 7:
-            _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.volum + tet_offset, numbers, lengthRate, volumeRate);
-            break;
-        case 8:
-            _get_triangleFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.triangles, TetMesh.triDmInverses,
-                TetMesh.area, numbers, stretchStiff, shearStiff, strainRate,
-                pe, pe ? p2g : nullptr, ng);
-            break;
-        case 9:
-            _computeSoftConstraintEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.targetVert, TetMesh.targetIndex,
-                softMotionRate, animation_fullRate, TetMesh.d_stitch_paired_vertex,
-                TetMesh.d_stitch_rest_offset, numbers,
-                pe, pe ? p2g : nullptr, ng);
-            break;
-        case 10:
-#ifdef USE_QUADRATIC_BENDING
-            _getQuadBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
-                TetMesh.tri_edge_adj_vertex, TetMesh.quad_bending_Q, numbers, bendStiff,
-                pe, pe ? p2g : nullptr, ng);
-#else
-            _getBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
-                TetMesh.tri_edge_adj_vertex, numbers, bendStiff,
-                pe, pe ? p2g : nullptr, ng);
-#endif
-            break;
-    }
+    // [E2] registry-driven launch: adding a constitutive term = its file
+    // (energy_size_/energy_launch_ members) + ONE row in GIPC_ENERGY_TERMS.
+#define GIPC_ENERGY_LAUNCH_CASE(id, name)                                      \
+    case id:                                                                   \
+        energy_launch_##name(TetMesh, queue, numbers, blockNum, threadNum,     \
+                             sharedMsize, pe, p2g, ng, tet_offset,             \
+                             point_offset, energy_kappa);                      \
+        break;
+    switch(type) { GIPC_ENERGY_TERMS(GIPC_ENERGY_LAUNCH_CASE) default: break; }
+#undef GIPC_ENERGY_LAUNCH_CASE
 
     numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;

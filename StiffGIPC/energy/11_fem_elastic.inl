@@ -61,3 +61,30 @@ __global__ void _getRestStableNHKEnergy_Reduction_3D(double*       squeue,
     gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
+
+// ── [E2] registry members for type 1 (fem_elastic): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_fem_elastic() { return abd_fem_count_info.fem_tet_num; }
+void GIPC::energy_launch_fem_elastic(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _getFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.tetrahedras + tet_offset,
+                TetMesh.DmInverses + tet_offset, TetMesh.volum + tet_offset,
+                numbers, TetMesh.lengthRate + tet_offset, TetMesh.volumeRate + tet_offset,
+                pe, pe ? p2g : nullptr, ng);
+}
+
+// ── [E2] registry members for type 7 (rest_nhk): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_rest_nhk() { return abd_fem_count_info.fem_tet_num; }
+void GIPC::energy_launch_rest_nhk(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.volum + tet_offset, numbers, lengthRate, volumeRate);
+}

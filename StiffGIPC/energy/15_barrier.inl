@@ -1118,3 +1118,17 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
     }
 }
 
+
+// ── [E2] registry members for type 2 (barrier): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_barrier() { return h_cpNum[0]; }
+void GIPC::energy_launch_barrier(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _getBarrierEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs,
+                energy_kappa >= 0.0 ? energy_kappa : Kappa, dHat, numbers,
+                pe, pe ? p2g : nullptr, ng);
+}

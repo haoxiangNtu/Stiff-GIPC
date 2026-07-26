@@ -51,3 +51,17 @@ __global__ void _calKineticEnergy(
         deltaX.x * masses[idx], deltaX.y * masses[idx], deltaX.z * masses[idx]);
 }
 
+
+// ── [E2] registry members for type 0 (kinetic): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_kinetic() { return abd_fem_count_info.fem_point_num; }
+void GIPC::energy_launch_kinetic(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _getKineticEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                TetMesh.vertexes + point_offset, TetMesh.xTilta + point_offset,
+                queue, TetMesh.masses + point_offset, numbers,
+                pe, pe ? p2g + point_offset : nullptr, ng);
+}

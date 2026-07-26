@@ -32,3 +32,17 @@ __global__ void _get_triangleFEMEnergy_Reduction_3D(double*        squeue,
     // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
     gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
+
+// ── [E2] registry members for type 8 (triangle_membrane): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_triangle_membrane() { return triangleNum; }
+void GIPC::energy_launch_triangle_membrane(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _get_triangleFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.triangles, TetMesh.triDmInverses,
+                TetMesh.area, numbers, stretchStiff, shearStiff, strainRate,
+                pe, pe ? p2g : nullptr, ng);
+}

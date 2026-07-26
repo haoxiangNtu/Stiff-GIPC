@@ -17,3 +17,15 @@ __global__ void _getDeltaEnergy_Reduction(double* squeue, const double3* b, cons
     gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
 }
 
+
+// ── [E2] registry members for type 3 (delta): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_delta() { return abd_fem_count_info.fem_point_num; }
+void GIPC::energy_launch_delta(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _getDeltaEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.fb + point_offset, _moveDir + point_offset, numbers);
+}

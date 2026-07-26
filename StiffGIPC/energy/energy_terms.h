@@ -20,7 +20,7 @@
 //   8    triangle membrane       triangleNum      _get_triangleFEMEnergy_Reduction_3D   gipc 12
 //   9    soft constraints        softNum          _computeSoftConstraintEnergy_Reduction gipc 06
 //  10    bending (quad|angle)    tri_edge_num     _getQuadBending/_getBendingEnergy     gipc 12
-//  11    VESTIGIAL — sized (triangleNum) but never dispatched; E2 cleanup
+//  11    REMOVED in E2 (was vestigial: sized but never dispatched)
 //
 // Constitutive libraries: femEnergy.cuh carries BOTH ARAP and SNK (USE_SNK1);
 // bending has USE_QUADRATIC_BENDING. ABD affine energy lives in abd_system/
@@ -32,3 +32,21 @@
 // entry — nothing else.
 // ============================================================================
 #pragma once
+
+// [E2] THE term registry. One row per term; the DeviceOut dispatcher's sizing
+// and launch switches expand from this list, and GIPC.cuh generates the
+// member declarations from it. Adding a constitutive term = its energy/ file
+// (defining energy_size_<name> / energy_launch_<name>) + ONE row here.
+// Type 11 (vestigial: sized but never dispatched) was REMOVED here in E2.
+#define GIPC_ENERGY_TERMS(X)                                                   \
+    X(0, kinetic)                                                              \
+    X(1, fem_elastic)                                                          \
+    X(2, barrier)                                                              \
+    X(3, delta)                                                                \
+    X(4, ground)                                                               \
+    X(5, friction)                                                             \
+    X(6, friction_gd)                                                          \
+    X(7, rest_nhk)                                                             \
+    X(8, triangle_membrane)                                                    \
+    X(9, soft_constraints)                                                     \
+    X(10, bending)

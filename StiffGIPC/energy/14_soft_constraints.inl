@@ -189,3 +189,18 @@ __global__ void _computeSoftConstraintGradient(const double3*  vertexes,
     }
 }
 
+
+// ── [E2] registry members for type 9 (soft_constraints): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_soft_constraints() { return softNum; }
+void GIPC::energy_launch_soft_constraints(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _computeSoftConstraintEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.targetVert, TetMesh.targetIndex,
+                softMotionRate, animation_fullRate, TetMesh.d_stitch_paired_vertex,
+                TetMesh.d_stitch_rest_offset, numbers,
+                pe, pe ? p2g : nullptr, ng);
+}

@@ -65,3 +65,24 @@ __global__ void _getBendingEnergy_Reduction(double*        squeue,
 }
 
 
+
+// ── [E2] registry members for type 10 (bending): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_bending() { return tri_edge_num; }
+void GIPC::energy_launch_bending(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+#ifdef USE_QUADRATIC_BENDING
+            _getQuadBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
+                TetMesh.tri_edge_adj_vertex, TetMesh.quad_bending_Q, numbers, bendStiff,
+                pe, pe ? p2g : nullptr, ng);
+#else
+            _getBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
+                TetMesh.tri_edge_adj_vertex, numbers, bendStiff,
+                pe, pe ? p2g : nullptr, ng);
+#endif
+}

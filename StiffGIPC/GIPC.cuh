@@ -18,6 +18,7 @@
 #include "device_common/device_buffer.cuh"  // [3d] RAII device-buffer owner
 #include "device_common/mirrors.h"           // [3b] audited host mirrors
 #include "multienv/mode_config.h"            // [C1] finalize-time mode snapshot
+#include "energy/energy_terms.h"             // [E2] term registry (X-macro)
 #include "multienv/mode_contract.h"          // [C2] the promise table (doc-only)
 #include <gipc/abd_fem_count_info.h>
 namespace gipc
@@ -512,6 +513,14 @@ class GIPC
     void computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
+    // [E2] per-term registry members (defined in each term's energy/ file)
+#define GIPC_ENERGY_TERM_DECL(id, name)                                        \
+    int  energy_size_##name();                                                 \
+    void energy_launch_##name(device_TetraData&, double*, int, int,            \
+                              unsigned int, unsigned int, double*, const int*, \
+                              int, int, int, double);
+    GIPC_ENERGY_TERMS(GIPC_ENERGY_TERM_DECL)
+#undef GIPC_ENERGY_TERM_DECL
     // [backport] standalone per-env energy dispatcher: writes the reduced global
     // scalar to a device slot (D2D) and, when out_penv != nullptr, buckets per-env.
     // Used only by computeEnergy_perenv. (Not the full ②-D2H computeEnergy rewrite.)

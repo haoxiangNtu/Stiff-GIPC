@@ -794,3 +794,35 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
 // (N) = -(sum of this contact's gradient over bodyA's verts)/dt^2. bodyA = body
 // of the first vertex; same-body (self) contacts get bodyB==bodyA (consumer
 // skips). nullptr -> no-op (solve path unchanged).
+
+// ── [E2] registry members for type 5 (friction): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_friction() { return h_cpNum_last[0]; }
+void GIPC::energy_launch_friction(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
+                numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
+                fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
+                pe, pe ? p2g : nullptr, ng,
+                d_vert_mu, frictionRate);  // [per-body friction]
+}
+
+// ── [E2] registry members for type 6 (friction_gd): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_friction_gd() { return h_gpNum_last; }
+void GIPC::energy_launch_friction_gd(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
+                _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
+                sqrt(fDhat) * IPC_dt,
+                pe, pe ? p2g : nullptr, ng,
+                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
+}

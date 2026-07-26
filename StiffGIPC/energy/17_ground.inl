@@ -140,3 +140,17 @@ __global__ void _computeGroundGradient(const double3* vertexes,
     }
 }
 
+
+// ── [E2] registry members for type 4 (ground): launcher body VERBATIM from
+// the DeviceOut dispatcher switch; size = its sizing-chain entry ──
+int GIPC::energy_size_ground() { return h_gpNum; }
+void GIPC::energy_launch_ground(device_TetraData& TetMesh, double* queue, int numbers,
+                                int blockNum, unsigned int threadNum, unsigned int sharedMsize,
+                                double* pe, const int* p2g, int ng,
+                                int tet_offset, int point_offset, double energy_kappa)
+{
+            _computeGroundEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
+                queue, TetMesh.vertexes, _groundOffset, _groundNormal,
+                _environment_collisionPair, dHat, Kappa, numbers,
+                pe, pe ? p2g : nullptr, ng);
+}
