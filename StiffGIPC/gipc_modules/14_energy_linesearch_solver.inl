@@ -789,7 +789,7 @@ int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int pre
         // merged matrix (converter output, what the spmv used) + the solve result
         _dbg_ksum("matrix_merged", gipc_global_triplet.block_values(),
                   (size_t)gipc_global_triplet.h_unique_key_number * 9 * sizeof(double));
-        printf("[ksum] nuniq_merged=%d\n", gipc_global_triplet.h_unique_key_number);
+        printf("[ksum] nuniq_merged=%d\n", gipc_global_triplet.h_unique_key_number.get());
         _dbg_ksum("moveDir_out", _moveDir, (size_t)vertexNum * sizeof(double3));
     }
 

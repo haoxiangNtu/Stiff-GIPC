@@ -111,9 +111,9 @@ class GIPC
     // run-to-run AND across identical envs, with full dynamic range (no single-scale overflow).
     // Layout: ((v*3 + comp)*BINNED_K + k). Combined back into contact_grads each Newton iter.
     double*   g_grad_binned  = nullptr;
-    uint3*    _faces         = nullptr;
-    uint2*    _edges         = nullptr;
-    uint32_t* _surfVerts     = nullptr;
+    DeviceBuffer<uint3>    _faces;      // [B1] owner; mlbvh holds raw views
+    DeviceBuffer<uint2>    _edges;
+    DeviceBuffer<uint32_t> _surfVerts;
 
 
     double3*  targetVert  = nullptr;
@@ -144,7 +144,7 @@ class GIPC
 
     int4*     _collisonPairs     = nullptr;
     int4*     _ccd_collisonPairs = nullptr;
-    uint32_t* _cpNum             = nullptr;
+    DeviceBuffer<uint32_t> _cpNum;  // [B1] 6 slots: cp[0:5] + gp[5]; _gpNum is a VIEW (=_cpNum+5)
     int*      _MatIndex          = nullptr;
     uint32_t* _close_cpNum       = nullptr;
     // On-demand reduction scratch: reductions launch ceil(count/default_threads)

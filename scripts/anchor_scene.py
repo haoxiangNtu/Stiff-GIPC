@@ -34,4 +34,7 @@ for _ in range(int(os.environ.get("SCENE_FRAMES", "50"))):
 V = np.asarray(eng.get_vertices())
 assert np.isfinite(V).all(), "non-finite!"
 print("VHASH", hashlib.sha256(V.tobytes()).hexdigest()[:16])
+print("NEWTON", eng.native.get_total_newton_iters())   # [C3] envelope input
+if os.environ.get("DUMP_POS"):                          # [C3] equivalence input
+    np.save(os.environ["DUMP_POS"], V)
 print("SCENE_OK")

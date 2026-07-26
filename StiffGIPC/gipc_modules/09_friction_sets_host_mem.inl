@@ -157,7 +157,7 @@ void GIPC::FREE_DEVICE_MEM()
 {
     pair_buffers_free(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM});   // [v0.8.6 2b] guarded + null-set
     m_reduce_scratch.release(); m_reduce_cap = 0;  // [3d-2]
-    CUDA_SAFE_CALL(cudaFree(_cpNum));
+    _cpNum.release();
     CUDA_SAFE_CALL(cudaFree(_close_cpNum));
     CUDA_SAFE_CALL(cudaFree(_close_gpNum));
     if(_gdCollapse) { CUDA_SAFE_CALL(cudaFree(_gdCollapse)); _gdCollapse = nullptr; }
@@ -174,9 +174,9 @@ void GIPC::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(_groundNormal));
     CUDA_SAFE_CALL(cudaFree(_groundOffset));
 
-    CUDA_SAFE_CALL(cudaFree(_faces));
-    CUDA_SAFE_CALL(cudaFree(_edges));
-    CUDA_SAFE_CALL(cudaFree(_surfVerts));
+    _faces.release();
+    _edges.release();
+    _surfVerts.release();
 
     // [multi-env S1] free per-env line-search substrate
     m_env_alpha.release();
@@ -265,7 +265,7 @@ void GIPC::MALLOC_DEVICE_MEM()
     // [9d28824-port] one contiguous [6]-uint32 block: _cpNum aliases [0:5],
     // _gpNum aliases [5]. Kernel-side code unchanged (takes uint32_t*); the
     // paired cpNum+gpNum reads become ONE 6-int D2H.
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_cpNum, 6 * sizeof(uint32_t)));
+    _cpNum.resize_discard(6);
     _gpNum = _cpNum + 5;
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundNormal, 5 * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundOffset, 5 * sizeof(double)));
@@ -280,9 +280,9 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMemcpy(_groundNormal, &H_normal, 5 * sizeof(double3), cudaMemcpyHostToDevice));
 
 
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_faces, surface_Num * sizeof(uint3)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_edges, edge_Num * sizeof(uint2)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_surfVerts, surf_vertexNum * sizeof(uint32_t)));
+    _faces.resize_discard(surface_Num);
+    _edges.resize_discard(edge_Num);
+    _surfVerts.resize_discard(surf_vertexNum);
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_cpNum, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_close_gpNum, sizeof(uint32_t)));

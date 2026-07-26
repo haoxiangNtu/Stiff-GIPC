@@ -104,6 +104,11 @@ timeout 600 python3 examples/test_passive_revolute.py > /tmp/vg_rev.log 2>&1
 rc=$?
 if [ $rc -eq 0 ]; then record passive-revolute PASS ""; else record passive-revolute FAIL "rc=$rc"; fi
 
+echo "== G9 mode envelope + equivalence =="
+(timeout 1800 python3 scripts/mode_gates.py > /tmp/vg_modes.log 2>&1)
+rc=$?; v=$(grep -E '^MODE-GATES' /tmp/vg_modes.log | tail -1)
+if [ $rc -eq 0 ]; then record mode-gates PASS ""; else record mode-gates FAIL "rc=$rc $v"; fi
+
 echo "== G8 foldshirt 30f smoke =="
 env CASE39ME_HEADLESS=1 CASE39ME_NUM_ENVS=4 CASE39_FRICTION=0.8 CASE39_FRAME_END=30 \
     STIFF_MULTIENV_MODE=merged STIFF_LOG_LEVEL=0 timeout 600 \

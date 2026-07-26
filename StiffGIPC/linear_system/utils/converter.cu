@@ -29,6 +29,7 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
     gipc::Timer timer("convert3x3");
     if(length < 1)
         return;
+    global_triplets.h_unique_key_number.invalidate();  // [B1] device truth changes below
     _radix_sort_indices_and_blocks(global_triplets, start, length, out_start_id);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -151,7 +152,7 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                });
 
 
-    CUDA_SAFE_CALL(cudaMemcpy(&(global_triplets.h_unique_key_number),
+    CUDA_SAFE_CALL(cudaMemcpy(global_triplets.h_unique_key_number.refresh_dst(),
                               sorted_partition_output + length - 1,
                               sizeof(int),
                               cudaMemcpyDeviceToHost));

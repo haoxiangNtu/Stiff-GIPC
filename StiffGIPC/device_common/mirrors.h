@@ -80,6 +80,14 @@ class HostMirror
         m_fresh = true;
         return *this;
     }
+    HostMirror& operator+=(T d)  // audited read-modify-write; result stays fresh
+    {
+        if(gipc_mirror_detail::audit_enabled() && !m_fresh)
+            gipc_mirror_detail::stale(m_name);
+        m_v += d;
+        m_fresh = true;
+        return *this;
+    }
     T* refresh_dst()  // D2H/memcpy target; statement completes the refresh
     {
         m_fresh = true;

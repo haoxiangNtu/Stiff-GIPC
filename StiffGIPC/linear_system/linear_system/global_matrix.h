@@ -17,6 +17,8 @@
 #endif
 
 
+#include "device_common/mirrors.h"  // [B1] HostMirror
+
 class GIPCTripletMatrix
 {
   public:
@@ -282,7 +284,8 @@ class GIPCTripletMatrix
     int h_abd_fem_contact_start_id = -1;
     int h_fem_abd_contact_start_id = -1;
     int h_fem_fem_contact_start_id = -1;
-    int h_unique_key_number        = 0;
+    // [B1] mirror of d_unique_key_number (D2H in the converter); audited
+    HostMirror<int> h_unique_key_number{"h_unique_key_number"};
 
     uint32_t abd_abd_contact_num = 0;
     uint32_t abd_fem_contact_num = 0;
