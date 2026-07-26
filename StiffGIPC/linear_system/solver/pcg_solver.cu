@@ -12,8 +12,7 @@
 
 // [decouple probe] global (non-namespaced) frame/Newton-iter counters defined in GIPC.cu — used to
 // gate the STIFF_H_DUMP rz0 dump to a specific frame/iteration.
-extern int g_dec_frame;
-extern int g_dec_k;
+#include "device_common/debug_probes.h"  // [A4] g_dec_* decls
 
 // ===================== [multi-env P3] segmented (block-diagonal) PCG kernels =====================
 // Per-env dot via binned deposit (exact, order-independent ⇒ per-env deterministic AND, for

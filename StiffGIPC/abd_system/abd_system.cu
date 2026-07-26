@@ -21,7 +21,7 @@
 // binning (the M root). g_massbin is a reused scratch (one quantity at a time, sequential).
 __device__ double* g_massbin = nullptr;
 
-extern int g_gipc_log_level;  // defined in GIPC.cu; gates the [abd-mass] audit print
+#include "device_common/debug_probes.h"  // [A4] g_gipc_log_level decl
 
 namespace gipc
 {

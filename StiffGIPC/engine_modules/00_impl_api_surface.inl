@@ -32,7 +32,7 @@
 #include <Eigen/Geometry>
 
 // Defined at GLOBAL scope in GIPC.cu (GIPC class is not in namespace gipc).
-extern int g_gipc_log_level;
+#include "device_common/debug_probes.h"  // [A4] g_gipc_log_level decl
 
 namespace gipc
 {

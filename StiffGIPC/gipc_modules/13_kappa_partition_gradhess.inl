@@ -612,6 +612,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         long long target    = bound > conv_pred ? bound : conv_pred;
         if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(target))
         {
+            gipc_global_triplet.open_discard_window();  // [A2] THE one legal point
             gipc_global_triplet.ensure_capacity_discard(static_cast<size_t>(target));
             // The whole-buffer determinism memset above ran on the OLD allocation;
             // re-zero the fresh one (grow iterations only, so effectively free).

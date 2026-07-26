@@ -15,6 +15,7 @@
 #include "GIPC_PDerivative.cuh"
 #include "fem_parameters.h"
 #include "device_common/reductions.cuh"   // [v0.8.6 2a] unified block reductions
+#include "device_common/debug_probes.h"  // [A4] decl-before-def type check
 #include "contact/pair_buffers.cuh"       // [v0.8.6 2b] pair-buffer growth mechanics owner
 #include "multienv/isolation.cuh"        // [v0.8.6 2c] env-isolation machinery owner
 #include "ACCD.cuh"

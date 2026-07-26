@@ -29,6 +29,11 @@ QUICK="${1:-}"
 # stale build/ silently validates old binaries (exactly what happened for
 # the 2026-07-25 P5..phase4 runs — the armed-audit "validations" tested a
 # lib that contained none of the audited code). Build failure = hard stop.
+# [A1] The armed audits are free (proven bit-transparent) — run the ENTIRE
+# suite with them on, so mirror/slot/discard-legality regressions fail gates
+# instead of waiting for someone to arm them by hand.
+export STIFF_MIRROR_AUDIT=1 STIFF_SLOT_AUDIT=1
+
 echo "== G0 build =="
 if cmake --build build -j"$(nproc)" > /tmp/vg_build.log 2>&1; then
   echo "BUILD OK"

@@ -31,9 +31,7 @@
 #include "solver_stats.h"  // [phase4] decl/def type-check for the cross-TU counters
 
 // ---- file-scope globals owned by the composite TU ----
-extern int g_gipc_log_level;   // gipc_modules/00 (log verbosity)
-extern int g_dec_k;            // gipc_modules/13 (decouple-probe Newton k)
-extern int g_dec_frame;        // gipc_modules/13 (decouple-probe frame; non-static by design)
+#include "device_common/debug_probes.h"  // [A4] typed decls for the debug globals
 
 // ---- host mechanism wrappers owned by the composite TU ----
 extern void calcMinMovement_DeviceOut(const double3* _moveDir, double* _queue, const int& number);

@@ -68,6 +68,8 @@ class GIPCTripletMatrix
     // exact misuse at the build point was the towel-strict SpMV OOB (b6c1f09).
     void ensure_capacity_discard(size_t need)
     {
+        assert_discard_window_or_throw();   // [A2] positional-legality audit
+        m_discard_window_open = false;      // single-shot
         if(m_block_values.capacity() >= need)
             return;
         size_t margin_cap = (size_t)(512ull * 1024 * 1024) / sizeof(BlockMatrix);
@@ -156,6 +158,14 @@ class GIPCTripletMatrix
     void slot_audit_arm();
     void slot_audit_check_and_restore(const char* context);
 
+    // [A2 discard-legality] ensure_capacity_discard is legal at ONE positional
+    // point per iteration (frame-start: offsets reset, no live data — the
+    // towel-strict contract). The legal site opens a single-shot window right
+    // before the call; under STIFF_SLOT_AUDIT=1 a discard WITHOUT an open
+    // window throws. Audit off = one bool test, no behavior change.
+    void open_discard_window() { m_discard_window_open = true; }
+    void assert_discard_window_or_throw();  // defined in global_matrix.cu
+
     auto block_values(int offset = 0) { return m_block_values.data() + offset; }
     auto block_values(int offset = 0) const
     {
@@ -224,6 +234,7 @@ class GIPCTripletMatrix
     auto triplet_count() const { return m_block_values.size(); }
     auto triplet_capacity() const { return m_block_values.capacity(); }
 
+    bool m_discard_window_open          = false;  // [A2]
     int global_triplet_offset           = 0;
     int global_collision_triplet_offset = 0;
     int global_external_max_capcity     = 0;

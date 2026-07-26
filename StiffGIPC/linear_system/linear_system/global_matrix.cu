@@ -86,6 +86,18 @@ __global__ void _slot_audit_scan(const int* rows, int n, int* out)  // out: {cou
 }
 }  // namespace
 
+void GIPCTripletMatrix::assert_discard_window_or_throw()
+{
+    if(!slot_audit_enabled() || m_discard_window_open)
+        return;
+    throw std::runtime_error(
+        "[slot-audit] ensure_capacity_discard called OUTSIDE the frame-start "
+        "legality window — discard growth destroys live triplets everywhere "
+        "except right after the offset reset (the towel-strict root cause). "
+        "If this site is genuinely frame-start, call open_discard_window() "
+        "immediately before it.");
+}
+
 void GIPCTripletMatrix::slot_audit_arm()
 {
     if(!slot_audit_enabled())
