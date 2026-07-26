@@ -10,14 +10,18 @@
 //
 // ─── PROMISES (what users may rely on; tests pin these) ─────────────────────
 // MERGED
+//   DESIGN GOAL (owner decision 2026-07-26): minimal overhead vs the raw
+//   single-simulation scheme — merged IS the "as fast as plain GIPC" mode.
+//   Isolation is NOT a merged-mode requirement and never will be promised.
 //   + maximum throughput; one global solve (global line-search alpha, global
-//     Newton convergence, shared kappa)
-//   - NO isolation promise: a pathological env throws and kills the batch
-//     (fail-fast; the fail-isolate extension is designed but awaits owner
-//     review — see the audit note, tier C4)
+//     Newton convergence, shared kappa); zero per-env machinery on the hot path
+//   - NO isolation promise BY DESIGN: a pathological env throws and kills the
+//     batch (fail-fast is the bug-finding stance; the fail-isolate extension
+//     was evaluated and REJECTED for merged — users needing isolation pick
+//     ISOLATED, that is what it is for)
 //   - NO reproducibility promise (atomic emission/reduction order)
-//   pinned by: kick + foldshirt-smoke behavioral gates (numeric envelope
-//   gate planned, tier C3)
+//   pinned by: kick + foldshirt-smoke behavioral gates + G9 envelope
+//   (NEWTON count) + G9 cross-mode equivalence
 // ISOLATED
 //   + per-env fairness: per-env line-search alpha, per-env convergence
 //     freeze, per-group kappa, env-local broadphase (no cross-env contact)
