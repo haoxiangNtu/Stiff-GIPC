@@ -17,6 +17,8 @@
 #include "PCG_SOLVER.cuh"
 #include "device_common/device_buffer.cuh"  // [3d] RAII device-buffer owner
 #include "device_common/mirrors.h"           // [3b] audited host mirrors
+#include "multienv/mode_config.h"            // [C1] finalize-time mode snapshot
+#include "multienv/mode_contract.h"          // [C2] the promise table (doc-only)
 #include <gipc/abd_fem_count_info.h>
 namespace gipc
 {
@@ -67,6 +69,8 @@ class GIPC
     // (to mark a quarantined env's bodies in the ground-skip table), plus
     // ownership of a lazily-allocated skip table (normally d_tetMesh owns it).
     const int*        m_d_b2g = nullptr;             // captured TetMesh.d_body_to_group
+    // [C1] runtime truth of the multi-env mode, captured once at finalize
+    ModeConfig m_mode_config;
     int               m_collision_body_count = 0;    // captured TetMesh.collision_body_num
     bool              m_ground_skip_owned = false;   // we cudaMalloc'ed _ground_skip_body
     // [multi-env cross-env DIAGNOSTIC] find the upstream env-asymmetry seed: compare env0 vs env1

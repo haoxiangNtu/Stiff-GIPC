@@ -4,6 +4,7 @@
 #include <gipc/utils/json.h>
 #include <load_mesh.h>
 #include <fstream>
+#include "device_common/debug_probes.h"  // g_gipc_log_level
 #include <stdexcept>
 
 void GIPC::build_gipc_system(device_TetraData& tet)
@@ -80,6 +81,12 @@ void GIPC::build_gipc_system(device_TetraData& tet)
         m_abd_system->parms.joint_strength_ratio = json["joint_strength_ratio"].get<double>();
     if(json.contains("revolute_driving_strength_ratio"))
         m_abd_system->parms.revolute_driving_strength_ratio = json["revolute_driving_strength_ratio"].get<double>();
+
+    // [C1] capture the mode snapshot AFTER the python resolver populated the
+    // env (Engine.__init__ precedes finalize); print + half-config check.
+    m_mode_config = ModeConfig::capture_from_env();
+    m_mode_config.warn_if_incoherent();
+    m_mode_config.print(g_gipc_log_level);
 
     std::cout << "- create Global Linear System ..." << std::endl;
 

@@ -53,6 +53,19 @@ record() { # name ok detail
 STRICT_ENV=(STIFF_MULTIENV_MODE=isolated STIFF_EE_CANON=1 STIFF_EE_DETGATE=1
             STIFF_CCD_CANON=1 STIFF_SPMV_DET=1)
 
+echo "== G0.5 frozen-zone tripwire =="
+# [A5] smooth/mollifier and the close-set chain are FROZEN by owner directive.
+# These greps pin the LOAD-BEARING lines; if one goes missing the suite fails
+# loudly. Changing frozen code requires explicit owner adjudication — update
+# this tripwire in the SAME commit as the adjudicated change.
+FZ_OK=1
+fz() { grep -qF "$2" "$1" || { echo "TRIPWIRE: frozen anchor missing in $1 -> $2"; FZ_OK=0; }; }
+fz StiffGIPC/mlbvh_modules/03_pair_emission.inl 'bool   smooth = false;'
+fz StiffGIPC/mlbvh_modules/00_gates_globals.inl '__device__ int g_ee_nomollify = 0;'
+fz StiffGIPC/GIPC.cuh 'void computeSelfCloseVal();'
+fz StiffGIPC/GIPC.cuh 'bool checkSelfCloseVal();'
+if [ "$FZ_OK" = 1 ]; then echo "FROZEN OK"; else exit 2; fi
+
 echo "== G1 strict bitwise anchor =="
 HA=$(env "${STRICT_ENV[@]}" SCENE_MODE=strict SCENE_N=2 timeout 900 \
      python3 scripts/anchor_scene.py 2>&1 | awk '/VHASH/{print $2}')

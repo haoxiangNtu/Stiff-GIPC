@@ -77,9 +77,11 @@ __global__ void _probe_ground_infeasible(const double3*  vertexes,
 // The ONE availability predicate for the whole isolation machinery.
 bool GIPC::perEnvIsolationLive()
 {
+    // [C1] reads the finalize-time ModeConfig snapshot (same env sources,
+    // captured once) instead of scattered getenv — behavior-neutral.
     return m_active_group_count > 1
-        && (env_newton_iter_cap > 0 || getenv("STIFF_PERENV_TELEM"))
-        && getenv("STIFF_PERENV_ALPHA");
+        && (env_newton_iter_cap > 0 || m_mode_config.perenv_telem)
+        && m_mode_config.perenv_alpha;
 }
 
 // IPC's invariant is ground distance d > 0, maintained by
