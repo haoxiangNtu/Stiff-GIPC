@@ -41,12 +41,16 @@ find_package(Eigen3 REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(urdfdom CONFIG QUIET)
-if(urdfdom_FOUND)
+# Debian's liburdfdom-dev (<=3.0.x) ships a config that sets urdfdom_FOUND
+# without defining the namespaced targets — FOUND alone is not enough (broke
+# the A800 wheel build). Require the target itself, else pkg-config fallback.
+if(urdfdom_FOUND AND TARGET urdfdom::urdf_parser)
     set(URDFDOM_LIBS urdfdom::urdf_parser urdfdom::urdfdom_model urdfdom::urdfdom_world)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(URDFDOM REQUIRED urdfdom)
     set(URDFDOM_LIBS ${URDFDOM_LIBRARIES})
+    link_directories(${URDFDOM_LIBRARY_DIRS})
 endif()
 
 # add external libraries
