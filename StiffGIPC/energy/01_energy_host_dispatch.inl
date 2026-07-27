@@ -450,14 +450,18 @@ double* GIPC::_launch_perenv_energy_terms(device_TetraData& TetMesh, bool& peren
     // slices: 0=kinetic 1=fem 2=tri_fem 3=bend 4=constraint 5=barrier 6=fricS 7=fricGd
     //         8=ground 9=kappa_group 10=abd
     constexpr int PE_SLOTS = 11;
-    static double* pe_all = nullptr;
-    if(!pe_all)
+    // [descriptor phase-0b] instance-owned (was function-static, shared across
+    // engines in one process); PE_STRIDE is a compile-time constant so the
+    // size is engine-independent — freed in FREE_DEVICE_MEM.
+    if(!m_pe_all)
         CUDA_SAFE_CALL(cudaMalloc(
-            (void**)&pe_all, (size_t)PE_SLOTS * PE_STRIDE * sizeof(double)));
+            (void**)&m_pe_all, (size_t)PE_SLOTS * PE_STRIDE * sizeof(double)));
     // [backport] throwaway sink for DeviceOut's global scalar (ignored here; the
     // per-env path uses the pe slices, and full_sum is assembled on host below).
-    static double* g_sink = nullptr;
-    if(!g_sink) CUDA_SAFE_CALL(cudaMalloc((void**)&g_sink, sizeof(double)));
+    if(!m_energy_sink)
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_sink, sizeof(double)));
+    double* pe_all = m_pe_all;
+    double* g_sink = m_energy_sink;
 
     auto slice = [&](int s) { return pe_all + (size_t)s * PE_STRIDE; };
     bool perenv_k = m_mode_config.decouple_thresh

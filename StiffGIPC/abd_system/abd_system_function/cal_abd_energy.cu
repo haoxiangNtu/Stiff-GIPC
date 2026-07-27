@@ -296,15 +296,12 @@ double ABDSystem::cal_abd_energy_perenv(ABDSimData& sim_data,
     // threshold this FLIPS env_0's backtrack-halve decision → env_0's ABD step alpha differs → its
     // gripper/arm pose drifts across batches (confirmed root: ABD dq identical, q drifts after the
     // last step). Binned deposit (Demmel-Nguyen, exact per-bin) is order-independent → bit-identical.
-    static double* s_ebin = nullptr; static int s_ebin_ng = 0;
-    if(s_ebin_ng < ng)
-    {
-        if(s_ebin) cudaFree(s_ebin);
-        cudaMalloc((void**)&s_ebin, (size_t)ng * BINNED_K * sizeof(double));
-        s_ebin_ng = ng;
-    }
-    cudaMemset(s_ebin, 0, (size_t)ng * BINNED_K * sizeof(double));
-    double* ebin = s_ebin;
+    // [descriptor phase-0b] instance-owned (was process-static, shared across
+    // engines; content was memset-safe but the allocation outlived the engine).
+    if(m_perenv_ebin.size() < (size_t)ng * BINNED_K)
+        m_perenv_ebin.resize((size_t)ng * BINNED_K);
+    cudaMemset(m_perenv_ebin.data(), 0, (size_t)ng * BINNED_K * sizeof(double));
+    double* ebin = m_perenv_ebin.data();
 
     // per-body terms: kinetic, shape (element i -> body i)
     if(abd_count > 0)

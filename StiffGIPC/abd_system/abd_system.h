@@ -36,6 +36,9 @@ class ABDSystem
   private:
     muda::DeviceBuffer<Vector12>  m_temp_q;
     muda::DeviceBuffer<Vector12>  m_temp_q_v;
+    // [descriptor phase-0b] per-env energy bins — was a function-static device
+    // allocation shared across engines in one process; instance-owned + RAII.
+    muda::DeviceBuffer<double>    m_perenv_ebin;
     muda::DeviceBuffer<Vector12>  m_temp_q_prev;
     muda::DeviceBuffer<Vector12>  m_temp_q_tilde;
     muda::DeviceBuffer<int>       m_temp_is_fixed;

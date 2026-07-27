@@ -275,6 +275,8 @@ void GIPC::FREE_DEVICE_MEM()
     release(d_face_v0);
     release(d_edge_v0);
     release(m_d_vloc);
+    release(m_pe_all);        // [descriptor phase-0b] per-env energy slices
+    release(m_energy_sink);   // [descriptor phase-0b] DeviceOut scalar sink
     release(d_env_bbox2);
     release(m_kappa_group);
     release(m_d_close_grp);

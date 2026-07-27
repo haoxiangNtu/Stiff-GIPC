@@ -330,6 +330,12 @@ class GIPC
     double* m_compatibility_energy    = nullptr;
     // Line-search decision only: 0=descent, 1=retry, 2=tolerance acceptance.
     int*    m_line_search_decision    = nullptr;
+    // [descriptor phase-0b] per-env energy slices + DeviceOut scalar sink for
+    // the host energy dispatch — were function-static device allocations
+    // shared across engines in one process; instance-owned, freed in
+    // FREE_DEVICE_MEM. Lazily allocated on first per-env energy evaluation.
+    double* m_pe_all                  = nullptr;
+    double* m_energy_sink             = nullptr;
     // Newton convergence only: 0=continue, 1=converged.
     int*    m_newton_convergence_decision = nullptr;
     // CCD device-control state: ground, narrow-self, temp alpha, max speed,
