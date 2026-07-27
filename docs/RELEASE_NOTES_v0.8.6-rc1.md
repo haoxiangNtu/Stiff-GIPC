@@ -90,3 +90,44 @@ wheel：cp311（sm_80/89/120；包声明 requires-python>=3.11，cp310 本地开
   energy/03_barrier_fused_assembly.inl 头部。
 - 性能基准协议：median-of-3，首跑受时钟爬坡/冷缓存污染约 10%，禁止单跑定带；
   GPU 非空闲时 mode_bench rc=2 fail-closed（tag 门禁 INFRA-BLOCK）。
+
+---
+
+# v0.8.6-rc2-internal（内测二版）
+
+rc1 后共 11 提交（6c562bc..HEAD），全部带 15 段门禁绿 + 锚 f7fb5a786c2d7935
+不动实据（gate-artifacts/）。
+
+## 修复
+- **checkpoint 续跑 5e-6 偏差破案**：帧入口碰撞对集合（跨帧携带不入档）；
+  load 后重建 → 实测 5e-17；门禁全例收紧（strict 逐位/其余 1e-12）。
+- **ABD teleport 顶点失同步**：只写 q 不映射 x（该 API 此前零使用者）；现
+  teleport 内 cal_x_from_q 全块同步（对未动 body 位级中性）。
+- **跨引擎串态三族清除**（描述符 phase-0 全竟）：模式闩锁值追踪（strict↔
+  merged 串模式风险）、静态设备 scratch 全部实例化（21 处：s_ebin、
+  pe_all/g_sink、18 个求解器小 scratch + 审计 out）。
+
+## 新能力（RL episode-reset 契约）
+- 两个 teleport 尾部重建帧入口配对集（与 checkpoint 同契约）。
+- **检疫复活**：teleport 触及检疫 env 自动清标志（自纠正——坏 reset 一帧内
+  被重检疫）；矢量化训练不再永久丢 env。
+- **step 健康 getter**：get_ls_exhausted_count / get_ls_nonfinite_count——
+  merged WARN-继续契约下，训练循环的弃 episode 信号。
+- merged 穿地 reset 在 teleport 调用点即抛 GeometryError。
+
+## 门禁（12 段 → 15 段）
+- G13 geometry：初始不可行性类型化拒绝负向测试（穿地/互穿/无误报）。
+- G14 knob-registry：84+17+11 个 STIFF_* 旋钮单源一致性（静态）+ finalize
+  未知旋钮绊线（STIFF_KNOB_STRICT=1 升抛错）。
+- G15 rl-reset：传送连续性/坏重置健康信号/穿地类型化拒绝/检疫→复活全弧。
+
+## 工程决策存档
+- dlto 实验闭环：TU 边界中性=否（复合驻留裁决维持）；复合+dlto 运行时基准
+  六格全快零回归（towel -10~12%、foldshirt merged -15.2%、isolated -3%、
+  strict -0.7%），strict 确定性完好（新不动点 0544461bd82123ae 两跑逐位一
+  致）。采纳=全引擎换锚（A800 重验+基线重录），建议 v0.9 周期执行，owner
+  拍板。基准工件在 gate-artifacts/。
+- GPU idle 门新增 BENCH_IDLE_ALLOWLIST（远程桌面类基础设施进程显式豁免，
+  默认空 fail-closed，每次豁免入日志）——远程操作期间 tag push 不再死锁。
+- 描述符 phase-1（三族 __constant__ 迁移）按蓝图留 v0.9：串行多引擎正确性
+  已由 phase-0 闭合，迁移是架构整合，不在发布前触碰热核访存路径。
