@@ -235,6 +235,17 @@ else
     record geometry FAIL "rc=$rc"
 fi
 
+echo "== G15 RL episode-reset (teleport/health/revival) =="
+timeout 900 python3 scripts/rl_reset_gate.py \
+    > "$GATE_LOG_DIR/rl_reset.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "RL-RESET-GATE: PASS" "$GATE_LOG_DIR/rl_reset.log"; then
+    record rl-reset PASS ""
+else
+    record rl-reset FAIL "rc=$rc"
+fi
+
 echo "== G14 STIFF_* knob registry consistency (static) =="
 timeout 120 python3 scripts/knob_gate.py \
     > "$GATE_LOG_DIR/knob.log" 2>&1

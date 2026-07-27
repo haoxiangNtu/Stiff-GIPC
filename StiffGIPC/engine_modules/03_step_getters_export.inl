@@ -1917,6 +1917,19 @@ void SimEngine::teleport_abd_bodies(const int* body_offsets, const double* mat4x
     // load_checkpoint and teleport_fem_vertices: the first Newton iteration
     // of the next step runs on the inherited pair set, which after a
     // teleport belongs to the pre-teleport configuration.
+    // [rl-reset] teleporting a quarantined env's body is an episode reset:
+    // clear its quarantine so the scans re-adjudicate from the new pose.
+    {
+        const auto& groups = impl.tetMesh.body_groups;
+        for(int k = 0; !groups.empty() && k < count; ++k)
+            for(size_t r = 0; r < impl.load_records.size(); ++r)
+            {
+                const auto& rec = impl.load_records[r];
+                if(rec.body_type == 0 && rec.body_offset == body_offsets[k]
+                   && r < groups.size())
+                    impl.ipc.reviveEnv(groups[r]);
+            }
+    }
     {
         GIPC& g = impl.ipc;
         if(impl.ipc.abd_fem_count_info.abd_point_num > 0)

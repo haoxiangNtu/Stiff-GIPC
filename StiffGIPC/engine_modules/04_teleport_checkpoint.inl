@@ -92,6 +92,23 @@ void SimEngine::teleport_fem_vertices(const double* xyz, int count,
                                   n * sizeof(double3)));
     }
 
+    // [rl-reset] a teleport touching a quarantined env is an episode reset:
+    // clear its quarantine so the scans re-adjudicate from the NEW
+    // configuration (reviveEnv is a no-op for healthy envs; a still-broken
+    // reset is re-quarantined within one frame).
+    {
+        const auto& groups = m_impl->tetMesh.body_groups;
+        for(size_t r = 0; !groups.empty() && r < m_impl->load_records.size(); ++r)
+        {
+            const auto& rec = m_impl->load_records[r];
+            if(rec.body_type != 1 || r >= groups.size())
+                continue;
+            const int rel = rec.vertex_offset - fem_offset;
+            if(rel < count && rel + rec.vertex_count > 0)
+                m_impl->ipc.reviveEnv(groups[r]);
+        }
+    }
+
     // [rl-reset] rebuild the frame-entry pair set — same contract as
     // load_checkpoint: the first Newton iteration of the next step runs on
     // the inherited pair set, which after a teleport belongs to the
@@ -136,6 +153,10 @@ const BodyLoadRecord& SimEngine::get_load_record(int idx) const
 namespace gipc {
 int    SimEngine::get_total_newton_iters() const
 { return m_impl->ipc.m_total_newton_iters; }
+int    SimEngine::get_ls_exhausted_count() const
+{ return m_impl->ipc.m_ls_exhausted_total; }
+int    SimEngine::get_ls_nonfinite_count() const
+{ return m_impl->ipc.m_ls_nonfinite_total; }
 double SimEngine::get_total_pcg_iters() const
 { return m_impl->ipc.m_total_pcg_iters; }
 double SimEngine::get_total_collision_pairs() const

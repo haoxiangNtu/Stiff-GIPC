@@ -62,6 +62,12 @@ class GIPC
     // causing one SimEngine to inherit another engine's frame index and
     // counters (checkpoint soft-target timing included).
     int       m_total_newton_iters    = 0;
+    // [rl-reset] step-health telemetry: line-search budget exhaustions and the
+    // subset with non-finite incremental potential. An RL loop diffs these
+    // across step() to detect and discard silently-degraded episodes (merged
+    // mode WARNs and continues by contract).
+    int       m_ls_exhausted_total    = 0;
+    int       m_ls_nonfinite_total    = 0;
     int       m_total_frames          = 0;
     double    m_total_pcg_iters       = 0.0;
     double    m_total_collision_pairs = 0.0;
@@ -252,6 +258,9 @@ class GIPC
     // ground infeasibility to a persistent per-env freeze instead of a throw.
     bool      quarantineEnvOfVertex(int vertex, double distance);
     bool      quarantineEnv(int env, int vertex, double distance);
+    // [rl-reset] inverse of quarantineEnv for episode resets; self-correcting
+    // (a still-broken env is re-quarantined within one frame by the scans).
+    bool      reviveEnv(int env);
     void      quarantineGroundInfeasibleAtFrameStart();
     bool      perEnvIsolationLive();   // [2c] THE availability gate (multienv/isolation.cuh)
     void      throwIfInvalidCcdAlpha(const char* context);

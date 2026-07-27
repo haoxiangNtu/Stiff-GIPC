@@ -633,6 +633,13 @@ class SimEngine
     // Read directly from GIPC.cu file-scope globals. Caller computes per-step delta.
     int    get_total_newton_iters() const;
     double get_total_pcg_iters() const;
+    // [rl-reset] step-health telemetry (per-instance, monotone): line-search
+    // budget exhaustions and the subset with non-finite incremental
+    // potential. Diff across step() to detect a degraded step; merged mode
+    // WARNs and continues by contract, so this is the RL loop's discard
+    // signal for poisoned episodes.
+    int    get_ls_exhausted_count() const;
+    int    get_ls_nonfinite_count() const;
     double get_total_collision_pairs() const;
     double get_max_collision_pairs() const;
     int    get_total_frames_done() const;

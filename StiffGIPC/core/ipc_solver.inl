@@ -333,6 +333,11 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                 "barrier distances / iteration blow-up in later frames. Raise "
                 "Config.line_search_max_iter, reduce dt, or soften the drive.\n",
                 numOfLineSearch, alpha, testingE, lastEnergyVal);
+        // [rl-reset] step-health telemetry: an RL loop diffs these counters
+        // across step() to detect and discard degraded episodes.
+        ++m_ls_exhausted_total;
+        if(!std::isfinite(testingE) || !std::isfinite(lastEnergyVal))
+            ++m_ls_nonfinite_total;
         // [error-taxonomy] frame 0 + non-finite incremental potential at every
         // trial alpha = the INITIAL configuration is infeasible (interpenetrating
         // bodies at spawn — log-barrier of a negative distance). Historically a

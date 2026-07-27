@@ -442,6 +442,8 @@ PYBIND11_MODULE(pystiffgipc, m)
             "tetrahedral constitutive law, max over incident tets. Non-tet "
             "vertices (cloth/ABD) are 0.")
         .def("get_total_newton_iters", &SimEngine::get_total_newton_iters)
+        .def("get_ls_exhausted_count", &SimEngine::get_ls_exhausted_count)
+        .def("get_ls_nonfinite_count", &SimEngine::get_ls_nonfinite_count)
         .def("get_per_env_newton_iters", &SimEngine::get_per_env_newton_iters,
              "[per-env] Newton iter at which each env froze last solve (-1 = ran "
              "to loop end / absent). 256 slots. Host per-env path only.")

@@ -174,6 +174,54 @@ bool GIPC::quarantineEnvOfVertex(int vertex, double distance)
     return quarantineEnv(env, vertex, distance);
 }
 
+__global__ void _unmark_env_ground_skip(int* skip, const int* b2g, int env, int nb)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if(b >= nb) return;
+    if(b2g[b] == env) skip[b] = 0;
+}
+
+// [rl-reset] Inverse of quarantineEnv, for episode resets: a teleport that
+// touches a quarantined env clears its persistent quarantine state (host+
+// device flags, ground-skip marks) so the frame-start scan re-adjudicates
+// from the NEW configuration. Revival is self-correcting, never a smuggling
+// path: a still-infeasible env is re-quarantined within one frame (ground:
+// the iron-law frame-start probe; non-finite direction: the per-iteration
+// detector). The ground-skip table has no user-registration path — its only
+// writers are quarantineEnv and checkpoint restore — so the unmark is safe.
+bool GIPC::reviveEnv(int env)
+{
+    if(!perEnvIsolationLive())
+        return false;
+    if(env < 0 || env >= kEnvAlphaSlots)
+        return false;
+    if(m_env_quarantined.empty() || !m_env_quarantined[env])
+        return false;
+    m_env_quarantined[env] = 0;
+    if(m_d_env_quarantined)
+    {
+        const int zero = 0;
+        CUDA_SAFE_CALL(cudaMemcpy(m_d_env_quarantined + env, &zero, sizeof(int),
+                                  cudaMemcpyHostToDevice));
+    }
+    if(_ground_skip_body && m_d_b2g && _ground_body_count > 0)
+    {
+        int bs = 128, gs = (_ground_body_count + bs - 1) / bs;
+        _unmark_env_ground_skip<<<gs, bs>>>(_ground_skip_body, m_d_b2g, env,
+                                            _ground_body_count);
+    }
+    // m_env_status is the per-solve presentation vector (reassigned each
+    // solve); clear it here too so a status query right after the reset —
+    // the natural RL-loop pattern — already reflects the revival.
+    if(env < (int)m_env_status.size())
+        m_env_status[env] = 0;
+    fprintf(stderr,
+            "[per-env][REVIVE] env %d un-quarantined by reset/teleport; the "
+            "frame-start scan re-adjudicates from the new configuration.\n",
+            env);
+    return true;
+}
+
 // [iron-law] Frame-start quarantine scan: runs BEFORE any CCD-alpha work of
 // the new frame. Teleports/drives can make an env infeasible BETWEEN frames,
 // and the collision build is carried over from the previous frame — without
