@@ -1903,6 +1903,37 @@ void SimEngine::teleport_abd_bodies(const int* body_offsets, const double* mat4x
     }
     CUDA_SAFE_CALL(cudaMemcpy(abd.body_id_to_q_v.data(), host_qv.data(), buf_bytes, cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaMemcpy(abd.body_id_to_dq.data(),  host_dq.data(), buf_bytes, cudaMemcpyHostToDevice));
+
+    // [rl-reset] q jumped, but vertex positions track q only through the
+    // solve (step_forward writes vert = J*q) — nothing outside the loop
+    // re-derived x, so a teleport left _vertexes at the OLD pose until the
+    // next solve ran (stale getters, and any pair rebuild would bin the old
+    // configuration). Re-derive the whole ABD block: bitwise-neutral for
+    // untouched bodies because x ≡ J*q holds at all times (step_forward is
+    // recompute-style, same J*q expression). Vertex-space o/xTilta/velocity
+    // need no block writes here: xTilta is overwritten every frame start,
+    // and ABD previous-state/velocity live in q_prev/q_v (both set above).
+    // Then rebuild the frame-entry pair set — same contract as
+    // load_checkpoint and teleport_fem_vertices: the first Newton iteration
+    // of the next step runs on the inherited pair set, which after a
+    // teleport belongs to the pre-teleport configuration.
+    {
+        GIPC& g = impl.ipc;
+        if(impl.ipc.abd_fem_count_info.abd_point_num > 0)
+        {
+            auto abd_verts =
+                muda::BufferView<double3>{impl.d_tetMesh.vertexes,
+                                          (size_t)g.vertexNum}
+                    .subview(impl.ipc.abd_fem_count_info.abd_point_offset,
+                             impl.ipc.abd_fem_count_info.abd_point_num);
+            g.m_abd_system->cal_x_from_q(*g.m_abd_sim_data, abd_verts);
+        }
+        if(!g.m_skip_all_collision)
+        {
+            g.buildBVH();
+            g.buildCP();
+        }
+    }
 }
 
 void SimEngine::get_abd_body_velocities(const int* body_offsets, double* out_mat4x4, int count) const

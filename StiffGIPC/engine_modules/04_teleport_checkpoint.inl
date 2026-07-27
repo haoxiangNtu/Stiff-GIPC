@@ -91,6 +91,17 @@ void SimEngine::teleport_fem_vertices(const double* xyz, int count,
         CUDA_SAFE_CALL(cudaMemset(v_base, 0,
                                   n * sizeof(double3)));
     }
+
+    // [rl-reset] rebuild the frame-entry pair set — same contract as
+    // load_checkpoint: the first Newton iteration of the next step runs on
+    // the inherited pair set, which after a teleport belongs to the
+    // pre-teleport configuration (episode resets move bodies far; a stale
+    // set gives the first post-reset step a garbage descent direction).
+    if(!m_impl->ipc.m_skip_all_collision)
+    {
+        m_impl->ipc.buildBVH();
+        m_impl->ipc.buildCP();
+    }
 }
 
 void SimEngine::get_fem_body_vertex_range(int fem_body_idx, int* out_start, int* out_count) const
