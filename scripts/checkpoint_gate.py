@@ -242,47 +242,26 @@ def run_case(mode: str, contact: bool = False) -> int:
         velocity_delta = float(
             np.max(np.abs(expected_velocities - actual_velocities))
         )
-        # strict promises deterministic kernels and must restart bit-for-bit —
+        # strict promises deterministic kernels and must restart bit-for-bit -
         # in the contact case this is the completeness oracle: bitwise restart
         # under live friction proves NO state is missing from the checkpoint.
-        # merged/isolated use unordered atomic deposits (binned deterministic
-        # deposit is strict-only), so near contact thresholds ulp noise can
-        # flip discrete branches (pair set, line-search halvings) and amplify
-        # to ~1e-4..1e-2 between two continuations of the SAME state. For
-        # those modes the contact case therefore self-calibrates: a fresh
-        # engine re-runs the whole trajectory, its divergence from `expected`
-        # measures intrinsic run-to-run scatter, and the restored engine must
-        # land within that scatter's magnitude. A missing friction/contact
-        # state would show up at the drive scale (mu*g*dt ~ 5e-2 velocity),
-        # orders above the scatter, and still fails the hard ceiling.
+        # merged/isolated allow last-ulp atomic-order noise, hence allclose.
+        # History: before load_checkpoint rebuilt the frame-entry contact pair
+        # set (see checkpoint_io.cu [frame-entry pair set]), the contact case
+        # diverged ~5e-6 - the first Newton iteration ran on the finalize-time
+        # pair set instead of the previous frame's final one. The rebuild
+        # reconstructs it from restored positions (measured restart delta
+        # ~5e-17), so every case now holds the same tight bound.
         if mode == "strict":
             restart_ok = np.array_equal(
                 expected_positions, actual_positions
             ) and np.array_equal(expected_velocities, actual_velocities)
-        elif not contact:
+        else:
             restart_ok = np.allclose(
                 expected_positions, actual_positions, rtol=1e-12, atol=1e-12
             ) and np.allclose(
                 expected_velocities, actual_velocities, rtol=1e-12, atol=1e-12
             )
-        else:
-            # Two divergence sources exist here BY DESIGN, so no tight bound
-            # is honest. (1) A reproducible ~6e-6 pos / ~6e-4 vel systematic:
-            # a three-way experiment (fresh full replay ~6.6e-9; aged engine
-            # self-reload ~2.1e-9; fresh restore-at-boundary 5.76e-6) pins it
-            # to ORDER state built during stepping and not checkpointed —
-            # strict is immune because canonical ordering + binned order-free
-            # deposit make emission order irrelevant there, while merged/
-            # isolated sum atomically in emission order. (NOT the PCG warm
-            # start: STIFF_PCG_WARM defaults OFF, both engines zero-start;
-            # exact carrier unidentified, tracked as follow-up.)
-            # (2) atomic-order noise occasionally flips a discrete branch
-            # (pair set, line-search halving) for a ~1e-4..1e-2 excursion.
-            # A genuinely missing friction/contact state would surface at the
-            # drive scale mu*g*dt ~ 5e-2 velocity, above these ceilings — and
-            # the strict case above proves state completeness bitwise, which
-            # is the real oracle.
-            restart_ok = position_delta <= 2e-3 and velocity_delta <= 2e-2
         if not restart_ok:
             raise AssertionError(
                 "restart next-step differs: "

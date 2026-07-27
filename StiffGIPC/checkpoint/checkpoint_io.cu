@@ -1221,6 +1221,20 @@ void GIPC::load_checkpoint(device_TetraData& mesh, const char* raw_path)
     Kappa             = saved_kappa;
     m_recheck_counter = static_cast<int>(recheck);
     m_total_frames    = static_cast<int>(frame);
+    // [frame-entry pair set] The first Newton iteration of every frame runs on
+    // the contact pair set inherited from the PREVIOUS frame's final
+    // line-search buildCP — cross-frame state that is deliberately NOT in the
+    // checkpoint. Without this rebuild a restored engine enters its first
+    // frame on the finalize-time (spawn-position) pair set and lands ~5e-6
+    // away from the source trajectory (measured, contact scene); rebuilding
+    // from the just-restored positions reconstructs the source's entry set
+    // exactly (same positions -> same pairs; restart delta drops to ~5e-17).
+    // Same reconstruct-on-restore principle as friction anchors and Kappa.
+    if(!m_skip_all_collision)
+    {
+        buildBVH();
+        buildCP();
+    }
     std::printf(
         "[ckpt] loaded v2 %s (vN=%llu nb=%llu env=%llu Kappa=%.6e frame=%d)\n",
         path.c_str(),
