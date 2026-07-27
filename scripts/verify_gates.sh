@@ -224,6 +224,28 @@ else
     record model-validation FAIL "rc=$rc"
 fi
 
+echo "== G13 geometry init-feasibility taxonomy =="
+timeout 600 python3 scripts/geometry_gate.py \
+    > "$GATE_LOG_DIR/geometry.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "GEOMETRY-GATE: PASS" "$GATE_LOG_DIR/geometry.log"; then
+    record geometry PASS ""
+else
+    record geometry FAIL "rc=$rc"
+fi
+
+echo "== G14 STIFF_* knob registry consistency (static) =="
+timeout 120 python3 scripts/knob_gate.py \
+    > "$GATE_LOG_DIR/knob.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "KNOB-GATE: PASS" "$GATE_LOG_DIR/knob.log"; then
+    record knob-registry PASS ""
+else
+    record knob-registry FAIL "rc=$rc"
+fi
+
 echo "== G8 foldshirt 30f smoke =="
 env CASE39ME_HEADLESS=1 CASE39ME_NUM_ENVS=4 CASE39_FRICTION=0.8 \
     CASE39_FRAME_END=30 STIFF_MULTIENV_MODE=merged STIFF_LOG_LEVEL=0 \

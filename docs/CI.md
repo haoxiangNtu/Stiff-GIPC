@@ -87,3 +87,16 @@ SKIP_GATES=1 git push
 
 `scripts/ci_watch.sh` 与 `scripts/nightly.sh` 只作为可选旧式 runner 附录保留，
 默认不安装、不启用。
+
+## 新增门禁（错误分类学 + 配置收口第一批）
+
+- **G13 geometry**（`scripts/geometry_gate.py`，GPU）：初始可行性类型化拒绝的负向
+  测试——FEM 穿地必须在 finalize 抛 `GeometryError`；初始互穿必须在第 0 帧首步
+  抛 `GeometryError`（线搜索耗尽+非有限势能签名）；干净场景必须不误报。帧中
+  NaN 策略不在此门管辖（isolated 检疫 / merged WARN-继续，均保持原契约）。
+- **G14 knob-registry**（`scripts/knob_gate.py`，纯静态无 GPU）：
+  `StiffGIPC/config/knob_registry.h` 是全部 STIFF_* 环境旋钮的单一真源；本门断言
+  C++/CUDA、python 层、mode resolver 读到的每个旋钮都有注册表行。运行时另有
+  finalize 绊线：进程环境里出现注册表外的 STIFF_* 变量 → 大声警告
+  （`STIFF_KNOB_STRICT=1` 升级为 `ConfigurationError`）。维护规则：新增
+  `getenv("STIFF_...")` 必须同 commit 加注册表行，否则 G14 红。

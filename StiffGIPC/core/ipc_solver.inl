@@ -19,6 +19,7 @@
 // triplet growth = linear_system ensure_capacity_{preserve,discard}.
 // ============================================================================
 #include "frame_pipeline.h"
+#include "errors.h"  // [error-taxonomy] GeometryError for frame-0 infeasibility
 
 // ── verbatim from gipc_modules/14 (pre-2d lines 962..1374) ──
 // [phase-time] lineSearch inner split (per frame): energy evals vs buildBVH+intersect vs buildCP vs step.
@@ -332,6 +333,22 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                 "barrier distances / iteration blow-up in later frames. Raise "
                 "Config.line_search_max_iter, reduce dt, or soften the drive.\n",
                 numOfLineSearch, alpha, testingE, lastEnergyVal);
+        // [error-taxonomy] frame 0 + non-finite incremental potential at every
+        // trial alpha = the INITIAL configuration is infeasible (interpenetrating
+        // bodies at spawn — log-barrier of a negative distance). Historically a
+        // silent NaN cascade; mid-run policy (WARN + accept, isolated-mode
+        // quarantine) is deliberately unchanged — this fires only before any
+        // valid frame ever existed, where "keep going" can only produce garbage.
+        if(m_total_frames == 0
+           && (!std::isfinite(testingE) || !std::isfinite(lastEnergyVal)))
+        {
+            throw gipc::GeometryError(
+                "frame 0 line search exhausted with non-finite incremental "
+                "potential — the initial configuration is infeasible for IPC "
+                "(bodies interpenetrating at spawn, or spawned through the "
+                "ground). Fix the spawn transforms; IPC requires a "
+                "penetration-free initial state.");
+        }
     }
 
 

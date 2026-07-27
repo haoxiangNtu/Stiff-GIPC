@@ -14,6 +14,9 @@ void SimEngine::finalize()
             "finalize() requires successful CUDA initialization");
     RuntimeOwnerAttempt runtime_attempt(
         impl.runtime_owner_lease, &impl, impl.finalize_failed);
+    // [knob-registry] surface STIFF_* typos before they become silent no-ops
+    // (warn by default; STIFF_KNOB_STRICT=1 throws ConfigurationError).
+    stiff_check_unknown_knobs();
     impl.apply_config_to_ipc();
 
     // Build ABD system + linear system
@@ -283,6 +286,10 @@ void SimEngine::finalize()
         printf("[M1+M2+M3.5] %d FEM pins: local_pos transformed, btype=Fixed, "
                "is_pinned_vertex mask + vertex_to_pin_idx uploaded\n", n_pins);
     }
+
+    // [error-taxonomy] init ground-penetration is detected by the existing
+    // buildCP invariant (gipc_modules/10, per-vertex message) — retyped to
+    // GeometryError there rather than duplicated here.
 
     impl.finalized = true;
     runtime_attempt.commit();

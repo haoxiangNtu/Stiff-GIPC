@@ -328,7 +328,9 @@ void GIPC::throwIfGroundDistanceInvalid()
                  offset,
                  distance,
                  " The logarithmic barrier requires strict distance > 0.");
-        throw std::runtime_error(message);
+        // [error-taxonomy] typed: derives from std::runtime_error, so existing
+        // catch sites are unaffected; python surfaces pystiffgipc.GeometryError.
+        throw gipc::GeometryError(message);
     }
 }
 

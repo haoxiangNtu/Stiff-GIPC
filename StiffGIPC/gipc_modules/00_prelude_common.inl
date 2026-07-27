@@ -12,6 +12,7 @@
 #include "cuda_tools/cuda_tools.h"
 #include "GIPC_PDerivative.cuh"
 #include "fem_parameters.h"
+#include "errors.h"  // typed taxonomy for composite-TU throws
 #include "device_common/reductions.cuh"  // unified block reductions
 #include "device_common/debug_probes.h"
 #include "contact/pair_buffers.cuh"

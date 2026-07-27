@@ -310,7 +310,9 @@ def resolve_multienv_mode(mode: str = "merged") -> str:
     # read by the engine and is not set anymore.
     # merged defaults the selfQuery_ee occupancy variant (STIFF_EE_LB=2: 128reg → 16 warps/SM,
     # measured -5.6%/frame). NOT defaulted for strict (measured no gain: seg/binned atomics own
-    # the L2 there) nor isolated (unmeasured); both can opt in explicitly.
+    # the L2 there) nor isolated (measured 2026-07-28: noise — towel -1.6%/foldshirt +1.5%,
+    # median-of-3; per-env queries are launch/latency-bound, not occupancy-bound). Both can
+    # opt in explicitly.
     if canon == "merged":
         _setdefault_tracked(_MODE_FLAGS_SET_BY_US, "STIFF_EE_LB", "2")
     return canon
