@@ -41,7 +41,7 @@ tag `v0.8.6-rc1-internal`，仅推私有仓（对外镜像不动）。
 isolated 铁律隔离（漂移 0）、merged 吞吐（契约成文 fail-fast）。结构发现：
 峰值迭代跨架构逐一相同；strict 峰值系统性最低；isolated 布料场景常最快且不触
 cap。详表：`docs/MODE_MATRIX_REPORT_2026-07-27.md`。
-自动化：`scripts/demo_verify.py` 10 headless demo 全绿；UI demo 拥有者 13 连逐个目验通过（软爪六件套、整机/全尺度/统一场景、finray UI 三连；含 case-26 修复复验）。
+自动化：`scripts/demo_verify.py` **19 个 headless demo**（含 replay 轨迹家族九项：case39 双形态、UMI 四变体、finray 单/多 env、diag）全绿；UI demo 拥有者 13 连逐个目验通过（软爪六件套、整机/全尺度/统一场景、finray UI 三连；含 case-26 修复复验）。
 
 ## 已知事项 / 冻结区
 
@@ -52,6 +52,6 @@ cap。详表：`docs/MODE_MATRIX_REPORT_2026-07-27.md`。
 
 ## 部署
 
-wheels：cp310（本地）+ cp311（A800，sm_80/89/120）。A800 bundle 配方与坑
+wheel：cp311（sm_80/89/120；包声明 requires-python>=3.11，cp310 本地开发直接用 build/ 树不经 wheel）。A800 bundle 配方与坑
 （npz 双件、盘子 episode 走 /data + STIFF_REPLAY_PATH、cwd=/data/stiff-physics）
 见记忆/报告。

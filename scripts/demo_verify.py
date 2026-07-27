@@ -23,6 +23,8 @@ QUICK = "quick" in sys.argv[1:]
 MODES = os.environ.get("DEMO_MODES", "merged,strict").split(",")
 ONLY = set(filter(None, os.environ.get("DEMO_ONLY", "").split(",")))
 F = "20" if QUICK else "60"
+# both headless spellings + short trajectory window for the replay family
+HL = {"CASE39_HEADLESS": "1", "CASE39ME_HEADLESS": "1", "CASE39_FRAME_END": F}
 
 # name: (script, extra_env, timeout_s, pass_marker_or_None)
 DEMOS = {
@@ -49,6 +51,17 @@ DEMOS = {
     "abd_badmesh":       ("examples/test_abd_badmesh_kinetic.py", {}, 600,
                           "ABD-BADMESH-KINETIC: PASS"),
     "bench_case26":      ("examples/bench_case26_simple.py", {}, 1800, None),
+    # ---- replay-trajectory family (owner directive: verify ALL replays) ----
+    "case39":            ("examples/replay_case39.py", HL, 2400, None),
+    "case39_multienv":   ("examples/replay_case39_multienv.py",
+                          dict(HL, CASE39ME_NUM_ENVS="2"), 2400, None),
+    "umi_beaker":        ("examples/replay_case39_UMI_beaker.py", HL, 2400, None),
+    "umi_cupshirt_fg":   ("examples/replay_case39_UMI_obb_cup_shirt_forcegrip.py", HL, 2400, None),
+    "umi_sf":            ("examples/replay_case39_UMI_sf.py", HL, 2400, None),
+    "umi_sf_obb":        ("examples/replay_case39_UMI_sf_obb.py", HL, 2400, None),
+    "finray_cupshirt_1env": ("examples/replay_cupshirt_finray.py", HL, 1800, None),
+    "finray_foldshirt_1env":("examples/replay_foldshirt_finray.py", HL, 2400, None),
+    "diag_finray_grip":  ("examples/diag_finray_grip.py", {}, 1800, None),
 }
 
 BAD = re.compile(r"budget exhausted.*nan|abd-kinetic-nan|Traceback|CUDA error", re.I)
