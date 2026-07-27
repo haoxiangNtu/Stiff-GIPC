@@ -422,7 +422,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
                       && m_mode_config.perenv_alpha);
     // [de-CPU] ta computed on device (see _compute_perenv_ta) — the per-env launches below read
     // their env's slot via the kernels' alpha_dev param; NO D2H / host loop.
-    static double* d_perenv_ta = nullptr;
+    double*& d_perenv_ta = m_scr_perenv_ta;
     if(perenv_ta)
     {
         if(!d_perenv_ta)
@@ -626,7 +626,7 @@ __global__ void _xenv_paircount(const int4* pairs, const int* p2g, int n,
 void GIPC::xenvPairClassify(const int4* pairs, int n, const char* label)
 {
     if(!getenv("STIFF_XENV") || !m_d_p2g || n <= 0) return;
-    static int* d4 = nullptr;
+    int*& d4 = m_scr_xenv4;
     if(!d4) CUDA_SAFE_CALL(cudaMalloc((void**)&d4, 4 * sizeof(int)));
     CUDA_SAFE_CALL(cudaMemset(d4, 0, 4 * sizeof(int)));
     int bs = 256, gs = (n + bs - 1) / bs;

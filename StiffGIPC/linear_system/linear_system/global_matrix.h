@@ -273,8 +273,11 @@ class GIPCTripletMatrix
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_assembly_scratch_count, sizeof(int)));
     }
 
+    int* m_audit_out = nullptr;  // [phase-0.3] slot-audit scratch (owned)
+
     void free_var()
     {
+        if(m_audit_out) { cudaFree(m_audit_out); m_audit_out = nullptr; }
         if(d_contact_start_block)
         {
             CUDA_SAFE_CALL(cudaFree(d_contact_start_block));

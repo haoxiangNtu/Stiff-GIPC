@@ -112,7 +112,7 @@ void GIPCTripletMatrix::slot_audit_check_and_restore(const char* context)
         return;
     const long long live = global_triplet_offset;
     const size_t    cap  = m_block_row_indices.capacity();
-    static int*     d_out = nullptr;  // audit-only scratch, intentionally leaked
+    int*&           d_out = m_audit_out;  // [phase-0.3] instance-owned audit scratch
     if(!d_out)
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_out, 2 * sizeof(int)));
     const int init[2] = {0, INT_MAX};

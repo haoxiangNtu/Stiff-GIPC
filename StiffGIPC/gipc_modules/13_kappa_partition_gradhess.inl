@@ -178,8 +178,8 @@ void GIPC::initKappa(device_TetraData& TetMesh)
            && TetMesh.d_point_to_group)
         {
             const int NG = TetMesh.h_group_count;
-            static double* d_gsum_bin = nullptr; static double* d_gsnorm_bin = nullptr;
-            static double* d_gsum_g = nullptr;   static double* d_gsnorm_g = nullptr;
+            double*& d_gsum_bin = m_scr_gsum_bin; double*& d_gsnorm_bin = m_scr_gsnorm_bin;
+            double*& d_gsum_g = m_scr_gsum_g;   double*& d_gsnorm_g = m_scr_gsnorm_g;
             if(!d_gsum_bin) {
                 cudaMalloc((void**)&d_gsum_bin,   (size_t)kEnvAlphaSlots * BINNED_K * sizeof(double));
                 cudaMalloc((void**)&d_gsnorm_bin, (size_t)kEnvAlphaSlots * BINNED_K * sizeof(double));

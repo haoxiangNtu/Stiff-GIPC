@@ -68,6 +68,29 @@ class GIPC
     // mode WARNs and continues by contract).
     int       m_ls_exhausted_total    = 0;
     int       m_ls_nonfinite_total    = 0;
+    // [descriptor phase-0.3] solver scratch — was function-static device
+    // allocations shared process-wide (leak + cross-engine sharing + dangling
+    // after device reset). Instance-owned; the use sites keep their lazy
+    // `if(!ptr) cudaMalloc` pattern through reference aliases; freed in
+    // FREE_DEVICE_MEM. All are tiny fixed-size (scalars / kEnvAlphaSlots).
+    double* m_scr_ls_eg0 = nullptr;
+    double* m_scr_ls_eg1 = nullptr;
+    int*    m_scr_ls_decision_counts = nullptr;
+    double* m_scr_maxk = nullptr;
+    double* m_scr_sq_a = nullptr;
+    int*    m_scr_cnt_a = nullptr;
+    double* m_scr_mxm = nullptr;
+    double* m_scr_mm = nullptr;
+    int*    m_scr_ct = nullptr;
+    double* m_scr_mx = nullptr;
+    int*    m_scr_env_cnt = nullptr;
+    double* m_scr_sq_b = nullptr;
+    double* m_scr_perenv_ta = nullptr;
+    int*    m_scr_xenv4 = nullptr;
+    double* m_scr_gsum_bin = nullptr;
+    double* m_scr_gsnorm_bin = nullptr;
+    double* m_scr_gsum_g = nullptr;
+    double* m_scr_gsnorm_g = nullptr;
     int       m_total_frames          = 0;
     double    m_total_pcg_iters       = 0.0;
     double    m_total_collision_pairs = 0.0;

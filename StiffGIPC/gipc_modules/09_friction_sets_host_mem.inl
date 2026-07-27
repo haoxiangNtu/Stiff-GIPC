@@ -276,6 +276,20 @@ void GIPC::FREE_DEVICE_MEM()
     release(d_edge_v0);
     release(m_d_vloc);
     release(m_pe_all);        // [descriptor phase-0b] per-env energy slices
+    // [descriptor phase-0.3] solver scratch family
+    release(m_scr_ls_eg0);   release(m_scr_ls_eg1);
+    release(m_scr_ls_decision_counts);
+    release(m_scr_maxk);
+    release(m_scr_sq_a);     release(m_scr_cnt_a);
+    release(m_scr_mxm);
+    release(m_scr_mm);       release(m_scr_ct);
+    release(m_scr_mx);
+    release(m_scr_env_cnt);
+    release(m_scr_sq_b);
+    release(m_scr_perenv_ta);
+    release(m_scr_xenv4);
+    release(m_scr_gsum_bin); release(m_scr_gsnorm_bin);
+    release(m_scr_gsum_g);   release(m_scr_gsnorm_g);
     release(m_energy_sink);   // [descriptor phase-0b] DeviceOut scalar sink
     release(d_env_bbox2);
     release(m_kappa_group);

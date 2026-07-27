@@ -98,8 +98,8 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         // d_Eg0/d_Eg1 (no 22KB D2H), _s3_decide halves m_env_alpha IN PLACE (the true state; the
         // old host loop operated on the stale h_env_alpha mirror). Host reads ONE int per round —
         // required: it decides whether to re-run the step/rebuild/energy round (host loop control).
-        static double* d_Eg0 = nullptr; static double* d_Eg1 = nullptr;
-        static int* d_decision_counts = nullptr;
+        double*& d_Eg0 = m_scr_ls_eg0; double*& d_Eg1 = m_scr_ls_eg1;
+        int*& d_decision_counts = m_scr_ls_decision_counts;
         if(!d_Eg0)
         {
             CUDA_SAFE_CALL(cudaMalloc((void**)&d_Eg0, kEnvAlphaSlots * sizeof(double)));
@@ -414,7 +414,7 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
             // frame and read nowhere else during the frame; device m_kappa_group is the in-frame truth).
             double kappaMax = 1e300;
             upperBoundKappa(kappaMax);     // kappaMax = env-independent cap (was recomputed per group)
-            static double* d_maxK = nullptr;
+            double*& d_maxK = m_scr_maxk;
             if(!d_maxK) CUDA_SAFE_CALL(cudaMalloc(&d_maxK, sizeof(double)));
             CUDA_SAFE_CALL(cudaMemcpy(d_maxK, &Kappa, sizeof(double), cudaMemcpyHostToDevice));  // envelope init
             {
@@ -688,7 +688,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         if(TetMesh.d_point_to_group && TetMesh.h_groups_present && getenv("STIFF_PENV_STATS"))
         {
             const int NG = active_group_count;
-            static double* d_sq = nullptr; static int* d_cnt = nullptr;
+            double*& d_sq = m_scr_sq_a; int*& d_cnt = m_scr_cnt_a;
             if(!d_sq) { cudaMalloc((void**)&d_sq, kEnvAlphaSlots*sizeof(double));
                         cudaMalloc((void**)&d_cnt, kEnvAlphaSlots*sizeof(int)); }
             cudaMemset(d_sq, 0, NG*sizeof(double)); cudaMemset(d_cnt, 0, NG*sizeof(int));
@@ -702,7 +702,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             double thr = sqrt(Newton_solver_threshold * Newton_solver_threshold
                               * bboxDiagSize2 * IPC_dt * IPC_dt);
             // [S4 probe] per-env MAX move (the real Newton-exit metric), not RMS.
-            static double* d_mxm = nullptr;
+            double*& d_mxm = m_scr_mxm;
             if(!d_mxm) cudaMalloc((void**)&d_mxm, kEnvAlphaSlots*sizeof(double));
             cudaMemset(d_mxm, 0, NG*sizeof(double));
             _per_env_max_move<<<gs, bs>>>(TetMesh.d_point_to_group, _moveDir, d_mxm, vertexNum, NG);
@@ -734,7 +734,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             const int RECHECK = 4;
             const double margin = 0.5;
             double thr = ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt));   // [decouple] batch-invariant; velocity_tol opt-in
-            static double* d_mm = nullptr; static int* d_ct = nullptr;
+            double*& d_mm = m_scr_mm; int*& d_ct = m_scr_ct;
             if(!d_mm) { cudaMalloc((void**)&d_mm, kEnvAlphaSlots*sizeof(double));
                         cudaMalloc((void**)&d_ct, kEnvAlphaSlots*sizeof(int)); }
             cudaMemset(d_mm, 0, NG*sizeof(double)); cudaMemset(d_ct, 0, NG*sizeof(int));
@@ -1054,7 +1054,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
            && surf_vertexNum >= 1 && getenv("STIFF_PENV_STATS"))
         {
             const int NG = active_group_count;
-            static double* d_mx = nullptr;
+            double*& d_mx = m_scr_mx;
             if(!d_mx) cudaMalloc((void**)&d_mx, kEnvAlphaSlots * sizeof(double));
             cudaMemset(d_mx, 0, NG * sizeof(double));
             int bs = 256, gs = (surf_vertexNum + bs - 1) / bs;
@@ -1119,7 +1119,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                || m_mode_config.perenv_telem;
             if(!_s1diag_)
             {
-                static int* d_env_cnt = nullptr;
+                int*& d_env_cnt = m_scr_env_cnt;
                 if(!d_env_cnt)
                     CUDA_SAFE_CALL(cudaMalloc((void**)&d_env_cnt, 3 * sizeof(int)));
                 CUDA_SAFE_CALL(cudaMemsetAsync(d_env_cnt, 0, 3 * sizeof(int)));
@@ -1711,7 +1711,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     if(getenv("STIFF_PENV_STATS") && TetMesh.d_point_to_group && TetMesh.h_groups_present)
     {
         const int NG = TetMesh.h_group_count;
-        static double* d_sq = nullptr;
+        double*& d_sq = m_scr_sq_b;
         static int*    d_cnt = nullptr;
         if(!d_sq)
         {
