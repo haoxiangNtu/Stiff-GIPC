@@ -50,3 +50,8 @@ dist_*/
 Assets/sorted_mesh/*.16.obj
 Assets/sorted_mesh/*.16.part
 Assets/sorted_mesh/*.16.msh
+
+# Gate-run evidence: keep compact run records tracked, full logs untracked
+gate-artifacts/*.log
+bench_results_mode_matrix.json
+demo_verify_results.json

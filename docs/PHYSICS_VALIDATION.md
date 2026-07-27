@@ -33,6 +33,12 @@ cmake -S . -B build -DSTIFFGIPC_ENABLE_DIAGNOSTICS=OFF
 软约束确实有活动项，避免“零贡献也通过”的假阳性。不同 multi-env mode 必须运行
 在不同子进程，因为 native 热路径的模式是进程级配置。
 
+**FD 覆盖按模型口径**：门禁构建的默认模型是 SNK1，因此常规 suite 的 FD 检查只
+覆盖 SNK1 的解析导数；SNK2/ARAP 在生产矩阵里是 diagnostics-OFF（刻意断言 FD 符
+号不在场）。重炮层（tag push）以 `FD_MATRIX=1` 运行 `model_build_matrix.sh`，为
+三个模型各做一个 diagnostics-ON 构建并完整跑 `fd_gate.py`——三模型的解析梯度都
+经 FD 对照，而不只是应力不变量。
+
 ## Checkpoint v2
 
 `Engine.save_checkpoint(path)` 在同目录写临时文件、同步后原子 rename；
@@ -50,4 +56,22 @@ active/quarantine/NaN 状态、recheck 计数
 不替外部控制器保存其目标轨迹或内部状态。
 `scripts/checkpoint_gate.py` 在 merged/strict 下检查
 载入瞬间位级恢复、下一步重启一致（strict 逐位；merged 因无序原子归约按严容差）、
-原子写、损坏/截断/旧格式的事务式拒绝，以及同计数但不同场景的签名拒绝。
+原子写、损坏/截断/旧格式的事务式拒绝，以及同计数但不同场景的签名拒绝。此外有一
+个**活跃接触场景**（堆叠立方体在持续摩擦接触中保存，保存帧断言碰撞对数非零）——
+无接触场景的往返一致证明不了接触/摩擦相关状态的恢复，这个场景专门堵这个洞。摩擦
+锚与 Kappa 不入档是设计而非遗漏：两者每帧从帧首构型确定性重建（`buildFrictionSets`
+/`initKappa`），帧边界 checkpoint 恢复构型即恢复它们。
+
+**第三类不入档状态：stepping 期间构建的顺序载体（未定名，已定界）**。接触场景
+实测：merged 恢复续跑有**可复现** ~6e-6 位置 / ~6e-4 速度系统差；三路判别实验
+（全新引擎整轨重放 ~6.6e-9 ≈ 散布地板；老引擎自重载 ~2.1e-9 = load 无副作用；
+全新引擎恢复到边界 5.76e-6 = 1000× 地板）把它钉在"只在逐帧 stepping 中构建、
+不在档案里"的顺序状态上；strict 免疫（EE/CCD 规范化排序 + binned 序无关沉积让
+发射顺序不影响位），merged/isolated 按发射顺序原子求和所以可见。**不是 PCG 温
+启动**——`STIFF_PCG_WARM` 默认关（显式 opt-in，两侧引擎都零启动）；若显式开启，
+温启动向量会成为另一个不入档载体，属已知取舍。精确定位载体（BVH/配对缓冲布局/
+预条件器结构之一）为跟进项。叠加原子噪声偶发翻转离散分支（配对集、线搜索减半，
+~1e-4..1e-2 漂移），merged/isolated 的接触续跑因此只按硬顶断言（pos≤2e-3、
+vel≤2e-2，仍低于"缺摩擦态"签名 μ·g·dt≈5e-2 一个量级）；完备性由 strict 接触
+场景的**逐位**断言承担——它若失败即顺序载体（或未来开启的温启动）侵入 strict
+路径的信号。

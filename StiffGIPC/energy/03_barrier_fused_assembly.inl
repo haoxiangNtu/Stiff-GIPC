@@ -10,6 +10,14 @@
 // --dump-resource-usage and --dump-sass --function, 2026-07-27).  That is a
 // 41% stack increase and 9.5% more instructions before runtime noise enters
 // the comparison, so physical TU separation is performance-vetoed.
+// Independently reproduced via ptxas -v with the production build flags:
+// composite 200 regs / 23,328 B stack / ZERO spill vs extracted 255 regs /
+// 31,504 B / 460 B spill stores+loads per thread; a --maxrregcount=200 pin
+// makes it WORSE (1,072 B spill). Both layouts run 1 block/SM at 256 threads,
+// so the cost is spill traffic + code growth, not occupancy. Runtime deltas
+// (+8~16% foldshirt 4env step) were partly confounded by GPU contention and
+// first-run clock-ramp inflation (~10%) — bench this kernel with median-of-3,
+// never a single run.
 // ============================================================================
 __device__ double* g_gbin = nullptr;
 // [multienv-mode] binned (Demmel-Nguyen order-free) gradient is a DETERMINISM feature (strict mode).

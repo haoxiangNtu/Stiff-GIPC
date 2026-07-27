@@ -62,4 +62,32 @@ PY
         "$LOG_DIR/model-$lower-validation.log"
 done
 
+# FD derivative matrix (opt-in: FD_MATRIX=1). The production loop above
+# deliberately builds diagnostics-OFF, so FD gradient checks never run there —
+# without this leg, FD coverage exists only for the gate build's default model
+# (SNK1). Each model gets a diagnostics-ON build and the full fd_gate scene
+# set, so the analytic gradients of SNK2/ARAP are FD-verified, not just their
+# stress invariants.
+if [ "${FD_MATRIX:-0}" = "1" ]; then
+    for model in SNK1 SNK2 ARAP; do
+        lower="${model,,}"
+        diag_dir="$BUILD_ROOT/$lower-diag"
+        echo "== FD matrix model $model =="
+        cmake -S "$ROOT" -B "$diag_dir" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_PYTHON_BINDINGS=ON \
+            -DBUILD_GL_VIEWER=OFF \
+            -DSTIFFGIPC_ENABLE_DIAGNOSTICS=ON \
+            -DSTIFFGIPC_FEM_MODEL="$model" \
+            > "$LOG_DIR/model-$lower-diag-configure.log" 2>&1
+        cmake --build "$diag_dir" -j"$JOBS" --target pystiffgipc \
+            > "$LOG_DIR/model-$lower-diag-build.log" 2>&1
+        env STIFFGIPC_NATIVE_DIR="$diag_dir" PYTHONPATH="$ROOT" \
+            timeout 1800 python3 "$ROOT/scripts/fd_gate.py" \
+            > "$LOG_DIR/model-$lower-fd.log" 2>&1
+        grep -qF "FD-GATE: PASS" "$LOG_DIR/model-$lower-fd.log"
+        echo "FD matrix $model PASS"
+    done
+fi
+
 echo "MODEL-BUILD-MATRIX: PASS"

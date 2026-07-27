@@ -55,3 +55,38 @@ cap。详表：`docs/MODE_MATRIX_REPORT_2026-07-27.md`。
 wheel：cp311（sm_80/89/120；包声明 requires-python>=3.11，cp310 本地开发直接用 build/ 树不经 wheel）。A800 bundle 配方与坑
 （npz 双件、盘子 episode 走 /data + STIFF_REPLAY_PATH、cwd=/data/stiff-physics）
 见记忆/报告。
+
+---
+
+# 附录：rc1 后加固合并（6c562bc + 补充，未随 rc1 tag 发布）
+
+外部审核分支 audit/codex-fable-review-20260727 经三路对抗审计后合入。要点与
+**调用方可见的行为变更**：
+
+## 行为变更（升级注意）
+- 性能计数 getter（total_newton_iters/pcg_iters/collision_pairs/max_collision_pairs/
+  frames_done）从进程级累计改为 **per-Engine 实例**；依赖跨 reset 累计值的调用方
+  读数会变。
+- `get_fem_von_mises_stress` 按编译期本构（SNK1/SNK2/ARAP）计算，不再硬编码
+  Neo-Hookean；两个接触力/导出 getter 改为**输入序**返回（与
+  `get_vertex_positions()` 对齐）。
+- `STIFF_*` 旗标解析统一为**值感知**（`=0`/空串=关）；标准 resolver 只写 "1"
+  或删除变量，不受影响；手写 `=0` 当"开"用的环境会翻转。
+- 单进程单 Engine 强制（RuntimeOwnerLease）：先前静默共享可变缓冲的多 Engine
+  用法现在显式抛 LifecycleError；reset() 后可重建。
+- 侵入式 FD API 移出生产 ABI（diagnostics 构建才有）。checkpoint v1（STKP）移除，
+  由带 CRC64/事务校验的 v2（STIFFCP2）替代。
+
+## 修复定性更正（相对该分支自述）
+- g_vloc：基线树中为 **泄漏 + 陈旧全局设备指针**（仅 STIFF_EE_CANON 路径可触发，
+  非默认公开 API 路径）；字面 use-after-free 是该提交自身补加的 `release(m_d_vloc)`
+  才会引入的，修复（buildCP 顶部无条件重发布）与该 free 正确同船。合入后闭环。
+- “三模型 FD 验证”原实为三模型不变量验证 + SNK1 FD；本合并补 `FD_MATRIX=1`
+  重炮腿后，三模型解析梯度均经 FD 对照（见 PHYSICS_VALIDATION.md）。
+
+## 工程裁决存档
+- 融合 barrier 核 TU 抽取被性能带否决（双盲复现：+9.5% SASS、栈帧 +8KB、
+  460B/线程溢出、--maxrregcount=200 恶化至 1072B）；裁决注释入
+  energy/03_barrier_fused_assembly.inl 头部。
+- 性能基准协议：median-of-3，首跑受时钟爬坡/冷缓存污染约 10%，禁止单跑定带；
+  GPU 非空闲时 mode_bench rc=2 fail-closed（tag 门禁 INFRA-BLOCK）。
