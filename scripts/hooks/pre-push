@@ -130,11 +130,16 @@ validate_commit()
     set +e
     (
         cd "$source_dir" || exit 2
+        # child processes must see the worktree as a normal checkout —
+        # the hook's inherited GIT_DIR/GIT_INDEX_FILE point at the caller's
+        # repo and would misdirect any git invocation inside the gates.
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR
         env GATE_LOG_DIR="$log_dir" \
             GATE_RESULTS_DIR="$log_dir/results" \
             GATE_BUILD_DIR="$source_dir/build" \
             GATE_CMAKE_BUILD_TYPE=Release \
             GATE_FEM_MODEL=SNK1 \
+            STIFFGIPC_IN_PREPUSH=1 \
             bash scripts/run_push_gates.sh "$tier"
     ) 2>&1 | tee "$log_dir/gates.log"
     rc=${PIPESTATUS[0]}

@@ -85,7 +85,14 @@ fz StiffGIPC/GIPC.cuh 'bool checkSelfCloseVal();'
 [ "$FZ_OK" = 1 ] && echo "FROZEN OK" || exit 2
 
 echo "== G0.7 exact-SHA pre-push dispatcher =="
-if timeout 120 bash scripts/test_pre_push_hook.sh \
+if [ "${STIFFGIPC_IN_PREPUSH:-0}" = "1" ]; then
+    # Running INSIDE the pre-push hook: the self-test would invoke the hook
+    # script again and block on the flock the enclosing hook already holds
+    # (re-entrancy deadlock, caught live on the first gated push). The
+    # dispatcher being self-tested IS the enclosing run — skipping here loses
+    # nothing; local/CI suite runs still exercise the full self-test.
+    echo "PRE-PUSH DISPATCH SKIPPED (inside the hook: re-entrant flock)"
+elif timeout 120 bash scripts/test_pre_push_hook.sh \
         > "$GATE_LOG_DIR/pre-push-hook.log" 2>&1 &&
    grep -qF "PRE-PUSH-HOOK-TEST: PASS" "$GATE_LOG_DIR/pre-push-hook.log"; then
     echo "PRE-PUSH DISPATCH OK"

@@ -2,6 +2,13 @@
 # Fast, GPU-free contract test for the exact-SHA pre-push dispatcher.
 set -euo pipefail
 
+# HERMETIC: when invoked from inside a git hook, git exports GIT_DIR /
+# GIT_WORK_TREE / GIT_INDEX_FILE pointing at the REAL repository — every
+# fixture `git commit` below would then write to the real refs (this
+# happened live: fixture A/B landed on internal/v0.8.6-rc1 during the
+# first gated push). Drop the inherited identity before any git call.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOOK="$ROOT/scripts/hooks/pre-push"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/stiffgipc-hook-test.XXXXXX")"
