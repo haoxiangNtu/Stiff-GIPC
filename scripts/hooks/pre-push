@@ -1,0 +1,32 @@
+#!/bin/bash
+# ============================================================================
+# pre-push — verification AT PUSH TIME (owner directive 2026-07-27: no
+# background polling; gates run exactly when a version is really pushed).
+#
+#   branch push  -> full ARMED 12-segment suite (verify_gates.sh, ~25 min)
+#   tag push     -> the HEAVY pack too (FD gate + 19-demo sweep + 3-mode
+#                   matrix + sanitizer) — tags are release moments
+#   escape hatch -> SKIP_GATES=1 git push   (emergencies only, logged)
+# Push is BLOCKED on any failure.
+# ============================================================================
+set -u
+[ "${SKIP_GATES:-}" = "1" ] && { echo "[pre-push] SKIP_GATES=1 — gates bypassed (logged)"; exit 0; }
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+has_tag=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in refs/tags/*) has_tag=1;; esac
+done
+
+echo "[pre-push] running the armed gate suite (blocking)..."
+bash scripts/verify_gates.sh || { echo "[pre-push] GATES FAILED — push blocked"; exit 1; }
+
+if [ "$has_tag" = 1 ]; then
+    echo "[pre-push] tag push detected — running the heavy release pack..."
+    python3 scripts/fd_gate.py      || { echo "[pre-push] FD gate FAILED — push blocked"; exit 1; }
+    python3 scripts/demo_verify.py  || { echo "[pre-push] demo sweep FAILED — push blocked"; exit 1; }
+    python3 scripts/mode_bench.py   || { echo "[pre-push] mode matrix FAILED — push blocked"; exit 1; }
+    bash scripts/sanitize_anchor.sh || { echo "[pre-push] sanitizer FAILED — push blocked"; exit 1; }
+fi
+echo "[pre-push] all green — push proceeds"
