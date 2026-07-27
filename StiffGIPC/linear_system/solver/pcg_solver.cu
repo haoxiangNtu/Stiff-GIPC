@@ -881,12 +881,16 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
                          SizeT max_iter, const int* d2g, int ng)
 {
     int n = (int)b.size();
-    static bool s_seg_binned_set = false;   // [multienv-mode] binned seg-dot only for strict (bit-identity)
-    if(!s_seg_binned_set) {
-        // [det-gating] binned seg-dot = strict-only (positive gate); STIFF_SEG_BINNED=1 forces.
-        int on = (ModeConfig::env_on("STIFF_SPMV_DET")
-                  || ModeConfig::env_on("STIFF_SEG_BINNED")) ? 1 : 0;
-        set_seg_binned(on); s_seg_binned_host = on; s_seg_binned_set = true;   // device + host mirror
+    // [multienv-mode] binned seg-dot only for strict (bit-identity). VALUE-
+    // tracked, not once-per-process: the old once-latch made engine B inherit
+    // engine A's mode (descriptor plan phase-0); republish only on change.
+    static int s_seg_binned_last = -1;
+    // [det-gating] binned seg-dot = strict-only (positive gate); STIFF_SEG_BINNED=1 forces.
+    if(const int on = (ModeConfig::env_on("STIFF_SPMV_DET")
+                       || ModeConfig::env_on("STIFF_SEG_BINNED")) ? 1 : 0;
+       on != s_seg_binned_last)
+    {
+        set_seg_binned(on); s_seg_binned_host = on; s_seg_binned_last = on;   // device + host mirror
         // [warp-reduce] DETERMINISM FIX (was: default ON for all modes — WRONG). The per-warp float
         // pre-sum is NOT binned-exact, AND the warp grouping depends on the GLOBAL DOF layout (env k
         // starts at offset Σ_{j<k} N_j, which is not 32-aligned), so env0 and env1 sum DIFFERENT lane

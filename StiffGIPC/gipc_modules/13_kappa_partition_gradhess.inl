@@ -465,18 +465,23 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 {
     gipc::Timer timer{"cal_gradient_hessian"};
 
-    // [multienv-mode] one-time: fast plain-atomic gradient for merged/isolated (STIFF_FAST_GRAD),
-    // binned order-free gradient for strict/default. Set once (device symbol).
-    static bool s_binned_set = false;
-    if(!s_binned_set)
+    // [multienv-mode] fast plain-atomic gradient for merged/isolated, binned
+    // order-free gradient for strict/default. VALUE-tracked, not once-per-
+    // process: a once-latch made a second engine in the same process silently
+    // inherit the first engine's determinism mode (descriptor plan phase-0).
+    // Republishing only on value change keeps the hot path at zero cost.
+    static int s_binned_last = -1;
     {   // [det-gating] POSITIVE gate: determinism machinery is strict-mode opt-in
         // (STIFF_SPMV_DET, set by mode=strict). merged/isolated never pay the
-        // bit-identity tax, даже when the python resolve layer is bypassed.
+        // bit-identity tax, even when the python resolve layer is bypassed.
         // STIFF_DIAG_BINNED_GRAD=1 forces binned (diagnostics).
         int det = (m_mode_config.spmv_det || getenv("STIFF_DIAG_BINNED_GRAD")) ? 1 : 0;
-        set_binned_on(det);
-        set_det_reduce(det);   // fem/MAS/ABD binned_deposit users, centrally
-        s_binned_set = true;
+        if(det != s_binned_last)
+        {
+            set_binned_on(det);
+            set_det_reduce(det);   // fem/MAS/ABD binned_deposit users, centrally
+            s_binned_last = det;
+        }
     }
 
     // [multi-env P2] capture d_point_to_group + enable per-env BVH (once). buildCP uses these
