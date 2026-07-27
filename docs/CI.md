@@ -100,3 +100,10 @@ SKIP_GATES=1 git push
   finalize 绊线：进程环境里出现注册表外的 STIFF_* 变量 → 大声警告
   （`STIFF_KNOB_STRICT=1` 升级为 `ConfigurationError`）。维护规则：新增
   `getenv("STIFF_...")` 必须同 commit 加注册表行，否则 G14 红。
+
+## GPU idle 门的基础设施白名单
+
+远程桌面类进程（如 ToDesk）持有小型 CUDA 上下文，会让 idle 门在远程操作期间
+永久 INFRA-BLOCK（含 tag push 的重炮包）。豁免方式：
+`BENCH_IDLE_ALLOWLIST=ToDesk`（逗号分隔的进程名子串）。默认空=fail-closed；
+每次豁免都会打印进门禁工件日志。真正的计算负载禁止入白名单。

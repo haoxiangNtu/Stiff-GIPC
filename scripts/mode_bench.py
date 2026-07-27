@@ -193,6 +193,14 @@ def scene_cmd(scene: str) -> tuple[list[str], dict[str, str]]:
 
 
 def external_apps(apps: list[str], allowed_pid: int) -> list[str]:
+    # BENCH_IDLE_ALLOWLIST: comma-separated process-name substrings the idle
+    # gate ignores (e.g. "ToDesk" — remote-desktop encoders hold a small CUDA
+    # context and would otherwise INFRA-BLOCK every bench/tag-push run made
+    # over a remote session). Default empty = fail-closed; opting in is a
+    # deliberate owner decision, and each skip is printed so it lands in the
+    # gate artifact log.
+    allow = [t.strip() for t in
+             os.environ.get("BENCH_IDLE_ALLOWLIST", "").split(",") if t.strip()]
     external = []
     for record in apps:
         try:
@@ -200,8 +208,12 @@ def external_apps(apps: list[str], allowed_pid: int) -> list[str]:
         except (ValueError, IndexError):
             external.append(record)
             continue
-        if pid != allowed_pid:
-            external.append(record)
+        if pid == allowed_pid:
+            continue
+        if allow and any(token in record for token in allow):
+            print(f"[bench] idle-allowlist skip: {record.strip()}", flush=True)
+            continue
+        external.append(record)
     return external
 
 
@@ -445,9 +457,12 @@ def main() -> int:
         flush=True,
     )
     infrastructure_failures: list[str] = []
-    if REQUIRE_IDLE and gpu["compute_apps"]:
+    # route the preflight through the same allowlist-aware filter as the
+    # mid-run monitor (allowed_pid=-1: no bench subprocess exists yet)
+    preflight_external = external_apps(gpu["compute_apps"], -1)
+    if REQUIRE_IDLE and preflight_external:
         infrastructure_failures.append(
-            "GPU is not idle: " + "; ".join(gpu["compute_apps"])
+            "GPU is not idle: " + "; ".join(preflight_external)
         )
     if REQUIRE_IDLE and gpu["error"]:
         infrastructure_failures.append(f"GPU preflight failed: {gpu['error']}")
@@ -463,7 +478,7 @@ def main() -> int:
             order = MODES if repeat % 2 == 0 else tuple(reversed(MODES))
             for mode in order:
                 if REQUIRE_IDLE:
-                    apps = compute_apps(gpu["uuid"])
+                    apps = external_apps(compute_apps(gpu["uuid"]), -1)
                     if apps:
                         print(
                             "INFRA FAIL GPU became busy before "
