@@ -7,7 +7,7 @@
 |---|---|---|
 | energy_terms.h | 12 型项表（type↔尺寸源↔kernel↔G/H 属主） | 文档 |
 | 02_contact_energy_device.inl | barrier/friction 能量 device 函数 + _pair_mu（冻结 smooth 分支逐字在内） | 老 01 位 |
-| 03_barrier_fused_assembly.inl | binned 梯度机制 + 融合 _calBarrierGradientAndHessian（老 04 整文件） | 老 04 位 |
+| 03_barrier_fused_assembly.inl | binned 梯度机制 + 融合 _calBarrierGradientAndHessian；受控物理抽离因 stack +41%、SASS +9.5% 被否决 | 老 04 位 |
 | 10_kinetic.inl | E 归约 + G/E kernel | 老 07 位 |
 | 11_fem_elastic.inl | FEM+RestNHK E 归约（元素 G/H 在上游 femEnergy.cuh，最小扰动） | 老 07 位 |
 | 12_triangle_membrane.inl | 膜 E 归约 | 老 07 位 |
@@ -27,3 +27,5 @@
 - E2 注册表 ✅、E3 物理 TU ✅（九项独立 .cu，锚六级不动；10..18 *.inl 现为各
   自 .cu 的正文，复合仅剩 01 宿主分派 + 02 共享能量头 + 03 融合装配例外）。
   新本构工作流：写 <term>.cu+.inl（核+两注册成员）→ GIPC_ENERGY_TERMS 加行。
+- `03` 继续留在复合 TU 是有量化证据的性能决策，不是遗漏；指标与复验条件见
+  `docs/ENERGY_SEPARATION_PLAN.md`。

@@ -104,15 +104,15 @@ void GIPC::buildCP()
     // else the per-env path (which returns early) runs the EE dedup with GLOBAL edge indices (not
     // env-local) → cross-env asymmetric. Idempotent; the merged path below re-runs harmlessly.
     set_ee_nodedup(getenv("STIFF_EE_NODEDUP") ? 1 : 0);
-    set_ee_detgate(getenv("STIFF_EE_DETGATE") ? 1 : 0);
+    set_ee_detgate(m_mode_config.ee_detgate ? 1 : 0);
     set_bvh_envpart(getenv("STIFF_BVH_ENVPART") ? 1 : 0);
     set_bvh_audit(getenv("STIFF_STACK_DIAG") ? 1 : 0);  // [audit-gate] per-pop depth probe, diag only
     // [perenv-par] per-vertex cross-env skip at self-collision emission (robust where BVH env-part is
     // bypassed by env-MIXED co-located nodes). Gated STIFF_DECOUPLE_THRESH; null = off (legacy path).
-    set_self_p2g((getenv("STIFF_DECOUPLE_THRESH") && m_d_p2g) ? m_d_p2g : nullptr);
-    set_ee_canon(getenv("STIFF_EE_CANON") ? 1 : 0);
+    set_self_p2g((m_mode_config.decouple_thresh && m_d_p2g) ? m_d_p2g : nullptr);
+    set_ee_canon(m_mode_config.ee_canon ? 1 : 0);
     set_ee_nomollify(getenv("STIFF_EE_NOMOLLIFY") ? 1 : 0);
-    if(getenv("STIFF_EE_CANON") && m_d_p2g && !m_vloc_built)
+    if(m_mode_config.ee_canon && m_d_p2g && !m_vloc_built)
     {
         std::vector<int> hp(vertexNum);
         CUDA_SAFE_CALL(cudaMemcpy(hp.data(), m_d_p2g, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost));
@@ -122,6 +122,11 @@ void GIPC::buildCP()
         CUDA_SAFE_CALL(cudaMemcpy(m_d_vloc, vloc.data(), (size_t)vertexNum*sizeof(int), cudaMemcpyHostToDevice));
         set_ee_vloc(m_d_vloc); m_vloc_built = true;
     }
+    // g_vloc is a process-global CUDA symbol. A previous Engine may have
+    // published an instance-owned map that reset() has since freed. Always
+    // republish this Engine's current view (including nullptr) before any EE
+    // kernel, rather than relying on the symbol's stale prior value.
+    set_ee_vloc((m_mode_config.ee_canon && m_vloc_built) ? m_d_vloc : nullptr);
 
     // [multi-env P2] per-env BVH path: build each env's tree on LOCAL verts + detect, looped.
     if(m_perenv_bvh && m_d_p2g)
@@ -157,16 +162,16 @@ void GIPC::buildCP()
     //   STIFF_SKIP_F=1 → only edge-edge (tests EE ownership obj_idx<self_eid)
     //   STIFF_SKIP_E=1 → only point-triangle (tests Morton/candidate; PT has no index dedup)
     set_ee_nodedup(getenv("STIFF_EE_NODEDUP") ? 1 : 0);
-    set_ee_detgate(getenv("STIFF_EE_DETGATE") ? 1 : 0);
+    set_ee_detgate(m_mode_config.ee_detgate ? 1 : 0);
     set_bvh_envpart(getenv("STIFF_BVH_ENVPART") ? 1 : 0);  // [env-part B]
     // [perenv-par] per-vertex cross-env skip at self-collision emission (see note above). null = off.
-    set_self_p2g((getenv("STIFF_DECOUPLE_THRESH") && m_d_p2g) ? m_d_p2g : nullptr);
-    set_ee_canon(getenv("STIFF_EE_CANON") ? 1 : 0);
+    set_self_p2g((m_mode_config.decouple_thresh && m_d_p2g) ? m_d_p2g : nullptr);
+    set_ee_canon(m_mode_config.ee_canon ? 1 : 0);
     set_ee_nomollify(getenv("STIFF_EE_NOMOLLIFY") ? 1 : 0);
     { static int _tc = 0; set_ee_trace((getenv("STIFF_EE_TRACE") && _tc++ == 0) ? 1 : 0); }  // first buildCP (iter0) only
     set_ee_tgt(getenv("STIFF_BAR_TGT0")?atoi(getenv("STIFF_BAR_TGT0")):-1, getenv("STIFF_BAR_TGT1")?atoi(getenv("STIFF_BAR_TGT1")):-1);
     // [env-det] build the global→env-local vertex id map once (canon total-order tie-break).
-    if(getenv("STIFF_EE_CANON") && m_d_p2g && !m_vloc_built)
+    if(m_mode_config.ee_canon && m_d_p2g && !m_vloc_built)
     {
         std::vector<int> hp(vertexNum);
         CUDA_SAFE_CALL(cudaMemcpy(hp.data(), m_d_p2g, (size_t)vertexNum*sizeof(int), cudaMemcpyDeviceToHost));

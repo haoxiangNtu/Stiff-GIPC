@@ -10,9 +10,8 @@
 // shell provides the context: extern decls for every kernel launched here
 // (definitions stay in their mechanism modules, composite TU) and for the
 // composite-owned globals (g_gipc_log_level, g_dec_k/g_dec_frame). Bodies are
-// verbatim moves from gipc_modules/14; the counters defined here
-// (totalNT/total_Frames/...) keep external linkage — engine_modules/04 and
-// module 14's checkpoint code consume them via extern.
+// verbatim moves from gipc_modules/14. Runtime counters are GIPC members so
+// multiple engines cannot contaminate one another's telemetry/frame state.
 //
 // Mechanics live with their owners and are CALLED from here, never inlined
 // here: pair growth = contact/pair_buffers.cuh, iron-law quarantine =
@@ -52,7 +51,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
                        && TetMesh.h_groups_present
                        && abd_fem_count_info.fem_point_num > 0
-                       && getenv("STIFF_PERENV_ALPHA"));
+                       && m_mode_config.perenv_alpha);
 
     // [multi-env S3] validate per-env energy decomposition (Sum_g E_g(FEM) ==
     // global FEM). Read-only; gated. Run a couple times then it's confirmed.
@@ -399,7 +398,7 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
             {
                 int bs = 256;
                 const double* frozen_alpha =
-                    (getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid)
+                    (m_mode_config.decouple_thresh && m_env_alpha_valid)
                         ? m_env_alpha.data()
                         : nullptr;
                 _per_group_kappa_double<<<(NG + bs - 1) / bs, bs>>>(
@@ -437,10 +436,6 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
 }
 
 // ── verbatim from gipc_modules/14 (pre-2d lines 1448..2543) ──
-double maxCOllisionPairNum = 0;
-double totalCollisionPairs = 0;
-double total_Cg_count      = 0;
-double timemakePd          = 0;
 #include <vector>
 #include <fstream>
 std::vector<int> iterV;
@@ -467,7 +462,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     m_active_group_count = active_group_count;
     // [env-det] capture p2g at entry so the canon env-local-id tiebreak (g_vloc) is built BEFORE the
     // first buildCP of this frame (buildCP runs before computeGradientAndHessian sets m_d_p2g).
-    if(getenv("STIFF_EE_CANON") && TetMesh.d_point_to_group) m_d_p2g = TetMesh.d_point_to_group;
+    if(m_mode_config.ee_canon && TetMesh.d_point_to_group) m_d_p2g = TetMesh.d_point_to_group;
 
     int iterCap = newton_iter_cap, k = 0;
     double semi_beta = 1.0;
@@ -500,11 +495,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     const bool s4_mask_on = (m_env_active && TetMesh.d_dof_to_group
                              && TetMesh.d_point_to_group
                              && TetMesh.h_groups_present
-                             && (getenv("STIFF_PERENV_MASK") || getenv("STIFF_PERENV_MASK_DEV")));
+                             && (m_mode_config.perenv_mask
+                                 || m_mode_config.perenv_mask_dev));
     // [S4-dev] device-derived mask (from m_env_alpha, zero D2H). Requires the per-env alpha
     // machinery (m_env_alpha filled by the S1 line-search block each iter).
-    const bool s4_dev_mask = s4_mask_on && m_env_alpha && getenv("STIFF_PERENV_MASK_DEV")
-                             && getenv("STIFF_PERENV_ALPHA");
+    const bool s4_dev_mask =
+        s4_mask_on && m_env_alpha && m_mode_config.perenv_mask_dev
+                             && m_mode_config.perenv_alpha;
     if(s4_mask_on)
     {
         std::fill_n(h_env_active.begin(), active_group_count, 1);
@@ -515,7 +512,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     }
     // [multi-env P3] register the DOF→group map for the SEGMENTED block-diagonal PCG even when
     // masking is off (the PCG reads m_s4_dof_to_group/m_s4_ng). active=nullptr ⇒ no RHS masking.
-    else if(getenv("STIFF_SEGMENTED_PCG") && TetMesh.d_dof_to_group
+    else if(m_mode_config.segmented_pcg && TetMesh.d_dof_to_group
             && TetMesh.d_point_to_group && TetMesh.h_groups_present)
         m_global_linear_system->set_env_mask(
             nullptr, TetMesh.d_dof_to_group, active_group_count);
@@ -537,7 +534,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // direction still entered line search and could spend 64 halvings fighting
     // energy-reduction roundoff. Per-env modes retain their existing freeze
     // pipeline for now and will be handled separately.
-    const bool current_global_exit = (getenv("STIFF_DECOUPLE_THRESH") == nullptr);
+    const bool current_global_exit = !m_mode_config.decouple_thresh;
     // Seven per-iteration events are diagnostic-only. Production must not
     // create/destroy them or force a device-wide synchronization.
     const bool phase_time = (getenv("STIFF_PHASE_TIME") != nullptr);
@@ -566,9 +563,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             _mask_fill<<<(active_group_count + 255) / 256, 256>>>(
                 m_env_active, 1, active_group_count);
 
-        totalCollisionPairs += h_cpNum[0];
-        maxCOllisionPairNum =
-            (maxCOllisionPairNum > h_cpNum[0]) ? maxCOllisionPairNum : h_cpNum[0];
+        m_total_collision_pairs += h_cpNum[0];
+        m_max_collision_pairs =
+            (m_max_collision_pairs > h_cpNum[0]) ? m_max_collision_pairs : h_cpNum[0];
         cudaEvent_t start = nullptr, end0 = nullptr, end1 = nullptr, end2 = nullptr;
         cudaEvent_t end3 = nullptr, end4 = nullptr, e2b = nullptr;
         if(phase_time)
@@ -597,7 +594,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(start));
         g_dec_k = (int)k;   // [decouple probe] expose k to computeGradientAndHessian's stage dumps
-        timemakePd += computeGradientAndHessian(TetMesh);
+        m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
 
         // [decouple probe] PRE-SOLVE gradient dump (shape_grads + fb hold the CLEAN gradient here,
         // before calculateMovingDirection clobbers shape_grads as scratch). frame STIFF_DUMP_FRAME,
@@ -630,7 +627,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // The scalar fallback used by the decoupled path is the average complete-environment scale;
         // normal freeze sites use each environment's own bbox. A physical velocity tolerance, when
         // configured, overrides both relative scales.
-        if(getenv("STIFF_DECOUPLE_THRESH")
+        if(m_mode_config.decouple_thresh
            && TetMesh.h_groups_present && m_avg_env_bbox2 > 0.0)
             thr_bbox2 = m_avg_env_bbox2;
 
@@ -707,7 +704,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // (catches non-monotonic bounce-back). Self-contained; gated STIFF_PERENV_MASK.
         // Skip detection on early Newton iters: nothing converges before ~k=MINK
         // (measured), so the per-iter D2H+sync overhead there is pure waste.
-        if(m_env_active && TetMesh.d_point_to_group && getenv("STIFF_PERENV_MASK")
+        if(m_env_active && TetMesh.d_point_to_group
+           && m_mode_config.perenv_mask
            && !s4_dev_mask && k >= 4)   // [S4-dev] device-derived mask supersedes host detection
         {
             const int NG = active_group_count;
@@ -767,7 +765,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // STIFF_PERENV_ALPHA, all_env_frozen stays false forever → the loop ran to iterCap every
         // frame (pathological, found by the flag ablation). Fall back to gradVanish in that case.
         bool do_break = !current_global_exit
-                     && ((getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid)
+                     && ((m_mode_config.decouple_thresh && m_env_alpha_valid)
                              ? (k && all_env_frozen)
                              : (k && gradVanish));
         // [drive-substep] no convergence exit until the driving ramp completes
@@ -783,7 +781,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         auto cg_count = calculateMovingDirection(TetMesh, h_cpNum[0], pcg_data.P_type);
         //std::cout << "[" << k << "]"
         //          << "cg_count = " << cg_count << std::endl;
-        total_Cg_count += cg_count;
+        m_total_pcg_iters += cg_count;
 
         // [iron-law completion] make quarantined envs fully INERT before any
         // downstream consumer of this iteration's direction. The CCD alpha
@@ -927,7 +925,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                             // valid, all_env_frozen unreachable -> Newton pegs at iterCap.
                             && TetMesh.h_groups_present
                             && surf_vertexNum >= 1 && !m_skip_all_collision
-                            && getenv("STIFF_PERENV_ALPHA"));
+                            && m_mode_config.perenv_alpha);
         if(s1_on)
         {
             const int NG = active_group_count, bs = 256;
@@ -946,7 +944,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 _per_env_selfAlpha_min<<<(m_dcd_snap_count+bs-1)/bs, bs>>>(
                     _vertexes, _dcd_ccd_snapshot, _moveDir, TetMesh.d_point_to_group,
                     m_env_scratch + 1*NG, slackness_m, m_dcd_snap_count, NG,
-                    getenv("STIFF_CCD_CANON") ? m_d_vloc : nullptr,
+                    m_mode_config.ccd_canon ? m_d_vloc : nullptr,
                     m_ccd_alpha_invalid,
                     kCcdInvalidPerEnvNarrow,
                     nullptr);
@@ -1072,7 +1070,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 _per_env_selfAlpha_min<<<(h_ccd_cpNum+bs-1)/bs, bs>>>(
                     _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
                     m_env_scratch + 2*NG, slackness_m, h_ccd_cpNum, NG,
-                    getenv("STIFF_CCD_CANON") ? m_d_vloc : nullptr,
+                    m_mode_config.ccd_canon ? m_d_vloc : nullptr,
                     m_ccd_alpha_invalid,
                     kCcdInvalidPerEnvRefined,
                     m_ccd_refined_invalid + 1);
@@ -1088,7 +1086,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             // Bit-identical to the host loop (same per-env formulas). Host path kept only under a
             // diagnostic flag.
             const double _sq_    = sqrt(dHat);
-            const double _thrcv_ = getenv("STIFF_DECOUPLE_THRESH") ? ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt)) : 0.0;
+            const double _thrcv_ = m_mode_config.decouple_thresh ? ((newton_velocity_tol > 0.0) ? (newton_velocity_tol * IPC_dt) : sqrt(Newton_solver_threshold * Newton_solver_threshold * thr_bbox2 * IPC_dt * IPC_dt)) : 0.0;
             const bool _s1diag_ = getenv("STIFF_PENV_STATS") || getenv("STIFF_A0_DUMP")
                                || getenv("STIFF_S1_DEBUG") || getenv("STIFF_ALPHA_DBG")
                                // [per-env productization] telemetry (freeze iters/
@@ -1096,8 +1094,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                // quarantine live in the host loop — route there
                                // when any of them is requested.
                                || env_newton_iter_cap > 0
-                               || (getenv("STIFF_PERENV_TELEM")
-                                   && getenv("STIFF_PERENV_TELEM")[0] != '0');
+                               || m_mode_config.perenv_telem;
             if(!_s1diag_)
             {
                 static int* d_env_cnt = nullptr;
@@ -1106,7 +1103,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 CUDA_SAFE_CALL(cudaMemsetAsync(d_env_cnt, 0, 3 * sizeof(int)));
                 _per_env_alpha_compute<<<(NG + bs - 1) / bs, bs>>>(
                     m_env_alpha, m_env_scratch, NG, _sq_, 1.0, (h_ccd_cpNum > 0) ? 1 : 0,
-                    temp_alpha, alpha_CFL, getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
+                    temp_alpha, alpha_CFL, m_mode_config.decouple_thresh ? 1 : 0,
                     getenv("STIFF_NO_REFINE") ? 1 : 0, _thrcv_,
                     d_env_bbox2, Newton_solver_threshold * IPC_dt, newton_velocity_tol * IPC_dt,
                     m_ccd_refined_invalid + 1,
@@ -1128,7 +1125,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 _sq_,
                 temp_alpha,
                 alpha_CFL,
-                getenv("STIFF_DECOUPLE_THRESH") ? 1 : 0,
+                m_mode_config.decouple_thresh ? 1 : 0,
                 getenv("STIFF_NO_REFINE") ? 1 : 0,
                 m_ccd_refined_invalid + 1,
                 m_ccd_alpha_invalid);
@@ -1191,8 +1188,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     // → fully per-env/batch-invariant; hr — built from global-temp_alpha CCD pairs — is
                     // the confirmed last leak). isIntersected safety net in lineSearch catches any
                     // resulting penetration. Used to verify hr is the only remaining batch-coupling.
-                    double gate_lhs = getenv("STIFF_DECOUPLE_THRESH") ? ta   : temp_alpha;
-                    double gate_rhs = getenv("STIFF_DECOUPLE_THRESH") ? acfl : alpha_CFL;
+                    double gate_lhs = m_mode_config.decouple_thresh ? ta   : temp_alpha;
+                    double gate_rhs = m_mode_config.decouple_thresh ? acfl : alpha_CFL;
                     if(!getenv("STIFF_NO_REFINE") && gate_lhs > 2.0 * gate_rhs)
                     {
                         a = std::min(ta, hr[g] * ccd_size);
@@ -1208,7 +1205,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 // drifts batch-dependently → FEM-pin seed. Freezing at the env's own convergence makes
                 // env g's total steps batch-invariant. Block-diagonal per-env solve ⇒ monotonic ⇒ no
                 // re-activation needed. Gated STIFF_DECOUPLE_THRESH.
-                if(getenv("STIFF_DECOUPLE_THRESH"))
+                if(m_mode_config.decouple_thresh)
                 {
                     double thr_cv = (newton_velocity_tol > 0.0)
                         ? (newton_velocity_tol * IPC_dt)
@@ -1324,7 +1321,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // The current move direction has just been tested against every environment's Newton
         // threshold. Exit immediately, exactly like the merged path, rather than performing a
         // full zero-active assembly/solve on the next iteration.
-        if(getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid
+        if(m_mode_config.decouple_thresh && m_env_alpha_valid
            && all_env_frozen && k && drive_ratio >= 1.0)
         {
             destroy_iteration_events();
@@ -1474,7 +1471,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // The decoupled path therefore ignores the semi-implicit exit (its per-env
         // frozen check already exits as soon as every env converged). A true per-env
         // beta belongs with the per-env productization work.
-        const bool semi_decoupled = getenv("STIFF_DECOUPLE_THRESH") && m_env_alpha_valid;
+        const bool semi_decoupled = m_mode_config.decouple_thresh && m_env_alpha_valid;
         if(semi_implicit_enabled && semi_decoupled)
         {
             static bool noted = false;
@@ -1529,20 +1526,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     if(getenv("STIFF_PHASE_TIME"))
         printf("[phase-time cum-ms] Hess=%.0f PCG=%.0f ccdBVH=%.0f lineSearch=%.0f kappaUpd=%.0f | ls-split[s1=%.0f ls=%.0f] ls-inner[e=%.0f bvh=%.0f cp=%.0f step=%.0f] | this-frame-newton-iters=%d cum-pcg-iters=%lld\n",
                time0, time1, time2, time3, time4, g_t3_s1_ms, g_t3_ls_ms,
-               g_ls_e_ms, g_ls_bvh_ms, g_ls_cp_ms, g_ls_step_ms, k, (long long)total_Cg_count);
+               g_ls_e_ms, g_ls_bvh_ms, g_ls_cp_ms, g_ls_step_ms, k, (long long)m_total_pcg_iters);
     return k;
 }
 
 // ── verbatim from gipc_modules/14 (pre-2d lines 2674..2897) ──
-int    totalNT          = 0;
-double totalTime        = 0;
-int    total_Frames     = 0;
-double ttime0           = 0;
-double ttime1           = 0;
-double ttime2           = 0;
-double ttime3           = 0;
-double ttime4           = 0;
-bool   isUpdateBoundary = false;
 void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 {
     //double animation_fullRate = 0;
@@ -1551,13 +1539,13 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     cudaEventCreate(&end0);
     double alpha = 1;
     cudaEventRecord(start);
-    //    if(isRotate&&total_Frames*IPC_dt>=2.2){
+    //    if(isRotate&&m_total_frames*IPC_dt>=2.2){
     //        isRotate = false;
     //        updateBoundary2(TetMesh);
     //    }
-    if(isUpdateBoundary)
+    if(m_update_boundary)
     {
-        updateBoundaryMoveDir(TetMesh, alpha, total_Frames);
+        updateBoundaryMoveDir(TetMesh, alpha, m_total_frames);
         buildBVH_FULLCCD(alpha);
         buildFullCP(alpha);
         if(h_ccd_cpNum > 0)
@@ -1573,7 +1561,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
                                   TetMesh.vertexes,
                                   vertexNum * sizeof(double3),
                                   cudaMemcpyDeviceToDevice));
-        updateBoundaryMoveDir(TetMesh, alpha, total_Frames);
+        updateBoundaryMoveDir(TetMesh, alpha, m_total_frames);
         stepForward(TetMesh.vertexes, TetMesh.temp_double3Mem, _moveDir, TetMesh.BoundaryType, 1, true, vertexNum);
         //step_forward(TetMesh, 1, true);
 
@@ -1592,7 +1580,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
             }
             printf("type 6 intersection happened:    %f\n", alpha);
             alpha /= 2.0;
-            updateBoundaryMoveDir(TetMesh, alpha, total_Frames);
+            updateBoundaryMoveDir(TetMesh, alpha, m_total_frames);
             numOfIntersect++;
             stepForward(TetMesh.vertexes,
                         TetMesh.temp_double3Mem,
@@ -1609,7 +1597,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         printf("boundary alpha: %f\n  finished a step\n", alpha);
     }
 
-    TetMesh.update_soft_constraint_target_position(total_Frames + 1, IPC_dt);
+    TetMesh.update_soft_constraint_target_position(m_total_frames + 1, IPC_dt);
     //suggestKappa(Kappa);
     upperBoundKappa(Kappa);
     if(Kappa < 1e-16)
@@ -1640,7 +1628,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
         CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
 
-        totalNT += solve_subIP(TetMesh, time0, time1, time2, time3, time4);
+        m_total_newton_iters += solve_subIP(TetMesh, time0, time1, time2, time3, time4);
 
         double2 minMaxDist1 = minMaxGroundDist();
         double2 minMaxDist2 = minMaxSelfDist();
@@ -1686,10 +1674,14 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     cudaEventElapsedTime(&tttime, start, end0);
     cudaEventDestroy(start);
     cudaEventDestroy(end0);
-    totalTime += tttime;
-    total_Frames++;
+    m_total_time_ms += tttime;
+    m_total_frames++;
     if(g_gipc_log_level >= 1)
-        printf("average time cost:     %f,    frame id:   %d\n", totalTime / totalNT, total_Frames);
+        printf("average time cost:     %f,    frame id:   %d\n",
+               m_total_newton_iters > 0
+                   ? m_total_time_ms / m_total_newton_iters
+                   : 0.0,
+               m_total_frames);
 
     // [multi-env P3a] validate the segmented per-env reduction primitive on real
     // data: per-env vertex count (must match the substrate, e.g. 11433/env) and a
@@ -1714,35 +1706,39 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         std::vector<int> h_cnt(NG);
         CUDA_SAFE_CALL(cudaMemcpy(h_sq.data(), d_sq, NG * sizeof(double), cudaMemcpyDeviceToHost));
         CUDA_SAFE_CALL(cudaMemcpy(h_cnt.data(), d_cnt, NG * sizeof(int), cudaMemcpyDeviceToHost));
-        printf("[P3a-reduce] frame %d per-env:", total_Frames);
+        printf("[P3a-reduce] frame %d per-env:", m_total_frames);
         for(int g = 0; g < NG; ++g)
             if(h_cnt[g] > 0) printf(" g%d[n=%d |v|=%.4e]", g, h_cnt[g], sqrt(h_sq[g]));
         printf("\n");
     }
 
-    ttime0 += time0;
-    ttime1 += time1;
-    ttime2 += time2;
-    ttime3 += time3;
-    ttime4 += time4;
+    m_phase_time_ms[0] += time0;
+    m_phase_time_ms[1] += time1;
+    m_phase_time_ms[2] += time2;
+    m_phase_time_ms[3] += time3;
+    m_phase_time_ms[4] += time4;
 
 
     std::ofstream outTime("timeCost.txt");
 
-    outTime << "time0: " << ttime0 / 1000.0 << std::endl;
-    outTime << "time1: " << ttime1 / 1000.0 << std::endl;
-    outTime << "time2: " << ttime2 / 1000.0 << std::endl;
-    outTime << "time3: " << ttime3 / 1000.0 << std::endl;
-    outTime << "time4: " << ttime4 / 1000.0 << std::endl;
-    outTime << "time_makePD: " << timemakePd / 1000.0 << std::endl;
+    outTime << "time0: " << m_phase_time_ms[0] / 1000.0 << std::endl;
+    outTime << "time1: " << m_phase_time_ms[1] / 1000.0 << std::endl;
+    outTime << "time2: " << m_phase_time_ms[2] / 1000.0 << std::endl;
+    outTime << "time3: " << m_phase_time_ms[3] / 1000.0 << std::endl;
+    outTime << "time4: " << m_phase_time_ms[4] / 1000.0 << std::endl;
+    outTime << "time_makePD: " << m_time_make_pd_ms / 1000.0 << std::endl;
 
-    outTime << "totalTime: " << totalTime / 1000.0 << std::endl;
-    outTime << "total iter: " << totalNT << std::endl;
-    outTime << "frames: " << total_Frames << std::endl;
-    outTime << "totalCollisionNum: " << totalCollisionPairs << std::endl;
-    outTime << "averageCollision: " << totalCollisionPairs / totalNT << std::endl;
-    outTime << "maxCOllisionPairNum: " << maxCOllisionPairNum << std::endl;
-    outTime << "totalCgTime: " << total_Cg_count << std::endl;
+    outTime << "totalTime: " << m_total_time_ms / 1000.0 << std::endl;
+    outTime << "total iter: " << m_total_newton_iters << std::endl;
+    outTime << "frames: " << m_total_frames << std::endl;
+    outTime << "totalCollisionNum: " << m_total_collision_pairs << std::endl;
+    outTime << "averageCollision: "
+            << (m_total_newton_iters > 0
+                    ? m_total_collision_pairs / m_total_newton_iters
+                    : 0.0)
+            << std::endl;
+    outTime << "maxCOllisionPairNum: " << m_max_collision_pairs << std::endl;
+    outTime << "totalCgTime: " << m_total_pcg_iters << std::endl;
     outTime.close();
 
 

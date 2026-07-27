@@ -64,3 +64,20 @@ __device__ inline void write_triplet(Eigen::Matrix3d*    triplet_value,
         }
     }
 }
+
+// Contact triplet slots are reserved at emission time (mlbvh MatIndex uses an
+// atomicAdd on the per-type counter), so an assembly-side early-out must still
+// deposit its blocks. A raw zeroed (0,0,0) slot is in-bounds but is
+// misclassified as abd_abd in mixed ABD+FEM scenes. Exactly parallel edge
+// pairs carry zero mollified barrier energy; writing a zero 12x12 block at the
+// decoded, valid vertex ids preserves both the contribution and its partition.
+// This helper is therefore part of the reserved-slot correctness contract.
+__device__ inline void write_zero_triplet12(Eigen::Matrix3d* triplet_value,
+                                            int*             row_ids,
+                                            int*             col_ids,
+                                            const uint4&     gidx,
+                                            int              offset)
+{
+    double Z[12][12] = {};
+    write_triplet<12, 12>(triplet_value, row_ids, col_ids, &(gidx.x), Z, offset);
+}

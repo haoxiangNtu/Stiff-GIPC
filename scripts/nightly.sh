@@ -1,8 +1,8 @@
 #!/bin/bash
 # ============================================================================
-# nightly.sh — the heavy verification pack (cron 02:30). Runs in the CI
-# worktree at the newest rc sha: FD gate, full demo sweep, three-mode matrix,
-# compute-sanitizer anchor. Verdict lines append to the shared CI history.
+# nightly.sh — optional legacy/manual heavy-pack runner. It is not installed or
+# scheduled by this repository; the versioned pre-push tag path is authoritative.
+# Runs FD, demos, the three-mode matrix and compute-sanitizer in a CI worktree.
 # ============================================================================
 set -u
 CI_WT=/home/ps/Downloads/Stiff-GIPC-ci

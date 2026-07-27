@@ -20,8 +20,16 @@ void PCG_Data::Malloc_DEVICE_MEM(const int& vertexNum, const int& tetrahedraNum)
 
 void PCG_Data::FREE_DEVICE_MEM()
 {
-    CUDA_SAFE_CALL(cudaFree(squeue));
-    CUDA_SAFE_CALL(cudaFree(dx));
+    if(squeue)
+    {
+        CUDA_SAFE_CALL(cudaFree(squeue));
+        squeue = nullptr;
+    }
+    if(dx)
+    {
+        CUDA_SAFE_CALL(cudaFree(dx));
+        dx = nullptr;
+    }
 
     if(P_type == 1)
     {

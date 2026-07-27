@@ -110,55 +110,84 @@ device_TetraData::~device_TetraData()
 
 void device_TetraData::FREE_DEVICE_MEM()
 {
-    CUDA_SAFE_CALL(cudaFree(vertexes));
-    CUDA_SAFE_CALL(cudaFree(o_vertexes));
-    CUDA_SAFE_CALL(cudaFree(temp_double3Mem));
-    CUDA_SAFE_CALL(cudaFree(velocities));
-    CUDA_SAFE_CALL(cudaFree(rest_vertexes));
-    CUDA_SAFE_CALL(cudaFree(xTilta));
-    CUDA_SAFE_CALL(cudaFree(fb));
-    CUDA_SAFE_CALL(cudaFree(apply_gravity));
-    CUDA_SAFE_CALL(cudaFree(shape_grads));
-    CUDA_SAFE_CALL(cudaFree(tetrahedras));
-    CUDA_SAFE_CALL(cudaFree(tempTetrahedras));
-    CUDA_SAFE_CALL(cudaFree(volum));
-    CUDA_SAFE_CALL(cudaFree(masses));
-    CUDA_SAFE_CALL(cudaFree(lengthRate));
-    CUDA_SAFE_CALL(cudaFree(volumeRate));
-    CUDA_SAFE_CALL(cudaFree(DmInverses));
-    CUDA_SAFE_CALL(cudaFree(tempDouble));
-    CUDA_SAFE_CALL(cudaFree(BoundaryType));
+    auto release = [](auto*& pointer)
+    {
+        if(pointer)
+        {
+            CUDA_SAFE_CALL(cudaFree(pointer));
+            pointer = nullptr;
+        }
+    };
 
-    CUDA_SAFE_CALL(cudaFree(totalForce));
-    CUDA_SAFE_CALL(cudaFree(targetIndex));
-    CUDA_SAFE_CALL(cudaFree(targetVert));
-    CUDA_SAFE_CALL(cudaFree(triDmInverses));
-    CUDA_SAFE_CALL(cudaFree(area));
-    CUDA_SAFE_CALL(cudaFree(triangles));
+    release(vertexes);
+    release(o_vertexes);
+    release(temp_double3Mem);
+    release(velocities);
+    release(rest_vertexes);
+    release(xTilta);
+    release(fb);
+    release(apply_gravity);
+    release(shape_grads);
+    release(tetrahedras);
+    release(tempTetrahedras);
+    release(volum);
+    release(masses);
+    release(lengthRate);
+    release(volumeRate);
+    release(DmInverses);
+    release(tempDouble);
+    release(BoundaryType);
 
-    CUDA_SAFE_CALL(cudaFree(tri_edges));
-    CUDA_SAFE_CALL(cudaFree(tri_edge_adj_vertex));
+    release(totalForce);
+    release(targetIndex);
+    release(targetVert);
+    release(triDmInverses);
+    release(area);
+    release(triangles);
+
+    release(tri_edges);
+    release(tri_edge_adj_vertex);
 
 #ifdef USE_QUADRATIC_BENDING
-    CUDA_SAFE_CALL(cudaFree(quad_bending_Q));
+    release(quad_bending_Q);
 #endif
 
-    CUDA_SAFE_CALL(cudaFree(body_id_to_boundary_type));
-    CUDA_SAFE_CALL(cudaFree(point_id_to_body_id));
-    CUDA_SAFE_CALL(cudaFree(tet_id_to_body_id));
-    CUDA_SAFE_CALL(cudaFree(body_motor_params));
-    CUDA_SAFE_CALL(cudaFree(collision_skip_matrix));
-    CUDA_SAFE_CALL(cudaFree(ground_skip_body));
-    CUDA_SAFE_CALL(cudaFree(bvh_active_face_idx));
-    CUDA_SAFE_CALL(cudaFree(bvh_active_edge_idx));
+    release(body_id_to_boundary_type);
+    release(point_id_to_body_id);
+    release(tet_id_to_body_id);
+    release(body_motor_params);
+    release(collision_skip_matrix);
+    release(ground_skip_body);
+    release(d_body_to_group);
+    release(d_point_to_group);
+    release(d_dof_to_group);
+    release(body_id_to_is_fem);
+    release(bvh_active_face_idx);
+    release(bvh_active_edge_idx);
+
+    release(d_fem_pin_fem_vertex);
+    release(d_fem_pin_abd_body_id);
+    release(d_fem_pin_abd_local_pos);
+    release(d_fem_pin_abd_anchor);
+    release(d_fem_pin_rest_offset);
+    release(is_pinned_vertex);
+    release(vertex_to_pin_idx);
 
     // Stitch spring GPU arrays
-    CUDA_SAFE_CALL(cudaFree(d_stitch_paired_vertex));
-    CUDA_SAFE_CALL(cudaFree(d_stitch_rest_offset));
-    CUDA_SAFE_CALL(cudaFree(d_stitch_abd_body_id));
+    release(d_stitch_paired_vertex);
+    release(d_stitch_rest_offset);
+    release(d_stitch_abd_body_id);
 
     // [Hybrid mesh] per-tet ABD body assignment.
-    CUDA_SAFE_CALL(cudaFree(d_tet_to_abd_body));
+    release(d_tet_to_abd_body);
+
+    collision_body_num = 0;
+    dof_block_count = 0;
+    h_groups_present = false;
+    h_group_count = 0;
+    n_fem_pins = 0;
+    bvh_active_face_num = 0;
+    bvh_active_edge_num = 0;
 }
 
 void device_TetraData::update_soft_constraint_target_position(int step_id, double ipc_dt)

@@ -16,7 +16,7 @@ class MASPreconditioner
 
     int totalNodes = 0;
     int totalMapNodes = 0;
-    int levelnum;
+    int levelnum = 0;
     // [per-env MAS] capacity of the cluster-space scratch arrays
     // (d_nextConnectMask / d_nextPrefix / d_nextPrefixSum / d_goingNext-per-level).
     // Per-env padding can push a level's cluster count ABOVE vertNum on small
@@ -39,44 +39,44 @@ class MASPreconditioner
     int* d_envBase  = nullptr;   // [per-env MAS] device scratch: per-env aligned base offsets
     int* d_envStart = nullptr;   //   per-env pre-mutation scan start (avoids RAW hazard in _apply)
     int* d_padTot   = nullptr;   //   per-env-padded cluster total (written to d_levelSize on device)
-    int collision_node_Offset;
-    int totalNumberClusters;
+    int collision_node_Offset = 0;
+    int totalNumberClusters = 0;
     //int bankSize;
-    int2  h_clevelSize;
-    int4* _collisonPairs;
+    int2  h_clevelSize{};
+    int4* _collisonPairs = nullptr;
 
-    int2*               d_levelSize;
-    int*                d_coarseSpaceTables;
-    int*                d_prefixOriginal;
-    int*                d_prefixSumOriginal;
-    int*                d_goingNext;
-    int*                d_denseLevel;
-    __GEIGEN__::itable* d_coarseTable;
-    unsigned int*       d_fineConnectMask;
-    unsigned int*       d_nextConnectMask;
-    unsigned int*       d_nextPrefix;
-    unsigned int*       d_nextPrefixSum;
+    int2*               d_levelSize = nullptr;
+    int*                d_coarseSpaceTables = nullptr;
+    int*                d_prefixOriginal = nullptr;
+    int*                d_prefixSumOriginal = nullptr;
+    int*                d_goingNext = nullptr;
+    int*                d_denseLevel = nullptr;
+    __GEIGEN__::itable* d_coarseTable = nullptr;
+    unsigned int*       d_fineConnectMask = nullptr;
+    unsigned int*       d_nextConnectMask = nullptr;
+    unsigned int*       d_nextPrefix = nullptr;
+    unsigned int*       d_nextPrefixSum = nullptr;
 
 
-    __GEIGEN__::MasMatrixT*    d_MatMas;
-    __GEIGEN__::MasMatrixSymT* d_inverseMatMas;
-    __GEIGEN__::MasMatrixSymf* d_precondMatMas;
-    Eigen::Vector3f*              d_multiLevelR;
-    Precision_T3*              d_multiLevelZ;
+    __GEIGEN__::MasMatrixT*    d_MatMas = nullptr;
+    __GEIGEN__::MasMatrixSymT* d_inverseMatMas = nullptr;
+    __GEIGEN__::MasMatrixSymf* d_precondMatMas = nullptr;
+    Eigen::Vector3f*           d_multiLevelR = nullptr;
+    Precision_T3*              d_multiLevelZ = nullptr;
     double* d_mRbin  = nullptr;  // [4.3] binned d_multiLevelR coarse accumulation
     double* d_mZbin  = nullptr;  // [4.3] binned d_multiLevelZ Schwarz accumulation
     double* d_matbin = nullptr;  // [4.3] binned d_inverseMatMas coarse aggregation
 
   public:
-    int           neighborListSize;
-    unsigned int* d_neighborList;
-    unsigned int* d_neighborStart;
-    unsigned int* d_neighborStartTemp;
-    unsigned int* d_neighborNum;
-    unsigned int* d_neighborListInit;
-    unsigned int* d_neighborNumInit;
-    int*          d_partId_map_real;
-    int*          d_real_map_partId;
+    int           neighborListSize = 0;
+    unsigned int* d_neighborList = nullptr;
+    unsigned int* d_neighborStart = nullptr;
+    unsigned int* d_neighborStartTemp = nullptr;
+    unsigned int* d_neighborNum = nullptr;
+    unsigned int* d_neighborListInit = nullptr;
+    unsigned int* d_neighborNumInit = nullptr;
+    int*          d_partId_map_real = nullptr;
+    int*          d_real_map_partId = nullptr;
 
   public:
     void initPreconditioner_Neighbor(int   vertNum,

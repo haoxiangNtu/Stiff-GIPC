@@ -362,12 +362,26 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
 
 void lbvh::FREE_DEVICE_MEM()
 {
-    CUDA_SAFE_CALL(cudaFree(_indices));
-    CUDA_SAFE_CALL(cudaFree(_MChash));
-    CUDA_SAFE_CALL(cudaFree(_nodes));
-    CUDA_SAFE_CALL(cudaFree(_bvs));
-    CUDA_SAFE_CALL(cudaFree(_flags));
-    CUDA_SAFE_CALL(cudaFree(_tempLeafBox));
+    auto release = [](auto*& pointer)
+    {
+        if(pointer)
+        {
+            CUDA_SAFE_CALL(cudaFree(pointer));
+            pointer = nullptr;
+        }
+    };
+    release(_indices);
+    release(_MChash);
+    release(_nodes);
+    release(_bvs);
+    release(_flags);
+    release(_tempLeafBox);
+    release(m_node_env);
+    release(_sort_tmp);
+    release(_mch_alt);
+    release(_idx_alt);
+    _sort_tmp_bytes = 0;
+    _sort_cap       = 0;
 }
 
 void lbvh::MALLOC_DEVICE_MEM(const int& number)

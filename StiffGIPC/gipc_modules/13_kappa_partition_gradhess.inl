@@ -58,7 +58,7 @@ void GIPC::initKappa(device_TetraData& TetMesh)
     // fell back to the GLOBAL Kappa (= -gsum/gsnorm, a reduction over ALL envs' verts → N-dependent)
     // → the batch-SIZE divergence seed. Enable per-group κ here too so env_0 uses its OWN per-env κ
     // (binned over d_point_to_group) from the very first step → N-independent.
-    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group
+    if(m_mode_config.pergroup_kappa && TetMesh.d_point_to_group
        && TetMesh.h_groups_present   /* [N=1 guard] wildcard p2g -> kappa_grp[-1] OOB */
        && !m_pergroup_kappa)
     {
@@ -174,7 +174,7 @@ void GIPC::initKappa(device_TetraData& TetMesh)
         // representation must match the global path: free FEM vertices plus each ABD body's 12
         // generalized DOFs. ABD collision vertices must not be treated as independent DOFs.
         // suggested (=minKappa after suggestKappa, eff-bbox) is the batch-invariant floor; kmax the cap.
-        if(getenv("STIFF_DECOUPLE_THRESH") && m_pergroup_kappa && m_kappa_group
+        if(m_mode_config.decouple_thresh && m_pergroup_kappa && m_kappa_group
            && TetMesh.d_point_to_group)
         {
             const int NG = TetMesh.h_group_count;
@@ -473,7 +473,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         // (STIFF_SPMV_DET, set by mode=strict). merged/isolated never pay the
         // bit-identity tax, даже when the python resolve layer is bypassed.
         // STIFF_DIAG_BINNED_GRAD=1 forces binned (diagnostics).
-        int det = (getenv("STIFF_SPMV_DET") || getenv("STIFF_DIAG_BINNED_GRAD")) ? 1 : 0;
+        int det = (m_mode_config.spmv_det || getenv("STIFF_DIAG_BINNED_GRAD")) ? 1 : 0;
         set_binned_on(det);
         set_det_reduce(det);   // fem/MAS/ABD binned_deposit users, centrally
         s_binned_set = true;
@@ -481,7 +481,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
     // [multi-env P2] capture d_point_to_group + enable per-env BVH (once). buildCP uses these
     // lazily (it has no TetMesh). STIFF_PERENV_BVH gates; needs grouped envs (d_point_to_group).
-    if(getenv("STIFF_PERENV_BVH") && TetMesh.d_point_to_group
+    if(m_mode_config.perenv_bvh && TetMesh.d_point_to_group
        && TetMesh.h_groups_present)   // [N=1 guard] all -1 p2g -> per-env index excludes
                                       // EVERY prim (active=0) -> ZERO self-collision
     {
@@ -501,7 +501,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         xenvDiff(_vertexes, lbl);
     }
     // [multi-env per-group κ] enable + allocate (once). STIFF_PERGROUP_KAPPA gates; needs groups.
-    if(getenv("STIFF_PERGROUP_KAPPA") && TetMesh.d_point_to_group
+    if(m_mode_config.pergroup_kappa && TetMesh.d_point_to_group
        && TetMesh.h_groups_present   /* [N=1 guard] wildcard p2g -> kappa_grp[-1] OOB */
        && !m_pergroup_kappa)
     {
@@ -1308,5 +1308,4 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     return time00;
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
-
 

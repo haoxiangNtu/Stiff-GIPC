@@ -460,7 +460,7 @@ double* GIPC::_launch_perenv_energy_terms(device_TetraData& TetMesh, bool& peren
     if(!g_sink) CUDA_SAFE_CALL(cudaMalloc((void**)&g_sink, sizeof(double)));
 
     auto slice = [&](int s) { return pe_all + (size_t)s * PE_STRIDE; };
-    bool perenv_k = getenv("STIFF_DECOUPLE_THRESH")
+    bool perenv_k = m_mode_config.decouple_thresh
                  && m_pergroup_kappa && m_kappa_group;
     Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, g_sink, slice(0));   // kinetic
     Energy_Add_Reduction_Algorithm_DeviceOut(1,  TetMesh, g_sink, slice(1));   // fem elastic

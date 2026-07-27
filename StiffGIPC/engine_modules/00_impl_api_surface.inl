@@ -13,9 +13,11 @@
 #include <map>
 #include <algorithm>
 #include <stdexcept>
+#include <mutex>
 #include <cuda_runtime.h>
 
 #include "GIPC.cuh"
+#include "errors.h"
 #include "mlbvh.cuh"
 #include "load_mesh.h"
 #include "device_fem_data.cuh"
@@ -34,17 +36,120 @@
 // Defined at GLOBAL scope in GIPC.cu (GIPC class is not in namespace gipc).
 #include "device_common/debug_probes.h"  // [A4] g_gipc_log_level decl
 
+namespace
+{
+// The user-facing per-vertex collision filter is backed by one CUDA device
+// symbol in mlbvh, not by an lbvh/Engine field. Make that process-global
+// constraint explicit so two same-process Engines cannot silently overwrite
+// each other's pointer. Leaked function-local storage avoids static-destruction
+// ordering hazards when Python tears the extension module down.
+std::mutex& vertex_env_owner_mutex()
+{
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+
+void*& vertex_env_owner()
+{
+    static auto* owner = new void*(nullptr);
+    return *owner;
+}
+
+std::mutex& runtime_owner_mutex()
+{
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+
+void*& runtime_owner()
+{
+    static auto* owner = new void*(nullptr);
+    return *owner;
+}
+
+// The solver still publishes several per-engine buffers through process-global
+// CUDA symbols (contact accumulation, MAS scratch and collision controls). Keep
+// the lease alive until every other Impl member has been destroyed; declaring
+// it first makes its destructor run last.
+class RuntimeOwnerLease
+{
+  public:
+    RuntimeOwnerLease() = default;
+    RuntimeOwnerLease(const RuntimeOwnerLease&) = delete;
+    RuntimeOwnerLease& operator=(const RuntimeOwnerLease&) = delete;
+
+    void acquire(void* candidate)
+    {
+        std::lock_guard<std::mutex> lock(runtime_owner_mutex());
+        if(runtime_owner() != nullptr && runtime_owner() != candidate)
+            throw gipc::LifecycleError(
+                "only one finalized SimEngine may be active in a process; "
+                "reset or destroy the current engine before finalizing another");
+        runtime_owner() = candidate;
+        m_candidate = candidate;
+    }
+
+    void release() noexcept
+    {
+        std::lock_guard<std::mutex> lock(runtime_owner_mutex());
+        if(runtime_owner() == m_candidate)
+            runtime_owner() = nullptr;
+        m_candidate = nullptr;
+    }
+
+    ~RuntimeOwnerLease() { release(); }
+
+  private:
+    void* m_candidate = nullptr;
+};
+
+class RuntimeOwnerAttempt
+{
+  public:
+    RuntimeOwnerAttempt(RuntimeOwnerLease& lease,
+                        void*              candidate,
+                        bool&              finalize_failed)
+        : m_lease(lease)
+        , m_finalize_failed(finalize_failed)
+    {
+        m_lease.acquire(candidate);
+    }
+
+    void commit() noexcept { m_committed = true; }
+
+    ~RuntimeOwnerAttempt()
+    {
+        if(!m_committed)
+        {
+            m_finalize_failed = true;
+            m_lease.release();
+        }
+    }
+
+  private:
+    RuntimeOwnerLease& m_lease;
+    bool&              m_finalize_failed;
+    bool               m_committed = false;
+};
+}  // namespace
+
 namespace gipc
 {
 
 struct SimEngine::Impl
 {
-    GIPC             ipc;
+    RuntimeOwnerLease runtime_owner_lease;
+    // GIPC borrows several device_TetraData buffers and owns auxiliary CUDA
+    // streams that may still reference them. Members are destroyed in reverse
+    // declaration order, so declare the borrowed storage first: GIPC then tears
+    // down its streams before device_TetraData releases the backing buffers.
     device_TetraData d_tetMesh;
+    GIPC             ipc;
     tetrahedra_obj   tetMesh;
     SimEngineConfig  cfg;
     bool             cuda_initialized = false;
     bool             finalized        = false;
+    bool             finalize_failed  = false;
     int              step_count       = 0;
     std::string      resolved_assets_dir;
 
@@ -59,6 +164,21 @@ struct SimEngine::Impl
     // set_vertex_env_ids(); length = vertexNum. Grow-only, mirrors d_contact_pair.
     int*     d_vertex_env_id   = nullptr;
     int      vertex_env_id_cap = 0;
+
+    // Instance-owned scratch for readback/export APIs. These used to be
+    // function-static CUDA allocations, which survived reset/destruction and
+    // made two same-process Engines share mutable buffers.
+    double*  d_stitch_scalar_out = nullptr;
+    int*     d_segment_starts    = nullptr;
+    int*     d_segment_counts    = nullptr;
+    double*  d_segment_output    = nullptr;  // three doubles per segment
+    int      segment_cap         = 0;
+    double3* d_contact_gradient  = nullptr;
+    int      contact_gradient_cap = 0;
+    double*  d_stress_tet        = nullptr;
+    double*  d_stress_vertex     = nullptr;
+    int      stress_tet_cap      = 0;
+    int      stress_vertex_cap   = 0;
 
     std::vector<BodyLoadRecord> load_records;
 
@@ -106,6 +226,37 @@ struct SimEngine::Impl
                              int verts_per_face,
                              const Eigen::Matrix4d& transform,
                              double young_modulus, int boundary_type);
+
+    ~Impl()
+    {
+        // Destructors must not throw. CUDA errors are surfaced by the normal
+        // APIs; teardown still attempts every owned allocation.
+        if(d_vertex_env_id)
+        {
+            std::lock_guard<std::mutex> lock(vertex_env_owner_mutex());
+            if(vertex_env_owner() == this)
+            {
+                try
+                {
+                    mlbvh_set_vertex_env_id(nullptr);
+                }
+                catch(...)
+                {
+                }
+                vertex_env_owner() = nullptr;
+            }
+        }
+        cudaFree(d_contact_pair);
+        cudaFree(d_contact_force);
+        cudaFree(d_vertex_env_id);
+        cudaFree(d_stitch_scalar_out);
+        cudaFree(d_segment_starts);
+        cudaFree(d_segment_counts);
+        cudaFree(d_segment_output);
+        cudaFree(d_contact_gradient);
+        cudaFree(d_stress_tet);
+        cudaFree(d_stress_vertex);
+    }
 };
 
 SimEngine::SimEngine()
@@ -179,17 +330,25 @@ void SimEngine::set_log_level(int level)
 
 void SimEngine::reset()
 {
-    // Recreate the whole Impl: ~Impl frees GPU buffers via ~GIPC/~device_TetraData
-    // (no leak); a fresh Impl gives an empty world.  Preserve Config + re-init CUDA.
-    SimEngineConfig saved_cfg = m_impl->cfg;
+    // Recreate the whole Impl: ~Impl, ~GIPC and ~device_TetraData release all
+    // instance-owned GPU buffers; a fresh Impl gives an empty world. Allocate
+    // the replacement before destroying the live state so allocation failure
+    // leaves this engine intact. Preserve Config and re-initialize CUDA.
+    Impl* replacement = new Impl;
+    replacement->cfg  = m_impl->cfg;
     delete m_impl;
-    m_impl = new Impl;
-    m_impl->cfg = saved_cfg;
+    m_impl = replacement;
     init_cuda();
 }
 
 void SimEngine::set_config(const SimEngineConfig& cfg)
 {
+    if(m_impl->finalized)
+        throw LifecycleError(
+            "set_config() cannot mutate an already-finalized SimEngine");
+    if(m_impl->cuda_initialized)
+        throw LifecycleError(
+            "set_config() cannot be called after CUDA initialization");
     if(!std::isfinite(cfg.energy_abs_tol) || cfg.energy_abs_tol < 0.0
        || !std::isfinite(cfg.energy_rel_tol) || cfg.energy_rel_tol < 0.0)
         throw std::invalid_argument(
@@ -204,13 +363,25 @@ const SimEngineConfig& SimEngine::config() const
 
 void SimEngine::init_cuda()
 {
+    // Several legacy CUDA scratch caches are still process-static. A second
+    // device would make those pointers belong to the wrong CUDA context, so
+    // fail explicitly instead of allowing a delayed invalid-pointer crash.
+    static std::mutex process_device_mutex;
+    static int        process_device = -1;
+    std::lock_guard<std::mutex> lock(process_device_mutex);
+    if(process_device >= 0 && process_device != m_impl->cfg.cuda_device)
+        throw LifecycleError(
+            "StiffGIPC CUDA device selection is process-scoped: initialized "
+            "device " + std::to_string(process_device) + ", then requested "
+            + std::to_string(m_impl->cfg.cuda_device)
+            + ". Use a separate process for another GPU.");
+
     cudaError_t err = cudaSetDevice(m_impl->cfg.cuda_device);
     if(err != cudaSuccess)
-    {
-        std::cerr << "[SimEngine] cudaSetDevice(" << m_impl->cfg.cuda_device
-                  << ") failed: " << cudaGetErrorString(err) << std::endl;
-        return;
-    }
+        throw ConfigurationError(
+            "cudaSetDevice(" + std::to_string(m_impl->cfg.cuda_device)
+            + ") failed: " + cudaGetErrorString(err));
+    process_device = m_impl->cfg.cuda_device;
     m_impl->cuda_initialized = true;
 
     if(m_impl->cfg.assets_dir.empty())
@@ -436,21 +607,47 @@ void SimEngine::set_vertex_env_ids(const std::vector<int>& env_ids)
     // spatial separation. Decoupled from the block-diagonal solve (contact only).
     auto& impl = *m_impl;
     int   n    = static_cast<int>(env_ids.size());
+    std::lock_guard<std::mutex> lock(vertex_env_owner_mutex());
     if(n <= 0)
     {
-        mlbvh_set_vertex_env_id(nullptr);
+        if(vertex_env_owner() == &impl)
+        {
+            mlbvh_set_vertex_env_id(nullptr);
+            vertex_env_owner() = nullptr;
+        }
         return;
     }
+    if(!impl.finalized)
+        throw LifecycleError(
+            "set_vertex_env_ids() requires a finalized SimEngine");
+    if(n != impl.ipc.vertexNum)
+        throw std::invalid_argument(
+            "set_vertex_env_ids() requires exactly one id per vertex: expected "
+            + std::to_string(impl.ipc.vertexNum) + ", got " + std::to_string(n));
+    if(vertex_env_owner() != nullptr && vertex_env_owner() != &impl)
+        throw LifecycleError(
+            "set_vertex_env_ids() is process-scoped and is already owned by "
+            "another SimEngine; clear it there or use a separate process");
     if(impl.d_vertex_env_id == nullptr || impl.vertex_env_id_cap < n)
     {
-        if(impl.d_vertex_env_id)
-            cudaFree(impl.d_vertex_env_id);
-        CUDA_SAFE_CALL(cudaMalloc(&impl.d_vertex_env_id, n * sizeof(int)));
+        int* replacement = nullptr;
+        CUDA_SAFE_CALL(cudaMalloc(&replacement, n * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemcpy(replacement,
+                                  env_ids.data(),
+                                  n * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        int* previous = impl.d_vertex_env_id;
+        impl.d_vertex_env_id = replacement;
         impl.vertex_env_id_cap = n;
+        mlbvh_set_vertex_env_id(impl.d_vertex_env_id);
+        vertex_env_owner() = &impl;
+        CUDA_SAFE_CALL(cudaFree(previous));
+        return;
     }
     CUDA_SAFE_CALL(cudaMemcpy(impl.d_vertex_env_id, env_ids.data(),
                               n * sizeof(int), cudaMemcpyHostToDevice));
     mlbvh_set_vertex_env_id(impl.d_vertex_env_id);
+    vertex_env_owner() = &impl;
 }
 
 void SimEngine::add_ground_collision_skip(int body_id)

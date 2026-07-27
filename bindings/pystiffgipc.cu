@@ -4,6 +4,7 @@
 #include <pybind11/eigen.h>
 #include "sim_engine.h"
 #include "GIPC.cuh"
+#include "errors.h"
 
 namespace py = pybind11;
 using namespace gipc;
@@ -11,6 +12,18 @@ using namespace gipc;
 PYBIND11_MODULE(pystiffgipc, m)
 {
     m.doc() = "StiffGIPC Python bindings - IPC-based physics simulation engine";
+    m.def("fem_model", []() { return std::string(GIPC_FEM_MODEL_NAME); },
+          "Return the compile-time tetrahedral constitutive model.");
+    auto stiff_error =
+        py::register_exception<gipc::StiffGIPCError>(m, "StiffGIPCError");
+    py::register_exception<gipc::ConfigurationError>(
+        m, "ConfigurationError", stiff_error.ptr());
+    py::register_exception<gipc::GeometryError>(
+        m, "GeometryError", stiff_error.ptr());
+    py::register_exception<gipc::CheckpointError>(
+        m, "CheckpointError", stiff_error.ptr());
+    py::register_exception<gipc::LifecycleError>(
+        m, "LifecycleError", stiff_error.ptr());
     m.def("_test_ccd_nan_max_speed_fail_fast",
           &stiff_test_ccd_nan_max_speed_fail_fast,
           "Internal regression hook for device-CCD NaN fail-fast.");
@@ -425,9 +438,9 @@ PYBIND11_MODULE(pystiffgipc, m)
                 e.get_fem_von_mises_stress(arr.mutable_data(), n);
                 return arr;
             },
-            "[FEM stress] Per-vertex von Mises stress (Pa): per-tet Neo-Hookean "
-            "Cauchy -> von Mises -> max over incident tets. Non-tet vertices "
-            "(cloth/ABD) are 0.")
+            "[FEM stress] Per-vertex von Mises stress (Pa) from the configured "
+            "tetrahedral constitutive law, max over incident tets. Non-tet "
+            "vertices (cloth/ABD) are 0.")
         .def("get_total_newton_iters", &SimEngine::get_total_newton_iters)
         .def("get_per_env_newton_iters", &SimEngine::get_per_env_newton_iters,
              "[per-env] Newton iter at which each env froze last solve (-1 = ran "
@@ -439,8 +452,13 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_total_collision_pairs", &SimEngine::get_total_collision_pairs)
         .def("get_max_collision_pairs", &SimEngine::get_max_collision_pairs)
         .def("get_total_frames_done", &SimEngine::get_total_frames_done)
+#ifdef GIPC_ENABLE_DIAGNOSTICS
         .def("debug_fd_gradient_check", &SimEngine::debug_fd_gradient_check,
              py::arg("h") = 1e-6, py::arg("nprobes") = 64, py::arg("seed") = 12345)
+        .def("debug_fd_hessian_check", &SimEngine::debug_fd_hessian_check,
+             py::arg("h") = 1e-5, py::arg("nprobes") = 16, py::arg("seed") = 54321)
+        .def("debug_fd_activity", &SimEngine::debug_fd_activity)
+#endif
         .def("get_total_energy_tolerance_accepts",
              &SimEngine::get_total_energy_tolerance_accepts,
              "Number of final line-search decisions accepted only by the optional "
@@ -490,7 +508,7 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         // Teleport FEM vertices: writes _vertexes, o_vertexes, xTilta and
         // (optionally) velocities. See sim_engine.h for rationale.
-        // Full-state checkpoint: deterministic mid-trajectory restart (FEM+ABD+Kappa state).
+        // Versioned frame-boundary integrator checkpoint.
         .def("save_checkpoint", [](SimEngine& e, const std::string& path) { e.save_checkpoint(path); }, py::arg("path"))
         .def("load_checkpoint", [](SimEngine& e, const std::string& path) { e.load_checkpoint(path); }, py::arg("path"))
 

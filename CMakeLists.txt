@@ -19,6 +19,18 @@ endif()
 project(StiffGIPC LANGUAGES CXX CUDA)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+option(STIFFGIPC_ENABLE_DIAGNOSTICS
+       "Build intrusive finite-difference diagnostics and Python debug hooks"
+       OFF)
+set(STIFFGIPC_FEM_MODEL "SNK1" CACHE STRING
+    "Compile-time tetrahedral constitutive model: SNK1, SNK2, or ARAP")
+set_property(CACHE STIFFGIPC_FEM_MODEL PROPERTY STRINGS SNK1 SNK2 ARAP)
+string(TOUPPER "${STIFFGIPC_FEM_MODEL}" STIFFGIPC_FEM_MODEL_NORMALIZED)
+if(NOT STIFFGIPC_FEM_MODEL_NORMALIZED MATCHES "^(SNK1|SNK2|ARAP)$")
+    message(FATAL_ERROR
+        "STIFFGIPC_FEM_MODEL must be SNK1, SNK2, or ARAP; got "
+        "'${STIFFGIPC_FEM_MODEL}'")
+endif()
 
 # generate compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -41,13 +53,24 @@ endif()
 
 # Common compile definitions for physics engine
 set(GIPC_PHYSICS_DEFS
-    USE_SNK1 
     ADAPTIVE_KAPPA 
     USE_FRICTION 
     USE_QUADRATIC_BENDING
     GIPC_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Assets/"
     GIPC_OUTPUT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Output/"
 )
+if(STIFFGIPC_FEM_MODEL_NORMALIZED STREQUAL "SNK1")
+    list(APPEND GIPC_PHYSICS_DEFS USE_SNK1)
+elseif(STIFFGIPC_FEM_MODEL_NORMALIZED STREQUAL "SNK2")
+    list(APPEND GIPC_PHYSICS_DEFS USE_SNK2)
+else()
+    list(APPEND GIPC_PHYSICS_DEFS USE_ARAP)
+endif()
+list(APPEND GIPC_PHYSICS_DEFS
+    GIPC_FEM_MODEL_NAME="${STIFFGIPC_FEM_MODEL_NORMALIZED}")
+message(STATUS
+    "StiffGIPC tetrahedral constitutive model: "
+    "${STIFFGIPC_FEM_MODEL_NORMALIZED}")
 
 # Common CUDA compile options
 set(GIPC_CUDA_PRIVATE_OPTS
@@ -88,6 +111,11 @@ file(GLOB_RECURSE GIPC_ALL_HEADERS CONFIGURE_DEPENDS
 
 # Exclude gl_main.cu from the library (it contains main() and GL code)
 list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "gl_main\\.cu$")
+if(STIFFGIPC_ENABLE_DIAGNOSTICS)
+    list(APPEND GIPC_PHYSICS_DEFS GIPC_ENABLE_DIAGNOSTICS)
+else()
+    list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "diagnostics/fd_check\\.cu$")
+endif()
 
 add_library(stiffgipc_core SHARED ${GIPC_ALL_SOURCE} ${GIPC_ALL_HEADERS})
 target_compile_features(stiffgipc_core PUBLIC cuda_std_17 cxx_std_17)

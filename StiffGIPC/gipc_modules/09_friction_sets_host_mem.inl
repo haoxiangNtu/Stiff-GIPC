@@ -155,24 +155,65 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 /// </summary>
 void GIPC::FREE_DEVICE_MEM()
 {
+    auto release = [](auto*& pointer)
+    {
+        if(pointer)
+        {
+            CUDA_SAFE_CALL(cudaFree(pointer));
+            pointer = nullptr;
+        }
+    };
+
+    // Streams must finish before their scratch allocations are released.
+    for(cudaStream_t& stream : m_pool_streams)
+    {
+        if(stream)
+        {
+            CUDA_SAFE_CALL(cudaStreamDestroy(stream));
+            stream = nullptr;
+        }
+    }
+    m_pool_streams.clear();
+    auto release_pool = [&](std::vector<BvhScratch>& pool)
+    {
+        for(BvhScratch& scratch : pool)
+        {
+            release(scratch.nodes);
+            release(scratch.bvs);
+            release(scratch.mch);
+            release(scratch.idx);
+            release(scratch.tmp);
+            release(scratch.flags);
+            release(scratch.node_env);
+            release(scratch.sort_tmp);
+            release(scratch.mch_alt);
+            release(scratch.idx_alt);
+            scratch.sort_bytes = 0;
+            scratch.sort_cap   = 0;
+        }
+        pool.clear();
+    };
+    release_pool(m_pool_f);
+    release_pool(m_pool_e);
+    m_pool_K = 0;
+
     pair_buffers_free(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM});   // [v0.8.6 2b] guarded + null-set
     m_reduce_scratch.release(); m_reduce_cap = 0;  // [3d-2]
     _cpNum.release();
-    CUDA_SAFE_CALL(cudaFree(_close_cpNum));
-    CUDA_SAFE_CALL(cudaFree(_close_gpNum));
-    if(_gdCollapse) { CUDA_SAFE_CALL(cudaFree(_gdCollapse)); _gdCollapse = nullptr; }
+    _gpNum = nullptr;
+    release(_close_cpNum);
+    release(_close_gpNum);
+    release(_gdCollapse);
     if(m_ground_skip_owned && _ground_skip_body)
     {   // [iron-law] only free when WE lazily allocated it (normally d_tetMesh owns it)
-        CUDA_SAFE_CALL(cudaFree(_ground_skip_body));
-        _ground_skip_body = nullptr; m_ground_skip_owned = false;
+        release(_ground_skip_body);
     }
+    m_ground_skip_owned = false;
     m_d_env_quarantined.release();
     m_d_env_dirnan.release();
-    CUDA_SAFE_CALL(cudaFree(_environment_collisionPair));
-    // [9d28824-port] _gpNum aliases (_cpNum + 5) — freed above with _cpNum.
-    _gpNum = nullptr;
-    CUDA_SAFE_CALL(cudaFree(_groundNormal));
-    CUDA_SAFE_CALL(cudaFree(_groundOffset));
+    release(_environment_collisionPair);
+    release(_groundNormal);
+    release(_groundOffset);
 
     _faces.release();
     _edges.release();
@@ -194,59 +235,51 @@ void GIPC::FREE_DEVICE_MEM()
     _collisonPairs_lastH_gd.release();
     if(_closeConstraintID)
     {
-        CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
-        CUDA_SAFE_CALL(cudaFree(_closeConstraintVal));
-        _closeConstraintID = nullptr; _closeConstraintVal = nullptr;
+        release(_closeConstraintID);
+        release(_closeConstraintVal);
     }
     if(_closeMConstraintID)
     {
-        CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
-        CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
-        _closeMConstraintID = nullptr; _closeMConstraintVal = nullptr;
+        release(_closeMConstraintID);
+        release(_closeMConstraintVal);
     }
     m_fric_cp_cap = 0; m_fric_gd_cap = 0; m_close_gp_cap = 0; m_close_cp_cap = 0;
 
     // Device-resident energy/control scalars.
-    if(m_energy_slots) { CUDA_SAFE_CALL(cudaFree(m_energy_slots)); m_energy_slots = nullptr; }
-    if(m_line_search_energy)
-    {
-        CUDA_SAFE_CALL(cudaFree(m_line_search_energy));
-        m_line_search_energy = nullptr;
-    }
-    if(m_compatibility_energy)
-    {
-        CUDA_SAFE_CALL(cudaFree(m_compatibility_energy));
-        m_compatibility_energy = nullptr;
-    }
-    if(m_line_search_decision)
-    {
-        CUDA_SAFE_CALL(cudaFree(m_line_search_decision));
-        m_line_search_decision = nullptr;
-    }
-    if(m_newton_convergence_decision)
-    {
-        CUDA_SAFE_CALL(cudaFree(m_newton_convergence_decision));
-        m_newton_convergence_decision = nullptr;
-    }
-    if(m_ccd_alpha_slots) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_slots)); m_ccd_alpha_slots = nullptr; }
-    if(m_ccd_alpha_invalid) { CUDA_SAFE_CALL(cudaFree(m_ccd_alpha_invalid)); m_ccd_alpha_invalid = nullptr; }
-    if(m_ccd_refined_invalid)
-    {
-        CUDA_SAFE_CALL(cudaFree(m_ccd_refined_invalid));
-        m_ccd_refined_invalid = nullptr;
-    }
-    if(_dcd_ccd_snapshot) { CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot)); _dcd_ccd_snapshot = nullptr; }
+    release(m_energy_slots);
+    release(m_line_search_energy);
+    release(m_compatibility_energy);
+    release(m_line_search_decision);
+    release(m_newton_convergence_decision);
+    release(m_ccd_alpha_slots);
+    release(m_ccd_alpha_invalid);
+    release(m_ccd_refined_invalid);
+    release(_dcd_ccd_snapshot);
     m_dcd_snap_count = 0; m_dcd_snap_cap = 0;
-    if(m_ground_trial_invalid)
-    {
-        CUDA_SAFE_CALL(cudaFree(m_ground_trial_invalid));
-        m_ground_trial_invalid = nullptr;
-    }
-    if(m_env_ground_trial_invalid)
-    {
-        CUDA_SAFE_CALL(cudaFree(m_env_ground_trial_invalid));
-        m_env_ground_trial_invalid = nullptr;
-    }
+    release(m_ground_trial_invalid);
+    release(m_env_ground_trial_invalid);
+
+    // GIPC-owned mode, determinism, material and diagnostic allocations that
+    // are created outside the initial allocator.
+    release(d_env_offset);
+    release(d_bvh_vertexes);
+    release(g_grad_binned);
+    release(d_perenv_face_idx);
+    release(d_perenv_edge_idx);
+    release(d_xenv_lid);
+    release(d_xenv_buf);
+    release(d_face_env);
+    release(d_edge_env);
+    release(d_face_localid);
+    release(d_edge_localid);
+    release(d_face_v0);
+    release(d_edge_v0);
+    release(m_d_vloc);
+    release(d_env_bbox2);
+    release(m_kappa_group);
+    release(m_d_close_grp);
+    release(d_vert_mu);
+    release(d_vert_mu_gd);
 
     pcg_data.FREE_DEVICE_MEM();
 
@@ -497,6 +530,11 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
 GIPC::~GIPC()
 {
+    // The auxiliary detector consumes both GIPC-owned buffers and pointers
+    // borrowed from device_TetraData. Complete its work before destroying
+    // events/stream or releasing either ownership domain during Engine reset.
+    if(m_aux_stream)
+        cudaStreamSynchronize(m_aux_stream);
     if(m_aux_done_event)
     {
         cudaEventDestroy(m_aux_done_event);
@@ -1002,4 +1040,3 @@ void GIPC::cfl_largestSpeed_DeviceOut(double* mqueue, double* out_slot)
     CUDA_SAFE_CALL(cudaMemcpyAsync(
         out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
 }
-

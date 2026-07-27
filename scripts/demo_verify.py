@@ -17,10 +17,17 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = Path(os.environ.get("GATE_RESULTS_DIR", os.path.join(ROOT, "gate-results")))
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 QUICK = "quick" in sys.argv[1:]
-MODES = os.environ.get("DEMO_MODES", "merged,strict").split(",")
+MODES = tuple(
+    mode.strip()
+    for mode in os.environ.get("DEMO_MODES", "merged,strict").split(",")
+    if mode.strip()
+)
 ONLY = set(filter(None, os.environ.get("DEMO_ONLY", "").split(",")))
 F = "20" if QUICK else "60"
 # both headless spellings + short trajectory window for the replay family
@@ -66,6 +73,13 @@ DEMOS = {
 
 BAD = re.compile(r"budget exhausted.*nan|abd-kinetic-nan|Traceback|CUDA error", re.I)
 
+def captured_text(value):
+    """Normalize TimeoutExpired output across Python/platform variants."""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value or ""
+
+
 def run(name, mode):
     entry = DEMOS[name]
     script, extra, tmo, marker = entry[:4]
@@ -81,7 +95,9 @@ def run(name, mode):
                            capture_output=True, text=True, timeout=tmo)
         rc, out = p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
-        rc, out = -9, (e.stdout or "") + (e.stderr or "") + "\nTIMEOUT"
+        rc, out = -9, (
+            captured_text(e.stdout) + captured_text(e.stderr) + "\nTIMEOUT"
+        )
     wall = time.perf_counter() - t0
     bad = BAD.findall(out)
     ok = (rc == 0 and not bad and (marker is None or marker in out))
@@ -102,7 +118,10 @@ for name in DEMOS:
         print(f"{name:18s} {mode:8s} {'PASS' if r['ok'] else 'FAIL':4s} "
               f"{r['wall_s']:7.1f}s  {r['why']}", flush=True)
 
-json.dump(results, open(os.path.join(ROOT, "demo_verify_results.json"), "w"), indent=1)
+results_path = RESULTS_DIR / "demo_verify_results.json"
+with results_path.open("w") as handle:
+    json.dump(results, handle, indent=1)
 bad = [r for r in results if not r["ok"]]
+print(f"\nRESULTS -> {results_path}")
 print(f"\nDEMO-VERIFY: {'PASS' if not bad else f'FAIL ({len(bad)}/{len(results)})'}")
 sys.exit(0 if not bad else 1)

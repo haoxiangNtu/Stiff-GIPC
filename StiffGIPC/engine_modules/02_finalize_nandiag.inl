@@ -1,6 +1,19 @@
 void SimEngine::finalize()
 {
     auto& impl = *m_impl;
+    if(impl.finalized)
+        throw LifecycleError(
+            "finalize() called on an already-finalized SimEngine; call "
+            "reset() before building a new scene");
+    if(impl.finalize_failed)
+        throw LifecycleError(
+            "a previous finalize() attempt failed after initialization began; "
+            "call reset() before trying again");
+    if(!impl.cuda_initialized)
+        throw LifecycleError(
+            "finalize() requires successful CUDA initialization");
+    RuntimeOwnerAttempt runtime_attempt(
+        impl.runtime_owner_lease, &impl, impl.finalize_failed);
     impl.apply_config_to_ipc();
 
     // Build ABD system + linear system
@@ -29,12 +42,6 @@ void SimEngine::finalize()
     impl.do_initFEM();
     impl.do_upload_to_gpu();
     impl.do_init_bvh_and_solver();
-
-    impl.finalized = true;
-    std::cout << "[SimEngine] Finalized: "
-              << impl.ipc.vertexNum << " verts, "
-              << impl.ipc.surface_Num << " surface faces, "
-              << impl.ipc.edge_Num << " edges" << std::endl;
 
     // [stitch sanity] Warn if soft_motion_rate (stitch spring stiffness) is
     // large compared to FEM Young modulus and the scene has many stitch
@@ -133,7 +140,6 @@ void SimEngine::finalize()
         const auto& fem_v_vec   = impl.tetMesh.fem_pin_fem_vertex;
         const auto& bid_vec     = impl.tetMesh.fem_pin_abd_body_id;
         const auto& anchor_vec  = impl.tetMesh.fem_pin_abd_anchor;
-        const auto& rest_w_vec  = impl.tetMesh.fem_pin_rest_offset;
 
         std::vector<double3> local_pos(n_pins);
         std::vector<double3> host_verts(impl.tetMesh.vertexNum);
@@ -277,6 +283,13 @@ void SimEngine::finalize()
         printf("[M1+M2+M3.5] %d FEM pins: local_pos transformed, btype=Fixed, "
                "is_pinned_vertex mask + vertex_to_pin_idx uploaded\n", n_pins);
     }
+
+    impl.finalized = true;
+    runtime_attempt.commit();
+    std::cout << "[SimEngine] Finalized: "
+              << impl.ipc.vertexNum << " verts, "
+              << impl.ipc.surface_Num << " surface faces, "
+              << impl.ipc.edge_Num << " edges" << std::endl;
 }
 
 // ======================== step ========================
@@ -472,4 +485,3 @@ static void dump_nan_diagnostics_(int n_tet, int n_v,
     }
     fflush(stdout);
 }
-

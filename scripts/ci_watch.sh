@@ -1,9 +1,8 @@
 #!/bin/bash
 # ============================================================================
-# ci_watch.sh — local CI poller (owner-approved CI item, 2026-07-27).
-# Cron-invoked every 10 min (lock-guarded). For each watched branch: if origin
-# moved, check out the new sha in the DEDICATED CI worktree (never the dev
-# tree), build + run the full armed gate suite, log verdict + notify.
+# ci_watch.sh — optional legacy/manual local poller. It is not installed or
+# scheduled by this repository. For each watched branch: if origin moved,
+# check out the new sha in a dedicated CI worktree, build and run the suite.
 # Usage: ci_watch.sh [--once branch]      (smoke/manual mode)
 # ============================================================================
 set -u

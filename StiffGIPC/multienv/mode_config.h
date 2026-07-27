@@ -7,7 +7,7 @@
 // C++-side SINGLE RUNTIME TRUTH: captured once at finalize (after the python
 // resolver has run), printed at log level >= 1, and coherence-checked so a
 // half-configured bundle warns loudly instead of running silently. Scattered
-// getenv() readers migrate to GIPC::mode_config() incrementally; new code
+// getenv() readers migrate to GIPC::m_mode_config incrementally; new code
 // must read the snapshot, not the environment.
 //
 // Behavior contract: capture reads the SAME env vars the legacy readers read,
@@ -30,10 +30,18 @@ struct ModeConfig
          perenv_par = false;
     // strict extras
     bool ee_canon = false, ee_detgate = false, ccd_canon = false, spmv_det = false;
-    // isolation availability inputs (see isolation.cuh contract)
-    bool perenv_telem = false;
+    // isolation availability and active-mask inputs (see isolation.cuh)
+    bool perenv_telem = false, perenv_mask = false, perenv_mask_dev = false;
 
-    static bool env_on(const char* k) { return std::getenv(k) != nullptr; }
+    // The Python resolver writes explicit "0" overrides for flags that do not
+    // belong to the selected mode. Presence-only checks therefore turn a
+    // disabled flag back on. Keep the snapshot value-aware and accept the
+    // conventional empty/unset/0 spellings as off.
+    static bool env_on(const char* k)
+    {
+        const char* value = std::getenv(k);
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }
 
     static ModeConfig capture_from_env()
     {
@@ -50,8 +58,21 @@ struct ModeConfig
         c.ccd_canon       = env_on("STIFF_CCD_CANON");
         c.spmv_det        = env_on("STIFF_SPMV_DET");
         c.perenv_telem    = env_on("STIFF_PERENV_TELEM");
-        const int strict_extras = c.ee_canon + c.ee_detgate + c.ccd_canon + c.spmv_det;
-        c.mode = c.perenv_alpha ? (strict_extras == 4 ? Strict : Isolated) : Merged;
+        c.perenv_mask     = env_on("STIFF_PERENV_MASK");
+        c.perenv_mask_dev = env_on("STIFF_PERENV_MASK_DEV");
+        const int iso_bundle = c.bvh_envdet + c.perenv_bvh + c.decouple_thresh
+                             + c.pergroup_kappa + c.segmented_pcg
+                             + c.perenv_alpha + c.perenv_par;
+        const int strict_extras =
+            c.ee_canon + c.ee_detgate + c.ccd_canon + c.spmv_det;
+        // Name only complete resolver bundles as isolated/strict.  In
+        // particular, the supported per_env_exit overlay on merged mode turns
+        // on DECOUPLE_THRESH + PERENV_ALPHA (+ mask/telemetry), but it does not
+        // promise collision, kappa, or PCG isolation and must not be reported
+        // (or checkpointed) as the isolated tier.
+        c.mode = iso_bundle == 7
+                   ? (strict_extras == 4 ? Strict : Isolated)
+                   : Merged;
         return c;
     }
 
@@ -83,7 +104,14 @@ struct ModeConfig
         }
         const int iso_bundle = bvh_envdet + perenv_bvh + decouple_thresh
                              + pergroup_kappa + segmented_pcg + perenv_alpha + perenv_par;
-        if(iso_bundle != 0 && iso_bundle != 7)
+        // Productized per_env_exit is a deliberate overlay that is also valid
+        // on merged mode.  Mask/telemetry are orthogonal inputs (and may be
+        // explicitly disabled for diagnostics), so recognize the core
+        // DECOUPLE_THRESH + PERENV_ALPHA pair here.
+        const bool exit_overlay =
+            decouple_thresh && perenv_alpha && !bvh_envdet && !perenv_bvh
+            && !pergroup_kappa && !segmented_pcg && !perenv_par;
+        if(iso_bundle != 0 && iso_bundle != 7 && !exit_overlay)
         {
             std::fprintf(stderr,
                          "[mode-config] WARNING: partial isolated bundle (%d/7) — "
@@ -102,10 +130,11 @@ struct ModeConfig
         std::printf("[mode-config] resolved=%s  iso[envdet=%d perenv_bvh=%d "
                     "decouple=%d pergroup_kappa=%d seg_pcg=%d perenv_alpha=%d "
                     "par=%d]  strict[ee_canon=%d detgate=%d ccd_canon=%d "
-                    "spmv_det=%d]  telem=%d\n",
+                    "spmv_det=%d]  telem=%d mask=%d mask_dev=%d\n",
                     mode_name(), (int)bvh_envdet, (int)perenv_bvh,
                     (int)decouple_thresh, (int)pergroup_kappa, (int)segmented_pcg,
                     (int)perenv_alpha, (int)perenv_par, (int)ee_canon,
-                    (int)ee_detgate, (int)ccd_canon, (int)spmv_det, (int)perenv_telem);
+                    (int)ee_detgate, (int)ccd_canon, (int)spmv_det,
+                    (int)perenv_telem, (int)perenv_mask, (int)perenv_mask_dev);
     }
 };

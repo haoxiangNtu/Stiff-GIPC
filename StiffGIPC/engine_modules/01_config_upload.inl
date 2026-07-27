@@ -112,7 +112,7 @@ void SimEngine::Impl::do_initFEM()
     // chaos-amplifies → env_0 not batch-SIZE invariant. Under STIFF_DECOUPLE_THRESH recompute meanMass
     // (and meanVolum) as the INTENSIVE per-vertex mean of ONE env (all envs identical, env-major
     // contiguous layout) → N-invariant by construction. Falls back to the global mean if ungrouped.
-    if(getenv("STIFF_DECOUPLE_THRESH") && !tetMesh.body_groups.empty()
+    if(ipc.m_mode_config.decouple_thresh && !tetMesh.body_groups.empty()
        && (int)tetMesh.point_id_to_body_id.size() == tetMesh.vertexNum)
     {
         // env_0's verts = { v : body_groups[point_id_to_body_id[v]] == 0 }. The vertex layout is NOT
@@ -354,11 +354,11 @@ void SimEngine::Impl::do_upload_to_gpu()
                     "set_body_groups: active group ids must be dense [0, N); missing group "
                     + std::to_string(group));
 
-        const bool isolated_features = getenv("STIFF_PERENV_BVH")
-                                    || getenv("STIFF_PERENV_ALPHA")
-                                    || getenv("STIFF_PERGROUP_KAPPA")
-                                    || getenv("STIFF_SEGMENTED_PCG")
-                                    || getenv("STIFF_DECOUPLE_THRESH");
+        const bool isolated_features = ipc.m_mode_config.perenv_bvh
+                                    || ipc.m_mode_config.perenv_alpha
+                                    || ipc.m_mode_config.pergroup_kappa
+                                    || ipc.m_mode_config.segmented_pcg
+                                    || ipc.m_mode_config.decouple_thresh;
         if(isolated_features && (active_group_count == 0 || has_wildcard))
             throw std::invalid_argument(
                 "isolated/strict mode requires every collision body to have a non-negative "
@@ -963,7 +963,7 @@ void SimEngine::Impl::do_init_bvh_and_solver()
 
     // [env-det] enable env-major Morton on the merged BVH so co-located identical envs build
     // env-blocked (mirror) trees ⇒ env-symmetric broad-phase enumeration (the last bit-identity layer).
-    if(getenv("STIFF_BVH_ENVDET") && d_tetMesh.h_groups_present) ipc.enableEnvMajorBVH(d_tetMesh.d_point_to_group);  // [N=1 guard]
+    if(ipc.m_mode_config.bvh_envdet && d_tetMesh.h_groups_present) ipc.enableEnvMajorBVH(d_tetMesh.d_point_to_group);  // [N=1 guard]
     // [multi-env P2] enable per-env BVH EAGERLY (before warm-start buildCP) so the warm-start uses
     // per-env LOCAL trees too — else the warm-start runs the merged path and (at spacing>0) injects
     // the offset-overlap divergence that all later frames inherit. Per-env trees use local verts ⇒
@@ -972,9 +972,9 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     // coherently no-op (exact merged behavior). Warn ONCE so the degradation is
     // never silent (user decision 2026-07-04: fallback + warning, not auto-group).
     if(!d_tetMesh.h_groups_present
-       && (getenv("STIFF_PERENV_BVH") || getenv("STIFF_PERENV_ALPHA")
-           || getenv("STIFF_PERGROUP_KAPPA") || getenv("STIFF_SEGMENTED_PCG")
-           || getenv("STIFF_BVH_ENVDET") || getenv("STIFF_DECOUPLE_THRESH")))
+       && (ipc.m_mode_config.perenv_bvh || ipc.m_mode_config.perenv_alpha
+           || ipc.m_mode_config.pergroup_kappa || ipc.m_mode_config.segmented_pcg
+           || ipc.m_mode_config.bvh_envdet || ipc.m_mode_config.decouple_thresh))
         printf("[multienv] WARNING: isolated/strict features requested but NO body groups declared "
                "(set_body_groups never called) — per-env machinery disabled, running merged-equivalent. "
                "Declare groups (all bodies -> 0 for a single env) to engage per-env paths.\n");
@@ -982,7 +982,8 @@ void SimEngine::Impl::do_init_bvh_and_solver()
     // [N=1 guard] h_groups_present REQUIRED: with the all -1 wildcard table the
     // per-env index excludes EVERY primitive (active=0) -> ZERO self-collision
     // detection -> silently wrong physics (cloth through gripper).
-    if(getenv("STIFF_PERENV_BVH") && d_tetMesh.d_point_to_group && d_tetMesh.h_groups_present)
+    if(ipc.m_mode_config.perenv_bvh && d_tetMesh.d_point_to_group
+       && d_tetMesh.h_groups_present)
     {
         ipc.m_perenv_bvh = true;
         ipc.m_d_p2g = d_tetMesh.d_point_to_group;

@@ -20,8 +20,9 @@
 #include "multienv/mode_config.h"            // [C1] finalize-time mode snapshot
 #include "energy/energy_terms.h"             // [E2] term registry (X-macro)
 
-// [FD gate] result of the finite-difference gradient consistency probe
-// (diagnostics/fd_check.cu; test-only, driven by scripts/fd_gate.py)
+#ifdef GIPC_ENABLE_DIAGNOSTICS
+// Intrusive derivative diagnostics. These declarations and their Python
+// bindings are absent from production builds unless explicitly enabled.
 struct FdCheckResult
 {
     double max_rel  = 0.0;
@@ -32,6 +33,18 @@ struct FdCheckResult
     double p50 = 0.0, p95 = 0.0;
     int    worst_v = -1, worst_axis = -1, n = 0, n_nonfinite = 0;
 };
+struct FdHessianResult
+{
+    double max_rel = 0.0, mean_rel = 0.0, sign = 0.0;
+    double p50 = 0.0, p95 = 0.0;
+    int worst_v = -1, worst_axis = -1, n = 0, n_nonfinite = 0;
+};
+struct FdActivityResult
+{
+    uint32_t fem_tets = 0, triangles = 0, bending_edges = 0, soft = 0;
+    uint32_t contact = 0, ground = 0, friction = 0, ground_friction = 0;
+};
+#endif
 #include "multienv/mode_contract.h"          // [C2] the promise table (doc-only)
 #include <gipc/abd_fem_count_info.h>
 namespace gipc
@@ -45,6 +58,18 @@ class GIPC
 {
   public:
     bool      animation      = false;
+    // Per-engine telemetry/state. These used to be translation-unit globals,
+    // causing one SimEngine to inherit another engine's frame index and
+    // counters (checkpoint soft-target timing included).
+    int       m_total_newton_iters    = 0;
+    int       m_total_frames          = 0;
+    double    m_total_pcg_iters       = 0.0;
+    double    m_total_collision_pairs = 0.0;
+    double    m_max_collision_pairs   = 0.0;
+    double    m_total_time_ms         = 0.0;
+    double    m_phase_time_ms[5]      = {0.0, 0.0, 0.0, 0.0, 0.0};
+    double    m_time_make_pd_ms       = 0.0;
+    bool      m_update_boundary       = false;
     double3*  _vertexes      = nullptr;
     double3*  _rest_vertexes = nullptr;
     // [multi-env determinism 4.1+4.2] per-vertex env offset (default 0). The BVH builds on
@@ -527,7 +552,17 @@ class GIPC
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
     // [FD gate] test-only: central-difference E vs assembled analytic gradient
-    FdCheckResult fd_gradient_check(device_TetraData& TetMesh, double h, int nprobes, unsigned seed);
+#ifdef GIPC_ENABLE_DIAGNOSTICS
+    FdCheckResult fd_gradient_check(device_TetraData& TetMesh,
+                                    double h,
+                                    int nprobes,
+                                    unsigned seed);
+    FdHessianResult fd_hessian_diagonal_check(device_TetraData& TetMesh,
+                                              double h,
+                                              int nprobes,
+                                              unsigned seed);
+    FdActivityResult fd_activity();
+#endif
     // [E2] per-term registry members (defined in each term's energy/ file)
 #define GIPC_ENERGY_TERM_DECL(id, name)                                        \
     int  energy_size_##name();                                                 \
@@ -624,11 +659,9 @@ class GIPC
     std::unique_ptr<gipc::ABDSystem>          m_abd_system;
     std::unique_ptr<gipc::GlobalLinearSystem> m_global_linear_system;
 
-    // [decouple debug] Full-state checkpoint: save/restore the cross-frame persistent state
-    // (FEM vertexes/o_vertexes/velocities/xTilta + ABD q/q_prev/q_v + Kappa) so a mid-trajectory
-    // restart is bit-identical (friction/contact is ephemeral, rebuilt each step from positions).
-    // Enables fast iteration on deep-grasp Hessian-FP debugging: checkpoint frame N once, then
-    // load+step frame N+1 repeatedly instead of replaying frames 0..N each time.
+    // Versioned frame-boundary integrator checkpoint. It restores FEM/ABD
+    // motion, external force, kappa, isolation/quarantine and frame state;
+    // ephemeral contact/friction sets are rebuilt from restored positions.
     void save_checkpoint(device_TetraData& tm, const char* path);
     void load_checkpoint(device_TetraData& tm, const char* path);
 

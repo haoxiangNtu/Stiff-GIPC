@@ -1,6 +1,8 @@
 void SimEngine::step()
 {
     auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError("step() requires a finalized SimEngine");
     cudaSetDevice(impl.cfg.cuda_device);
 
     if(!impl.tetMesh.joint_angle_controls.empty()
@@ -844,15 +846,18 @@ double SimEngine::get_stitch_max_stretch(int pair_start, int pair_count) const
     if(g._vertexes == nullptr || g.targetInd == nullptr
        || g.m_d_stitch_paired_vertex == nullptr)
         return 0.0;
-    // tiny persistent device scalar (8 bytes); allocated once, never freed
-    static double* s_d_out = nullptr;
-    if(s_d_out == nullptr)
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_out, sizeof(double)));
+    if(impl.d_stitch_scalar_out == nullptr)
+        CUDA_SAFE_CALL(
+            cudaMalloc(&impl.d_stitch_scalar_out, sizeof(double)));
     _stitch_max_stretch_kernel<<<1, 256>>>(g._vertexes, g.targetInd,
                                            g.m_d_stitch_paired_vertex,
-                                           pair_start, pair_count, s_d_out);
+                                           pair_start, pair_count,
+                                           impl.d_stitch_scalar_out);
     double h = 0.0;
-    CUDA_SAFE_CALL(cudaMemcpy(&h, s_d_out, sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(&h,
+                              impl.d_stitch_scalar_out,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
     return h;
 }
 
@@ -907,28 +912,41 @@ void SimEngine::get_stitch_max_stretch_batched(const int* h_starts,
     if(g._vertexes == nullptr || g.targetInd == nullptr
        || g.m_d_stitch_paired_vertex == nullptr)
         return;
-    // persistent device buffers (grow on demand; never freed). Holding starts/
-    // counts/out for ALL segments (= all fingers of all envs).
-    static int*    s_d_starts = nullptr;
-    static int*    s_d_counts = nullptr;
-    static double* s_d_out    = nullptr;
-    static int     s_cap      = 0;
-    if(n_seg > s_cap)
+    // Instance-owned, grow-only buffers. Output reserves three doubles per
+    // segment so this storage is shared with the batched contact-force getter.
+    if(n_seg > impl.segment_cap)
     {
-        if(s_d_starts) cudaFree(s_d_starts);
-        if(s_d_counts) cudaFree(s_d_counts);
-        if(s_d_out)    cudaFree(s_d_out);
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_starts, n_seg * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_counts, n_seg * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_out,    n_seg * sizeof(double)));
-        s_cap = n_seg;
+        int*    starts = nullptr;
+        int*    counts = nullptr;
+        double* output = nullptr;
+        CUDA_SAFE_CALL(cudaMalloc(&starts, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&counts, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&output, n_seg * 3 * sizeof(double)));
+        CUDA_SAFE_CALL(cudaFree(impl.d_segment_starts));
+        CUDA_SAFE_CALL(cudaFree(impl.d_segment_counts));
+        CUDA_SAFE_CALL(cudaFree(impl.d_segment_output));
+        impl.d_segment_starts = starts;
+        impl.d_segment_counts = counts;
+        impl.d_segment_output = output;
+        impl.segment_cap      = n_seg;
     }
-    CUDA_SAFE_CALL(cudaMemcpy(s_d_starts, h_starts, n_seg * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(s_d_counts, h_counts, n_seg * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_segment_starts,
+                              h_starts,
+                              n_seg * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_segment_counts,
+                              h_counts,
+                              n_seg * sizeof(int),
+                              cudaMemcpyHostToDevice));
     _stitch_max_stretch_batched_kernel<<<n_seg, 256>>>(
         g._vertexes, g.targetInd, g.m_d_stitch_paired_vertex,
-        s_d_starts, s_d_counts, s_d_out);
-    CUDA_SAFE_CALL(cudaMemcpy(h_out, s_d_out, n_seg * sizeof(double), cudaMemcpyDeviceToHost));
+        impl.d_segment_starts,
+        impl.d_segment_counts,
+        impl.d_segment_output);
+    CUDA_SAFE_CALL(cudaMemcpy(h_out,
+                              impl.d_segment_output,
+                              n_seg * sizeof(double),
+                              cudaMemcpyDeviceToHost));
 }
 
 // [force-control — BATCHED] One block PER segment (= one gripper finger, and for
@@ -987,37 +1005,54 @@ void SimEngine::get_body_contact_force_batched(const int* h_offsets,
     g.buildCP();
     if(g.h_cpNum[0] < 1) return;   // nothing in contact -> all zeros
 
-    static double3* s_d_grad = nullptr;
-    static int      s_grad_cap = 0;
-    if(nv > s_grad_cap)
+    if(nv > impl.contact_gradient_cap)
     {
-        if(s_d_grad) cudaFree(s_d_grad);
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_grad, nv * sizeof(double3)));
-        s_grad_cap = nv;
+        double3* gradient = nullptr;
+        CUDA_SAFE_CALL(cudaMalloc(&gradient, nv * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaFree(impl.d_contact_gradient));
+        impl.d_contact_gradient  = gradient;
+        impl.contact_gradient_cap = nv;
     }
-    CUDA_SAFE_CALL(cudaMemset(s_d_grad, 0, nv * sizeof(double3)));
+    CUDA_SAFE_CALL(
+        cudaMemset(impl.d_contact_gradient, 0, nv * sizeof(double3)));
     g.zeroBinnedGrad();                          // [4.3] calBarrierGradient scatters to binned buf
-    g.calBarrierGradient(s_d_grad, g.Kappa);     // contact force per vertex (→ binned accumulator)
-    g.combineBinnedGrad(s_d_grad);               // [4.3] fold binned contact force into s_d_grad
+    g.calBarrierGradient(impl.d_contact_gradient, g.Kappa);
+    g.combineBinnedGrad(impl.d_contact_gradient);
 
-    static int*    s_d_off = nullptr;
-    static int*    s_d_cnt = nullptr;
-    static double* s_d_out = nullptr;
-    static int     s_cap   = 0;
-    if(n_seg > s_cap)
+    if(n_seg > impl.segment_cap)
     {
-        if(s_d_off) cudaFree(s_d_off);
-        if(s_d_cnt) cudaFree(s_d_cnt);
-        if(s_d_out) cudaFree(s_d_out);
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_off, n_seg * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_cnt, n_seg * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_out, n_seg * 3 * sizeof(double)));
-        s_cap = n_seg;
+        int*    offsets = nullptr;
+        int*    counts  = nullptr;
+        double* output  = nullptr;
+        CUDA_SAFE_CALL(cudaMalloc(&offsets, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&counts, n_seg * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&output, n_seg * 3 * sizeof(double)));
+        CUDA_SAFE_CALL(cudaFree(impl.d_segment_starts));
+        CUDA_SAFE_CALL(cudaFree(impl.d_segment_counts));
+        CUDA_SAFE_CALL(cudaFree(impl.d_segment_output));
+        impl.d_segment_starts = offsets;
+        impl.d_segment_counts = counts;
+        impl.d_segment_output = output;
+        impl.segment_cap      = n_seg;
     }
-    CUDA_SAFE_CALL(cudaMemcpy(s_d_off, h_offsets, n_seg * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(s_d_cnt, h_counts, n_seg * sizeof(int), cudaMemcpyHostToDevice));
-    _contact_force_sum_batched_kernel<<<n_seg, 256>>>(s_d_grad, nv, s_d_off, s_d_cnt, s_d_out);
-    CUDA_SAFE_CALL(cudaMemcpy(h_out3, s_d_out, n_seg * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_segment_starts,
+                              h_offsets,
+                              n_seg * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(impl.d_segment_counts,
+                              h_counts,
+                              n_seg * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    _contact_force_sum_batched_kernel<<<n_seg, 256>>>(
+        impl.d_contact_gradient,
+        nv,
+        impl.d_segment_starts,
+        impl.d_segment_counts,
+        impl.d_segment_output);
+    CUDA_SAFE_CALL(cudaMemcpy(h_out3,
+                              impl.d_segment_output,
+                              n_seg * 3 * sizeof(double),
+                              cudaMemcpyDeviceToHost));
 }
 
 int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_ground,
@@ -1057,26 +1092,31 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
        && !(want_friction && have_friction))
         return nw;   // nothing requested is present -> all zeros
 
-    static double3* s_d_grad = nullptr;
-    static int      s_cap    = 0;
-    if(nv > s_cap)
+    if(nv > impl.contact_gradient_cap)
     {
-        if(s_d_grad) cudaFree(s_d_grad);
-        CUDA_SAFE_CALL(cudaMalloc(&s_d_grad, nv * sizeof(double3)));
-        s_cap = nv;
+        double3* gradient = nullptr;
+        CUDA_SAFE_CALL(cudaMalloc(&gradient, nv * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaFree(impl.d_contact_gradient));
+        impl.d_contact_gradient  = gradient;
+        impl.contact_gradient_cap = nv;
     }
-    CUDA_SAFE_CALL(cudaMemset(s_d_grad, 0, nv * sizeof(double3)));
+    CUDA_SAFE_CALL(
+        cudaMemset(impl.d_contact_gradient, 0, nv * sizeof(double3)));
     g.zeroBinnedGrad();
     if(want_normal)
     {
-        g.calBarrierGradient(s_d_grad, g.Kappa);
+        g.calBarrierGradient(impl.d_contact_gradient, g.Kappa);
         if(include_ground)
-            g.computeGroundGradient(s_d_grad, g.Kappa);
+            g.computeGroundGradient(impl.d_contact_gradient, g.Kappa);
     }
     if(want_friction && have_friction)
-        g.calFrictionGradient(s_d_grad, impl.d_tetMesh);   // lastH set, read-only
-    g.combineBinnedGrad(s_d_grad);
-    CUDA_SAFE_CALL(cudaMemcpy(out3, s_d_grad, (size_t)nw * 3 * sizeof(double),
+        g.calFrictionGradient(impl.d_contact_gradient,
+                              impl.d_tetMesh);  // lastH set, read-only
+    g.combineBinnedGrad(impl.d_contact_gradient);
+    std::vector<double3> engine_order(nv);
+    CUDA_SAFE_CALL(cudaMemcpy(engine_order.data(),
+                              impl.d_contact_gradient,
+                              (size_t)nv * sizeof(double3),
                               cudaMemcpyDeviceToHost));
     // The buffer holds the incremental-potential GRADIENT (dE/dx = -force*dt^2).
     // Physical contact force = -gradient/dt^2 (same convention as the
@@ -1085,15 +1125,39 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
     // regression used |Fy| and hid it. Verified post-fix: resting cube net
     // vertical force = +mg (upward support).
     const double neg_inv_dt2 = -1.0 / (g.IPC_dt * g.IPC_dt);
-    for(int i = 0; i < nw * 3; ++i)
-        out3[i] *= neg_inv_dt2;
+    const auto& perm = impl.tetMesh.vertex_metis_to_input;
+    if(perm.empty() || static_cast<int>(perm.size()) < nv)
+    {
+        for(int i = 0; i < nw; ++i)
+        {
+            out3[3 * i + 0] = engine_order[i].x * neg_inv_dt2;
+            out3[3 * i + 1] = engine_order[i].y * neg_inv_dt2;
+            out3[3 * i + 2] = engine_order[i].z * neg_inv_dt2;
+        }
+    }
+    else
+    {
+        // Match get_vertex_positions(): per-vertex force is user/input ordered.
+        for(int engine_index = 0; engine_index < nv; ++engine_index)
+        {
+            const int input_index = perm[engine_index];
+            if(input_index < 0 || input_index >= nw)
+                continue;
+            out3[3 * input_index + 0] =
+                engine_order[engine_index].x * neg_inv_dt2;
+            out3[3 * input_index + 1] =
+                engine_order[engine_index].y * neg_inv_dt2;
+            out3[3 * input_index + 2] =
+                engine_order[engine_index].z * neg_inv_dt2;
+        }
+    }
     return nw;
 }
 
-// [FEM stress] per-tet Neo-Hookean Cauchy -> von Mises. Plain-double 3x3 math
-// (no __GEIGEN__ device helpers needed). GIPC's stable-NHK per-tet arrays are
-// lengthRate = 4/3 * mu_lame and volumeRate = lambda + 5/6 * mu_lame; recover
-// (mu, lambda) from them so the stress matches the body's actual material.
+// [FEM stress] configured per-tet constitutive law -> first Piola -> Cauchy
+// -> von Mises. Each compile-time model branch must use the same P(F) as its
+// solver energy/gradient path; a generic fallback would silently report a
+// different material law.
 __global__ void _fem_tet_von_mises(const double3* verts, const uint4* tets,
                                    const __GEIGEN__::Matrix3x3d* DmInv,
                                    const double* lengthRate, const double* volumeRate,
@@ -1159,26 +1223,62 @@ __global__ void _fem_tet_von_mises(const double3* verts, const uint4* tets,
         tet_vm[i] = sqrt(1.5 * dd2);
         return;
     }
+#elif defined(USE_SNK2)
+    // Use the same SNK2 first-Piola law as the energy/gradient path, then
+    // convert sigma = P F^T / J. The previous generic standard-NHK fallback
+    // reported stress from a different constitutive law.
+    {
+        __GEIGEN__::Matrix3x3d Fg;
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                Fg.m[r][c] = F[r][c];
+        const double I2 = __GEIGEN__::__squaredNorm(Fg);
+        const auto Pg = __computePEPF_StableNHK3D2_double(
+            Fg, I2, J, lengthRate[i], volumeRate[i]);
+        double s[3][3];
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                s[r][c] = (Pg.m[r][0] * F[c][0]
+                           + Pg.m[r][1] * F[c][1]
+                           + Pg.m[r][2] * F[c][2]) / J;
+        const double tr3 = (s[0][0] + s[1][1] + s[2][2]) / 3.0;
+        s[0][0] -= tr3; s[1][1] -= tr3; s[2][2] -= tr3;
+        double dd = 0.0;
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                dd += s[r][c] * s[r][c];
+        tet_vm[i] = sqrt(1.5 * dd);
+        return;
+    }
+#elif defined(USE_ARAP)
+    // ARAP P(F)=lengthRate*(F-R), with R from the same QR-SVD routine used by
+    // the solver. Do not reuse a neo-Hookean stress formula here.
+    {
+        Eigen::Matrix<double, 3, 3> Fm, U, V;
+        Eigen::Matrix<double, 3, 1> sigma;
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                Fm(r, c) = F[r][c];
+        __GEIGEN__::math::qr_svd(Fm, sigma, U, V);
+        const auto P = computePEPF_ARAP_double(Fm, U, V, lengthRate[i]);
+        double s[3][3];
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                s[r][c] = (P(r, 0) * F[c][0]
+                           + P(r, 1) * F[c][1]
+                           + P(r, 2) * F[c][2]) / J;
+        const double tr3 = (s[0][0] + s[1][1] + s[2][2]) / 3.0;
+        s[0][0] -= tr3; s[1][1] -= tr3; s[2][2] -= tr3;
+        double dd = 0.0;
+        for(int r = 0; r < 3; ++r)
+            for(int c = 0; c < 3; ++c)
+                dd += s[r][c] * s[r][c];
+        tet_vm[i] = sqrt(1.5 * dd);
+        return;
+    }
+#else
+#error "Von Mises export requires a configured tetrahedral constitutive model"
 #endif
-    const double mu_l  = 0.75 * lengthRate[i];
-    const double lam   = volumeRate[i] - (5.0 / 6.0) * mu_l;
-    // Cauchy sigma = mu/J (F F^T - I) + lambda ln(J)/J I  (standard NHK builds)
-    double B[3][3];
-    for(int r = 0; r < 3; ++r)
-        for(int c = 0; c < 3; ++c)
-            B[r][c] = F[r][0] * F[c][0] + F[r][1] * F[c][1] + F[r][2] * F[c][2];
-    const double a = mu_l / J, b = lam * log(J) / J;
-    double s[3][3];
-    for(int r = 0; r < 3; ++r)
-        for(int c = 0; c < 3; ++c)
-            s[r][c] = a * (B[r][c] - (r == c ? 1.0 : 0.0)) + (r == c ? b : 0.0);
-    const double tr3 = (s[0][0] + s[1][1] + s[2][2]) / 3.0;
-    s[0][0] -= tr3; s[1][1] -= tr3; s[2][2] -= tr3;
-    double dd = 0.0;
-    for(int r = 0; r < 3; ++r)
-        for(int c = 0; c < 3; ++c)
-            dd += s[r][c] * s[r][c];
-    tet_vm[i] = sqrt(1.5 * dd);
 }
 
 __device__ inline void _se_atomicMaxPosDouble(double* addr, double val)
@@ -1206,30 +1306,67 @@ int SimEngine::get_fem_von_mises_stress(double* out, int n)
     auto& impl = *m_impl;
     GIPC& g    = impl.ipc;
     int   nv   = static_cast<int>(g.vertexNum);
-    int   nt   = impl.tetMesh.tetrahedraNum;
+    int   tet_offset =
+        static_cast<int>(g.abd_fem_count_info.fem_tet_offset);
+    int   nt = static_cast<int>(g.abd_fem_count_info.fem_tet_num);
     int   nw   = std::min(n, nv);
     if(nw <= 0)
         return 0;
     memset(out, 0, (size_t)nw * sizeof(double));
     if(nt <= 0)
         return nw;
-    static double* s_tet_vm  = nullptr;
-    static double* s_vert_vm = nullptr;
-    static int     s_nt = 0, s_nv = 0;
-    if(nt > s_nt) { if(s_tet_vm) cudaFree(s_tet_vm);
-        CUDA_SAFE_CALL(cudaMalloc(&s_tet_vm, nt * sizeof(double))); s_nt = nt; }
-    if(nv > s_nv) { if(s_vert_vm) cudaFree(s_vert_vm);
-        CUDA_SAFE_CALL(cudaMalloc(&s_vert_vm, nv * sizeof(double))); s_nv = nv; }
-    CUDA_SAFE_CALL(cudaMemset(s_vert_vm, 0, nv * sizeof(double)));
+    if(nt > impl.stress_tet_cap)
+    {
+        double* stress = nullptr;
+        CUDA_SAFE_CALL(cudaMalloc(&stress, nt * sizeof(double)));
+        CUDA_SAFE_CALL(cudaFree(impl.d_stress_tet));
+        impl.d_stress_tet   = stress;
+        impl.stress_tet_cap = nt;
+    }
+    if(nv > impl.stress_vertex_cap)
+    {
+        double* stress = nullptr;
+        CUDA_SAFE_CALL(cudaMalloc(&stress, nv * sizeof(double)));
+        CUDA_SAFE_CALL(cudaFree(impl.d_stress_vertex));
+        impl.d_stress_vertex   = stress;
+        impl.stress_vertex_cap = nv;
+    }
+    CUDA_SAFE_CALL(
+        cudaMemset(impl.d_stress_vertex, 0, nv * sizeof(double)));
     const int bs = 256;
     _fem_tet_von_mises<<<(nt + bs - 1) / bs, bs>>>(
-        impl.d_tetMesh.vertexes, impl.d_tetMesh.tetrahedras,
-        impl.d_tetMesh.DmInverses, impl.d_tetMesh.lengthRate,
-        impl.d_tetMesh.volumeRate, s_tet_vm, nt);
+        impl.d_tetMesh.vertexes,
+        impl.d_tetMesh.tetrahedras + tet_offset,
+        impl.d_tetMesh.DmInverses + tet_offset,
+        impl.d_tetMesh.lengthRate + tet_offset,
+        impl.d_tetMesh.volumeRate + tet_offset,
+        impl.d_stress_tet,
+        nt);
     _fem_scatter_vm_to_verts<<<(nt + bs - 1) / bs, bs>>>(
-        impl.d_tetMesh.tetrahedras, s_tet_vm, s_vert_vm, nt);
-    CUDA_SAFE_CALL(cudaMemcpy(out, s_vert_vm, (size_t)nw * sizeof(double),
+        impl.d_tetMesh.tetrahedras + tet_offset,
+        impl.d_stress_tet,
+        impl.d_stress_vertex,
+        nt);
+    std::vector<double> engine_order(nv);
+    CUDA_SAFE_CALL(cudaMemcpy(engine_order.data(),
+                              impl.d_stress_vertex,
+                              (size_t)nv * sizeof(double),
                               cudaMemcpyDeviceToHost));
+    const auto& perm = impl.tetMesh.vertex_metis_to_input;
+    if(perm.empty() || static_cast<int>(perm.size()) < nv)
+    {
+        std::copy_n(engine_order.begin(), nw, out);
+    }
+    else
+    {
+        // Match get_vertex_positions(): return values indexed in input order.
+        for(int engine_index = 0; engine_index < nv; ++engine_index)
+        {
+            const int input_index = perm[engine_index];
+            if(input_index >= 0 && input_index < nw)
+                out[input_index] = engine_order[engine_index];
+        }
+    }
     return nw;
 }
 
@@ -1917,4 +2054,3 @@ void SimEngine::set_vertex_velocities_gpu(const double* xyz, int count)
     CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.velocities, tmp.data(),
                               n * sizeof(double3), cudaMemcpyHostToDevice));
 }
-

@@ -1,6 +1,7 @@
 #include <linear_system/solver/pcg_solver.h>
 #include <linear_system/linear_system/global_linear_system.h>   // [P3] system_ptr()->m_s4_*
 #include <linear_system/utils/binned_reduce.cuh>                // [P3] exact per-env dot
+#include "multienv/mode_config.h"
 #include <gipc/utils/timer.h>
 #include <gipc/statistics.h>
 #include <cuda_tools/cuda_tools.h>
@@ -598,7 +599,7 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
     // Falls back to scalar PCG only when segmentation is disabled or no groups were declared.
     const int* d2g = nullptr;
     int        ng  = 0;
-    if(getenv("STIFF_SEGMENTED_PCG") && system_ptr())
+    if(ModeConfig::env_on("STIFF_SEGMENTED_PCG") && system_ptr())
     {
         d2g = system_ptr()->m_s4_dof_to_group;
         ng  = system_ptr()->m_s4_ng;
@@ -678,7 +679,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     static int s_graph_env = -1;
     if(s_graph_env < 0)
     { const char* e = getenv("STIFF_PCG_GRAPH"); s_graph_env = e ? atoi(e) : 1; }
-    bool use_graph = s_graph_env && !getenv("STIFF_SPMV_DET")   // [det-gating] graph for ALL non-strict modes (was: required STIFF_FAST_GRAD)
+    bool use_graph = s_graph_env && !ModeConfig::env_on("STIFF_SPMV_DET")   // [det-gating] graph for ALL non-strict modes (was: required STIFF_FAST_GRAD)
                      // STIFF_KSUM intentionally synchronizes inside MAS diagnostics.
                      && !getenv("STIFF_KSUM")
                      && !getenv("STIFF_MAS_FUSE_VALIDATE")
@@ -883,7 +884,8 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     static bool s_seg_binned_set = false;   // [multienv-mode] binned seg-dot only for strict (bit-identity)
     if(!s_seg_binned_set) {
         // [det-gating] binned seg-dot = strict-only (positive gate); STIFF_SEG_BINNED=1 forces.
-        int on = (getenv("STIFF_SPMV_DET") || getenv("STIFF_SEG_BINNED")) ? 1 : 0;
+        int on = (ModeConfig::env_on("STIFF_SPMV_DET")
+                  || ModeConfig::env_on("STIFF_SEG_BINNED")) ? 1 : 0;
         set_seg_binned(on); s_seg_binned_host = on; s_seg_binned_set = true;   // device + host mirror
         // [warp-reduce] DETERMINISM FIX (was: default ON for all modes — WRONG). The per-warp float
         // pre-sum is NOT binned-exact, AND the warp grouping depends on the GLOBAL DOF layout (env k
@@ -1185,7 +1187,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         // changes); the captured body overwrites Ap before consuming it. Work
         // is ordered on the same PTDS stream, so no host synchronization is
         // needed. merged/isolated use the non-binned SpMV and skip this cost.
-        if(getenv("STIFF_SPMV_DET"))
+        if(ModeConfig::env_on("STIFF_SPMV_DET"))
             spmv(p.cview(), Ap.view());
 
         cudaGraph_t dg = nullptr;

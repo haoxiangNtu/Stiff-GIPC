@@ -242,17 +242,17 @@ class GIPCTripletMatrix
     int global_external_max_capcity     = 0;
     int global_internal_capcity         = 0;
 
-    int* d_abd_abd_contact_start_id;
-    int* d_abd_fem_contact_start_id;
-    int* d_fem_abd_contact_start_id;
-    int* d_fem_fem_contact_start_id;
+    int* d_abd_abd_contact_start_id = nullptr;
+    int* d_abd_fem_contact_start_id = nullptr;
+    int* d_fem_abd_contact_start_id = nullptr;
+    int* d_fem_fem_contact_start_id = nullptr;
     // [v0.8.5.1] The converter-published unique count is a persistent solver
     // input. It must never alias a scratch counter: the local-preconditioner
     // DeviceSelect count and the pinned-FEM extension counter both legitimately
     // overwrite their scratch after convert — with the old aliased layout
     // (d_contact_start_block + 4) that clobbered the unique count and a stale
     // host mirror could pick the garbage up (towel-strict OOB, 2026-07-24).
-    int* d_unique_key_number;
+    int* d_unique_key_number = nullptr;
     int* d_assembly_scratch_count = nullptr;
 
     // ②-D2H: one contiguous [5] block (abd_abd, abd_fem, fem_abd, fem_fem,
@@ -275,9 +275,25 @@ class GIPCTripletMatrix
 
     void free_var()
     {
-        CUDA_SAFE_CALL(cudaFree(d_contact_start_block));
-        CUDA_SAFE_CALL(cudaFree(d_unique_key_number));
-        CUDA_SAFE_CALL(cudaFree(d_assembly_scratch_count));
+        if(d_contact_start_block)
+        {
+            CUDA_SAFE_CALL(cudaFree(d_contact_start_block));
+            d_contact_start_block = nullptr;
+            d_abd_abd_contact_start_id = nullptr;
+            d_abd_fem_contact_start_id = nullptr;
+            d_fem_abd_contact_start_id = nullptr;
+            d_fem_fem_contact_start_id = nullptr;
+        }
+        if(d_unique_key_number)
+        {
+            CUDA_SAFE_CALL(cudaFree(d_unique_key_number));
+            d_unique_key_number = nullptr;
+        }
+        if(d_assembly_scratch_count)
+        {
+            CUDA_SAFE_CALL(cudaFree(d_assembly_scratch_count));
+            d_assembly_scratch_count = nullptr;
+        }
     }
 
     int h_abd_abd_contact_start_id = -1;

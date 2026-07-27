@@ -22,6 +22,7 @@ suite; every other STIFF_* var is stripped for the child runs.
 import os
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
@@ -41,19 +42,29 @@ EQ_TOL = 1e-3
 
 
 def run(mode, tag):
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("STIFF_") or k in KEEP}
-    env.update(SCENE_MODE=mode, SCENE_N="2",
-               DUMP_POS=f"/tmp/mode_gate_{tag}.npy", STIFF_LOG_LEVEL="0")
-    p = subprocess.run([sys.executable, os.path.join(ROOT, "scripts/anchor_scene.py")],
-                       env=env, capture_output=True, text=True, timeout=900)
-    lines = p.stdout.splitlines()
-    vh = next((l.split()[1] for l in lines if l.startswith("VHASH")), None)
-    nt = next((int(l.split()[1]) for l in lines if l.startswith("NEWTON")), None)
-    if vh is None or nt is None:
-        sys.stderr.write(p.stdout[-2000:] + p.stderr[-2000:])
-        raise SystemExit(f"mode {mode}: run failed")
-    return vh, nt, np.load(f"/tmp/mode_gate_{tag}.npy")
+    with tempfile.TemporaryDirectory(
+        prefix=f"stiffgipc-mode-gate-{tag}."
+    ) as tmp:
+        dump_path = os.path.join(tmp, "positions.npy")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("STIFF_") or k in KEEP}
+        env.update(SCENE_MODE=mode, SCENE_N="2",
+                   DUMP_POS=dump_path, STIFF_LOG_LEVEL="0")
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "scripts/anchor_scene.py")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        lines = p.stdout.splitlines()
+        vh = next((l.split()[1] for l in lines if l.startswith("VHASH")), None)
+        nt = next((int(l.split()[1]) for l in lines if l.startswith("NEWTON")), None)
+        if vh is None or nt is None:
+            sys.stderr.write(p.stdout[-2000:] + p.stderr[-2000:])
+            raise SystemExit(f"mode {mode}: run failed")
+        positions = np.load(dump_path)
+    return vh, nt, positions
 
 
 res = {}

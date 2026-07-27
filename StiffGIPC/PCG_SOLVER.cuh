@@ -15,8 +15,8 @@
 class PCG_Data
 {
   public:
-    double*                 squeue;
-    double3*                dx;
+    double*                 squeue = nullptr;
+    double3*                dx     = nullptr;
     MASPreconditioner MP;
 
     int P_type = 1;

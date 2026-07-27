@@ -1251,38 +1251,52 @@ void MASPreconditioner::FreeMAS()
 {
     if(totalNodes < 1)
         return;
+    auto release = [](auto*& pointer)
+    {
+        if(pointer)
+        {
+            CUDA_SAFE_CALL(cudaFree(pointer));
+            pointer = nullptr;
+        }
+    };
     // [per-env MAS] env-segmentation scratch (allocated unconditionally in init)
-    CUDA_SAFE_CALL(cudaFree(d_envBase));
-    CUDA_SAFE_CALL(cudaFree(d_envStart));
-    CUDA_SAFE_CALL(cudaFree(d_padTot));
-    CUDA_SAFE_CALL(cudaFree(d_denseLevel));
-    CUDA_SAFE_CALL(cudaFree(d_coarseSpaceTables));
-    CUDA_SAFE_CALL(cudaFree(d_levelSize));
-    CUDA_SAFE_CALL(cudaFree(d_goingNext));
-    CUDA_SAFE_CALL(cudaFree(d_prefixOriginal));
-    CUDA_SAFE_CALL(cudaFree(d_nextPrefix));
-    CUDA_SAFE_CALL(cudaFree(d_nextPrefixSum));
-    CUDA_SAFE_CALL(cudaFree(d_prefixSumOriginal));
-    CUDA_SAFE_CALL(cudaFree(d_fineConnectMask));
-    CUDA_SAFE_CALL(cudaFree(d_nextConnectMask));
-    CUDA_SAFE_CALL(cudaFree(d_neighborList));
-    CUDA_SAFE_CALL(cudaFree(d_neighborListInit));
-    CUDA_SAFE_CALL(cudaFree(d_neighborStart));
-    CUDA_SAFE_CALL(cudaFree(d_neighborStartTemp));
-    CUDA_SAFE_CALL(cudaFree(d_neighborNum));
-    CUDA_SAFE_CALL(cudaFree(d_neighborNumInit));
-    CUDA_SAFE_CALL(cudaFree(d_partId_map_real));
-    CUDA_SAFE_CALL(cudaFree(d_real_map_partId));
+    release(d_envBase);
+    release(d_envStart);
+    release(d_padTot);
+    release(d_denseLevel);
+    release(d_coarseSpaceTables);
+    release(d_coarseTable);
+    release(d_levelSize);
+    release(d_goingNext);
+    release(d_prefixOriginal);
+    release(d_nextPrefix);
+    release(d_nextPrefixSum);
+    release(d_prefixSumOriginal);
+    release(d_fineConnectMask);
+    release(d_nextConnectMask);
+    release(d_neighborList);
+    release(d_neighborListInit);
+    release(d_neighborStart);
+    release(d_neighborStartTemp);
+    release(d_neighborNum);
+    release(d_neighborNumInit);
+    release(d_partId_map_real);
+    release(d_real_map_partId);
 #ifdef SYME
-    CUDA_SAFE_CALL(cudaFree(d_inverseMatMas));
+    release(d_inverseMatMas);
 #else
-    CUDA_SAFE_CALL(cudaFree(d_MatMas));
+    release(d_MatMas);
 #endif
 
-    CUDA_SAFE_CALL(cudaFree(d_precondMatMas));
-    CUDA_SAFE_CALL(cudaFree(d_multiLevelR));
-    CUDA_SAFE_CALL(cudaFree(d_multiLevelZ));
-    if(d_mRbin) CUDA_SAFE_CALL(cudaFree(d_mRbin));
-    if(d_mZbin) CUDA_SAFE_CALL(cudaFree(d_mZbin));
-    if(d_matbin) CUDA_SAFE_CALL(cudaFree(d_matbin));
+    release(d_precondMatMas);
+    release(d_multiLevelR);
+    release(d_multiLevelZ);
+    release(d_mRbin);
+    release(d_mZbin);
+    release(d_matbin);
+    totalNodes = 0;
+    totalMapNodes = 0;
+    totalNumberClusters = 0;
+    m_clusterCap = 0;
+    m_outputClusterCap = 0;
 }

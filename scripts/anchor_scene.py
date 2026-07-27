@@ -8,6 +8,7 @@ changes it. Env knobs: SCENE_N (default 2), SCENE_FRAMES (default 50).
 """
 import os, sys
 import hashlib
+import time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,8 +30,16 @@ for _ in range(N):
     eng.load_mesh("tetMesh/cube.msh", 3, "FEM", tf)
 eng.native.set_body_groups(list(range(N)) * 2)
 eng.finalize()
-for _ in range(int(os.environ.get("SCENE_FRAMES", "50"))):
+for frame in range(int(os.environ.get("SCENE_FRAMES", "50"))):
+    t0 = time.perf_counter()
     eng.step()
+    if os.environ.get("STIFF_BENCH_STATS"):
+        print(
+            f"[bench] frame {frame} newton "
+            f"{eng.native.get_total_newton_iters()} "
+            f"ms {(time.perf_counter() - t0) * 1000.0:.3f}",
+            flush=True,
+        )
 V = np.asarray(eng.get_vertices())
 assert np.isfinite(V).all(), "non-finite!"
 print("VHASH", hashlib.sha256(V.tobytes()).hexdigest()[:16])

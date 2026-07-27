@@ -3,6 +3,13 @@
 // binned-gradient mechanism (g_gbin/_gfxAdd) + the fused
 // _calBarrierGradientAndHessian. WHOLE-FILE relocation of gipc_modules/04
 // (zero reordering); frozen smooth branches inside travel verbatim.
+//
+// COMPOSITE-RESIDENT FOR NOW.  A controlled sm_89 extraction with the same
+// Release flags changed this kernel from 254 registers / 23,832-byte stack /
+// 27,264 SASS instructions to 255 / 33,688 / 29,848 respectively (cuobjdump
+// --dump-resource-usage and --dump-sass --function, 2026-07-27).  That is a
+// 41% stack increase and 9.5% more instructions before runtime noise enters
+// the comparison, so physical TU separation is performance-vetoed.
 // ============================================================================
 __device__ double* g_gbin = nullptr;
 // [multienv-mode] binned (Demmel-Nguyen order-free) gradient is a DETERMINISM feature (strict mode).
@@ -1937,5 +1944,3 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
         }
     }
 }
-
-

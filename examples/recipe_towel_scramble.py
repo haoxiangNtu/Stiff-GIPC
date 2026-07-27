@@ -100,6 +100,9 @@ eng.native.save_checkpoint(OUT_CKPT)
 print(f"[save] {OUT_NPY} + {OUT_CKPT}")
 
 # ---------------- Phase 3: reuse in a fresh engine ----------------
+# Solver buffers are still published through process-global CUDA symbols, so
+# release the first finalized engine before constructing the verification scene.
+eng.reset()
 eng2 = build_scene(tilt, yaw, h)   # same scene graph; state comes from the npy
 target = np.load(OUT_NPY)
 eng2.native.teleport_fem_vertices(target, None)   # rest velocities

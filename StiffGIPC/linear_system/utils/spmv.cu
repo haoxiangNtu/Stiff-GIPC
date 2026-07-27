@@ -1,5 +1,6 @@
 #include <linear_system/utils/spmv.h>
 #include <linear_system/utils/binned_reduce.cuh>
+#include "multienv/mode_config.h"
 #include <muda/launch/launch.h>
 #include <cub/warp/warp_reduce.cuh>
 
@@ -47,7 +48,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
     // memset load) and the combine pass. strict (no FAST_GRAD / SPMV_DET set) keeps the binned path.
     static int s_fast = -1;
     if(s_fast < 0)
-        s_fast = getenv("STIFF_SPMV_DET") ? 0 : 1;   // [det-gating] ybin(order-free y) = strict-only
+        s_fast = ModeConfig::env_on("STIFF_SPMV_DET") ? 0 : 1;   // [det-gating] ybin(order-free y) = strict-only
     const bool fast = (s_fast == 1);
 
     // [multi-env determinism 4.3] grow + zero the binned y accumulator. The matvec deposits
@@ -77,7 +78,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
     // [env-det] when set, deposit each row contribution per-entry (fully order-free) instead of
     // warp-segmented-reducing first — the warp reduce sums in lane order, which differs cross-env
     // for mirror rows at different global triplet positions (the last 1-ULP cross-env seed).
-    bool det = (getenv("STIFF_SPMV_DET") != nullptr);
+    bool det = ModeConfig::env_on("STIFF_SPMV_DET");
 
     // [seg-fused dot] one-shot accumulator pointer (consumed per call; seg_pcg re-sets each iter).
     double* seg_dot = m_seg_dot_partials;

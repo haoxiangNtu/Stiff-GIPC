@@ -295,9 +295,9 @@ class SimEngine
                                   int components = 0);
 
     /// [FEM stress] Per-vertex von Mises stress (Pa) of the current state:
-    /// per-tet Neo-Hookean Cauchy stress -> von Mises -> per-vertex MAX over
-    /// incident tets. Vertices not in any tet (cloth, ABD) get 0. Writes
-    /// min(n, vertexNum) values; returns the number written.
+    /// per-tet Cauchy stress from the configured tetrahedral constitutive law
+    /// -> von Mises -> per-vertex MAX over incident tets. Vertices not in any
+    /// tet (cloth, ABD) get 0. Writes min(n, vertexNum) values.
     int get_fem_von_mises_stress(double* out, int n);
 
     /// [per-env productization] Newton iter at which each env froze last solve
@@ -416,6 +416,9 @@ class SimEngine
     /// stitch springs / joint constraints / etc.
     void get_vertex_positions_host(double* out_xyz, int count) const;
 
+    /// Upload and initialize the scene. Several solver buffers are published
+    /// through process-global CUDA symbols, so only one finalized SimEngine
+    /// may be active per process; reset or destroy it before finalizing another.
     void finalize();
 
     void step();
@@ -530,7 +533,7 @@ class SimEngine
     void teleport_fem_vertices(const double* xyz, int count,
                                const double* velocities = nullptr);
 
-    // ---- full-state checkpoint (deterministic mid-trajectory restart) ----
+    // ---- frame-boundary integrator checkpoint ----
     void save_checkpoint(const std::string& path);
     void load_checkpoint(const std::string& path);
 
@@ -634,8 +637,12 @@ class SimEngine
     double get_max_collision_pairs() const;
     int    get_total_frames_done() const;
     uint64_t get_total_energy_tolerance_accepts() const;
-    // [FD gate] test-only: {max_rel, mean_rel, n, worst_v, worst_axis, sign}
+#ifdef GIPC_ENABLE_DIAGNOSTICS
+    // Intrusive test-only diagnostics; omitted from production builds.
     std::vector<double> debug_fd_gradient_check(double h, int nprobes, unsigned seed);
+    std::vector<double> debug_fd_hessian_check(double h, int nprobes, unsigned seed);
+    std::vector<double> debug_fd_activity();
+#endif
 
 
   private:

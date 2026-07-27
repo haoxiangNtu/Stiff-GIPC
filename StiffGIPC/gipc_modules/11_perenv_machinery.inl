@@ -405,12 +405,10 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
 {
     h_ccd_cpNum.invalidate();  // [3b] swept re-emission ahead
     if(m_skip_all_collision) { h_ccd_cpNum = 0; return; }
-    int NG = m_perenv_bvh_groups;
     double3* sf = bvh_f._vertexes;
     double3* se = bvh_e._vertexes;
     bvh_f._vertexes = _vertexes;
     bvh_e._vertexes = _vertexes;
-    (void)NG;
     // [decouple] PER-ENV CCD search inflation. The global `alpha` (=temp_alpha=min over ALL envs)
     // makes env e's swept-BVH search — and thus its refined-self CCD pair set + hr (refined-self
     // timestep) — depend on the MATES → batch-coupling (the confirmed root: frame0 k=3 hr diverged
@@ -420,7 +418,8 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     // of pairs → hr is the true most-constraining value → refinement KEPT (unlike STIFF_NO_REFINE,
     // which skipped it and caused excessive backtracking). Gated STIFF_DECOUPLE_THRESH.
     const int KNG = m_active_group_count;
-    bool perenv_ta = (getenv("STIFF_DECOUPLE_THRESH") && m_env_scratch && getenv("STIFF_PERENV_ALPHA"));
+    bool perenv_ta = (m_mode_config.decouple_thresh && m_env_scratch
+                      && m_mode_config.perenv_alpha);
     // [de-CPU] ta computed on device (see _compute_perenv_ta) — the per-env launches below read
     // their env's slot via the kernels' alpha_dev param; NO D2H / host loop.
     static double* d_perenv_ta = nullptr;
@@ -437,8 +436,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     // [perenv-parallel #2] STIFF_PERENV_PAR: run the per-env SWEPT (CCD) builds+queries concurrently
     // on the K-stream scratch pool — mirrors the DCD loop. The 6-7ms _selfQuery_*_ccd kernels are
     // occupancy-starved at 1-env size (~25 blocks); overlapping K envs fills the GPU.
-    const char* _ccd_pe_par = getenv("STIFF_PERENV_PAR");   // value-aware (=0 disables)
-    bool ccd_par = _ccd_pe_par && atoi(_ccd_pe_par) != 0;
+    bool ccd_par = m_mode_config.perenv_par;
     int  ccd_K   = 1;
     if(ccd_par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;
                   ccd_K = (int)h_perenv_active.size(); if(ccd_K > cap) ccd_K = cap; if(ccd_K < 1) ccd_K = 1;
@@ -701,7 +699,8 @@ __global__ void _prim_env_e(const uint2* edges, const int* p2g, int* env, int n)
 // P1: group faces/edges by env (host, one-time; topology static) → env-contiguous _active_idx.
 static void _build_perenv_list(const int* d_env, int n, int NG,
                                int*& d_idx, std::vector<int>& off, std::vector<int>& cnt,
-                               const std::vector<uint64_t>* key = nullptr)
+                               const std::vector<uint64_t>* key,
+                               bool canonical_order)
 {
     std::vector<int> h_env(n);
     CUDA_SAFE_CALL(cudaMemcpy(h_env.data(), d_env, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
@@ -716,7 +715,7 @@ static void _build_perenv_list(const int* d_env, int n, int NG,
     // [env-det BVH] order each env's active list by an ENV-LOCAL key so ALL envs share an identical
     // local prim ordering (mirror) ⇒ the per-env Construct sees identical inputs ⇒ identical trees.
     // (default builds in ascending global-prim order, which is NOT env-mirror for co-located envs.)
-    if(key && getenv("STIFF_BVH_ENVDET"))
+    if(key && canonical_order)
         for(int e = 0; e < NG; e++)
         { int s = off[e], c = cnt[e];
           std::sort(idx.begin() + s, idx.begin() + s + c,
@@ -792,7 +791,7 @@ void GIPC::buildPerEnvBVHIndex(int NG, const int* p2g)
     // rank of a vertex among its env's vertices by ascending GLOBAL index (mirror across identical
     // envs, proven by xenvDiff call#0==0). Used to canonicalize the per-env active-list ordering.
     std::vector<uint64_t> fkey, ekey;
-    if(getenv("STIFF_BVH_ENVDET"))
+    if(m_mode_config.bvh_envdet)
     {
         std::vector<int> hp2g(vertexNum);
         CUDA_SAFE_CALL(cudaMemcpy(hp2g.data(), p2g, (size_t)vertexNum * sizeof(int), cudaMemcpyDeviceToHost));
@@ -808,8 +807,12 @@ void GIPC::buildPerEnvBVHIndex(int NG, const int* p2g)
         for(int i=0;i<nF;i++) fkey[i]=pack3(vloc[hf[i].x],vloc[hf[i].y],vloc[hf[i].z]);
         for(int i=0;i<nE;i++){ uint64_t a=vloc[he[i].x],b=vloc[he[i].y]; ekey[i]=(a<b)?((a<<20)|b):((b<<20)|a); }
     }
-    _build_perenv_list(d_fenv, nF, NG, d_perenv_face_idx, h_perenv_face_off, h_perenv_face_cnt, fkey.empty()?nullptr:&fkey);
-    _build_perenv_list(d_eenv, nE, NG, d_perenv_edge_idx, h_perenv_edge_off, h_perenv_edge_cnt, ekey.empty()?nullptr:&ekey);
+    _build_perenv_list(d_fenv, nF, NG, d_perenv_face_idx,
+                       h_perenv_face_off, h_perenv_face_cnt,
+                       fkey.empty() ? nullptr : &fkey, m_mode_config.bvh_envdet);
+    _build_perenv_list(d_eenv, nE, NG, d_perenv_edge_idx,
+                       h_perenv_edge_off, h_perenv_edge_cnt,
+                       ekey.empty() ? nullptr : &ekey, m_mode_config.bvh_envdet);
     CUDA_SAFE_CALL(cudaFree(d_fenv));
     CUDA_SAFE_CALL(cudaFree(d_eenv));
     int tf = 0, te = 0;
@@ -830,6 +833,7 @@ void GIPC::buildPerEnvBVHIndex(int NG, const int* p2g)
 void GIPC::allocPerEnvPool(int K)
 {
     if(m_pool_K >= K) return;
+    const int old_K = m_pool_K;
     int nF = (int)bvh_f.face_number, nE = (int)bvh_e.edge_number;
     m_pool_f.resize(K); m_pool_e.resize(K);
     // [perenv-parallel #2] per-slot cub sort scratch, pre-sized to the FULL prim count so the
@@ -868,7 +872,7 @@ void GIPC::allocPerEnvPool(int K)
             allocSort(s, nE); }
     }
     m_pool_streams.resize(K);
-    for(int k = 0; k < K; ++k) CUDA_SAFE_CALL(cudaStreamCreate(&m_pool_streams[k]));
+    for(int k = old_K; k < K; ++k)
+        CUDA_SAFE_CALL(cudaStreamCreate(&m_pool_streams[k]));
     m_pool_K = K;
 }
-

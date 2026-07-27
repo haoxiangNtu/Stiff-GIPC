@@ -216,15 +216,54 @@ _MULTIENV_MODE_ALIASES = {
 }
 
 
-# [audit v0.8.5.1] os.environ.setdefault is PROCESS-global: with two Engines in
-# one process, flags set for the first silently leaked into the second (e.g.
-# Engine(strict) then Engine(merged) ran the second engine with strict flags).
-# Track exactly the key:value pairs THIS module set — per feature group, so the
-# mode flags and the per_env_exit flags retract independently — and retract only
-# ours: user-set or user-modified env vars are never touched (an explicit
-# STIFF_* env var still always wins).
+# STIFF_* controls are process-global and several native hot paths cache them on
+# first use.  Track the values the wrapper owns so repeated Engines in the SAME
+# mode are idempotent, and lock the native mode after the first Engine: changing
+# modes in one process used to mix cached and live flags and can corrupt CUDA
+# graph execution.  Cross-mode comparisons must use subprocesses.
 _MODE_FLAGS_SET_BY_US: dict = {}
 _PEE_FLAGS_SET_BY_US: dict = {}
+_PROCESS_MULTIENV_MODE: str | None = None
+_PROCESS_PER_ENV_EXIT: bool | None = None
+_PROCESS_MODE_SIGNATURE: tuple[tuple[str, str | None], ...] | None = None
+_PER_ENV_EXIT_FLAGS = (
+    "STIFF_DECOUPLE_THRESH",
+    "STIFF_PERENV_ALPHA",
+    "STIFF_PERENV_MASK",
+    "STIFF_PERENV_TELEM",
+)
+_MODE_SIGNATURE_KEYS = tuple(
+    sorted(
+        set(
+            _MULTIENV_ISOLATED_FLAGS
+            + _MULTIENV_STRICT_EXTRA
+            + _MULTIENV_ISOLATED_ONLY
+            + list(_PER_ENV_EXIT_FLAGS)
+            + ["STIFF_EE_LB", "STIFF_PERENV_MASK_DEV"]
+        )
+    )
+)
+
+
+def _env_enabled(key: str) -> bool:
+    """Return whether a low-level feature flag is explicitly enabled."""
+    value = os.environ.get(key)
+    return value is not None and value != "" and not value.startswith("0")
+
+
+def _mode_signature() -> tuple[tuple[str, str | None], ...]:
+    return tuple((key, os.environ.get(key)) for key in _MODE_SIGNATURE_KEYS)
+
+
+def _assert_process_mode_signature() -> None:
+    if (
+        _PROCESS_MODE_SIGNATURE is not None
+        and _mode_signature() != _PROCESS_MODE_SIGNATURE
+    ):
+        raise _C.LifecycleError(
+            "process-scoped STIFF_* mode flags changed after the first "
+            "Engine was created. Restore them or start a new subprocess."
+        )
 
 
 def _setdefault_tracked(registry: dict, key: str, value: str) -> None:
@@ -247,9 +286,10 @@ def _retract_our_flags(registry: dict, keep: set = frozenset()) -> None:
 def resolve_multienv_mode(mode: str = "merged") -> str:
     """Set the STIFF_* env flags for the requested multi-env mode (setdefault, so
     explicit STIFF_* env vars win). STIFF_MULTIENV_MODE overrides `mode`. Returns
-    the canonical mode name. Idempotent; safe to call once per Engine. Flags this
-    module itself set for a PREVIOUS mode in the same process are retracted first
-    (multi-Engine processes no longer leak the first engine's mode into the next)."""
+    the canonical mode name. Idempotent for repeated Engines in one mode.
+
+    Native kernels cache some STIFF_* values, so :class:`Engine` rejects a
+    cross-mode switch in the same process before calling this resolver."""
     import os
     raw = os.environ.get("STIFF_MULTIENV_MODE", mode)
     canon = _MULTIENV_MODE_ALIASES.get(str(raw).strip().lower())
@@ -421,41 +461,91 @@ class Engine:
     """
 
     def __init__(self, config: Optional[Config] = None):
-        self._engine = _C.SimEngine()
         self._config = config or Config()
         # Resolve the multi-env mode → STIFF_* flags BEFORE any load/finalize/step, so the
         # gated engine paths (finalize meanMass, per-frame κ/BVH/PCG) see them. Env vars win.
-        self.multienv_mode = resolve_multienv_mode(getattr(self._config, "multienv_mode", "merged"))
-        if getattr(self._config, "per_env_exit", False):
+        requested_mode = os.environ.get(
+            "STIFF_MULTIENV_MODE",
+            getattr(self._config, "multienv_mode", "merged"),
+        )
+        canonical_mode = _MULTIENV_MODE_ALIASES.get(
+            str(requested_mode).strip().lower()
+        )
+        if canonical_mode is None:
+            raise ValueError(
+                f"unknown multienv_mode {requested_mode!r}; "
+                "use merged/isolated/strict (or 0/1/2)"
+            )
+        requested_per_env_exit = bool(
+            getattr(self._config, "per_env_exit", False)
+        )
+        global _PROCESS_MULTIENV_MODE
+        global _PROCESS_PER_ENV_EXIT
+        global _PROCESS_MODE_SIGNATURE
+        if (
+            _PROCESS_MULTIENV_MODE is not None
+            and canonical_mode != _PROCESS_MULTIENV_MODE
+        ):
+            raise _C.LifecycleError(
+                "multi-environment mode is process-scoped: this process "
+                f"already initialized {_PROCESS_MULTIENV_MODE!r}, then requested "
+                f"{canonical_mode!r}. Run different modes in separate subprocesses."
+            )
+        if (
+            _PROCESS_PER_ENV_EXIT is not None
+            and requested_per_env_exit != _PROCESS_PER_ENV_EXIT
+        ):
+            raise _C.LifecycleError(
+                "per_env_exit is process-scoped: this process already "
+                f"initialized per_env_exit={_PROCESS_PER_ENV_EXIT}, then "
+                f"requested {requested_per_env_exit}. Use a separate subprocess."
+            )
+        if (
+            _PROCESS_MODE_SIGNATURE is not None
+            and _mode_signature() != _PROCESS_MODE_SIGNATURE
+        ):
+            raise _C.LifecycleError(
+                "process-scoped STIFF_* mode flags changed after the first "
+                "Engine was created. Restore them or start a new subprocess."
+            )
+        self.multienv_mode = resolve_multienv_mode(canonical_mode)
+        if requested_per_env_exit:
             # [per-env exit] productized switch — see Config docstring. Tracked
             # setdefault so explicitly-set env vars (incl. "0" overrides) still
-            # win, AND a later Engine(per_env_exit=False) in the same process
-            # retracts these instead of silently inheriting them.
-            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_DECOUPLE_THRESH", "1")
-            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_PERENV_ALPHA", "1")
-            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_PERENV_MASK", "1")
+            # win. The process lock above rejects a later Engine with a
+            # different per_env_exit setting.
+            for flag in _PER_ENV_EXIT_FLAGS:
+                _setdefault_tracked(_PEE_FLAGS_SET_BY_US, flag, "1")
             # telemetry (per-env iters/status, NaN quarantine) lives in the host
             # S1 path — make it part of the productized switch. Set
             # STIFF_PERENV_TELEM=0 explicitly to opt back into the zero-D2H
             # device fast path (no telemetry).
-            _setdefault_tracked(_PEE_FLAGS_SET_BY_US, "STIFF_PERENV_TELEM", "1")
         else:
-            # per_env_exit=False: retract only flags WE set for a previous
-            # engine in this process (user-set env vars are untouched).
+            # First Engine with per_env_exit=False retracts only wrapper-owned
+            # setup left by an explicit resolver call; user flags remain.
             _retract_our_flags(_PEE_FLAGS_SET_BY_US)
         # [audit] half-configuration traps (documented in the engine): warn
         # loudly instead of running with silently-degraded semantics.
-        if os.environ.get("STIFF_DECOUPLE_THRESH") and not os.environ.get("STIFF_PERENV_ALPHA"):
+        if _env_enabled("STIFF_DECOUPLE_THRESH") and not _env_enabled("STIFF_PERENV_ALPHA"):
             print("[stiff-physics][WARN] STIFF_DECOUPLE_THRESH without "
                   "STIFF_PERENV_ALPHA: per-env freezing cannot run, so the Newton "
                   "loop runs to its iteration cap EVERY frame (worse than default). "
                   "Set both, or use multienv_mode='isolated'/'strict'.")
-        if os.environ.get("STIFF_PERGROUP_KAPPA") and not os.environ.get("STIFF_DECOUPLE_THRESH"):
+        if _env_enabled("STIFF_PERGROUP_KAPPA") and not _env_enabled("STIFF_DECOUPLE_THRESH"):
             print("[stiff-physics][WARN] STIFF_PERGROUP_KAPPA without "
                   "STIFF_DECOUPLE_THRESH: per-group kappa is only a broadcast of "
                   "the global kappa (stub) — environments are NOT kappa-isolated.")
-        self._engine.set_config(self._config.native)
-        self._engine.init_cuda()
+        signature = _mode_signature()
+        native_engine = _C.SimEngine()
+        native_engine.set_config(self._config.native)
+        native_engine.init_cuda()
+        self._engine = native_engine
+        # Commit the process lock only after native construction and CUDA
+        # initialization succeed. A failed constructor must not poison all
+        # later Engine attempts in this Python process.
+        _PROCESS_MULTIENV_MODE = canonical_mode
+        _PROCESS_PER_ENV_EXIT = requested_per_env_exit
+        _PROCESS_MODE_SIGNATURE = signature
         self._finalized = False
 
     @property
@@ -643,6 +733,8 @@ class Engine:
         and is decoupled from the block-diagonal solve (contact filtering only).
         env id < 0 = shared geometry that collides with every env. May be called
         any time after finalize(); the device array is (re)uploaded on each call.
+        The underlying CUDA symbol is process-scoped, so only one Engine may own
+        this optional filter at a time. Pass an empty sequence to release it.
         """
         self._engine.set_vertex_env_ids([int(e) for e in env_ids])
 
@@ -885,12 +977,19 @@ class Engine:
         return self._engine.get_vertex_position_host(idx)
 
     def finalize(self) -> None:
-        """Finalize the scene: compute FEM data, upload to GPU, build BVH."""
+        """Finalize the scene: compute FEM data, upload to GPU, build BVH.
+
+        Only one finalized Engine may be active in a process because legacy
+        solver buffers are still published through process-global CUDA symbols.
+        Reset or destroy it before finalizing another Engine.
+        """
+        _assert_process_mode_signature()
         self._engine.finalize()
         self._finalized = True
 
     def step(self) -> None:
         """Advance simulation by one timestep (dt)."""
+        _assert_process_mode_signature()
         self._engine.step()
         # [release gate] STIFF_ITER_LOG=1: per-frame Newton-iteration telemetry
         # for ANY example without touching the example (peak / anomaly audits).
@@ -924,6 +1023,30 @@ class Engine:
         """
         self._engine.reset()
         self._finalized = False
+
+    def save_checkpoint(self, path: str | os.PathLike) -> None:
+        """Atomically save a versioned, checksummed frame-boundary checkpoint.
+
+        The destination is replaced only after the complete checkpoint has
+        reached disk. Invalid/non-finite live state raises ``CheckpointError``.
+        """
+        if not self._finalized:
+            raise _C.LifecycleError(
+                "save_checkpoint requires a finalized Engine"
+            )
+        self._engine.save_checkpoint(os.fspath(path))
+
+    def load_checkpoint(self, path: str | os.PathLike) -> None:
+        """Load a checkpoint for this exact scene/material/mode configuration.
+
+        Format, checksum, topology and finite-value validation all finish
+        before live GPU state is changed.
+        """
+        if not self._finalized:
+            raise _C.LifecycleError(
+                "load_checkpoint requires a finalized Engine"
+            )
+        self._engine.load_checkpoint(os.fspath(path))
 
     # ---- State queries ----
 
@@ -1160,8 +1283,8 @@ class Engine:
         return np.asarray(self._engine.get_vertex_contact_forces(include_ground, comp))
 
     def get_fem_von_mises_stress(self) -> np.ndarray:
-        """Per-vertex von Mises stress (Pa): per-tet Neo-Hookean Cauchy stress,
-        max-scattered to vertices. Non-tet vertices (cloth/ABD) are 0."""
+        """Per-vertex von Mises stress (Pa) for the configured tetrahedral
+        constitutive law. Non-tet vertices (cloth/ABD) are 0."""
         return np.asarray(self._engine.get_fem_von_mises_stress())
 
     def get_per_env_newton_iters(self) -> np.ndarray:

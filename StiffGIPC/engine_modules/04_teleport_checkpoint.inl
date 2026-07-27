@@ -122,16 +122,17 @@ const BodyLoadRecord& SimEngine::get_load_record(int idx) const
 
 
 // ======================== Per-step counters (perf debugging) ========================
-// [phase4] counters declared ONCE in core/solver_stats.h (defined in
-// core/ipc_solver.inl) — no hand-rolled externs here.
-#include "core/solver_stats.h"
-
 namespace gipc {
-int    SimEngine::get_total_newton_iters() const     { return totalNT; }
-double SimEngine::get_total_pcg_iters() const        { return total_Cg_count; }
-double SimEngine::get_total_collision_pairs() const  { return totalCollisionPairs; }
-double SimEngine::get_max_collision_pairs() const    { return maxCOllisionPairNum; }
-int    SimEngine::get_total_frames_done() const      { return total_Frames; }
+int    SimEngine::get_total_newton_iters() const
+{ return m_impl->ipc.m_total_newton_iters; }
+double SimEngine::get_total_pcg_iters() const
+{ return m_impl->ipc.m_total_pcg_iters; }
+double SimEngine::get_total_collision_pairs() const
+{ return m_impl->ipc.m_total_collision_pairs; }
+double SimEngine::get_max_collision_pairs() const
+{ return m_impl->ipc.m_max_collision_pairs; }
+int    SimEngine::get_total_frames_done() const
+{ return m_impl->ipc.m_total_frames; }
 uint64_t SimEngine::get_total_energy_tolerance_accepts() const
 {
     return m_impl->ipc.energy_tolerance_accept_count;
@@ -139,15 +140,22 @@ uint64_t SimEngine::get_total_energy_tolerance_accepts() const
 
 void SimEngine::save_checkpoint(const std::string& path)
 {
+    if(!m_impl->finalized)
+        throw LifecycleError(
+            "save_checkpoint() requires a finalized SimEngine");
     m_impl->ipc.save_checkpoint(m_impl->d_tetMesh, path.c_str());
 }
 
 void SimEngine::load_checkpoint(const std::string& path)
 {
+    if(!m_impl->finalized)
+        throw LifecycleError(
+            "load_checkpoint() requires a finalized SimEngine");
     m_impl->ipc.load_checkpoint(m_impl->d_tetMesh, path.c_str());
 }
 }  // namespace gipc
 
+#ifdef GIPC_ENABLE_DIAGNOSTICS
 namespace gipc {
 std::vector<double> SimEngine::debug_fd_gradient_check(double h, int nprobes, unsigned seed)
 {
@@ -155,4 +163,20 @@ std::vector<double> SimEngine::debug_fd_gradient_check(double h, int nprobes, un
     return {r.max_rel, r.mean_rel, (double)r.n, (double)r.worst_v,
             (double)r.worst_axis, r.sign, r.p50, r.p95, (double)r.n_nonfinite};
 }
+
+std::vector<double> SimEngine::debug_fd_hessian_check(double h, int nprobes, unsigned seed)
+{
+    auto r = m_impl->ipc.fd_hessian_diagonal_check(m_impl->d_tetMesh, h, nprobes, seed);
+    return {r.max_rel, r.mean_rel, (double)r.n, (double)r.worst_v,
+            (double)r.worst_axis, r.sign, r.p50, r.p95, (double)r.n_nonfinite};
+}
+
+std::vector<double> SimEngine::debug_fd_activity()
+{
+    auto r = m_impl->ipc.fd_activity();
+    return {(double)r.fem_tets, (double)r.triangles, (double)r.bending_edges,
+            (double)r.soft, (double)r.contact, (double)r.ground,
+            (double)r.friction, (double)r.ground_friction};
+}
 }  // namespace gipc
+#endif

@@ -1,32 +1,177 @@
-#!/bin/bash
-# ============================================================================
-# pre-push — verification AT PUSH TIME (owner directive 2026-07-27: no
-# background polling; gates run exactly when a version is really pushed).
+#!/usr/bin/env bash
+# Validate the exact commits about to be pushed. Branch refs receive the full
+# suite; any tag ref upgrades its target commit to the heavy release suite.
 #
-#   branch push  -> full ARMED 12-segment suite (verify_gates.sh, ~25 min)
-#   tag push     -> the HEAVY pack too (FD gate + 19-demo sweep + 3-mode
-#                   matrix + sanitizer) — tags are release moments
-#   escape hatch -> SKIP_GATES=1 git push   (emergencies only, logged)
-# Push is BLOCKED on any failure.
-# ============================================================================
-set -u
-[ "${SKIP_GATES:-}" = "1" ] && { echo "[pre-push] SKIP_GATES=1 — gates bypassed (logged)"; exit 0; }
-ROOT="$(git rev-parse --show-toplevel)"
-cd "$ROOT" || exit 1
+# Install with scripts/install_hooks.sh. The installer copies this hook into
+# the common git directory so it also runs from older linked worktrees.
+set -euo pipefail
+umask 077
 
-has_tag=0
+REQUIRED_PROTOCOL=2
+REMOTE_NAME="${1:-unknown}"
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+LOG_ROOT="$COMMON_DIR/gate-logs"
+mkdir -p "$LOG_ROOT"
+
+ACTIVE_SOURCE_DIR=""
+ACTIVE_RUN_ROOT=""
+cleanup_active_validator()
+{
+    if [ -n "$ACTIVE_SOURCE_DIR" ]; then
+        git worktree remove --force "$ACTIVE_SOURCE_DIR" >/dev/null 2>&1 ||
+            rmdir "$ACTIVE_SOURCE_DIR" 2>/dev/null || true
+    fi
+    if [ -n "$ACTIVE_RUN_ROOT" ]; then
+        rmdir "$ACTIVE_RUN_ROOT" 2>/dev/null || true
+    fi
+}
+trap cleanup_active_validator EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+declare -A TIERS LABELS
+declare -a PUSHED_REFS
+VALIDATION_COUNT=0
+
 while read -r local_ref local_sha remote_ref remote_sha; do
-    case "$remote_ref" in refs/tags/*) has_tag=1;; esac
+    PUSHED_REFS+=("$local_ref $local_sha $remote_ref $remote_sha")
+
+    # Deleting a remote ref has no outgoing tree to validate.
+    [[ "$local_sha" =~ ^0+$ ]] && continue
+
+    if ! commit="$(git rev-parse --verify "${local_sha}^{commit}" 2>/dev/null)"; then
+        echo "[pre-push] $local_ref does not resolve to a commit" >&2
+        exit 2
+    fi
+
+    tier=full
+    case "$remote_ref" in
+        refs/tags/*) tier=heavy ;;
+    esac
+    if [ -z "${TIERS[$commit]+present}" ]; then
+        VALIDATION_COUNT=$((VALIDATION_COUNT + 1))
+    fi
+    if [ "${TIERS[$commit]:-}" != "heavy" ]; then
+        TIERS[$commit]="$tier"
+    fi
+    LABELS[$commit]="${LABELS[$commit]:-}${local_ref}->${remote_ref} "
 done
 
-echo "[pre-push] running the armed gate suite (blocking)..."
-bash scripts/verify_gates.sh || { echo "[pre-push] GATES FAILED — push blocked"; exit 1; }
-
-if [ "$has_tag" = 1 ]; then
-    echo "[pre-push] tag push detected — running the heavy release pack..."
-    python3 scripts/fd_gate.py      || { echo "[pre-push] FD gate FAILED — push blocked"; exit 1; }
-    python3 scripts/demo_verify.py  || { echo "[pre-push] demo sweep FAILED — push blocked"; exit 1; }
-    python3 scripts/mode_bench.py   || { echo "[pre-push] mode matrix FAILED — push blocked"; exit 1; }
-    bash scripts/sanitize_anchor.sh || { echo "[pre-push] sanitizer FAILED — push blocked"; exit 1; }
+if [ "${SKIP_GATES:-}" = "1" ]; then
+    stamp="$(date -Is)"
+    {
+        printf '%s remote=%s pid=%s' "$stamp" "$REMOTE_NAME" "$$"
+        for ref_record in "${PUSHED_REFS[@]}"; do
+            read -r local_ref local_sha remote_ref _ <<< "$ref_record"
+            printf ' %s@%s->%s' "$local_ref" "${local_sha:0:12}" "$remote_ref"
+        done
+        printf '\n'
+    } >> "$LOG_ROOT/bypass.log"
+    echo "[pre-push] SKIP_GATES=1 — bypass recorded in $LOG_ROOT/bypass.log"
+    exit 0
 fi
-echo "[pre-push] all green — push proceeds"
+
+if [ "$VALIDATION_COUNT" -eq 0 ]; then
+    echo "[pre-push] no outgoing ref target (deletion or no-op); nothing to validate"
+    exit 0
+fi
+
+# One GPU validation at a time across every worktree of this repository.
+exec 9>"$COMMON_DIR/push-gates.lock"
+if ! flock -w "${GATE_LOCK_TIMEOUT:-7200}" 9; then
+    echo "[pre-push] timed out waiting for $COMMON_DIR/push-gates.lock" >&2
+    exit 2
+fi
+
+validate_commit()
+{
+    local commit=$1 tier=$2
+    local protocol stamp run_id log_dir run_root source_dir rc add_rc
+
+    protocol="$(git show "$commit:scripts/GATE_PROTOCOL_VERSION" 2>/dev/null |
+                tr -d '[:space:]' || true)"
+    if [ "$protocol" != "$REQUIRED_PROTOCOL" ]; then
+        echo "[pre-push] $commit uses gate protocol '${protocol:-missing}'," >&2
+        echo "           required='$REQUIRED_PROTOCOL'; update the branch or use the audited emergency bypass" >&2
+        return 2
+    fi
+
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    run_id="${stamp}-${commit:0:12}-${tier}-$$"
+    log_dir="$LOG_ROOT/$run_id"
+    run_root="$(mktemp -d "${TMPDIR:-/tmp}/stiffgipc-push-gate.XXXXXX")"
+    source_dir="$run_root/source"
+    ACTIVE_RUN_ROOT="$run_root"
+    ACTIVE_SOURCE_DIR="$source_dir"
+    mkdir -p "$log_dir/results"
+
+    {
+        echo "commit=$commit"
+        echo "tier=$tier"
+        echo "refs=${LABELS[$commit]}"
+        echo "remote=$REMOTE_NAME"
+        echo "started=$(date -Is)"
+    } > "$log_dir/metadata.txt"
+
+    echo "[pre-push] validating $commit tier=$tier refs=${LABELS[$commit]}"
+    set +e
+    git worktree add --detach "$source_dir" "$commit" 2>&1 |
+        tee "$log_dir/worktree-add.log"
+    add_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$add_rc" -ne 0 ]; then
+        echo "result=FAIL worktree-add rc=$add_rc" >> "$log_dir/metadata.txt"
+        cleanup_active_validator
+        ACTIVE_SOURCE_DIR=""
+        ACTIVE_RUN_ROOT=""
+        return "$add_rc"
+    fi
+
+    set +e
+    (
+        cd "$source_dir" || exit 2
+        env GATE_LOG_DIR="$log_dir" \
+            GATE_RESULTS_DIR="$log_dir/results" \
+            GATE_BUILD_DIR="$source_dir/build" \
+            GATE_CMAKE_BUILD_TYPE=Release \
+            GATE_FEM_MODEL=SNK1 \
+            bash scripts/run_push_gates.sh "$tier"
+    ) 2>&1 | tee "$log_dir/gates.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+
+    # This is a validator-owned mktemp worktree. Tests may legitimately rewrite
+    # generated tracked caches, so forced removal is confined to this exact path.
+    if ! git worktree remove --force "$source_dir" >> "$log_dir/worktree-remove.log" 2>&1; then
+        echo "[pre-push] warning: could not remove validator worktree $source_dir" >&2
+        rc=2
+    else
+        rmdir "$run_root" 2>/dev/null || true
+        ACTIVE_SOURCE_DIR=""
+        ACTIVE_RUN_ROOT=""
+    fi
+
+    {
+        echo "finished=$(date -Is)"
+        if [ "$rc" -eq 0 ]; then
+            echo "result=PASS"
+        else
+            echo "result=FAIL rc=$rc"
+        fi
+    } >> "$log_dir/metadata.txt"
+    printf '%s %s %s %s %s\n' "$(date -Is)" "$([ "$rc" -eq 0 ] && echo PASS || echo FAIL)" \
+        "$tier" "$commit" "${LABELS[$commit]}" >> "$LOG_ROOT/history.log"
+
+    if [ "$rc" -ne 0 ]; then
+        echo "[pre-push] FAILED; logs retained at $log_dir" >&2
+    else
+        echo "[pre-push] PASS; logs retained at $log_dir"
+    fi
+    return "$rc"
+}
+
+for commit in "${!TIERS[@]}"; do
+    validate_commit "$commit" "${TIERS[$commit]}" || exit $?
+done
+
+echo "[pre-push] every outgoing ref-target commit passed; push proceeds"

@@ -5,18 +5,15 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     h_gpNum.invalidate();
     h_ccd_cpNum.invalidate();
     if(m_skip_all_collision) return;
-    int NG = m_perenv_bvh_groups;
     // point the BVH at LOCAL verts (the whole reason this kills cross-env divergence)
     double3* saved_f = bvh_f._vertexes;
     double3* saved_e = bvh_e._vertexes;
     bvh_f._vertexes = _vertexes;
     bvh_e._vertexes = _vertexes;
-    (void)NG;
     bool skipF = getenv("STIFF_SKIP_F"), skipE = getenv("STIFF_SKIP_E");  // [decomp] per-env skips
     // [perenv-parallel #1] STIFF_PERENV_PAR: run envs concurrently on a K-stream scratch pool.
     // Value-aware (=0 disables) — isolated mode defaults it ON via the Python resolver.
-    const char* _pe_par = getenv("STIFF_PERENV_PAR");
-    bool par = _pe_par && atoi(_pe_par) != 0;
+    bool par = m_mode_config.perenv_par;
     int  K   = 1;
     if(par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;  // concurrency cap
               K = (int)h_perenv_active.size(); if(K > cap) K = cap; if(K < 1) K = 1; allocPerEnvPool(K); }
@@ -1073,4 +1070,3 @@ void compute_H_b(double d, double dHat, double& H)
     double t = d - dHat;
     H = (std::log(d / dHat) * -2.0 - t * 4.0 / d) + 1.0 / (d * d) * (t * t);
 }
-

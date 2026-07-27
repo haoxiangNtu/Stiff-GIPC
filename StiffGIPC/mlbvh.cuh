@@ -65,21 +65,21 @@ struct Node
 class lbvh
 {
   public:
-    uint32_t  vert_number;
-    double3*  _vertexes;
-    AABB*     _bvs;
-    AABB*     _tempLeafBox;
-    Node*     _nodes;
-    uint64_t* _MChash;
-    uint32_t* _indices;
-    int4*     _collisionPair;
-    int4*     _ccd_collisionPair;
-    uint32_t* _cpNum;
-    int*      _MatIndex;
-    uint32_t* _flags;
+    uint32_t  vert_number = 0;
+    double3*  _vertexes = nullptr;
+    AABB*     _bvs = nullptr;
+    AABB*     _tempLeafBox = nullptr;
+    Node*     _nodes = nullptr;
+    uint64_t* _MChash = nullptr;
+    uint32_t* _indices = nullptr;
+    int4*     _collisionPair = nullptr;
+    int4*     _ccd_collisionPair = nullptr;
+    uint32_t* _cpNum = nullptr;
+    int*      _MatIndex = nullptr;
+    uint32_t* _flags = nullptr;
     AABB      scene;
-    int*      _btype;
-    int*      _bodyId;
+    int*      _btype = nullptr;
+    int*      _bodyId = nullptr;
     int*      _collision_skip_matrix = nullptr;  // NxN exclusion matrix (null if none)
     int       _collision_body_count = 0;        // N dimension of exclusion matrix
     // [multi-FEM-bodyid] per-body flag table (size = _collision_body_count).
@@ -126,9 +126,9 @@ class lbvh
 class lbvh_f : public lbvh
 {
   public:
-    uint32_t  face_number;
-    uint3*    _faces;
-    uint32_t* _surfVerts;
+    uint32_t  face_number = 0;
+    uint3*    _faces = nullptr;
+    uint32_t* _surfVerts = nullptr;
 
   public:
     void   init(int*       _bodyID,
@@ -156,9 +156,9 @@ class lbvh_f : public lbvh
 class lbvh_e : public lbvh
 {
   public:
-    double3* _rest_vertexes;
-    uint32_t edge_number;
-    uint2*   _edges;
+    double3* _rest_vertexes = nullptr;
+    uint32_t edge_number = 0;
+    uint2*   _edges = nullptr;
 
   public:
     void   init(int*       _bodyID,

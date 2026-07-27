@@ -5,6 +5,7 @@
 #include <load_mesh.h>
 #include <fstream>
 #include "device_common/debug_probes.h"  // g_gipc_log_level
+#include "errors.h"
 #include <stdexcept>
 
 void GIPC::build_gipc_system(device_TetraData& tet)
@@ -60,7 +61,7 @@ void GIPC::build_gipc_system(device_TetraData& tet)
     // Assets/scene/abd_system_config.json).
     std::ifstream config_in{std::string{config_dir}};
     if(!config_in.is_open())
-        throw std::runtime_error(
+        throw gipc::ConfigurationError(
             "[finalize] required config file missing or unreadable: " + std::string{config_dir}
             + " — the deployment bundle must include Assets/scene/abd_system_config.json"
               " (or set assets_dir to a tree that has it)");
@@ -71,7 +72,9 @@ void GIPC::build_gipc_system(device_TetraData& tet)
     }
     catch(const std::exception& e)
     {
-        throw std::runtime_error("[finalize] failed to parse " + std::string{config_dir} + ": " + e.what());
+        throw gipc::ConfigurationError(
+            "[finalize] failed to parse " + std::string{config_dir}
+            + ": " + e.what());
     }
     
 
