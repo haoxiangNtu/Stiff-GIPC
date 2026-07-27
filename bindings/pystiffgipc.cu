@@ -439,6 +439,8 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_total_collision_pairs", &SimEngine::get_total_collision_pairs)
         .def("get_max_collision_pairs", &SimEngine::get_max_collision_pairs)
         .def("get_total_frames_done", &SimEngine::get_total_frames_done)
+        .def("debug_fd_gradient_check", &SimEngine::debug_fd_gradient_check,
+             py::arg("h") = 1e-6, py::arg("nprobes") = 64, py::arg("seed") = 12345)
         .def("get_total_energy_tolerance_accepts",
              &SimEngine::get_total_energy_tolerance_accepts,
              "Number of final line-search decisions accepted only by the optional "

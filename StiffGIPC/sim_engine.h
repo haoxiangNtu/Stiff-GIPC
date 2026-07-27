@@ -634,6 +634,8 @@ class SimEngine
     double get_max_collision_pairs() const;
     int    get_total_frames_done() const;
     uint64_t get_total_energy_tolerance_accepts() const;
+    // [FD gate] test-only: {max_rel, mean_rel, n, worst_v, worst_axis, sign}
+    std::vector<double> debug_fd_gradient_check(double h, int nprobes, unsigned seed);
 
 
   private:

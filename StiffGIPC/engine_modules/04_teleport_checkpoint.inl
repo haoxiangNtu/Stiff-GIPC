@@ -147,3 +147,12 @@ void SimEngine::load_checkpoint(const std::string& path)
     m_impl->ipc.load_checkpoint(m_impl->d_tetMesh, path.c_str());
 }
 }  // namespace gipc
+
+namespace gipc {
+std::vector<double> SimEngine::debug_fd_gradient_check(double h, int nprobes, unsigned seed)
+{
+    auto r = m_impl->ipc.fd_gradient_check(m_impl->d_tetMesh, h, nprobes, seed);
+    return {r.max_rel, r.mean_rel, (double)r.n, (double)r.worst_v,
+            (double)r.worst_axis, r.sign, r.p50, r.p95, (double)r.n_nonfinite};
+}
+}  // namespace gipc

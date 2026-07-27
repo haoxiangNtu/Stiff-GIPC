@@ -19,6 +19,19 @@
 #include "device_common/mirrors.h"           // [3b] audited host mirrors
 #include "multienv/mode_config.h"            // [C1] finalize-time mode snapshot
 #include "energy/energy_terms.h"             // [E2] term registry (X-macro)
+
+// [FD gate] result of the finite-difference gradient consistency probe
+// (diagnostics/fd_check.cu; test-only, driven by scripts/fd_gate.py)
+struct FdCheckResult
+{
+    double max_rel  = 0.0;
+    double mean_rel = 0.0;
+    double worst_fd = 0.0;
+    double worst_an = 0.0;
+    double sign     = 0.0;
+    double p50 = 0.0, p95 = 0.0;
+    int    worst_v = -1, worst_axis = -1, n = 0, n_nonfinite = 0;
+};
 #include "multienv/mode_contract.h"          // [C2] the promise table (doc-only)
 #include <gipc/abd_fem_count_info.h>
 namespace gipc
@@ -513,6 +526,8 @@ class GIPC
     void computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
+    // [FD gate] test-only: central-difference E vs assembled analytic gradient
+    FdCheckResult fd_gradient_check(device_TetraData& TetMesh, double h, int nprobes, unsigned seed);
     // [E2] per-term registry members (defined in each term's energy/ file)
 #define GIPC_ENERGY_TERM_DECL(id, name)                                        \
     int  energy_size_##name();                                                 \
