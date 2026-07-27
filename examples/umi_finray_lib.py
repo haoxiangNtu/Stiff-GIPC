@@ -617,7 +617,7 @@ def drive_frame(eng, robot, ejs, groups, prep, raw, mode, gstate, P, stitch_seg,
 # ----------------------------------------------------------------------------
 def make_engine(prep, num_envs):
     cfg = Config(
-        dt=0.020, cloth_thickness=1e-3, cloth_young_modulus=1e4, bend_young_modulus=1e3,
+        dt=float(os.environ.get("CASE39_DT", "0.020")), cloth_thickness=1e-3, cloth_young_modulus=1e4, bend_young_modulus=1e3,
         cloth_density=200, strain_rate=100, soft_motion_rate=1e4, poisson_rate=0.49,
         friction_rate=prep["friction"], relative_dhat=1e-3,
         joint_strength_ratio=100.0, revolute_driving_strength_ratio=100.0,
@@ -947,7 +947,19 @@ def run_replay(scene_name, default_envs=1):
         return
 
     import polyscope as ps, polyscope.imgui as psim
-    v = eng.get_vertices(); fa = eng.get_surface_faces()
+    # [display-split] co-located local-frame envs overlap on screen; offset each
+    # env's vertices AT RENDER TIME by the same spacing grid the BVH uses
+    # (physics coordinates untouched). CASE39ME_DISPLAY_SPLIT=0 disables.
+    disp_off = None
+    if local_frame and num_envs > 1 and int(os.environ.get("CASE39ME_DISPLAY_SPLIT", "1")):
+        pg    = np.asarray(eng.native.get_point_groups(), dtype=np.int64)
+        offsD = make_env_offsets(num_envs, spacing)
+        grid  = np.stack([o[:3, 3] for o in offsD]).astype(np.float64)
+        disp_off = grid[np.clip(pg, 0, num_envs - 1)]
+        print(f"[display-split] rendering {num_envs} co-located envs on a spacing={spacing} grid", flush=True)
+    def _disp(vv):
+        return vv + disp_off if disp_off is not None and len(vv) == len(disp_off) else vv
+    v = _disp(eng.get_vertices()); fa = eng.get_surface_faces()
     ps.init(); ps.set_up_dir("y_up"); ps.set_ground_plane_mode("none")
     st = dict(idx=0, run=bool(int(os.environ.get("CASE39ME_AUTOSTART", "0"))), ms=0.,
               mesh=ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)), v=v, f=fa,
@@ -984,7 +996,7 @@ def run_replay(scene_name, default_envs=1):
             mm = st['acc'] / st['nstep']
             print(f"[gui] frame {st['idx']}/{Lmax}  step {st['ms']:.0f}ms  mean {mm:.0f}ms "
                   f"({1000.0/mm:.2f} fps) = {mm/num_envs:.1f} ms/env  envs={num_envs}", flush=True)
-        v = eng.get_vertices(); fa = eng.get_surface_faces()
+        v = _disp(eng.get_vertices()); fa = eng.get_surface_faces()
         if v.shape[0] != st['v'].shape[0] or fa.shape != st['f'].shape:
             st['mesh'] = ps.register_surface_mesh("scene", v, fa, color=(0.6, 0.7, 0.8)); st['v'], st['f'] = v, fa
         else:
