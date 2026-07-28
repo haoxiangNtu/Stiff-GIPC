@@ -9,6 +9,10 @@ class Spmv
 {
   public:
 
+    // d_live: optional device-resident triplet count (B2'-a). When set, the
+    // kernel reads the live count and triplet_count only sizes the grid (pass
+    // the same value for bitwise-identical launches; pass a capacity bound
+    // under graph capture).
     void warp_reduce_sym_spmv(Float                         a,
                               Eigen::Matrix3d*              triplet_values,
                               int*                          row_ids,
@@ -22,7 +26,8 @@ class Spmv
                               // s4_dof_to_group[row]; skip if !s4_active[group].
                               const int*                    s4_active = nullptr,
                               const int*                    s4_dof_to_group = nullptr,
-                              int                           s4_ng = 0);
+                              int                           s4_ng = 0,
+                              const int*                    d_live = nullptr);
     ~Spmv();
 
     // [seg-fused dot] when set (by seg_pcg's fast path), the spmv ALSO accumulates the per-env

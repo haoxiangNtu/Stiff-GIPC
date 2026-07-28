@@ -23,7 +23,8 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                                 muda::DenseVectorView<Float>  y,
                                 const int*                    s4_active,
                                 const int*                    s4_dof_to_group,
-                                int                           s4_ng)
+                                int                           s4_ng,
+                                const int*                    d_live)
 
 {
     using namespace muda;
@@ -93,6 +94,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
              rows  = row_ids,
              cols  = col_ids,
              triplet_count,
+             d_live,
              x = x.viewer().name("x"),
              b = b,
              det = det,
@@ -104,7 +106,10 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
             {
                 using WarpReduceFloat = cub::WarpReduce<Float, warp_size>;
                 auto global_thread_id = blockDim.x * blockIdx.x + threadIdx.x;
-                if(global_thread_id >= triplet_count)
+                // [B2'-a] live device count when armed; identical value to the
+                // host mirror today, so behavior is bitwise-unchanged.
+                const int _live_n = d_live ? *d_live : triplet_count;
+                if(global_thread_id >= _live_n)
                     return;
                 // [multi-env S4] skip triplets whose row env is masked. y[masked]
                 // stays 0 (pre-zeroed when b==0) and masked p is 0 -> result

@@ -289,6 +289,7 @@ void GlobalLinearSystem::spmv(Float                         a,
                                 y,
                                 m_s4_active,        // [S4] skip masked envs' triplets
                                 m_s4_dof_to_group,
-                                m_s4_ng);
+                                m_s4_ng,
+                                gipc_global_triplet->d_unique_key_number);  // [B2'-a]
 }
 }  // namespace gipc
