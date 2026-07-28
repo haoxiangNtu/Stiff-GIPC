@@ -183,3 +183,58 @@ strict/per-env 路径不启用（其管线自带刷新），锚逐位原位。
 ×0.8 trial，精确吻合）；GH 7.88 不变。多 trial 场景收益按 2×trials/iter 放大。
 解锁：trial 决策+溢出已合一读；余 gdCollapse 1/trial（下刀）；B2' 图缓存的
 triplet_count PSV 同法可解；ccd 隐藏族同族。
+
+---
+
+# 手术④战报：gdCollapse 搭乘 decision 读回（2026-07-28）
+
+塌陷响应从 `throwIfGroundDistanceInvalid()` 拆出 `handleGroundCollapse(int)`；
+trial 期 buildCP 跳过 4 字节塌陷回读，`_global_ls_decide` 把 `_gdCollapse`
+写进 status[2]（decision 缓冲 2→3 int，同一次读回捎带），宿主在**同一
+trial**内消费——GeometryError 契约不变，NaN→backtrack 仍是天然前哨。非
+trial 调用者（post-LS buildCP、FEM 包装器）保留即时阻塞校验。
+
+验证：15 段绿，锚 0544461bd82123ae 逐位。towel（空中揉布 gpNum=0）按设计
+无变化（GH 7.88 / ls 8.27）；foldshirt merged N=4 字节指纹：12B×769=新 3-int
+decision 读（延迟激活证明），4B 族 806≈非 trial 人口（trial 期塌陷读若存活
+应翻倍）。
+
+**foldshirt 分解普查的意外收获**（新目标入列）：
+- 48B×2/trial：buildBVH 根 AABB 回读（bvh_f+bvh_e 各一）→ 手术⑥
+- ls_mas_setup 8B×5/iter：多环境 merged 走 MAS 层循环 legacy 分支（手术①只
+  盖单环境）→ 多环境刀的精确账
+- ls_convert 4B×1/iter：triplet_count（B2' 阻塞点实锤）
+- ls_pcg 16B×1/iter：收敛判定（有效等待）
+
+---
+
+# 手术⑤战报：ccd 计数搭乘标量链读回（2026-07-28）
+
+merged buildFullCP 不再阻塞刷新 h_ccd_cpNum：refined min 归约改容量网格+核内
+活计数掩码（**min 精确无舍入 ⇒ 重排网格位级中性**；OOB 线程持恒等元 1.0，
+统一尾部见全网格）；combine 核从设备计数器读配对门并把原始计数写进
+slots[8]（标量链 8→9 double，同一次读回）。**过容量溢出信号=原始原子计数
+本身**（trash 发射也计入，无需借永增计数器）：读回处发现 count>capacity 即
+退回 legacy grow-redo 机器重算 refined 项再重读——子集 alpha 消费前即弃。
+per-env 保留即时刷新；迭代内下游镜像读全部改用捎带值（审计武装收口）。
+
+验证：15 段绿（MIRROR_AUDIT 全程），锚逐位。towel ccd_alpha **6.52→5.69/
+迭代**，4B 刷新族**整族消失**；残余=48B×1.63（swept 根 AABB→⑥）+72B×0.81
+（9-double 标量链=宿主决策读，Phase C 整帧图目标）。GH 对照 7.88 不变。
+
+---
+
+# 手术⑥战报：merged BVH 根 AABB 设备驻留（2026-07-28）
+
+per-env 路径早备好的 `calcMaxBV_async`（设备写 `_bvs[0]`，morton 哈希核本就
+从设备指针读）直接接管 merged Construct/ConstructFullCCD 全部 4 个热站——根
+盒 48B 回读归零。**第一版翻车实录**：宿主 `scene` 成员靠阻塞版 Construct 的
+副作用喂 `GIPC::init()` 的 dHat 推导；副作用一除，不走 getSceneSize 的流程
+init 吃到未初始化值（bboxDiagSize2=1.2e65 → dHat=3.5e29 → 2200 万接触对 →
+OOM/越界，一根线炸 7 段门禁；锚与 foldshirt 恰好走了另一条填充路径而幸免）。
+修复 v2 更本质：init 改为 boot 期单次从设备 `_bvs[0]` 直读根盒，彻底解除对
+构建副作用的暗依赖。
+
+验证：15 段绿，锚 0544461bd82123ae 逐位。towel：**ccd_alpha 5.69→0.81/迭代**
+（=纯 72B 标量链决策读，理论地板）、**line_search 8.25→3.27/迭代**；GH 7.88
+不变（非 bbox 族，下一分解目标）。战役累计：ls 9.87→3.27，ccd 6.52→0.81。

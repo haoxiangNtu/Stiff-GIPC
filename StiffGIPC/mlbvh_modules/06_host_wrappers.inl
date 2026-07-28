@@ -468,7 +468,10 @@ AABB* lbvh_f::getSceneSize()
     calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
 
-    calcMaxBV(_bvs, _tempLeafBox, face_number);
+    // [B3 bbox-async] the init-only entry keeps the blocking reduction and now
+    // also owns the host `scene` mirror (GIPC::init reads it for dHat); the
+    // hot Construct paths never touch the host again.
+    scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
     return _bvs;
 }
 
@@ -496,7 +499,7 @@ double lbvh_f::Construct(cudaStream_t stream)
     calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
+    calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + face_number);
@@ -537,7 +540,7 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
                         _bodyId, _collision_skip_matrix, _collision_body_count,
                         alpha_dev);
-    scene = calcMaxBV(_bvs, _tempLeafBox, face_number);
+    calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + face_number);
@@ -585,7 +588,7 @@ double lbvh_e::Construct(cudaStream_t stream)
     cudaEventRecord(start);*/
     calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
-    scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
+    calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + edge_number);
@@ -643,7 +646,7 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
                         _bodyId, _collision_skip_matrix, _collision_body_count,
                         alpha_dev);
-    scene = calcMaxBV(_bvs, _tempLeafBox, edge_number);
+    calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
                      thrust::device_ptr<uint32_t>(_indices) + edge_number);
