@@ -121,7 +121,9 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
                                                     int*   row_ids,
                                                     int*   col_ids,
                                                     double IPC_dt,
-                                                    int global_hessian_fem_offset);
+                                                    int global_hessian_fem_offset,
+                                                    const int* offset_dev = nullptr,
+                                                    int offset_partial = 0);
 
 
 #ifdef USE_QUADRATIC_BENDING
@@ -234,7 +236,9 @@ __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d*
                                                          int*   row_ids,
                                                          int*   col_ids,
                                                          double strainRate,
-                                                         int global_hessian_fem_offset);
+                                                         int global_hessian_fem_offset,
+                                                         const int* offset_dev = nullptr,
+                                                         int offset_partial = 0);
 
 __global__ void _calculate_triangle_fem_deformationF(__GEIGEN__::Matrix2x2d* trimInverses,
                                                      const double3* vertexes,

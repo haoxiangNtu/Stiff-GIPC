@@ -2189,9 +2189,12 @@ __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d*
                                                          int*   row_ids,
                                                          int*   col_ids,
                                                          double strainRate,
-                                                         int global_hessian_fem_offset)
+                                                         int global_hessian_fem_offset,
+                                                         const int* offset_dev, int offset_partial)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(offset_dev)   // [C-2] see _calculate_fem_gradient_hessian
+        global_offset = *offset_dev + offset_partial;
     if(idx >= triangleNum)
         return;
 
@@ -2392,9 +2395,12 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
                                                     int*   row_ids,
                                                     int*   col_ids,
                                                     double IPC_dt,
-                                                    int global_hessian_fem_offset)
+                                                    int global_hessian_fem_offset,
+                                                    const int* offset_dev, int offset_partial)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(offset_dev)   // [C-2] see _calculate_fem_gradient_hessian
+        global_offset = *offset_dev + offset_partial;
     if(idx >= edgeNum)
         return;
     uint2 edge = edges[idx];

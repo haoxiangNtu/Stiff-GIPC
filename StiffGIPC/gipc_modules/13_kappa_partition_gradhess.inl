@@ -1,12 +1,15 @@
 // [C-2] knob-gated device-offset arming: STIFF_C2_OFFSET_DEV=1 makes the FEM
-// assembly read its triplet offset from the device total (merged path only;
-// per-env keeps host offsets — its count semantics differ). Default off until
-// the Newton-loop graph arms it wholesale. Lambda macro: needs method context.
+// assembly read its triplet offset from the device total. Transitional gate =
+// SINGLE-ENV merged only: the multi-env merged contact accumulation does not
+// match the seeded single-env formula (armed foldshirt N=4 stalled inside the
+// first solve — mis-offset FEM triplets corrupt the Hessian), and per-env has
+// different count semantics outright. Both revert to host offsets (equal
+// values) until the C-2 (3) in-graph recompute covers their formulas.
 #define _c2_offset_dev() \
     ([&]() -> const int* { \
         static int _c2on = -1; \
         if(_c2on < 0) { const char* _e = getenv("STIFF_C2_OFFSET_DEV"); _c2on = _e ? atoi(_e) : 0; } \
-        return (_c2on && !(m_perenv_bvh && m_d_p2g)) ? m_d_contact_triplet_total : nullptr; }())
+        return (_c2on && !m_perenv_bvh && m_active_group_count <= 1) ? m_d_contact_triplet_total : nullptr; }())
 
 // [C-2] contact-segment triplet total, computed from device-resident counts.
 // Mirrors the host accumulation exactly: barrier(live cp 2/3/4) +
@@ -926,7 +929,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                            gipc_global_triplet.block_row_indices(),
                                            gipc_global_triplet.block_col_indices(),
                                            IPC_dt,
-                                           fem_global_hessian_index_offset);
+                                           fem_global_hessian_index_offset,
+                                           _c2_offset_dev(),
+                                           abd_fem_count_info.fem_tet_num * 10);  // [C-2]
 #endif
         gipc_global_triplet.global_triplet_offset += tri_edge_num * 10;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -945,7 +950,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                                 gipc_global_triplet.block_row_indices(),
                                                 gipc_global_triplet.block_col_indices(),
                                                 IPC_dt,
-                                                fem_global_hessian_index_offset);
+                                                fem_global_hessian_index_offset,
+                                                _c2_offset_dev(),
+                                                abd_fem_count_info.fem_tet_num * 10 + tri_edge_num * 10);  // [C-2]
 
         gipc_global_triplet.global_triplet_offset += triangleNum * 6;
 
