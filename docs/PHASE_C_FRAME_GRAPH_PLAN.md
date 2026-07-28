@@ -70,3 +70,19 @@ d_*_contact_start_id[5] 块与 d_unique_key_number（B2'-a）。C-2 路线：
   收敛判定=残差设备归约写 status；κ 更新（postLineSearch close 检查）
   帧内设备化或留图外（先留图外=每迭代一次小同步，C-3 再收）。
 - 验证环不变：build→anchor→套件→towel/foldshirt knob 双态→指纹→推送。
+
+## C-2 核心简化发现（2026-07-28 深读 13 号回填）
+
+offset 累加结构：接触项（barrier 684/700 += f(h_cpNum[2/3/4])、ground 751
++= h_gpNum）之后，FEM 各项偏移 = 接触段总量 + **场景常量步长**
+（fem_tet×10 / tri_edge×10 / tri×6 / softNum）。⇒ 逐迭代可变性坍缩为
+**一个设备标量 `d_contact_triplet_total`**（tiny 核从 _cpNum 槽直算
+c2·M6+c3·M9+c4·M12+gp——无需宿主镜像）：
+- FEM 装配核 +`const int* d_contact_total` 尾参 + 各自常量部分和（烤死安全）；
+- 接触装配核本就按 MatIndex 设备散射 ✓；
+- converter：length 参数（=offset）需容量界+d_live（B2'-a 的
+  d_unique_key_number 已铺路；cub sort/RLE 容量化）；宿主 offset 镜像累加
+  保留（图外消费者：ensure_capacity_preserve/诊断）。
+执行序：①d_contact_total 核+FEM 装配尾参（机械 ~8 核）→ ②converter 容量化
+→ ③Newton WHILE 尾launch 图（LS 子图复用、PCG device-loop 内嵌、κ 更新暂留
+图外）→ 验证环同 C-1。
