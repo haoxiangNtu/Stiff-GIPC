@@ -1005,6 +1005,46 @@ class Engine:
             print(f"[iterlog] fr={fr} newton={total - prev}", flush=True)
             self._iterlog_prev, self._iterlog_frame = total, fr + 1
 
+    # ---- [Phase D] episode residency ----
+    def fetch_obs_async(self, slot: int) -> None:
+        """Queue an async D2H of vertex positions into pinned slot (0/1).
+
+        Never blocks the host: the copy runs on a side stream ordered after
+        the sim work already enqueued. Pair with :meth:`get_obs` on the OTHER
+        slot for a double-buffered episode loop where frame i's observation
+        readback overlaps frame i+1's compute."""
+        self._engine.fetch_obs_async(slot)
+
+    def obs_ready(self, slot: int) -> bool:
+        """Non-blocking: has slot's queued observation copy completed?"""
+        return self._engine.obs_ready(slot)
+
+    def get_obs(self, slot: int, wait: bool = True) -> np.ndarray:
+        """Zero-copy (N, 3) view of pinned observation slot.
+
+        The array aliases engine-owned pinned memory: valid until the next
+        fetch_obs_async on the same slot. Copy if you need to keep it."""
+        return self._engine.get_obs(slot, wait)
+
+    def upload_episode_actions(self, actions: np.ndarray) -> int:
+        """One H2D upload of a whole episode's action array; returns the
+        device pointer (int) for gpu-direct consumers (row arithmetic stays
+        on device — e.g. wrap with warp/cupy and slice per frame)."""
+        return self._engine.upload_episode_actions(
+            np.ascontiguousarray(actions, dtype=np.float64))
+
+    def episode_loop(self, num_frames: int, on_obs=None):
+        """[Phase D] canonical zero-stall episode loop: step -> async obs fetch
+        -> consume PREVIOUS frame's obs while this frame's copy is in flight.
+        on_obs(frame_index, obs_view) is called with a zero-copy view."""
+        for f in range(num_frames):
+            self.step()
+            self.fetch_obs_async(f & 1)
+            if f > 0 and on_obs is not None:
+                on_obs(f - 1, self.get_obs((f - 1) & 1, wait=True))
+        if num_frames > 0 and on_obs is not None:
+            on_obs(num_frames - 1, self.get_obs((num_frames - 1) & 1, wait=True))
+
     def set_log_level(self, level: int) -> None:
         """Control per-frame solver log verbosity.
 

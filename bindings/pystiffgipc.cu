@@ -692,6 +692,23 @@ PYBIND11_MODULE(pystiffgipc, m)
         })
 
         .def("get_vertex_count",          &SimEngine::get_vertex_count)
+        // ---- [Phase D] episode residency primitives ----
+        .def("fetch_obs_async", &SimEngine::fetch_obs_async, py::arg("slot"),
+             "Queue an async D2H of the vertex buffer into pinned slot (0/1); never blocks.")
+        .def("obs_ready", &SimEngine::obs_ready, py::arg("slot"))
+        .def("obs_wait", &SimEngine::obs_wait, py::arg("slot"))
+        .def("get_obs", [](SimEngine& e, int slot, bool wait) {
+            if(wait) e.obs_wait(slot);
+            int n = e.obs_doubles();
+            // Zero-copy numpy view of the pinned buffer (owned by the engine).
+            return py::array_t<double>({n / 3, 3}, {3 * (py::ssize_t)sizeof(double), (py::ssize_t)sizeof(double)},
+                                       reinterpret_cast<double*>(e.obs_ptr(slot)),
+                                       py::cast(&e));
+        }, py::arg("slot"), py::arg("wait") = true,
+           "Zero-copy (N,3) view of pinned obs slot; wait=True syncs its event first.")
+        .def("upload_episode_actions", [](SimEngine& e, py::array_t<double, py::array::c_style | py::array::forcecast> a) {
+            return e.upload_episode_actions(a.data(), (size_t)a.size());
+        }, "One H2D for a whole episode's action array; returns the device pointer (int).")
         .def("get_vertices_device_ptr",   &SimEngine::get_vertices_device_ptr,
              "[gpu-direct] Raw device pointer (int) to the double3 vertex buffer "
              "(length get_vertex_count()). For zero-copy GPU readback via Warp.")

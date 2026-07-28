@@ -430,6 +430,22 @@ class SimEngine
     int      get_surface_vertex_count() const;
 
     void     get_vertex_positions(double* out_xyz, int count) const;
+
+    // ---- [Phase D] episode residency primitives ----
+    // Observation streaming: fetch_obs_async(slot) copies the vertex buffer
+    // D2H into pinned buffer[slot] on a dedicated copy stream and records an
+    // event — the host never blocks on the sim stream. obs_wait/obs_ready
+    // consume the event; obs_ptr exposes the pinned memory for a zero-copy
+    // numpy view. Double-buffer (slot 0/1) => frame i's read overlaps frame
+    // i+1's compute for a whole-episode zero-stall loop.
+    void      fetch_obs_async(int slot);
+    bool      obs_ready(int slot);
+    void      obs_wait(int slot);
+    uintptr_t obs_ptr(int slot);
+    int       obs_doubles() const;
+    // Episode actions: ONE H2D for the whole action sequence; the device
+    // pointer feeds gpu-direct consumers (row arithmetic on device).
+    uintptr_t upload_episode_actions(const double* host, size_t n_doubles);
     // [decouple] per-vertex env/group id ALIGNED to get_vertex_positions order (input order):
     // out[v] = body_groups[point_id_to_body_id[v]] (-1 if ungrouped). Lets Python extract a single
     // env's verts (verts[groups==g]) for batch-invariance tests regardless of the type-grouped layout.
@@ -653,6 +669,14 @@ class SimEngine
 
 
   private:
+    // [Phase D] episode residency state (lazy-init; freed in the dtor path).
+    cudaStream_t m_obs_stream            = nullptr;
+    cudaEvent_t  m_obs_evt[2]            = {nullptr, nullptr};
+    double*      m_obs_pinned[2]         = {nullptr, nullptr};
+    size_t       m_obs_capacity_doubles  = 0;
+    double*      m_episode_actions_dev   = nullptr;
+    size_t       m_episode_actions_cap   = 0;
+
     struct Impl;
     Impl* m_impl;
 };

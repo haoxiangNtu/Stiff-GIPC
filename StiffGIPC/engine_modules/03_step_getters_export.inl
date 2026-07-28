@@ -56,6 +56,72 @@ int SimEngine::get_surface_vertex_count() const
     return static_cast<int>(m_impl->tetMesh.surfVerts.size());
 }
 
+// ---- [Phase D] episode residency primitives ----
+void SimEngine::fetch_obs_async(int slot)
+{
+    slot &= 1;
+    const size_t need = (size_t)m_impl->ipc.vertexNum * 3;
+    if(!m_obs_stream)
+        CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&m_obs_stream, cudaStreamNonBlocking));
+    if(m_obs_capacity_doubles < need)
+    {
+        for(int s = 0; s < 2; ++s)
+        {
+            if(m_obs_pinned[s]) CUDA_SAFE_CALL(cudaFreeHost(m_obs_pinned[s]));
+            CUDA_SAFE_CALL(cudaMallocHost((void**)&m_obs_pinned[s], need * sizeof(double)));
+            if(!m_obs_evt[s])
+                CUDA_SAFE_CALL(cudaEventCreateWithFlags(&m_obs_evt[s], cudaEventDisableTiming));
+        }
+        m_obs_capacity_doubles = need;
+    }
+    // Order after the sim work already enqueued on the per-thread stream, then
+    // copy on the side stream: record a fence event on PTDS, wait on it.
+    cudaEvent_t fence = m_obs_evt[slot];
+    CUDA_SAFE_CALL(cudaEventRecord(fence, cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaStreamWaitEvent(m_obs_stream, fence, 0));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(m_obs_pinned[slot], m_impl->ipc._vertexes,
+                                   need * sizeof(double), cudaMemcpyDeviceToHost,
+                                   m_obs_stream));
+    CUDA_SAFE_CALL(cudaEventRecord(m_obs_evt[slot], m_obs_stream));
+}
+
+bool SimEngine::obs_ready(int slot)
+{
+    slot &= 1;
+    if(!m_obs_evt[slot]) return false;
+    return cudaEventQuery(m_obs_evt[slot]) == cudaSuccess;
+}
+
+void SimEngine::obs_wait(int slot)
+{
+    slot &= 1;
+    if(m_obs_evt[slot])
+        CUDA_SAFE_CALL(cudaEventSynchronize(m_obs_evt[slot]));
+}
+
+uintptr_t SimEngine::obs_ptr(int slot)
+{
+    return reinterpret_cast<uintptr_t>(m_obs_pinned[slot & 1]);
+}
+
+int SimEngine::obs_doubles() const
+{
+    return (int)((size_t)m_impl->ipc.vertexNum * 3);
+}
+
+uintptr_t SimEngine::upload_episode_actions(const double* host, size_t n_doubles)
+{
+    if(m_episode_actions_cap < n_doubles)
+    {
+        if(m_episode_actions_dev) CUDA_SAFE_CALL(cudaFree(m_episode_actions_dev));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_episode_actions_dev, n_doubles * sizeof(double)));
+        m_episode_actions_cap = n_doubles;
+    }
+    CUDA_SAFE_CALL(cudaMemcpy(m_episode_actions_dev, host,
+                              n_doubles * sizeof(double), cudaMemcpyHostToDevice));
+    return reinterpret_cast<uintptr_t>(m_episode_actions_dev);
+}
+
 void SimEngine::get_vertex_positions(double* out_xyz, int count) const
 {
     int n = std::min(count, static_cast<int>(m_impl->ipc.vertexNum));
