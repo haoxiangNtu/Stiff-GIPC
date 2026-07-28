@@ -4,8 +4,12 @@ __global__ void _stepForward(double3* _vertexes,
                              int*     bType,
                              double   alpha,
                              bool     moveBoundary,
-                             int      numbers)
+                             int      numbers,
+                             const double* alpha_dev = nullptr)
 {
+    // [C-1 ls-graph] device-resident trial alpha when armed.
+    if(alpha_dev)
+        alpha = *alpha_dev;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= numbers)
         return;

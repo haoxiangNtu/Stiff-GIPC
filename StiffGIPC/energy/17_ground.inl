@@ -13,12 +13,15 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
                                                double Kappa,
                                                int    number,
                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                               const uint32_t* d_live = nullptr)
+                                               const uint32_t* d_live = nullptr,
+                                               const double* kappa_dev = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
 
     extern __shared__ double tep[];
+    if(kappa_dev)   // [C-1 ls-graph] live kappa (see barrier variant)
+        Kappa = *kappa_dev;
     // [B3 device-count] see _getBarrierEnergy_Reduction_3D — live count read on
     // device in trial mode; idle threads contribute exact 0.0 (bitwise-neutral).
     if(d_live) number = (int)*d_live;
@@ -35,7 +38,7 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
     }
 
     // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
-    gipc_block_sum_to(temp, tep, number, idof, squeue + blockIdx.x);
+    gipc_block_sum_to(temp, tep, d_live ? (int)(gridDim.x * blockDim.x) : number, idof, squeue + blockIdx.x);  // [C-1] capacity-grid tail
 }
 
 
@@ -157,5 +160,6 @@ void GIPC::energy_launch_ground(device_TetraData& TetMesh, double* queue, int nu
                 queue, TetMesh.vertexes, _groundOffset, _groundNormal,
                 _environment_collisionPair, dHat, Kappa, numbers,
                 pe, pe ? p2g : nullptr, ng,
-                m_energy_use_device_counts ? _cpNum + 5 : nullptr);
+                m_energy_use_device_counts ? _cpNum + 5 : nullptr,
+                m_ls_recording ? m_d_ls_scalars + 1 : nullptr);  // [C-1] live kappa
 }

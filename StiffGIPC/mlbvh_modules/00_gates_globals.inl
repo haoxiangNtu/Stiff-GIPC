@@ -1,3 +1,4 @@
+#include "linear_system/utils/pcg_capacity_mode.h"  // [C-1]
 //
 // mlbvh.cu
 // GIPC
@@ -117,6 +118,7 @@ __global__ void _iota_u32(uint32_t* a, int n)
 void lbvh::ensure_sort_scratch(int N)
 {
     if(_sort_tmp && N <= _sort_cap) return;
+    ++pcg_buffer_generation();   // [C-1] sort scratch baked in the LS graph moves
     int cap = N + N / 4 + 64;
     if(_sort_tmp) cudaFree(_sort_tmp);
     if(_mch_alt)  cudaFree(_mch_alt);

@@ -1,3 +1,4 @@
+#include "linear_system/utils/pcg_capacity_mode.h"  // [C-1]
 __global__ void _ccd_initial_alpha_combine(double* slots,
                                            int have_ground,
                                            int have_self,
@@ -12,6 +13,19 @@ __global__ void _ccd_initial_alpha_combine(double* slots,
     if(have_self && (!isfinite(self) || self <= 0.0 || self > 1.0))
         atomicOr(invalid, kCcdInvalidGlobalNarrow);
     slots[2] = ground < self ? ground : self;
+}
+
+// [C-1 ls-graph] device-count snapshot copy: byte counts must not be baked
+// into the cached trial graph, so the copy is a capacity-grid kernel masked by
+// the live emission counter (clamped to buffer capacity like every consumer).
+__global__ void _snapshot_pairs_dev(int4* dst, const int4* src,
+                                    const uint32_t* d_live, int cap)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned raw = *d_live;
+    int live = raw < (unsigned)cap ? (int)raw : cap;
+    if(i < live)
+        dst[i] = src[i];
 }
 
 __global__ void _ccd_final_alpha_combine(double* slots,
@@ -291,14 +305,23 @@ void GIPC::snapshotDcdCcdPairs()
         return;
     if((int)m_dcd_snap_count > m_dcd_snap_cap)
     {
+        ++pcg_buffer_generation();   // [C-1] snapshot dst is baked in the LS graph
         if(_dcd_ccd_snapshot) CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot));
         m_dcd_snap_cap = (int)(m_dcd_snap_count + m_dcd_snap_count / 2) + 1;
         CUDA_SAFE_CALL(cudaMalloc((void**)&_dcd_ccd_snapshot,
                                   (size_t)m_dcd_snap_cap * sizeof(int4)));
     }
-    CUDA_SAFE_CALL(cudaMemcpy(_dcd_ccd_snapshot, _ccd_collisonPairs,
-                              (size_t)m_dcd_snap_count * sizeof(int4),
-                              cudaMemcpyDeviceToDevice));
+    // [C-1 capture-safe] device-count copy kernel: the byte count would be
+    // baked into a cached trial graph (stale for later frames), so the kernel
+    // masks by the live emission counter over a capacity grid instead. The
+    // grow branch above cannot fire mid-line-search (mirror frozen for the LS).
+    {
+        const int cap = m_dcd_snap_cap < MAX_COLLITION_PAIRS_NUM
+                            ? m_dcd_snap_cap
+                            : MAX_COLLITION_PAIRS_NUM;
+        _snapshot_pairs_dev<<<(cap + 255) / 256, 256>>>(
+            _dcd_ccd_snapshot, _ccd_collisonPairs, _cpNum, cap);
+    }
 }
 
 void GIPC::throwIfGroundDistanceInvalid()

@@ -1,3 +1,4 @@
+#include "linear_system/utils/pcg_capacity_mode.h"  // [C-1]
 __global__ void _s3_decide(const double* Eg0,
                            const double* Eg1,
                            double*       env_alpha,
@@ -29,8 +30,16 @@ __global__ void _global_ls_decide(const double* energy0,
                                   double        energy_abs_tol,
                                   double        energy_rel_tol,
                                   int*          status,
-                                  const int*    gd_collapse)
+                                  const int*    gd_collapse,
+                                  const double* alpha_dev,
+                                  const double* c1m_dev)
 {
+    // [C-1 ls-graph] device-resident trial alpha / per-iteration Armijo slope
+    // when armed (both change between solves; the cached graph reads live).
+    if(alpha_dev)
+        alpha = *alpha_dev;
+    if(c1m_dev)
+        c1m = *c1m_dev;
     const double e0  = *energy0;
     const double e1  = *energy1;
     const double rhs = __dadd_rn(e0, __dmul_rn(c1m, alpha));
@@ -49,6 +58,34 @@ __global__ void _global_ls_decide(const double* energy0,
     // [B3 trial-defer] ground-collapse flag rides the same read; the host
     // response (quarantine / typed throw) fires only on a negative value.
     status[2] = gd_collapse ? *gd_collapse : 0;
+}
+
+// [C-1 ls-graph] trial-body head: halve the device alpha, count the trial.
+__global__ void _ls_trial_begin(double* alpha_dev, int* status)
+{
+    *alpha_dev *= 0.5;
+    ++status[3];
+}
+// [C-1 ls-graph] seed before graph launch: start alpha + zeroed trial count.
+__global__ void _ls_seed(double* alpha_dev, double alpha0, int* status,
+                         double* scal2, double c1m, double kappa)
+{
+    *alpha_dev = alpha0;
+    status[3]  = 0;
+    scal2[0]   = c1m;
+    scal2[1]   = kappa;
+}
+// [C-1 ls-graph] trial-body tail: publish alpha bits for the single post-loop
+// host read, then self-relaunch while still backtracking with budget left
+// (same device tail-launch idiom as pcg_graph_tail_relaunch).
+__global__ void _ls_trial_tail(int* status, int budget, const double* alpha_dev)
+{
+    const unsigned long long bits =
+        (unsigned long long)__double_as_longlong(*alpha_dev);
+    status[4] = (int)(bits & 0xffffffffull);
+    status[5] = (int)(bits >> 32);
+    if(status[0] == 1 && status[3] < budget)
+        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
 }
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)
@@ -396,6 +433,7 @@ void GIPC::ensure_frictionBuffers()
     // same way), keeping the [4.3] frame-0 lag fix value-identical.
     if((size_t)h_cpNum[0] > m_fric_cp_cap)
     {
+        ++pcg_buffer_generation();   // [C-1] lastH pointers are baked in the LS graph
         size_t n = (size_t)h_cpNum[0] + h_cpNum[0] / 4;   // growth policy stays HERE
         lambda_lastH_scalar.resize_discard(n);            // [3d] release-then-alloc
         distCoord.resize_discard(n);
@@ -405,6 +443,7 @@ void GIPC::ensure_frictionBuffers()
     }
     if((size_t)h_gpNum > m_fric_gd_cap)
     {
+        ++pcg_buffer_generation();   // [C-1] gd lastH pointers are baked in the LS graph
         size_t n = (size_t)h_gpNum + h_gpNum / 4;         // growth policy stays HERE
         lambda_lastH_scalar_gd.resize_discard(n);
         _collisonPairs_lastH_gd.resize_discard(n);

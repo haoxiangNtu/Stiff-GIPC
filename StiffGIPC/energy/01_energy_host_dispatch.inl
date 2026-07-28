@@ -276,8 +276,13 @@ __global__ void _global_energy_combine(const double* slots,
                                        double        Kappa,
                                        double        friction_rate,
                                        double        ground_friction_rate,
-                                       double*       out)
+                                       double*       out,
+                                       const double* kappa_dev)
 {
+    // [C-1 ls-graph] kappa changes per frame; the cached trial graph must read
+    // the live value instead of the capture-time constant.
+    if(kappa_dev)
+        Kappa = *kappa_dev;
     double e = 0.0;
     e = __dadd_rn(e, slots[0]);   // FEM kinetic
     e = __dadd_rn(e, slots[9]);   // ABD kinetic
@@ -302,7 +307,7 @@ __global__ void _global_energy_combine(const double* slots,
     *out = e;
 }
 
-void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar)
+void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar, const double* kappa_dev)
 {
     // slots: 0..8 FEM/contact, 9..14 ABD in the exact order consumed above.
     Energy_Add_Reduction_Algorithm_DeviceOut(0,  TetMesh, m_energy_slots + 0);
@@ -323,7 +328,8 @@ void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar
                                      Kappa,
                                      frictionRate,
                                      gd_frictionRate,
-                                     out_scalar);
+                                     out_scalar,
+                                     kappa_dev);
 
     static bool energy_validated = false;
     if(!energy_validated && getenv("STIFF_ENERGY_VALIDATE"))

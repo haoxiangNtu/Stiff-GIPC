@@ -16,7 +16,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
                                                 double        fricDHat,
                                                 double        eps,
                                                 double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                                const double* vert_mu = nullptr, double mu_global = 1.0
+                                                const double* vert_mu = nullptr, double mu_global = 1.0,
+                                                const uint32_t* d_live = nullptr
 
 )
 {
@@ -25,6 +26,13 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
 
     extern __shared__ double tep[];
     int                      numbers = cpNum;
+    // [C-1 ls-graph] live lastH total from the device stash: the cached graph
+    // records a capacity grid; zero-padded sums stay bitwise-neutral.
+    if(d_live)
+    {
+        const unsigned raw = *d_live;
+        numbers = raw < (unsigned)cpNum ? (int)raw : cpNum;
+    }
     double                   temp = 0.0;
     if(idx < numbers)
     {
@@ -43,7 +51,7 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
     }
 
     // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
-    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
+    gipc_block_sum_to(temp, tep, d_live ? (int)(gridDim.x * blockDim.x) : numbers, idof, squeue + blockIdx.x);  // [C-1] capacity-grid tail
 }
 
 __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
@@ -56,7 +64,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
                                                    const double* lastH,
                                                    double        eps,
                                                    double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                                   const double* vert_mu_gd = nullptr, double mu_global = 1.0
+                                                   const double* vert_mu_gd = nullptr, double mu_global = 1.0,
+                                                   const uint32_t* d_live = nullptr
 
 )
 {
@@ -65,6 +74,11 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
 
     extern __shared__ double tep[];
     int                      numbers = gpNum;
+    if(d_live)   // [C-1 ls-graph] live gd lastH count (s7 stash)
+    {
+        const unsigned raw = *d_live;
+        numbers = raw < (unsigned)gpNum ? (int)raw : gpNum;
+    }
     double                   temp = 0.0;
     if(idx < numbers)
     {
@@ -79,7 +93,7 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
     }
 
     // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
-    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
+    gipc_block_sum_to(temp, tep, d_live ? (int)(gridDim.x * blockDim.x) : numbers, idof, squeue + blockIdx.x);  // [C-1] capacity-grid tail
 }
 
 
@@ -797,7 +811,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
 
 // ── [E2] registry members for type 5 (friction): launcher body VERBATIM from
 // the DeviceOut dispatcher switch; size = its sizing-chain entry ──
-int GIPC::energy_size_friction() { return h_cpNum_last[0]; }
+int GIPC::energy_size_friction() { return m_ls_recording ? MAX_COLLITION_PAIRS_NUM : (int)h_cpNum_last[0]; }  // [C-1] capacity grid under record
 void GIPC::energy_launch_friction(device_TetraData& TetMesh, double* queue, int numbers,
                                 int blockNum, unsigned int threadNum, unsigned int sharedMsize,
                                 double* pe, const int* p2g, int ng,
@@ -808,12 +822,13 @@ void GIPC::energy_launch_friction(device_TetraData& TetMesh, double* queue, int 
                 numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
                 fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,
-                d_vert_mu, frictionRate);  // [per-body friction]
+                d_vert_mu, frictionRate,
+                m_scr_cp_friction);  // [per-body friction / C-1 live lastH count]
 }
 
 // ── [E2] registry members for type 6 (friction_gd): launcher body VERBATIM from
 // the DeviceOut dispatcher switch; size = its sizing-chain entry ──
-int GIPC::energy_size_friction_gd() { return h_gpNum_last; }
+int GIPC::energy_size_friction_gd() { return m_ls_recording ? surf_vertexNum : (int)h_gpNum_last; }  // [C-1] capacity grid under record
 void GIPC::energy_launch_friction_gd(device_TetraData& TetMesh, double* queue, int numbers,
                                 int blockNum, unsigned int threadNum, unsigned int sharedMsize,
                                 double* pe, const int* p2g, int ng,
@@ -824,5 +839,6 @@ void GIPC::energy_launch_friction_gd(device_TetraData& TetMesh, double* queue, i
                 _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
                 sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,
-                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
+                d_vert_mu_gd, gd_frictionRate,
+                m_scr_gp_friction);  // [per-body friction / C-1 live lastH count]
 }

@@ -1505,7 +1505,8 @@ Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data,
         return 0;
 
     auto& abd = sim_data.device;
-    m_revolute_driving_energy_per.resize(m_num_revolute_driving);
+    if(m_revolute_driving_energy_per.size() != (size_t)m_num_revolute_driving)   // [C-1 capture-safe: muda resize waits]
+        m_revolute_driving_energy_per.resize(m_num_revolute_driving);
 
     ParallelFor()
         .kernel_name("cal_revolute_driving_energy")
@@ -1710,7 +1711,8 @@ Float ABDSystem::cal_abd_prismatic_energy(ABDSimData& sim_data, bool copy_to_hos
 
     auto& abd = sim_data.device;
     Float kappa = parms.prismatic_strength_ratio;
-    m_prismatic_energy_per.resize(m_num_prismatic);
+    if(m_prismatic_energy_per.size() != (size_t)m_num_prismatic)   // [C-1 capture-safe: muda resize waits]
+        m_prismatic_energy_per.resize(m_num_prismatic);
 
     ParallelFor()
         .kernel_name("cal_prismatic_energy")
@@ -1991,7 +1993,8 @@ Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data,
         return 0;
 
     auto& abd = sim_data.device;
-    m_prismatic_driving_energy_per.resize(m_num_prismatic_driving);
+    if(m_prismatic_driving_energy_per.size() != (size_t)m_num_prismatic_driving)   // [C-1 capture-safe: muda resize waits]
+        m_prismatic_driving_energy_per.resize(m_num_prismatic_driving);
 
     ParallelFor()
         .kernel_name("cal_prismatic_driving_energy")

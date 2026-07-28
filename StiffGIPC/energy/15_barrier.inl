@@ -12,12 +12,17 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
                                                double         _dHat,
                                                int            cpNum,
                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                               const uint32_t* d_live = nullptr)
+                                               const uint32_t* d_live = nullptr,
+                                               const double* kappa_dev = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
 
     extern __shared__ double tep[];
+    // [C-1 ls-graph] live kappa: the cached trial graph must not bake the
+    // per-frame value into the launch.
+    if(kappa_dev)
+        _Kappa = *kappa_dev;
     // [B3 device-count] d_live non-null = trial mode: the grid was sized from a
     // slacked iteration-start bound; the LIVE pair count is read here on device
     // (no host mirror refresh per trial). Idle threads contribute exact 0.0 —
@@ -34,7 +39,9 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
     }
 
     // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
-    gipc_block_sum_to(temp, tep, numbers, idof, squeue + blockIdx.x);
+    // [C-1] capacity grid: full participation (temp=0 padding is sum-neutral);
+    // the live-count tail arithmetic breaks for fully-OOB last blocks.
+    gipc_block_sum_to(temp, tep, d_live ? (int)(gridDim.x * blockDim.x) : numbers, idof, squeue + blockIdx.x);
 }
 
 
@@ -1136,5 +1143,6 @@ void GIPC::energy_launch_barrier(device_TetraData& TetMesh, double* queue, int n
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs,
                 energy_kappa >= 0.0 ? energy_kappa : Kappa, dHat, numbers,
                 pe, pe ? p2g : nullptr, ng,
-                m_energy_use_device_counts ? _cpNum + 0 : nullptr);
+                m_energy_use_device_counts ? _cpNum + 0 : nullptr,
+                m_ls_recording ? m_d_ls_scalars + 1 : nullptr);  // [C-1] live kappa
 }

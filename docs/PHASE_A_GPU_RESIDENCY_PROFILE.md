@@ -287,3 +287,33 @@ foldshirt merged N=4：**ls_mas_setup 8B×5/iter → 8B×1/iter**（−4，逐�
 验证：默认套件 15 段绿锚逐位；cache=1 towel/foldshirt merged 双 HIT+PASS；
 VERIFY 模式如期无 HIT。桌面 4090 towel 墙钟 7.48→7.70s（小场景容量网格开销
 ≈录制节省；本刀目标=A800 慢主机链路场景，默认关、待 A800 实测定夺翻转）。
+
+---
+
+# Phase C-1 战报：LS 试探环设备自尾launch 图（2026-07-28）
+
+trial 体（halve→step→BVH→CP(defer)→energy→decide→tail）录成 DeviceLaunch 图，
+decide 尾核未收敛即 `cudaGraphLaunch(cudaGetCurrentGraphExec(), TailLaunch)`
+自我重launch（PCG device-loop 先例复用，无需条件节点）；宿主出环单次 6-int 打包读
+{decision, overflow, collapse, trials, alpha_bits}。跨 LS/帧缓存于
+pcg_buffer_generation 签名；`STIFF_LS_GRAPH`（默认 0）+DIAG 行。
+
+**七连环调试实录**（每环都以工具实证收口）：
+1. muda `DeviceBuffer::resize` 无条件 `.wait()` → 能量路径 6 处尺寸守卫；
+2. 同步 memcpy 捕获非法 → snapshot 改设备计数核（容量网格+`_cpNum` 掩码）；
+3. **c1m 逐迭代 / κ 逐帧被烤死**（E1 用陈旧 Armijo 斜率与 κ 评判→64 减半全烧）
+   → `_ls_seed` 按值下发 {c1m, κ} 至设备槽，decide/combine/barrier/ground 核
+   读 `c1m_dev/kappa_dev`；
+4. 能量网格界烤死 → 录制期容量网格（barrier=MAX_PAIRS、ground/gd=surfN、
+   fric=cap；`m_ls_recording` 开关 sizing）；
+5. sum 尾部末块 warpNum 负值跳写 → d_live 时尾部按全网格参与（0 填充和中性）；
+6. 摩擦 lastH 族 `resize_discard` 无代数 bump → 悬垂（sanitizer:
+   `_getFrictionEnergy_gd` 越界读 308B cap 后 1 字节实锤）→ ensure_frictionBuffers
+   + snapshot grow 补 bump；
+7. **stash 从设备 `_cpNum+5` 原始拷贝与镜像脱钩**（LS 出口刷新后设备槽被后续
+   检测漂移，缓冲却按镜像尺寸增长）→ `_stash_fric_counts` 镜像值按值下发。
+
+验证：15 段绿锚 0544461bd82123ae 逐位（默认关）；knob=1 towel 全程
+PASS/0 耗尽/drift 1.94e-3（健康区间）、foldshirt merged N=4 图激活 PASS；
+指纹=逐 trial 12B 决策读消失（余：首评 1 读+出环 24B 打包+设计内出口刷新）。
+副产物：thrust→cub 排序（a606c79）、摩擦计数镜像化根治一处真实潜伏竞态。

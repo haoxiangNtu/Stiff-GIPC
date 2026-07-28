@@ -80,6 +80,12 @@ class GIPC
     // rare trip re-runs buildCP in legacy mode (full grow+redo machinery).
     bool      m_ls_defer_counts       = false;
     uint32_t* m_scr_gp_friction       = nullptr;  // [B3 s7] friction-era gp count, device-stashed
+    double*   m_d_ls_alpha            = nullptr;  // [C-1] device-resident trial alpha
+    double*   m_d_ls_scalars          = nullptr;  // [C-1] {c1m, kappa} staged per line search
+    uint32_t* m_scr_cp_friction       = nullptr;  // [C-1] friction-era cp counts, device-stashed
+    bool      m_ls_recording          = false;    // [C-1] capacity sizing while recording
+    cudaGraphExec_t m_ls_graph_exec   = nullptr;  // [C-1] cached trial-body self-tail graph
+    long long m_ls_graph_sig[2]       = {-1, -1}; //   {buffer generation, budget}
     bool      m_ccd_defer_counts      = false;
     int       m_energy_bound_cp       = 0;
     int       m_energy_bound_gp       = 0;
@@ -562,7 +568,7 @@ class GIPC
 
     void buildBVH_FULLCCD(const double& alpha,
                           const double* alpha_dev = nullptr);
-    void step_forward(device_TetraData& TetMesh, double alpha = 1.0, bool move_boundary = false);
+    void step_forward(device_TetraData& TetMesh, double alpha = 1.0, bool move_boundary = false, const double* alpha_dev = nullptr);
 
 
     void GroundCollisionDetect();
@@ -604,7 +610,7 @@ class GIPC
     double computeEnergy(device_TetraData& TetMesh);
     // Queue all FEM/contact/ABD reductions and the exact-order device combine
     // into out_scalar. No D2H or host synchronization.
-    void computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar);
+    void computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar, const double* kappa_dev = nullptr);
 
     double Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh);
     // [FD gate] test-only: central-difference E vs assembled analytic gradient
