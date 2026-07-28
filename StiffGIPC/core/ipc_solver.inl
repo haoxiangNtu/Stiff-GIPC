@@ -20,6 +20,7 @@
 // ============================================================================
 #include "frame_pipeline.h"
 #include "errors.h"  // [error-taxonomy] GeometryError for frame-0 infeasibility
+#include "device_common/nvtx_ranges.h"  // [B3] phase attribution
 
 // ── verbatim from gipc_modules/14 (pre-2d lines 962..1374) ──
 // [phase-time] lineSearch inner split (per frame): energy evals vs buildBVH+intersect vs buildCP vs step.
@@ -616,7 +617,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(start));
         g_dec_k = (int)k;   // [decouple probe] expose k to computeGradientAndHessian's stage dumps
+        gipc_nvtx_push("GH_assembly");
         m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
+        gipc_nvtx_pop();
 
         // [decouple probe] PRE-SOLVE gradient dump (shape_grads + fb hold the CLEAN gradient here,
         // before calculateMovingDirection clobbers shape_grads as scratch). frame STIFF_DUMP_FRAME,
@@ -800,7 +803,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         }
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end0));
 
+        gipc_nvtx_push("linear_solve");
         auto cg_count = calculateMovingDirection(TetMesh, h_cpNum[0], pcg_data.P_type);
+        gipc_nvtx_pop();
         //std::cout << "[" << k << "]"
         //          << "cg_count = " << cg_count << std::endl;
         m_total_pcg_iters += cg_count;
@@ -912,6 +917,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         const bool g_did = !m_skip_all_collision && surf_vertexNum >= 1;
         // Gate/count from the stable DCD snapshot, not the live CCD buffer.
         const bool s_did = !m_skip_all_collision && m_dcd_snap_count >= 1;
+        gipc_nvtx_push("ccd_alpha");
         CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_alpha_invalid, 0, sizeof(int)));
         CUDA_SAFE_CALL(cudaMemsetAsync(
             m_ccd_refined_invalid, 0, (1 + kEnvAlphaSlots) * sizeof(int)));
@@ -1040,6 +1046,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         alpha              = h_ccd_state[5];
         alpha_CFL          = h_ccd_state[6];
         diag_refine_used   = h_ccd_cpNum > 0 && temp_alpha > 2.0 * alpha_CFL;
+        gipc_nvtx_pop();
 
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end2));
         //printf("alpha:  %f\n", alpha);
@@ -1438,7 +1445,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                    limiting_distance,
                    limiting_coefficient);
         }
+        gipc_nvtx_push("line_search");
         lineSearch(TetMesh, alpha, alpha_CFL);
+        gipc_nvtx_pop();
 
         if(merged_diag_sample)
             printf("[merged-alpha] frame=%d k=%d move=%.17e thr=%.17e "
@@ -1453,7 +1462,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                    (int)h_cpNum[0], (int)h_gpNum);
 
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end3));
+        gipc_nvtx_push("post_ls");
         postLineSearch(TetMesh, alpha);
+        gipc_nvtx_pop();
         //computeGradientAndHessian(TetMesh);
         if(phase_time)
         {
@@ -1555,6 +1566,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 // ── verbatim from gipc_modules/14 (pre-2d lines 2674..2897) ──
 void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 {
+    GipcNvtxScope _nvtx_frame("frame");
     //double animation_fullRate = 0;
     cudaEvent_t start, end0;
     cudaEventCreate(&start);

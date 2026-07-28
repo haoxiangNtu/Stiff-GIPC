@@ -61,6 +61,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_MCDUMP, "diag") \
     X(STIFF_MERGED_DIAG_FRAME, "diag") \
     X(STIFF_MIRROR_AUDIT, "audit") \
+    X(STIFF_NVTX, "diag") \
     X(STIFF_MULTIENV_MODE, "python") \
     X(STIFF_NO_REFINE, "perf") \
     X(STIFF_PCG_CHECK_K, "diag") \
