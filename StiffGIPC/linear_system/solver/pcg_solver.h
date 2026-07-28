@@ -52,6 +52,10 @@ class PCGSolver : public IterativeSolver
     // capture updates pointer/grid/kernel arguments; re-instantiation is only
     // needed when CUDA reports a real topology incompatibility.
     cudaGraphExec_t m_device_loop_exec = nullptr;
+    // [B2'-b] signature stored with the cached device-loop exec:
+    // {buffer generation, dofs, K, tol bits}. Match -> skip the re-record.
+    long long m_cache_sig[4]   = {0, 0, 0, 0};
+    bool      m_cache_sig_valid = false;
     cudaGraphExec_t m_seg_device_loop_exec = nullptr;
     int        h_break    = 0;
     bool       d_scalars_alloced = false;

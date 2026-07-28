@@ -265,3 +265,25 @@ L1 的 warpNum 是 totalNodes 派生（场景常量）保持宿主判定。
 验证：15 段绿（mas-oracle strict 20-cube 4-level=本刀位级覆盖），锚逐位。
 foldshirt merged N=4：**ls_mas_setup 8B×5/iter → 8B×1/iter**（−4，逐层回读全
 灭；余=终层 totalNumberClusters 1 读 + 4B×1 未名读，双双归 B2' 块）。
+
+---
+
+# B2' 战报：跨 solve PCG 图缓存（2026-07-28）
+
+三段落地：
+- **a**（eba4871）：converter 设备侧 finalize 唯一键数（+1 上核，写入 07-24 事
+  故后专位保留却从未被写的 `d_unique_key_number`），宿主镜像改从该槽 D2H；
+  spmv 加 `d_live` 尾参——网格仍用等值镜像（今日逐位同），核内界读设备。
+- **b-1**（77b4fe2）：三个 SchwarzLocalXSym 核 +`(d_lvl,levelnum)` 尾参核内取
+  `d_levelSize[levelnum].y`；apply 路径 4 个 memset 改 `m_outputClusterCap` 容
+  量字节数（活区等同、跨 Newton 稳定）。
+- **b-2**：`pcg_capacity_mode.h` 双全局（容量网格模式 + 单一缓冲代数计数器，
+  gt 三处 realloc + MAS ensureOutputClusterCapacity 皆 bump）；签名
+  {generation, dofs, K, tol_bits} 命中即跳过逐 solve 重录（录制窗口内网格切容
+  量派生）；`STIFF_PCG_GRAPH_CACHE`（默认 0）+`STIFF_PCG_CACHE_VERIFY`（强制
+  重录，existing exec-update 路径持续证明拓扑不漂移）双知识库行。strict 因
+  `!STIFF_SPMV_DET` 门控从不捕获——锚免疫本构。
+
+验证：默认套件 15 段绿锚逐位；cache=1 towel/foldshirt merged 双 HIT+PASS；
+VERIFY 模式如期无 HIT。桌面 4090 towel 墙钟 7.48→7.70s（小场景容量网格开销
+≈录制节省；本刀目标=A800 慢主机链路场景，默认关、待 A800 实测定夺翻转）。

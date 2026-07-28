@@ -279,11 +279,17 @@ void GlobalLinearSystem::spmv(Float                         a,
                               muda::DenseVectorView<Float>  y)
 {
 
+    // [B2'-b] under cached-graph capture the grid is capacity-sized so the
+    // recorded launch stays valid across solves; the kernel bound is the live
+    // device count either way.
+    const int _spmv_bound = pcg_grid_capacity_mode()
+                                ? (int)gipc_global_triplet->triplet_capacity()
+                                : (int)gipc_global_triplet->h_unique_key_number;
     m_spmv.warp_reduce_sym_spmv(a,
                                 gipc_global_triplet->block_values(),
                                 gipc_global_triplet->block_row_indices(),
                                 gipc_global_triplet->block_col_indices(),
-                                gipc_global_triplet->h_unique_key_number,
+                                _spmv_bound,
                                 x,
                                 b,
                                 y,
