@@ -3,6 +3,7 @@
 #include "abd_system/abd_sim_data.h"
 #include "abd_system/abd_system.h"
 #include "cuda_tools/cuda_tools.h"
+#include "linear_system/linear_system/global_linear_system.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,6 +32,7 @@ struct alignas(16) FrameTerminalInput
     int32_t err_env       = -1;
     int32_t err_primitive = -1;
     int32_t newton_iters  = 0;
+    int32_t pcg_iters     = 0;
     int32_t ls_trials     = 0;
 
     int32_t hw_dcd_pairs     = 0;
@@ -184,6 +186,7 @@ __global__ void frame_terminal_apply(
     if(blockIdx.x || threadIdx.x)
         return;
     state->newton_iter      = input->newton_iters;
+    state->pcg_iter_total  += input->pcg_iters;
     state->ls_trial         = input->ls_trials;
     state->hw_dcd_pairs     = input->hw_dcd_pairs;
     state->hw_ccd_pairs     = input->hw_ccd_pairs;
@@ -206,13 +209,18 @@ __global__ void frame_terminal_apply(
                                     input->invalid_bits,
                                     input->err_env,
                                     input->err_primitive);
+        state->result = input->result;
     }
     else if(input->invalid_bits)
     {
         atomicOr(&state->invalid_bits, input->invalid_bits);
+        state->result = input->result;
     }
-    state->result = input->result;
-    state->phase  = input->result == frame_fsm::FRAME_OK
+    else if(state->result == frame_fsm::FRAME_OK)
+    {
+        state->result = input->result;
+    }
+    state->phase  = state->result == frame_fsm::FRAME_OK
                         ? frame_fsm::PHASE_COMMIT
                         : frame_fsm::PHASE_ROLLBACK;
 }
@@ -717,6 +725,8 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
             std::string("frame root graph launch failed: ")
             + cudaGetErrorString(launch));
     }
+    if(m_global_linear_system)
+        m_global_linear_system->set_frame_device_state(context.d_state);
     m_frame_graph_active     = true;
     m_frame_terminal_emitted = false;
 }
@@ -741,6 +751,9 @@ void GIPC::frame_graph_enqueue_terminal(device_TetraData&,
     input.err_primitive = err_primitive;
     input.newton_iters  =
         std::max(0, m_total_newton_iters - context.newton_begin);
+    input.pcg_iters = static_cast<int>(std::max(
+        0.0,
+        m_total_pcg_iters - context.host_snapshot.total_pcg_iters));
     input.hw_dcd_pairs  = static_cast<int>(h_cpNum[0]);
     input.hw_ccd_pairs  = static_cast<int>(m_last_ccd_pair_count);
     input.hw_triplets   = gipc_global_triplet.global_triplet_offset;
@@ -781,6 +794,12 @@ int GIPC::frame_graph_finish_terminal()
     m_last_frame_status = *context.h_status;
     if(m_last_frame_status.result != frame_fsm::FRAME_OK)
         restore_host_attempt(*this, context.host_snapshot);
+    else
+        m_total_pcg_iters =
+            context.host_snapshot.total_pcg_iters
+            + m_last_frame_status.pcg_iters;
+    if(m_global_linear_system)
+        m_global_linear_system->set_frame_device_state(nullptr);
     m_frame_graph_active     = false;
     m_frame_terminal_emitted = false;
     return m_last_frame_status.result;

@@ -5,6 +5,7 @@
 #include <linear_system/linear_system/linear_subsystem.h>
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
+#include <frame_fsm/frame_status.cuh>
 #include <muda/ext/linear_system.h>
 #include <gipc/utils/json.h>
 
@@ -72,6 +73,14 @@ class GlobalLinearSystem
     // is block-indexed (size = block count); a DOF i belongs to block i/3.
     void set_env_mask(const int* active, const int* dof_to_group, int ng)
     { m_s4_active = active; m_s4_dof_to_group = dof_to_group; m_s4_ng = ng; }
+    void set_frame_device_state(frame_fsm::FrameDeviceState* state)
+    {
+        m_frame_device_state = state;
+    }
+    frame_fsm::FrameDeviceState* frame_device_state() const
+    {
+        return m_frame_device_state;
+    }
     // [seg-fused dot] arm the NEXT spmv to also accumulate the per-env x·(aAx) into `partials`
     // (one-shot; see Spmv::set_seg_dot_accum). Used by seg_pcg's fast path.
     void set_seg_dot_accum(double* partials, int ng) { m_spmv.set_seg_dot_accum(partials, ng); }
@@ -106,6 +115,7 @@ class GlobalLinearSystem
     const int* m_s4_active       = nullptr;
     const int* m_s4_dof_to_group = nullptr;
     int        m_s4_ng           = 0;
+    frame_fsm::FrameDeviceState* m_frame_device_state = nullptr;
 
   private:
     std::vector<U<ILinearSubsystem>> m_subsystems;

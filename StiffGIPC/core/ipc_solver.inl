@@ -873,7 +873,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             calcMinMovement_DeviceOut(_moveDir, pcg_data.squeue, vertexNum);
             _newton_convergence_decide<<<1, 1>>>(pcg_data.squeue,
                                                  _newton_thr,
-                                                 m_newton_convergence_decision);
+                                                 m_newton_convergence_decision,
+                                                 frame_graph_device_state());
             int converged = 0;
             CUDA_SAFE_CALL(cudaMemcpy(&converged,
                                       m_newton_convergence_decision,
@@ -1214,7 +1215,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                                ccd_size,
                                                m_ccd_alpha_invalid,
                                                m_ccd_refined_invalid,
-                                               _cpNum);
+                                               _cpNum,
+                                               frame_graph_device_state());
         }
         else
         {
@@ -1236,7 +1238,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                                ccd_size,
                                                m_ccd_alpha_invalid,
                                                m_ccd_refined_invalid,
-                                               nullptr);
+                                               nullptr,
+                                               frame_graph_device_state());
         }
 
         // One scalar-chain D2H after every global decision and validation bit.
@@ -1269,7 +1272,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                                    ccd_size,
                                                    m_ccd_alpha_invalid,
                                                    m_ccd_refined_invalid,
-                                                   nullptr);
+                                                   nullptr,
+                                                   frame_graph_device_state());
                 CUDA_SAFE_CALL(cudaMemcpy(h_ccd_state,
                                           m_ccd_alpha_slots,
                                           sizeof(h_ccd_state),

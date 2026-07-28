@@ -42,7 +42,7 @@ extern void throwForInvalidCcdMask(int invalid, const char* context);
 extern void validateFinalCcdStateOrThrow(const double* state, const char* context);
 
 // ---- kernels owned by their mechanism modules (composite TU) ----
-extern __global__ void _ccd_final_alpha_combine(double* slots, int have_ccd_pairs, double d_hat, double ccd_size, int* invalid, const int* refined_invalid, const uint32_t* d_ccd_count);
+extern __global__ void _ccd_final_alpha_combine(double* slots, int have_ccd_pairs, double d_hat, double ccd_size, int* invalid, const int* refined_invalid, const uint32_t* d_ccd_count, frame_fsm::FrameDeviceState* frame);
 extern __global__ void _ccd_initial_alpha_combine(double* slots, int have_ground, int have_self, int* invalid);
 extern __global__ void _fill_double(double* values, double value, int count);
 extern __global__ void _gather_abd_body_alpha(const int* body_to_group, const double* env_alpha, double* abd_body_alpha, int abd_body_num, int ng);
@@ -52,7 +52,7 @@ extern __global__ void _ls_seed(double* alpha_dev, double alpha0, int* status);
 extern __global__ void _ls_trial_tail(int* status, int budget, const double* alpha_dev);
 extern __global__ void _mask_fill(int* m, int v, int n);
 extern __global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, int ng);
-extern __global__ void _newton_convergence_decide(const double* max_movement, double threshold, int* converged);
+extern __global__ void _newton_convergence_decide(const double* max_movement, double threshold, int* converged, frame_fsm::FrameDeviceState* frame);
 extern __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng, double sq, double ccd_size, int have_ccd, double temp_alpha, double alpha_CFL, int decouple, int no_refine, double thr_cv, const double* env_bbox2, double ntol_dt, double vtol_dt, const int* refined_invalid, const int* ccd_alpha_invalid, int* cnt);
 extern __global__ void _per_env_groundAlpha_min(const double3* vertexes, const uint32_t* surfVertIds, const double* g_offset, const double3* g_normal, const double3* moveDir, const int* p2g, double* per_env_alpha, double slackness, int number, const int* _point_body_id, const int* _ground_skip_body, int _ground_body_count, int ng, int* ccd_alpha_invalid);
 extern __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir, const uint32_t* mSVI, double* per_env_max, int n_surf, int ng);

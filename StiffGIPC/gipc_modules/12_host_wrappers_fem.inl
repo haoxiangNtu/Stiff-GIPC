@@ -820,9 +820,18 @@ void calcMinMovement_DeviceOut(const double3* _moveDir,
 
 __global__ void _newton_convergence_decide(const double* max_movement,
                                             double threshold,
-                                            int* converged)
+                                            int* converged,
+                                            frame_fsm::FrameDeviceState* frame)
 {
-    *converged = (*max_movement < threshold) ? 1 : 0;
+    const double movement = *max_movement;
+    const int decision = movement < threshold ? 1 : 0;
+    if(converged) *converged = decision;
+    if(frame)
+    {
+        frame->newton_converged = decision;
+        frame->max_movement     = movement;
+        frame->phase            = frame_fsm::PHASE_NEWTON_DECIDE;
+    }
 }
 
 void stepForward(double3* _vertexes,

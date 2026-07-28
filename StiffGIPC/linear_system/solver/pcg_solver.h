@@ -1,8 +1,24 @@
 #pragma once
 #include <linear_system/linear_system/i_linear_system_solver.h>
+#include <frame_fsm/frame_status.cuh>
 
 namespace gipc
 {
+// Device-owned progress for a cached PCG graph.  The graph may execute a
+// partially-filled final K batch: iteration_active predicates every stateful
+// update, so `iteration` is the exact legacy iteration count rather than a
+// rounded-up graph tier.
+struct alignas(16) PCGDeviceState
+{
+    unsigned long long iteration     = 1;
+    unsigned long long max_iteration = 0;
+    int                iteration_active = 0;
+    int                converged        = 0;
+    int                terminal         = 0;
+    int                segmented        = 0;
+    frame_fsm::FrameDeviceState* frame = nullptr;
+};
+
 class PCGSolverConfig
 {
   public:
@@ -44,10 +60,11 @@ class PCGSolver : public IterativeSolver
     Float*     d_alpha    = nullptr;
     Float*     d_beta     = nullptr;
     int*       d_break    = nullptr;
-    // [device-loop graph] {iteration, break} snapshot.  A self-tail-launching
-    // graph updates this pair once per K-iteration batch, allowing one final
-    // D2H read instead of one blocking read after every batch.
-    unsigned long long* d_graph_state = nullptr;
+    // [device-loop graph] exact iteration/convergence state.  During a Phase-C
+    // frame it publishes directly into FrameDeviceState and solve() performs
+    // no D2H.  Legacy callers still read this record once for their historical
+    // SizeT return value.
+    PCGDeviceState* d_graph_state = nullptr;
     // Device-launchable executable is retained across Newton solves.  A fresh
     // capture updates pointer/grid/kernel arguments; re-instantiation is only
     // needed when CUDA reports a real topology incompatibility.

@@ -20,7 +20,8 @@ __global__ void _ccd_final_alpha_combine(double* slots,
                                          double ccd_size,
                                          int* invalid,
                                          const int* refined_invalid,
-                                         const uint32_t* d_ccd_count)
+                                         const uint32_t* d_ccd_count,
+                                         frame_fsm::FrameDeviceState* frame)
 {
     // [B3 ccd-defer] when armed, the pair gate comes from the live device
     // count and the raw count rides slot 8 of the same scalar-chain read
@@ -55,7 +56,31 @@ __global__ void _ccd_final_alpha_combine(double* slots,
     slots[4] = refined;
     slots[5] = alpha;
     slots[6] = alpha_cfl;
-    slots[7] = static_cast<double>(*invalid & kCcdInvalidEffectiveMask);
+    const uint32_t invalid_bits =
+        static_cast<uint32_t>(*invalid & kCcdInvalidEffectiveMask);
+    slots[7] = static_cast<double>(invalid_bits);
+    if(frame)
+    {
+        frame->alpha     = alpha;
+        frame->cfl_alpha = alpha_cfl;
+        frame->ccd_count = d_ccd_count
+                               ? static_cast<int>(*d_ccd_count)
+                               : have_ccd_pairs;
+        frame->phase = frame_fsm::PHASE_LINE_SEARCH;
+        if(invalid_bits || !isfinite(alpha) || alpha <= 0.0 || alpha > 1.0)
+        {
+            frame_fsm::fsm_record_error(
+                frame,
+                frame_fsm::ERR_CCD_INVALID,
+                invalid_bits ? invalid_bits
+                             : static_cast<uint32_t>(
+                                   frame_fsm::INV_NAN_STATE),
+                -1,
+                -1);
+            frame->result = frame_fsm::FRAME_FATAL;
+            frame->phase  = frame_fsm::PHASE_ROLLBACK;
+        }
+    }
 }
 
 
@@ -491,6 +516,7 @@ void stiff_test_ccd_nan_max_speed_fail_fast()
                                       1.0,
                                       device_invalid,
                                       device_refined_invalid,
+                                      nullptr,
                                       nullptr);
     CUDA_SAFE_CALL(cudaMemcpy(
         host_state, device_state, sizeof(host_state), cudaMemcpyDeviceToHost));

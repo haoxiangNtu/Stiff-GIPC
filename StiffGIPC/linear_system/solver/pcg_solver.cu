@@ -142,10 +142,11 @@ __global__ void _seg_dot_fused(const double* a, const double* b, const int* d2g,
 // x += α_g c; r -= α_g Ap; α_g = rz_g/dot_g. Converged envs (brk_g) and bad dot are frozen.
 __global__ void _seg_axpy_xr(double* dx, double* r, const double* c, const double* q,
                              const double* rz_g, const double* dot_g, const int* brk_g,
-                             const int* d2g, int ng, int n)
+                             const int* d2g, int ng, int n,
+                             const gipc::PCGDeviceState* graph_state)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i >= n) return;
+    if(i >= n || !graph_state->iteration_active) return;
     int g = d2g[i / 3];
     if(g < 0 || g >= ng || brk_g[g]) return;
     double dot = dot_g[g];
@@ -156,10 +157,11 @@ __global__ void _seg_axpy_xr(double* dx, double* r, const double* c, const doubl
 }
 // p = z + β_g p; β_g = rzn_g/rz_g.
 __global__ void _seg_axpy_p(double* c, const double* z, const double* rzn_g, const double* rz_g,
-                            const int* brk_g, const int* d2g, int ng, int n)
+                            const int* brk_g, const int* d2g, int ng, int n,
+                            const gipc::PCGDeviceState* graph_state)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i >= n) return;
+    if(i >= n || !graph_state->iteration_active) return;
     int g = d2g[i / 3];
     if(g < 0 || g >= ng || brk_g[g]) return;
     double rzo = rz_g[g];
@@ -199,7 +201,8 @@ __global__ void _seg_partial_combine(double* out_g, double* partials, int ng)
 // separate _seg_swap_check launch; the rz swap itself becomes a host-side POINTER ping-pong).
 // tol2_g == nullptr -> scalar tol. Bit-identical values to combine-then-check.
 __global__ void _seg_partial_combine_ck(double* out_g, double* partials, const double* rz0_g,
-                                        const double* tol2_g, double tol, int* brk_g, int ng)
+                                        const double* tol2_g, double tol, int* brk_g, int ng,
+                                        const gipc::PCGDeviceState* graph_state)
 {
     __shared__ double sh[256];
     int g = blockIdx.x;
@@ -215,6 +218,7 @@ __global__ void _seg_partial_combine_ck(double* out_g, double* partials, const d
     }
     if(threadIdx.x == 0)
     {
+        if(!graph_state->iteration_active) return;
         double rzn = sh[0];
         out_g[g]   = rzn;
         double t   = tol2_g ? tol2_g[g] : tol;
@@ -223,7 +227,8 @@ __global__ void _seg_partial_combine_ck(double* out_g, double* partials, const d
 }
 // [micro-fusion (3)] binned-dot combine WITH the check folded in (strict path equivalent).
 __global__ void _seg_dot_combine_ck(double* out_g, double* segbin, const double* rz0_g,
-                                    const double* tol2_g, double tol, int* brk_g, int ng)
+                                    const double* tol2_g, double tol, int* brk_g, int ng,
+                                    const gipc::PCGDeviceState* graph_state)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
@@ -231,6 +236,7 @@ __global__ void _seg_dot_combine_ck(double* out_g, double* segbin, const double*
     double  rzn = binned_combine(b);
 #pragma unroll
     for(int kk = 0; kk < BINNED_K; ++kk) b[kk] = 0.0;
+    if(!graph_state->iteration_active) return;
     out_g[g] = rzn;
     double t = tol2_g ? tol2_g[g] : tol;
     if(fabs(rzn) <= t * rz0_g[g]) brk_g[g] = 1;
@@ -238,10 +244,11 @@ __global__ void _seg_dot_combine_ck(double* out_g, double* segbin, const double*
 // [micro-fusion (3)] check-only variant (fast-path fallback when the precond-fused dot is not
 // armed): brk from an already-combined rzn.
 __global__ void _seg_check_only(const double* rzn_g, const double* rz0_g, const double* tol2_g,
-                                double tol, int* brk_g, int ng)
+                                double tol, int* brk_g, int ng,
+                                const gipc::PCGDeviceState* graph_state)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
-    if(g >= ng) return;
+    if(g >= ng || !graph_state->iteration_active) return;
     double t = tol2_g ? tol2_g[g] : tol;
     if(fabs(rzn_g[g]) <= t * rz0_g[g]) brk_g[g] = 1;
 }
@@ -353,10 +360,11 @@ __global__ void update_vector_c_dev(
 // host-side break check to fire on next K-stride sync.
 __global__ void update_vector_dx_r_fused(
     double* dx, double* r, const double* c, const double* q,
-    const double* d_rz, const double* d_dot_res, int* d_break, int numbers)
+    const double* d_rz, const double* d_dot_res, int* d_break, int numbers,
+    const gipc::PCGDeviceState* graph_state)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if(idx >= numbers) return;
+    if(idx >= numbers || !graph_state->iteration_active) return;
     double dot = *d_dot_res;
     // Soundness: same exit criteria as original compute_alpha_kernel —
     // dot_res<=0 or non-finite means PCG has effectively converged (PD A
@@ -375,10 +383,12 @@ __global__ void update_vector_dx_r_fused(
 // Same trick for beta + axpy on p. Swap (d_rz = d_rz_new) and convergence
 // check are deferred to a tiny <<<1,1>>> post kernel below.
 __global__ void update_vector_c_fused(
-    double* c, const double* s, const double* d_rz_new, const double* d_rz_old, int numbers)
+    double* c, const double* s, const double* d_rz_new,
+    const double* d_rz_old, int numbers,
+    const gipc::PCGDeviceState* graph_state)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if(idx >= numbers) return;
+    if(idx >= numbers || !graph_state->iteration_active) return;
     double rz_old = *d_rz_old;
     // Soundness: rz_old should be > 0 in a healthy PCG (it's |r|_M from
     // previous iter). If it's 0/non-finite, original compute_beta_and_swap
@@ -394,12 +404,14 @@ __global__ void update_vector_c_fused(
 // check_convergence_kernel pair (saves 1 launch per iter).
 __global__ void post_iter_swap_and_check(
     double* d_rz, const double* d_rz_new, const double* d_rz0,
-    double tol_rate, int* d_break)
+    double tol_rate, int* d_break, gipc::PCGDeviceState* graph_state)
 {
+    if(!graph_state->iteration_active) return;
     double new_v = *d_rz_new;
     *d_rz = new_v;
     if(fabs(new_v) <= tol_rate * (*d_rz0))
         *d_break = 1;
+    ++graph_state->iteration;
 }
 
 // alpha = rz / dot_res; if dot_res <= 0 or non-finite, set break flag.
@@ -451,50 +463,88 @@ __global__ void copy_scalar_kernel(double* dst, const double* src)
 // the same as the host K-stride loop while the convergence decision stays on
 // the GPU.  Device graph launch is available before conditional graph nodes
 // (CUDA 12.0 vs 12.3), which keeps this path usable on the A800's R535 driver.
-__global__ void pcg_graph_state_init(unsigned long long* state,
-                                     unsigned long long  first_iteration)
+__global__ void pcg_graph_state_init(gipc::PCGDeviceState* state,
+                                     unsigned long long max_iteration,
+                                     int segmented,
+                                     frame_fsm::FrameDeviceState* frame)
 {
-    state[0] = first_iteration;
-    state[1] = 0;
+    state->iteration        = 1;
+    state->max_iteration    = max_iteration;
+    state->iteration_active = 0;
+    state->converged        = 0;
+    state->terminal         = 0;
+    state->segmented        = segmented;
+    state->frame            = frame;
 }
 
-__global__ void pcg_graph_tail_relaunch(unsigned long long* state,
-                                        const int*          d_break,
-                                        unsigned long long  max_iter,
-                                        unsigned long long  check_k)
+__global__ void pcg_iteration_begin(gipc::PCGDeviceState* state,
+                                    const int* d_break)
 {
-    if(threadIdx.x != 0 || blockIdx.x != 0)
-        return;
-
-    const unsigned long long next = state[0] + check_k;
-    state[0] = next;
-    state[1] = static_cast<unsigned long long>(*d_break != 0);
-    if(*d_break == 0 && next + check_k <= max_iter)
-        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    state->converged = *d_break != 0;
+    // Preserve the historical K-cadence exactly: convergence is consumed only
+    // by the graph-tail decision, never midway through an already-launched
+    // batch.  The predicate exists solely for a partially-filled final batch.
+    state->iteration_active = state->iteration < state->max_iteration;
 }
 
-__global__ void pcg_seg_graph_tail_relaunch(unsigned long long* state,
-                                            const int*          d_break_g,
-                                            int                 ng,
-                                            unsigned long long  max_iter,
-                                            unsigned long long  check_k)
+__global__ void pcg_seg_iteration_begin(gipc::PCGDeviceState* state,
+                                        const int* d_break_g,
+                                        int ng)
 {
-    if(threadIdx.x != 0 || blockIdx.x != 0)
-        return;
-
-    bool all_converged = true;
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    bool converged = true;
     for(int g = 0; g < ng; ++g)
         if(d_break_g[g] == 0)
         {
-            all_converged = false;
+            converged = false;
             break;
         }
+    state->converged = converged;
+    state->iteration_active = state->iteration < state->max_iteration;
+}
 
-    const unsigned long long next = state[0] + check_k;
-    state[0] = next;
-    state[1] = static_cast<unsigned long long>(all_converged);
-    if(!all_converged && next + check_k <= max_iter)
-        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+__global__ void pcg_seg_iteration_end(gipc::PCGDeviceState* state)
+{
+    if(threadIdx.x == 0 && blockIdx.x == 0 && state->iteration_active)
+        ++state->iteration;
+}
+
+__device__ __forceinline__ void pcg_continue_or_finish(
+    gipc::PCGDeviceState* state, bool converged)
+{
+    state->converged = converged;
+    if(!converged && state->iteration < state->max_iteration)
+    {
+        cudaGraphLaunch(cudaGetCurrentGraphExec(),
+                        cudaStreamGraphTailLaunch);
+        return;
+    }
+    if(atomicCAS(&state->terminal, 0, 1) == 0 && state->frame)
+        atomicAdd(&state->frame->pcg_iter_total,
+                  static_cast<int>(state->iteration));
+}
+
+__global__ void pcg_graph_tail_relaunch(gipc::PCGDeviceState* state,
+                                        const int* d_break)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    pcg_continue_or_finish(state, *d_break != 0);
+}
+
+__global__ void pcg_seg_graph_tail_relaunch(gipc::PCGDeviceState* state,
+                                            const int* d_break_g,
+                                            int ng)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    bool converged = true;
+    for(int g = 0; g < ng; ++g)
+        if(d_break_g[g] == 0)
+        {
+            converged = false;
+            break;
+        }
+    pcg_continue_or_finish(state, converged);
 }
 
 
@@ -590,7 +640,8 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
         cudaMalloc(&d_alpha,   sizeof(Float));
         cudaMalloc(&d_beta,    sizeof(Float));
         cudaMalloc(&d_break,   sizeof(int));
-        cudaMalloc(&d_graph_state, 2 * sizeof(unsigned long long));
+        cudaMalloc(&d_graph_state, sizeof(PCGDeviceState));
+        cudaMemset(d_graph_state, 0, sizeof(PCGDeviceState));
         d_scalars_alloced = true;
     }
 
@@ -642,12 +693,20 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     const SizeT K = getenv("STIFF_PCG_CHECK_K") ? (SizeT)atoi(getenv("STIFF_PCG_CHECK_K")) : 8;
     const double pcg_tol = getenv("STIFF_PCG_TOL") ? atof(getenv("STIFF_PCG_TOL"))
                                                    : m_config.global_tol_rate;
+    frame_fsm::FrameDeviceState* frame_state =
+        system_ptr() ? system_ptr()->frame_device_state() : nullptr;
+    pcg_graph_state_init<<<1, 1>>>(
+        d_graph_state,
+        static_cast<unsigned long long>(max_iter),
+        0,
+        frame_state);
 
     // [pcg-graph] one FULL iteration of the (shape-constant-within-a-solve) inner loop. The break
     // check moved to ITERATION BOUNDARIES (same K cadence): the second half-iteration only touches
     // p/rz/brk — x and r are bit-identical to the old mid-iteration-check loop at every exit point.
     auto body = [&]()
     {
+        pcg_iteration_begin<<<1, 1>>>(d_graph_state, d_break);
         // Ap = A * p
         spmv(p.cview(), Ap.view());
         // Step E: cub fused dot(p, Ap) -> d_dot_res (1 launch instead of 2-3).
@@ -659,7 +718,8 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                                  (const double*)p.buffer_view().data(),
                                  (const double*)Ap.buffer_view().data(),
                                  (const double*)d_rz, (const double*)d_dot_res,
-                                 d_break, (int)z.size());
+                                 d_break, (int)z.size(),
+                                 (const PCGDeviceState*)d_graph_state);
         apply_preconditioner(z, r);
         // Step E: cub fused dot(r, z) -> d_rz_new.
         Cub_PCG_DotReduction(r.buffer_view().data(), z.buffer_view().data(), z.size(),
@@ -667,9 +727,12 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         // Step E: fused axpy on p re-deriving beta = *d_rz_new / *d_rz per-thread.
         LaunchCudaKernal_default(z.size(), 256, 0, update_vector_c_fused,
                                  p.buffer_view().data(), (const double*)z.buffer_view().data(),
-                                 (const double*)d_rz_new, (const double*)d_rz, (int)z.size());
+                                 (const double*)d_rz_new, (const double*)d_rz,
+                                 (int)z.size(),
+                                 (const PCGDeviceState*)d_graph_state);
         // Step E: combined swap (d_rz = d_rz_new) + convergence check.
-        post_iter_swap_and_check<<<1, 1>>>(d_rz, d_rz_new, d_rz0, pcg_tol, d_break);
+        post_iter_swap_and_check<<<1, 1>>>(
+            d_rz, d_rz_new, d_rz0, pcg_tol, d_break, d_graph_state);
     };
 
     // [pcg-graph] capture K iterations into a CUDA graph and replay between break checks — removes
@@ -704,7 +767,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         cudaDriverGetVersion(&s_driver_version);
     const bool use_device_loop = use_graph && s_device_loop_env
                               && s_driver_version >= 12000
-                              && K > 0 && 1 + K <= max_iter;
+                              && K > 0 && max_iter > 1;
 
     if(use_device_loop)
     {
@@ -750,9 +813,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                 body();
             pcg_graph_tail_relaunch<<<1, 1>>>(
                 d_graph_state,
-                d_break,
-                static_cast<unsigned long long>(max_iter),
-                static_cast<unsigned long long>(K));
+                d_break);
             capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
             if(capture_status == cudaSuccess && dg)
             {
@@ -812,16 +873,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                 CUDA_SAFE_CALL(cudaGraphDestroy(dg));
                 dg = nullptr;
             }
-            pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
             CUDA_SAFE_CALL(cudaGraphLaunch(m_device_loop_exec, cudaStreamPerThread));
-
-            unsigned long long graph_state[2] = {1ULL, 0ULL};
-            CUDA_SAFE_CALL(cudaMemcpy(graph_state,
-                                      d_graph_state,
-                                      sizeof(graph_state),
-                                      cudaMemcpyDeviceToHost));
-            k       = static_cast<SizeT>(graph_state[0]);
-            h_break = static_cast<int>(graph_state[1]);
 
             static bool once = false;
             if(!once)
@@ -834,11 +886,18 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
             if(rebuilt && getenv("STIFF_PCG_GRAPH_DIAG"))
                 printf("[pcg-device-loop] executable rebuilt\n");
 
-            // The device graph stops before a partial final batch.  Preserve the
-            // legacy max-iteration semantics with at most K-1 plain tail steps.
-            if(!h_break)
-                for(; k < max_iter; ++k)
-                    body();
+            // A Phase-C frame consumes the exact count from FrameDeviceState at
+            // its single terminal boundary.  Legacy callers retain one final
+            // state read for their historical SizeT telemetry.
+            if(frame_state)
+                return 0;
+            PCGDeviceState graph_state{};
+            CUDA_SAFE_CALL(cudaMemcpy(&graph_state,
+                                      d_graph_state,
+                                      sizeof(graph_state),
+                                      cudaMemcpyDeviceToHost));
+            k       = static_cast<SizeT>(graph_state.iteration);
+            h_break = graph_state.converged;
             return k;
         }
 
@@ -1145,6 +1204,13 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     const SizeT K = getenv("STIFF_PCG_CHECK_K") ? (SizeT)atoi(getenv("STIFF_PCG_CHECK_K")) : 8;
     std::vector<int> h_brk(ng);
     double tol = getenv("STIFF_PCG_TOL") ? atof(getenv("STIFF_PCG_TOL")) : m_config.global_tol_rate;
+    frame_fsm::FrameDeviceState* frame_state =
+        system_ptr() ? system_ptr()->frame_device_state() : nullptr;
+    pcg_graph_state_init<<<1, 1>>>(
+        d_graph_state,
+        static_cast<unsigned long long>(max_iter),
+        1,
+        frame_state);
     if(ew)   // [E-W (2)] per-env tolerance for this solve (floor = the configured tol)
         _ew_eta<<<(ng + bs - 1) / bs, bs>>>(d_rz0_g, d_ew_prev, d_tol2_g, ew_gamma, ew_max2, tol, ng);
     const double* tol2_arg = ew ? d_tol2_g : nullptr;
@@ -1167,6 +1233,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     double* rz_next = d_rzn_g;
     auto body = [&]()
     {
+        pcg_seg_iteration_begin<<<1, 1>>>(d_graph_state, d_break_g, ng);
         if(fuse_dot) fsys->set_seg_dot_accum(d_dot_partials, ng);   // baked into kernel args on capture
         spmv(p.cview(), Ap.view());
         if(fuse_dot)
@@ -1176,18 +1243,22 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         _seg_axpy_xr<<<gn, bs>>>(x.buffer_view().data(), r.buffer_view().data(),
                                  (const double*)p.buffer_view().data(),
                                  (const double*)Ap.buffer_view().data(),
-                                 rz_cur, d_dot_g, d_break_g, d2g, ng, n);
+                                 rz_cur, d_dot_g, d_break_g, d2g, ng, n,
+                                 d_graph_state);
         // [seg-fused dot] preconditioners accumulate per-env r·z alongside their z-write
         // (final-z exact via the ABD correction); falls back if any preconditioner isn't capable.
         bool rz_armed = fuse_dot && fsys->arm_precond_seg_dot(d_dot_partials, d2g, ng);
         apply_preconditioner(z, r);
         if(rz_armed)
             _seg_partial_combine_ck<<<ng, 256>>>(rz_next, d_dot_partials, d_rz0_g,
-                                                 tol2_arg, tol, d_break_g, ng);
+                                                 tol2_arg, tol, d_break_g, ng,
+                                                 d_graph_state);
         else if(!s_seg_binned_host)
         {   // fast path without armed preconditioners (e.g. MAS): standalone fast dot + check
             seg_dot(r.buffer_view().data(), z.buffer_view().data(), d2g, ng, n, rz_next);
-            _seg_check_only<<<(ng + bs - 1) / bs, bs>>>(rz_next, d_rz0_g, tol2_arg, tol, d_break_g, ng);
+            _seg_check_only<<<(ng + bs - 1) / bs, bs>>>(
+                rz_next, d_rz0_g, tol2_arg, tol, d_break_g, ng,
+                d_graph_state);
         }
         else
         {   // binned (strict) path: deposit + combine-with-check
@@ -1195,10 +1266,13 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
             _seg_dot_deposit<<<gn, bs, shmem>>>(r.buffer_view().data(), z.buffer_view().data(),
                                                 d2g, d_segbin, ng, n);
             _seg_dot_combine_ck<<<(ng + bs - 1) / bs, bs>>>(rz_next, d_segbin, d_rz0_g,
-                                                            tol2_arg, tol, d_break_g, ng);
+                                                            tol2_arg, tol, d_break_g, ng,
+                                                            d_graph_state);
         }
         _seg_axpy_p<<<gn, bs>>>(p.buffer_view().data(), (const double*)z.buffer_view().data(),
-                                rz_next, rz_cur, d_break_g, d2g, ng, n);
+                                rz_next, rz_cur, d_break_g, d2g, ng, n,
+                                d_graph_state);
+        pcg_seg_iteration_end<<<1, 1>>>(d_graph_state);
         std::swap(rz_cur, rz_next);   // pointer ping-pong (replaces the swap kernel)
     };
 
@@ -1231,7 +1305,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     const bool use_device_loop = use_graph && s_device_loop_env_seg
                               && s_driver_version_seg >= 12000
                               && K > 0 && (K & 1) == 0
-                              && 1 + K <= max_iter;
+                              && max_iter > 1;
 
     if(use_device_loop)
     {
@@ -1257,9 +1331,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
             pcg_seg_graph_tail_relaunch<<<1, 1>>>(
                 d_graph_state,
                 d_break_g,
-                ng,
-                static_cast<unsigned long long>(max_iter),
-                static_cast<unsigned long long>(K));
+                ng);
             capture_status = cudaStreamEndCapture(cudaStreamPerThread, &dg);
             if(capture_status == cudaSuccess && dg)
             {
@@ -1298,17 +1370,8 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
                                            cudaStreamPerThread));
             CUDA_SAFE_CALL(cudaGraphDestroy(dg));
             dg = nullptr;
-            pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
             CUDA_SAFE_CALL(cudaGraphLaunch(m_seg_device_loop_exec,
                                            cudaStreamPerThread));
-
-            unsigned long long graph_state[2] = {1ULL, 0ULL};
-            CUDA_SAFE_CALL(cudaMemcpy(graph_state,
-                                      d_graph_state,
-                                      sizeof(graph_state),
-                                      cudaMemcpyDeviceToHost));
-            k = static_cast<SizeT>(graph_state[0]);
-            const bool all_converged = graph_state[1] != 0;
 
             static bool once = false;
             if(!once)
@@ -1322,9 +1385,14 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
             if(rebuilt && getenv("STIFF_PCG_GRAPH_DIAG"))
                 printf("[pcg-device-loop] segmented executable rebuilt\n");
 
-            if(!all_converged)
-                for(; k < max_iter; ++k)
-                    body();
+            if(frame_state)
+                return 0;
+            PCGDeviceState graph_state{};
+            CUDA_SAFE_CALL(cudaMemcpy(&graph_state,
+                                      d_graph_state,
+                                      sizeof(graph_state),
+                                      cudaMemcpyDeviceToHost));
+            k = static_cast<SizeT>(graph_state.iteration);
             return k;
         }
 
