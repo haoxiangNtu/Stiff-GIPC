@@ -238,3 +238,30 @@ OOM/越界，一根线炸 7 段门禁；锚与 foldshirt 恰好走了另一条�
 验证：15 段绿，锚 0544461bd82123ae 逐位。towel：**ccd_alpha 5.69→0.81/迭代**
 （=纯 72B 标量链决策读，理论地板）、**line_search 8.25→3.27/迭代**；GH 7.88
 不变（非 bbox 族，下一分解目标）。战役累计：ls 9.87→3.27，ccd 6.52→0.81。
+
+---
+
+# 手术⑦战报：摩擦期 gp 计数 D2D 恢复（2026-07-28）
+
+摩擦 Hessian gd 路径每迭代把 h_gpNum_last 阻塞 H2D 回传 `_gpNum`——GH 相唯一
+逐迭代 H2D。改为摩擦集构建时设备侧 stash（`m_scr_gp_friction`，boot memset 0；
+此刻 `_cpNum+5` 恰持镜像快照值）+ 异步 D2D 恢复。时序审计：恢复后 `_gpNum`
+持 last 值直到下次检测重写——与 legacy 全同；trial 能量核只在 trial buildCP
+重写后读 `_cpNum+5`。towel：GH **7.88→6.88/迭代**（−1.0 精确），4B H2D 族消失，
+实传输仅剩 16B contact start-ids（B2' 块）。ls 3.28 / ccd 0.82 对照不动。
+
+---
+
+# 手术⑧战报：多环境 MAS 层循环设备驻留（2026-07-28）
+
+关键发现：`_mas_envSegN` 的 `warpNum % n_env` 整除性守卫使 segN **非**场景常
+量（齐次批量恒成立，分歧层静默退全局 bank）——判定随 warpNum 整体搬进
+`_mas_env_base_dev` 核内（写 `d_segwpe` 设备槽，apply/setx 自守卫），宿主只留
+env-var/4096 静态解析（`_mas_envSegN_static`）。PrefixSumLx 多环境改容量扫描
++零填充（手术①已证位级中性）+ `_prefixSumLx_dev`；NextLevelCluster 多环境同
+走 `_dev` 容量网格；ReorderRealtime 无条件容量 memset（396 else-读删除）。
+L1 的 warpNum 是 totalNodes 派生（场景常量）保持宿主判定。
+
+验证：15 段绿（mas-oracle strict 20-cube 4-level=本刀位级覆盖），锚逐位。
+foldshirt merged N=4：**ls_mas_setup 8B×5/iter → 8B×1/iter**（−4，逐层回读全
+灭；余=终层 totalNumberClusters 1 读 + 4B×1 未名读，双双归 B2' 块）。
