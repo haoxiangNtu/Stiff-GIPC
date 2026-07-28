@@ -34,3 +34,42 @@
 3. 1,500 次/帧发射：整帧 CUDA Graph（CUDA 12.4+ 条件节点）一次发射吃掉全部。
 
 isolated 对照：wall 22.9s、newton 545——结构同病，比例相近。
+
+---
+
+# Phase B 现状与设计（2026-07-28 勘察）
+
+## 勘察发现
+
+- **B1（设备线搜索默认化）已是既成事实**：`STIFF_DEVICE_LINESEARCH` 语义为
+  非"0"即开（ipc_solver ~41-43）——每 trial 的能量读回早已消灭，每 trial 仅回
+  传 1 个决策 int。靶单中它出局。
+- **PCG 设备自尾图无罪**：每次求解仅 1 次状态读回（graph_state，~771），不是
+  每批。但**每次求解都重新 stream-capture 整张图**（K×body ≈ 百余次发射被反复
+  录制 + ExecUpdate + Upload，×~3.4 求解/帧）——1,500 次/帧发射的主要成分之一。
+- 138 次/帧阻塞拷贝为长尾结构：per-trial 决策 int、per-buildCP 计数块+
+  _gdCollapse、alpha 链标量族（ground/self/refine）、minMax 距离对、kappa、
+  检测计数（06 wrappers ×4 D2H）等 ~15 个散点 × 各自倍率。
+
+## B2'：捕获缓存（设计+风险边界）
+
+签名=捕获参数全集 {x/r/z/p/dirs 指针、d_rz/d_break/d_graph_state、n、K、
+max_iter、tol 位} + **预条件器缓冲代际计数**。风险：body() 经
+apply_preconditioner 吸入 MAS 内部指针（mRbin/mZbin 有增长路径 05:1241、
+matbin 每聚合重发布 05:402）——签名漏掉任一指针生命周期，脏命中=越界。
+**前置条件：body() 捕获指针族的完整生命周期审计**（枚举每个被捕获参数的
+alloc/realloc/publish 点，接显式失效钩子）。审计完成前不实施。
+
+## B3：迭代状态块（设计）
+
+设备侧 struct IterStatus { alpha_ground, alpha_self, alpha_refine, minDist2_g,
+minDist2_s, gd_collapse, ls_decision, dirnan_any, ... }，各生产者内核就地写入，
+每牛顿迭代**一次** ~64B 读回替代 ~10 个散点 memcpy。改动面=每个散点的消费端
+从"独立读回"改为"读状态块字段"，语义逐点位级等价可证。与描述符战役（写侧
+__constant__ 合并）互补成对：读侧状态块 + 写侧描述符 = 主机交互每迭代 O(1)。
+
+## 实施顺序（下一轮）
+
+1. B2' 前置审计（Explore 代理枚举捕获指针族生命周期）→ 实施+失效钩子。
+2. B3 状态块（散点逐个迁移，每步套件+锚验证）。
+3. 复剖析（nsys A800 对照 Phase A 基线：memcpy/帧、launch/帧、GPU 空转比）。
