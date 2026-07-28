@@ -16,8 +16,13 @@ void set_emit_caps(int dcd_cap, int ccd_cap)
                 "the CCD mirror buffer can overflow. A pair-buffer grow site "
                 "raised the DCD cap without growing the CCD mirror.\n",
                 dcd_cap, ccd_cap);
+    // [B3 tosymbol-cache] caps change only on pair-buffer growth
+    static int last_dcd = -1, last_ccd = -1;
+    if(dcd_cap == last_dcd && ccd_cap == last_ccd)
+        return;
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_dcd_cp_cap, &dcd_cap, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ccd_cp_cap, &ccd_cap, sizeof(int)));
+    last_dcd = dcd_cap; last_ccd = ccd_cap;
 }
 
 

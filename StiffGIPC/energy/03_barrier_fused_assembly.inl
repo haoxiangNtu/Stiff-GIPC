@@ -47,9 +47,12 @@ __device__ int g_bar_trace = 0;
 __device__ int g_tgt0 = -1;
 __device__ int g_tgt1 = -1;
 static void set_bar_targets(int t, int a, int b){
+    static int lt = -999, la = -999, lb = -999;   // [B3 tosymbol-cache]
+    if(t == lt && a == la && b == lb) return;
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bar_trace, &t, sizeof(int)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt0, &a, sizeof(int)));
-    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt1, &b, sizeof(int))); }
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_tgt1, &b, sizeof(int)));
+    lt = t; la = a; lb = b; }
 #include "energy/binned_grad_common.cuh"  // [E3.2] _gfxAdd/_binDepBase hoisted
 // combine the K bins per vertex back into the (double3) contact gradient (+= onto ground grad).
 __global__ void _gfxToGrad(double3* _grad, const double* gbin, int n)
