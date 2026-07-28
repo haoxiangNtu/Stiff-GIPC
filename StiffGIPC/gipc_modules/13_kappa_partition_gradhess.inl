@@ -1,3 +1,22 @@
+// [C-2] contact-segment triplet total, computed from device-resident counts.
+// Mirrors the host accumulation exactly: barrier(live cp 2/3/4) +
+// friction(lastH stash 2/3/4 + gd stash, when armed) + ground(live gp slot 5).
+__global__ void _calc_contact_triplet_total(int* d_total,
+                                            const uint32_t* cp_live,
+                                            const uint32_t* cp_fric,
+                                            const uint32_t* gp_fric,
+                                            int m12, int m9, int m6)
+{
+    long long t = (long long)cp_live[4] * m12 + (long long)cp_live[3] * m9
+                  + (long long)cp_live[2] * m6;
+#ifdef USE_FRICTION
+    t += (long long)cp_fric[4] * m12 + (long long)cp_fric[3] * m9
+         + (long long)cp_fric[2] * m6 + (long long)(*gp_fric);
+#endif
+    t += (long long)cp_live[5];
+    *d_total = (int)t;
+}
+
 void GIPC::suggestKappa(double& kappa)
 {
     double H_b;
@@ -752,6 +771,15 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     KSEG("seg_thru_ground")
     gipc_global_triplet.global_collision_triplet_offset =
         gipc_global_triplet.global_triplet_offset;
+    // [C-2] device mirror of the contact-segment triplet total: every factor
+    // already lives on device (_cpNum live slots + the C-1 friction stashes),
+    // so downstream FEM assembly offsets (= this + scene-constant strides) can
+    // be read in-kernel — the prerequisite for the Newton-loop graph.
+    _calc_contact_triplet_total<<<1, 1>>>(m_d_contact_triplet_total,
+                                          _cpNum,
+                                          m_scr_cp_friction,
+                                          m_scr_gp_friction,
+                                          M12_Off, M9_Off, M6_Off);
 
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     gipc_global_triplet.update_hash_value(abd_fem_count_info.abd_point_num);

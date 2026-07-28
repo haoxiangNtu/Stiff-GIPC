@@ -83,6 +83,7 @@ class GIPC
     double*   m_d_ls_alpha            = nullptr;  // [C-1] device-resident trial alpha
     double*   m_d_ls_scalars          = nullptr;  // [C-1] {c1m, kappa} staged per line search
     uint32_t* m_scr_cp_friction       = nullptr;  // [C-1] friction-era cp counts, device-stashed
+    int*      m_d_contact_triplet_total = nullptr; // [C-2] device contact-segment triplet total
     bool      m_ls_recording          = false;    // [C-1] capacity sizing while recording
     cudaGraphExec_t m_ls_graph_exec   = nullptr;  // [C-1] cached trial-body self-tail graph
     long long m_ls_graph_sig[2]       = {-1, -1}; //   {buffer generation, budget}

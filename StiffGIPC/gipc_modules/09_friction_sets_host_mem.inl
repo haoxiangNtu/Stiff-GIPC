@@ -294,6 +294,7 @@ void GIPC::FREE_DEVICE_MEM()
     release(m_d_ls_alpha);        // [C-1]
     release(m_d_ls_scalars);      // [C-1]
     release(m_scr_cp_friction);   // [C-1]
+    release(m_d_contact_triplet_total); // [C-2]
     release(m_scr_ls_decision_counts);
     release(m_scr_maxk);
     release(m_scr_sq_a);     release(m_scr_cnt_a);
@@ -403,6 +404,8 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_gp_friction, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_cp_friction, 5 * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(m_scr_cp_friction, 0, 5 * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_contact_triplet_total, sizeof(int)));  // [C-2]
+    CUDA_SAFE_CALL(cudaMemset(m_d_contact_triplet_total, 0, sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_ls_alpha, sizeof(double)));  // [C-1]
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_ls_scalars, 2 * sizeof(double)));  // [C-1] {c1m, kappa}
     CUDA_SAFE_CALL(cudaMemset(m_scr_gp_friction, 0, sizeof(uint32_t)));
