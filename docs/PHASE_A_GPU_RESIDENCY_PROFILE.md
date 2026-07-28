@@ -95,3 +95,21 @@ __constant__ 合并）互补成对：读侧状态块 + 写侧描述符 = 主机�
   另：pcg_solver 文件级 getenv 静态族（s_graph_env 等）为进程稳定缓存，跨引擎
   语义已由 phase-0a 值追踪先例覆盖 s_seg_binned_host，余者低危。
 - 完整表（每指针 owner/alloc/realloc 点/稳定性判定）见会话审计工件。
+
+---
+
+# B3 精确归因（2026-07-28，NVTX 相位 + sqlite 联查，4090 foldshirt 4env 20f）
+
+每牛顿迭代阻塞拷贝census（~1000 迭代归一）：
+linear_solve **5.4**（6.46s 总）> line_search **6.2**（2.82s）> ccd_alpha
+**4.2**（3.98s）> GH_assembly 4.8 + **ToSymbol 5.4**（1.36s）。
+**20s 墙钟中 13.3s 为阻塞拷贝**（4090 尚且如此，A800 按往返延迟放大）。
+
+静态普查三次落空的教训：大头在被调函数内部（buildFullCP 的 ccd 计数镜像刷新、
+MAS ReorderRealtime 读回、DeviceOut 助手隐藏读回），顶层代码只见 1 次
+h_ccd_state。工具链已入库：STIFF_NVTX=1（默认零开销）+ 六相位区间 +
+scratchpad sqlite 联查模板。
+
+B3 手术顺序（按耗时）：①linear_solve 内部（converter 计数→设备侧绑定与 B2'
+前置改造同解；MAS 重排读回合批）②ccd_alpha 的隐藏 3.2（buildFullCP 计数族
+合批/延迟）③line_search 每 trial 族。每步：改后重跑本归因剖析对照 + 套件+锚。
