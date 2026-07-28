@@ -447,7 +447,13 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     }
     else
     {
-        SceneSize = bvh_f.scene;
+        // [B3 bbox-async fix] boot-only 48B read of the root box straight from
+        // the device. The old code consumed bvh_f.scene — a SIDE EFFECT of the
+        // blocking Construct — which surgery ⑥'s async builds no longer refresh;
+        // flows that never call getSceneSize() then fed garbage into the dHat
+        // derivation (bboxDiagSize2=1e65 → 22M pairs → OOM, 7 gates down).
+        CUDA_SAFE_CALL(cudaMemcpy(
+            &SceneSize, bvh_f._bvs, sizeof(AABB), cudaMemcpyDeviceToHost));
     }
     bboxDiagSize2 = __GEIGEN__::__squaredNorm(
         __GEIGEN__::__minus(SceneSize.upper, SceneSize.lower));
