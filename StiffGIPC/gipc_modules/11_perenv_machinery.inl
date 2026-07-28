@@ -404,7 +404,12 @@ __global__ void _per_env_selfAlpha_min(const double3* vertexes, const int4* pair
 void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
 {
     h_ccd_cpNum.invalidate();  // [3b] swept re-emission ahead
-    if(m_skip_all_collision) { h_ccd_cpNum = 0; return; }
+    if(m_skip_all_collision)
+    {
+        h_ccd_cpNum = 0;
+        m_last_ccd_pair_count = 0;
+        return;
+    }
     double3* sf = bvh_f._vertexes;
     double3* se = bvh_e._vertexes;
     bvh_f._vertexes = _vertexes;
@@ -498,6 +503,7 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
     bvh_f._vertexes = sf;
     bvh_e._vertexes = se;
+    m_last_ccd_pair_count = static_cast<uint32_t>(h_ccd_cpNum);
 }
 
 void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
@@ -506,6 +512,7 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
     if(m_skip_all_collision)
     {
         h_ccd_cpNum = 0;
+        m_last_ccd_pair_count = 0;
         return;
     }
 
@@ -572,6 +579,7 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
             cudaStreamPerThread, m_aux_done_event, 0));
         CUDA_SAFE_CALL(cudaMemcpy(h_ccd_cpNum.refresh_dst(), _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     }
+    m_last_ccd_pair_count = static_cast<uint32_t>(h_ccd_cpNum);
 }
 
 

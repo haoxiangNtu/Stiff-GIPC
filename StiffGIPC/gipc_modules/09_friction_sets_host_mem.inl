@@ -210,6 +210,8 @@ void GIPC::FREE_DEVICE_MEM()
     pair_buffers_free(PairBuffers{_collisonPairs, _MatIndex, _ccd_collisonPairs, MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM});   // [v0.8.6 2b] guarded + null-set
     m_reduce_scratch.release(); m_reduce_cap = 0;  // [3d-2]
     _cpNum.release();
+    m_pair_snap_cur.release();
+    m_pair_snap_last.release();
     _gpNum = nullptr;
     release(_close_cpNum);
     release(_close_gpNum);
@@ -328,6 +330,12 @@ void GIPC::MALLOC_DEVICE_MEM()
     // paired cpNum+gpNum reads become ONE 6-int D2H.
     _cpNum.resize_discard(6);
     _gpNum = _cpNum + 5;
+    m_pair_snap_cur.resize_discard(6);
+    m_pair_snap_last.resize_discard(6);
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_pair_snap_cur, 0, 6 * sizeof(uint32_t), cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_pair_snap_last, 0, 6 * sizeof(uint32_t), cudaStreamPerThread));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundNormal, 5 * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_groundOffset, 5 * sizeof(double)));
     double  h_offset[5] = {ground_offset_cfg, -1, 1, -1, 1};
@@ -634,6 +642,21 @@ void GIPC::buildFrictionSets()
                                                               m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     CUDA_SAFE_CALL(cudaMemcpy(h_cpNum_last.refresh_dst(), _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // Preserve the body-contact truth before _cpNum becomes another rank
+    // scratch. Ground is different: _gpNum aliases slot 5 and ground Hessian
+    // assembly increments it even though the rank is unused. If Newton exits
+    // before another buildCP, slot 5 is therefore 2*h_gpNum here. The DCD
+    // snapshot is the immutable exact source for the lagged ground count.
+    CUDA_SAFE_CALL(cudaMemcpyAsync(m_pair_snap_last,
+                                   _cpNum,
+                                   5 * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(m_pair_snap_last.data() + 5,
+                                   m_pair_snap_cur.data() + 5,
+                                   sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread));
     numbers = h_gpNum;
     if(numbers > 0)
     {
@@ -652,9 +675,10 @@ void GIPC::buildFrictionSets()
                                                       m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     h_gpNum_last = h_gpNum;
-    // [B3 s7] stash the friction-era device count: _cpNum+5 still holds the
-    // value h_gpNum mirrors here; the friction-Hessian restore becomes D2D.
-    CUDA_SAFE_CALL(cudaMemcpyAsync(m_scr_gp_friction, _cpNum + 5,
+    // [B3 s7] Restore from the immutable DCD snapshot for the same reason as
+    // m_pair_snap_last[5] above; raw _cpNum+5 may already be rank-incremented.
+    CUDA_SAFE_CALL(cudaMemcpyAsync(m_scr_gp_friction,
+                                   m_pair_snap_cur.data() + 5,
                                    sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
 }
 
@@ -724,7 +748,15 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         return;
     }
     const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    const bool tier_mode = contact_tier_layout_mode();
+    const int  launch_count = contact_pair_launch_extent(numbers);
+    int        blockNum =
+        (launch_count + static_cast<int>(threadNum) - 1)
+        / static_cast<int>(threadNum);
+    if(tier_mode)
+        clear_contact_triplet_span(gipc_global_triplet,
+                                   gipc_global_triplet.global_triplet_offset,
+                                   launch_count);
     _computeGroundGradientAndHessian<<<blockNum, threadNum>>>(
         _vertexes,
         _groundOffset,
@@ -740,7 +772,8 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         gipc_global_triplet.global_triplet_offset,
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,
-        m_pergroup_kappa ? m_d_p2g : nullptr);
+        m_pergroup_kappa ? m_d_p2g : nullptr,
+        tier_mode ? m_pair_snap_cur.data() + 5 : nullptr);
 }
 
 void GIPC::computeCloseGroundVal()
@@ -828,7 +861,10 @@ void GIPC::computeGroundGradient(double3* _gradient,
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    const int launch_count = contact_pair_launch_extent(numbers);
+    int blockNum =
+        (launch_count + static_cast<int>(threadNum) - 1)
+        / static_cast<int>(threadNum);
     _computeGroundGradient<<<blockNum, threadNum>>>(_vertexes,
                                                     _groundOffset,
                                                     _groundNormal,
@@ -843,6 +879,9 @@ void GIPC::computeGroundGradient(double3* _gradient,
                                                         : nullptr,
                                                     use_group_kappa && m_pergroup_kappa
                                                         ? m_d_p2g
+                                                        : nullptr,
+                                                    contact_tier_layout_mode()
+                                                        ? m_pair_snap_cur.data() + 5
                                                         : nullptr);
 }
 

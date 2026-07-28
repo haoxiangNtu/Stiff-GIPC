@@ -54,8 +54,11 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  int    global_offset,
                                                  int    number,
                                                  const double* kappa_grp = nullptr,
-                                                 const int*    p2g       = nullptr)
+                                                 const int*    p2g       = nullptr,
+                                                 const uint32_t* d_count = nullptr)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -118,8 +121,11 @@ __global__ void _computeGroundGradient(const double3* vertexes,
                                        double    Kappa_scalar,
                                        int       number,
                                        const double* kappa_grp = nullptr,
-                                       const int*    p2g       = nullptr)
+                                       const int*    p2g       = nullptr,
+                                       const uint32_t* d_count = nullptr)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;

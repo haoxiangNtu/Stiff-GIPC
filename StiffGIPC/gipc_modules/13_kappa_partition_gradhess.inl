@@ -270,6 +270,171 @@ void GIPC::partitionContactHessian()
         return;
     }
 
+    if(contact_tier_layout_mode())
+    {
+        // The payload has a bound layout (neutral zero pads included), while
+        // the classification sort itself runs at the next launch tier. Hash
+        // sentinels beyond payload_count sort after the four real classes.
+        const int payload_count =
+            gipc_global_triplet.global_collision_triplet_offset;
+        const int sort_capacity =
+            gipc::assembly_capacity_tier(payload_count);
+        muda::DeviceRadixSort().SortPairs(
+            gipc_global_triplet.block_hash_value(),
+            gipc_global_triplet.block_sort_hash_value(),
+            gipc_global_triplet.block_index(),
+            gipc_global_triplet.block_sort_index(),
+            sort_capacity);
+
+        constexpr int thread_num = 256;
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            gipc_global_triplet.d_contact_start_block,
+            0xFF,
+            4 * sizeof(int),
+            cudaStreamPerThread));
+        const size_t shared_mem = (thread_num + 1) * sizeof(int);
+        _partition_collision_triplets<<<sort_capacity / thread_num,
+                                        thread_num,
+                                        shared_mem>>>(
+            (const uint64_t*)
+                gipc_global_triplet.block_sort_hash_value(),
+            gipc_global_triplet.d_abd_abd_contact_start_id,
+            gipc_global_triplet.d_abd_fem_contact_start_id,
+            gipc_global_triplet.d_fem_abd_contact_start_id,
+            gipc_global_triplet.d_fem_fem_contact_start_id,
+            payload_count);
+
+        // This is the last host bridge in contact partitioning. The next C2
+        // layer publishes these four ranges as a device-resident record; for
+        // now retain the historical ABI consumed by ABD setup.
+        int h_class_start[4];
+        CUDA_SAFE_CALL(cudaMemcpy(
+            h_class_start,
+            gipc_global_triplet.d_contact_start_block,
+            4 * sizeof(int),
+            cudaMemcpyDeviceToHost));
+
+        // Sorted class order is fem-fem(0), abd-fem(1), fem-abd(2),
+        // abd-abd(3); the device block stores them in the legacy order.
+        const int raw_start[4] = {
+            h_class_start[3],
+            h_class_start[1],
+            h_class_start[2],
+            h_class_start[0]};
+        int segment_count[4] = {0, 0, 0, 0};
+        for(int s = 0; s < 4; ++s)
+        {
+            if(raw_start[s] < 0)
+                continue;
+            int end = payload_count;
+            for(int next = s + 1; next < 4; ++next)
+            {
+                if(raw_start[next] >= 0)
+                {
+                    end = raw_start[next];
+                    break;
+                }
+            }
+            if(raw_start[s] > end || end > payload_count)
+                throw std::runtime_error(
+                    "contact partition produced non-monotonic class starts");
+            segment_count[s] = end - raw_start[s];
+        }
+
+        int segment_start[4] = {0, 0, 0, 0};
+        for(int s = 1; s < 4; ++s)
+            segment_start[s] =
+                segment_start[s - 1] + segment_count[s - 1];
+        if(segment_start[3] + segment_count[3] != payload_count)
+            throw std::runtime_error(
+                "contact partition class counts do not cover the payload");
+
+        gipc_global_triplet.fem_fem_contact_num = segment_count[0];
+        gipc_global_triplet.abd_fem_contact_num = segment_count[1];
+        gipc_global_triplet.fem_abd_contact_num = segment_count[2];
+        gipc_global_triplet.abd_abd_contact_num = segment_count[3];
+        gipc_global_triplet.h_fem_fem_contact_start_id =
+            segment_start[0];
+        gipc_global_triplet.h_abd_fem_contact_start_id =
+            segment_start[1];
+        gipc_global_triplet.h_fem_abd_contact_start_id =
+            segment_start[2];
+        gipc_global_triplet.h_abd_abd_contact_start_id =
+            segment_start[3];
+
+        int segment_capacity[4] = {0, 0, 0, 0};
+        int staging_start[4] = {
+            sort_capacity, sort_capacity, sort_capacity, sort_capacity};
+        size_t staging_count = 0;
+        for(int s = 0; s < 4; ++s)
+        {
+            segment_capacity[s] =
+                segment_count[s]
+                    ? gipc::assembly_capacity_tier(segment_count[s])
+                    : 0;
+            if(s > 0)
+                staging_start[s] =
+                    staging_start[s - 1] + segment_capacity[s - 1];
+            staging_count +=
+                static_cast<size_t>(segment_capacity[s]);
+        }
+        const size_t need =
+            static_cast<size_t>(sort_capacity) + staging_count;
+        gipc_global_triplet.ensure_capacity_preserve(
+            static_cast<size_t>(payload_count), need);
+        if(staging_count > 0)
+        {
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_row_indices(sort_capacity),
+                0,
+                staging_count * sizeof(int),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_col_indices(sort_capacity),
+                0,
+                staging_count * sizeof(int),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_values(sort_capacity),
+                0,
+                staging_count * sizeof(Eigen::Matrix3d),
+                cudaStreamPerThread));
+        }
+
+        for(int s = 0; s < 4; ++s)
+        {
+            if(segment_capacity[s] == 0)
+                continue;
+            _reorder_triplet_segment<<<segment_capacity[s] / thread_num,
+                                       thread_num>>>(
+                gipc_global_triplet.block_row_indices(),
+                gipc_global_triplet.block_col_indices(),
+                gipc_global_triplet.block_values(),
+                gipc_global_triplet.block_row_indices(),
+                gipc_global_triplet.block_col_indices(),
+                gipc_global_triplet.block_values(),
+                (const uint32_t*)
+                    gipc_global_triplet.block_sort_index(),
+                segment_start[s],
+                staging_start[s],
+                segment_count[s]);
+        }
+        for(int s = 0; s < 4; ++s)
+        {
+            if(segment_capacity[s] == 0)
+                continue;
+            _compact_triplet_segment<<<segment_capacity[s] / thread_num,
+                                       thread_num>>>(
+                gipc_global_triplet.block_row_indices(),
+                gipc_global_triplet.block_col_indices(),
+                gipc_global_triplet.block_values(),
+                staging_start[s],
+                segment_start[s],
+                segment_count[s]);
+        }
+        return;
+    }
+
     // Contact partitioning is itself an out-of-place reorder: assembled
     // triplets live in [0,n), while _reorder_triplets writes [n,2n) before
     // the ranges are copied back. Dynamic pre-assembly growth only guarantees
@@ -590,14 +755,27 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // Non-hybrid only; hybrid keeps the worst-case finalize allocation.
     if(m_dynamic_triplet)
     {
-        long long bound = m_fixed_triplet_base
-            + static_cast<long long>(abd_fem_count_info.fem_point_num)
-            + static_cast<long long>(h_cpNum[0]) * M12_Off     // all contact pairs x max blocks
-            + static_cast<long long>(h_gpNum) * M6_Off;        // ground (generous)
+        long long bound =
+            m_fixed_triplet_base
+            + static_cast<long long>(abd_fem_count_info.fem_point_num);
+        if(contact_tier_layout_mode())
+        {
+            bound += make_contact_triplet_tier(h_cpNum).tier_triplets
+                     + contact_scalar_extent(h_gpNum);
 #ifdef USE_FRICTION
-        bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
-               + static_cast<long long>(h_gpNum_last) * M6_Off;
+            bound += make_contact_triplet_tier(h_cpNum_last).tier_triplets
+                     + contact_scalar_extent(h_gpNum_last);
 #endif
+        }
+        else
+        {
+            bound += static_cast<long long>(h_cpNum[0]) * M12_Off
+                     + static_cast<long long>(h_gpNum) * M6_Off;
+#ifdef USE_FRICTION
+            bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
+                     + static_cast<long long>(h_gpNum_last) * M6_Off;
+#endif
+        }
         bound += 4096;                                          // fixed slack
         // [v0.8.5.1] This is the ONE point where the triplet buffer provably holds no
         // live data (offset just reset; the previous stream was fully consumed by its
@@ -614,7 +792,13 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         // at the build point — the correctness backstop: rare, one transient copy,
         // always correct. Margin (30% capped at 512MB) lives in the callee.
         long long conv_pred = 27 * prev_triplet_len / 10;
-        long long target    = bound > conv_pred ? bound : conv_pred;
+        // A bound-layout assembly must also have its converter/partition
+        // staging envelope resident before capture. The exact-count release
+        // path retains its historical one-bound target.
+        long long assembly_target =
+            contact_tier_layout_mode() ? 2 * bound : bound;
+        long long target =
+            assembly_target > conv_pred ? assembly_target : conv_pred;
         if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(target))
         {
             gipc_global_triplet.open_discard_window();  // [A2] THE one legal point
@@ -670,19 +854,25 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             if(_numbers >= 1)
             {
                 const unsigned int _tn = 256;
-                int                _bn = (_numbers + _tn - 1) / _tn;
+                const int _launch = contact_pair_launch_extent(_numbers);
+                int       _bn = (_launch + static_cast<int>(_tn) - 1)
+                                / static_cast<int>(_tn);
                 _calBarrierGradient<<<_bn, _tn>>>(_vertexes, _rest_vertexes,
                     _collisonPairs, contact_grads, dHat, Kappa, _numbers,
                     m_pergroup_kappa ? m_kappa_group : nullptr,
-                    m_pergroup_kappa ? m_d_p2g : nullptr);
+                    m_pergroup_kappa ? m_d_p2g : nullptr,
+                    nullptr, nullptr, nullptr, 0.0,
+                    contact_tier_layout_mode()
+                        ? m_pair_snap_cur.data()
+                        : nullptr);
             }
             calBarrierHessian();
         }
         else
         calBarrierGradientAndHessian(contact_grads, Kappa);
         set_bar_targets(0, -1, -1);
-        gipc_global_triplet.global_triplet_offset +=
-            h_cpNum[4] * M12_Off + h_cpNum[3] * M9_Off + h_cpNum[2] * M6_Off;
+        gipc_global_triplet.global_triplet_offset += contact_triplet_extent(
+            make_contact_triplet_tier(h_cpNum));
     }
     KSEG("seg_contact")
 
@@ -698,8 +888,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         calFrictionHessian(TetMesh);
         }
         gipc_global_triplet.global_triplet_offset +=
-            h_cpNum_last[4] * M12_Off + h_cpNum_last[3] * M9_Off
-            + h_cpNum_last[2] * M6_Off + h_gpNum_last;
+            contact_triplet_extent(
+                make_contact_triplet_tier(h_cpNum_last))
+            + contact_scalar_extent(h_gpNum_last);
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     }
 #endif
@@ -748,7 +939,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         }
         xenvDiff(contact_grads, "  b.barrier+fric+grnd");
     }
-    gipc_global_triplet.global_triplet_offset += h_gpNum;
+    gipc_global_triplet.global_triplet_offset +=
+        contact_scalar_extent(h_gpNum);
     KSEG("seg_thru_ground")
     gipc_global_triplet.global_collision_triplet_offset =
         gipc_global_triplet.global_triplet_offset;
@@ -1313,4 +1505,3 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     return time00;
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
-

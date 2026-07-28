@@ -98,6 +98,11 @@ double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueu
 // line-search exit can restore mirror freshness after deferred trials.
 void GIPC::refresh_pair_counts()
 {
+    CUDA_SAFE_CALL(cudaMemcpyAsync(m_pair_snap_cur,
+                                   _cpNum,
+                                   6 * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread));
     uint32_t cp_gp_buf[6];
     CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
@@ -116,6 +121,10 @@ void GIPC::buildCP()
     {
         memset(h_cpNum.refresh_dst(), 0, 5 * sizeof(uint32_t));
         h_gpNum = 0;
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_pair_snap_cur,
+                                       0,
+                                       6 * sizeof(uint32_t),
+                                       cudaStreamPerThread));
         return;
     }
 
@@ -230,6 +239,11 @@ void GIPC::buildCP()
     {   // [B3 trial-defer] mirror stays invalid during trials; energies use
         // the slacked bounds + device live counts; overflow via the monotone
         // counter on the decision read. MIRROR_AUDIT proves no stale reader.
+        CUDA_SAFE_CALL(cudaMemcpyAsync(m_pair_snap_cur,
+                                       _cpNum,
+                                       6 * sizeof(uint32_t),
+                                       cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
         return;
     }
     {   // [9d28824-port] contiguous _cpNum[0:5]+_gpNum[5]: one 6-int D2H.
@@ -273,6 +287,11 @@ void GIPC::buildCP()
         }
     }
 
+    CUDA_SAFE_CALL(cudaMemcpyAsync(m_pair_snap_cur,
+                                   _cpNum,
+                                   6 * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread));
     snapshotDcdCcdPairs();   // [narrow-self snapshot] before buildFullCP clobbers the mirror
     // [B3 trial-defer] during line-search trials the collapse flag rides the
     // piggybacked decision read instead (handleGroundCollapse at the consumer);

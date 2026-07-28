@@ -97,8 +97,11 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        double*          lastH,
                                        int              global_offset,
                                        double           coef,
-                                       const double*    vert_mu_gd)
+                                       const double*    vert_mu_gd,
+                                       const uint32_t*  d_count)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -209,13 +212,14 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                                     double*                 lastH,
                                     double                  coef,
                                     const double*           vert_mu,
-                                    int                     cd_offset4,
-                                    int                     cd_offset3,
-                                    int                     cd_offset2,
+                                    int                     global_offset,
                                     int                     f_offset4,
                                     int                     f_offset3,
-                                    int                     f_offset2)
+                                    int                     f_offset2,
+                                    const uint32_t*         d_count)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -223,7 +227,6 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
     const double mu = _pair_mu(MMCVIDI, vert_mu, coef);  // [per-body friction]
     double  eps     = sqrt(eps2);
     double3 relDX3D;
-    int global_offset = cd_offset4 * M12_Off + cd_offset3 * M9_Off + cd_offset2 * M6_Off;
     if(MMCVIDI.x >= 0)
     {
         Friction::computeRelDX_EE(
@@ -571,8 +574,11 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
                                         double   eps2,
                                         double*  lastH,
                                         double   coef,
-                                        const double* vert_mu_gd)
+                                        const double* vert_mu_gd,
+                                        const uint32_t* d_count)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -613,8 +619,11 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                                      double                  eps2,
                                      double*                 lastH,
                                      double                  coef,
-                                     const double*           vert_mu)
+                                     const double*           vert_mu,
+                                     const uint32_t*         d_count)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     double eps = std::sqrt(eps2);
     int    idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)

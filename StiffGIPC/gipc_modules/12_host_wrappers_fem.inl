@@ -4,7 +4,18 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     h_cpNum.invalidate();
     h_gpNum.invalidate();
     h_ccd_cpNum.invalidate();
-    if(m_skip_all_collision) return;
+    if(m_skip_all_collision)
+    {
+        memset(h_cpNum.refresh_dst(), 0, 5 * sizeof(uint32_t));
+        h_gpNum = 0;
+        h_ccd_cpNum = 0;
+        m_last_ccd_pair_count = 0;
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_pair_snap_cur,
+                                       0,
+                                       6 * sizeof(uint32_t),
+                                       cudaStreamPerThread));
+        return;
+    }
     // point the BVH at LOCAL verts (the whole reason this kills cross-env divergence)
     double3* saved_f = bvh_f._vertexes;
     double3* saved_e = bvh_e._vertexes;
@@ -86,6 +97,11 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     if(!getenv("STIFF_SKIP_GRND")) GroundCollisionDetect();
     {   // [9d28824-port] one 6-int D2H
         uint32_t cp_gp_buf[6];
+        CUDA_SAFE_CALL(cudaMemcpyAsync(m_pair_snap_cur,
+                                       _cpNum,
+                                       6 * sizeof(uint32_t),
+                                       cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
         CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
@@ -118,27 +134,37 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
     int numbers = h_cpNum[0];
     if(numbers < 1)
         return;
+    const bool tier_mode = contact_tier_layout_mode();
+    const ContactTripletTierLayout layout =
+        make_contact_triplet_tier(h_cpNum);
+    const int output_start = gipc_global_triplet.global_triplet_offset;
+    if(tier_mode)
+        clear_contact_triplet_span(
+            gipc_global_triplet, output_start, layout.tier_triplets);
+
     const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    const int launch_count = contact_pair_launch_extent(numbers);
+    int       blockNum     = (launch_count + threadNum - 1) / threadNum;
 
     _calBarrierGradientAndHessian<<<blockNum, threadNum>>>(
         _vertexes,
         _rest_vertexes,
         _collisonPairs,
         _gradient,
-        gipc_global_triplet.block_values(),
-        gipc_global_triplet.block_row_indices(),
-        gipc_global_triplet.block_col_indices(),
+        gipc_global_triplet.block_values(tier_mode ? output_start : 0),
+        gipc_global_triplet.block_row_indices(tier_mode ? output_start : 0),
+        gipc_global_triplet.block_col_indices(tier_mode ? output_start : 0),
         _cpNum,
         _MatIndex,
         dHat,
         mKappa,
-        h_cpNum[4],
-        h_cpNum[3],
-        h_cpNum[2],
+        tier_mode ? layout.c4 : layout.n4,
+        tier_mode ? layout.c3 : layout.n3,
+        tier_mode ? layout.c2 : layout.n2,
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,   // [per-group κ] nullptr → scalar
-        m_pergroup_kappa ? m_d_p2g : nullptr);
+        m_pergroup_kappa ? m_d_p2g : nullptr,
+        tier_mode ? m_pair_snap_cur.data() : nullptr);
 }
 
 
@@ -148,25 +174,38 @@ void GIPC::calBarrierHessian()
     int numbers = h_cpNum[0];
     if(numbers < 1)
         return;
+    const bool tier_mode = contact_tier_layout_mode();
+    const ContactTripletTierLayout layout =
+        make_contact_triplet_tier(h_cpNum);
+    const int output_start = gipc_global_triplet.global_triplet_offset;
+    if(tier_mode)
+        clear_contact_triplet_span(
+            gipc_global_triplet, output_start, layout.tier_triplets);
+
     const unsigned int threadNum = 256;   // [split-GH] parity with the fused kernel launch
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    const int launch_count = contact_pair_launch_extent(numbers);
+    int       blockNum     = (launch_count + threadNum - 1) / threadNum;
 
     _calBarrierHessian<<<blockNum, threadNum>>>(_vertexes,
                                                 _rest_vertexes,
                                                 _collisonPairs,
-                                                gipc_global_triplet.block_values(),
-                                                gipc_global_triplet.block_row_indices(),
-                                                gipc_global_triplet.block_col_indices(),
+                                                gipc_global_triplet.block_values(
+                                                    tier_mode ? output_start : 0),
+                                                gipc_global_triplet.block_row_indices(
+                                                    tier_mode ? output_start : 0),
+                                                gipc_global_triplet.block_col_indices(
+                                                    tier_mode ? output_start : 0),
                                                 _cpNum,
                                                 _MatIndex,
                                                 dHat,
                                                 Kappa,
-                                                h_cpNum[4],
-                                                h_cpNum[3],
-                                                h_cpNum[2],
+                                                tier_mode ? layout.c4 : layout.n4,
+                                                tier_mode ? layout.c3 : layout.n3,
+                                                tier_mode ? layout.c2 : layout.n2,
                                                 numbers,
                                                 m_pergroup_kappa ? m_kappa_group : nullptr,   // [split-GH]
-                                                m_pergroup_kappa ? m_d_p2g : nullptr);
+                                                m_pergroup_kappa ? m_d_p2g : nullptr,
+                                                tier_mode ? m_pair_snap_cur.data() : nullptr);
 }
 
 static void _dbg_ksum(const char*, const void*, size_t);            // [4.3 fwd]
@@ -176,10 +215,20 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
 {
     int numbers = h_cpNum_last[0];
     //if (numbers < 1) return;
+    const bool tier_mode = contact_tier_layout_mode();
+    const ContactTripletTierLayout layout =
+        make_contact_triplet_tier(h_cpNum_last);
+    const int output_start = gipc_global_triplet.global_triplet_offset;
     const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;  //
+    int                blockNum  = 0;
     if(numbers > 0)
     {
+        if(tier_mode)
+            clear_contact_triplet_span(
+                gipc_global_triplet, output_start, layout.tier_triplets);
+        const int launch_count = contact_pair_launch_extent(numbers);
+        blockNum = (launch_count + threadNum - 1) / threadNum;
+
         // [v0.8.5 fix] _calFrictionHessian ranks its M12/M9/M6 slots via
         // atomicAdd(_cpNum+4/3/2), but those counters still hold THIS frame's
         // barrier type counts here, so friction ranks started at n4/n3/n2 and
@@ -200,9 +249,9 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             _vertexes,
             TetMesh.o_vertexes,
             _collisonPairs_lastH,
-            gipc_global_triplet.block_values(),
-            gipc_global_triplet.block_row_indices(),
-            gipc_global_triplet.block_col_indices(),
+            gipc_global_triplet.block_values(tier_mode ? output_start : 0),
+            gipc_global_triplet.block_row_indices(tier_mode ? output_start : 0),
+            gipc_global_triplet.block_col_indices(tier_mode ? output_start : 0),
             _cpNum,
             numbers,
             IPC_dt,
@@ -212,12 +261,14 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             lambda_lastH_scalar,
             frictionRate,
             d_vert_mu,  // [per-body friction]
-            h_cpNum[4],
-            h_cpNum[3],
-            h_cpNum[2],
-            h_cpNum_last[4],
-            h_cpNum_last[3],
-            h_cpNum_last[2]);
+            tier_mode
+                ? 0
+                : h_cpNum[4] * M12_Off + h_cpNum[3] * M9_Off
+                      + h_cpNum[2] * M6_Off,
+            tier_mode ? layout.c4 : layout.n4,
+            tier_mode ? layout.c3 : layout.n3,
+            tier_mode ? layout.c2 : layout.n2,
+            tier_mode ? m_pair_snap_last.data() : nullptr);
     }
 
     numbers = h_gpNum_last;
@@ -228,9 +279,14 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     if(numbers < 1)
         return;
 
-    blockNum = (numbers + threadNum - 1) / threadNum;
-    int global_offset = gipc_global_triplet.global_triplet_offset + h_cpNum_last[4] * M12_Off
-                        + h_cpNum_last[3] * M9_Off + h_cpNum_last[2] * M6_Off;
+    const int ground_launch = contact_pair_launch_extent(numbers);
+    blockNum = (ground_launch + threadNum - 1) / threadNum;
+    int global_offset =
+        output_start
+        + (tier_mode ? layout.tier_triplets : layout.exact_triplets);
+    if(tier_mode)
+        clear_contact_triplet_span(
+            gipc_global_triplet, global_offset, ground_launch);
     _calFrictionHessian_gd<<<blockNum, threadNum>>>(
         _vertexes,
         TetMesh.o_vertexes,
@@ -244,7 +300,9 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
         fDhat * IPC_dt * IPC_dt,
         lambda_lastH_scalar_gd,
         global_offset,
-        gd_frictionRate, d_vert_mu_gd);  // [per-body friction]
+        gd_frictionRate,
+        d_vert_mu_gd,
+        tier_mode ? m_pair_snap_last.data() + 5 : nullptr);  // [per-body friction]
 }
 
 void GIPC::computeSelfCloseVal()
@@ -395,14 +453,16 @@ void GIPC::calBarrierGradient(double3* _gradient, double mKappa,
     if(numbers < 1)
         return;
     const unsigned int threadNum = 256;
-    int                blockNum  = (numbers + threadNum - 1) / threadNum;
+    const int launch_count = contact_pair_launch_extent(numbers);
+    int       blockNum     = (launch_count + threadNum - 1) / threadNum;
 
 
     _calBarrierGradient<<<blockNum, threadNum>>>(
         _vertexes, _rest_vertexes, _collisonPairs, _gradient, dHat, mKappa, numbers,
         use_group_kappa && m_pergroup_kappa ? m_kappa_group : nullptr,
         use_group_kappa && m_pergroup_kappa ? m_d_p2g : nullptr,
-        ec_pair, ec_force, ec_pbid, ec_inv_dt2);
+        ec_pair, ec_force, ec_pbid, ec_inv_dt2,
+        contact_tier_layout_mode() ? m_pair_snap_cur.data() : nullptr);
 }
 
 void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
@@ -412,7 +472,8 @@ void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
     int                blockNum  = 0;
     if(numbers > 0)
     {
-        blockNum = (numbers + threadNum - 1) / threadNum;
+        const int launch_count = contact_pair_launch_extent(numbers);
+        blockNum = (launch_count + threadNum - 1) / threadNum;
         _calFrictionGradient<<<blockNum, threadNum>>>(_vertexes,
                                                       TetMesh.o_vertexes,
                                                       _collisonPairs_lastH,
@@ -424,12 +485,16 @@ void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
                                                       fDhat * IPC_dt * IPC_dt,
                                                       lambda_lastH_scalar,
                                                       frictionRate,
-                                                      d_vert_mu);  // [per-body friction]
+                                                      d_vert_mu,
+                                                      contact_tier_layout_mode()
+                                                          ? m_pair_snap_last.data()
+                                                          : nullptr);  // [per-body friction]
     }
     numbers = h_gpNum_last;
     if(numbers < 1)
         return;
-    blockNum = (numbers + threadNum - 1) / threadNum;
+    const int ground_launch = contact_pair_launch_extent(numbers);
+    blockNum = (ground_launch + threadNum - 1) / threadNum;
 
     _calFrictionGradient_gd<<<blockNum, threadNum>>>(_vertexes,
                                                      TetMesh.o_vertexes,
@@ -440,7 +505,11 @@ void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
                                                      IPC_dt,
                                                      fDhat * IPC_dt * IPC_dt,
                                                      lambda_lastH_scalar_gd,
-                                                     gd_frictionRate, d_vert_mu_gd);  // [per-body friction]
+                                                     gd_frictionRate,
+                                                     d_vert_mu_gd,
+                                                     contact_tier_layout_mode()
+                                                         ? m_pair_snap_last.data() + 5
+                                                         : nullptr);  // [per-body friction]
 }
 
 

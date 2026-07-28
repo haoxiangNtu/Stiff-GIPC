@@ -1277,6 +1277,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             }
         }
         validateFinalCcdStateOrThrow(h_ccd_state, "device CCD chain");
+        m_last_ccd_pair_count = static_cast<uint32_t>(std::max(0, ccd_cnt));
         if(getenv("STIFF_CCD_VALIDATE"))
         {
             const double host_temp = h_ccd_state[0] < h_ccd_state[1]

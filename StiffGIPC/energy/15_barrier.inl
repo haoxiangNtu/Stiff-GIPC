@@ -51,8 +51,11 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
                                     int2*             _ec_out_pair  = nullptr,
                                     double3*          _ec_out_force = nullptr,
                                     const int*        _ec_pbid      = nullptr,
-                                    double            _ec_inv_dt2   = 0.0)
+                                    double            _ec_inv_dt2   = 0.0,
+                                    const uint32_t*   d_count       = nullptr)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;

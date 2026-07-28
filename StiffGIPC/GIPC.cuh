@@ -243,6 +243,11 @@ class GIPC
     int4*     _collisonPairs     = nullptr;
     int4*     _ccd_collisonPairs = nullptr;
     DeviceBuffer<uint32_t> _cpNum;  // [B1] 6 slots: cp[0:5] + gp[5]; _gpNum is a VIEW (=_cpNum+5)
+    // Read-only detection snapshots used by capacity-launched contact
+    // assembly. _cpNum is reused as an atomic rank scratch during assembly,
+    // so no guarded kernel may consume it directly.
+    DeviceBuffer<uint32_t> m_pair_snap_cur;   // cp[0:5] + gp[5], current DCD
+    DeviceBuffer<uint32_t> m_pair_snap_last;  // lagged friction counts
     int*      _MatIndex          = nullptr;
     uint32_t* _close_cpNum       = nullptr;
     // On-demand reduction scratch: reductions launch ceil(count/default_threads)
@@ -324,6 +329,10 @@ class GIPC
     // (writers invalidate at build entries, refresh at the D2H copy-backs)
     HostMirrorArray<uint32_t, 5> h_cpNum{"h_cpNum"};
     HostMirror<uint32_t>         h_ccd_cpNum{"h_ccd_cpNum"};
+    // Last fully adjudicated swept-CCD count. DCD legitimately invalidates
+    // h_ccd_cpNum by reusing _cpNum, but frame-boundary telemetry must still
+    // report the most recent CCD high-water without bypassing mirror audits.
+    uint32_t m_last_ccd_pair_count = 0;
     // [narrow-self snapshot] immutable copy of the DCD-time CCD pair mirror.
     // The DCD detect kernels write _collisionPair AND _ccd_collisionPair at the
     // same atomic slot, so right after buildCP the first h_cpNum[0] entries of

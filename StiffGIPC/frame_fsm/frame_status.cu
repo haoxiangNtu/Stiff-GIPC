@@ -20,7 +20,7 @@ void GIPC::record_legacy_frame_status(bool graph_requested,
         status.path_flags |= frame_fsm::PATH_LEGACY_FALLBACK;
     status.newton_iters       = std::max(0, newton_iterations);
     status.hw_dcd_pairs       = static_cast<int>(h_cpNum[0]);
-    status.hw_ccd_pairs       = static_cast<int>(h_ccd_cpNum);
+    status.hw_ccd_pairs       = static_cast<int>(m_last_ccd_pair_count);
     status.final_alpha        = 1.0;
     status.cfl_alpha          = 1.0;
     status.kappa              = Kappa;

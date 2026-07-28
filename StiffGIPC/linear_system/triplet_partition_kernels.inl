@@ -61,3 +61,39 @@ __global__ void _reorder_triplets(int*             row_ids_input,
     col_ids[idx]       = col_ids_input[sort_index[idx]];
     triplet_value[idx] = triplet_value_inpuit[sort_index[idx]];
 }
+
+__global__ void _reorder_triplet_segment(
+    const int*             row_ids_input,
+    const int*             col_ids_input,
+    const Eigen::Matrix3d* triplet_value_input,
+    int*                   row_ids,
+    int*                   col_ids,
+    Eigen::Matrix3d*       triplet_value,
+    const uint32_t*        sort_index,
+    int                    sorted_start,
+    int                    output_start,
+    int                    number)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    const uint32_t source = sort_index[sorted_start + idx];
+    row_ids[output_start + idx]       = row_ids_input[source];
+    col_ids[output_start + idx]       = col_ids_input[source];
+    triplet_value[output_start + idx] = triplet_value_input[source];
+}
+
+__global__ void _compact_triplet_segment(int*             row_ids,
+                                         int*             col_ids,
+                                         Eigen::Matrix3d* triplet_value,
+                                         int              input_start,
+                                         int              output_start,
+                                         int              number)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    row_ids[output_start + idx]       = row_ids[input_start + idx];
+    col_ids[output_start + idx]       = col_ids[input_start + idx];
+    triplet_value[output_start + idx] = triplet_value[input_start + idx];
+}

@@ -13,8 +13,11 @@ __global__ void _calBarrierHessian(const double3*   _vertexes,
                                    int              offset2,
                                    int              number,
                                    const double*    kappa_grp = nullptr,   // [split-GH] per-group kappa parity with the fused kernel
-                                   const int*       p2g       = nullptr)
+                                   const int*       p2g       = nullptr,
+                                   const uint32_t*  d_count   = nullptr)
 {
+    if(d_count)
+        number = static_cast<int>(*d_count);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;

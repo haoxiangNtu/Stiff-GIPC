@@ -1,4 +1,5 @@
 #include "linear_system/linear_system/global_matrix.h"
+#include "linear_system/utils/capacity_tier.h"
 #include "cuda_tools/cuda_tools.h"
 #include <climits>
 #include <cstdlib>
@@ -11,12 +12,15 @@ __global__ void _set_hash_value(const int* row_ids,
                                 uint32_t*  index,
                                 uint64_t*  hashValue,
                                 int        abd_vert_num,
-                                int        number)
+                                int        exact_number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= number)
+    index[idx] = idx;
+    if(idx >= exact_number)
+    {
+        hashValue[idx] = ~uint64_t{0};
         return;
-    index[idx]     = idx;
+    }
     //hashValue[idx] = (((uint64_t)rows[idx]) << 32) | ((uint64_t)cols[idx]);
     uint64_t self_hash;
     if(row_ids[idx] < abd_vert_num && col_ids[idx] < abd_vert_num)
@@ -43,13 +47,19 @@ __global__ void _set_hash_value(const int* row_ids,
 void GIPCTripletMatrix::update_hash_value(int fem_offset)
 {
     //reset_zero();
+    const int exact_number = global_collision_triplet_offset;
+    const int launch_number =
+        device_count_mode() ? gipc::assembly_capacity_tier(exact_number)
+                            : exact_number;
+    if(launch_number <= 0)
+        return;
     int threadNum = 256;
-    int blockNum = (global_collision_triplet_offset + threadNum - 1) / threadNum;
+    int blockNum = (launch_number + threadNum - 1) / threadNum;
 
-    if(global_collision_triplet_offset > global_external_max_capcity)
+    if(launch_number > global_external_max_capcity)
     {
-        global_external_max_capcity = global_collision_triplet_offset;
-        resize_collision_hash_size(global_collision_triplet_offset);
+        global_external_max_capcity = launch_number;
+        resize_collision_hash_size(launch_number);
     }
 
     LaunchCudaKernal(blockNum,
@@ -61,7 +71,7 @@ void GIPCTripletMatrix::update_hash_value(int fem_offset)
                      m_block_index.data(),
                      m_block_hash_value.data(),
                      fem_offset,
-                     global_collision_triplet_offset);
+                     exact_number);
 }
 
 
