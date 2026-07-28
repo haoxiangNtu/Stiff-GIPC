@@ -18,6 +18,12 @@
 // (+8~16% foldshirt 4env step) were partly confounded by GPU contention and
 // first-run clock-ramp inflation (~10%) — bench this kernel with median-of-3,
 // never a single run.
+//
+// [dlto adopted 2026-07-28] Device LTO is now the default build: this kernel
+// compiles to 178 regs / 2 KB stack (nvlink cross-TU inlining; ABI calls
+// 320->76). Extraction to its own TU was RE-TESTED under dlto and is STILL
+// degraded (255 regs, +17.7% instructions) — composite residency stands.
+// The non-dlto figures above are kept as the adjudication record.
 // ============================================================================
 __device__ double* g_gbin = nullptr;
 // [multienv-mode] binned (Demmel-Nguyen order-free) gradient is a DETERMINISM feature (strict mode).
