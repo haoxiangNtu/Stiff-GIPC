@@ -501,11 +501,11 @@ double lbvh_f::Construct(cudaStream_t stream)
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + face_number);
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + face_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    // [C-1 capture-safe sort] cub stable radix on pre-allocated instance
+    // scratch (bit-identical order; no thrust internal malloc/free, so the
+    // build can be recorded into a CUDA graph).
+    _iota_u32<<<(face_number + 255) / 256, 256>>>(_indices, face_number);
+    _mc_sort_active(*this, _MChash, _indices, face_number, 0);
     sortBvs(_indices, _bvs, _tempLeafBox, face_number);
     calcLeafNodes(_nodes, _indices, face_number);
     calcInternalNodes(_nodes, _MChash, face_number);
@@ -542,12 +542,11 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
                         alpha_dev);
     calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + face_number);
-
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + face_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    // [C-1 capture-safe sort] cub stable radix on pre-allocated instance
+    // scratch (bit-identical order; no thrust internal malloc/free, so the
+    // build can be recorded into a CUDA graph).
+    _iota_u32<<<(face_number + 255) / 256, 256>>>(_indices, face_number);
+    _mc_sort_active(*this, _MChash, _indices, face_number, 0);
     sortBvs(_indices, _bvs, _tempLeafBox, face_number);
 
     calcLeafNodes(_nodes, _indices, face_number);
@@ -590,13 +589,9 @@ double lbvh_e::Construct(cudaStream_t stream)
                 _bodyId, _collision_skip_matrix, _collision_body_count);
     calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + edge_number);
-    //cudaEventRecord(end0);
-
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + edge_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    // [C-1 capture-safe sort] see face variant.
+    _iota_u32<<<(edge_number + 255) / 256, 256>>>(_indices, edge_number);
+    _mc_sort_active(*this, _MChash, _indices, edge_number, 0);
     sortBvs(_indices, _bvs, _tempLeafBox, edge_number);
 
     //cudaEventRecord(end1);
@@ -648,12 +643,9 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
                         alpha_dev);
     calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
-    thrust::sequence(thrust::device_ptr<uint32_t>(_indices),
-                     thrust::device_ptr<uint32_t>(_indices) + edge_number);
-
-    thrust::sort_by_key(thrust::device_ptr<uint64_t>(_MChash),
-                        thrust::device_ptr<uint64_t>(_MChash) + edge_number,
-                        thrust::device_ptr<uint32_t>(_indices));
+    // [C-1 capture-safe sort] see face variant.
+    _iota_u32<<<(edge_number + 255) / 256, 256>>>(_indices, edge_number);
+    _mc_sort_active(*this, _MChash, _indices, edge_number, 0);
     sortBvs(_indices, _bvs, _tempLeafBox, edge_number);
 
     calcLeafNodes(_nodes, _indices, edge_number);
