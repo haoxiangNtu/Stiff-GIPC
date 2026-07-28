@@ -68,6 +68,21 @@ class GIPC
     // mode WARNs and continues by contract).
     int       m_ls_exhausted_total    = 0;
     int       m_ls_nonfinite_total    = 0;
+    // [B3 device-count] trial mode: contact-count-dependent energy kernels
+    // read the LIVE count from _cpNum on device (grid sized from a slacked
+    // iteration-start bound) instead of a per-trial host mirror refresh.
+    // Default off = legacy behavior everywhere.
+    bool      m_energy_use_device_counts = false;
+    // [B3 trial-defer] iteration-start contact-count bounds (slacked) for
+    // trial-mode energy grids; buildCP skips its counts D2H + overflow check
+    // while m_ls_defer_counts is set — overflow is detected via the monotone
+    // device counter piggybacked on the line-search decision read, and the
+    // rare trip re-runs buildCP in legacy mode (full grow+redo machinery).
+    bool      m_ls_defer_counts       = false;
+    int       m_energy_bound_cp       = 0;
+    int       m_energy_bound_gp       = 0;
+    unsigned  m_pair_overflow_seen    = 0u;
+    void      refresh_pair_counts();
     // [descriptor phase-0.3] solver scratch — was function-static device
     // allocations shared process-wide (leak + cross-engine sharing + dangling
     // after device reset). Instance-owned; the use sites keep their lazy

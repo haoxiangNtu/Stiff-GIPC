@@ -12,12 +12,16 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
                                                double dHat,
                                                double Kappa,
                                                int    number,
-                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                               const uint32_t* d_live = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
 
     extern __shared__ double tep[];
+    // [B3 device-count] see _getBarrierEnergy_Reduction_3D — live count read on
+    // device in trial mode; idle threads contribute exact 0.0 (bitwise-neutral).
+    if(d_live) number = (int)*d_live;
     double temp = 0.0;
     if(idx < number)
     {
@@ -143,7 +147,7 @@ __global__ void _computeGroundGradient(const double3* vertexes,
 
 // ── [E2] registry members for type 4 (ground): launcher body VERBATIM from
 // the DeviceOut dispatcher switch; size = its sizing-chain entry ──
-int GIPC::energy_size_ground() { return h_gpNum; }
+int GIPC::energy_size_ground() { return m_energy_use_device_counts ? m_energy_bound_gp : (int)h_gpNum; }  // [B3] trial bound
 void GIPC::energy_launch_ground(device_TetraData& TetMesh, double* queue, int numbers,
                                 int blockNum, unsigned int threadNum, unsigned int sharedMsize,
                                 double* pe, const int* p2g, int ng,
@@ -152,5 +156,6 @@ void GIPC::energy_launch_ground(device_TetraData& TetMesh, double* queue, int nu
             _computeGroundEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, _groundOffset, _groundNormal,
                 _environment_collisionPair, dHat, Kappa, numbers,
-                pe, pe ? p2g : nullptr, ng);
+                pe, pe ? p2g : nullptr, ng,
+                m_energy_use_device_counts ? _cpNum + 5 : nullptr);
 }

@@ -1,7 +1,16 @@
+// [B3 trial-defer] monotone overflow counter: emission bumps it on the trash-
+// slot branch (cold path, zero hot cost). Consumers compare against the last
+// value they saw — no resets, no ToSymbol churn. Cross-TU via RDC extern.
+__device__ uint32_t g_pair_overflow_count = 0u;
 __device__ __forceinline__ uint32_t _emit_slot(uint32_t* cnt, int cap)
 {
     uint32_t i = atomicAdd(cnt, 1u);
-    return (i < (uint32_t)cap) ? i : (uint32_t)cap;   // overflow -> trash slot [cap]
+    if(i >= (uint32_t)cap)
+    {
+        atomicAdd(&g_pair_overflow_count, 1u);
+        return (uint32_t)cap;   // overflow -> trash slot [cap]
+    }
+    return i;
 }
 void set_emit_caps(int dcd_cap, int ccd_cap)
 {
