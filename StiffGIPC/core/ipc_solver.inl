@@ -1037,32 +1037,97 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     nullptr);
         }
 
+        // [B3 ccd-defer] merged path: the count refresh inside buildFullCP is
+        // deferred; count + past-capacity overflow signal ride the scalar-chain
+        // read below. Per-env keeps the legacy immediate refresh.
+        const bool ccd_defer =
+            !m_skip_all_collision
+            && !(m_perenv_bvh && m_d_p2g && m_perenv_bvh_groups > 0);
+        m_ccd_defer_counts = ccd_defer;
         buildBVH_FULLCCD(1.0, m_ccd_alpha_slots + 2);
         buildFullCP(1.0, m_ccd_alpha_slots + 2);
-        if(h_ccd_cpNum > 0)
+        m_ccd_defer_counts = false;
+        int ccd_cnt = 0;
+        if(ccd_defer)
         {
+            // Capacity grid + in-kernel live mask: min is exact, so regridding
+            // is bitwise-neutral; count==0 degenerates to identity everywhere
+            // and the combine gate (device-read) leaves it unconsumed.
             cfl_largestSpeed_DeviceOut(pcg_data.squeue, m_ccd_alpha_slots + 3);
-            // Launch the refined reduction unconditionally. Its raw invalid
-            // status becomes effective only if the exact refinement gate fires.
             self_full_largestFeasibleStepSize_DeviceOut(
                 slackness_m,
-                ensure_reduce_scratch(h_ccd_cpNum),
-                h_ccd_cpNum,
-                m_ccd_alpha_slots + 4);
+                ensure_reduce_scratch(MAX_CCD_COLLITION_PAIRS_NUM),
+                MAX_CCD_COLLITION_PAIRS_NUM,
+                m_ccd_alpha_slots + 4,
+                _cpNum);
+            _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
+                                               0,
+                                               dHat,
+                                               ccd_size,
+                                               m_ccd_alpha_invalid,
+                                               m_ccd_refined_invalid,
+                                               _cpNum);
         }
-        _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
-                                           h_ccd_cpNum > 0 ? 1 : 0,
-                                           dHat,
-                                           ccd_size,
-                                           m_ccd_alpha_invalid,
-                                           m_ccd_refined_invalid);
+        else
+        {
+            ccd_cnt = (int)h_ccd_cpNum;
+            if(ccd_cnt > 0)
+            {
+                cfl_largestSpeed_DeviceOut(pcg_data.squeue, m_ccd_alpha_slots + 3);
+                // Launch the refined reduction unconditionally. Its raw invalid
+                // status becomes effective only if the exact refinement gate fires.
+                self_full_largestFeasibleStepSize_DeviceOut(
+                    slackness_m,
+                    ensure_reduce_scratch(ccd_cnt),
+                    ccd_cnt,
+                    m_ccd_alpha_slots + 4);
+            }
+            _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
+                                               ccd_cnt > 0 ? 1 : 0,
+                                               dHat,
+                                               ccd_size,
+                                               m_ccd_alpha_invalid,
+                                               m_ccd_refined_invalid,
+                                               nullptr);
+        }
 
         // One scalar-chain D2H after every global decision and validation bit.
-        double h_ccd_state[8] = {1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0};
+        double h_ccd_state[9] = {1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0};
         CUDA_SAFE_CALL(cudaMemcpy(h_ccd_state,
                                   m_ccd_alpha_slots,
                                   sizeof(h_ccd_state),
                                   cudaMemcpyDeviceToHost));
+        if(ccd_defer)
+        {
+            ccd_cnt = (int)h_ccd_state[8];
+            if(ccd_cnt > MAX_CCD_COLLITION_PAIRS_NUM)
+            {
+                // Overflow: emits past capacity went to the trash slot, so the
+                // deferred reduction saw a subset. Fall back to the legacy
+                // machinery (refresh + grow + redo detection), recompute the
+                // refined term over the full set, and re-read. Rare by design;
+                // the discarded subset alpha was never consumed.
+                buildFullCP(1.0, m_ccd_alpha_slots + 2);
+                ccd_cnt = (int)h_ccd_cpNum;
+                if(ccd_cnt > 0)
+                    self_full_largestFeasibleStepSize_DeviceOut(
+                        slackness_m,
+                        ensure_reduce_scratch(ccd_cnt),
+                        ccd_cnt,
+                        m_ccd_alpha_slots + 4);
+                _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
+                                                   ccd_cnt > 0 ? 1 : 0,
+                                                   dHat,
+                                                   ccd_size,
+                                                   m_ccd_alpha_invalid,
+                                                   m_ccd_refined_invalid,
+                                                   nullptr);
+                CUDA_SAFE_CALL(cudaMemcpy(h_ccd_state,
+                                          m_ccd_alpha_slots,
+                                          sizeof(h_ccd_state),
+                                          cudaMemcpyDeviceToHost));
+            }
+        }
         validateFinalCcdStateOrThrow(h_ccd_state, "device CCD chain");
         if(getenv("STIFF_CCD_VALIDATE"))
         {
@@ -1071,7 +1136,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                          : h_ccd_state[1];
             double host_cfl   = host_temp;
             double host_alpha = host_temp;
-            if(h_ccd_cpNum > 0)
+            if(ccd_cnt > 0)
             {
                 host_cfl = sqrt(dHat) / h_ccd_state[3] * 0.5;
                 host_alpha = host_temp < host_cfl ? host_temp : host_cfl;
@@ -1104,7 +1169,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         diag_refined_alpha = h_ccd_state[4];
         alpha              = h_ccd_state[5];
         alpha_CFL          = h_ccd_state[6];
-        diag_refine_used   = h_ccd_cpNum > 0 && temp_alpha > 2.0 * alpha_CFL;
+        diag_refine_used   = ccd_cnt > 0 && temp_alpha > 2.0 * alpha_CFL;
         gipc_nvtx_pop();
 
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end2));
@@ -1154,10 +1219,10 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             _fill_double<<<(NG + bs - 1) / bs, bs>>>(
                 m_env_scratch + 2*NG, 1.0, NG);  // refined-alpha region
             cudaMemset(m_env_scratch + 3*NG, 0, 2 * NG * sizeof(double));  // cfl + Newton max regions
-            if(h_ccd_cpNum > 0)  // refined-self over NEW _ccd_collisonPairs[0..h_ccd_cpNum)
-                _per_env_selfAlpha_min<<<(h_ccd_cpNum+bs-1)/bs, bs>>>(
+            if(ccd_cnt > 0)  // refined-self over NEW _ccd_collisonPairs[0..ccd_cnt)
+                _per_env_selfAlpha_min<<<(ccd_cnt+bs-1)/bs, bs>>>(
                     _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
-                    m_env_scratch + 2*NG, slackness_m, h_ccd_cpNum, NG,
+                    m_env_scratch + 2*NG, slackness_m, ccd_cnt, NG,
                     m_mode_config.ccd_canon ? m_d_vloc : nullptr,
                     m_ccd_alpha_invalid,
                     kCcdInvalidPerEnvRefined,
@@ -1190,7 +1255,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     CUDA_SAFE_CALL(cudaMalloc((void**)&d_env_cnt, 3 * sizeof(int)));
                 CUDA_SAFE_CALL(cudaMemsetAsync(d_env_cnt, 0, 3 * sizeof(int)));
                 _per_env_alpha_compute<<<(NG + bs - 1) / bs, bs>>>(
-                    m_env_alpha, m_env_scratch, NG, _sq_, 1.0, (h_ccd_cpNum > 0) ? 1 : 0,
+                    m_env_alpha, m_env_scratch, NG, _sq_, 1.0, (ccd_cnt > 0) ? 1 : 0,
                     temp_alpha, alpha_CFL, m_mode_config.decouple_thresh ? 1 : 0,
                     getenv("STIFF_NO_REFINE") ? 1 : 0, _thrcv_,
                     d_env_bbox2, Newton_solver_threshold * IPC_dt, newton_velocity_tol * IPC_dt,
@@ -1209,7 +1274,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             _promote_per_env_refined_invalid<<<(NG + bs - 1) / bs, bs>>>(
                 m_env_scratch,
                 NG,
-                (h_ccd_cpNum > 0) ? 1 : 0,
+                (ccd_cnt > 0) ? 1 : 0,
                 _sq_,
                 temp_alpha,
                 alpha_CFL,
@@ -1251,7 +1316,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             cudaMemcpy(hnm.data(), m_env_scratch + 4*NG, NG*sizeof(double), cudaMemcpyDeviceToHost);
             const double sq       = sqrt(dHat);
             const double ccd_size = 1.0;
-            const bool   have_ccd = (h_ccd_cpNum > 0);
+            const bool   have_ccd = (ccd_cnt > 0);
             double       min_env  = 1e30, max_env = 0.0;
             int          n_env    = 0, n_frozen = 0;
             for(int g = 0; g < NG; ++g)
@@ -1378,7 +1443,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     printf("  [S1-dbg] g%d a=%.4e ta=%.4e ground=%.4e narrow=%.4e "
                            "refined=%.4e acfl=%.4e ccdN=%d alphaCFLglob=%.4e (global=%.4e)\n",
                            g, a, ta, hg[g], hs[g], hr[g], have_ccd?sq/hmx[g]*0.5:9.99,
-                           (int)h_ccd_cpNum, alpha_CFL, alpha);
+                           ccd_cnt, alpha_CFL, alpha);
             }
             // [env-det dbg] cross-env alpha mismatch (STIFF_ALPHA_DBG): pin the component that differs.
             if(getenv("STIFF_ALPHA_DBG") && NG >= 2 && hmx[0] > 0.0 && hmx[1] > 0.0
@@ -1390,7 +1455,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     printf("[alpha-dbg] a0=%.17e a1=%.17e | hg %.17e/%.17e hs %.17e/%.17e "
                            "hr %.17e/%.17e hmx %.17e/%.17e ccdN=%d\n",
                            h_env_alpha[0], h_env_alpha[1], hg[0], hg[1], hs[0], hs[1],
-                           hr[0], hr[1], hmx[0], hmx[1], (int)h_ccd_cpNum);
+                           hr[0], hr[1], hmx[0], hmx[1], ccd_cnt);
             }
             CUDA_SAFE_CALL(cudaMemcpy(m_env_alpha, h_env_alpha.data(),
                                       NG * sizeof(double), cudaMemcpyHostToDevice));
@@ -1515,7 +1580,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                    "preLS=%.17e postLS=%.17e lsRatio=%.17e cp=%d gp=%d\n",
                    s_dec_frame, (int)k, distToOpt_PN, _newton_thr,
                    diag_ground_alpha, diag_narrow_alpha, diag_narrow_pairs, temp_alpha,
-                   (int)h_ccd_cpNum, alpha_CFL, diag_refined_alpha, (int)diag_refine_used,
+                   ccd_cnt, alpha_CFL, diag_refined_alpha, (int)diag_refine_used,
                    alpha_before_line_search, alpha,
                    alpha_before_line_search > 0.0 ? alpha / alpha_before_line_search : 0.0,
                    (int)h_cpNum[0], (int)h_gpNum);

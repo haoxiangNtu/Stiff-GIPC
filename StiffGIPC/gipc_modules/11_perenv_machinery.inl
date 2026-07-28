@@ -537,6 +537,13 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
     CUDA_SAFE_CALL(cudaStreamWaitEvent(
         cudaStreamPerThread, m_aux_done_event, 0));
 
+    // [B3 ccd-defer] merged line of duty: skip the blocking count refresh —
+    // the count and the past-capacity overflow signal ride the scalar-chain
+    // read; the consumer falls back to this legacy path (defer flag off) on
+    // overflow. The mirror stays invalidated (audit-armed closure proof).
+    if(m_ccd_defer_counts)
+        return;
+
     CUDA_SAFE_CALL(cudaMemcpy(h_ccd_cpNum.refresh_dst(), _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
     // Overflow → grow CCD pair buffer + redo detection. The swept BVH

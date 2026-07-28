@@ -19,8 +19,17 @@ __global__ void _ccd_final_alpha_combine(double* slots,
                                          double d_hat,
                                          double ccd_size,
                                          int* invalid,
-                                         const int* refined_invalid)
+                                         const int* refined_invalid,
+                                         const uint32_t* d_ccd_count)
 {
+    // [B3 ccd-defer] when armed, the pair gate comes from the live device
+    // count and the raw count rides slot 8 of the same scalar-chain read
+    // (exact in double well past 2^32). Null keeps legacy semantics.
+    if(d_ccd_count)
+    {
+        have_ccd_pairs = (*d_ccd_count > 0u) ? 1 : 0;
+        slots[8]       = (double)(*d_ccd_count);
+    }
     const double temp_alpha = slots[2];
     double refined   = 1.0;
     double alpha_cfl = temp_alpha;
@@ -458,7 +467,8 @@ void stiff_test_ccd_nan_max_speed_fail_fast()
                                       1.0,
                                       1.0,
                                       device_invalid,
-                                      device_refined_invalid);
+                                      device_refined_invalid,
+                                      nullptr);
     CUDA_SAFE_CALL(cudaMemcpy(
         host_state, device_state, sizeof(host_state), cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaFree(device_refined_invalid));

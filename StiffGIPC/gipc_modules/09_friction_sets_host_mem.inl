@@ -383,7 +383,7 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, 3 * sizeof(int)));  // [B3] {decision, overflow_count, gd_collapse}
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_newton_convergence_decision, sizeof(int)));
     // Device-resident CCD alpha/control chain (see slot layout in GIPC.cuh).
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 8 * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 9 * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -867,7 +867,7 @@ double GIPC::self_largestFeasibleStepSize(double slackness, double* mqueue, int 
     //CUDA_SAFE_CALL(cudaMemcpy(_tempMinMovement, _moveDir, number * sizeof(AABB), cudaMemcpyDeviceToDevice));
     _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
         _vertexes, _ccd_collisonPairs, _moveDir, mqueue, slackness, numbers,
-        m_ccd_alpha_invalid, kCcdInvalidGlobalRefined);
+        m_ccd_alpha_invalid, kCcdInvalidGlobalRefined, nullptr);
     //_reduct_min_double3_to_double << <blockNum, threadNum, sharedMsize >> > (_moveDir, _tempMinMovement, numbers);
 
     numbers  = blockNum;
@@ -991,7 +991,7 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mque
 
     _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
         _vertexes, _dcd_ccd_snapshot /* [narrow-self snapshot] DCD-time mirror, immune to buildFullCP clobbering */, _moveDir, mqueue, slackness, numbers,
-        m_ccd_alpha_invalid, kCcdInvalidGlobalNarrow);
+        m_ccd_alpha_invalid, kCcdInvalidGlobalNarrow, nullptr);
 
     numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;
@@ -1007,7 +1007,8 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mque
 void GIPC::self_full_largestFeasibleStepSize_DeviceOut(double slackness,
                                                        double* mqueue,
                                                        int numbers,
-                                                       double* out_slot)
+                                                       double* out_slot,
+                                                       const uint32_t* d_live)
 {
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
@@ -1023,7 +1024,8 @@ void GIPC::self_full_largestFeasibleStepSize_DeviceOut(double slackness,
         slackness,
         numbers,
         m_ccd_refined_invalid,
-        kCcdRawInvalid);
+        kCcdRawInvalid,
+        d_live);
     numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;
     while(numbers > 1)
