@@ -278,6 +278,7 @@ void GIPC::FREE_DEVICE_MEM()
     release(m_pe_all);        // [descriptor phase-0b] per-env energy slices
     // [descriptor phase-0.3] solver scratch family
     release(m_scr_ls_eg0);   release(m_scr_ls_eg1);
+    release(m_scr_gp_friction);   // [B3 s7]
     release(m_scr_ls_decision_counts);
     release(m_scr_maxk);
     release(m_scr_sq_a);     release(m_scr_cnt_a);
@@ -384,6 +385,8 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_newton_convergence_decision, sizeof(int)));
     // Device-resident CCD alpha/control chain (see slot layout in GIPC.cuh).
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 9 * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_gp_friction, sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMemset(m_scr_gp_friction, 0, sizeof(uint32_t)));
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(_close_gpNum, 0, sizeof(uint32_t)));
@@ -637,6 +640,10 @@ void GIPC::buildFrictionSets()
                                                       m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     h_gpNum_last = h_gpNum;
+    // [B3 s7] stash the friction-era device count: _cpNum+5 still holds the
+    // value h_gpNum mirrors here; the friction-Hessian restore becomes D2D.
+    CUDA_SAFE_CALL(cudaMemcpyAsync(m_scr_gp_friction, _cpNum + 5,
+                                   sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
 }
 
 

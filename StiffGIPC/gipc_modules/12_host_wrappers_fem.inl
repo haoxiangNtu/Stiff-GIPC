@@ -221,7 +221,10 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
     }
 
     numbers = h_gpNum_last;
-    CUDA_SAFE_CALL(cudaMemcpy(_gpNum, h_gpNum_last.read_ptr(), sizeof(uint32_t), cudaMemcpyHostToDevice));
+    // [B3 s7] device-stashed restore (was a blocking 4B H2D each iteration;
+    // the stash is written at friction-set build, boot-memset to 0 before).
+    CUDA_SAFE_CALL(cudaMemcpyAsync(_gpNum, m_scr_gp_friction,
+                                   sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
     if(numbers < 1)
         return;
 
