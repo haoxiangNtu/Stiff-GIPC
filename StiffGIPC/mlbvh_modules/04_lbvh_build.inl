@@ -285,7 +285,7 @@ __global__ void _calcLeafNodes_indirect(Node*           _nodes,
 // sort into separate contiguous blocks (env-symmetric tree), instead of the default global-index
 // tie-break that interleaves equal-Morton co-located prims non-deterministically. STIFF_BVH_ENVDET.
 __device__ int g_bvh_envmajor = 0;
-void set_bvh_envmajor(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envmajor, &v, sizeof(int))); }
+void set_bvh_envmajor(int v){ static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envmajor, &v, sizeof(int))); last = v; }
 __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int* prim_env,
                             const int* prim_localid, const double3* env_offset,
                             const uint32_t* prim_v0)
@@ -408,7 +408,7 @@ __global__ void _sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, 
 
 // [env-part B] traversal pruning gate: skip other-env subtrees by env-id (no cross-env candidates).
 __device__ int g_bvh_envpart = 0;
-void set_bvh_envpart(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envpart, &v, sizeof(int))); }
+void set_bvh_envpart(int v){ static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envpart, &v, sizeof(int))); last = v; }
 
 // [perenv-par] per-vertex env id (= d_point_to_group); cross-env self-collision pairs skipped at
 // emission when set. -1 = ungrouped/static (never skipped). Null = gate off (byte-for-byte legacy).
@@ -416,7 +416,11 @@ __device__ const int* g_self_p2g = nullptr;
 __device__ unsigned long long g_xskip = 0;   // [debug] count of cross-env pairs skipped
 void set_self_p2g(const int* p){
     if(getenv("STIFF_XSKIP_DBG")) fprintf(stderr, "[self_p2g] set to %p\n", (const void*)p);
+    static const int* last_p2g = (const int*)-1;
+    if(p == last_p2g)
+        return;
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_self_p2g, &p, sizeof(const int*)));
+    last_p2g = p;
 }
 unsigned long long get_xskip(){ unsigned long long h=0; cudaMemcpyFromSymbol(&h, g_xskip, sizeof(h)); return h; }
 
@@ -435,7 +439,11 @@ __device__ inline bool _same_env(int vA, int vB)
 }
 void mlbvh_set_vertex_env_id(const int* d_vertex_env_id)
 {
+    static const int* last_veid = (const int*)-1;
+    if(d_vertex_env_id == last_veid)
+        return;
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_vertex_env_id, &d_vertex_env_id, sizeof(const int*)));
+    last_veid = d_vertex_env_id;
 }
 
 // [perenv-par] skip a self-collision pair iff both representative verts are in DIFFERENT non-negative
