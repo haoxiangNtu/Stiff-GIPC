@@ -60,6 +60,12 @@ void DeviceDenseVector<T>::reserve(size_t size)
 template <typename T>
 void DeviceDenseVector<T>::resize(size_t size)
 {
+    // Stable descriptors are required while an enclosing CUDA Graph is being
+    // captured.  Recreating the cuSPARSE descriptor for an unchanged extent is
+    // both unnecessary and capture-hostile.
+    if(m_data.size() == size && m_descr)
+        return;
+
     if(m_descr)
     {
         checkCudaErrors(cusparseDestroyDnVec(m_descr));

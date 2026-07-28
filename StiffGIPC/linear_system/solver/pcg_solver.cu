@@ -1,4 +1,5 @@
 #include <linear_system/solver/pcg_solver.h>
+#include <frame_fsm/conditional_graph.h>
 #include <linear_system/linear_system/global_linear_system.h>   // [P3] system_ptr()->m_s4_*
 #include <linear_system/utils/binned_reduce.cuh>                // [P3] exact per-env dot
 #include "multienv/mode_config.h"
@@ -547,6 +548,51 @@ __global__ void pcg_seg_graph_tail_relaunch(gipc::PCGDeviceState* state,
     pcg_continue_or_finish(state, converged);
 }
 
+__device__ __forceinline__ void pcg_conditional_continue_or_finish(
+    gipc::PCGDeviceState* state,
+    bool converged,
+    cudaGraphConditionalHandle handle)
+{
+    state->converged = converged;
+    const unsigned int keep_running =
+        !converged && state->iteration < state->max_iteration ? 1u : 0u;
+    cudaGraphSetConditional(handle, keep_running);
+    if(!keep_running
+       && atomicCAS(&state->terminal, 0, 1) == 0
+       && state->frame)
+        atomicAdd(&state->frame->pcg_iter_total,
+                  static_cast<int>(state->iteration));
+}
+
+__global__ void pcg_graph_tail_conditional(
+    gipc::PCGDeviceState* state,
+    const int* d_break,
+    cudaGraphConditionalHandle handle)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    pcg_conditional_continue_or_finish(
+        state, *d_break != 0, handle);
+}
+
+__global__ void pcg_seg_graph_tail_conditional(
+    gipc::PCGDeviceState* state,
+    const int* d_break_g,
+    int ng,
+    cudaGraphConditionalHandle handle)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    bool converged = true;
+    for(int g = 0; g < ng; ++g)
+        if(d_break_g[g] == 0)
+        {
+            converged = false;
+            break;
+        }
+    pcg_conditional_continue_or_finish(state, converged, handle);
+}
+
 
 
 // === Step E: cub-based fused dot product ===
@@ -685,7 +731,10 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     copy_scalar_kernel<<<1, 1>>>(d_rz0, d_rz);
     cudaMemsetAsync(d_break, 0, sizeof(int));
 
-    p = z;
+    // Stream-ordered D2D copy.  DeviceDenseVector::operator= waits on its
+    // BufferLaunch and therefore cannot be used while Phase C records an
+    // enclosing conditional graph.
+    p.buffer_view().copy_from(z.buffer_view());
 
     // [perf] convergence-check period: each check is a BLOCKING D2H (host loop needs the flag to
     // break) → the dominant host-bound cost (nsys: cudaMemcpy 68% of API). Larger K = fewer syncs at
@@ -734,6 +783,27 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         post_iter_swap_and_check<<<1, 1>>>(
             d_rz, d_rz_new, d_rz0, pcg_tol, d_break, d_graph_state);
     };
+
+    // Phase C owns the top-level graph.  Compose PCG as a nested WHILE body;
+    // launching the cached self-tail executable from an enclosing capture is
+    // rejected by CUDA and invalidates that capture.
+    if(auto* recorder = frame_fsm::ConditionalGraphRecorder::current())
+    {
+        if(K == 0)
+            throw std::runtime_error(
+                "[pcg-conditional] STIFF_PCG_CHECK_K must be positive");
+        recorder->while_loop(
+            1,
+            cudaGraphCondAssignDefault,
+            [&](cudaGraphConditionalHandle handle)
+            {
+                for(SizeT i = 0; i < K; ++i)
+                    body();
+                pcg_graph_tail_conditional<<<1, 1>>>(
+                    d_graph_state, d_break, handle);
+            });
+        return 0;
+    }
 
     // [pcg-graph] capture K iterations into a CUDA graph and replay between break checks — removes
     // ~8 launch gaps per iteration. PTDS build ⇒ cudaStreamPerThread capture records all default-
@@ -1143,7 +1213,7 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     if(!warm)   // warm path already set the b-based rz0_g
         cudaMemcpyAsync(d_rz0_g, d_rz_g, ng * sizeof(Float), cudaMemcpyDeviceToDevice);
     cudaMemsetAsync(d_break_g, 0, ng * sizeof(int));
-    p = z;
+    p.buffer_view().copy_from(z.buffer_view());
     // [E-W (2)] per-env Eisenstat-Walker forcing term for THIS solve. Semantics: the existing
     // check |rzn| <= T * rz0 operates on rz = ||r||^2_{M^-1} (a NORM-SQUARED), so a norm-reduction
     // target eta corresponds to T = eta^2. EW choice-2 with alpha=2 on norms gives
@@ -1275,6 +1345,28 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         pcg_seg_iteration_end<<<1, 1>>>(d_graph_state);
         std::swap(rz_cur, rz_next);   // pointer ping-pong (replaces the swap kernel)
     };
+
+    if(auto* recorder = frame_fsm::ConditionalGraphRecorder::current())
+    {
+        // The segmented implementation ping-pongs two rz buffers on the host
+        // while recording the K-body.  Repeating an odd-K body would start the
+        // next WHILE iteration with the opposite orientation.
+        if(K == 0 || (K & 1) != 0)
+            throw std::runtime_error(
+                "[pcg-conditional] segmented PCG requires an even, positive "
+                "STIFF_PCG_CHECK_K");
+        recorder->while_loop(
+            1,
+            cudaGraphCondAssignDefault,
+            [&](cudaGraphConditionalHandle handle)
+            {
+                for(SizeT i = 0; i < K; ++i)
+                    body();
+                pcg_seg_graph_tail_conditional<<<1, 1>>>(
+                    d_graph_state, d_break_g, ng, handle);
+            });
+        return 0;
+    }
 
     // [pcg-graph] capture K iterations, replay between break checks (see pcg() — same design).
     // Gated to the fast (non-binned) path — strict keeps the plain loop byte-for-byte.
