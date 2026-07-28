@@ -345,3 +345,27 @@ ground_start, rsv, cd4..2, f4..2}；soft/barrier 融合装配（活类型计数�
 **至 Phase C-3 全图的剩余蓝图**（前置全部就绪）：converter pad-sentinel 容量
 化 → ext 段设备递延 → Newton WHILE 尾launch（图内设备重算 offset 快照替换
 镜像下发）→ 帧图。A800 部署实测裁决四 knob 默认值。
+
+---
+
+# converter 容量化 + 装配全设备参数化战报（2026-07-28）
+
+**converter 容量模式**（`Converter::m_capacity_mode`）：哨兵键（全 1）pad 内联
+进 hash 构建核（排序推至尾部）；分区旗公式对活/哨兵边界天然正确（live-1 处
+恰好闭合最后一个真 unique）；全部 5 个 ParallelFor+双 cub 调用改容量网格+
+`d_convert_len` 掩码；finalize 设备变体读 `partition[*d_len-1]+1`；mergebin
+容量 memset+grow 补代数 bump；combine 走 `d_unique` 掩码。过渡期长度按值
+seed（图时代由图内累加替换——蓝图既定）。
+
+**装配全设备参数化**（Newton 图最后前置）：快照重排 {n,t4,t3,t2} 双视图
+（+3 活 barrier / +7 lastH 摩擦）+ slot11 活 gp；barrier/摩擦 cp+gd/ground
+四装配核补活计数尾参；**κ 设备化**——GH 起点种子核把 postLineSearch 逐迭代
+变异的 κ 再暂存进 `m_d_ls_scalars[1]`，barrier/ground 装配核读 kappa_dev。
+至此 GH 装配链内**再无任何按值烤死的逐迭代量**（offset/count/type/κ 全设备
+可读）——Newton WHILE 尾launch 捕获的全部发射参数就绪。
+
+批量验证：15 段绿锚逐位；towel 三 knob 齐开（完整设备装配路径）PASS/对账
+0 分歧/0 耗尽/drift 1.852e-3；foldshirt 正常回退；episode 冒烟 PASS。
+剩余=WHILE 捕获 harness 本体（C-1 的 try/catch+阶段标记模式复用）+ MAS
+do_assemble 计数化 + ccd 消费闭环——首次捕获尝试将以阶段报告形式给出精确
+剩余清单。

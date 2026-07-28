@@ -756,7 +756,9 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,
         m_pergroup_kappa ? m_d_p2g : nullptr,
-        _c2_offset_dev() ? _c2_offset_dev() + 2 : nullptr);  // [C-2] ground base
+        _c2_offset_dev() ? _c2_offset_dev() + 2 : nullptr,
+        _c2_offset_dev() ? (const uint32_t*)(_c2_offset_dev() + 11) : nullptr,
+        _c2_offset_dev() ? m_d_ls_scalars + 1 : nullptr);  // [C-2/C-3]
 }
 
 void GIPC::computeCloseGroundVal()

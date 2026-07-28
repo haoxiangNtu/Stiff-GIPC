@@ -139,7 +139,8 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,   // [per-group κ] nullptr → scalar
         m_pergroup_kappa ? m_d_p2g : nullptr,
-        _c2_offset_dev() ? (const uint32_t*)(_c2_offset_dev() + 4) : nullptr);  // [C-2]
+        _c2_offset_dev() ? (const uint32_t*)(_c2_offset_dev() + 3) : nullptr,
+        _c2_offset_dev() ? m_d_ls_scalars + 1 : nullptr);  // [C-2/C-3] {n,t4,t3,t2} + live kappa
 }
 
 
@@ -219,8 +220,8 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
             h_cpNum_last[4],
             h_cpNum_last[3],
             h_cpNum_last[2],
-            _c2_offset_dev() ? (const uint32_t*)(_c2_offset_dev() + 4) : nullptr,
-            _c2_offset_dev() ? (const uint32_t*)(_c2_offset_dev() + 7) : nullptr);  // [C-2]
+            _c2_offset_dev() ? (const uint32_t*)(_c2_offset_dev() + 3) : nullptr,
+            _c2_offset_dev() ? (const uint32_t*)(_c2_offset_dev() + 7) : nullptr);  // [C-2] {n,t4,t3,t2} views
     }
 
     numbers = h_gpNum_last;
@@ -248,7 +249,8 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
         lambda_lastH_scalar_gd,
         global_offset,
         gd_frictionRate, d_vert_mu_gd,
-        _c2_offset_dev() ? _c2_offset_dev() + 1 : nullptr);  // [per-body friction / C-2]
+        _c2_offset_dev() ? _c2_offset_dev() + 1 : nullptr,
+        _c2_offset_dev() ? m_scr_gp_friction : nullptr);  // [per-body friction / C-2/C-3]
 }
 
 void GIPC::computeSelfCloseVal()

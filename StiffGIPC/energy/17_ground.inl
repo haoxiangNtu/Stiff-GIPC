@@ -58,11 +58,17 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  int    number,
                                                  const double* kappa_grp = nullptr,
                                                  const int*    p2g       = nullptr,
-                                                 const int*    offset_dev = nullptr)
+                                                 const int*    offset_dev = nullptr,
+                                                 const uint32_t* n_dev   = nullptr,
+                                                 const double* kappa_dev = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(kappa_dev)    // [C-3] live kappa
+        Kappa_scalar = *kappa_dev;
     if(offset_dev)   // [C-2] device ground assembly base
         global_offset = *offset_dev;
+    if(n_dev)        // [C-3] live ground count (GH-start snapshot slot 11)
+        number = (int)*n_dev;
     if(idx >= number)
         return;
     double3      normal = *g_normal;

@@ -34,5 +34,10 @@ class Converter
     // ⇒ deterministic matrix values (FastSegmentalReduce summed in emission order). Grown lazily.
     double* m_mergebin     = nullptr;
     size_t  m_mergebin_cap = 0;
+  public:
+    // [C-3 prep] capacity-mode: fixed grids + device-length masks so the
+    // convert chain records into a cross-iteration CUDA graph.
+    bool    m_capacity_mode = false;
+  private:
 };
 }  // namespace gipc

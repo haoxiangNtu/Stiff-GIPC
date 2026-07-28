@@ -112,11 +112,14 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        int              global_offset,
                                        double           coef,
                                        const double*    vert_mu_gd,
-                                       const int*       offset_dev = nullptr)
+                                       const int*       offset_dev = nullptr,
+                                       const uint32_t*  n_dev = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(offset_dev)   // [C-2] device gd-friction assembly base
         global_offset = *offset_dev;
+    if(n_dev)        // [C-3] live lastH gd count (s7 stash)
+        number = (int)*n_dev;
     if(idx >= number)
         return;
     double                 eps           = sqrt(eps2);
@@ -238,17 +241,18 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // [C-2] device-resident type-count offsets (live barrier types + lastH
     // stash) — the graph era must not bake per-iteration counts.
-    if(cd_dev)   // compact {t4, t3, t2} snapshot layout
+    if(cd_dev)   // [C-2/C-3] {n, t4, t3, t2} views: live barrier + lastH friction
     {
-        cd_offset4 = (int)cd_dev[0];
-        cd_offset3 = (int)cd_dev[1];
-        cd_offset2 = (int)cd_dev[2];
+        cd_offset4 = (int)cd_dev[1];
+        cd_offset3 = (int)cd_dev[2];
+        cd_offset2 = (int)cd_dev[3];
     }
     if(f_dev)
     {
-        f_offset4 = (int)f_dev[0];
-        f_offset3 = (int)f_dev[1];
-        f_offset2 = (int)f_dev[2];
+        number     = (int)f_dev[0];   // lastH pair count (this kernel's items)
+        f_offset4  = (int)f_dev[1];
+        f_offset3  = (int)f_dev[2];
+        f_offset2  = (int)f_dev[3];
     }
     if(idx >= number)
         return;

@@ -110,14 +110,18 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                               int              number,
                                               const double*    kappa_grp = nullptr,
                                               const int*       p2g       = nullptr,
-                                              const uint32_t*  cd_dev    = nullptr)
+                                              const uint32_t*  cd_dev    = nullptr,
+                                              const double*    kappa_dev = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(cd_dev)   // [C-2] compact {t4, t3, t2} snapshot layout
+    if(kappa_dev)   // [C-3] live kappa (per-iteration mutation)
+        Kappa_scalar = *kappa_dev;
+    if(cd_dev)   // [C-2/C-3] {n, t4, t3, t2} snapshot view: counts + types live
     {
-        offset4 = (int)cd_dev[0];
-        offset3 = (int)cd_dev[1];
-        offset2 = (int)cd_dev[2];
+        number  = (int)cd_dev[0];
+        offset4 = (int)cd_dev[1];
+        offset3 = (int)cd_dev[2];
+        offset2 = (int)cd_dev[3];
     }
     if(idx >= number)
         return;

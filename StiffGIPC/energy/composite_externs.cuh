@@ -32,7 +32,9 @@ extern __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  int    number,
                                                  const double* kappa_grp = nullptr,
                                                  const int*    p2g       = nullptr,
-                                                 const int*    offset_dev = nullptr);
+                                                 const int*    offset_dev = nullptr,
+                                                 const uint32_t* n_dev   = nullptr,
+                                                 const double* kappa_dev = nullptr);
 extern __global__ void _computeGroundGradient(const double3* vertexes,
                                        const double*  g_offset,
                                        const double3* g_normal,
@@ -186,7 +188,8 @@ extern __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        int              global_offset,
                                        double           coef,
                                        const double*    vert_mu_gd,
-                                       const int*       offset_dev = nullptr);
+                                       const int*       offset_dev = nullptr,
+                                       const uint32_t*  n_dev = nullptr);
 extern __global__ void _calFrictionGradient(const double3*    _vertexes,
                                      const double3*    _o_vertexes,
                                      const const int4* _last_collisionPair,

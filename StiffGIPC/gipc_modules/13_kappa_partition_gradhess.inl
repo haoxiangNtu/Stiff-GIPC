@@ -8,14 +8,18 @@
 // once the contact side is device-offset too.
 __global__ void _calc_contact_triplet_total(int* d_slots, int contact_total,
                                             int fricgd_start, int ground_start,
-                                            int cd4, int cd3, int cd2,
-                                            int f4, int f3, int f2)
+                                            int cp0, int cd4, int cd3, int cd2,
+                                            int f0, int f4, int f3, int f2, int gp,
+                                            double* scal2, double kappa)
 {
+    scal2[1] = kappa;   // [C-3] GH-era kappa restage (postLineSearch mutates it)
     d_slots[0] = contact_total;   // FEM segment base
     d_slots[1] = fricgd_start;    // gd-friction assembly base
     d_slots[2] = ground_start;    // ground assembly base
-    d_slots[4] = cd4; d_slots[5] = cd3; d_slots[6] = cd2;   // live barrier types
-    d_slots[7] = f4;  d_slots[8] = f3;  d_slots[9] = f2;    // lastH types
+    // {count, t4, t3, t2} views: +3 = live barrier, +7 = lastH friction
+    d_slots[3] = cp0; d_slots[4] = cd4; d_slots[5]  = cd3; d_slots[6] = cd2;
+    d_slots[7] = f0;  d_slots[8] = f4;  d_slots[9]  = f3;  d_slots[10] = f2;
+    d_slots[11] = gp;                    // live ground count
 }
 
 void GIPC::suggestKappa(double& kappa)
@@ -617,13 +621,16 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                               (int)_ct,
                                               (int)(_barrier + _fric_cp),
                                               (int)_ground_start,
+                                              (int)h_cpNum[0],
                                               (int)h_cpNum[4], (int)h_cpNum[3], (int)h_cpNum[2],
 #ifdef USE_FRICTION
-                                              (int)h_cpNum_last[4], (int)h_cpNum_last[3], (int)h_cpNum_last[2]
+                                              (int)h_cpNum_last[0],
+                                              (int)h_cpNum_last[4], (int)h_cpNum_last[3], (int)h_cpNum_last[2],
 #else
-                                              0, 0, 0
+                                              0, 0, 0, 0,
 #endif
-        );
+                                              (int)h_gpNum,
+                                              m_d_ls_scalars, Kappa);
     }
 
     // [P1-dyn] Grow the global triplet buffer BEFORE any assembly writes, to a PROVABLE

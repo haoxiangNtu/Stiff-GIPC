@@ -256,6 +256,7 @@ class GIPCTripletMatrix
     // (d_contact_start_block + 4) that clobbered the unique count and a stale
     // host mirror could pick the garbage up (towel-strict OOB, 2026-07-24).
     int* d_unique_key_number = nullptr;
+    int* d_convert_len       = nullptr;   // [C-3 prep] device assembled-length for capacity-mode convert
     int* d_assembly_scratch_count = nullptr;
 
     // ②-D2H: one contiguous [5] block (abd_abd, abd_fem, fem_abd, fem_fem,
@@ -273,6 +274,8 @@ class GIPCTripletMatrix
         d_fem_abd_contact_start_id = d_contact_start_block + 2;
         d_fem_fem_contact_start_id = d_contact_start_block + 3;
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_unique_key_number, sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_convert_len, sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(d_convert_len, 0, sizeof(int)));
         CUDA_SAFE_CALL(cudaMalloc((void**)&d_assembly_scratch_count, sizeof(int)));
     }
 
@@ -294,6 +297,11 @@ class GIPCTripletMatrix
         {
             CUDA_SAFE_CALL(cudaFree(d_unique_key_number));
             d_unique_key_number = nullptr;
+        }
+        if(d_convert_len)
+        {
+            CUDA_SAFE_CALL(cudaFree(d_convert_len));
+            d_convert_len = nullptr;
         }
         if(d_assembly_scratch_count)
         {
