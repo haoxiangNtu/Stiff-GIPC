@@ -218,6 +218,17 @@ void MASPreconditioner::BuildConnectMaskLx(int level)
 
 void MASPreconditioner::NextLevelCluster(int level)
 {
+    // [B3 mas-8] single-env: capacity grid + device-read count (no host
+    // readback fed us `number`); multi-env keeps the legacy host-count path
+    // (its env-padding arithmetic below PrefixSumLx needs host warp counts).
+    if(m_numEnvs <= 1)
+    {
+        int blockSize = DEFAULT_BLOCKSIZE;
+        int numBlocks = (m_clusterCap + blockSize - 1) / blockSize;
+        _nextLevelCluster_dev<<<numBlocks, blockSize>>>(
+            d_nextConnectMask, d_nextPrefix, d_levelSize, level);
+        return;
+    }
     int number    = h_clevelSize.x;
     if(number < 1)
         return;
@@ -239,6 +250,28 @@ void MASPreconditioner::ComputeNextLevel(int level)
 
 void MASPreconditioner::PrefixSumLx(int level)
 {
+    // [B3 mas-8] single-env: fixed capacity-sized scan (prefix buffer is
+    // zeroed to capacity in ReorderRealtime, so the padded tail scans as a
+    // constant and consumers only read the live prefix range) + device-read
+    // count/levelBegin in the kernel. Bitwise-identical live results: the
+    // scan prefix over [0, warpNum) is unchanged by trailing zeros, and the
+    // kernel does exactly the legacy work for idx < number.
+    if(m_numEnvs <= 1)
+    {
+        int blockSize = BANKSIZE * BANKSIZE;
+        int numBlocks = (m_clusterCap + blockSize - 1) / blockSize;
+        int warpCap   = (m_clusterCap + BANKSIZE - 1) / BANKSIZE;
+        thrust::exclusive_scan(thrust::device_ptr<unsigned int>(d_nextPrefix),
+                               thrust::device_ptr<unsigned int>(d_nextPrefix) + warpCap,
+                               thrust::device_ptr<unsigned int>(d_nextPrefixSum));
+        _prefixSumLx_dev<<<numBlocks, blockSize>>>(d_levelSize,
+                                                   d_nextPrefix,
+                                                   d_nextPrefixSum,
+                                                   d_nextConnectMask,
+                                                   d_goingNext,
+                                                   level);
+        return;
+    }
     int number     = h_clevelSize.x;
     if(number < 1)
         return;
@@ -350,7 +383,17 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
         if(cpNum)
             BuildCollisionConnection(d_nextConnectMask, d_coarseSpaceTables, level, cpNum);
 
-        CUDA_SAFE_CALL(cudaMemcpy(&h_clevelSize, d_levelSize + level, sizeof(int2), cudaMemcpyDeviceToHost));
+        // [B3 mas-8] single-env: the per-level count stays device-resident
+        // (written by the previous _prefixSumLx, read by the _dev kernels) —
+        // the host mirror readback was the round-trip king (8/Newton-iter).
+        // The prefix buffer is zeroed to capacity so the fixed-size scan in
+        // PrefixSumLx sees deterministic zeros in the padded tail.
+        if(m_numEnvs <= 1)
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                d_nextPrefix, 0,
+                ((m_clusterCap + BANKSIZE - 1) / BANKSIZE) * sizeof(unsigned int)));
+        else
+            CUDA_SAFE_CALL(cudaMemcpy(&h_clevelSize, d_levelSize + level, sizeof(int2), cudaMemcpyDeviceToHost));
 
         NextLevelCluster(level);
 
