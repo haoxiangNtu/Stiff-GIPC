@@ -148,3 +148,21 @@ foldshirt 4env=5.0（旧路,按设计）。锚 0544461bd82123ae 逐位、MAS ora
 15 段、diag 三模式全绿。剩余 mas 段 ~3/迭代为其他站点（下一刀），line_search
 6.2 与 GH ToSymbol 5.4（描述符）在队。多环境版设备绑定（环填充算术下设备）
 为后续项。
+
+---
+
+# 手术②战报 + 手术③依赖链（2026-07-28）
+
+**手术② ToSymbol 值缓存**：14 setter（八门族/emit_caps/envmajor/part/两指针/
+bar_targets；reset 类设备写计数器刻意不缓存；租约下单写者=sound）。指纹：
+GH 8426→全程 5、line_search 19805→**0**（约 20 次/迭代→0）。锚逐位、15 段绿。
+
+**累计**：手术①+② 消灭 ~23 往返/迭代（原 census ~42 的过半）。
+
+**手术③（line_search trial 块）侦察结论**：per-trial 的 {decision, cpNum[6],
+gdCollapse} 三读合一受阻于**能量核网格消费 h_cpNum[0]**（decide 前主机已读计
+数）——先决改造=能量核容量网格+设备计数界（_dev 同款；与 B2' 的 spmv 设备绑
+定同族）。改造顺序：①能量/装配核 grid 设备绑定（同时解锁 B2' 缓存与 trial
+合块）→②trial 三读合一→③gdCollapse 延迟消费（仅 line-search 路径，其余
+buildCP 调用者保留即时校验；NaN→backtrack 语义已天然兜底）。ccd 隐藏 3.2 同
+族（buildFullCP 计数镜像）。
