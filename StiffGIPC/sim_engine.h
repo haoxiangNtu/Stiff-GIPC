@@ -424,6 +424,36 @@ class SimEngine
 
     void step();
 
+    // ---- Phase D: episode-resident RL execution ----
+    //
+    // A warm-up step() is required first so all lazy CUDA workspaces have
+    // stable addresses. Actions are contiguous `(frames, joints, 3)` arrays:
+    //   revolute = {target_angle, strength_ratio, external_torque}
+    //   prismatic = {target_distance, strength_ratio, external_force}
+    // The complete sequences are uploaded once, then one asynchronous CUDA
+    // Graph launch consumes every frame without a host wait.
+    void launch_episode_async(
+        int frames,
+        const double* revolute_actions,
+        int revolute_joints,
+        const double* prismatic_actions,
+        int prismatic_joints);
+    bool episode_in_flight() const;
+    bool episode_observation_ready(int slot) const;
+    void wait_episode_observation(int slot) const;
+    int  get_episode_slot_first_frame(int slot) const;
+    int  get_episode_slot_frame_count(int slot) const;
+    int  get_episode_attempted_frame_count() const;
+    void get_episode_observation(
+        int slot,
+        double* positions,
+        double* velocities,
+        frame_fsm::FrameStatus* statuses,
+        int frame_capacity) const;
+    // Wait for the terminal slot, commit successful-frame telemetry, and
+    // return the number of successfully committed frames.
+    int finish_episode();
+
     /// Result, work counters and capacity high-water marks for the latest
     /// frame.  In whole-frame graph mode this is the single terminal D2H
     /// packet; the legacy path publishes the same ABI for uniform tooling.

@@ -9,6 +9,8 @@
 #include <frame_fsm/frame_status.cuh>
 
 #include <algorithm>
+#include <sstream>
+#include <stdexcept>
 
 namespace gipc
 {
@@ -67,11 +69,12 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
                         const int&          out_start_id,
                         ConvertLayout       layout)
 {
-    const int capacity =
-        GIPCTripletMatrix::device_count_mode()
-                && layout == ConvertLayout::FinalGlobal
-            ? assembly_capacity_tier(length)
-            : length;
+    int capacity = length;
+    if(GIPCTripletMatrix::device_count_mode())
+    {
+        if(layout == ConvertLayout::FinalGlobal)
+            capacity = assembly_capacity_tier(length);
+    }
     convert(
         global_triplets, start, length, capacity, out_start_id, layout);
 }
@@ -114,8 +117,9 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
         global_triplets.global_external_max_capcity =
             std::max(global_triplets.global_external_max_capcity, capacity);
     }
-    const size_t payload_need = static_cast<size_t>(out_start_id)
-                              + static_cast<size_t>(capacity);
+    const size_t payload_need =
+        static_cast<size_t>(std::max(start, out_start_id))
+        + static_cast<size_t>(capacity);
     if(global_triplets.triplet_capacity() < payload_need)
         global_triplets.reserve_triplets(payload_need + payload_need / 16);
 
@@ -255,16 +259,43 @@ void Converter::_make_unique_block_warp_reduction(
     }
     else if(GIPCTripletMatrix::device_count_mode()
             && global_triplets.m_abd_tier_txn_ok
-            && global_triplets.m_abd_unique_tier[tier_index] > 0
-            && global_triplets.m_abd_unique_tier[tier_index] <= length)
+            && global_triplets.m_abd_unique_tier[tier_index] > 0)
     {
-        armed_abd_tier =
-            global_triplets.m_abd_unique_tier[tier_index];
+        // A tier trained on an earlier frame may exceed this frame's raw
+        // input length. The exact unique count can never exceed `length`, so
+        // tightening the graph-local bound is safe; carrying the larger tier
+        // forward would make ABD's following 16x expansion consume padding as
+        // real blocks and can collapse the solve direction to zero.
+        armed_abd_tier = std::min(
+            global_triplets.m_abd_unique_tier[tier_index], length);
         global_triplets.h_unique_key_number = armed_abd_tier;
         bound_layout = true;
     }
     else
     {
+        cudaStreamCaptureStatus capture_status =
+            cudaStreamCaptureStatusNone;
+        const cudaError_t capture_query = cudaStreamIsCapturing(
+            cudaStreamPerThread, &capture_status);
+        if(capture_query == cudaSuccess
+           && capture_status != cudaStreamCaptureStatusNone)
+        {
+            std::ostringstream message;
+            message
+                << "[converter] exact unique-count D2H reached during "
+                   "capture (layout="
+                << static_cast<int>(layout)
+                << ", length=" << length
+                << ", capacity=" << capacity
+                << ", tier0="
+                << global_triplets.m_abd_unique_tier[0]
+                << ", tier1="
+                << global_triplets.m_abd_unique_tier[1]
+                << ", tier_txn="
+                << global_triplets.m_abd_tier_txn_ok << ")";
+            throw std::runtime_error(message.str());
+        }
+        CUDA_SAFE_CALL(capture_query);
         CUDA_SAFE_CALL(
             cudaMemcpy(global_triplets.h_unique_key_number.refresh_dst(),
                        global_triplets.d_unique_key_number,
@@ -273,8 +304,32 @@ void Converter::_make_unique_block_warp_reduction(
         host_merge_count = global_triplets.h_unique_key_number;
         if(GIPCTripletMatrix::device_count_mode()
            && layout != ConvertLayout::FinalGlobal)
-            global_triplets.m_abd_unique_tier[tier_index] =
+        {
+            const int trained_tier =
                 assembly_capacity_tier(host_merge_count);
+            global_triplets.m_abd_unique_tier[tier_index] =
+                trained_tier;
+
+            // Train the complete stable layout at this legal host boundary,
+            // not just its scalar size. A later captured frame may have a
+            // shorter exact input while still publishing this tier.
+            ensure_capacity(trained_tier);
+            if(global_triplets.m_block_index.capacity()
+               < static_cast<size_t>(trained_tier))
+            {
+                global_triplets.resize_collision_hash_size(
+                    static_cast<size_t>(trained_tier));
+                global_triplets.global_external_max_capcity = std::max(
+                    global_triplets.global_external_max_capcity,
+                    trained_tier);
+            }
+            const size_t trained_payload =
+                static_cast<size_t>(std::max(start, out_start_id))
+                + static_cast<size_t>(trained_tier);
+            if(global_triplets.triplet_capacity() < trained_payload)
+                global_triplets.reserve_triplets(
+                    trained_payload + trained_payload / 16);
+        }
     }
 
     _publish_unique_frame_state<<<1, 1, 0, cudaStreamPerThread>>>(
@@ -284,7 +339,11 @@ void Converter::_make_unique_block_warp_reduction(
             : armed_abd_tier,
         global_triplets.m_frame_device_state);
 
-    const int clear_count = bound_layout ? length : host_merge_count;
+    const int padded_unique_count =
+        bound_layout
+            ? (armed_abd_tier > 0 ? armed_abd_tier : length)
+            : host_merge_count;
+    const int clear_count = padded_unique_count;
     CUDA_SAFE_CALL(cudaMemsetAsync(
         global_triplets.block_values(start),
         0,
@@ -352,13 +411,13 @@ void Converter::_make_unique_block_warp_reduction(
     {
         ParallelFor(256)
             .kernel_name("neutralize_pad_unique_ids")
-            .apply(capacity,
+            .apply(padded_unique_count,
                    [rows = global_triplets.block_row_indices(start),
                     cols = global_triplets.block_col_indices(start),
                     d_uniq = global_triplets.d_unique_key_number,
-                    length] __device__(int u) mutable
+                    padded_unique_count] __device__(int u) mutable
                    {
-                       if(u < *d_uniq || u >= length)
+                       if(u < *d_uniq || u >= padded_unique_count)
                            return;
                        rows[u] = 0;
                        cols[u] = 0;

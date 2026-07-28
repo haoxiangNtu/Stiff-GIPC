@@ -1005,6 +1005,55 @@ class Engine:
             print(f"[iterlog] fr={fr} newton={total - prev}", flush=True)
             self._iterlog_prev, self._iterlog_frame = total, fr + 1
 
+    def launch_episode_async(
+        self,
+        frames: int,
+        revolute_actions=None,
+        prismatic_actions=None,
+    ) -> None:
+        """Launch a device-resident RL episode without per-frame host waits.
+
+        A normal :meth:`step` must run first to train lazy CUDA workspaces.
+        Each non-empty action array has shape ``(frames, joints, 3)`` and
+        stores target, strength, and external torque/force respectively.
+        Use :meth:`wait_episode_observation` or poll
+        :meth:`episode_observation_ready` before reading either observation
+        slot, then call :meth:`finish_episode`.
+        """
+        _assert_process_mode_signature()
+        self._engine.launch_episode_async(
+            int(frames), revolute_actions, prismatic_actions
+        )
+
+    def episode_in_flight(self) -> bool:
+        """Return whether an asynchronous episode still needs finishing."""
+        return bool(self._engine.episode_in_flight())
+
+    def episode_observation_ready(self, slot: int) -> bool:
+        """Non-blocking readiness query for pinned observation slot 0 or 1."""
+        return bool(self._engine.episode_observation_ready(int(slot)))
+
+    def wait_episode_observation(self, slot: int) -> None:
+        """Wait only for observation slot 0 or 1 and its CUDA event fence."""
+        self._engine.wait_episode_observation(int(slot))
+
+    def get_episode_observation(self, slot: int):
+        """Return one ready episode observation slot.
+
+        The result contains ``first_frame``, ``positions``, ``velocities``,
+        and per-frame ``statuses``. Position and velocity arrays have shape
+        ``(slot_frames, vertices, 3)``.
+        """
+        return self._engine.get_episode_observation(int(slot))
+
+    def get_episode_attempted_frame_count(self) -> int:
+        """Return the number of frames published by ready observation slots."""
+        return int(self._engine.get_episode_attempted_frame_count())
+
+    def finish_episode(self) -> int:
+        """Wait for the terminal slot and return the successful frame count."""
+        return int(self._engine.finish_episode())
+
     def set_log_level(self, level: int) -> None:
         """Control per-frame solver log verbosity.
 

@@ -28,6 +28,7 @@
 #include <gipc/utils/timer.h>           // gipc::GlobalTimer
 
 #include "contact/ccd_invalid_bits.h"  // CCD invalid-mask contract
+#include "frame_fsm/conditional_graph.h"
 #include "solver_stats.h"  // [phase4] decl/def type-check for the cross-TU counters
 
 // ---- file-scope globals owned by the composite TU ----
@@ -50,9 +51,16 @@ extern __global__ void _global_ls_decide(const double* energy0, const double* en
 extern __global__ void _ls_trial_begin(double* alpha_dev, int* status);
 extern __global__ void _ls_seed(double* alpha_dev, double alpha0, int* status);
 extern __global__ void _ls_trial_tail(int* status, int budget, const double* alpha_dev);
+extern __global__ void _ls_conditional_seed(double* alpha_dev, const double* alpha0_dev, int* status, frame_fsm::FrameDeviceState* frame);
+extern __global__ void _ls_conditional_trial_begin(double* alpha_dev, int* status);
+extern __global__ void _ls_conditional_tail(int* status, int budget, const double* alpha_dev, const double* energy_trial, cudaGraphConditionalHandle handle, frame_fsm::FrameDeviceState* frame);
 extern __global__ void _mask_fill(int* m, int v, int n);
 extern __global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, int ng);
 extern __global__ void _newton_convergence_decide(const double* max_movement, double threshold, int* converged, frame_fsm::FrameDeviceState* frame);
+extern __global__ void _newton_step_predicate(frame_fsm::FrameDeviceState* frame, cudaGraphConditionalHandle handle);
+extern __global__ void _newton_iteration_begin(frame_fsm::FrameDeviceState* frame);
+extern __global__ void _newton_unit_alpha(double* alpha_slots, frame_fsm::FrameDeviceState* frame);
+extern __global__ void _newton_tail_conditional(frame_fsm::FrameDeviceState* frame, int iteration_cap, cudaGraphConditionalHandle handle);
 extern __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng, double sq, double ccd_size, int have_ccd, double temp_alpha, double alpha_CFL, int decouple, int no_refine, double thr_cv, const double* env_bbox2, double ntol_dt, double vtol_dt, const int* refined_invalid, const int* ccd_alpha_invalid, int* cnt);
 extern __global__ void _per_env_groundAlpha_min(const double3* vertexes, const uint32_t* surfVertIds, const double* g_offset, const double3* g_normal, const double3* moveDir, const int* p2g, double* per_env_alpha, double slackness, int number, const int* _point_body_id, const int* _ground_skip_body, int _ground_body_count, int ng, int* ccd_alpha_invalid);
 extern __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir, const uint32_t* mSVI, double* per_env_max, int n_surf, int ng);

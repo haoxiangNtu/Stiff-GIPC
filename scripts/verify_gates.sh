@@ -253,6 +253,42 @@ else
     record rl-reset FAIL "rc=$rc"
 fi
 
+echo "== G16 Phase-C frame CUDA Graph transaction =="
+timeout 300 python3 scripts/frame_graph_gate.py \
+    > "$GATE_LOG_DIR/frame-graph.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "FRAME-GRAPH-GATE: PASS" \
+       "$GATE_LOG_DIR/frame-graph.log"; then
+    record frame-graph PASS ""
+else
+    record frame-graph FAIL "rc=$rc"
+fi
+
+echo "== G17a Phase-D episode graph (FEM/reuse/bitwise) =="
+timeout 300 python3 scripts/episode_graph_gate.py \
+    > "$GATE_LOG_DIR/episode-graph.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "EPISODE-GRAPH-GATE: PASS" \
+       "$GATE_LOG_DIR/episode-graph.log"; then
+    record episode-graph PASS ""
+else
+    record episode-graph FAIL "rc=$rc"
+fi
+
+echo "== G17b Phase-D articulated RL episode graph =="
+timeout 300 python3 scripts/episode_graph_rl_gate.py \
+    > "$GATE_LOG_DIR/episode-rl-graph.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "EPISODE-RL-GRAPH-GATE: PASS" \
+       "$GATE_LOG_DIR/episode-rl-graph.log"; then
+    record episode-rl-graph PASS ""
+else
+    record episode-rl-graph FAIL "rc=$rc"
+fi
+
 echo "== G14 STIFF_* knob registry consistency (static) =="
 timeout 120 python3 scripts/knob_gate.py \
     > "$GATE_LOG_DIR/knob.log" 2>&1

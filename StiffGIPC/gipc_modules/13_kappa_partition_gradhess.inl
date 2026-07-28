@@ -812,12 +812,23 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         printf("[pergroup-kappa] enabled, NG=%d\n", NG);
     }
 
-    CUDA_SAFE_CALL(cudaMemset(TetMesh.fb, 0, vertexNum * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        TetMesh.fb,
+        0,
+        vertexNum * sizeof(double3),
+        cudaStreamPerThread));
     // [multi-env determinism 4.3] zero the binned contact/friction gradient accumulator
     // (bins start at 0; deposits add exactly). Combined back into contact_grads after ground.
-    CUDA_SAFE_CALL(cudaMemset(g_grad_binned, 0,
-                              3 * (size_t)vertexNum * BINNED_K * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMemset(TetMesh.shape_grads, 0, vertexNum * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        g_grad_binned,
+        0,
+        3 * (size_t)vertexNum * BINNED_K * sizeof(double),
+        cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        TetMesh.shape_grads,
+        0,
+        vertexNum * sizeof(double3),
+        cudaStreamPerThread));
 
     // [multi-env determinism 4.3] zero the WHOLE triplet buffer (block values + row/col) to the
     // reserved capacity. The triplet count is a provable UPPER BOUND (16 slots/pair, but PP/PE/PT
@@ -827,9 +838,21 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         size_t cap = gipc_global_triplet.triplet_capacity();
         if(cap > 0)
         {
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_values(),
+                0,
+                cap * 9 * sizeof(double),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_row_indices(),
+                0,
+                cap * sizeof(int),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_col_indices(),
+                0,
+                cap * sizeof(int),
+                cudaStreamPerThread));
         }
     }
 
@@ -925,9 +948,21 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             // The whole-buffer determinism memset above ran on the OLD allocation;
             // re-zero the fresh one (grow iterations only, so effectively free).
             size_t cap = gipc_global_triplet.triplet_capacity();
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_values(),
+                0,
+                cap * 9 * sizeof(double),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_row_indices(),
+                0,
+                cap * sizeof(int),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_col_indices(),
+                0,
+                cap * sizeof(int),
+                cudaStreamPerThread));
         }
         if(gipc_global_triplet.global_external_max_capcity < bound)
         {
@@ -941,7 +976,11 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
-        CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            _cpNum,
+            0,
+            5 * sizeof(uint32_t),
+            cudaStreamPerThread));
         //calBarrierHessian();
         //calBarrierGradient(contact_grads, Kappa);
 

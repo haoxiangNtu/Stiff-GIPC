@@ -1,3 +1,5 @@
+#include "frame_fsm/conditional_graph.h"
+
 __global__ void _s3_decide(const double* Eg0,
                            const double* Eg1,
                            double*       env_alpha,
@@ -78,6 +80,164 @@ __global__ void _ls_trial_tail(int* status, int budget, const double* alpha_dev)
     status[5] = (int)(bits >> 32);
     if(status[0] == 1 && status[3] < budget)
         cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
+}
+
+// [C-3 conditional LS] The first WHILE iteration evaluates the CCD-selected
+// alpha verbatim; subsequent iterations halve before evaluating, matching the
+// legacy "first trial outside the backtracking loop" order.
+__global__ void _ls_conditional_seed(double* alpha_dev,
+                                     const double* alpha0_dev,
+                                     int* status,
+                                     frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    *alpha_dev = *alpha0_dev;
+    status[0]  = 1;
+    status[1]  = static_cast<int>(g_pair_overflow_count);
+    status[2]  = 0;
+    status[3]  = 0;
+    status[6]  = status[1];
+    if(frame)
+    {
+        frame->alpha       = *alpha_dev;
+        frame->ls_decision = 1;
+        frame->phase       = frame_fsm::PHASE_LINE_SEARCH;
+    }
+}
+
+__global__ void _ls_conditional_trial_begin(double* alpha_dev, int* status)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    if(status[3] != 0)
+        *alpha_dev *= 0.5;
+    ++status[3];
+}
+
+__global__ void _ls_conditional_tail(
+    int* status,
+    int budget,
+    const double* alpha_dev,
+    const double* energy_trial,
+    cudaGraphConditionalHandle handle,
+    frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+
+    const bool pair_overflow = status[1] != status[6];
+    const bool collapse      = status[2] < 0;
+    const bool exhausted     = status[0] == 1 && status[3] >= budget;
+    if(frame)
+    {
+        frame->alpha        = *alpha_dev;
+        frame->energy_trial = *energy_trial;
+        frame->ls_decision  = status[0];
+        ++frame->ls_trial;
+        frame->phase = frame_fsm::PHASE_LINE_SEARCH;
+        if(pair_overflow)
+        {
+            frame_fsm::fsm_record_error(
+                frame,
+                frame_fsm::ERR_CAPACITY,
+                frame_fsm::OVF_DCD_PAIRS,
+                -1,
+                -1);
+            frame->result = frame_fsm::FRAME_RETRY_REQUIRED;
+            frame->phase  = frame_fsm::PHASE_ROLLBACK;
+        }
+        if(collapse)
+        {
+            frame_fsm::fsm_record_error(
+                frame,
+                frame_fsm::ERR_SOLVER_EXCEPTION,
+                frame_fsm::INV_START_INTERSECTING,
+                -1,
+                status[2]);
+            frame->result = frame_fsm::FRAME_FATAL;
+            frame->phase  = frame_fsm::PHASE_ROLLBACK;
+        }
+        if(exhausted)
+        {
+            frame_fsm::fsm_record_error(
+                frame,
+                frame_fsm::ERR_SOLVER_EXCEPTION,
+                frame_fsm::INV_LS_BUDGET,
+                -1,
+                -1);
+            frame->result = frame_fsm::FRAME_FATAL;
+            frame->phase  = frame_fsm::PHASE_ROLLBACK;
+        }
+    }
+    const bool healthy = !frame || frame->result == frame_fsm::FRAME_OK;
+    cudaGraphSetConditional(
+        handle,
+        healthy && status[0] == 1 && status[3] < budget ? 1u : 0u);
+}
+
+__global__ void _newton_step_predicate(
+    frame_fsm::FrameDeviceState* frame,
+    cudaGraphConditionalHandle handle)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    const bool healthy = frame->result == frame_fsm::FRAME_OK;
+    // Preserve the legacy `k && converged` rule: the first solved direction
+    // always takes one line-search step, even if it is already below the
+    // threshold. Later converged directions exit before stepping.
+    frame->newton_step_active =
+        healthy
+        && (frame->newton_iter == 0 || !frame->newton_converged);
+    cudaGraphSetConditional(
+        handle, frame->newton_step_active ? 1u : 0u);
+}
+
+__global__ void _newton_iteration_begin(
+    frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    frame->phase              = frame_fsm::PHASE_ASSEMBLY;
+    frame->newton_step_active = 0;
+}
+
+__global__ void _newton_unit_alpha(
+    double* alpha_slots,
+    frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    alpha_slots[5] = 1.0;
+    alpha_slots[6] = 1.0;
+    frame->alpha     = 1.0;
+    frame->cfl_alpha = 1.0;
+}
+
+__global__ void _newton_tail_conditional(
+    frame_fsm::FrameDeviceState* frame,
+    int iteration_cap,
+    cudaGraphConditionalHandle handle)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    const int previous_completed = frame->newton_iter;
+    if(frame->newton_step_active
+       && frame->result == frame_fsm::FRAME_OK)
+        ++frame->newton_iter;
+
+    const bool first_step_completed =
+        previous_completed == 0 && frame->newton_step_active;
+    const bool keep_running =
+        frame->result == frame_fsm::FRAME_OK
+        && frame->newton_iter < iteration_cap
+        && (first_step_completed || !frame->newton_converged);
+    frame->phase = keep_running
+                       ? frame_fsm::PHASE_ASSEMBLY
+                       : (frame->result == frame_fsm::FRAME_OK
+                              ? frame_fsm::PHASE_POST_LS
+                              : frame_fsm::PHASE_ROLLBACK);
+    cudaGraphSetConditional(handle, keep_running ? 1u : 0u);
 }
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)
@@ -216,8 +376,11 @@ int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int pre
     }
 
 
-    auto& json = gipc::Statistics::instance().at_current_frame();
-    json["newton"].back()["pcg"]["iterations"] = iter;
+    if(!frame_fsm::ConditionalGraphRecorder::active())
+    {
+        auto& json = gipc::Statistics::instance().at_current_frame();
+        json["newton"].back()["pcg"]["iterations"] = iter;
+    }
     return iter;
 }
 

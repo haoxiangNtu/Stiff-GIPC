@@ -60,6 +60,10 @@ class MASPreconditioner
     unsigned int*       d_nextConnectMask = nullptr;
     unsigned int*       d_nextPrefix = nullptr;
     unsigned int*       d_nextPrefixSum = nullptr;
+    // CUB scans run inside the full-frame capture.  Their temporary storage
+    // must therefore be sized and allocated once at the scene boundary.
+    void*  d_scanTemp = nullptr;
+    size_t m_scanTempBytes = 0;
 
 
     __GEIGEN__::MasMatrixT*    d_MatMas = nullptr;

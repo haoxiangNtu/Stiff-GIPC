@@ -2,6 +2,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <pybind11/eigen.h>
+#include <sstream>
 #include "sim_engine.h"
 #include "GIPC.cuh"
 #include "errors.h"
@@ -476,6 +477,132 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::call_guard<py::gil_scoped_release>())
         .def("get_frame_status", &SimEngine::get_frame_status,
              "Return the latest frame-boundary status packet.")
+
+        .def("launch_episode_async",
+             [](SimEngine& e,
+                int frames,
+                py::object revolute_actions,
+                py::object prismatic_actions)
+             {
+                 using ActionArray = py::array_t<
+                     double,
+                     py::array::c_style | py::array::forcecast>;
+                 const int revolute_count =
+                     e.get_num_revolute_joints();
+                 const int prismatic_count =
+                     e.get_num_prismatic_joints();
+                 ActionArray revolute;
+                 ActionArray prismatic;
+                 const double* revolute_data = nullptr;
+                 const double* prismatic_data = nullptr;
+
+                 auto validate = [frames](
+                     py::object object,
+                     int joints,
+                     const char* label,
+                     ActionArray& array,
+                     const double*& data)
+                 {
+                     if(joints == 0 && object.is_none())
+                         return;
+                     if(object.is_none())
+                         throw py::value_error(
+                             std::string(label)
+                             + " actions are required by this scene");
+                     array = ActionArray::ensure(object);
+                     if(!array)
+                         throw py::type_error(
+                             std::string(label)
+                             + " actions must be float-compatible");
+                     const py::buffer_info info = array.request();
+                     if(info.ndim != 3
+                        || info.shape[0] != frames
+                        || info.shape[1] != joints
+                        || info.shape[2] != 3)
+                     {
+                         std::ostringstream message;
+                         message << label
+                                 << " actions must have shape ("
+                                 << frames << ", " << joints
+                                 << ", 3)";
+                         throw py::value_error(message.str());
+                     }
+                     data = static_cast<const double*>(info.ptr);
+                 };
+                 validate(
+                     revolute_actions,
+                     revolute_count,
+                     "revolute",
+                     revolute,
+                     revolute_data);
+                 validate(
+                     prismatic_actions,
+                     prismatic_count,
+                     "prismatic",
+                     prismatic,
+                     prismatic_data);
+                 py::gil_scoped_release release;
+                 e.launch_episode_async(
+                     frames,
+                     revolute_data,
+                     revolute_count,
+                     prismatic_data,
+                     prismatic_count);
+             },
+             py::arg("frames"),
+             py::arg("revolute_actions") = py::none(),
+             py::arg("prismatic_actions") = py::none(),
+             "Launch one device-resident RL episode asynchronously. A prior "
+             "warm-up step() is required. Action arrays have shape "
+             "(frames, joints, 3): target, strength, external force/torque.")
+        .def("episode_in_flight", &SimEngine::episode_in_flight)
+        .def("episode_observation_ready",
+             &SimEngine::episode_observation_ready,
+             py::arg("slot"),
+             "Non-blocking query for asynchronous observation slot 0 or 1.")
+        .def("wait_episode_observation",
+             &SimEngine::wait_episode_observation,
+             py::arg("slot"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Wait only for the requested observation slot's CUDA event.")
+        .def("get_episode_observation",
+             [](const SimEngine& e, int slot)
+             {
+                 const int frames =
+                     e.get_episode_slot_frame_count(slot);
+                 const int vertices = e.get_vertex_count();
+                 auto positions =
+                     py::array_t<double>({frames, vertices, 3});
+                 auto velocities =
+                     py::array_t<double>({frames, vertices, 3});
+                 std::vector<frame_fsm::FrameStatus> statuses(frames);
+                 e.get_episode_observation(
+                     slot,
+                     positions.mutable_data(),
+                     velocities.mutable_data(),
+                     statuses.data(),
+                     frames);
+                 py::list py_statuses;
+                 for(const auto& status : statuses)
+                     py_statuses.append(py::cast(status));
+                 py::dict result;
+                 result["first_frame"] =
+                     e.get_episode_slot_first_frame(slot);
+                 result["positions"] = std::move(positions);
+                 result["velocities"] = std::move(velocities);
+                 result["statuses"] = std::move(py_statuses);
+                 return result;
+             },
+             py::arg("slot"),
+             "Return a ready slot as {first_frame, positions, velocities, "
+             "statuses}; this performs only pinned-host memory copies.")
+        .def("get_episode_attempted_frame_count",
+             &SimEngine::get_episode_attempted_frame_count)
+        .def("finish_episode",
+             &SimEngine::finish_episode,
+             py::call_guard<py::gil_scoped_release>(),
+             "Wait for the terminal slot, commit telemetry, and return the "
+             "number of successful frames.")
 
         .def("get_assets_dir", &SimEngine::get_assets_dir)
 

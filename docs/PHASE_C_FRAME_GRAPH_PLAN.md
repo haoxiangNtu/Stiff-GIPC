@@ -81,3 +81,114 @@ SQLite 以 runtime correlation + NVTX `line_search` 区间联查）：
 merged 的 Newton 数本来即非逐位确定，故两行各自按本行区间数归一：graph=1 时
 12B 次数与区间数严格相等，证明所有回溯 trial 决策读均消失；24 个实际进入
 回溯的 line search 各付一次 packed 读，而非每 trial 一次宿主往返。
+
+## C-2/C-3 落地战报：Newton→PCG→LS 整帧条件图（2026-07-28）
+
+`STIFF_FRAME_GRAPH=1 STIFF_FRAME_FULL_GRAPH=1`（两个旋钮均默认关闭）启用
+整帧条件图候选。录制后的层次为：
+
+```text
+root graph
+└─ Newton WHILE
+   ├─ GH 装配（设备计数/固定容量 launch bound）
+   ├─ PCG WHILE
+   ├─ convergence IF
+   └─ LS WHILE
+```
+
+每次物理帧只有一次 root `cudaGraphLaunch`、一次帧尾
+`FrameStatus` D2H 和一个宿主帧边界；Newton、PCG、LS 的继续/退出均由设备
+条件句柄决定。异常、非有限值和容量不足先写 `FrameDeviceState`，停止条件环，
+再由帧尾统一裁决。失败帧通过入口快照逐位恢复 FEM/ABD/κ，容量增长和重录只
+发生在合法帧边界。
+
+实现中补齐了以下捕获安全前提：
+
+- 接触分类、稀疏矩阵范围、MAS 范围和 line-search 能量范围改读设备计数；
+- merged BVH 与 MAS 的 capture 路径使用预分配 CUB scratch，不在捕获中调用
+  Thrust 分配；
+- ABD converter 使用边界训练的容量 tier，图内不做 D2H/resize/wait；
+- CUDA 捕获异常会安全结束捕获、销毁半成品并对该 Engine 永久降级，不遗留
+  非法 capture state；
+- 每个嵌套 WHILE 前显式重设条件句柄。仅依赖
+  `cudaGraphCondAssignDefault` 会使第二个外层迭代沿用前一轮的终止零值，这一
+  CUDA 条件图陷阱已由连续多帧 gate 覆盖。
+
+当前 whole-frame 候选故意只覆盖经过验证的快路径：merged、静态边界、
+无 soft target/FEM pin、`skip_all_collision=True`、非 semi-implicit、
+单 animation substep，且所有 isolated/strict/per-env overlay 关闭。不满足时
+不伪装成功：普通 `step()` 回退到已审计的两图事务路径；捕获失败也只影响当前
+Engine 的 whole-frame 候选。ABD 普通逐帧 whole-frame 仍关闭，ABD 支持由
+Phase D episode API 显式进入。会执行宿主同步/读回的诊断旋钮（mirror/slot
+audit、phase timer、KSUM、MAS dump/validate、stack diagnostic）同样在资格
+检查阶段明确拒绝，避免让审计逻辑进入 CUDA capture。
+
+验收入口：
+
+```bash
+STIFFGIPC_NATIVE_DIR="$PWD/build" python3 scripts/frame_graph_gate.py
+```
+
+该 gate 覆盖 warm-up 降级、正常两图事务、强制逐位回滚、ABD unique-tier
+边界增长/重试、重试耗尽、host-audit 请求下的安全降级，以及 whole-frame
+开关前后的逐位指纹。当前结果：`FRAME-GRAPH-GATE: PASS`。
+
+## Phase D 落地战报：RL episode 驻留（2026-07-28）
+
+高层 Python API 已加入 `stiff_physics.engine.Engine`：
+
+```python
+engine.step()  # 一次同步 warm-up，训练所有 lazy workspace/tier
+engine.launch_episode_async(
+    frames,
+    revolute_actions,   # (frames, revolute_joints, 3)
+    prismatic_actions,  # (frames, prismatic_joints, 3)
+)
+
+for slot in (0, 1):
+    engine.wait_episode_observation(slot)
+    observation = engine.get_episode_observation(slot)
+
+successful_frames = engine.finish_episode()
+```
+
+动作三元组分别是 `{target, strength, external torque/force}`。两类关节动作先在
+宿主打包成一个连续块，整个 episode 只做一次动作序列 H2D；设备上的
+`frame_index` 直接索引该序列，逐帧不再回到宿主更新 joint control。
+
+episode 是一次 root graph launch。由于 CUDA 不允许把 host-queryable external
+event node 放进 conditional body，root 合法地组织成“两段 WHILE + 两个 root
+观测出口”：第一段完成后异步复制 slot 0，第二段完成后异步复制 slot 1。每个
+slot 都包含逐帧 positions、velocities、`FrameStatus` 和 attempted-frame 计数，
+复制目标是 pinned host memory，并由 external CUDA event 围栏发布。调用方可用
+`episode_observation_ready(slot)` 无阻塞轮询，也可只等待需要的 slot。两段仍属于
+同一次 root graph launch，episode 内 `host_boundaries == 0`。
+
+任一帧失败会在设备侧停止后续帧，失败帧先回滚到该帧入口状态再发布状态包；
+`finish_episode()` 返回成功提交的帧数，调用方可据逐帧状态丢弃 poisoned
+episode。销毁/reset 正在运行的 episode 时会先安全收束 stream，再释放借用的
+frame snapshot。
+
+可执行图复用策略保持诚实：
+
+- 纯 FEM、形状和 buffer generation 不变时，后续 episode 复用同一个 exec；
+- ABD 的中间 converter offset 会随已提交的 q/layout 状态前进，因此当前在
+  **episode 边界**重录，绝不在 episode 内重录或同步；
+- 不满足 C-3 候选约束、未 warm-up、动作 shape 不符、存在
+  `STIFF_DRIVE_SUBSTEP>1` 等情况会明确抛错，不偷偷走逐帧宿主循环。
+
+验收入口：
+
+```bash
+STIFFGIPC_NATIVE_DIR="$PWD/build" python3 scripts/episode_graph_gate.py
+STIFFGIPC_NATIVE_DIR="$PWD/build" python3 scripts/episode_graph_rl_gate.py
+```
+
+第一项连续运行两个纯 FEM episode（默认共 12 帧），覆盖 exec 复用、两个异步
+slot、一次发射/零边界计数，并与普通逐帧 whole-frame 路径逐字节一致。第二项
+构造 fixed+revolute+prismatic 的 ABD 铰接场景，把 6 帧动作分成两个 episode，
+核对逐帧 Newton/PCG/status/观测。ABD 并行归约在普通基线自身就有约
+`1e-17` 位置、`1e-15` 速度的末位抖动，因此 gate 先跑两次普通基线建立噪声
+包络，再要求 episode 误差不超过该包络和机器精度下限；纯 FEM 的严格逐位 gate
+不放宽。当前结果分别为 `EPISODE-GRAPH-GATE: PASS` 和
+`EPISODE-RL-GRAPH-GATE: PASS`。

@@ -1,4 +1,5 @@
 #include "linear_system/utils/pcg_capacity_mode.h"  // [B2'-b]
+#include <cub/device/device_scan.cuh>
 __global__ void _mas_env_base(const unsigned int* prefixSum, const unsigned int* prefix,
                               int wpe, int n_env, int* envBase, int* envStart, int* padTot)
 {
@@ -199,9 +200,16 @@ void MASPreconditioner::BuildLevel1()
     int numBlocks = (number + blockSize - 1) / blockSize;
     //exclusive(d_prefixOriginal, d_prefixSumOriginal); wait to do;
     int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
-    thrust::exclusive_scan(thrust::device_ptr<int>(d_prefixOriginal),
-                           thrust::device_ptr<int>(d_prefixOriginal) + warpNum,
-                           thrust::device_ptr<int>(d_prefixSumOriginal));
+    {
+        size_t workspace_bytes = m_scanTempBytes;
+        CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(
+            d_scanTemp,
+            workspace_bytes,
+            d_prefixOriginal,
+            d_prefixSumOriginal,
+            warpNum,
+            cudaStreamPerThread));
+    }
     // [per-env MAS] pad each env's level-1 clusters to a BANKSIZE-aligned block (no bank sharing).
     int _segN = _mas_envSegN(warpNum, m_numEnvs);
     if(_segN > 1)
@@ -228,9 +236,16 @@ void MASPreconditioner::BuildLevel1()
     int numBlocks = (number + blockSize - 1) / blockSize;
     //exclusive(d_prefixOriginal, d_prefixSumOriginal); wait to do;
     int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
-    thrust::exclusive_scan(thrust::device_ptr<int>(d_prefixOriginal),
-                           thrust::device_ptr<int>(d_prefixOriginal) + warpNum,
-                           thrust::device_ptr<int>(d_prefixSumOriginal));
+    {
+        size_t workspace_bytes = m_scanTempBytes;
+        CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(
+            d_scanTemp,
+            workspace_bytes,
+            d_prefixOriginal,
+            d_prefixSumOriginal,
+            warpNum,
+            cudaStreamPerThread));
+    }
     _buildLevel1<<<numBlocks, blockSize>>>(d_levelSize,
                                            d_coarseSpaceTables,
                                            d_goingNext,
@@ -321,9 +336,14 @@ void MASPreconditioner::PrefixSumLx(int level)
         int blockSize = BANKSIZE * BANKSIZE;
         int numBlocks = (m_clusterCap + blockSize - 1) / blockSize;
         int warpCap   = (m_clusterCap + BANKSIZE - 1) / BANKSIZE;
-        thrust::exclusive_scan(thrust::device_ptr<unsigned int>(d_nextPrefix),
-                               thrust::device_ptr<unsigned int>(d_nextPrefix) + warpCap,
-                               thrust::device_ptr<unsigned int>(d_nextPrefixSum));
+        size_t workspace_bytes = m_scanTempBytes;
+        CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(
+            d_scanTemp,
+            workspace_bytes,
+            d_nextPrefix,
+            d_nextPrefixSum,
+            warpCap,
+            cudaStreamPerThread));
         _prefixSumLx_dev<<<numBlocks, blockSize>>>(d_levelSize,
                                                    d_nextPrefix,
                                                    d_nextPrefixSum,
@@ -340,9 +360,14 @@ void MASPreconditioner::PrefixSumLx(int level)
         int blockSize = BANKSIZE * BANKSIZE;
         int numBlocks = (m_clusterCap + blockSize - 1) / blockSize;
         int warpCap   = (m_clusterCap + BANKSIZE - 1) / BANKSIZE;
-        thrust::exclusive_scan(thrust::device_ptr<unsigned int>(d_nextPrefix),
-                               thrust::device_ptr<unsigned int>(d_nextPrefix) + warpCap,
-                               thrust::device_ptr<unsigned int>(d_nextPrefixSum));
+        size_t workspace_bytes = m_scanTempBytes;
+        CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(
+            d_scanTemp,
+            workspace_bytes,
+            d_nextPrefix,
+            d_nextPrefixSum,
+            warpCap,
+            cudaStreamPerThread));
         _mas_env_base_dev<<<1, 1>>>(d_nextPrefixSum, d_nextPrefix, d_levelSize, level,
                                     _mas_envSegN_static(m_numEnvs),
                                     d_envBase, d_envStart, d_padTot, d_segwpe);
@@ -434,7 +459,11 @@ int MASPreconditioner::exactClusterCountBlocking() const
 
 int MASPreconditioner::ReorderRealtime(int cpNum)
 {
-    CUDA_SAFE_CALL(cudaMemset(d_levelSize, 0, levelnum * sizeof(int2)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        d_levelSize,
+        0,
+        levelnum * sizeof(int2),
+        cudaStreamPerThread));
 
 
     BuildConnectMaskL0();
@@ -450,7 +479,11 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
         // clear the FULL cluster-space capacity: padded slots beyond the real
         // cluster count are read by _nextLevelCluster/_prefixSumLx and must be
         // deterministic zeros, not stale/uninitialized memory.
-        CUDA_SAFE_CALL(cudaMemset(d_nextConnectMask, 0, m_clusterCap * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            d_nextConnectMask,
+            0,
+            m_clusterCap * sizeof(int),
+            cudaStreamPerThread));
 
         BuildConnectMaskLx(level);
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -466,7 +499,8 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
         // count readback (the level loop is now fully device-resident).
         CUDA_SAFE_CALL(cudaMemsetAsync(
             d_nextPrefix, 0,
-            ((m_clusterCap + BANKSIZE - 1) / BANKSIZE) * sizeof(unsigned int)));
+            ((m_clusterCap + BANKSIZE - 1) / BANKSIZE) * sizeof(unsigned int),
+            cudaStreamPerThread));
 
         NextLevelCluster(level);
 
@@ -522,10 +556,12 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
         int startC = totalMapNodes / BANKSIZE;
         int endC   = totalNumberClusters / BANKSIZE;
         if(endC > startC)
-            CUDA_SAFE_CALL(cudaMemset(
-                d_matbin + (size_t)startC * MAS_NB * 9 * BINNED_K, 0,
-                (size_t)(endC - startC) * MAS_NB * 9 * BINNED_K * sizeof(double)));
-        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_matbin, &d_matbin, sizeof(double*)));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                d_matbin + (size_t)startC * MAS_NB * 9 * BINNED_K,
+                0,
+                (size_t)(endC - startC) * MAS_NB * 9 * BINNED_K
+                    * sizeof(double),
+                cudaStreamPerThread));
     }
     if(true)
     {
@@ -953,15 +989,19 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
 {
     if(totalNodes < 1)
         return;
-    CUDA_SAFE_CALL(cudaMemcpy(d_neighborList,
-                              d_neighborListInit,
-                              neighborListSize * sizeof(unsigned int),
-                              cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        d_neighborList,
+        d_neighborListInit,
+        neighborListSize * sizeof(unsigned int),
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
     //CUDA_SAFE_CALL(cudaMemcpy(ipc.pcg_data.MP.d_neighborStart, tetMesh.neighborStart.data(), ipc.vertexNum * sizeof(unsigned int), cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(d_neighborNum,
-                              d_neighborNumInit,
-                              totalNodes * sizeof(unsigned int),
-                              cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        d_neighborNum,
+        d_neighborNumInit,
+        totalNodes * sizeof(unsigned int),
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
 
 
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -977,11 +1017,19 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
 
 #ifdef SYME
 
-    CUDA_SAFE_CALL(cudaMemset(
-        d_inverseMatMas, 0, totalNumberClusters / BANKSIZE * sizeof(__GEIGEN__::MasMatrixSymT)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        d_inverseMatMas,
+        0,
+        totalNumberClusters / BANKSIZE
+            * sizeof(__GEIGEN__::MasMatrixSymT),
+        cudaStreamPerThread));
 #else
-    CUDA_SAFE_CALL(cudaMemset(
-        d_MatMas, 0, totalNumberClusters / BANKSIZE * sizeof(__GEIGEN__::MasMatrixT)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        d_MatMas,
+        0,
+        totalNumberClusters / BANKSIZE
+            * sizeof(__GEIGEN__::MasMatrixT),
+        cudaStreamPerThread));
 #endif
     PrepareHessian_bcoo(triplet_values,
                         row_ids,
@@ -1308,6 +1356,31 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_envStart, 4096 * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_padTot,   sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_segwpe,   sizeof(int2)));  // [B3 s8]
+
+    // Query both scan value types at the maximum fixed launch extent.  CUB
+    // then receives this persistent workspace on every frame, avoiding
+    // Thrust's capture-illegal temporary cudaMalloc.
+    const int max_scan_items =
+        (std::max(vertNum, m_clusterCap) + BANKSIZE - 1) / BANKSIZE;
+    size_t int_scan_bytes  = 0;
+    size_t uint_scan_bytes = 0;
+    CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(
+        nullptr,
+        int_scan_bytes,
+        d_prefixOriginal,
+        d_prefixSumOriginal,
+        max_scan_items,
+        cudaStreamPerThread));
+    CUDA_SAFE_CALL(cub::DeviceScan::ExclusiveSum(
+        nullptr,
+        uint_scan_bytes,
+        d_nextPrefix,
+        d_nextPrefixSum,
+        max_scan_items,
+        cudaStreamPerThread));
+    m_scanTempBytes = std::max(int_scan_bytes, uint_scan_bytes);
+    if(m_scanTempBytes)
+        CUDA_SAFE_CALL(cudaMalloc(&d_scanTemp, m_scanTempBytes));
 }
 
 void MASPreconditioner::initPreconditioner_Matrix()
@@ -1351,6 +1424,8 @@ void MASPreconditioner::initPreconditioner_Matrix()
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_matbin,
                               (size_t)(totalCluster / BANKSIZE) * MAS_NB * 9 * BINNED_K
                                   * sizeof(double)));
+    CUDA_SAFE_CALL(
+        cudaMemcpyToSymbol(g_matbin, &d_matbin, sizeof(double*)));
     m_outputClusterCap = totalCluster;   // [audit lens-A fix] remember the TRUE size
     m_allocClusterTotal =
         totalCluster / BANKSIZE * BANKSIZE;
@@ -1402,6 +1477,8 @@ void MASPreconditioner::ensureOutputClusterCapacity(int need)
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_matbin,
                               (size_t)(newCap / BANKSIZE) * MAS_NB * 9 * BINNED_K
                                   * sizeof(double)));
+    CUDA_SAFE_CALL(
+        cudaMemcpyToSymbol(g_matbin, &d_matbin, sizeof(double*)));
     m_outputClusterCap = newCap;
     if(m_allocClusterTotal > 0)
         m_allocClusterTotal =
@@ -1432,6 +1509,8 @@ void MASPreconditioner::FreeMAS()
     release(d_prefixOriginal);
     release(d_nextPrefix);
     release(d_nextPrefixSum);
+    release(d_scanTemp);
+    m_scanTempBytes = 0;
     release(d_prefixSumOriginal);
     release(d_fineConnectMask);
     release(d_nextConnectMask);

@@ -381,9 +381,15 @@ void ABDSystem::_cal_abd_body_gradient_and_hessian(ABDSimData& sim_data)
     auto& abd       = sim_data.device;
     auto  N         = sim_data.abd_fem_count_info().abd_body_num;
     auto  parameter = parms;
-    abd_body_hessian.resize(N);
-    abd_gradient.resize(N);
-    system_gradient.resize(N * 12);
+    // Fixed-topology workspaces are already sized by the warm-up frame.
+    // muda::DeviceBuffer::resize() waits even when the size is unchanged,
+    // which is illegal while recording the episode graph.
+    if(abd_body_hessian.size() != N)
+        abd_body_hessian.resize(N);
+    if(abd_gradient.size() != N)
+        abd_gradient.resize(N);
+    if(system_gradient.size() != N * 12)
+        system_gradient.resize(N * 12);
 
     auto boundary_type = sim_data.body_id_to_boundary_type();
 
@@ -1065,7 +1071,8 @@ void ABDSystem::_cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data)
     auto  kappa_fallback = parms.joint_strength_ratio;  // fallback (per-joint kappa takes priority)
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
 
-    m_joint_cross_hessian.resize(m_num_joints);
+    if(m_joint_cross_hessian.size() != m_num_joints)
+        m_joint_cross_hessian.resize(m_num_joints);
 
     ParallelFor(256)
         .kernel_name(__FUNCTION__)
@@ -1571,7 +1578,10 @@ void ABDSystem::_cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_d
     auto& abd = sim_data.device;
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
 
-    m_revolute_driving_cross_hessian.resize(m_num_revolute_driving);
+    if(m_revolute_driving_cross_hessian.size()
+       != m_num_revolute_driving)
+        m_revolute_driving_cross_hessian.resize(
+            m_num_revolute_driving);
 
     ParallelFor(256)
         .kernel_name("cal_revolute_driving_grad_hess")
@@ -1774,7 +1784,8 @@ void ABDSystem::_cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data)
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
     Float kappa = parms.prismatic_strength_ratio;
 
-    m_prismatic_cross_hessian.resize(m_num_prismatic);
+    if(m_prismatic_cross_hessian.size() != m_num_prismatic)
+        m_prismatic_cross_hessian.resize(m_num_prismatic);
 
     ParallelFor(256)
         .kernel_name("cal_prismatic_grad_hess")
@@ -2005,6 +2016,166 @@ void ABDSystem::update_prismatic_driving_targets(
                });
 }
 
+// ============================================================================
+// Episode-resident driving targets (Phase D)
+// ============================================================================
+
+void ABDSystem::enqueue_episode_driving_targets(
+    ABDSimData& sim_data,
+    const RevoluteDrivingControlPacked* revolute_actions,
+    const PrismaticDrivingControlPacked* prismatic_actions,
+    const int* frame_index)
+{
+    if(!frame_index)
+        throw std::invalid_argument(
+            "[episode-graph] null device frame index");
+
+    using namespace muda;
+    auto& abd = sim_data.device;
+
+    if(m_num_revolute_driving > 0)
+    {
+        if(!revolute_actions)
+            throw std::invalid_argument(
+                "[episode-graph] missing revolute action sequence");
+        const int n = m_num_revolute_driving;
+        const Float kMaxStepPerFrame = parms.max_revolute_step_per_frame;
+        const Float sr = parms.revolute_driving_strength_ratio;
+        ParallelFor(256)
+            .kernel_name("episode_revolute_driving_targets_gpu")
+            .apply(
+                n,
+                [drvs = m_revolute_driving_data.viewer().name(
+                     "revolute_driving"),
+                 q_prev = abd.body_id_to_q_prev.cviewer().name("q_prev"),
+                 masses = body_mass.cviewer().name("body_mass"),
+                 ctrls = revolute_actions,
+                 frame_index,
+                 n,
+                 sr,
+                 kMaxStepPerFrame] __device__(int i) mutable
+                {
+                    auto& drv = drvs(i);
+                    const auto& ctrl =
+                        ctrls[static_cast<size_t>(*frame_index) * n + i];
+                    const int pid = drv.parent_body_id;
+                    const int cid = drv.child_body_id;
+                    const auto& q1 = q_prev(pid);
+                    const auto& q2 = q_prev(cid);
+
+                    Matrix3x3 A1, A2;
+                    A1.row(0) = q1.segment<3>(3).transpose();
+                    A1.row(1) = q1.segment<3>(6).transpose();
+                    A1.row(2) = q1.segment<3>(9).transpose();
+                    A2.row(0) = q2.segment<3>(3).transpose();
+                    A2.row(1) = q2.segment<3>(6).transpose();
+                    A2.row(2) = q2.segment<3>(9).transpose();
+
+                    const Vector3 p  = A1 * drv.p_bar;
+                    const Vector3 pN = A1 * drv.pN_bar;
+                    const Vector3 q  = A2 * drv.q_bar;
+                    const Vector3 qN = A2 * drv.qN_bar;
+                    const Float cos_prev =
+                        Float(0.5) * (p.dot(q) + pN.dot(qN));
+                    const Float sin_prev =
+                        Float(0.5) * (q.dot(pN) - qN.dot(p));
+                    const Float theta_prev = atan2(sin_prev, cos_prev);
+
+                    const Float desired_goal =
+                        ctrl.target_angle - drv.initial_angle_offset;
+                    Float diff = desired_goal - theta_prev;
+                    const Float two_pi =
+                        Float(2.0 * 3.14159265358979323846);
+                    diff -= two_pi * round(diff / two_pi);
+                    diff = diff > kMaxStepPerFrame
+                               ? kMaxStepPerFrame
+                               : (diff < -kMaxStepPerFrame
+                                      ? -kMaxStepPerFrame
+                                      : diff);
+
+                    drv.target_angle = theta_prev + diff;
+                    const Float mass_sum = masses(pid) + masses(cid);
+                    drv.stiffness =
+                        sr * ctrl.strength_ratio * mass_sum;
+                    drv.ext_torque = ctrl.ext_torque;
+
+                    if(drv.limit_stiffness > Float(0))
+                    {
+                        if(drv.limit_active == 0)
+                        {
+                            if(theta_prev < drv.lower_limit)
+                                drv.limit_active = -1;
+                            else if(theta_prev > drv.upper_limit)
+                                drv.limit_active = +1;
+                        }
+                        else if(drv.limit_active < 0)
+                        {
+                            if(theta_prev > drv.lower_limit)
+                                drv.limit_active = 0;
+                        }
+                        else if(theta_prev < drv.upper_limit)
+                        {
+                            drv.limit_active = 0;
+                        }
+                    }
+                });
+    }
+
+    if(m_num_prismatic_driving > 0)
+    {
+        if(!prismatic_actions)
+            throw std::invalid_argument(
+                "[episode-graph] missing prismatic action sequence");
+        const int n = m_num_prismatic_driving;
+        const Float kMaxStepPerFrame =
+            parms.max_prismatic_step_per_frame;
+        const Float sr = parms.prismatic_driving_strength_ratio;
+        ParallelFor(256)
+            .kernel_name("episode_prismatic_driving_targets_gpu")
+            .apply(
+                n,
+                [drvs = m_prismatic_driving_data.viewer().name(
+                     "prismatic_driving"),
+                 q_prev = abd.body_id_to_q_prev.cviewer().name("q_prev"),
+                 masses = body_mass.cviewer().name("body_mass"),
+                 ctrls = prismatic_actions,
+                 frame_index,
+                 n,
+                 sr,
+                 kMaxStepPerFrame] __device__(int i) mutable
+                {
+                    auto& drv = drvs(i);
+                    const auto& ctrl =
+                        ctrls[static_cast<size_t>(*frame_index) * n + i];
+                    const int pid = drv.parent_body_id;
+                    const int cid = drv.child_body_id;
+                    const auto& q1 = q_prev(pid);
+                    const auto& q2 = q_prev(cid);
+
+                    const Vector3 Cp = ABDJacobi(drv.Cp_bar) * q1;
+                    const Vector3 Cq = ABDJacobi(drv.Cq_bar) * q2;
+                    Matrix3x3 Aq;
+                    Aq.row(0) = q2.segment<3>(3).transpose();
+                    Aq.row(1) = q2.segment<3>(6).transpose();
+                    Aq.row(2) = q2.segment<3>(9).transpose();
+                    const Vector3 tq = Aq * drv.tq_bar;
+                    const Float d_prev = (Cq - Cp).dot(tq);
+
+                    Float diff = ctrl.target_distance - d_prev;
+                    diff = diff > kMaxStepPerFrame
+                               ? kMaxStepPerFrame
+                               : (diff < -kMaxStepPerFrame
+                                      ? -kMaxStepPerFrame
+                                      : diff);
+                    drv.target_distance = d_prev + diff;
+                    const Float mass_sum = masses(pid) + masses(cid);
+                    drv.stiffness =
+                        sr * ctrl.strength_ratio * mass_sum;
+                    drv.ext_force = ctrl.ext_force;
+                });
+    }
+}
+
 
 // ============================================================================
 // Prismatic Driving Energy
@@ -2054,7 +2225,10 @@ void ABDSystem::_cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_
     auto& abd = sim_data.device;
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
 
-    m_prismatic_driving_cross_hessian.resize(m_num_prismatic_driving);
+    if(m_prismatic_driving_cross_hessian.size()
+       != m_num_prismatic_driving)
+        m_prismatic_driving_cross_hessian.resize(
+            m_num_prismatic_driving);
 
     ParallelFor(256)
         .kernel_name("cal_prismatic_driving_grad_hess")
@@ -2111,7 +2285,8 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
     auto  unique_point_id_to_body_id = sim_data.unique_point_id_to_body_id();
     auto  body_hessian_size = sim_data.abd_fem_count_info().abd_body_num;
 
-    abd_system_diag_preconditioner.resize(body_hessian_size);
+    if(abd_system_diag_preconditioner.size() != body_hessian_size)
+        abd_system_diag_preconditioner.resize(body_hessian_size);
     // Must zero-init: the scatter loop below only touches bodies that appear
     // in the contact triplet range.  Bodies with no barrier/joint coupling
     // (e.g. an isolated free rigid body) would otherwise receive uninitialized

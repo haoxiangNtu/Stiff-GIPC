@@ -445,6 +445,15 @@ class ABDSystem
                                           const std::vector<PrismaticDrivingControlInfo>& controls,
                                           double substep_ratio = 1.0);
 
+    // [Phase D] Queue one frame's controls directly from an episode-resident
+    // device sequence. `frame_index` is device-owned by the outer conditional
+    // graph; no per-frame host staging or synchronization occurs.
+    void enqueue_episode_driving_targets(
+        ABDSimData& sim_data,
+        const RevoluteDrivingControlPacked* revolute_actions,
+        const PrismaticDrivingControlPacked* prismatic_actions,
+        const int* frame_index);
+
     void _cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data);
     void _cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_data);
 

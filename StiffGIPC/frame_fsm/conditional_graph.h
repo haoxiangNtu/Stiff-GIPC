@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <functional>
+#include <vector>
 
 namespace frame_fsm
 {
@@ -44,8 +45,21 @@ class ConditionalGraphRecorder
         unsigned int handle_flags,
         const Body& body);
 
+    // Capture `predicate(handle)` immediately before an IF node. The
+    // predicate must set the handle from device code on every execution.
+    cudaGraphConditionalHandle if_then(const Body& predicate,
+                                       const Body& body);
+
     cudaGraph_t owner() const noexcept { return m_owner; }
     cudaStream_t stream() const noexcept { return m_stream; }
+    const std::vector<cudaGraph_t>& conditional_bodies() const noexcept
+    {
+        return m_conditional_bodies;
+    }
+    const std::vector<cudaGraphNode_t>& conditional_nodes() const noexcept
+    {
+        return m_conditional_nodes;
+    }
 
     static ConditionalGraphRecorder* current() noexcept;
     static bool active() noexcept { return current() != nullptr; }
@@ -54,6 +68,8 @@ class ConditionalGraphRecorder
     cudaGraph_t  m_owner  = nullptr;
     cudaStream_t m_stream = nullptr;
     bool         m_active = false;
+    std::vector<cudaGraph_t> m_conditional_bodies;
+    std::vector<cudaGraphNode_t> m_conditional_nodes;
 
     static thread_local ConditionalGraphRecorder* s_current;
 };

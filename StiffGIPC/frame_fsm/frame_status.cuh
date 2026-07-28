@@ -137,6 +137,7 @@ struct alignas(16) FrameDeviceState
     int32_t ls_trial;
     int32_t substep;
     int32_t newton_converged;
+    int32_t newton_step_active;
     int32_t ls_decision;
     int32_t phase;
     int32_t result;
@@ -149,6 +150,9 @@ struct alignas(16) FrameDeviceState
     int32_t  err_ls_iter;
     uint32_t path_flags;
     int32_t  host_boundaries;
+    int32_t  _control_pad0;
+    int32_t  _control_pad1;
+    int32_t  _control_pad2;
 
     int32_t cp_count;
     int32_t gp_count;

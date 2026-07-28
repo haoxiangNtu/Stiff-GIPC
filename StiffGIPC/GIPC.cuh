@@ -53,6 +53,8 @@ namespace gipc
 class ABDSimData;
 class ABDSystem;
 class GlobalLinearSystem;
+struct RevoluteDrivingControlPacked;
+struct PrismaticDrivingControlPacked;
 }  // namespace gipc
 
 class GIPC
@@ -90,6 +92,11 @@ class GIPC
     // pinned frame-boundary packets.  Kept opaque here so the public solver
     // header exposes only the stable FrameStatus ABI.
     void*                   m_frame_graph_context = nullptr;
+    // [Phase D] Opaque owner of an episode-resident outer WHILE graph,
+    // pre-uploaded action sequences, and two pinned observation slots.  The
+    // episode context borrows the frame transaction snapshots, so it is
+    // destroyed before m_frame_graph_context.
+    void*                   m_episode_graph_context = nullptr;
     bool                    m_frame_graph_active  = false;
     bool                    m_frame_terminal_emitted = false;
     frame_fsm::FrameStatus  m_last_frame_status{};
@@ -685,6 +692,8 @@ class GIPC
     double cfl_largestSpeed(double* mqueue);
 
     bool lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha);
+    void lineSearchConditional(device_TetraData& TetMesh,
+                               const double* alpha_device);
     void postLineSearch(device_TetraData& TetMesh, double alpha);
 
     bool checkEdgeTriIntersectionIfAny(device_TetraData& TetMesh);
@@ -715,10 +724,34 @@ class GIPC
                      double&           time2,
                      double&           time3,
                      double&           time4);
+    void enqueue_frame_graph_body(device_TetraData& TetMesh);
     void IPC_Solver(device_TetraData& TetMesh);
     void IPC_Solver_FrameGraph(device_TetraData& TetMesh);
     void prepare_frame_graph(device_TetraData& TetMesh);
     void destroy_frame_graph();
+    void prepare_episode_graph(
+        device_TetraData& TetMesh,
+        int frame_count,
+        const gipc::RevoluteDrivingControlPacked* revolute_actions,
+        int revolute_count,
+        const gipc::PrismaticDrivingControlPacked* prismatic_actions,
+        int prismatic_count);
+    void launch_episode_graph_async(device_TetraData& TetMesh,
+                                    int64_t base_frame_id);
+    bool episode_graph_in_flight() const;
+    bool episode_observation_ready(int slot) const;
+    void wait_episode_observation(int slot) const;
+    int episode_slot_first_frame(int slot) const;
+    int episode_slot_frame_count(int slot) const;
+    int episode_attempted_frame_count() const;
+    void copy_episode_observation_slot(
+        int slot,
+        double3* positions,
+        double3* velocities,
+        frame_fsm::FrameStatus* statuses,
+        int frame_capacity) const;
+    int finish_episode_graph();
+    void destroy_episode_graph();
     void frame_graph_begin(device_TetraData& TetMesh,
                            int64_t frame_id,
                            int attempt = 0,

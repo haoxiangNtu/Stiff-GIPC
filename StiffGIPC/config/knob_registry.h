@@ -51,6 +51,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_EE_TRACE, "diag") \
     X(STIFF_ENERGY_VALIDATE, "diag") \
     X(STIFF_FRAME_GRAPH, "perf") \
+    X(STIFF_FRAME_FULL_GRAPH, "perf") \
     X(STIFF_FRAME_MAX_RETRIES, "solver") \
     X(STIFF_FRAME_FORCE_UNIQUE_TIER, "diag") \
     X(STIFF_FRAME_FORCE_ROLLBACK, "diag") \

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <map>
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <mutex>
 #include <cuda_runtime.h>
@@ -151,6 +152,9 @@ struct SimEngine::Impl
     bool             finalized        = false;
     bool             finalize_failed  = false;
     int              step_count       = 0;
+    int              episode_frames   = 0;
+    std::vector<double> episode_revolute_actions;
+    std::vector<double> episode_prismatic_actions;
     std::string      resolved_assets_dir;
 
     // [Step B] grow-only device buffers for per-contact force export

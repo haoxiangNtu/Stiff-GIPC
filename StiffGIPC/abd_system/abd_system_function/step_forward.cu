@@ -6,8 +6,16 @@ namespace gipc
 void ABDSystem::copy_q_to_q_temp(ABDSimData& sim_data)
 {
     using namespace muda;
-    auto& abd             = sim_data.device;
-    abd.body_id_to_q_temp = abd.body_id_to_q;
+    auto& abd = sim_data.device;
+    // DeviceBuffer's copy-assignment finishes with LaunchCore::wait(), which
+    // injects a host synchronization even when both buffers are already the
+    // right size (and even for an empty FEM-only scene).  Keep capacity growth
+    // at the boundary, then record only the stream-ordered D2D copy.
+    if(abd.body_id_to_q_temp.size() != abd.body_id_to_q.size())
+        abd.body_id_to_q_temp.resize(abd.body_id_to_q.size());
+    if(abd.body_id_to_q.size())
+        abd.body_id_to_q_temp.view().copy_from(
+            abd.body_id_to_q.view());
 }
 
 void ABDSystem::step_forward(ABDSimData&                sim_data,

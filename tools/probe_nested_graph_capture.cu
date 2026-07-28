@@ -21,6 +21,15 @@ __global__ void continue_until(int* value,
         cudaGraphSetConditional(handle, *value < limit ? 1u : 0u);
 }
 
+__global__ void set_if_equal(const int* value,
+                             int expected,
+                             cudaGraphConditionalHandle handle)
+{
+    if(blockIdx.x == 0 && threadIdx.x == 0)
+        cudaGraphSetConditional(
+            handle, *value == expected ? 1u : 0u);
+}
+
 static bool check(cudaError_t error, const char* what)
 {
     std::printf("[nested-probe] %s -> %s\n",
@@ -256,6 +265,17 @@ int main()
                 continue_until<<<1, 1, 0, cudaStreamPerThread>>>(
                     outer_value, 4, outer_handle);
             });
+        recorder.if_then(
+            [&](cudaGraphConditionalHandle if_handle)
+            {
+                set_if_equal<<<1, 1, 0, cudaStreamPerThread>>>(
+                    outer_value, 4, if_handle);
+            },
+            [&](cudaGraphConditionalHandle)
+            {
+                add_one<<<1, 1, 0, cudaStreamPerThread>>>(
+                    inner_value);
+            });
     }
     catch(const std::exception& error)
     {
@@ -293,7 +313,7 @@ int main()
         return 1;
     std::printf(
         "[nested-probe] recorder nested result outer=%d inner=%d "
-        "(expected outer=4, inner>=2)\n",
+        "(expected outer=4, inner=3)\n",
         outer_host,
         inner_host);
     cudaGraphExecDestroy(recorder_exec);
@@ -303,7 +323,7 @@ int main()
     cudaFree(value);
     return nested_launch != cudaSuccess && end != cudaSuccess
                    && conditional_value == 5 && outer_host == 4
-                   && inner_host >= 2
+                   && inner_host == 3
                ? 0
                : 2;
 }

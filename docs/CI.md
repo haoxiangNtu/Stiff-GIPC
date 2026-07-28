@@ -100,6 +100,13 @@ SKIP_GATES=1 git push
   finalize 绊线：进程环境里出现注册表外的 STIFF_* 变量 → 大声警告
   （`STIFF_KNOB_STRICT=1` 升级为 `ConfigurationError`）。维护规则：新增
   `getenv("STIFF_...")` 必须同 commit 加注册表行，否则 G14 红。
+- **G16 frame-graph**（`scripts/frame_graph_gate.py`，GPU）：覆盖 Phase C 两图
+  事务、强制回滚、容量 tier 边界重试/耗尽，以及整帧条件图开关前后的逐位
+  指纹；整帧路径必须报告一次 graph launch、一次帧尾 D2H。
+- **G17 episode-graph / episode-rl-graph**（`scripts/episode_graph_gate.py`、
+  `scripts/episode_graph_rl_gate.py`，GPU）：覆盖 Phase D 两段 observation
+  event、纯 FEM exec 跨 episode 复用及逐位一致，并用 fixed+revolute+prismatic
+  ABD 场景验证整段动作上传和 RL 数值噪声包络。
 
 ## GPU idle 门的基础设施白名单
 

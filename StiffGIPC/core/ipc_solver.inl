@@ -36,6 +36,100 @@ struct _LsTimer {
               *acc += m; cudaEventDestroy(a); cudaEventDestroy(b); on=false; } }
 };
 
+void GIPC::lineSearchConditional(device_TetraData& TetMesh,
+                                 const double* alpha_device)
+{
+    auto* recorder = frame_fsm::ConditionalGraphRecorder::current();
+    if(!recorder)
+        throw std::logic_error(
+            "[line-search-conditional] no active conditional recorder");
+    if(!alpha_device)
+        throw std::invalid_argument(
+            "[line-search-conditional] null device alpha");
+    if(!m_skip_all_collision)
+        throw std::runtime_error(
+            "[line-search-conditional] collision-domain checks are not yet "
+            "device-conditional");
+    if(m_mode_config.perenv_alpha)
+        throw std::runtime_error(
+            "[line-search-conditional] per-environment alpha requires the "
+            "device S3 conditional path");
+
+    frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    if(!frame)
+        throw std::logic_error(
+            "[line-search-conditional] frame device state is unavailable");
+
+    const int budget =
+        line_search_max_iter > 0 ? line_search_max_iter : 64;
+    computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
+
+    CUDA_SAFE_CALL(cudaMemcpyAsync(TetMesh.temp_double3Mem,
+                                   TetMesh.vertexes,
+                                   vertexNum * sizeof(double3),
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread));
+    m_abd_system->copy_q_to_q_temp(*m_abd_sim_data);
+
+    // Host values below define only capacity-sized launch bounds while the
+    // graph is being recorded. Exact live counts remain device-owned.
+    m_energy_bound_cp =
+        static_cast<int>(h_cpNum[0])
+        + static_cast<int>(h_cpNum[0]) / 4 + 64;
+    m_energy_bound_gp =
+        static_cast<int>(h_gpNum)
+        + static_cast<int>(h_gpNum) / 4 + 64;
+    m_ls_defer_counts           = true;
+    m_energy_use_device_counts = true;
+
+    _ls_conditional_seed<<<1, 1>>>(
+        m_d_ls_alpha,
+        alpha_device,
+        m_line_search_decision,
+        frame);
+    try
+    {
+        recorder->while_loop(
+            1,
+            cudaGraphCondAssignDefault,
+            [&](cudaGraphConditionalHandle handle)
+            {
+                _ls_conditional_trial_begin<<<1, 1>>>(
+                    m_d_ls_alpha, m_line_search_decision);
+                step_forward(TetMesh, 0.0, false, m_d_ls_alpha);
+                buildBVH();
+                buildCP();
+                computeEnergy_DeviceOut(
+                    TetMesh, m_line_search_energy + 1);
+                _global_ls_decide<<<1, 1>>>(
+                    m_line_search_energy + 0,
+                    m_line_search_energy + 1,
+                    0.0,
+                    0.0,
+                    energy_abs_tol,
+                    energy_rel_tol,
+                    m_line_search_decision,
+                    nullptr,
+                    m_d_ls_alpha);
+                _ls_conditional_tail<<<1, 1>>>(
+                    m_line_search_decision,
+                    budget,
+                    m_d_ls_alpha,
+                    m_line_search_energy + 1,
+                    handle,
+                    frame);
+            });
+    }
+    catch(...)
+    {
+        m_ls_defer_counts           = false;
+        m_energy_use_device_counts = false;
+        throw;
+    }
+    m_ls_defer_counts           = false;
+    m_energy_use_device_counts = false;
+}
+
 bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha)
 {
     bool   stopped       = false;
@@ -595,6 +689,77 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     }
 
     return stopped;
+}
+
+void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
+{
+    auto* recorder = frame_fsm::ConditionalGraphRecorder::current();
+    frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    if(!recorder || !frame)
+        throw std::logic_error(
+            "[frame-conditional] recorder/device state is unavailable");
+    if(!m_skip_all_collision)
+        throw std::runtime_error(
+            "[frame-conditional] collision path is not yet eligible");
+    if(m_update_boundary || softNum != 0)
+        throw std::runtime_error(
+            "[frame-conditional] moving boundaries and host soft targets "
+            "are not yet eligible");
+    if(m_mode_config.perenv_alpha || m_mode_config.decouple_thresh
+       || m_mode_config.segmented_pcg)
+        throw std::runtime_error(
+            "[frame-conditional] per-environment Newton controls are not yet "
+            "eligible");
+    if(semi_implicit_enabled)
+        throw std::runtime_error(
+            "[frame-conditional] semi-implicit host beta is not eligible");
+
+    const int iteration_cap = std::max(1, newton_iter_cap);
+    const double threshold =
+        newton_velocity_tol > 0.0
+            ? newton_velocity_tol * IPC_dt
+            : sqrt(Newton_solver_threshold * Newton_solver_threshold
+                   * bboxDiagSize2 * IPC_dt * IPC_dt);
+
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        _moveDir,
+        0,
+        vertexNum * sizeof(double3),
+        cudaStreamPerThread));
+    recorder->while_loop(
+        1,
+        cudaGraphCondAssignDefault,
+        [&](cudaGraphConditionalHandle newton_handle)
+        {
+            _newton_iteration_begin<<<1, 1>>>(frame);
+            computeGradientAndHessian(TetMesh);
+            calculateMovingDirection(
+                TetMesh, 0, pcg_data.P_type);
+            calcMinMovement_DeviceOut(
+                _moveDir, pcg_data.squeue, vertexNum);
+            _newton_convergence_decide<<<1, 1>>>(
+                pcg_data.squeue,
+                threshold,
+                m_newton_convergence_decision,
+                frame);
+
+            recorder->if_then(
+                [&](cudaGraphConditionalHandle step_handle)
+                {
+                    _newton_step_predicate<<<1, 1>>>(
+                        frame, step_handle);
+                },
+                [&](cudaGraphConditionalHandle)
+                {
+                    _newton_unit_alpha<<<1, 1>>>(
+                        m_ccd_alpha_slots, frame);
+                    lineSearchConditional(
+                        TetMesh, m_ccd_alpha_slots + 5);
+                });
+
+            _newton_tail_conditional<<<1, 1>>>(
+                frame, iteration_cap, newton_handle);
+        });
 }
 
 

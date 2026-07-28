@@ -4,6 +4,9 @@ void SimEngine::step()
     if(!impl.finalized)
         throw LifecycleError("step() requires a finalized SimEngine");
     cudaSetDevice(impl.cfg.cuda_device);
+    if(impl.ipc.episode_graph_in_flight())
+        throw LifecycleError(
+            "step() is unavailable while an episode graph is in flight");
 
     if(!impl.tetMesh.joint_angle_controls.empty()
        || !impl.tetMesh.prismatic_drive_controls.empty())
@@ -32,20 +35,280 @@ void SimEngine::step()
     }
     impl.step_count++;
 
-    // [NaN-sentinel] always-on lightweight NaN watchdog (~1 atomic int +
-    // 4-byte D->H copy per step). Prints a one-time warning at first
-    // occurrence so users notice silent physics divergence.
-    check_nan_sentinel_(impl.tetMesh.vertexNum,
-                        impl.d_tetMesh.vertexes,
-                        impl.d_tetMesh.velocities);
+    const bool full_frame_graph =
+        (impl.ipc.get_frame_status().path_flags
+         & frame_fsm::PATH_FULL_CONDITIONAL_GRAPH)
+        != 0;
+    if(!full_frame_graph)
+    {
+        // [NaN-sentinel] always-on lightweight NaN watchdog (~1 atomic int +
+        // 4-byte D->H copy per step). The full graph performs the same finite
+        // validation before its sole terminal status packet, so repeating the
+        // sentinel there would violate the one-boundary contract.
+        check_nan_sentinel_(impl.tetMesh.vertexNum,
+                            impl.d_tetMesh.vertexes,
+                            impl.d_tetMesh.velocities);
 
-    // [NAN_DIAG] env-gated — only runs when NAN_DIAG=1.
-    dump_nan_diagnostics_(impl.tetMesh.tetrahedraNum,
-                          impl.tetMesh.vertexNum,
-                          impl.d_tetMesh.volum,
-                          impl.d_tetMesh.velocities,
-                          impl.d_tetMesh.vertexes,
-                          impl.tetMesh.point_id_to_body_id);
+        // [NAN_DIAG] env-gated — only runs when NAN_DIAG=1. Full-graph
+        // eligibility rejects that diagnostic mode.
+        dump_nan_diagnostics_(impl.tetMesh.tetrahedraNum,
+                              impl.tetMesh.vertexNum,
+                              impl.d_tetMesh.volum,
+                              impl.d_tetMesh.velocities,
+                              impl.d_tetMesh.vertexes,
+                              impl.tetMesh.point_id_to_body_id);
+    }
+}
+
+void SimEngine::launch_episode_async(
+    int frames,
+    const double* revolute_actions,
+    int revolute_joints,
+    const double* prismatic_actions,
+    int prismatic_joints)
+{
+    auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError(
+            "launch_episode_async() requires a finalized SimEngine");
+    if(impl.ipc.episode_graph_in_flight())
+        throw LifecycleError("an episode graph is already in flight");
+    if(frames <= 0)
+        throw std::invalid_argument("episode frames must be positive");
+    const int expected_revolute =
+        static_cast<int>(impl.tetMesh.joint_angle_controls.size());
+    const int expected_prismatic =
+        static_cast<int>(
+            impl.tetMesh.prismatic_drive_controls.size());
+    if(revolute_joints != expected_revolute
+       || prismatic_joints != expected_prismatic)
+        throw std::invalid_argument(
+            "episode action joint dimensions do not match the scene");
+    if((revolute_joints && !revolute_actions)
+       || (prismatic_joints && !prismatic_actions))
+        throw std::invalid_argument(
+            "non-empty episode actions require data");
+
+    const auto checked_elements = [frames](int joints)
+    {
+        if(joints < 0
+           || static_cast<size_t>(frames)
+                  > std::numeric_limits<size_t>::max()
+                        / static_cast<size_t>(
+                            std::max(1, joints))
+                        / 3u)
+            throw std::overflow_error(
+                "episode action shape is too large");
+        return static_cast<size_t>(frames)
+               * static_cast<size_t>(joints) * 3u;
+    };
+    const size_t revolute_values =
+        checked_elements(revolute_joints);
+    const size_t prismatic_values =
+        checked_elements(prismatic_joints);
+    impl.episode_revolute_actions.clear();
+    impl.episode_prismatic_actions.clear();
+    if(revolute_values)
+        impl.episode_revolute_actions.assign(
+            revolute_actions,
+            revolute_actions + revolute_values);
+    if(prismatic_values)
+        impl.episode_prismatic_actions.assign(
+            prismatic_actions,
+            prismatic_actions + prismatic_values);
+
+    std::vector<RevoluteDrivingControlPacked> revolute_packed(
+        static_cast<size_t>(frames)
+        * static_cast<size_t>(revolute_joints));
+    std::vector<PrismaticDrivingControlPacked> prismatic_packed(
+        static_cast<size_t>(frames)
+        * static_cast<size_t>(prismatic_joints));
+    for(size_t i = 0; i < revolute_packed.size(); ++i)
+    {
+        const double target   = revolute_actions[3 * i + 0];
+        const double strength = revolute_actions[3 * i + 1];
+        const double external = revolute_actions[3 * i + 2];
+        if(!std::isfinite(target) || !std::isfinite(strength)
+           || !std::isfinite(external))
+            throw std::invalid_argument(
+                "revolute episode actions must be finite");
+        revolute_packed[i] = RevoluteDrivingControlPacked{
+            static_cast<Float>(target),
+            static_cast<Float>(strength),
+            static_cast<Float>(external)};
+    }
+    for(size_t i = 0; i < prismatic_packed.size(); ++i)
+    {
+        const double target   = prismatic_actions[3 * i + 0];
+        const double strength = prismatic_actions[3 * i + 1];
+        const double external = prismatic_actions[3 * i + 2];
+        if(!std::isfinite(target) || !std::isfinite(strength)
+           || !std::isfinite(external))
+            throw std::invalid_argument(
+                "prismatic episode actions must be finite");
+        prismatic_packed[i] = PrismaticDrivingControlPacked{
+            static_cast<Float>(target),
+            static_cast<Float>(strength),
+            static_cast<Float>(external)};
+    }
+
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.prepare_episode_graph(
+        impl.d_tetMesh,
+        frames,
+        revolute_packed.empty() ? nullptr : revolute_packed.data(),
+        revolute_joints,
+        prismatic_packed.empty() ? nullptr : prismatic_packed.data(),
+        prismatic_joints);
+    impl.ipc.launch_episode_graph_async(
+        impl.d_tetMesh, impl.ipc.m_total_frames);
+    impl.episode_frames = frames;
+}
+
+bool SimEngine::episode_in_flight() const
+{
+    return m_impl->ipc.episode_graph_in_flight();
+}
+
+bool SimEngine::episode_observation_ready(int slot) const
+{
+    cudaSetDevice(m_impl->cfg.cuda_device);
+    return m_impl->ipc.episode_observation_ready(slot);
+}
+
+void SimEngine::wait_episode_observation(int slot) const
+{
+    cudaSetDevice(m_impl->cfg.cuda_device);
+    m_impl->ipc.wait_episode_observation(slot);
+}
+
+int SimEngine::get_episode_slot_first_frame(int slot) const
+{
+    return m_impl->ipc.episode_slot_first_frame(slot);
+}
+
+int SimEngine::get_episode_slot_frame_count(int slot) const
+{
+    cudaSetDevice(m_impl->cfg.cuda_device);
+    return m_impl->ipc.episode_slot_frame_count(slot);
+}
+
+int SimEngine::get_episode_attempted_frame_count() const
+{
+    return m_impl->ipc.episode_attempted_frame_count();
+}
+
+void SimEngine::get_episode_observation(
+    int slot,
+    double* positions,
+    double* velocities,
+    frame_fsm::FrameStatus* statuses,
+    int frame_capacity) const
+{
+    cudaSetDevice(m_impl->cfg.cuda_device);
+    const int frame_count =
+        m_impl->ipc.episode_slot_frame_count(slot);
+    const int vertex_count = m_impl->ipc.vertexNum;
+    if(frame_capacity < frame_count)
+        throw std::invalid_argument(
+            "episode observation capacity is too small");
+    if(frame_count > 0
+       && vertex_count > 0
+       && (!positions || !velocities))
+        throw std::invalid_argument(
+            "episode observation outputs must not be null");
+
+    const size_t elements =
+        static_cast<size_t>(frame_count)
+        * static_cast<size_t>(vertex_count);
+    std::vector<double3> raw_positions(elements);
+    std::vector<double3> raw_velocities(elements);
+    m_impl->ipc.copy_episode_observation_slot(
+        slot,
+        raw_positions.empty() ? nullptr : raw_positions.data(),
+        raw_velocities.empty() ? nullptr : raw_velocities.data(),
+        statuses,
+        frame_capacity);
+
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    const bool use_perm =
+        !perm.empty()
+        && static_cast<int>(perm.size()) >= vertex_count;
+    for(int frame = 0; frame < frame_count; ++frame)
+    {
+        const size_t base =
+            static_cast<size_t>(frame) * vertex_count;
+        for(int internal = 0; internal < vertex_count; ++internal)
+        {
+            int output = use_perm ? perm[internal] : internal;
+            if(output < 0 || output >= vertex_count)
+                output = internal;
+            const double3& p = raw_positions[base + internal];
+            const double3& v = raw_velocities[base + internal];
+            const size_t dst =
+                (base + static_cast<size_t>(output)) * 3u;
+            positions[dst + 0] = p.x;
+            positions[dst + 1] = p.y;
+            positions[dst + 2] = p.z;
+            velocities[dst + 0] = v.x;
+            velocities[dst + 1] = v.y;
+            velocities[dst + 2] = v.z;
+        }
+    }
+}
+
+int SimEngine::finish_episode()
+{
+    auto& impl = *m_impl;
+    if(!impl.ipc.episode_graph_in_flight())
+        throw LifecycleError("no episode graph is in flight");
+    cudaSetDevice(impl.cfg.cuda_device);
+    const int successful = impl.ipc.finish_episode_graph();
+    impl.step_count += successful;
+
+    if(successful > 0)
+    {
+        const int action_frame = successful - 1;
+        const int revolute_count =
+            static_cast<int>(
+                impl.tetMesh.joint_angle_controls.size());
+        for(int joint = 0; joint < revolute_count; ++joint)
+        {
+            const size_t offset =
+                (static_cast<size_t>(action_frame)
+                     * revolute_count
+                 + joint)
+                * 3u;
+            auto& control =
+                impl.tetMesh.joint_angle_controls[joint];
+            control.target_angle =
+                impl.episode_revolute_actions[offset + 0];
+            control.strength_ratio =
+                impl.episode_revolute_actions[offset + 1];
+            control.ext_torque =
+                impl.episode_revolute_actions[offset + 2];
+        }
+        const int prismatic_count =
+            static_cast<int>(
+                impl.tetMesh.prismatic_drive_controls.size());
+        for(int joint = 0; joint < prismatic_count; ++joint)
+        {
+            const size_t offset =
+                (static_cast<size_t>(action_frame)
+                     * prismatic_count
+                 + joint)
+                * 3u;
+            auto& control =
+                impl.tetMesh.prismatic_drive_controls[joint];
+            control.target_distance =
+                impl.episode_prismatic_actions[offset + 0];
+            control.strength_ratio =
+                impl.episode_prismatic_actions[offset + 1];
+            control.ext_force =
+                impl.episode_prismatic_actions[offset + 2];
+        }
+    }
+    return successful;
 }
 
 // ======================== state queries ========================

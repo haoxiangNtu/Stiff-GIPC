@@ -52,8 +52,11 @@ bool GlobalLinearSystem::build_linear_system()
     m_x.resize(total_rhs_count);
     // PCG's initial guess must start finite; ::resize() leaves new elements
     // uninitialized and the IterativeSolver reads x on the very first spmv.
-    CUDA_SAFE_CALL(cudaMemset(m_x.view().data(), 0,
-                              total_rhs_count * sizeof(Float)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_x.view().data(),
+        0,
+        total_rhs_count * sizeof(Float),
+        cudaStreamPerThread));
 
     // [P0-mem pre-grow → towel-strict root fix] grow the triplet storage before
     // the solve. The original [P0-mem] version used ensure_capacity_discard here
