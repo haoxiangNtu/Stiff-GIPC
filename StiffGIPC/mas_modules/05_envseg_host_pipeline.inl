@@ -1,3 +1,4 @@
+#include "linear_system/utils/pcg_capacity_mode.h"  // [B2'-b]
 __global__ void _mas_env_base(const unsigned int* prefixSum, const unsigned int* prefix,
                               int wpe, int n_env, int* envBase, int* envStart, int* padTot)
 {
@@ -846,7 +847,8 @@ void MASPreconditioner::BuildMultiLevelR(const double3* R)
 void MASPreconditioner::SchwarzLocalXSym()
 {
     //int matNum    = totalNumberClusters / BANKSIZE;
-    int number    = totalNumberClusters * BANKSIZE * 3;
+    int number    = (pcg_grid_capacity_mode() ? m_outputClusterCap : totalNumberClusters)
+                    * BANKSIZE * 3;   // [B2'-b] capacity grid under cached capture
     if(number < 1)
         return;
     int blockSize = BANKSIZE * BANKSIZE;
@@ -860,7 +862,8 @@ void MASPreconditioner::SchwarzLocalXSym()
 void MASPreconditioner::SchwarzLocalXSym_block3()
 {
     //int matNum    = totalNumberClusters / BANKSIZE;
-    int number = totalNumberClusters * BANKSIZE;
+    int number = (pcg_grid_capacity_mode() ? m_outputClusterCap : totalNumberClusters)
+                 * BANKSIZE;   // [B2'-b] capacity grid under cached capture
     if(number < 1)
         return;
     int blockSize = BANKSIZE * BANKSIZE;
@@ -873,7 +876,8 @@ void MASPreconditioner::SchwarzLocalXSym_block3()
 
 void MASPreconditioner::SchwarzLocalXSym_sym()
 {
-    int matNum    = totalNumberClusters / BANKSIZE;
+    int matNum    = (pcg_grid_capacity_mode() ? m_outputClusterCap : totalNumberClusters)
+                    / BANKSIZE;   // [B2'-b] capacity grid under cached capture
     int number = matNum * (1 + BANKSIZE) * BANKSIZE / 2;
     if(number < 1)
         return;
@@ -1312,6 +1316,7 @@ void MASPreconditioner::ensureOutputClusterCapacity(int need)
 {
     if(need <= m_outputClusterCap)
         return;
+    ++pcg_buffer_generation();   // [B2'-b] apply-path pointers move: cached PCG graph is stale
     int newCap = need + need / 16 + BANKSIZE;             // ~6% headroom
     newCap     = ((newCap + BANKSIZE - 1) / BANKSIZE) * BANKSIZE;
     printf("[MAS][grow] output cluster buffers: %d -> %d (frame cluster count %d "

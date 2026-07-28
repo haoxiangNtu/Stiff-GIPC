@@ -66,6 +66,8 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_NO_REFINE, "perf") \
     X(STIFF_PCG_CHECK_K, "diag") \
     X(STIFF_PCG_DEVICE_LOOP, "perf") \
+    X(STIFF_PCG_GRAPH_CACHE, "perf") \
+    X(STIFF_PCG_CACHE_VERIFY, "diag") \
     X(STIFF_PCG_EW, "solver") \
     X(STIFF_PCG_EW_ETAMAX, "solver") \
     X(STIFF_PCG_EW_GAMMA, "solver") \

@@ -2,6 +2,8 @@
 #include <linear_system/linear_system/global_linear_system.h>   // [P3] system_ptr()->m_s4_*
 #include <linear_system/utils/binned_reduce.cuh>                // [P3] exact per-env dot
 #include "multienv/mode_config.h"
+#include <linear_system/utils/pcg_capacity_mode.h>   // [B2'-b]
+#include <cstring>
 #include <gipc/utils/timer.h>
 #include <gipc/statistics.h>
 #include <cuda_tools/cuda_tools.h>
@@ -709,8 +711,38 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         cudaGraph_t     dg  = nullptr;
         bool            ready = false;
         bool            rebuilt = false;
+        cudaError_t     capture_status = cudaSuccess;
 
-        cudaError_t capture_status = cudaStreamBeginCapture(
+        // [B2'-b] cross-solve graph cache: with device-count kernels (spmv
+        // d_live, Schwarz d_lvl) and capacity-sized grids/memsets recorded at
+        // capture time, the exec only goes stale when a baked pointer moves
+        // (buffer generation) or the problem shape/tolerance changes. On a
+        // signature match, skip the per-solve re-record entirely.
+        // STIFF_PCG_GRAPH_CACHE=1 arms it; STIFF_PCG_CACHE_VERIFY=1 forces the
+        // re-record each solve so the existing exec-update path continuously
+        // proves the cached topology is still exactly reproduced.
+        static int s_cache_env = -1;
+        if(s_cache_env < 0)
+        { const char* e = getenv("STIFF_PCG_GRAPH_CACHE"); s_cache_env = e ? atoi(e) : 0; }
+        static int s_cache_verify = -1;
+        if(s_cache_verify < 0)
+            s_cache_verify = getenv("STIFF_PCG_CACHE_VERIFY") ? 1 : 0;
+        long long tol_bits = 0;
+        memcpy(&tol_bits, &pcg_tol, sizeof(tol_bits));
+        const long long sig[4] = {pcg_buffer_generation(),
+                                  (long long)z.size(),
+                                  (long long)K,
+                                  tol_bits};
+        const bool cache_hit =
+            s_cache_env && !s_cache_verify && m_device_loop_exec
+            && m_cache_sig_valid && sig[0] == m_cache_sig[0]
+            && sig[1] == m_cache_sig[1] && sig[2] == m_cache_sig[2]
+            && sig[3] == m_cache_sig[3];
+        if(!cache_hit)
+        {
+        if(s_cache_env)
+            pcg_grid_capacity_mode() = 1;
+        capture_status = cudaStreamBeginCapture(
             cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
         if(capture_status == cudaSuccess)
         {
@@ -753,14 +785,33 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
             // A failed BeginCapture does not put the stream into capture mode.
             cudaGetLastError();
         }
+        if(s_cache_env)
+            pcg_grid_capacity_mode() = 0;
+        if(ready && s_cache_env)
+        {
+            m_cache_sig[0] = sig[0]; m_cache_sig[1] = sig[1];
+            m_cache_sig[2] = sig[2]; m_cache_sig[3] = sig[3];
+            m_cache_sig_valid = true;
+        }
+        }
+        else
+        {
+            ready = true;   // [B2'-b] cache hit: cached exec launches as-is
+            static bool oncec = false;
+            if(!oncec)
+            { oncec = true; printf("[pcg-graph-cache] HIT - per-solve re-record skipped\n"); }
+        }
 
         if(ready)
         {
             // Device-graph updates must be uploaded again before device launch.
             // Upload is stream ordered, so no host synchronization is introduced.
             CUDA_SAFE_CALL(cudaGraphUpload(m_device_loop_exec, cudaStreamPerThread));
-            CUDA_SAFE_CALL(cudaGraphDestroy(dg));
-            dg = nullptr;
+            if(dg)
+            {
+                CUDA_SAFE_CALL(cudaGraphDestroy(dg));
+                dg = nullptr;
+            }
             pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
             CUDA_SAFE_CALL(cudaGraphLaunch(m_device_loop_exec, cudaStreamPerThread));
 

@@ -18,6 +18,7 @@
 
 
 #include "device_common/mirrors.h"  // [B1] HostMirror
+#include "linear_system/utils/pcg_capacity_mode.h"  // [B2'-b]
 
 class GIPCTripletMatrix
 {
@@ -78,6 +79,7 @@ class GIPCTripletMatrix
         size_t margin     = need * 3 / 10;
         if(margin > margin_cap) margin = margin_cap;
         size_t cap = need + margin;
+        ++pcg_buffer_generation();   // [B2'-b] pointers move: cached PCG graph is stale
         m_block_values.reserve_discard(cap);
         m_block_row_indices.reserve_discard(cap);
         m_block_col_indices.reserve_discard(cap);
@@ -119,6 +121,7 @@ class GIPCTripletMatrix
         size_t margin     = need * 3 / 10;
         if(margin > margin_cap) margin = margin_cap;
         size_t cap = need + margin;
+        ++pcg_buffer_generation();   // [B2'-b] pointers move: cached PCG graph is stale
         resize_triplets(live_count);   // publish the live size: reserve()'s copy covers [0:live)
         reserve_triplets(cap);
     }
