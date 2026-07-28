@@ -117,7 +117,8 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
                                                 double         slackness,
                                                 int            number,
                                                 int*           ccd_alpha_invalid,
-                                                int            invalid_bit)
+                                                int            invalid_bit,
+                                                const uint32_t* d_live)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -127,7 +128,16 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
     double temp         = 1.0;
     double CCDDistRatio = 1.0 - slackness;
 
-    if(idx < number)
+    // [B3 ccd-defer] capacity grid: mask by the live device count (raw atomic
+    // total can exceed capacity when emits hit the trash slot). OOB threads
+    // keep the min identity 1.0, so the reduction is bitwise the exact-grid one.
+    int live = number;
+    if(d_live)
+    {
+        const unsigned raw = *d_live;
+        live = raw < (unsigned)number ? (int)raw : number;
+    }
+    if(idx < live)
     {
         int4 MMCVIDI = _ccd_collitionPairs[idx];
         if(MMCVIDI.x < 0)
@@ -167,7 +177,14 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
     }
 
     // [v0.8.6 2a] unified tail — see device_common/reductions.cuh
-    gipc_block_min_full_to(temp, tep, number, idof, 1.0, minStepSizes + blockIdx.x);
+    // Under a capacity grid every block participates fully (identity-padded);
+    // the tail's last-block arithmetic must then see the full grid extent.
+    gipc_block_min_full_to(temp,
+                           tep,
+                           d_live ? (int)(gridDim.x * blockDim.x) : number,
+                           idof,
+                           1.0,
+                           minStepSizes + blockIdx.x);
 }
 
 __global__ void _reduct_max_cfl_to_double(const double3* moveDir,

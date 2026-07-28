@@ -79,6 +79,7 @@ class GIPC
     // device counter piggybacked on the line-search decision read, and the
     // rare trip re-runs buildCP in legacy mode (full grow+redo machinery).
     bool      m_ls_defer_counts       = false;
+    bool      m_ccd_defer_counts      = false;
     int       m_energy_bound_cp       = 0;
     int       m_energy_bound_gp       = 0;
     unsigned  m_pair_overflow_seen    = 0u;
@@ -650,7 +651,8 @@ class GIPC
     void   self_full_largestFeasibleStepSize_DeviceOut(double slackness,
                                                        double* mqueue,
                                                        int numbers,
-                                                       double* out_slot);
+                                                       double* out_slot,
+                                                       const uint32_t* d_live = nullptr);
     void   cfl_largestSpeed_DeviceOut(double* mqueue, double* out_slot);
 
     double self_largestFeasibleStepSize(double slackness, double* mqueue, int numbers);
