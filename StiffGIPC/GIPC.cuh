@@ -79,6 +79,7 @@ class GIPC
     // device counter piggybacked on the line-search decision read, and the
     // rare trip re-runs buildCP in legacy mode (full grow+redo machinery).
     bool      m_ls_defer_counts       = false;
+    uint32_t* m_scr_gp_friction       = nullptr;  // [B3 s7] friction-era gp count, device-stashed
     bool      m_ccd_defer_counts      = false;
     int       m_energy_bound_cp       = 0;
     int       m_energy_bound_gp       = 0;
