@@ -317,3 +317,31 @@ pcg_buffer_generation 签名；`STIFF_LS_GRAPH`（默认 0）+DIAG 行。
 PASS/0 耗尽/drift 1.94e-3（健康区间）、foldshirt merged N=4 图激活 PASS；
 指纹=逐 trial 12B 决策读消失（余：首评 1 读+出环 24B 打包+设计内出口刷新）。
 副产物：thrust→cub 排序（a606c79）、摩擦计数镜像化根治一处真实潜伏竞态。
+
+---
+
+# C-2 ②/Phase D 战报 + 统一验证战役（2026-07-28）
+
+**C-2 ②**（7bc910a）：GH 起点快照扩 12-int {contact_total, fricgd_start,
+ground_start, rsv, cd4..2, f4..2}；soft/barrier 融合装配（活类型计数——其核
+自身向 _cpNum 再发射，消费者必须用快照）/摩擦 cp（6 值参→双紧凑指针视图）/
+摩擦 gd/ground（设备段基址）全链尾参；`_c2_offset_dev()` 宏上移 GIPC.cuh
+（12 在 13 前含入）。converter 容量化（pad-sentinel 键语义）列入 ③ 蓝图。
+
+**Phase D 原语**（eaa6e39）：`fetch_obs_async(slot)` 顶点缓冲 D2H 进钉页双缓
+冲（专用非阻塞流，PTDS 事件栅栏定序——宿主永不同步仿真流）；
+`obs_ready/obs_wait/get_obs`（零拷贝 numpy 视图）；`upload_episode_actions`
+整段一次 H2D 返回设备指针（gpu-direct 行消费）；`engine.episode_loop` =
+标准零停顿环（第 i 帧观测回读与第 i+1 帧计算重叠）。
+
+**统一验证战役**（实现先行后的批量收口）：
+- 15 段门禁绿，锚 0544461bd82123ae 逐位；
+- towel 三 knob 齐开（LS_GRAPH+C2_OFFSET_DEV+PCG_GRAPH_CACHE）：PASS、
+  offset 对账 0 分歧、0 耗尽、drift 1.942e-3（健康带）；
+- foldshirt LS+CACHE：PASS、0 耗尽；
+- episode API 冒烟（examples/episode_obs_smoke.py）：10 帧零拷贝观测、
+  动作预上传、布料坠落物理正常。
+
+**至 Phase C-3 全图的剩余蓝图**（前置全部就绪）：converter pad-sentinel 容量
+化 → ext 段设备递延 → Newton WHILE 尾launch（图内设备重算 offset 快照替换
+镜像下发）→ 帧图。A800 部署实测裁决四 knob 默认值。
