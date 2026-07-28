@@ -454,6 +454,31 @@ class SimEngine
     // return the number of successfully committed frames.
     int finish_episode();
 
+    // ---- GPU-native RL device ABI ----
+    //
+    // prepare_gpu_rl() is a setup boundary and may allocate, capture, upload,
+    // and synchronize. After it returns, an external CUDA policy writes the
+    // packed float64 action buffers directly, then calls
+    // launch_gpu_rl_async() on the same CUDA stream. The steady-state launch
+    // contains no H2D/D2H graph nodes and performs no host synchronization.
+    // Device outputs use engine-internal vertex order.
+    void prepare_gpu_rl();
+    void launch_gpu_rl_async(uintptr_t cuda_stream = 0);
+    bool gpu_rl_prepared() const;
+    bool gpu_rl_ready() const;
+    void synchronize_gpu_rl() const;  // Explicit debug/teardown boundary.
+    void end_gpu_rl();                 // Synchronizes before releasing buffers.
+    uintptr_t get_gpu_rl_revolute_actions_device_ptr() const;
+    uintptr_t get_gpu_rl_prismatic_actions_device_ptr() const;
+    uintptr_t get_gpu_rl_positions_device_ptr() const;
+    uintptr_t get_gpu_rl_velocities_device_ptr() const;
+    uintptr_t get_gpu_rl_statuses_device_ptr() const;
+    uintptr_t get_gpu_rl_frame_counter_device_ptr() const;
+    int get_gpu_rl_graph_node_count() const;
+    int get_gpu_rl_graph_h2d_count() const;
+    int get_gpu_rl_graph_d2h_count() const;
+    int get_gpu_rl_status_size_bytes() const;
+
     /// Result, work counters and capacity high-water marks for the latest
     /// frame.  In whole-frame graph mode this is the single terminal D2H
     /// packet; the legacy path publishes the same ABI for uniform tooling.
@@ -462,6 +487,7 @@ class SimEngine
     // ---- State queries ----
     int      get_vertex_count() const;
     uintptr_t get_vertices_device_ptr() const;  // [gpu-direct] double3* device ptr to vertex buffer
+    uintptr_t get_vertex_velocities_device_ptr() const;
     int      get_surface_face_count() const;
     int      get_surface_vertex_count() const;
 

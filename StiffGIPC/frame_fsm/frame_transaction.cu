@@ -161,10 +161,13 @@ struct EpisodeGraphContext
 {
     cudaGraphExec_t exec = nullptr;
     cudaEvent_t slot_event[2] = {nullptr, nullptr};
+    cudaEvent_t completion_event = nullptr;
+    cudaStream_t launch_stream = nullptr;
 
     EpisodeRuntimeInput*  d_input   = nullptr;
     EpisodeDeviceControl* d_control = nullptr;
     int*                  d_ready_one = nullptr;
+    int64_t*              d_frame_counter = nullptr;
 
     EpisodeRuntimeInput* h_input = nullptr;
     int* h_ready            = nullptr;
@@ -187,11 +190,13 @@ struct EpisodeGraphContext
     int prismatic_count = 0;
     size_t vertex_count = 0;
     int graph_nodes     = 0;
+    int graph_h2d       = 0;
     int graph_d2h       = 0;
     size_t action_bytes = 0;
     size_t prismatic_action_offset = 0;
     long long generation = -1;
     bool in_flight       = false;
+    bool device_native   = false;
 
     HostAttemptSnapshot host_snapshot;
 };
@@ -311,6 +316,7 @@ void device_free(T*& pointer)
 struct GraphAudit
 {
     int node_count = 0;
+    int h2d_count  = 0;
     int d2h_count  = 0;
     int host_count = 0;
 };
@@ -350,7 +356,9 @@ void accumulate_graph_audit(
         {
             cudaMemcpy3DParms params{};
             CUDA_SAFE_CALL(cudaGraphMemcpyNodeGetParams(node, &params));
-            if(params.kind == cudaMemcpyDeviceToHost)
+            if(params.kind == cudaMemcpyHostToDevice)
+                ++audit.h2d_count;
+            else if(params.kind == cudaMemcpyDeviceToHost)
                 ++audit.d2h_count;
             continue;
         }
@@ -619,7 +627,8 @@ __global__ void episode_initialize(EpisodeDeviceControl* control)
 __global__ void episode_frame_begin(
     frame_fsm::FrameDeviceState* state,
     const EpisodeDeviceControl* control,
-    const EpisodeRuntimeInput* input)
+    const EpisodeRuntimeInput* input,
+    const int64_t* frame_counter)
 {
     if(blockIdx.x || threadIdx.x)
         return;
@@ -633,9 +642,20 @@ __global__ void episode_frame_begin(
     state->alpha           = 1.0;
     state->cfl_alpha       = 1.0;
     state->frame_id =
-        input->base_frame_id + control->frame_index;
+        (input->path_flags & frame_fsm::PATH_GPU_NATIVE_RL)
+            ? *frame_counter + control->frame_index
+            : input->base_frame_id + control->frame_index;
     state->path_flags = input->path_flags;
     state->kappa      = input->kappa;
+}
+
+__global__ void episode_advance_frame_counter(
+    const EpisodeDeviceControl* control,
+    int64_t* frame_counter)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    *frame_counter += control->attempted_frames;
 }
 
 __global__ void episode_store_frame(
@@ -812,6 +832,8 @@ void destroy_episode_context(EpisodeGraphContext* context)
         return;
     if(context->exec)
         cudaGraphExecDestroy(context->exec);
+    if(context->completion_event)
+        cudaEventDestroy(context->completion_event);
     for(cudaEvent_t& event : context->slot_event)
     {
         if(event)
@@ -821,6 +843,7 @@ void destroy_episode_context(EpisodeGraphContext* context)
     device_free(context->d_input);
     device_free(context->d_control);
     device_free(context->d_ready_one);
+    device_free(context->d_frame_counter);
     device_free(context->d_actions);
     device_free(context->d_positions);
     device_free(context->d_velocities);
@@ -1391,12 +1414,13 @@ void capture_episode_graph(GIPC& ipc,
             nullptr,
             0,
             cudaStreamCaptureModeThreadLocal));
-        CUDA_SAFE_CALL(cudaMemcpyAsync(
-            episode.d_input,
-            episode.h_input,
-            sizeof(EpisodeRuntimeInput),
-            cudaMemcpyHostToDevice,
-            cudaStreamPerThread));
+        if(!episode.device_native)
+            CUDA_SAFE_CALL(cudaMemcpyAsync(
+                episode.d_input,
+                episode.h_input,
+                sizeof(EpisodeRuntimeInput),
+                cudaMemcpyHostToDevice,
+                cudaStreamPerThread));
         const size_t observation_elements =
             checked_product(
                 static_cast<size_t>(episode.frame_count),
@@ -1438,7 +1462,8 @@ void capture_episode_graph(GIPC& ipc,
                         1, 1, 0, cudaStreamPerThread>>>(
                         frame.d_state,
                         episode.d_control,
-                        episode.d_input);
+                        episode.d_input,
+                        episode.d_frame_counter);
 
                     const size_t vertex_bytes =
                         frame.vertex_count * sizeof(double3);
@@ -1618,7 +1643,8 @@ void capture_episode_graph(GIPC& ipc,
                     enqueue_iteration(
                         first_half, episode.split_frame);
                 });
-            enqueue_episode_slot_copy(episode, 0);
+            if(!episode.device_native)
+                enqueue_episode_slot_copy(episode, 0);
 
             // Recording the solver body advances capture-time host mirrors
             // (PCG counters, kappa, assembly offsets, and animation rate).
@@ -1649,7 +1675,13 @@ void capture_episode_graph(GIPC& ipc,
                                 episode.frame_count);
                         });
                 });
-            enqueue_episode_slot_copy(episode, 1);
+            if(!episode.device_native)
+                enqueue_episode_slot_copy(episode, 1);
+            else
+                episode_advance_frame_counter<<<
+                    1, 1, 0, cudaStreamPerThread>>>(
+                    episode.d_control,
+                    episode.d_frame_counter);
             conditional_bodies = recorder.conditional_bodies();
             conditional_nodes  = recorder.conditional_nodes();
         }
@@ -1669,8 +1701,24 @@ void capture_episode_graph(GIPC& ipc,
             accumulate_graph_audit(
                 body, audit, &conditional_nodes);
         episode.graph_nodes = audit.node_count;
+        episode.graph_h2d   = audit.h2d_count;
         episode.graph_d2h   = audit.d2h_count;
-        if(audit.host_count != 0 || audit.d2h_count < 4)
+        if(episode.device_native
+           && (audit.host_count != 0
+               || audit.h2d_count != 0
+               || audit.d2h_count != 0))
+        {
+            std::ostringstream message;
+            message
+                << "GPU-native RL graph audit requires zero host nodes "
+                   "and zero host/device transfers; got h2d="
+                << audit.h2d_count
+                << " d2h=" << audit.d2h_count
+                << " host=" << audit.host_count;
+            throw std::runtime_error(message.str());
+        }
+        if(!episode.device_native
+           && (audit.host_count != 0 || audit.d2h_count < 4))
         {
             std::ostringstream message;
             message
@@ -1844,8 +1892,13 @@ void GIPC::destroy_episode_graph()
         return;
     if(context->in_flight)
     {
-        const cudaError_t result =
-            cudaStreamSynchronize(cudaStreamPerThread);
+        // GPU-native consumers may enqueue observation/reward/policy kernels
+        // after the graph's completion event on the bound stream. Teardown is
+        // an explicit host boundary, so drain the entire stream before freeing
+        // any exported device buffer.
+        const cudaError_t result = context->device_native
+            ? cudaStreamSynchronize(context->launch_stream)
+            : cudaStreamSynchronize(cudaStreamPerThread);
         if(result != cudaSuccess)
             cudaGetLastError();
         disarm_full_graph_attempt(*this);
@@ -1861,7 +1914,8 @@ void GIPC::prepare_episode_graph(
     const gipc::RevoluteDrivingControlPacked* revolute_actions,
     int revolute_count,
     const gipc::PrismaticDrivingControlPacked* prismatic_actions,
-    int prismatic_count)
+    int prismatic_count,
+    bool device_native)
 {
     if(frame_count <= 0)
         throw std::invalid_argument(
@@ -1907,14 +1961,15 @@ void GIPC::prepare_episode_graph(
             << revolute_count << " and " << prismatic_count;
         throw std::invalid_argument(message.str());
     }
-    if((revolute_count && !revolute_actions)
-       || (prismatic_count && !prismatic_actions))
+    if(!device_native
+       && ((revolute_count && !revolute_actions)
+           || (prismatic_count && !prismatic_actions)))
         throw std::invalid_argument(
             "[episode-graph] non-empty controls require action data");
 
     auto upload_actions = [&](EpisodeGraphContext& context)
     {
-        if(context.action_bytes == 0)
+        if(context.device_native || context.action_bytes == 0)
             return;
         std::vector<unsigned char> staging(context.action_bytes);
         if(context.prismatic_action_offset)
@@ -1950,13 +2005,7 @@ void GIPC::prepare_episode_graph(
             && existing->vertex_count == frame.vertex_count
             && existing->revolute_count == revolute_count
             && existing->prismatic_count == prismatic_count
-            // ABD's intermediate converter launch bounds are trained at the
-            // episode boundary. They remain stable inside one device loop,
-            // but reusing the executable after committed q/layout state has
-            // advanced can replay stale contraction offsets. Re-record ABD
-            // episodes at their legal host boundary; pure FEM executables are
-            // state-independent and remain reusable.
-            && frame.abd_count == 0
+            && existing->device_native == device_native
             && existing->generation == pcg_buffer_generation();
         if(compatible)
         {
@@ -1976,6 +2025,7 @@ void GIPC::prepare_episode_graph(
         context->revolute_count  = revolute_count;
         context->prismatic_count = prismatic_count;
         context->vertex_count    = frame.vertex_count;
+        context->device_native   = device_native;
 
         const size_t observations = checked_product(
             static_cast<size_t>(frame_count),
@@ -2005,12 +2055,20 @@ void GIPC::prepare_episode_graph(
         static_assert(
             alignof(gipc::RevoluteDrivingControlPacked)
             == alignof(gipc::PrismaticDrivingControlPacked));
+        static_assert(
+            sizeof(gipc::RevoluteDrivingControlPacked)
+                == 3 * sizeof(gipc::Float)
+            && sizeof(gipc::PrismaticDrivingControlPacked)
+                   == 3 * sizeof(gipc::Float),
+            "GPU-native RL actions require three tightly packed scalars");
         context->prismatic_action_offset = revolute_bytes;
         context->action_bytes =
             revolute_bytes + prismatic_bytes;
         device_alloc(context->d_input, 1);
         device_alloc(context->d_control, 1);
-        device_alloc(context->d_ready_one, 1);
+        device_alloc(context->d_frame_counter, 1);
+        if(!device_native)
+            device_alloc(context->d_ready_one, 1);
         device_alloc(
             context->d_actions, context->action_bytes);
         if(context->d_actions)
@@ -2024,6 +2082,8 @@ void GIPC::prepare_episode_graph(
                     gipc::PrismaticDrivingControlPacked*>(
                     context->d_actions
                     + context->prismatic_action_offset);
+            CUDA_SAFE_CALL(cudaMemset(
+                context->d_actions, 0, context->action_bytes));
         }
         device_alloc(context->d_positions, observations);
         device_alloc(context->d_velocities, observations);
@@ -2031,49 +2091,69 @@ void GIPC::prepare_episode_graph(
             context->d_statuses,
             static_cast<size_t>(frame_count));
 
-        pinned_alloc(context->h_input, 1);
-        pinned_alloc(context->h_ready, 2);
-        pinned_alloc(context->h_slot_attempted, 2);
-        std::memset(context->h_ready, 0, 2 * sizeof(int));
-        std::memset(
-            context->h_slot_attempted, 0, 2 * sizeof(int));
-        for(int slot = 0; slot < 2; ++slot)
+        if(device_native)
         {
-            const int count =
-                slot == 0
-                    ? context->split_frame
-                    : frame_count - context->split_frame;
-            const size_t elements = checked_product(
-                static_cast<size_t>(count),
-                context->vertex_count,
-                "pinned observation slot");
-            pinned_alloc(context->h_positions[slot], elements);
-            pinned_alloc(context->h_velocities[slot], elements);
-            pinned_alloc(
-                context->h_statuses[slot],
-                static_cast<size_t>(count));
             CUDA_SAFE_CALL(cudaEventCreateWithFlags(
-                &context->slot_event[slot],
+                &context->completion_event,
                 cudaEventDisableTiming));
         }
-        const int one = 1;
-        CUDA_SAFE_CALL(cudaMemcpy(
-            context->d_ready_one,
-            &one,
-            sizeof(one),
-            cudaMemcpyHostToDevice));
+        else
+        {
+            pinned_alloc(context->h_input, 1);
+            pinned_alloc(context->h_ready, 2);
+            pinned_alloc(context->h_slot_attempted, 2);
+            std::memset(context->h_ready, 0, 2 * sizeof(int));
+            std::memset(
+                context->h_slot_attempted, 0, 2 * sizeof(int));
+            for(int slot = 0; slot < 2; ++slot)
+            {
+                const int count =
+                    slot == 0
+                        ? context->split_frame
+                        : frame_count - context->split_frame;
+                const size_t elements = checked_product(
+                    static_cast<size_t>(count),
+                    context->vertex_count,
+                    "pinned observation slot");
+                pinned_alloc(context->h_positions[slot], elements);
+                pinned_alloc(context->h_velocities[slot], elements);
+                pinned_alloc(
+                    context->h_statuses[slot],
+                    static_cast<size_t>(count));
+                CUDA_SAFE_CALL(cudaEventCreateWithFlags(
+                    &context->slot_event[slot],
+                    cudaEventDisableTiming));
+            }
+            const int one = 1;
+            CUDA_SAFE_CALL(cudaMemcpy(
+                context->d_ready_one,
+                &one,
+                sizeof(one),
+                cudaMemcpyHostToDevice));
+        }
+        CUDA_SAFE_CALL(cudaMemset(
+            context->d_frame_counter, 0, sizeof(int64_t)));
         upload_actions(*context);
 
-        *context->h_input = EpisodeRuntimeInput{};
-        context->h_input->frame_count = frame_count;
-        context->h_input->path_flags =
+        EpisodeRuntimeInput initial_input{};
+        initial_input.frame_count = frame_count;
+        initial_input.path_flags =
             frame_fsm::PATH_GRAPH_REQUESTED
             | frame_fsm::PATH_GRAPH_ACTIVE
             | frame_fsm::PATH_FULL_CONDITIONAL_GRAPH
             | frame_fsm::PATH_PCG_DEVICE_CONTINUATION
             | frame_fsm::PATH_LS_DEVICE_LOOP
-            | frame_fsm::PATH_EPISODE_RESIDENT;
-        context->h_input->kappa = Kappa;
+            | frame_fsm::PATH_EPISODE_RESIDENT
+            | (device_native ? frame_fsm::PATH_GPU_NATIVE_RL : 0u);
+        initial_input.kappa = Kappa;
+        if(device_native)
+            CUDA_SAFE_CALL(cudaMemcpy(
+                context->d_input,
+                &initial_input,
+                sizeof(initial_input),
+                cudaMemcpyHostToDevice));
+        else
+            *context->h_input = initial_input;
 
         snapshot_host_attempt(*this, context->host_snapshot);
         animation_fullRate = animation_subRate;
@@ -2083,6 +2163,18 @@ void GIPC::prepare_episode_graph(
             capture_episode_graph(*this, mesh, frame, *context);
             restore_host_attempt(*this, context->host_snapshot);
             disarm_full_graph_attempt(*this);
+            if(device_native)
+            {
+                initial_input.graph_nodes = context->graph_nodes;
+                initial_input.graph_d2h   = context->graph_d2h;
+                CUDA_SAFE_CALL(cudaMemcpy(
+                    context->d_input,
+                    &initial_input,
+                    sizeof(initial_input),
+                    cudaMemcpyHostToDevice));
+                CUDA_SAFE_CALL(
+                    cudaStreamSynchronize(cudaStreamPerThread));
+            }
         }
         catch(...)
         {
@@ -2103,6 +2195,10 @@ void GIPC::launch_episode_graph_async(device_TetraData&,
                                       int64_t base_frame_id)
 {
     EpisodeGraphContext& context = episode_context(*this);
+    if(context.device_native)
+        throw std::logic_error(
+            "[episode-graph] use launch_gpu_rl_graph_async() for a "
+            "GPU-native RL graph");
     if(context.in_flight)
         throw std::logic_error(
             "[episode-graph] an episode is already in flight");
@@ -2147,6 +2243,187 @@ void GIPC::launch_episode_graph_async(device_TetraData&,
     m_frame_terminal_emitted = true;
 }
 
+void GIPC::launch_gpu_rl_graph_async(uintptr_t cuda_stream)
+{
+    EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] prepare a GPU-native RL graph before launch");
+    if(context.frame_count != 1)
+        throw std::logic_error(
+            "[gpu-rl] closed-loop execution requires a one-frame graph");
+    if(!context.exec
+       || context.generation != pcg_buffer_generation())
+        throw std::runtime_error(
+            "[gpu-rl] graph buffers changed; prepare the graph again");
+
+    cudaStream_t stream = cuda_stream
+        ? reinterpret_cast<cudaStream_t>(cuda_stream)
+        : cudaStreamPerThread;
+    if(context.in_flight && context.launch_stream != stream)
+        throw std::logic_error(
+            "[gpu-rl] repeated launches must use the same CUDA stream; "
+            "end_gpu_rl() before changing streams");
+
+    const bool first_launch = !context.in_flight;
+    if(first_launch)
+    {
+        FrameGraphContext& frame = graph_context(*this);
+        snapshot_host_attempt(*this, context.host_snapshot);
+        animation_fullRate = animation_subRate;
+        arm_full_graph_attempt(*this, frame);
+        context.launch_stream = stream;
+    }
+
+    const cudaError_t launch = cudaGraphLaunch(context.exec, stream);
+    if(launch != cudaSuccess)
+    {
+        cudaGetLastError();
+        if(first_launch)
+        {
+            restore_host_attempt(*this, context.host_snapshot);
+            disarm_full_graph_attempt(*this);
+            context.launch_stream = nullptr;
+        }
+        throw std::runtime_error(
+            std::string("[gpu-rl] graph launch failed: ")
+            + cudaGetErrorString(launch));
+    }
+    const cudaError_t record =
+        cudaEventRecord(context.completion_event, stream);
+    if(record != cudaSuccess)
+    {
+        cudaGetLastError();
+        cudaStreamSynchronize(stream);
+        restore_host_attempt(*this, context.host_snapshot);
+        disarm_full_graph_attempt(*this);
+        context.launch_stream = nullptr;
+        context.in_flight = false;
+        throw std::runtime_error(
+            std::string("[gpu-rl] completion event record failed: ")
+            + cudaGetErrorString(record));
+    }
+    context.in_flight = true;
+    m_frame_terminal_emitted = true;
+}
+
+bool GIPC::gpu_rl_graph_prepared() const
+{
+    const auto* context =
+        static_cast<const EpisodeGraphContext*>(
+            m_episode_graph_context);
+    return context && context->device_native && context->exec;
+}
+
+bool GIPC::gpu_rl_graph_ready() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    if(!context.in_flight)
+        return false;
+    const cudaError_t query =
+        cudaEventQuery(context.completion_event);
+    if(query == cudaSuccess)
+        return true;
+    if(query == cudaErrorNotReady)
+        return false;
+    cudaGetLastError();
+    throw std::runtime_error(
+        std::string("[gpu-rl] completion query failed: ")
+        + cudaGetErrorString(query));
+}
+
+void GIPC::synchronize_gpu_rl_graph() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    if(!context.in_flight)
+        throw std::logic_error("[gpu-rl] no GPU-native RL step was launched");
+    const cudaError_t result =
+        cudaEventSynchronize(context.completion_event);
+    if(result != cudaSuccess)
+    {
+        cudaGetLastError();
+        throw std::runtime_error(
+            std::string("[gpu-rl] completion wait failed: ")
+            + cudaGetErrorString(result));
+    }
+}
+
+uintptr_t GIPC::gpu_rl_revolute_actions_device_ptr() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return reinterpret_cast<uintptr_t>(context.d_revolute_actions);
+}
+
+uintptr_t GIPC::gpu_rl_prismatic_actions_device_ptr() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return reinterpret_cast<uintptr_t>(context.d_prismatic_actions);
+}
+
+uintptr_t GIPC::gpu_rl_positions_device_ptr() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return reinterpret_cast<uintptr_t>(context.d_positions);
+}
+
+uintptr_t GIPC::gpu_rl_velocities_device_ptr() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return reinterpret_cast<uintptr_t>(context.d_velocities);
+}
+
+uintptr_t GIPC::gpu_rl_statuses_device_ptr() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return reinterpret_cast<uintptr_t>(context.d_statuses);
+}
+
+uintptr_t GIPC::gpu_rl_frame_counter_device_ptr() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return reinterpret_cast<uintptr_t>(context.d_frame_counter);
+}
+
+int GIPC::gpu_rl_graph_node_count() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return context.graph_nodes;
+}
+
+int GIPC::gpu_rl_graph_h2d_count() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return context.graph_h2d;
+}
+
+int GIPC::gpu_rl_graph_d2h_count() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return context.graph_d2h;
+}
+
 bool GIPC::episode_graph_in_flight() const
 {
     const auto* context =
@@ -2161,6 +2438,10 @@ bool GIPC::episode_observation_ready(int slot) const
         throw std::out_of_range(
             "[episode-graph] observation slot must be 0 or 1");
     const EpisodeGraphContext& context = episode_context(*this);
+    if(context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] device observations must be consumed through the "
+            "device ABI");
     const volatile int* ready = context.h_ready + slot;
     if(*ready == 0)
         return false;
@@ -2182,6 +2463,9 @@ void GIPC::wait_episode_observation(int slot) const
         throw std::out_of_range(
             "[episode-graph] observation slot must be 0 or 1");
     const EpisodeGraphContext& context = episode_context(*this);
+    if(context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] device observations have no host observation slot");
     const volatile int* ready = context.h_ready + slot;
     if(*ready == 0 && !context.in_flight)
         throw std::logic_error(
@@ -2205,12 +2489,18 @@ int GIPC::episode_slot_first_frame(int slot) const
         throw std::out_of_range(
             "[episode-graph] observation slot must be 0 or 1");
     const EpisodeGraphContext& context = episode_context(*this);
+    if(context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] device observations have no host observation slot");
     return slot == 0 ? 0 : context.split_frame;
 }
 
 int GIPC::episode_attempted_frame_count() const
 {
     const EpisodeGraphContext& context = episode_context(*this);
+    if(context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] read the device frame counter through the device ABI");
     int attempted = 0;
     for(int slot = 0; slot < 2; ++slot)
     {
@@ -2286,6 +2576,9 @@ void GIPC::copy_episode_observation_slot(
 int GIPC::finish_episode_graph()
 {
     EpisodeGraphContext& context = episode_context(*this);
+    if(context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] use end_gpu_rl() to leave GPU-native RL mode");
     if(!context.in_flight)
         throw std::logic_error(
             "[episode-graph] no episode is in flight");

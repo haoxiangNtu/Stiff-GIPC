@@ -735,9 +735,23 @@ class GIPC
         const gipc::RevoluteDrivingControlPacked* revolute_actions,
         int revolute_count,
         const gipc::PrismaticDrivingControlPacked* prismatic_actions,
-        int prismatic_count);
+        int prismatic_count,
+        bool device_native = false);
     void launch_episode_graph_async(device_TetraData& TetMesh,
                                     int64_t base_frame_id);
+    void launch_gpu_rl_graph_async(uintptr_t cuda_stream);
+    bool gpu_rl_graph_prepared() const;
+    bool gpu_rl_graph_ready() const;
+    void synchronize_gpu_rl_graph() const;
+    uintptr_t gpu_rl_revolute_actions_device_ptr() const;
+    uintptr_t gpu_rl_prismatic_actions_device_ptr() const;
+    uintptr_t gpu_rl_positions_device_ptr() const;
+    uintptr_t gpu_rl_velocities_device_ptr() const;
+    uintptr_t gpu_rl_statuses_device_ptr() const;
+    uintptr_t gpu_rl_frame_counter_device_ptr() const;
+    int gpu_rl_graph_node_count() const;
+    int gpu_rl_graph_h2d_count() const;
+    int gpu_rl_graph_d2h_count() const;
     bool episode_graph_in_flight() const;
     bool episode_observation_ready(int slot) const;
     void wait_episode_observation(int slot) const;

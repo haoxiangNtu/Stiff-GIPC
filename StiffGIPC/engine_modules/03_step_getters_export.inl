@@ -3,6 +3,10 @@ void SimEngine::step()
     auto& impl = *m_impl;
     if(!impl.finalized)
         throw LifecycleError("step() requires a finalized SimEngine");
+    if(impl.ipc.gpu_rl_graph_prepared())
+        throw LifecycleError(
+            "step() is unavailable while GPU-native RL mode is prepared; "
+            "call end_gpu_rl() first");
     cudaSetDevice(impl.cfg.cuda_device);
     if(impl.ipc.episode_graph_in_flight())
         throw LifecycleError(
@@ -71,6 +75,10 @@ void SimEngine::launch_episode_async(
     if(!impl.finalized)
         throw LifecycleError(
             "launch_episode_async() requires a finalized SimEngine");
+    if(impl.ipc.gpu_rl_graph_prepared())
+        throw LifecycleError(
+            "launch_episode_async() is unavailable in GPU-native RL mode; "
+            "call end_gpu_rl() first");
     if(impl.ipc.episode_graph_in_flight())
         throw LifecycleError("an episode graph is already in flight");
     if(frames <= 0)
@@ -311,6 +319,121 @@ int SimEngine::finish_episode()
     return successful;
 }
 
+void SimEngine::prepare_gpu_rl()
+{
+    auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError(
+            "prepare_gpu_rl() requires a finalized SimEngine");
+    if(impl.ipc.episode_graph_in_flight())
+        throw LifecycleError(
+            "end the active episode before preparing GPU-native RL mode");
+
+    const int revolute_count =
+        static_cast<int>(impl.tetMesh.joint_angle_controls.size());
+    const int prismatic_count =
+        static_cast<int>(
+            impl.tetMesh.prismatic_drive_controls.size());
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.prepare_episode_graph(
+        impl.d_tetMesh,
+        1,
+        nullptr,
+        revolute_count,
+        nullptr,
+        prismatic_count,
+        true);
+    impl.episode_frames = 1;
+    impl.episode_revolute_actions.clear();
+    impl.episode_prismatic_actions.clear();
+}
+
+void SimEngine::launch_gpu_rl_async(uintptr_t cuda_stream)
+{
+    auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError(
+            "launch_gpu_rl_async() requires a finalized SimEngine");
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.launch_gpu_rl_graph_async(cuda_stream);
+}
+
+bool SimEngine::gpu_rl_prepared() const
+{
+    return m_impl->ipc.gpu_rl_graph_prepared();
+}
+
+bool SimEngine::gpu_rl_ready() const
+{
+    cudaSetDevice(m_impl->cfg.cuda_device);
+    return m_impl->ipc.gpu_rl_graph_ready();
+}
+
+void SimEngine::synchronize_gpu_rl() const
+{
+    cudaSetDevice(m_impl->cfg.cuda_device);
+    m_impl->ipc.synchronize_gpu_rl_graph();
+}
+
+void SimEngine::end_gpu_rl()
+{
+    auto& impl = *m_impl;
+    if(!impl.ipc.gpu_rl_graph_prepared())
+        throw LifecycleError("GPU-native RL mode is not prepared");
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.destroy_episode_graph();
+}
+
+uintptr_t SimEngine::get_gpu_rl_revolute_actions_device_ptr() const
+{
+    return m_impl->ipc.gpu_rl_revolute_actions_device_ptr();
+}
+
+uintptr_t SimEngine::get_gpu_rl_prismatic_actions_device_ptr() const
+{
+    return m_impl->ipc.gpu_rl_prismatic_actions_device_ptr();
+}
+
+uintptr_t SimEngine::get_gpu_rl_positions_device_ptr() const
+{
+    return m_impl->ipc.gpu_rl_positions_device_ptr();
+}
+
+uintptr_t SimEngine::get_gpu_rl_velocities_device_ptr() const
+{
+    return m_impl->ipc.gpu_rl_velocities_device_ptr();
+}
+
+uintptr_t SimEngine::get_gpu_rl_statuses_device_ptr() const
+{
+    return m_impl->ipc.gpu_rl_statuses_device_ptr();
+}
+
+uintptr_t SimEngine::get_gpu_rl_frame_counter_device_ptr() const
+{
+    return m_impl->ipc.gpu_rl_frame_counter_device_ptr();
+}
+
+int SimEngine::get_gpu_rl_graph_node_count() const
+{
+    return m_impl->ipc.gpu_rl_graph_node_count();
+}
+
+int SimEngine::get_gpu_rl_graph_h2d_count() const
+{
+    return m_impl->ipc.gpu_rl_graph_h2d_count();
+}
+
+int SimEngine::get_gpu_rl_graph_d2h_count() const
+{
+    return m_impl->ipc.gpu_rl_graph_d2h_count();
+}
+
+int SimEngine::get_gpu_rl_status_size_bytes() const
+{
+    return static_cast<int>(sizeof(frame_fsm::FrameStatus));
+}
+
 // ======================== state queries ========================
 int SimEngine::get_vertex_count() const
 {
@@ -324,6 +447,12 @@ uintptr_t SimEngine::get_vertices_device_ptr() const
     // positions straight from device memory without a host round-trip. Valid
     // after finalize(); contents update after each step().
     return reinterpret_cast<uintptr_t>(m_impl->ipc._vertexes);
+}
+
+uintptr_t SimEngine::get_vertex_velocities_device_ptr() const
+{
+    return reinterpret_cast<uintptr_t>(
+        m_impl->d_tetMesh.velocities);
 }
 
 int SimEngine::get_surface_face_count() const

@@ -604,6 +604,66 @@ PYBIND11_MODULE(pystiffgipc, m)
              "Wait for the terminal slot, commit telemetry, and return the "
              "number of successful frames.")
 
+        .def("prepare_gpu_rl",
+             &SimEngine::prepare_gpu_rl,
+             py::call_guard<py::gil_scoped_release>(),
+             "Capture the reusable one-frame GPU-native RL graph. This is a "
+             "setup boundary; call one warm-up step() first.")
+        .def("launch_gpu_rl_async",
+             &SimEngine::launch_gpu_rl_async,
+             py::arg("cuda_stream") = uintptr_t{0},
+             "Enqueue one RL simulation step without a host wait. The policy "
+             "must write actions and consume outputs on this same CUDA stream.")
+        .def("gpu_rl_prepared", &SimEngine::gpu_rl_prepared)
+        .def("gpu_rl_ready",
+             &SimEngine::gpu_rl_ready,
+             "Optional host-side completion query; not part of the steady "
+             "GPU-native path.")
+        .def("synchronize_gpu_rl",
+             &SimEngine::synchronize_gpu_rl,
+             py::call_guard<py::gil_scoped_release>(),
+             "Explicit debug/teardown wait; omit from steady-state RL.")
+        .def("end_gpu_rl",
+             &SimEngine::end_gpu_rl,
+             py::call_guard<py::gil_scoped_release>(),
+             "Synchronize and release GPU-native RL episode resources.")
+        .def("get_gpu_rl_device_abi",
+             [](const SimEngine& e)
+             {
+                 py::dict result;
+                 result["action_dtype"] = "float64";
+                 result["action_components"] = 3;
+                 result["revolute_joints"] =
+                     e.get_num_revolute_joints();
+                 result["prismatic_joints"] =
+                     e.get_num_prismatic_joints();
+                 result["vertices"] = e.get_vertex_count();
+                 result["revolute_actions"] =
+                     e.get_gpu_rl_revolute_actions_device_ptr();
+                 result["prismatic_actions"] =
+                     e.get_gpu_rl_prismatic_actions_device_ptr();
+                 result["positions"] =
+                     e.get_gpu_rl_positions_device_ptr();
+                 result["velocities"] =
+                     e.get_gpu_rl_velocities_device_ptr();
+                 result["statuses"] =
+                     e.get_gpu_rl_statuses_device_ptr();
+                 result["frame_counter"] =
+                     e.get_gpu_rl_frame_counter_device_ptr();
+                 result["status_bytes"] =
+                     e.get_gpu_rl_status_size_bytes();
+                 result["graph_nodes"] =
+                     e.get_gpu_rl_graph_node_count();
+                 result["graph_h2d"] =
+                     e.get_gpu_rl_graph_h2d_count();
+                 result["graph_d2h"] =
+                     e.get_gpu_rl_graph_d2h_count();
+                 return result;
+             },
+             "Return raw device pointers and the audited graph ABI. Positions "
+             "and velocities are contiguous (vertices, 3) float64 arrays in "
+             "engine-internal vertex order.")
+
         .def("get_assets_dir", &SimEngine::get_assets_dir)
 
         .def("get_vertex_contact_forces", [](SimEngine& e, bool include_ground,
@@ -887,6 +947,10 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_vertices_device_ptr",   &SimEngine::get_vertices_device_ptr,
              "[gpu-direct] Raw device pointer (int) to the double3 vertex buffer "
              "(length get_vertex_count()). For zero-copy GPU readback via Warp.")
+        .def("get_vertex_velocities_device_ptr",
+             &SimEngine::get_vertex_velocities_device_ptr,
+             "[gpu-direct] Raw device pointer (int) to the double3 velocity "
+             "buffer (length get_vertex_count()).")
         .def("get_surface_face_count",    &SimEngine::get_surface_face_count)
         .def("get_surface_vertex_count",  &SimEngine::get_surface_vertex_count)
 

@@ -192,3 +192,66 @@ slot、一次发射/零边界计数，并与普通逐帧 whole-frame 路径逐�
 包络，再要求 episode 误差不超过该包络和机器精度下限；纯 FEM 的严格逐位 gate
 不放宽。当前结果分别为 `EPISODE-GRAPH-GATE: PASS` 和
 `EPISODE-RL-GRAPH-GATE: PASS`。
+
+## Phase D 终态落地战报：GPU-native RL 设备 ABI（2026-07-29）
+
+episode API 每段仍付一次动作 H2D 和 pinned 观测 D2H。GPU-native RL 模式把
+最后这两笔也删掉：动作、观测、状态、帧计数全部只存在于设备指针后面，宿主在
+稳态循环里**一次传输都不做**——真正的闭环（policy 读观测 → 写动作）整体留在
+GPU 上，宿主只负责把图发射进流。
+
+```python
+engine.step()                       # 一次 warm-up，训练 lazy workspace/tier
+engine.prepare_gpu_rl()             # 捕获可复用的一帧图（setup 边界）
+abi = engine.get_gpu_rl_device_abi()  # 裸设备指针 + 图审计
+
+for _ in range(horizon):            # 稳态：零宿主同步、零 H2D/D2H
+    policy_kernel(abi["positions"], abi["velocities"],
+                  abi["revolute_actions"], abi["prismatic_actions"])
+    engine.launch_gpu_rl_async(stream)
+
+engine.synchronize_gpu_rl()         # 显式 debug/teardown 边界
+engine.end_gpu_rl()                 # 释放并恢复普通 step()
+```
+
+契约要点：
+
+- `prepare_gpu_rl()` 是 setup 边界（分配/捕获/上传/同步都允许），复用
+  episode 捕获管线但走 `device_native` 分支：跳过 input H2D 与两个 pinned
+  slot D2H，图尾改为设备侧 `frame_counter += attempted_frames`；
+  **捕获后审计硬性要求 0 host / 0 H2D / 0 D2H 节点**，不满足直接抛错。
+- 动作缓冲是紧排 `(joints, 3)` float64（static_assert 钉死布局），语义与
+  episode 动作相同：{target, strength, external torque/force}；单帧图恒消费
+  slot 0，policy 每步覆写即可。观测 = 提交后的 positions/velocities D2D
+  副本 + 208B `FrameStatus` 包 + int64 帧计数，全在设备。
+- `frame_id` 在 `PATH_GPU_NATIVE_RL` 下由设备帧计数器推进，跨发射单调；
+  失败帧仍走图内回滚 + status 发布，policy 侧读 `result`/`error_code`
+  即可丢弃 poisoned 轨迹——检疫裁决权从帧尾宿主移到了消费者。
+- 流亲和是 ABI 的一部分：首次发射绑定流，换流必须先 `end_gpu_rl()`；
+  `step()`/`launch_episode_async()` 在模式内被锁定，`end_gpu_rl()` 同步、
+  释放并恢复普通逐帧路径。
+- 资格约束与 C-3 相同（merged、静态边界、单 substep 等）；ABD 铰接场景由
+  闭环 gate 实证一帧图跨发射复用合法（converter extents 已设备驻留，
+  容量溢出会以 status 错误显形而非静默错误）。
+
+验收入口：
+
+```bash
+STIFFGIPC_NATIVE_DIR="$PWD/build" python3 scripts/gpu_rl_gate.py
+```
+
+gate 用 cudart memcpy 扮演 GPU policy（写动作/读观测的角色与 torch kernel
+等价），双基线建立噪声包络后分两相验证：parity 相（逐发射同步）逐帧对照
+公开 setter 基线；zero-sync 相 back-to-back 发射、全程无宿主等待，末尾一次
+event 同步后核对帧计数与终态，并断言 stored 观测与引擎提交态逐位相等。
+负向断言覆盖 step/episode 锁定、流亲和拒绝、`end_gpu_rl()` 后复活。
+4090 实测（fixed+revolute+prismatic ABD 场景）：图 551 节点、**h2d=0、
+d2h=0**；parity/final 的位置与速度误差全部 `0.0e+00`（低于基线自身
+`1e-17`~`1e-15` 的 ABD 归约抖动包络）。`GPU-RL-GATE: PASS`，套件段位
+G17c（`scripts/verify_gates.sh`）；D2D 动作发布变体 =
+`scripts/gpu_native_rl_gate.py`（G17d）。
+
+诚实完成度：该 ABI 是 GPU-native RL 的**地基块**，资格约束仍与 C-3 相同
+（`skip_all_collision=True` 等）。到"接触丰富场景 + 设备 reward/done/reset +
+批量环境 + A800 nsys 证明"的完整定义与四个完成块（C4/D2/D3/D4）见
+`docs/GPU_NATIVE_RL_PLAN.md`——四块全过之前，Phase C/D 不标记为最终完成。

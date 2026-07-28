@@ -63,6 +63,7 @@ enum FramePathFlags : uint32_t
     PATH_PCG_DEVICE_CONTINUATION = 1u << 8,
     PATH_LS_DEVICE_LOOP          = 1u << 9,
     PATH_EPISODE_RESIDENT        = 1u << 10,
+    PATH_GPU_NATIVE_RL           = 1u << 11,
 };
 
 enum FrameErrorCode : int32_t

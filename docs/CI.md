@@ -107,6 +107,16 @@ SKIP_GATES=1 git push
   `scripts/episode_graph_rl_gate.py`，GPU）：覆盖 Phase D 两段 observation
   event、纯 FEM exec 跨 episode 复用及逐位一致，并用 fixed+revolute+prismatic
   ABD 场景验证整段动作上传和 RL 数值噪声包络。
+- **G17c gpu-rl-graph**（`scripts/gpu_rl_gate.py`，GPU）：GPU-native RL 设备
+  ABI——稳态一帧图审计必须 0 host / 0 H2D / 0 D2H 节点；闭环 parity 相位逐帧
+  对照公开 setter 基线的噪声包络；零同步相位 back-to-back 发射后核对设备
+  frame counter 与终态；step()/episode 锁定、stream 亲和拒绝与 `end_gpu_rl()`
+  复活均为负向断言。
+- **G17d gpu-native-rl**（`scripts/gpu_native_rl_gate.py`，GPU）：同一 ABI 的
+  D2D 动作发布变体——动作轨迹一次上载到临时设备缓冲，每步只入队 D2D 发布+
+  仿真图+D2D 观测保留（更贴近动作已驻留显存的真实 GPU policy），末尾一次
+  裁决读回，轨迹对照 episode 噪声包络。契约与完成度路线图见
+  `docs/GPU_NATIVE_RL_PLAN.md`。
 
 ## GPU idle 门的基础设施白名单
 

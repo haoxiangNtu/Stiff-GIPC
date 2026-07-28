@@ -1054,6 +1054,60 @@ class Engine:
         """Wait for the terminal slot and return the successful frame count."""
         return int(self._engine.finish_episode())
 
+    # ---- GPU-native RL device ABI ----
+
+    def prepare_gpu_rl(self) -> None:
+        """Capture the reusable one-frame GPU-native RL graph.
+
+        This is a setup boundary and may allocate, capture and synchronize;
+        run one warm-up :meth:`step` first.  Afterwards an external CUDA
+        agent (e.g. a policy holding torch tensors) writes the packed
+        float64 action buffers from :meth:`get_gpu_rl_device_abi` directly
+        in device memory and calls :meth:`launch_gpu_rl_async` — the steady
+        state performs no host synchronization and its graph contains zero
+        H2D/D2H nodes.  :meth:`step` and :meth:`launch_episode_async` are
+        locked out until :meth:`end_gpu_rl`.
+        """
+        _assert_process_mode_signature()
+        self._engine.prepare_gpu_rl()
+
+    def launch_gpu_rl_async(self, cuda_stream: int = 0) -> None:
+        """Enqueue one RL simulation step without any host wait.
+
+        Action writes and observation reads must be issued on this same
+        CUDA stream (0 = the engine's per-thread default stream); repeated
+        launches must keep using the stream chosen first.
+        """
+        self._engine.launch_gpu_rl_async(int(cuda_stream))
+
+    def gpu_rl_prepared(self) -> bool:
+        """Return whether the GPU-native RL graph is captured and armed."""
+        return bool(self._engine.gpu_rl_prepared())
+
+    def gpu_rl_ready(self) -> bool:
+        """Non-blocking completion query; not part of the steady RL loop."""
+        return bool(self._engine.gpu_rl_ready())
+
+    def synchronize_gpu_rl(self) -> None:
+        """Block until the last launched step finished (debug/teardown)."""
+        self._engine.synchronize_gpu_rl()
+
+    def end_gpu_rl(self) -> None:
+        """Synchronize, release episode resources and re-enable step()."""
+        self._engine.end_gpu_rl()
+
+    def get_gpu_rl_device_abi(self) -> dict:
+        """Return raw device pointers and the audited graph ABI.
+
+        Keys include ``revolute_actions``/``prismatic_actions`` (packed
+        ``(joints, 3)`` float64: target, strength, external torque/force),
+        ``positions``/``velocities`` (``(vertices, 3)`` float64 in
+        engine-internal order), ``statuses`` (one ``status_bytes`` frame
+        packet), ``frame_counter`` (int64), and the audited
+        ``graph_nodes``/``graph_h2d``/``graph_d2h`` counts.
+        """
+        return dict(self._engine.get_gpu_rl_device_abi())
+
     def set_log_level(self, level: int) -> None:
         """Control per-frame solver log verbosity.
 

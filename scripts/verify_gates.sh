@@ -289,6 +289,30 @@ else
     record episode-rl-graph FAIL "rc=$rc"
 fi
 
+echo "== G17c GPU-native RL device ABI (zero-transfer graph) =="
+timeout 300 python3 scripts/gpu_rl_gate.py \
+    > "$GATE_LOG_DIR/gpu-rl-graph.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "GPU-RL-GATE: PASS" \
+       "$GATE_LOG_DIR/gpu-rl-graph.log"; then
+    record gpu-rl-graph PASS ""
+else
+    record gpu-rl-graph FAIL "rc=$rc"
+fi
+
+echo "== G17d GPU-native RL D2D action publication =="
+timeout 300 python3 scripts/gpu_native_rl_gate.py \
+    > "$GATE_LOG_DIR/gpu-native-rl.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "GPU-NATIVE-RL-GATE: PASS" \
+       "$GATE_LOG_DIR/gpu-native-rl.log"; then
+    record gpu-native-rl PASS ""
+else
+    record gpu-native-rl FAIL "rc=$rc"
+fi
+
 echo "== G14 STIFF_* knob registry consistency (static) =="
 timeout 120 python3 scripts/knob_gate.py \
     > "$GATE_LOG_DIR/knob.log" 2>&1
