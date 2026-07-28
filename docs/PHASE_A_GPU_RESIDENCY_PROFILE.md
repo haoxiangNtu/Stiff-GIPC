@@ -131,3 +131,20 @@ B3 手术顺序（按耗时）：①linear_solve 内部（converter 计数→设
 
 合计 ~22 往返/迭代。A800 期望：每削一次往返 ≈ 省百µs 级空转 × 迭代数。
 下一刀：MAS setPreconditioner/ReorderRealtime 内部 8 次读回的合批/设备驻留。
+
+---
+
+# 手术①战报：MAS 层级读回设备驻留（2026-07-28）
+
+单环境路径（盘子/towel 类=ModelScope 与 RL 主战场）：ReorderRealtime 的
+per-level h_clevelSize 读回（levelnum-1 次/迭代）消灭——层级尺寸本就由
+_prefixSumLx 在设备上写出，主机副本纯属镜像。改造=_dev 内核变体核内读
+d_levelSize[level]（容量网格；两核原生 inRange/无早退纪律=填充惰性由设计保证）
++ 定容 thrust scan（前缀缓冲每层零化到容量，填充尾扫描为常量）+ number<1
+设备侧写穿。多环境（其环填充算术需主机 warp 计数）保留旧路。
+
+指纹验证（8 字节 D2H × ls_mas_setup 相位）：towel 1env=**1.0/迭代**（原 4）；
+foldshirt 4env=5.0（旧路,按设计）。锚 0544461bd82123ae 逐位、MAS oracle、
+15 段、diag 三模式全绿。剩余 mas 段 ~3/迭代为其他站点（下一刀），line_search
+6.2 与 GH ToSymbol 5.4（描述符）在队。多环境版设备绑定（环填充算术下设备）
+为后续项。

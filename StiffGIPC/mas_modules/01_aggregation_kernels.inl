@@ -465,7 +465,60 @@ __global__ void _buildConnectMaskLx_new(const unsigned int* _neighborStart,
 }
 
 
-__global__ void _nextLevelCluster(unsigned int* _nextConnectedMsk, unsigned int* _nextPrefix, int number)
+__device__ __forceinline__ void _nextLevelCluster_body(unsigned int* _nextConnectedMsk,
+                                                       unsigned int* _nextPrefix,
+                                                       int           number);
+__device__ __forceinline__ void _prefixSumLx_body(int2*         _levelSize,
+                                                  unsigned int* _nextPrefix,
+                                                  unsigned int* _nextPrefixSum,
+                                                  unsigned int* _nextConnectMsk,
+                                                  int*          _goingNext,
+                                                  int           level,
+                                                  int           levelBegin,
+                                                  int           number);
+
+// [B3 mas-8] Device-bound variants: read the per-level count from d_levelSize
+// on device instead of a host readback (the count was WRITTEN by the previous
+// _prefixSumLx from device code — the host copy was a pure mirror). Launched
+// at cluster-capacity grids; both kernels already use the inRange/no-early-
+// return discipline, so padded lanes are inert by design. The number<1 guard
+// is warp-uniform (all threads read the same count) so a uniform early exit
+// is safe; the number==0 case writes the next level through so the hierarchy
+// stays consistent (mirrors the legacy host-side `if(number<1) return`).
+__global__ void _nextLevelCluster_dev(unsigned int* _nextConnectedMsk,
+                                      unsigned int* _nextPrefix,
+                                      const int2*   _levelSize,
+                                      int           level)
+{
+    const int number = _levelSize[level].x;
+    if(number < 1)
+        return;
+    _nextLevelCluster_body(_nextConnectedMsk, _nextPrefix, number);
+}
+
+__global__ void _prefixSumLx_dev(int2*         _levelSize,
+                                 unsigned int* _nextPrefix,
+                                 unsigned int* _nextPrefixSum,
+                                 unsigned int* _nextConnectMsk,
+                                 int*          _goingNext,
+                                 int           level)
+{
+    const int number     = _levelSize[level].x;
+    const int levelBegin = _levelSize[level].y;
+    if(number < 1)
+    {
+        if(blockIdx.x == 0 && threadIdx.x == 0)
+        {
+            _levelSize[level + 1].x = 0;
+            _levelSize[level + 1].y = levelBegin;
+        }
+        return;
+    }
+    _prefixSumLx_body(_levelSize, _nextPrefix, _nextPrefixSum,
+                      _nextConnectMsk, _goingNext, level, levelBegin, number);
+}
+
+__device__ __forceinline__ void _nextLevelCluster_body(unsigned int* _nextConnectedMsk, unsigned int* _nextPrefix, int number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // [racecheck] no early return + __syncwarp() around the cachedMsk /
@@ -522,7 +575,25 @@ __global__ void _nextLevelCluster(unsigned int* _nextConnectedMsk, unsigned int*
         _nextPrefix[warpId] = prefixSum[localWarpId];
 }
 
+__global__ void _nextLevelCluster(unsigned int* _nextConnectedMsk, unsigned int* _nextPrefix, int number)
+{
+    _nextLevelCluster_body(_nextConnectedMsk, _nextPrefix, number);
+}
+
 __global__ void _prefixSumLx(int2*         _levelSize,
+                             unsigned int* _nextPrefix,
+                             unsigned int* _nextPrefixSum,
+                             unsigned int* _nextConnectMsk,
+                             int*          _goingNext,
+                             int           level,
+                             int           levelBegin,
+                             int           number)
+{
+    _prefixSumLx_body(_levelSize, _nextPrefix, _nextPrefixSum,
+                      _nextConnectMsk, _goingNext, level, levelBegin, number);
+}
+
+__device__ __forceinline__ void _prefixSumLx_body(int2*         _levelSize,
                              unsigned int* _nextPrefix,
                              unsigned int* _nextPrefixSum,
                              unsigned int* _nextConnectMsk,
