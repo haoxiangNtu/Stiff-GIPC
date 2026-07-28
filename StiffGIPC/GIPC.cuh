@@ -96,6 +96,12 @@ class GIPC
     unsigned  m_pair_overflow_seen    = 0u;
     void      refresh_pair_counts();
     void      handleGroundCollapse(int collapsed);
+    long long gh_contact_total(long long* barrier_fric_out, long long* ground_start_out) const;
+    void      seed_gh_snapshot();   // [C-3] GH-start device snapshot (callsite, never in-graph)
+    void      gh_pregrow();         // [C-3] shared pre-assembly host prologue
+    cudaGraphExec_t m_gh_graph_exec = nullptr;  // [C-3] cached GH assembly graph
+    long long m_gh_graph_sig  = -1;             //   buffer generation at record
+    long long m_gh_tail_len   = 0;              //   observed FEM-tail triplet length
     // [descriptor phase-0.3] solver scratch — was function-static device
     // allocations shared process-wide (leak + cross-engine sharing + dangling
     // after device reset). Instance-owned; the use sites keep their lazy

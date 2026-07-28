@@ -853,71 +853,136 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             if(s_ng < 0)
             { const char* e = getenv("STIFF_NEWTON_GRAPH"); s_ng = e ? atoi(e) : 0; }
             bool gh_done = false;
+            // [C-3] the device snapshot seeds at the CALLSITE every iteration
+            // (fresh mirrors + kappa) — never from inside the recorded graph.
+            // Gated to the armed single-env merged population: per-env modes
+            // have different mirror semantics (and the audit-armed gates read
+            // trip on merged-formula mirror access there).
+            static int s_c2 = -1;
+            if(s_c2 < 0)
+            { const char* e = getenv("STIFF_C2_OFFSET_DEV"); s_c2 = e ? atoi(e) : 0; }
+            if((s_ng || s_c2) && !m_perenv_bvh && m_active_group_count <= 1)
+                seed_gh_snapshot();
             if(s_ng && !m_perenv_bvh && m_active_group_count <= 1
                && m_total_frames >= 1)
             {
-                cudaGraph_t gg    = nullptr;
-                bool        threw = false;
-                if(cudaStreamBeginCapture(cudaStreamPerThread,
-                                          cudaStreamCaptureModeThreadLocal)
-                   == cudaSuccess)
+                // [C-3] the signature covers pointer generations AND the host
+                // branch state baked into the recorded graph (the partition /
+                // assembly paths branch on contact presence).
+                const long long sig0 = (pcg_buffer_generation() << 2)
+                                       | ((h_cpNum[0] > 0) ? 1 : 0)
+                                       | ((h_gpNum > 0) ? 2 : 0);
+                if(m_gh_graph_exec && m_gh_graph_sig != sig0)
                 {
-                    try
-                    {
-                        m_gh_recording          = true;
-                        cuda_safe_call_throws() = true;
-                        gipc_in_graph_capture() = true;
-                        m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
-                        cuda_safe_call_throws() = false;
-                        gipc_in_graph_capture() = false;
-                    }
-                    catch(const std::exception& ex)
-                    {
-                        cuda_safe_call_throws() = false;
-                        gipc_in_graph_capture() = false;
-                        threw = true;
-                        s_ng  = 0;
-                        cudaGraph_t junk = nullptr;
-                        cudaStreamEndCapture(cudaStreamPerThread, &junk);
-                        if(junk) cudaGraphDestroy(junk);
-                        cudaGetLastError();
-                        fprintf(stderr,
-                                "[gh-graph] assembly not capturable (%s) -> "
-                                "plain path for this session\n",
-                                ex.what());
-                    }
-                    m_gh_recording = false;
-                    if(!threw
-                       && cudaStreamEndCapture(cudaStreamPerThread, &gg) == cudaSuccess
-                       && gg)
-                    {
-                        cudaGraphExec_t ge = nullptr;
-                        if(cudaGraphInstantiate(&ge, gg, nullptr, nullptr, 0)
-                           == cudaSuccess && ge)
-                        {
-                            CUDA_SAFE_CALL(cudaGraphLaunch(ge, cudaStreamPerThread));
-                            cudaGraphExecDestroy(ge);
-                            gh_done = true;
-                            static bool onceg = false;
-                            if(!onceg)
-                            {
-                                onceg = true;
-                                printf("[gh-graph] assembly chain captured + "
-                                       "graph-launched (per-iteration record)\n");
-                            }
-                        }
-                        cudaGraphDestroy(gg);
-                    }
-                    else if(!threw)
-                        cudaGetLastError();
+                    cudaGraphExecDestroy(m_gh_graph_exec);
+                    m_gh_graph_exec = nullptr;
                 }
-                if(!gh_done && !threw)
-                    s_ng = 0;   // capture path unavailable: permanent fallback
-                if(threw || !gh_done)
-                    m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
-                else
-                    (void)0;
-                gh_done = true;
+                // [C-3] reuse is EXPERIMENTAL (=2): remaining baked host
+                // branches inside GH (probe-enumerated so far: partition
+                // segment converts, SPLIT_GH, pin blocks) make replays unsound
+                // until each is device-closed. =1 keeps the validated
+                // per-iteration record path.
+                if(s_ng >= 2 && m_gh_graph_exec)
+                {
+                    // [C-3 reuse] REPLAY: shared host prologue (P1-dyn grow can
+                    // bump the generation -> fall through to a re-record), then
+                    // bookkeeping recompute via the observed FEM-tail length,
+                    // then ONE graph launch replaces the whole assembly chain.
+                    gh_pregrow();
+                    if(((pcg_buffer_generation() << 2)
+                        | ((h_cpNum[0] > 0) ? 1 : 0)
+                        | ((h_gpNum > 0) ? 2 : 0)) != sig0)
+                    {
+                        cudaGraphExecDestroy(m_gh_graph_exec);
+                        m_gh_graph_exec = nullptr;
+                    }
+                    else
+                    {
+                        const long long ct = gh_contact_total(nullptr, nullptr);
+                        gipc_global_triplet.global_collision_triplet_offset = (int)ct;
+                        gipc_global_triplet.global_triplet_offset = (int)(ct + m_gh_tail_len);
+                        CUDA_SAFE_CALL(cudaGraphLaunch(m_gh_graph_exec, cudaStreamPerThread));
+                        gh_done = true;
+                        static bool oncer = false;
+                        if(!oncer)
+                        {
+                            oncer = true;
+                            printf("[gh-graph] cross-iteration REUSE active "
+                                   "(assembly = one graph launch)\n");
+                        }
+                    }
+                }
+                if(!gh_done)
+                {
+                    cudaGraph_t gg    = nullptr;
+                    bool        threw = false;
+                    if(cudaStreamBeginCapture(cudaStreamPerThread,
+                                              cudaStreamCaptureModeThreadLocal)
+                       == cudaSuccess)
+                    {
+                        try
+                        {
+                            m_gh_recording          = true;
+                            cuda_safe_call_throws() = true;
+                            gipc_in_graph_capture() = true;
+                            m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
+                            cuda_safe_call_throws() = false;
+                            gipc_in_graph_capture() = false;
+                        }
+                        catch(const std::exception& ex)
+                        {
+                            cuda_safe_call_throws() = false;
+                            gipc_in_graph_capture() = false;
+                            threw = true;
+                            s_ng  = 0;
+                            cudaGraph_t junk = nullptr;
+                            cudaStreamEndCapture(cudaStreamPerThread, &junk);
+                            if(junk) cudaGraphDestroy(junk);
+                            cudaGetLastError();
+                            fprintf(stderr,
+                                    "[gh-graph] assembly not capturable (%s) -> "
+                                    "plain path for this session\n",
+                                    ex.what());
+                        }
+                        m_gh_recording = false;
+                        if(!threw
+                           && cudaStreamEndCapture(cudaStreamPerThread, &gg) == cudaSuccess
+                           && gg)
+                        {
+                            if(cudaGraphInstantiate(&m_gh_graph_exec, gg, nullptr, nullptr, 0)
+                               == cudaSuccess && m_gh_graph_exec)
+                            {
+                                CUDA_SAFE_CALL(cudaGraphLaunch(m_gh_graph_exec,
+                                                               cudaStreamPerThread));
+                                gh_done = true;
+                                // Record-time bookkeeping ran on the host: cache
+                                // the generation + the observed FEM-tail length
+                                // (offset - contact total, scene-constant for the
+                                // gated no-ABD single-env population).
+                                m_gh_graph_sig = (pcg_buffer_generation() << 2)
+                                                 | ((h_cpNum[0] > 0) ? 1 : 0)
+                                                 | ((h_gpNum > 0) ? 2 : 0);
+                                m_gh_tail_len  = (long long)gipc_global_triplet.global_triplet_offset
+                                                 - gh_contact_total(nullptr, nullptr);
+                                static bool onceg = false;
+                                if(!onceg)
+                                {
+                                    onceg = true;
+                                    printf("[gh-graph] assembly chain captured + "
+                                           "graph-launched (exec cached)\n");
+                                }
+                            }
+                            cudaGraphDestroy(gg);
+                        }
+                        else if(!threw)
+                            cudaGetLastError();
+                    }
+                    if(!gh_done && !threw)
+                        s_ng = 0;   // capture path unavailable: permanent fallback
+                    if(!gh_done)
+                        m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
+                    gh_done = true;
+                }
             }
             if(!gh_done)
                 m_time_make_pd_ms += computeGradientAndHessian(TetMesh);

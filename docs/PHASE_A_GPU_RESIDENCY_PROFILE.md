@@ -389,3 +389,23 @@ do_assemble 计数化 + ccd 消费闭环——首次捕获尝试将以阶段报�
 0.97/iter 那笔）喂 mid-GH 宿主算术（ABD 接触段偏移）+ GH 内嵌 ABD convert
 的 unique 读回——两者的设备闭环即跨迭代 exec 复用（真正收益）的解锁条件，
 其后 WHILE 尾launch 包 Newton 环、C-3 帧图水到渠成。
+
+---
+
+# start-ids/重定位设备闭环 + 复用机械落地战报（2026-07-29）
+
+**四轮实证连环**（每轮工具定位）：
+1. no-ABD 门首版清零 start-ids——**语义竟正确**（零值走 ELSE 分支=fem_fem
+   吃满全段 ✓）但重定位核用错偏移源（seed 前置量 vs 去重后量）→ 719；
+2. 无接触迭代 d_unique 陈值（上次 solve 级 convert 残留）→ 加零接触门；
+3. **分区分支烤进图**（无接触迭代录的图在有接触迭代重放=漏跑分区——drift
+   异常 3.6e-3 的真因）→ sig 加分支位 {cp>0, gp>0}；
+4. 种子提升后无条件执行撞 per-env 镜像审计 → 种子/跳读/重定位核全部收进
+   **armed 门**（默认路径逐字节恢复 legacy）。
+
+终态：`STIFF_NEWTON_GRAPH=1`（逐迭代录制-发射，已验证）/`=2`（跨迭代 exec
+复用，实验档——机械完备：exec 缓存+代数×分支复合 sig+gh_pregrow 共享前奏+
+观察式尾长簿记，余未名烤值待逐清）；armed no-ABD 人口的 start-ids D2H 与
+三重同步 D2D 重定位全部设备闭环（`_relocate_collision_triplets` 容量网格+
+设备偏移）。终验：15 段绿锚 0544461bd82123ae 逐位；armed 四 knob towel 双跑
+drift 1.827/1.832e-3=对照带内、PASS、0 耗尽；捕获+缓存打印激活。

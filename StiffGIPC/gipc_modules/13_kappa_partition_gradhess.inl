@@ -6,6 +6,22 @@
 // arithmetic; the live device slots drift around frame boundaries (re-emitting
 // scans). The Newton-graph era recomputes this in-graph from device counts
 // once the contact side is device-offset too.
+// [C-3] device-count relocation of the collision triplet segment
+// [off, 2*off) -> [0, off): disjoint ranges, one kernel replaces three sync
+// D2D memcpys whose byte counts would bake into the cached GH graph.
+__global__ void _relocate_collision_triplets(int* rows, int* cols,
+                                             Eigen::Matrix3d* vals,
+                                             const int* d_off, int cap)
+{
+    int       i   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int off = *d_off;
+    if(i >= off || i >= cap)
+        return;
+    rows[i] = rows[off + i];
+    cols[i] = cols[off + i];
+    vals[i] = vals[off + i];
+}
+
 __global__ void _calc_contact_triplet_total(int* d_slots, int contact_total,
                                             int fricgd_start, int ground_start,
                                             int cp0, int cd4, int cd3, int cd2,
@@ -367,11 +383,15 @@ void GIPC::partitionContactHessian()
 
     // ②-D2H: single batched copy of the 4 contiguous start-ids (block[0..3])
     // replaces 4 separate blocking D2H (each of which drains the GPU).
-    int h_csb[4];
-    CUDA_SAFE_CALL(cudaMemcpy(h_csb,
-                              gipc_global_triplet.d_abd_abd_contact_start_id,
-                              4 * sizeof(int),
-                              cudaMemcpyDeviceToHost));
+    // [C-3] no-ABD scenes: every ABD contact segment is empty, all consumers
+    // are 0-length no-ops — skip the read (it was the LAST per-iteration D2H
+    // in GH and the capture blocker) and publish deterministic zeros.
+    int h_csb[4] = {0, 0, 0, 0};
+    if(!(_c2_offset_dev() && abd_fem_count_info.abd_body_num == 0))
+        CUDA_SAFE_CALL(cudaMemcpy(h_csb,
+                                  gipc_global_triplet.d_abd_abd_contact_start_id,
+                                  4 * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
     gipc_global_triplet.h_abd_abd_contact_start_id = h_csb[0];
     gipc_global_triplet.h_abd_fem_contact_start_id = h_csb[1];
     gipc_global_triplet.h_fem_abd_contact_start_id = h_csb[2];
@@ -455,23 +475,40 @@ void GIPC::partitionContactHessian()
     gipc_global_triplet.h_abd_abd_contact_start_id =
         gipc_global_triplet.h_fem_abd_contact_start_id + gipc_global_triplet.fem_abd_contact_num;
 
-    CUDA_SAFE_CALL(
-        cudaMemcpy(gipc_global_triplet.block_row_indices(),
-                   gipc_global_triplet.block_row_indices() + gipc_global_triplet.global_collision_triplet_offset,
-                   gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
-                   cudaMemcpyDeviceToDevice));
-
-    CUDA_SAFE_CALL(
-        cudaMemcpy(gipc_global_triplet.block_col_indices(),
-                   gipc_global_triplet.block_col_indices() + gipc_global_triplet.global_collision_triplet_offset,
-                   gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
-                   cudaMemcpyDeviceToDevice));
-
-    CUDA_SAFE_CALL(cudaMemcpy(
-        gipc_global_triplet.block_values(),
-        gipc_global_triplet.block_values() + gipc_global_triplet.global_collision_triplet_offset,
-        gipc_global_triplet.global_collision_triplet_offset * sizeof(Eigen::Matrix3d),
-        cudaMemcpyDeviceToDevice));
+    if(_c2_offset_dev() && abd_fem_count_info.abd_body_num == 0)
+    {
+        // [C-3] armed no-ABD: the collision offset is the seeded device contact
+        // total (no segment convert changes it without ABD). Capacity grid +
+        // device offset: capture-legal and replay-correct; a zero total makes
+        // every thread exit.
+        const int cap = (int)gipc_global_triplet.triplet_capacity();
+        _relocate_collision_triplets<<<(cap + 255) / 256, 256>>>(
+            gipc_global_triplet.block_row_indices(),
+            gipc_global_triplet.block_col_indices(),
+            gipc_global_triplet.block_values(),
+            _c2_offset_dev(),
+            cap);
+    }
+    else
+    {
+        // ABD scenes: multi-segment post-dedup offset lives only in host
+        // bookkeeping today — keep the legacy copies (capture excluded).
+        CUDA_SAFE_CALL(
+            cudaMemcpy(gipc_global_triplet.block_row_indices(),
+                       gipc_global_triplet.block_row_indices() + gipc_global_triplet.global_collision_triplet_offset,
+                       gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+                       cudaMemcpyDeviceToDevice));
+        CUDA_SAFE_CALL(
+            cudaMemcpy(gipc_global_triplet.block_col_indices(),
+                       gipc_global_triplet.block_col_indices() + gipc_global_triplet.global_collision_triplet_offset,
+                       gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+                       cudaMemcpyDeviceToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(
+            gipc_global_triplet.block_values(),
+            gipc_global_triplet.block_values() + gipc_global_triplet.global_collision_triplet_offset,
+            gipc_global_triplet.global_collision_triplet_offset * sizeof(Eigen::Matrix3d),
+            cudaMemcpyDeviceToDevice));
+    }
 }
 
 static void _dbg_ksum_comm(const char* name, const void* dptr, size_t nbytes);  // [4.3 fwd]
@@ -484,6 +521,119 @@ static void _dbg_ksum_comm(const char* name, const void* dptr, size_t nbytes);  
 // (.s1) and after the elastic bracket (.s2) → cross-batch compare splits kinetic vs elastic.
 int g_dec_frame = -1;   // [decouple probe] non-static so other TUs (pcg_solver) can gate dumps by frame/k
 int g_dec_k     = -1;
+
+// [C-3] host mirror arithmetic for the contact-segment total (shared by the
+// seed and the replay-prologue bookkeeping recompute).
+long long GIPC::gh_contact_total(long long* barrier_fric_out, long long* ground_start_out) const
+{
+    const long long _barrier = (long long)h_cpNum[4] * M12_Off
+                               + (long long)h_cpNum[3] * M9_Off
+                               + (long long)h_cpNum[2] * M6_Off;
+    long long _fric_cp = 0, _fric_gd = 0;
+#ifdef USE_FRICTION
+    _fric_cp = (long long)h_cpNum_last[4] * M12_Off + (long long)h_cpNum_last[3] * M9_Off
+               + (long long)h_cpNum_last[2] * M6_Off;
+    _fric_gd = (long long)(uint32_t)h_gpNum_last;
+#endif
+    const long long _ground_start = _barrier + _fric_cp + _fric_gd;
+    if(barrier_fric_out) *barrier_fric_out = _barrier + _fric_cp;
+    if(ground_start_out) *ground_start_out = _ground_start;
+    return _ground_start + (long long)(uint32_t)h_gpNum;
+}
+
+// [C-3] GH-start device snapshot seed (mirror values + live kappa). Runs at
+// the CALLSITE each iteration — never inside the recorded graph.
+void GIPC::seed_gh_snapshot()
+{
+    long long _bf = 0, _gs = 0;
+    const long long _ct = gh_contact_total(&_bf, &_gs);
+    _calc_contact_triplet_total<<<1, 1>>>(m_d_contact_triplet_total,
+                                          (int)_ct,
+                                          (int)_bf,
+                                          (int)_gs,
+                                          (int)h_cpNum[0],
+                                          (int)h_cpNum[4], (int)h_cpNum[3], (int)h_cpNum[2],
+#ifdef USE_FRICTION
+                                          (int)h_cpNum_last[0],
+                                          (int)h_cpNum_last[4], (int)h_cpNum_last[3], (int)h_cpNum_last[2],
+#else
+                                          0, 0, 0, 0,
+#endif
+                                          (int)h_gpNum,
+                                          m_d_ls_scalars, Kappa);
+}
+
+// [C-3] host pre-assembly prologue: prev-length capture, offset reset, the
+// P1-dyn provable-bound discard-grow (bumps the buffer generation on an actual
+// grow — a cached GH graph then re-records), and the slot-audit arm. Shared
+// verbatim by the recorded/plain GH path and the graph-replay prologue.
+void GIPC::gh_pregrow()
+{
+    // [v0.8.5.1 frame-start grow] Capture the previous iteration's EXACT stream length
+    // before the reset — it predicts this iteration's converter need (2*length) far
+    // more tightly than the M12_Off-blocks-per-pair worst-case bound can.
+    const long long prev_triplet_len = gipc_global_triplet.global_triplet_offset;
+    gipc_global_triplet.global_triplet_offset = 0;
+    // [C-3] snapshot seed hoisted to seed_gh_snapshot(): a by-value seed inside
+    // the recorded graph would replay stale values over the fresh prologue seed.
+
+    // [P1-dyn] Grow the global triplet buffer BEFORE any assembly writes, to a PROVABLE
+    // UPPER BOUND on this step's triplet count (so the unchecked assembly kernels can
+    // NEVER overflow — not merely "usually fit"). The bound:
+    //   - fixed (topology) internal triplets: m_fixed_triplet_base + fem_point (exact)
+    //   - collision: h_cpNum[0] is the EXACT number of contact pairs calBarrier iterates;
+    //     any pair writes at most M12_Off 3x3 blocks, so M12_Off*h_cpNum[0] >= the real
+    //     collision-triplet count for ANY type mix (PP/PE/PT/EE). Same for lagged
+    //     friction (h_cpNum_last[0]) and ground (h_gpNum, generous *M6_Off).
+    // Non-hybrid only; hybrid keeps the worst-case finalize allocation.
+    if(m_dynamic_triplet)
+    {
+        long long bound = m_fixed_triplet_base
+            + static_cast<long long>(abd_fem_count_info.fem_point_num)
+            + static_cast<long long>(h_cpNum[0]) * M12_Off     // all contact pairs x max blocks
+            + static_cast<long long>(h_gpNum) * M6_Off;        // ground (generous)
+#ifdef USE_FRICTION
+        bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
+               + static_cast<long long>(h_gpNum_last) * M6_Off;
+#endif
+        bound += 4096;                                          // fixed slack
+        // [v0.8.5.1] This is the ONE point where the triplet buffer provably holds no
+        // live data (offset just reset; the previous stream was fully consumed by its
+        // solve) — so growth here may legally DISCARD (free→malloc, no copy, no
+        // old+new transient): the [P0-mem] memory property, at the location where its
+        // "nothing to preserve" premise is actually true. Size for BOTH consumers:
+        //   - assembly writes [0:length): 1*bound covers it (provable upper bound);
+        //   - the converter needs 2*length_now at the build point. length_now is
+        //     unknown here; predict from the previous iteration's EXACT length with
+        //     35% jump headroom (2.7 = 2 x 1.35). A plain 2*prev misses exactly the
+        //     frames that matter: the towel-strict trigger was a +26% single-frame
+        //     contact jump (2*prev=267864 < cap while 2*length_now=336938 > cap).
+        // Jumps >35% per Newton iteration fall through to ensure_capacity_preserve
+        // at the build point — the correctness backstop: rare, one transient copy,
+        // always correct. Margin (30% capped at 512MB) lives in the callee.
+        long long conv_pred = 27 * prev_triplet_len / 10;
+        long long target    = bound > conv_pred ? bound : conv_pred;
+        if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(target))
+        {
+            gipc_global_triplet.open_discard_window();  // [A2] THE one legal point
+            gipc_global_triplet.ensure_capacity_discard(static_cast<size_t>(target));
+            // The whole-buffer determinism memset above ran on the OLD allocation;
+            // re-zero the fresh one (grow iterations only, so effectively free).
+            size_t cap = gipc_global_triplet.triplet_capacity();
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int), 0));
+        }
+        if(gipc_global_triplet.global_external_max_capcity < bound)
+        {
+            gipc_global_triplet.resize_collision_hash_size(static_cast<size_t>(bound * 1.1));
+            gipc_global_triplet.global_external_max_capcity = static_cast<int>(bound * 1.1);
+        }
+    }
+    // [3c] offsets are reset and no assembly write has happened yet — the one
+    // place arming the slot audit is legal (mirrors the discard-grow legality).
+    gipc_global_triplet.slot_audit_arm();
+}
 
 float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 {
@@ -597,98 +747,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         printf("[shape-stage] s1 (kinetic) dumped @frame %d k=%d\n", g_dec_frame, g_dec_k);
     }
 
-    // [v0.8.5.1 frame-start grow] Capture the previous iteration's EXACT stream length
-    // before the reset — it predicts this iteration's converter need (2*length) far
-    // more tightly than the M12_Off-blocks-per-pair worst-case bound can.
-    const long long prev_triplet_len = gipc_global_triplet.global_triplet_offset;
-    gipc_global_triplet.global_triplet_offset = 0;
-    // [C-2] device contact total at GH START: the assembly kernels RE-EMIT into
-    // the live _cpNum slots (ground doubles slot 5), so only the detection-fresh
-    // values here match the host mirror arithmetic below.
-    {
-        const long long _barrier = (long long)h_cpNum[4] * M12_Off
-                                   + (long long)h_cpNum[3] * M9_Off
-                                   + (long long)h_cpNum[2] * M6_Off;
-        long long _fric_cp = 0, _fric_gd = 0;
-#ifdef USE_FRICTION
-        _fric_cp = (long long)h_cpNum_last[4] * M12_Off + (long long)h_cpNum_last[3] * M9_Off
-                   + (long long)h_cpNum_last[2] * M6_Off;
-        _fric_gd = (long long)(uint32_t)h_gpNum_last;
-#endif
-        const long long _ground_start = _barrier + _fric_cp + _fric_gd;
-        const long long _ct = _ground_start + (long long)(uint32_t)h_gpNum;
-        _calc_contact_triplet_total<<<1, 1>>>(m_d_contact_triplet_total,
-                                              (int)_ct,
-                                              (int)(_barrier + _fric_cp),
-                                              (int)_ground_start,
-                                              (int)h_cpNum[0],
-                                              (int)h_cpNum[4], (int)h_cpNum[3], (int)h_cpNum[2],
-#ifdef USE_FRICTION
-                                              (int)h_cpNum_last[0],
-                                              (int)h_cpNum_last[4], (int)h_cpNum_last[3], (int)h_cpNum_last[2],
-#else
-                                              0, 0, 0, 0,
-#endif
-                                              (int)h_gpNum,
-                                              m_d_ls_scalars, Kappa);
-    }
-
-    // [P1-dyn] Grow the global triplet buffer BEFORE any assembly writes, to a PROVABLE
-    // UPPER BOUND on this step's triplet count (so the unchecked assembly kernels can
-    // NEVER overflow — not merely "usually fit"). The bound:
-    //   - fixed (topology) internal triplets: m_fixed_triplet_base + fem_point (exact)
-    //   - collision: h_cpNum[0] is the EXACT number of contact pairs calBarrier iterates;
-    //     any pair writes at most M12_Off 3x3 blocks, so M12_Off*h_cpNum[0] >= the real
-    //     collision-triplet count for ANY type mix (PP/PE/PT/EE). Same for lagged
-    //     friction (h_cpNum_last[0]) and ground (h_gpNum, generous *M6_Off).
-    // Non-hybrid only; hybrid keeps the worst-case finalize allocation.
-    if(m_dynamic_triplet)
-    {
-        long long bound = m_fixed_triplet_base
-            + static_cast<long long>(abd_fem_count_info.fem_point_num)
-            + static_cast<long long>(h_cpNum[0]) * M12_Off     // all contact pairs x max blocks
-            + static_cast<long long>(h_gpNum) * M6_Off;        // ground (generous)
-#ifdef USE_FRICTION
-        bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
-               + static_cast<long long>(h_gpNum_last) * M6_Off;
-#endif
-        bound += 4096;                                          // fixed slack
-        // [v0.8.5.1] This is the ONE point where the triplet buffer provably holds no
-        // live data (offset just reset; the previous stream was fully consumed by its
-        // solve) — so growth here may legally DISCARD (free→malloc, no copy, no
-        // old+new transient): the [P0-mem] memory property, at the location where its
-        // "nothing to preserve" premise is actually true. Size for BOTH consumers:
-        //   - assembly writes [0:length): 1*bound covers it (provable upper bound);
-        //   - the converter needs 2*length_now at the build point. length_now is
-        //     unknown here; predict from the previous iteration's EXACT length with
-        //     35% jump headroom (2.7 = 2 x 1.35). A plain 2*prev misses exactly the
-        //     frames that matter: the towel-strict trigger was a +26% single-frame
-        //     contact jump (2*prev=267864 < cap while 2*length_now=336938 > cap).
-        // Jumps >35% per Newton iteration fall through to ensure_capacity_preserve
-        // at the build point — the correctness backstop: rare, one transient copy,
-        // always correct. Margin (30% capped at 512MB) lives in the callee.
-        long long conv_pred = 27 * prev_triplet_len / 10;
-        long long target    = bound > conv_pred ? bound : conv_pred;
-        if(gipc_global_triplet.triplet_capacity() < static_cast<size_t>(target))
-        {
-            gipc_global_triplet.open_discard_window();  // [A2] THE one legal point
-            gipc_global_triplet.ensure_capacity_discard(static_cast<size_t>(target));
-            // The whole-buffer determinism memset above ran on the OLD allocation;
-            // re-zero the fresh one (grow iterations only, so effectively free).
-            size_t cap = gipc_global_triplet.triplet_capacity();
-            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double), 0));
-            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int), 0));
-            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int), 0));
-        }
-        if(gipc_global_triplet.global_external_max_capcity < bound)
-        {
-            gipc_global_triplet.resize_collision_hash_size(static_cast<size_t>(bound * 1.1));
-            gipc_global_triplet.global_external_max_capcity = static_cast<int>(bound * 1.1);
-        }
-    }
-    // [3c] offsets are reset and no assembly write has happened yet — the one
-    // place arming the slot audit is legal (mirrors the discard-grow legality).
-    gipc_global_triplet.slot_audit_arm();
+    gh_pregrow();
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
