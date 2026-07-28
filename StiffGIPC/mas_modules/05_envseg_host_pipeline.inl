@@ -30,6 +30,66 @@ __global__ void _mas_env_setx(int2* levelSizeSlot, const int* padTot)
     if(blockIdx.x == 0 && threadIdx.x == 0)
         levelSizeSlot->x = *padTot;
 }
+// [B3 s8] device-resident env segmentation for the level loop: warpNum and the
+// divisibility guard move in-kernel, so no per-level count readback. A level
+// whose warp count stops dividing evenly falls back to segN=1 exactly like the
+// host check did. d_segwpe = {segN, wpe} feeds the apply/setx guards.
+__global__ void _mas_env_base_dev(const unsigned int* prefixSum, const unsigned int* prefix,
+                                  const int2* levelSize, int level, int n_env_static,
+                                  int* envBase, int* envStart, int* padTot, int2* segwpe)
+{
+    if(blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    const int number  = levelSize[level].x;
+    const int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
+    const int n_env   = n_env_static;
+    if(n_env <= 1 || warpNum <= 0 || warpNum % n_env != 0)
+    {
+        *segwpe = make_int2(1, 0);
+        return;
+    }
+    const int wpe = warpNum / n_env;
+    *segwpe       = make_int2(n_env, wpe);
+    int base = 0;
+    for(int e = 0; e < n_env; e++)
+    {
+        int          sW = e * wpe, eW = (e + 1) * wpe;
+        envStart[e]     = (int)prefixSum[sW];
+        unsigned int Ce = prefixSum[eW - 1] + prefix[eW - 1] - prefixSum[sW];
+        envBase[e]      = base;
+        base += ((int)Ce + BANKSIZE - 1) / BANKSIZE * BANKSIZE;
+    }
+    *padTot = base;
+}
+__global__ void _mas_env_apply_dev(unsigned int* prefixSum, const int* envBase, const int* envStart,
+                                   const int2* levelSize, int level, const int2* segwpe)
+{
+    const int segN = segwpe->x;
+    if(segN <= 1)
+        return;
+    const int wpe     = segwpe->y;
+    const int number  = levelSize[level].x;
+    const int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
+    int       w       = blockIdx.x * blockDim.x + threadIdx.x;
+    if(w >= warpNum)
+        return;
+    int e        = w / wpe;
+    prefixSum[w] = (unsigned int)(envBase[e] + ((int)prefixSum[w] - envStart[e]));
+}
+__global__ void _mas_env_setx_dev(int2* levelSizeSlot, const int* padTot, const int2* segwpe)
+{
+    if(blockIdx.x == 0 && threadIdx.x == 0 && segwpe->x > 1)
+        levelSizeSlot->x = *padTot;
+}
+// [B3 s8] the host-static part of _mas_envSegN (env var + verified env count +
+// scratch cap); the warpNum-dependent checks now live in _mas_env_base_dev.
+static int _mas_envSegN_static(int numEnvs)
+{
+    const char* force = getenv("STIFF_MAS_SEG");
+    if(force && atoi(force) == 0)
+        return 1;
+    return (numEnvs >= 1 && numEnvs <= 4096) ? numEnvs : 1;
+}
 // Host-side decision only (getenv + integer arithmetic, no device access → no sync): returns the
 // effective env count to segment by, or <=1 when disabled.
 //   default (STIFF_MAS_SEG unset): ON for multi-env (numEnvs>1) in EVERY mode.
@@ -229,12 +289,11 @@ void MASPreconditioner::NextLevelCluster(int level)
             d_nextConnectMask, d_nextPrefix, d_levelSize, level);
         return;
     }
-    int number    = h_clevelSize.x;
-    if(number < 1)
-        return;
+    // [B3 s8] multi-env: same device-count kernel, capacity grid.
     int blockSize = DEFAULT_BLOCKSIZE;
-    int numBlocks = (number + blockSize - 1) / blockSize;
-    _nextLevelCluster<<<numBlocks, blockSize>>>(d_nextConnectMask, d_nextPrefix, number);
+    int numBlocks = (m_clusterCap + blockSize - 1) / blockSize;
+    _nextLevelCluster_dev<<<numBlocks, blockSize>>>(
+        d_nextConnectMask, d_nextPrefix, d_levelSize, level);
 }
 
 void MASPreconditioner::ComputeNextLevel(int level)
@@ -272,30 +331,26 @@ void MASPreconditioner::PrefixSumLx(int level)
                                                    level);
         return;
     }
-    int number     = h_clevelSize.x;
-    if(number < 1)
-        return;
-    int levelBegin = h_clevelSize.y;
-    int blockSize  = BANKSIZE * BANKSIZE;
-    int numBlocks  = (number + blockSize - 1) / blockSize;
-
-    int warpNum = (number + BANKSIZE - 1) / BANKSIZE;
-    thrust::exclusive_scan(thrust::device_ptr<unsigned int>(d_nextPrefix),
-                           thrust::device_ptr<unsigned int>(d_nextPrefix) + warpNum,
-                           thrust::device_ptr<unsigned int>(d_nextPrefixSum));
-    // [per-env MAS] pad each env's level-(level+1) clusters to a BANKSIZE-aligned block.
-    int _segN = _mas_envSegN(warpNum, m_numEnvs);
-    if(_segN > 1)
+    // [B3 s8] multi-env: capacity scan over the zero-padded prefix buffer
+    // (live prefix range unchanged by trailing zeros), then the env padding
+    // chain reads its geometry from d_levelSize/d_segwpe on device — the
+    // per-level h_clevelSize readbacks are gone.
     {
-        int wpe = warpNum / _segN;
-        _mas_env_base<<<1, 1>>>(d_nextPrefixSum, d_nextPrefix, wpe, _segN, d_envBase, d_envStart, d_padTot);
-        _mas_env_apply<<<(warpNum + 255) / 256, 256>>>(d_nextPrefixSum, d_envBase, d_envStart, warpNum, wpe);
+        int blockSize = BANKSIZE * BANKSIZE;
+        int numBlocks = (m_clusterCap + blockSize - 1) / blockSize;
+        int warpCap   = (m_clusterCap + BANKSIZE - 1) / BANKSIZE;
+        thrust::exclusive_scan(thrust::device_ptr<unsigned int>(d_nextPrefix),
+                               thrust::device_ptr<unsigned int>(d_nextPrefix) + warpCap,
+                               thrust::device_ptr<unsigned int>(d_nextPrefixSum));
+        _mas_env_base_dev<<<1, 1>>>(d_nextPrefixSum, d_nextPrefix, d_levelSize, level,
+                                    _mas_envSegN_static(m_numEnvs),
+                                    d_envBase, d_envStart, d_padTot, d_segwpe);
+        _mas_env_apply_dev<<<(warpCap + 255) / 256, 256>>>(
+            d_nextPrefixSum, d_envBase, d_envStart, d_levelSize, level, d_segwpe);
+        _prefixSumLx_dev<<<numBlocks, blockSize>>>(d_levelSize, d_nextPrefix, d_nextPrefixSum,
+                                                   d_nextConnectMask, d_goingNext, level);
+        _mas_env_setx_dev<<<1, 1>>>(d_levelSize + level + 1, d_padTot, d_segwpe);
     }
-
-    _prefixSumLx<<<numBlocks, blockSize>>>(
-        d_levelSize, d_nextPrefix, d_nextPrefixSum, d_nextConnectMask, d_goingNext, level, levelBegin, number);
-    if(_segN > 1)
-        _mas_env_setx<<<1, 1>>>(d_levelSize + level + 1, d_padTot);   // padded cluster count (device)
 }
 
 void MASPreconditioner::AggregationKernel()
@@ -388,12 +443,11 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
         // the host mirror readback was the round-trip king (8/Newton-iter).
         // The prefix buffer is zeroed to capacity so the fixed-size scan in
         // PrefixSumLx sees deterministic zeros in the padded tail.
-        if(m_numEnvs <= 1)
-            CUDA_SAFE_CALL(cudaMemsetAsync(
-                d_nextPrefix, 0,
-                ((m_clusterCap + BANKSIZE - 1) / BANKSIZE) * sizeof(unsigned int)));
-        else
-            CUDA_SAFE_CALL(cudaMemcpy(&h_clevelSize, d_levelSize + level, sizeof(int2), cudaMemcpyDeviceToHost));
+        // [B3 s8] both paths: capacity-zeroed prefix buffer, no per-level
+        // count readback (the level loop is now fully device-resident).
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            d_nextPrefix, 0,
+            ((m_clusterCap + BANKSIZE - 1) / BANKSIZE) * sizeof(unsigned int)));
 
         NextLevelCluster(level);
 
@@ -1199,6 +1253,7 @@ void MASPreconditioner::initPreconditioner_Neighbor(int vertNum,
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_envBase,  4096 * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_envStart, 4096 * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_padTot,   sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_segwpe,   sizeof(int2)));  // [B3 s8]
 }
 
 void MASPreconditioner::initPreconditioner_Matrix()

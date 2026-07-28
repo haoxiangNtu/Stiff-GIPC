@@ -39,6 +39,7 @@ class MASPreconditioner
     int* d_envBase  = nullptr;   // [per-env MAS] device scratch: per-env aligned base offsets
     int* d_envStart = nullptr;   //   per-env pre-mutation scan start (avoids RAW hazard in _apply)
     int* d_padTot   = nullptr;   //   per-env-padded cluster total (written to d_levelSize on device)
+    int2* d_segwpe  = nullptr;   // [B3 s8] {segN, wpe} decided in-kernel per level
     int collision_node_Offset = 0;
     int totalNumberClusters = 0;
     //int bankSize;
