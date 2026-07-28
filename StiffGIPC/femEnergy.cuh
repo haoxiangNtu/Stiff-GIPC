@@ -153,7 +153,9 @@ __global__ void _calculate_quad_bending_gradient_hessian(const double3* vertexes
                                                          int*   row_ids,
                                                          int*   col_ids,
                                                          double IPC_dt,
-                                                         int global_hessian_fem_offset);
+                                                         int global_hessian_fem_offset,
+                                                         const int* offset_dev = nullptr,
+                                                         int offset_partial = 0);
 #endif
 
 __global__ void _calculate_triangle_fem_strain_limiting_gradient_hessian(
@@ -215,7 +217,9 @@ __global__ void _calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInvers
                                                 int*             col_ids,
                                                 double           IPC_dt,
                                                 int global_hessian_fem_offset,
-                                                const int* tet_to_abd_body /* nullable */);
+                                                const int* tet_to_abd_body /* nullable */,
+                                                const int* offset_dev = nullptr,
+                                                int offset_partial = 0);
 __global__ void _calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* trimInverses,
                                                          const double3* vertexes,
                                                          const uint3* triangles,

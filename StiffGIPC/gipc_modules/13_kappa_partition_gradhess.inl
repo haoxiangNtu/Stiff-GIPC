@@ -1,20 +1,24 @@
+// [C-2] knob-gated device-offset arming: STIFF_C2_OFFSET_DEV=1 makes the FEM
+// assembly read its triplet offset from the device total (merged path only;
+// per-env keeps host offsets — its count semantics differ). Default off until
+// the Newton-loop graph arms it wholesale. Lambda macro: needs method context.
+#define _c2_offset_dev() \
+    ([&]() -> const int* { \
+        static int _c2on = -1; \
+        if(_c2on < 0) { const char* _e = getenv("STIFF_C2_OFFSET_DEV"); _c2on = _e ? atoi(_e) : 0; } \
+        return (_c2on && !(m_perenv_bvh && m_d_p2g)) ? m_d_contact_triplet_total : nullptr; }())
+
 // [C-2] contact-segment triplet total, computed from device-resident counts.
 // Mirrors the host accumulation exactly: barrier(live cp 2/3/4) +
 // friction(lastH stash 2/3/4 + gd stash, when armed) + ground(live gp slot 5).
-__global__ void _calc_contact_triplet_total(int* d_total,
-                                            const uint32_t* cp_live,
-                                            const uint32_t* cp_fric,
-                                            const uint32_t* gp_fric,
-                                            int m12, int m9, int m6)
+// Transitional (knob mode): seeded BY MIRROR VALUE — the contact assembly
+// still writes at host offsets, so FEM must continue at exactly the host
+// arithmetic; the live device slots drift around frame boundaries (re-emitting
+// scans). The Newton-graph era recomputes this in-graph from device counts
+// once the contact side is device-offset too.
+__global__ void _calc_contact_triplet_total(int* d_total, int host_total)
 {
-    long long t = (long long)cp_live[4] * m12 + (long long)cp_live[3] * m9
-                  + (long long)cp_live[2] * m6;
-#ifdef USE_FRICTION
-    t += (long long)cp_fric[4] * m12 + (long long)cp_fric[3] * m9
-         + (long long)cp_fric[2] * m6 + (long long)(*gp_fric);
-#endif
-    t += (long long)cp_live[5];
-    *d_total = (int)t;
+    *d_total = host_total;
 }
 
 void GIPC::suggestKappa(double& kappa)
@@ -597,6 +601,19 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // more tightly than the M12_Off-blocks-per-pair worst-case bound can.
     const long long prev_triplet_len = gipc_global_triplet.global_triplet_offset;
     gipc_global_triplet.global_triplet_offset = 0;
+    // [C-2] device contact total at GH START: the assembly kernels RE-EMIT into
+    // the live _cpNum slots (ground doubles slot 5), so only the detection-fresh
+    // values here match the host mirror arithmetic below.
+    {
+        long long _ct = (long long)h_cpNum[4] * M12_Off + (long long)h_cpNum[3] * M9_Off
+                        + (long long)h_cpNum[2] * M6_Off;
+#ifdef USE_FRICTION
+        _ct += (long long)h_cpNum_last[4] * M12_Off + (long long)h_cpNum_last[3] * M9_Off
+               + (long long)h_cpNum_last[2] * M6_Off + (long long)(uint32_t)h_gpNum_last;
+#endif
+        _ct += (long long)(uint32_t)h_gpNum;
+        _calc_contact_triplet_total<<<1, 1>>>(m_d_contact_triplet_total, (int)_ct);
+    }
 
     // [P1-dyn] Grow the global triplet buffer BEFORE any assembly writes, to a PROVABLE
     // UPPER BOUND on this step's triplet count (so the unchecked assembly kernels can
@@ -771,15 +788,16 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     KSEG("seg_thru_ground")
     gipc_global_triplet.global_collision_triplet_offset =
         gipc_global_triplet.global_triplet_offset;
-    // [C-2] device mirror of the contact-segment triplet total: every factor
-    // already lives on device (_cpNum live slots + the C-1 friction stashes),
-    // so downstream FEM assembly offsets (= this + scene-constant strides) can
-    // be read in-kernel — the prerequisite for the Newton-loop graph.
-    _calc_contact_triplet_total<<<1, 1>>>(m_d_contact_triplet_total,
-                                          _cpNum,
-                                          m_scr_cp_friction,
-                                          m_scr_gp_friction,
-                                          M12_Off, M9_Off, M6_Off);
+    if(getenv("STIFF_C2_OFFSET_DIAG"))
+    {
+        int dv = -1;
+        CUDA_SAFE_CALL(cudaMemcpy(&dv, m_d_contact_triplet_total,
+                                  sizeof(int), cudaMemcpyDeviceToHost));
+        const int hv = gipc_global_triplet.global_collision_triplet_offset;
+        static int _mm = 0;
+        if(dv != hv && _mm++ < 6)
+            printf("[c2-offset-diag] MISMATCH dev=%d host=%d\n", dv, hv);
+    }
 
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     gipc_global_triplet.update_hash_value(abd_fem_count_info.abd_point_num);
@@ -873,7 +891,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                        gipc_global_triplet.block_col_indices(),
                                        IPC_dt,
                                        fem_global_hessian_index_offset,
-                                       TetMesh.d_tet_to_abd_body);
+                                       TetMesh.d_tet_to_abd_body,
+                                       _c2_offset_dev(), 0);  // [C-2] device offset (knob-gated)
         gipc_global_triplet.global_triplet_offset += abd_fem_count_info.fem_tet_num * 10;
 
 
@@ -891,7 +910,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                                 gipc_global_triplet.block_row_indices(),
                                                 gipc_global_triplet.block_col_indices(),
                                                 IPC_dt,
-                                                fem_global_hessian_index_offset);
+                                                fem_global_hessian_index_offset,
+                                                _c2_offset_dev(),
+                                                abd_fem_count_info.fem_tet_num * 10);  // [C-2] device offset (knob-gated)
 #else
         calculate_bending_gradient_hessian(TetMesh.vertexes,
                                            TetMesh.rest_vertexes,

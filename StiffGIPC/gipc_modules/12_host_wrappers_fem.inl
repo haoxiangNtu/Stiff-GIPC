@@ -469,7 +469,9 @@ void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInverses,
                                     int*                    col_ids,
                                     double                  IPC_dt,
                                     int global_hessian_fem_offset,
-                                    const int*              tet_to_abd_body /* nullable, indexed in GLOBAL tet space */)
+                                    const int*              tet_to_abd_body /* nullable, indexed in GLOBAL tet space */,
+                                    const int*              offset_dev = nullptr,
+                                    int                     offset_partial = 0)
 {
     int numbers = tetrahedraNum_FEM;
     if(numbers < 1)
@@ -492,7 +494,9 @@ void calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInverses,
         col_ids,
         IPC_dt,
         global_hessian_fem_offset,
-        tet_to_abd_body ? tet_to_abd_body + tetrahedraNum_ABD : nullptr);
+        tet_to_abd_body ? tet_to_abd_body + tetrahedraNum_ABD : nullptr,
+        offset_dev,
+        offset_partial);
 }
 
 void calculate_triangle_fem_gradient_hessian(__GEIGEN__::Matrix2x2d* triDmInverses,
@@ -625,7 +629,9 @@ void calculate_quad_bending_gradient_hessian(const double3* vertexes,
                                              int*             row_ids,
                                              int*             col_ids,
                                              double           IPC_dt,
-                                             int global_hessian_fem_offset)
+                                             int global_hessian_fem_offset,
+                                             const int*       offset_dev = nullptr,
+                                             int              offset_partial = 0)
 {
     int numbers = edgeNum;
     if(numbers < 1)
@@ -645,7 +651,9 @@ void calculate_quad_bending_gradient_hessian(const double3* vertexes,
                                                                       row_ids,
                                                                       col_ids,
                                                                       IPC_dt,
-                                                                      global_hessian_fem_offset);
+                                                                      global_hessian_fem_offset,
+                                                                      offset_dev,
+                                                                      offset_partial);
 }
 #endif
 

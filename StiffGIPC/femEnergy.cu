@@ -1735,9 +1735,15 @@ __global__ void _calculate_fem_gradient_hessian(__GEIGEN__::Matrix3x3d* DmInvers
                                                 int*             row_ids,
                                                 int*             col_ids,
                                                 double IPC_dt,int global_hessian_fem_offset,
-                                                const int* tet_to_abd_body /* nullable */)
+                                                const int* tet_to_abd_body /* nullable */,
+                                                const int* offset_dev, int offset_partial)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // [C-2] device-resident triplet offset: contact-segment total (device) +
+    // this term's scene-constant stride prefix. Equals the host value today;
+    // stays live once the Newton loop is graph-captured.
+    if(offset_dev)
+        global_offset = *offset_dev + offset_partial;
     if(idx >= tetrahedraNum)
         return;
 
@@ -2659,9 +2665,12 @@ __global__ void _calculate_quad_bending_gradient_hessian(const double3* vertexes
                                                          int*   row_ids,
                                                          int*   col_ids,
                                                          double IPC_dt,
-                                                         int global_hessian_fem_offset)
+                                                         int global_hessian_fem_offset,
+                                                         const int* offset_dev, int offset_partial)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(offset_dev)   // [C-2] see _calculate_fem_gradient_hessian
+        global_offset = *offset_dev + offset_partial;
     if(idx >= edgeNum)
         return;
 
