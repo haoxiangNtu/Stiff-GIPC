@@ -50,5 +50,13 @@ gate_prepare_paths()
 
     export GATE_BUILD_DIR GATE_LOG_DIR GATE_RESULTS_DIR
     export STIFFGIPC_NATIVE_DIR="$GATE_BUILD_DIR"
+
+# Build parallelism: leave two cores for the desktop (owner directive — a
+# saturated host reads as a frozen machine). Override with GATE_BUILD_JOBS.
+if [ -z "${GATE_BUILD_JOBS:-}" ]; then
+    GATE_BUILD_JOBS=$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))
+fi
+export GATE_BUILD_JOBS
+
     export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
 }

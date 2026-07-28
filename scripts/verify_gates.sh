@@ -35,7 +35,7 @@ if cmake -S "$ROOT" -B "$GATE_BUILD_DIR" \
         -DSTIFFGIPC_ENABLE_DIAGNOSTICS=ON \
         -DSTIFFGIPC_FEM_MODEL="${GATE_FEM_MODEL:-SNK1}" \
         > "$GATE_LOG_DIR/configure.log" 2>&1 &&
-   cmake --build "$GATE_BUILD_DIR" -j"$(nproc)" --target pystiffgipc \
+   cmake --build "$GATE_BUILD_DIR" -j"$GATE_BUILD_JOBS" --target pystiffgipc \
         > "$GATE_LOG_DIR/build.log" 2>&1; then
     echo "BUILD OK"
 else
