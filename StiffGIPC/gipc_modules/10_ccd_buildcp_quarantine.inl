@@ -265,7 +265,11 @@ void GIPC::buildCP()
     }
 
     snapshotDcdCcdPairs();   // [narrow-self snapshot] before buildFullCP clobbers the mirror
-    throwIfGroundDistanceInvalid();
+    // [B3 trial-defer] during line-search trials the collapse flag rides the
+    // piggybacked decision read instead (handleGroundCollapse at the consumer);
+    // every non-trial caller keeps the immediate blocking check.
+    if(!m_ls_defer_counts)
+        throwIfGroundDistanceInvalid();
 }
 
 // [narrow-self snapshot] copy the DCD-time CCD mirror (first h_cpNum[0] slots of
@@ -295,6 +299,14 @@ void GIPC::throwIfGroundDistanceInvalid()
     int collapsed = 0;
     if(h_gpNum > 0)
         CUDA_SAFE_CALL(cudaMemcpy(&collapsed, _gdCollapse, sizeof(int), cudaMemcpyDeviceToHost));
+    handleGroundCollapse(collapsed);
+}
+
+// [B3 trial-defer] the collapse RESPONSE, callable with a value that arrived
+// via the piggybacked decision read (no dedicated D2H). Rare path: position/
+// normal readbacks below only run on an actual violation.
+void GIPC::handleGroundCollapse(int collapsed)
+{
     if(collapsed < 0)
     {
         const int vertex = -collapsed - 1;

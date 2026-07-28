@@ -28,7 +28,8 @@ __global__ void _global_ls_decide(const double* energy0,
                                   double        alpha,
                                   double        energy_abs_tol,
                                   double        energy_rel_tol,
-                                  int*          status)
+                                  int*          status,
+                                  const int*    gd_collapse)
 {
     const double e0  = *energy0;
     const double e1  = *energy1;
@@ -45,6 +46,9 @@ __global__ void _global_ls_decide(const double* energy0,
     // [B3 trial-defer] piggyback the pair-overflow counter into the SAME
     // 8-byte host read that fetches the decision — zero extra round trips.
     status[1] = (int)g_pair_overflow_count;
+    // [B3 trial-defer] ground-collapse flag rides the same read; the host
+    // response (quarantine / typed throw) fires only on a negative value.
+    status[2] = gd_collapse ? *gd_collapse : 0;
 }
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)

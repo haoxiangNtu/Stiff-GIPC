@@ -83,6 +83,7 @@ class GIPC
     int       m_energy_bound_gp       = 0;
     unsigned  m_pair_overflow_seen    = 0u;
     void      refresh_pair_counts();
+    void      handleGroundCollapse(int collapsed);
     // [descriptor phase-0.3] solver scratch — was function-static device
     // allocations shared process-wide (leak + cross-engine sharing + dangling
     // after device reset). Instance-owned; the use sites keep their lazy
