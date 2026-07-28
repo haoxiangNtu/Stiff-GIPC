@@ -4,6 +4,13 @@
 #include "linear_system/linear_system/global_matrix.h"
 namespace gipc
 {
+enum class ConvertLayout
+{
+    AbdContact,
+    AbdFinal,
+    FinalGlobal,
+};
+
 class Converter
 {
   public:
@@ -11,13 +18,15 @@ class Converter
     void convert(GIPCTripletMatrix& global_triplets,
                  const int&         start,
                  const int&         length,
-                 const int&         out_start_id);
+                 const int&         out_start_id,
+                 ConvertLayout      layout);
 
     void convert(GIPCTripletMatrix& global_triplets,
                  const int&         start,
                  const int&         length,
                  const int&         capacity,
-                 const int&         out_start_id);
+                 const int&         out_start_id,
+                 ConvertLayout      layout);
 
     // Frame-boundary preallocation hook. Calling this before graph capture
     // guarantees that the binned duplicate merge cannot allocate in-frame.
@@ -34,7 +43,8 @@ class Converter
                                            const int&         start,
                                            const int&         length,
                                            const int&         capacity,
-                                           const int&         out_start_id);
+                                           const int&         out_start_id,
+                                           ConvertLayout      layout);
 
 
     ~Converter();

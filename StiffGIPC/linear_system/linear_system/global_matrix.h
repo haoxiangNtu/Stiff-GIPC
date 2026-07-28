@@ -21,6 +21,11 @@
 #include "linear_system/utils/pcg_capacity_mode.h"  // [B2'-b]
 #include <cstdlib>
 
+namespace frame_fsm
+{
+struct FrameDeviceState;
+}
+
 class GIPCTripletMatrix
 {
   public:
@@ -245,6 +250,24 @@ class GIPCTripletMatrix
     int global_collision_triplet_offset = 0;
     int global_external_max_capcity     = 0;
     int global_internal_capcity         = 0;
+
+    // Phase-C intermediate-convert layout.  ABD expands a contracted contact
+    // slice by 16x, so publishing the raw input length as a bound would
+    // compound every Newton iteration.  Frame zero arms a power-of-two tier
+    // from the exact unique count; transactional frames then keep that tier as
+    // the stable host layout while the exact count remains device-resident.
+    // An undersized tier is reported through m_frame_device_state and the
+    // whole frame is rolled back/retried at the boundary.
+    // The two contraction stages have unrelated cardinalities and therefore
+    // must never train/consume the same tier. [0] is the contact 3x3
+    // contraction, [1] is the post-ABD-expansion contraction.
+    int                          m_abd_unique_tier[2] = {0, 0};
+    // Diagnostic-only comparison threshold. It must never size execution:
+    // forcing the real layout tier smaller would make the 16x ABD expansion
+    // consume an incomplete Hessian before the terminal rollback can run.
+    int                          m_abd_unique_test_tier = 0;
+    bool                         m_abd_tier_txn_ok   = false;
+    frame_fsm::FrameDeviceState* m_frame_device_state = nullptr;
 
     int* d_abd_abd_contact_start_id = nullptr;
     int* d_abd_fem_contact_start_id = nullptr;

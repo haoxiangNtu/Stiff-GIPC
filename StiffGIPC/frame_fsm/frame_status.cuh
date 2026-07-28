@@ -174,6 +174,8 @@ struct alignas(16) FrameDeviceState
 
     int64_t frame_id;
     int32_t attempt;
+    int32_t retry_count;
+    uint32_t retry_invalid_bits;
     int32_t _pad1;
 };
 

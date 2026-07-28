@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 
-def make_engine():
+def make_engine(hybrid: bool = False):
     from stiff_physics.engine import Config, Engine
 
     cfg = Config(
@@ -34,8 +34,15 @@ def make_engine():
     )
     cfg._cfg.absolute_dhat = 1e-3
     engine = Engine(cfg)
-    engine.load_mesh("tetMesh/cube.msh", 3, "FEM", np.eye(4))
-    engine.native.set_body_groups([0])
+    if hybrid:
+        engine.load_mesh("tetMesh/cube.msh", 3, "ABD", np.eye(4))
+        transform = np.eye(4)
+        transform[0, 3] = 0.4005
+        engine.load_mesh("tetMesh/cube.msh", 3, "ABD", transform)
+        engine.native.set_body_groups([0, 0])
+    else:
+        engine.load_mesh("tetMesh/cube.msh", 3, "FEM", np.eye(4))
+        engine.native.set_body_groups([0])
     engine.finalize()
     return engine
 
@@ -85,6 +92,47 @@ def rollback_case() -> None:
     print("FRAME-GRAPH-ROLLBACK: PASS")
 
 
+def unique_overflow_case() -> None:
+    engine = make_engine(hybrid=True)
+    engine.step()
+    before = np.asarray(engine.get_vertices()).copy()
+    engine.step()
+    after = np.asarray(engine.get_vertices()).copy()
+    status = engine.native.get_frame_status()
+    assert not np.array_equal(before, after)
+    assert status.result == 0
+    assert status.phase == 8
+    assert status.error_code == 0
+    assert status.attempt == 1
+    assert status.retry_count == 1
+    assert status.retry_invalid_bits & (1 << 19)
+    assert status.path_flags & (1 << 6)
+    assert status.path_flags & (1 << 7)
+    assert status.terminal_d2h_nodes == 1
+    print("FRAME-GRAPH-UNIQUE-RETRY: PASS")
+
+
+def unique_exhaustion_case() -> None:
+    engine = make_engine(hybrid=True)
+    engine.step()
+    before = np.asarray(engine.get_vertices()).copy()
+    try:
+        engine.step()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("zero retry budget did not surface overflow")
+    after = np.asarray(engine.get_vertices()).copy()
+    status = engine.native.get_frame_status()
+    assert np.array_equal(before, after)
+    assert status.result == 1
+    assert status.phase == 9
+    assert status.error_code == 4
+    assert status.retry_count == 0
+    assert status.retry_invalid_bits & (1 << 19)
+    print("FRAME-GRAPH-RETRY-EXHAUSTION: PASS")
+
+
 def run_child(mode: str) -> None:
     env = os.environ.copy()
     env["STIFF_FRAME_GRAPH"] = "1"
@@ -93,6 +141,14 @@ def run_child(mode: str) -> None:
         env["STIFF_FRAME_FORCE_ROLLBACK"] = "1"
     else:
         env.pop("STIFF_FRAME_FORCE_ROLLBACK", None)
+    if mode.startswith("unique-"):
+        env["STIFF_FRAME_FORCE_UNIQUE_TIER"] = "1"
+    else:
+        env.pop("STIFF_FRAME_FORCE_UNIQUE_TIER", None)
+    if mode == "unique-exhaustion":
+        env["STIFF_FRAME_MAX_RETRIES"] = "0"
+    else:
+        env.pop("STIFF_FRAME_MAX_RETRIES", None)
     subprocess.run(
         [sys.executable, __file__, f"--child={mode}"],
         check=True,
@@ -111,7 +167,13 @@ if __name__ == "__main__":
         normal_case()
     elif child == "rollback":
         rollback_case()
+    elif child == "unique-overflow":
+        unique_overflow_case()
+    elif child == "unique-exhaustion":
+        unique_exhaustion_case()
     else:
         run_child("normal")
         run_child("rollback")
+        run_child("unique-overflow")
+        run_child("unique-exhaustion")
         print("FRAME-GRAPH-GATE: PASS")

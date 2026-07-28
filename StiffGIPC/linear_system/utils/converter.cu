@@ -6,6 +6,7 @@
 #include <gipc/utils/timer.h>
 #include <gipc/utils/parallel_algorithm/fast_segmental_reduce.h>
 #include <linear_system/utils/binned_reduce.cuh>
+#include <frame_fsm/frame_status.cuh>
 
 #include <algorithm>
 
@@ -32,19 +33,47 @@ __global__ void _finalize_unique_count(int* dst,
     *dst = static_cast<int>(*last_partition) + 1;
 }
 
+__global__ void _publish_unique_frame_state(
+    const int* d_unique,
+    int armed_tier,
+    frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x || !frame)
+        return;
+
+    const int exact = *d_unique;
+    frame->unique_count = exact;
+    atomicMax(&frame->hw_unique_blocks, exact);
+    if(armed_tier <= 0 || exact <= armed_tier)
+        return;
+
+    atomicMax(&frame->required_unique_blocks, exact);
+    frame_fsm::fsm_record_error(frame,
+                                frame_fsm::ERR_CAPACITY,
+                                frame_fsm::OVF_UNIQUE_BLOCKS,
+                                -1,
+                                -1);
+    atomicCAS(&frame->result,
+              frame_fsm::FRAME_OK,
+              frame_fsm::FRAME_RETRY_REQUIRED);
+}
+
 constexpr bool UseRadixSort   = true;
 constexpr bool UseReduceByKey = false;
 
 void Converter::convert(GIPCTripletMatrix& global_triplets,
                         const int&          start,
                         const int&          length,
-                        const int&          out_start_id)
+                        const int&          out_start_id,
+                        ConvertLayout       layout)
 {
     const int capacity =
-        GIPCTripletMatrix::device_count_mode() && start == 0
+        GIPCTripletMatrix::device_count_mode()
+                && layout == ConvertLayout::FinalGlobal
             ? assembly_capacity_tier(length)
             : length;
-    convert(global_triplets, start, length, capacity, out_start_id);
+    convert(
+        global_triplets, start, length, capacity, out_start_id, layout);
 }
 
 void Converter::ensure_capacity(int capacity)
@@ -66,7 +95,8 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
                         const int&          start,
                         const int&          length,
                         const int&          capacity,
-                        const int&          out_start_id)
+                        const int&          out_start_id,
+                        ConvertLayout       layout)
 {
     gipc::Timer timer("convert3x3");
     if(length < 1)
@@ -93,7 +123,7 @@ void Converter::convert(GIPCTripletMatrix& global_triplets,
     _radix_sort_indices_and_blocks(
         global_triplets, start, length, capacity, out_start_id);
     _make_unique_block_warp_reduction(
-        global_triplets, start, length, capacity, out_start_id);
+        global_triplets, start, length, capacity, out_start_id, layout);
 }
 
 void Converter::_radix_sort_indices_and_blocks(
@@ -159,7 +189,8 @@ void Converter::_make_unique_block_warp_reduction(
     const int&         start,
     const int&         length,
     const int&         capacity,
-    const int&         out_start_id)
+    const int&         out_start_id,
+    ConvertLayout      layout)
 {
     using namespace muda;
 
@@ -207,15 +238,30 @@ void Converter::_make_unique_block_warp_reduction(
         global_triplets.d_unique_key_number,
         sorted_partition_output + length - 1);
 
-    // A bound layout is valid only at the final global convert. Intermediate
-    // ABD slice converts size the following x16 expansion and retain the exact
-    // host contraction until that dispatch is made device-resident.
-    const bool bound_layout =
-        GIPCTripletMatrix::device_count_mode() && start == 0;
+    // A raw upper-bound layout is valid at the final global convert. ABD
+    // slice converts instead use the stable power-of-two tier armed during
+    // warm-up. The exact device count still guards the merge and an
+    // undershoot poisons the surrounding frame transaction.
+    bool bound_layout =
+        GIPCTripletMatrix::device_count_mode()
+        && layout == ConvertLayout::FinalGlobal;
+    const int tier_index =
+        layout == ConvertLayout::AbdFinal ? 1 : 0;
+    int armed_abd_tier  = 0;
     int host_merge_count = length;
     if(bound_layout)
     {
         global_triplets.h_unique_key_number = length;
+    }
+    else if(GIPCTripletMatrix::device_count_mode()
+            && global_triplets.m_abd_tier_txn_ok
+            && global_triplets.m_abd_unique_tier[tier_index] > 0
+            && global_triplets.m_abd_unique_tier[tier_index] <= length)
+    {
+        armed_abd_tier =
+            global_triplets.m_abd_unique_tier[tier_index];
+        global_triplets.h_unique_key_number = armed_abd_tier;
+        bound_layout = true;
     }
     else
     {
@@ -225,7 +271,18 @@ void Converter::_make_unique_block_warp_reduction(
                        sizeof(int),
                        cudaMemcpyDeviceToHost));
         host_merge_count = global_triplets.h_unique_key_number;
+        if(GIPCTripletMatrix::device_count_mode()
+           && layout != ConvertLayout::FinalGlobal)
+            global_triplets.m_abd_unique_tier[tier_index] =
+                assembly_capacity_tier(host_merge_count);
     }
+
+    _publish_unique_frame_state<<<1, 1, 0, cudaStreamPerThread>>>(
+        global_triplets.d_unique_key_number,
+        global_triplets.m_abd_unique_test_tier > 0
+            ? global_triplets.m_abd_unique_test_tier
+            : armed_abd_tier,
+        global_triplets.m_frame_device_state);
 
     const int clear_count = bound_layout ? length : host_merge_count;
     CUDA_SAFE_CALL(cudaMemsetAsync(

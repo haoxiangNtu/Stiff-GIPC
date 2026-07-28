@@ -721,7 +721,8 @@ class GIPC
     void destroy_frame_graph();
     void frame_graph_begin(device_TetraData& TetMesh,
                            int64_t frame_id,
-                           int attempt = 0);
+                           int attempt = 0,
+                           uint32_t retry_invalid_bits = 0);
     void frame_graph_enqueue_terminal(device_TetraData& TetMesh,
                                       int result,
                                       int error_code,

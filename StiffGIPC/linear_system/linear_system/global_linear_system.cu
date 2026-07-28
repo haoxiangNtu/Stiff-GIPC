@@ -301,12 +301,21 @@ void GlobalLinearSystem::convert_new()
     {
         const int layout = assembly_capacity_tier(length);
         m_converter.convert(
-            *gipc_global_triplet, 0, length, layout, layout);
+            *gipc_global_triplet,
+            0,
+            length,
+            layout,
+            layout,
+            ConvertLayout::FinalGlobal);
     }
     else
     {
         m_converter.convert(
-            *gipc_global_triplet, 0, length, length);
+            *gipc_global_triplet,
+            0,
+            length,
+            length,
+            ConvertLayout::FinalGlobal);
     }
 }
 

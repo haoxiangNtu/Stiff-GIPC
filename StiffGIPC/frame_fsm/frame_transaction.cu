@@ -4,6 +4,7 @@
 #include "abd_system/abd_system.h"
 #include "cuda_tools/cuda_tools.h"
 #include "linear_system/linear_system/global_linear_system.h"
+#include "linear_system/utils/capacity_tier.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -16,10 +17,12 @@ namespace
 {
 struct alignas(16) FrameBeginInput
 {
-    int64_t  frame_id   = 0;
-    int32_t  attempt    = 0;
-    uint32_t path_flags = 0;
-    double   kappa      = 0.0;
+    int64_t  frame_id           = 0;
+    int32_t  attempt            = 0;
+    uint32_t path_flags         = 0;
+    uint32_t retry_invalid_bits = 0;
+    int32_t  _pad0              = 0;
+    double   kappa              = 0.0;
 };
 
 struct alignas(16) FrameTerminalInput
@@ -175,6 +178,8 @@ __global__ void frame_begin_init(frame_fsm::FrameDeviceState* state,
     state->cfl_alpha        = 1.0;
     state->frame_id         = input->frame_id;
     state->attempt          = input->attempt;
+    state->retry_count      = input->attempt;
+    state->retry_invalid_bits = input->retry_invalid_bits;
     state->path_flags       = input->path_flags;
     state->kappa            = input->kappa;
 }
@@ -188,14 +193,38 @@ __global__ void frame_terminal_apply(
     state->newton_iter      = input->newton_iters;
     state->pcg_iter_total  += input->pcg_iters;
     state->ls_trial         = input->ls_trials;
-    state->hw_dcd_pairs     = input->hw_dcd_pairs;
-    state->hw_ccd_pairs     = input->hw_ccd_pairs;
-    state->hw_triplets      = input->hw_triplets;
-    state->hw_unique_blocks = input->hw_unique_blocks;
-    state->required_dcd_pairs = input->required_dcd_pairs;
-    state->required_ccd_pairs = input->required_ccd_pairs;
-    state->required_triplets = input->required_triplets;
-    state->required_unique_blocks = input->required_unique_blocks;
+    state->hw_dcd_pairs =
+        state->hw_dcd_pairs > input->hw_dcd_pairs
+            ? state->hw_dcd_pairs
+            : input->hw_dcd_pairs;
+    state->hw_ccd_pairs =
+        state->hw_ccd_pairs > input->hw_ccd_pairs
+            ? state->hw_ccd_pairs
+            : input->hw_ccd_pairs;
+    state->hw_triplets =
+        state->hw_triplets > input->hw_triplets
+            ? state->hw_triplets
+            : input->hw_triplets;
+    state->hw_unique_blocks =
+        state->hw_unique_blocks > input->hw_unique_blocks
+            ? state->hw_unique_blocks
+            : input->hw_unique_blocks;
+    state->required_dcd_pairs =
+        state->required_dcd_pairs > input->required_dcd_pairs
+            ? state->required_dcd_pairs
+            : input->required_dcd_pairs;
+    state->required_ccd_pairs =
+        state->required_ccd_pairs > input->required_ccd_pairs
+            ? state->required_ccd_pairs
+            : input->required_ccd_pairs;
+    state->required_triplets =
+        state->required_triplets > input->required_triplets
+            ? state->required_triplets
+            : input->required_triplets;
+    state->required_unique_blocks =
+        state->required_unique_blocks > input->required_unique_blocks
+            ? state->required_unique_blocks
+            : input->required_unique_blocks;
     state->alpha            = input->final_alpha;
     state->energy_trial     = input->final_energy;
     state->max_movement     = input->max_movement;
@@ -346,6 +375,8 @@ __global__ void frame_serialize_status(
     out.kappa          = state->kappa;
     out.frame_id       = state->frame_id;
     out.attempt        = state->attempt;
+    out.retry_count    = state->retry_count;
+    out.retry_invalid_bits = state->retry_invalid_bits;
     *status = out;
 }
 
@@ -699,7 +730,8 @@ void GIPC::prepare_frame_graph(device_TetraData& mesh)
 
 void GIPC::frame_graph_begin(device_TetraData& mesh,
                              int64_t frame_id,
-                             int attempt)
+                             int attempt,
+                             uint32_t retry_invalid_bits)
 {
     prepare_frame_graph(mesh);
     FrameGraphContext& context = graph_context(*this);
@@ -709,11 +741,29 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     *context.h_begin = FrameBeginInput{};
     context.h_begin->frame_id = frame_id;
     context.h_begin->attempt  = attempt;
+    context.h_begin->retry_invalid_bits = retry_invalid_bits;
     context.h_begin->path_flags =
         frame_fsm::PATH_GRAPH_REQUESTED
         | frame_fsm::PATH_GRAPH_ACTIVE
         | frame_fsm::PATH_HOST_PHASE_BRIDGE
         | frame_fsm::PATH_PCG_DEVICE_CONTINUATION;
+    if(attempt > 0)
+        context.h_begin->path_flags |= frame_fsm::PATH_RETRIED;
+    gipc_global_triplet.m_abd_unique_test_tier = 0;
+    bool force_unique_tier = false;
+    if(const char* forced_tier =
+           std::getenv("STIFF_FRAME_FORCE_UNIQUE_TIER"))
+    {
+        const int tier = std::atoi(forced_tier);
+        if(tier > 0)
+        {
+            force_unique_tier = true;
+            if(attempt == 0)
+                gipc_global_triplet.m_abd_unique_test_tier = tier;
+            context.h_begin->path_flags |=
+                frame_fsm::PATH_TEST_INJECTION;
+        }
+    }
     context.h_begin->kappa = Kappa;
 
     const cudaError_t launch =
@@ -727,6 +777,11 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     }
     if(m_global_linear_system)
         m_global_linear_system->set_frame_device_state(context.d_state);
+    gipc_global_triplet.m_frame_device_state = context.d_state;
+    const char* abd_tier = std::getenv("STIFF_ABD_TIER");
+    gipc_global_triplet.m_abd_tier_txn_ok =
+        force_unique_tier
+        || (abd_tier && abd_tier[0] && std::atoi(abd_tier) != 0);
     m_frame_graph_active     = true;
     m_frame_terminal_emitted = false;
 }
@@ -792,6 +847,20 @@ int GIPC::frame_graph_finish_terminal()
     if(!m_frame_terminal_emitted)
         throw std::logic_error("frame terminal graph was not emitted");
     m_last_frame_status = *context.h_status;
+    if((m_last_frame_status.invalid_bits
+        & frame_fsm::OVF_UNIQUE_BLOCKS)
+       && m_last_frame_status.required_unique_blocks > 0)
+    {
+        // Boundary-only tier growth.  No graph body allocation or host count
+        // refresh is needed on the retry: the terminal packet already carried
+        // the exact required count.
+        const int tier = gipc::assembly_capacity_tier(
+            m_last_frame_status.required_unique_blocks);
+        gipc_global_triplet.m_abd_unique_tier[0] = std::max(
+            gipc_global_triplet.m_abd_unique_tier[0], tier);
+        gipc_global_triplet.m_abd_unique_tier[1] = std::max(
+            gipc_global_triplet.m_abd_unique_tier[1], tier);
+    }
     if(m_last_frame_status.result != frame_fsm::FRAME_OK)
         restore_host_attempt(*this, context.host_snapshot);
     else
@@ -800,6 +869,9 @@ int GIPC::frame_graph_finish_terminal()
             + m_last_frame_status.pcg_iters;
     if(m_global_linear_system)
         m_global_linear_system->set_frame_device_state(nullptr);
+    gipc_global_triplet.m_frame_device_state = nullptr;
+    gipc_global_triplet.m_abd_unique_test_tier = 0;
+    gipc_global_triplet.m_abd_tier_txn_ok    = false;
     m_frame_graph_active     = false;
     m_frame_terminal_emitted = false;
     return m_last_frame_status.result;
@@ -826,30 +898,75 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
         return;
     }
 
-    frame_graph_begin(mesh, m_total_frames, 0);
-    try
+    int max_retries = 3;
+    if(const char* configured = std::getenv("STIFF_FRAME_MAX_RETRIES"))
+        max_retries = std::clamp(std::atoi(configured), 0, 16);
+    const char* force_rollback =
+        std::getenv("STIFF_FRAME_FORCE_ROLLBACK");
+    const bool diagnostic_rollback =
+        force_rollback && force_rollback[0]
+        && force_rollback[0] != '0';
+    constexpr uint32_t capacity_bits =
+        frame_fsm::OVF_DCD_PAIRS
+        | frame_fsm::OVF_CCD_PAIRS
+        | frame_fsm::OVF_TRIPLETS
+        | frame_fsm::OVF_UNIQUE_BLOCKS
+        | frame_fsm::OVF_MAS_CLUSTERS;
+    const int64_t physical_frame_id = m_total_frames;
+    uint32_t retry_invalid_bits = 0;
+
+    for(int attempt = 0; attempt <= max_retries; ++attempt)
     {
-        IPC_Solver(mesh);
-        frame_graph_enqueue_terminal(
-            mesh, frame_fsm::FRAME_OK, frame_fsm::ERR_NONE);
-        CUDA_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
-        const int result = frame_graph_finish_terminal();
-        if(result != frame_fsm::FRAME_OK)
-            throw std::runtime_error(
-                status_error(m_last_frame_status, "terminal rollback"));
-    }
-    catch(const std::exception& error)
-    {
-        if(m_frame_graph_active && !m_frame_terminal_emitted)
+        frame_graph_begin(
+            mesh, physical_frame_id, attempt, retry_invalid_bits);
+        try
         {
-            frame_graph_enqueue_terminal(mesh,
-                                         frame_fsm::FRAME_FATAL,
-                                         frame_fsm::ERR_SOLVER_EXCEPTION);
+            IPC_Solver(mesh);
+            frame_graph_enqueue_terminal(
+                mesh, frame_fsm::FRAME_OK, frame_fsm::ERR_NONE);
             CUDA_SAFE_CALL(
                 cudaStreamSynchronize(cudaStreamPerThread));
-            frame_graph_finish_terminal();
+        }
+        catch(const std::exception& error)
+        {
+            if(m_frame_graph_active && !m_frame_terminal_emitted)
+            {
+                frame_graph_enqueue_terminal(
+                    mesh,
+                    frame_fsm::FRAME_FATAL,
+                    frame_fsm::ERR_SOLVER_EXCEPTION);
+                CUDA_SAFE_CALL(
+                    cudaStreamSynchronize(cudaStreamPerThread));
+                frame_graph_finish_terminal();
+            }
+            throw std::runtime_error(
+                status_error(m_last_frame_status, error.what()));
+        }
+
+        const int result = frame_graph_finish_terminal();
+        if(result == frame_fsm::FRAME_OK)
+            return;
+
+        retry_invalid_bits |= m_last_frame_status.invalid_bits;
+        const bool retryable =
+            result == frame_fsm::FRAME_RETRY_REQUIRED
+            && (m_last_frame_status.invalid_bits & capacity_bits)
+            && !diagnostic_rollback;
+        if(retryable && attempt < max_retries)
+            continue;
+
+        if(retryable)
+        {
+            m_last_frame_status.error_code =
+                frame_fsm::ERR_RETRY_EXHAUSTED;
+            m_last_frame_status.retry_count = attempt;
+            m_last_frame_status.retry_invalid_bits =
+                retry_invalid_bits;
         }
         throw std::runtime_error(
-            status_error(m_last_frame_status, error.what()));
+            status_error(m_last_frame_status,
+                         retryable
+                             ? "capacity retry budget exhausted"
+                             : "terminal rollback"));
     }
 }

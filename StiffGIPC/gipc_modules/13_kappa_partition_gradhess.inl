@@ -478,10 +478,11 @@ void GIPC::partitionContactHessian()
     //gipc_global_triplet.d_fem_abd_contact_start_id = -1;
     //gipc_global_triplet.d_fem_fem_contact_start_id = -1;
 
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_abd_abd_contact_start_id, -1, sizeof(int)));
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_abd_fem_contact_start_id, -1, sizeof(int)));
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_fem_abd_contact_start_id, -1, sizeof(int)));
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_fem_fem_contact_start_id, -1, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        gipc_global_triplet.d_contact_start_block,
+        -1,
+        4 * sizeof(int),
+        cudaStreamPerThread));
 
     size_t shareMem = (threadNum + 1) * sizeof(int);
     LaunchCudaKernal_default(gipc_global_triplet.global_collision_triplet_offset,
@@ -596,23 +597,28 @@ void GIPC::partitionContactHessian()
     gipc_global_triplet.h_abd_abd_contact_start_id =
         gipc_global_triplet.h_fem_abd_contact_start_id + gipc_global_triplet.fem_abd_contact_num;
 
-    CUDA_SAFE_CALL(
-        cudaMemcpy(gipc_global_triplet.block_row_indices(),
-                   gipc_global_triplet.block_row_indices() + gipc_global_triplet.global_collision_triplet_offset,
-                   gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
-                   cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        gipc_global_triplet.block_row_indices(),
+        gipc_global_triplet.block_row_indices()
+            + gipc_global_triplet.global_collision_triplet_offset,
+        gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
 
-    CUDA_SAFE_CALL(
-        cudaMemcpy(gipc_global_triplet.block_col_indices(),
-                   gipc_global_triplet.block_col_indices() + gipc_global_triplet.global_collision_triplet_offset,
-                   gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
-                   cudaMemcpyDeviceToDevice));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        gipc_global_triplet.block_col_indices(),
+        gipc_global_triplet.block_col_indices()
+            + gipc_global_triplet.global_collision_triplet_offset,
+        gipc_global_triplet.global_collision_triplet_offset * sizeof(int),
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
 
-    CUDA_SAFE_CALL(cudaMemcpy(
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
         gipc_global_triplet.block_values(),
         gipc_global_triplet.block_values() + gipc_global_triplet.global_collision_triplet_offset,
         gipc_global_triplet.global_collision_triplet_offset * sizeof(Eigen::Matrix3d),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
 }
 
 static void _dbg_ksum_comm(const char* name, const void* dptr, size_t nbytes);  // [4.3 fwd]

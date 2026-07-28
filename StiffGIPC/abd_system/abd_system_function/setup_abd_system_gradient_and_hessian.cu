@@ -343,12 +343,12 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
 {
     fem_boundary_type = fbtype;
     setup_abd_system_gradient_hessian(sim_data, global_triplets, vertex_barrier_gradient);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     converter3x3.convert(global_triplets,
                          global_triplets.h_abd_abd_contact_start_id,
                          global_triplets.abd_abd_contact_num,
-                         global_triplets.global_collision_triplet_offset);
+                         global_triplets.global_collision_triplet_offset,
+                         ConvertLayout::AbdFinal);
     global_triplets.global_collision_triplet_offset =
         global_triplets.global_collision_triplet_offset
         - global_triplets.abd_abd_contact_num + global_triplets.h_unique_key_number;
@@ -647,7 +647,8 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
         converter3x3.convert(global_triplets,
                              global_triplets.h_abd_abd_contact_start_id,
                              global_triplets.abd_abd_contact_num,
-                             global_triplets.global_collision_triplet_offset);
+                             global_triplets.global_collision_triplet_offset,
+                             ConvertLayout::AbdContact);
     }
     else
     {
@@ -699,7 +700,6 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
         global_triplets.block_col_indices(h_abd_abd_contact_start_id
                                           + new_triplet_offset + write_offset),
         (int)body_hessian_size);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
     if(bcooNum)
     {
         {
@@ -1026,24 +1026,27 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
     global_triplets.global_triplet_offset = global_triplets.global_collision_triplet_offset;
 
 
-    CUDA_SAFE_CALL(cudaMemcpy(
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
         global_triplets.block_values() + global_triplets.fem_fem_contact_num,
         global_triplets.block_values() + new_triplet_offset + global_triplets.fem_fem_contact_num,
         (new_triplet_offset - global_triplets.fem_fem_contact_num) * sizeof(Eigen::Matrix3d),
-        cudaMemcpyDeviceToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
         global_triplets.block_col_indices() + global_triplets.fem_fem_contact_num,
         global_triplets.block_col_indices() + new_triplet_offset
             + global_triplets.fem_fem_contact_num,
         (new_triplet_offset - global_triplets.fem_fem_contact_num) * sizeof(int),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
 
-    CUDA_SAFE_CALL(cudaMemcpy(
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
         global_triplets.block_row_indices() + global_triplets.fem_fem_contact_num,
         global_triplets.block_row_indices() + new_triplet_offset
             + global_triplets.fem_fem_contact_num,
         (new_triplet_offset - global_triplets.fem_fem_contact_num) * sizeof(int),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice,
+        cudaStreamPerThread));
 }
 
 // ============================================================================
