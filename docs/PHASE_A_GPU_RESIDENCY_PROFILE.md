@@ -73,3 +73,25 @@ __constant__ 合并）互补成对：读侧状态块 + 写侧描述符 = 主机�
 1. B2' 前置审计（Explore 代理枚举捕获指针族生命周期）→ 实施+失效钩子。
 2. B3 状态块（散点逐个迁移，每步套件+锚验证）。
 3. 复剖析（nsys A800 对照 Phase A 基线：memcpy/帧、launch/帧、GPU 空转比）。
+
+---
+
+# B2' 前置审计结论（2026-07-28，全量指针生命周期普查）
+
+- **朴素签名缓存必然高失效**：triplet_count（converter 每牛顿迭代 D2H 刷新，
+  喂 spmv 网格）与 MAS totalNumberClusters（每迭代随接触重聚类，喂 memset
+  长度+三处网格）皆 PSV。先决改造=**设备侧计数绑定**：spmv 按容量定网格+核内
+  `if(tid>=*d_unique_key_number) return`（设备标量现成 global_matrix.h:255）；
+  MAS memset/网格按 m_outputClusterCap 填充+设备簇数界。strict 走 binned 序无
+  关沉积→网格改形位级中性；merged/isolated 在非确定性包络内（G9 看守）。
+- **收益重估**：捕获+更新+上传 ≈2-3ms/帧（~2%）。**B3 迭代状态块升为主攻**
+  （75% 空转在阻塞读回的排空语义）；B2' 缓存降为后续，实施时按审计的
+  PcgGraphSig 结构体+三代际计数器（GIPCTripletMatrix::m_alloc_gen /
+  MASPreconditioner::m_alloc_gen / PCGSolver::m_seg_alloc_gen，ABA 防护非可选）
+  +STIFF_PCG_GRAPH_CACHE 开关+CACHE_VERIFY 自证模式。
+- **捎回两个潜伏 bug（入错误分类学队列）**：①cub_temp 惰性分配后**从不增长**
+  且 cub 返回码被丢弃（pcg_solver.cu:528-533）——n 增长时静默 InvalidValue；
+  ②reserve_discard free-立即-malloc 的 ABA（global_matrix.h:81-83）。
+  另：pcg_solver 文件级 getenv 静态族（s_graph_env 等）为进程稳定缓存，跨引擎
+  语义已由 phase-0a 值追踪先例覆盖 s_seg_binned_host，余者低危。
+- 完整表（每指针 owner/alloc/realloc 点/稳定性判定）见会话审计工件。
