@@ -229,6 +229,19 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         //break;
     }
 
+    // [B3 trial-defer] merged path only (the per-env buildCP refreshes counts
+    // inside its own pipeline): contact/ground energy grids use slacked
+    // iteration-start bounds + device live counts during trials; the mirror
+    // stays invalid (MIRROR_AUDIT enforces no stale reader) and is refreshed
+    // once at line-search exit. Overflow rides the decision read.
+    const bool ls_defer = device_ls && !(m_perenv_bvh && m_d_p2g);
+    if(ls_defer)
+    {
+        m_energy_bound_cp = (int)h_cpNum[0] + (int)h_cpNum[0] / 4 + 64;
+        m_energy_bound_gp = (int)h_gpNum + (int)h_gpNum / 4 + 64;
+        m_ls_defer_counts          = true;
+        m_energy_use_device_counts = true;
+    }
     buildCP();
 
     double testingE = 0.0;
@@ -244,11 +257,42 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                                         energy_abs_tol,
                                         energy_rel_tol,
                                         m_line_search_decision);
-            int decision = 0;
-            CUDA_SAFE_CALL(cudaMemcpy(&decision,
+            int dec_of[2] = {0, 0};
+            CUDA_SAFE_CALL(cudaMemcpy(dec_of,
                                       m_line_search_decision,
-                                      sizeof(int),
+                                      2 * sizeof(int),
                                       cudaMemcpyDeviceToHost));
+            int decision = dec_of[0];
+            // [B3 trial-defer] monotone pair-overflow counter piggybacked on
+            // the decision read. A bump means this trial's detection hit the
+            // emission caps: re-run buildCP in legacy mode (full counts +
+            // grow + redo machinery), refresh the bounds, and re-evaluate the
+            // trial energy once. False positives (counter drift from a legacy
+            // overflow elsewhere) just repeat this benign recovery.
+            if(m_ls_defer_counts
+               && (unsigned)dec_of[1] != m_pair_overflow_seen)
+            {
+                m_pair_overflow_seen       = (unsigned)dec_of[1];
+                m_ls_defer_counts          = false;
+                buildCP();
+                m_ls_defer_counts          = true;
+                m_energy_bound_cp = (int)h_cpNum[0] + (int)h_cpNum[0] / 4 + 64;
+                m_energy_bound_gp = (int)h_gpNum + (int)h_gpNum / 4 + 64;
+                computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 1);
+                _global_ls_decide<<<1, 1>>>(m_line_search_energy + 0,
+                                            m_line_search_energy + 1,
+                                            c1m,
+                                            trial_alpha,
+                                            energy_abs_tol,
+                                            energy_rel_tol,
+                                            m_line_search_decision);
+                CUDA_SAFE_CALL(cudaMemcpy(dec_of,
+                                          m_line_search_decision,
+                                          2 * sizeof(int),
+                                          cudaMemcpyDeviceToHost));
+                decision             = dec_of[0];
+                m_pair_overflow_seen = (unsigned)dec_of[1];
+            }
             if(getenv("STIFF_DEVICE_LINESEARCH_VALIDATE"))
             {
                 double h_energy[2] = {0.0, 0.0};
@@ -308,6 +352,14 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         buildBVH();
         buildCP();
         energy_decision = evaluate_trial_energy(alpha);
+    }
+    // [B3 trial-defer] restore mirror freshness once for everything after
+    // the trial loop (postLineSearch, next-iteration GH, close constraints).
+    if(m_ls_defer_counts)
+    {
+        m_ls_defer_counts          = false;
+        m_energy_use_device_counts = false;
+        refresh_pair_counts();
     }
     const bool line_search_exhausted = energy_decision == 1;
     if(energy_decision == 2)

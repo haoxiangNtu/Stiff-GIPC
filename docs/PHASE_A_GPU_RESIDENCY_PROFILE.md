@@ -166,3 +166,20 @@ gdCollapse} 三读合一受阻于**能量核网格消费 h_cpNum[0]**（decide �
 合块）→②trial 三读合一→③gdCollapse 延迟消费（仅 line-search 路径，其余
 buildCP 调用者保留即时校验；NaN→backtrack 语义已天然兜底）。ccd 隐藏 3.2 同
 族（buildFullCP 计数镜像）。
+
+---
+
+# 手术③战报：trial 计数延迟 + 设备计数界（2026-07-28）
+
+能量核容量网格改造落地（merged 路径）：barrier/ground 能量核 +`d_live` 尾参
+（空=旧语义，全调用点零改动）；trial 期 buildCP 跳过计数 D2H（镜像保持
+invalid，MIRROR_AUDIT 武装态即收口证明）；能量网格用迭代首界（×1.25+64 松
+弛）+核内设备活计数；溢出走发射路径的**永增计数器**（trash 分支冷路径零热
+成本）随 decision 同一次 8 字节读回捎带，触发即退回 legacy buildCP 复用全部
+grow+redo 机器再重评（假阳性=良性重跑）。零填充归约位级中性（temp=0）。
+strict/per-env 路径不启用（其管线自带刷新），锚逐位原位。
+
+同场景对照（towel）：line_search 阻塞拷贝 **9.87→8.29/迭代**（-1.6=2 拷贝
+×0.8 trial，精确吻合）；GH 7.88 不变。多 trial 场景收益按 2×trials/iter 放大。
+解锁：trial 决策+溢出已合一读；余 gdCollapse 1/trial（下刀）；B2' 图缓存的
+triplet_count PSV 同法可解；ccd 隐藏族同族。

@@ -380,7 +380,7 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_energy, 2 * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_compatibility_energy, sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, 2 * sizeof(int)));  // [B3] {decision, overflow_count}
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_newton_convergence_decision, sizeof(int)));
     // Device-resident CCD alpha/control chain (see slot layout in GIPC.cuh).
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 8 * sizeof(double)));

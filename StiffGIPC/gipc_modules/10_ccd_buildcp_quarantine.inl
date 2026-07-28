@@ -85,6 +85,16 @@ double GIPC::InjectiveStepSize(double slackness, double errorRate, double* mqueu
     return 1.0 / minValue;
 }
 
+// [B3 trial-defer] the counts-after-build refresh, extracted so the
+// line-search exit can restore mirror freshness after deferred trials.
+void GIPC::refresh_pair_counts()
+{
+    uint32_t cp_gp_buf[6];
+    CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
+    h_gpNum = cp_gp_buf[5];
+}
+
 void GIPC::buildCP()
 {
     // [3b] device truth changes below: DCD re-emission rewrites _cpNum/_gpNum
@@ -207,6 +217,12 @@ void GIPC::buildCP()
     CUDA_SAFE_CALL(cudaStreamWaitEvent(
         cudaStreamPerThread, m_aux_done_event, 0));
 
+    if(m_ls_defer_counts)
+    {   // [B3 trial-defer] mirror stays invalid during trials; energies use
+        // the slacked bounds + device live counts; overflow via the monotone
+        // counter on the decision read. MIRROR_AUDIT proves no stale reader.
+        return;
+    }
     {   // [9d28824-port] contiguous _cpNum[0:5]+_gpNum[5]: one 6-int D2H.
         uint32_t cp_gp_buf[6];
         CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));

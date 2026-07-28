@@ -51,7 +51,8 @@ extern __global__ void _computeGroundEnergy_Reduction(double*        squeue,
                                                double dHat,
                                                double Kappa,
                                                int    number,
-                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0);  // reduction: blocking-dispatcher launch, defaults carried
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                               const uint32_t* d_live = nullptr);  // reduction: blocking-dispatcher launch, defaults carried
 
 // ── rung 2: soft_constraints (energy/soft_constraints.cu) ──
 extern __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes,
@@ -252,4 +253,5 @@ extern __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
                                                double         _Kappa,
                                                double         _dHat,
                                                int            cpNum,
-                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0);
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                               const uint32_t* d_live = nullptr);

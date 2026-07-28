@@ -11,13 +11,18 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
                                                double         _Kappa,
                                                double         _dHat,
                                                int            cpNum,
-                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
+                                               double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
+                                               const uint32_t* d_live = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
 
     extern __shared__ double tep[];
-    int                      numbers = cpNum;
+    // [B3 device-count] d_live non-null = trial mode: the grid was sized from a
+    // slacked iteration-start bound; the LIVE pair count is read here on device
+    // (no host mirror refresh per trial). Idle threads contribute exact 0.0 —
+    // bitwise-neutral in the zero-padded reduction.
+    int                      numbers = d_live ? (int)*d_live : cpNum;
     double                   temp = 0.0;
     if(idx < numbers)
     {
@@ -1121,7 +1126,7 @@ __global__ void _calBarrierGradient(const double3*    _vertexes,
 
 // ── [E2] registry members for type 2 (barrier): launcher body VERBATIM from
 // the DeviceOut dispatcher switch; size = its sizing-chain entry ──
-int GIPC::energy_size_barrier() { return h_cpNum[0]; }
+int GIPC::energy_size_barrier() { return m_energy_use_device_counts ? m_energy_bound_cp : (int)h_cpNum[0]; }  // [B3] trial bound
 void GIPC::energy_launch_barrier(device_TetraData& TetMesh, double* queue, int numbers,
                                 int blockNum, unsigned int threadNum, unsigned int sharedMsize,
                                 double* pe, const int* p2g, int ng,
@@ -1130,5 +1135,6 @@ void GIPC::energy_launch_barrier(device_TetraData& TetMesh, double* queue, int n
             _getBarrierEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs,
                 energy_kappa >= 0.0 ? energy_kappa : Kappa, dHat, numbers,
-                pe, pe ? p2g : nullptr, ng);
+                pe, pe ? p2g : nullptr, ng,
+                m_energy_use_device_counts ? _cpNum + 0 : nullptr);
 }

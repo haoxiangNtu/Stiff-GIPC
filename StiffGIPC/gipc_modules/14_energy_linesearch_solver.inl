@@ -21,6 +21,7 @@ __global__ void _s3_decide(const double* Eg0,
 
 // Standard (uniform-alpha) line-search decision.  Status: 0=descent,
 // 1=retry/exhausted, 2=accepted only by configured roundoff tolerance.
+extern __device__ uint32_t g_pair_overflow_count;
 __global__ void _global_ls_decide(const double* energy0,
                                   const double* energy1,
                                   double        c1m,
@@ -39,8 +40,11 @@ __global__ void _global_ls_decide(const double* energy0,
     // — the one path where a diverged env's NaN could slip past the per-env
     // quarantine. Non-finite trial ⇒ status 1 (keep backtracking; on budget
     // exhaustion the loud non-descent warning fires instead of silence).
-    *status = !isfinite(e1) ? 1
+    status[0] = !isfinite(e1) ? 1
               : (e1 > __dadd_rn(rhs, tol) ? 1 : (e1 > rhs ? 2 : 0));
+    // [B3 trial-defer] piggyback the pair-overflow counter into the SAME
+    // 8-byte host read that fetches the decision — zero extra round trips.
+    status[1] = (int)g_pair_overflow_count;
 }
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)
