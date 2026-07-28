@@ -113,3 +113,21 @@ scratchpad sqlite 联查模板。
 B3 手术顺序（按耗时）：①linear_solve 内部（converter 计数→设备侧绑定与 B2'
 前置改造同解；MAS 重排读回合批）②ccd_alpha 的隐藏 3.2（buildFullCP 计数族
 合批/延迟）③line_search 每 trial 族。每步：改后重跑本归因剖析对照 + 套件+锚。
+
+---
+
+# B3 子相位判决与解读修正（2026-07-28）
+
+**解读修正**：阻塞拷贝的"耗时"含生产性等待（ls_pcg 每迭代 1 次 × 8.9ms =
+等 PCG 图完成，GPU 在干活）。诚实浪费度量 = GPU 忙碌 vs 墙钟：**4090 忙
+74%/闲 26%（14.9s/20.0s）；A800 闲 75%**——同结构，主机延迟是放大器。
+手术优化目标因此是**往返次数**（每次在服务器付 ~百µs 空转），不是拷贝毫秒数。
+
+每迭代阻塞往返 census（616 迭代归一）：
+- **ls_mas_setup 8.0 次**（MAS 装配小读回族——count 之王，手术①头号）
+- line_search 6.2 · GH ToSymbol 5.4（=描述符 phase-1 靶）· ccd 隐藏 3.2
+- ls_convert 1.0（×1.1ms：unique-key 归约+计数刷新，半生产性）
+- ls_pcg 1.0（×8.9ms 生产性等待，非靶）
+
+合计 ~22 往返/迭代。A800 期望：每削一次往返 ≈ 省百µs 级空转 × 迭代数。
+下一刀：MAS setPreconditioner/ReorderRealtime 内部 8 次读回的合批/设备驻留。

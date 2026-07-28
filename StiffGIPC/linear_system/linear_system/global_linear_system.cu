@@ -1,4 +1,5 @@
 #include <linear_system/linear_system/global_linear_system.h>
+#include "device_common/nvtx_ranges.h"  // [B3] sub-phase attribution
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <gipc/utils/timer.h>
@@ -82,6 +83,7 @@ bool GlobalLinearSystem::build_linear_system()
 
     auto rhs_view = m_b.view();
 
+    gipc_nvtx_push("ls_assemble");
     for(auto& subsystem : m_subsystems)
         subsystem->do_assemble(rhs_view);
 
@@ -91,7 +93,11 @@ bool GlobalLinearSystem::build_linear_system()
         m_local_preconditioners[0]->assemble();
         start_preconditioner_id++;
     }
+    gipc_nvtx_pop();
+    gipc_nvtx_push("ls_convert");
     convert_new();
+    gipc_nvtx_pop();
+    gipc_nvtx_push("ls_mas_setup");
 
     if(m_global_preconditioner)
         m_global_preconditioner->do_assemble(*gipc_global_triplet);
@@ -100,6 +106,7 @@ bool GlobalLinearSystem::build_linear_system()
     {
         m_local_preconditioners[i]->assemble();
     }
+    gipc_nvtx_pop();
 
     return true;
 }
@@ -180,7 +187,9 @@ gipc::SizeT GlobalLinearSystem::solve_linear_system()
         _s4_zero_masked_rhs<<<gn, bs>>>(m_b.view().data(), m_s4_active,
                                         m_s4_dof_to_group, n, m_s4_ng);
     }
+    gipc_nvtx_push("ls_pcg");
     auto iter = m_solver->solve(m_x, m_b);
+    gipc_nvtx_pop();
     distribute_solution();
     return iter;
 }
