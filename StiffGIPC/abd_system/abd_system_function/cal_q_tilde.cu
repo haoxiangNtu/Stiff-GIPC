@@ -53,9 +53,16 @@ void ABDSystem::cal_q_tilde(ABDSimData& sim_data)
     {
         size_t wn = (size_t)abd_body_count * 12 * BINNED_K;
         if(wn > m_abd_wrenchbin_cap)
-        { if(m_abd_wrenchbin) cudaFree(m_abd_wrenchbin); cudaMalloc((void**)&m_abd_wrenchbin, wn * sizeof(double)); m_abd_wrenchbin_cap = wn; }
-        cudaMemset(m_abd_wrenchbin, 0, wn * sizeof(double));
-        cudaMemcpyToSymbol(g_abd_wrenchbin, &m_abd_wrenchbin, sizeof(double*));
+        {
+            if(m_abd_wrenchbin) cudaFree(m_abd_wrenchbin);
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_abd_wrenchbin, wn * sizeof(double)));
+            m_abd_wrenchbin_cap = wn;
+            CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+                g_abd_wrenchbin, &m_abd_wrenchbin, sizeof(double*)));
+        }
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_abd_wrenchbin, 0, wn * sizeof(double), cudaStreamPerThread));
     }
     if(m_num_revolute_driving > 0)
     {

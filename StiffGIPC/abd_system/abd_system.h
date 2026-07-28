@@ -31,6 +31,24 @@ struct ABDSurfaceMeshBody
     int point_start = -1;  // first unique_point_id belonging to this body
     int point_count = 0;   // number of unique points in this body
 };
+
+// Persistent host-to-device staging records for interactive control.  Keeping
+// these types in the public system header lets Phase D pre-upload an episode
+// without constructing a temporary DeviceBuffer on every frame.
+struct RevoluteDrivingControlPacked
+{
+    Float target_angle;
+    Float strength_ratio;
+    Float ext_torque;
+};
+
+struct PrismaticDrivingControlPacked
+{
+    Float target_distance;
+    Float strength_ratio;
+    Float ext_force;
+};
+
 class ABDSystem
 {
   private:
@@ -101,6 +119,8 @@ class ABDSystem
     // ---- Revolute Driving Joint Data ----
     int                                         m_num_revolute_driving = 0;
     muda::DeviceBuffer<RevoluteDrivingGPUData>   m_revolute_driving_data;
+    muda::DeviceBuffer<RevoluteDrivingControlPacked>
+        m_revolute_control_staging;
     muda::DeviceBuffer<Matrix12x12>              m_revolute_driving_cross_hessian;
     muda::DeviceVar<Float>                       m_revolute_driving_energy;
     muda::DeviceBuffer<Float>                    m_revolute_driving_energy_per;
@@ -115,6 +135,8 @@ class ABDSystem
     // ---- Prismatic Driving Joint Data ----
     int                                         m_num_prismatic_driving = 0;
     muda::DeviceBuffer<PrismaticDrivingGPUData>  m_prismatic_driving_data;
+    muda::DeviceBuffer<PrismaticDrivingControlPacked>
+        m_prismatic_control_staging;
     muda::DeviceBuffer<Matrix12x12>              m_prismatic_driving_cross_hessian;
     muda::DeviceVar<Float>                       m_prismatic_driving_energy;
     muda::DeviceBuffer<Float>                    m_prismatic_driving_energy_per;

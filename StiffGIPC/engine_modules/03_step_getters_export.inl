@@ -11,8 +11,18 @@ void SimEngine::step()
         impl.ipc.update_joint_angle_targets_from_mesh(impl.tetMesh);
     }
 
+    const int newton_before = impl.ipc.m_total_newton_iters;
     impl.ipc.IPC_Solver(impl.d_tetMesh);
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    const char* frame_graph_env = std::getenv("STIFF_FRAME_GRAPH");
+    const bool frame_graph_requested =
+        frame_graph_env && frame_graph_env[0] && std::atoi(frame_graph_env) != 0;
+    // Until the conditional executable is armed, publish an honest fallback
+    // packet rather than making graph-aware RL tooling special-case step().
+    impl.ipc.record_legacy_frame_status(
+        frame_graph_requested,
+        frame_graph_requested,
+        impl.ipc.m_total_newton_iters - newton_before);
     impl.step_count++;
 
     // [NaN-sentinel] always-on lightweight NaN watchdog (~1 atomic int +

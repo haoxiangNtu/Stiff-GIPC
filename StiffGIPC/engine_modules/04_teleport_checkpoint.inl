@@ -165,6 +165,8 @@ double SimEngine::get_max_collision_pairs() const
 { return m_impl->ipc.m_max_collision_pairs; }
 int    SimEngine::get_total_frames_done() const
 { return m_impl->ipc.m_total_frames; }
+frame_fsm::FrameStatus SimEngine::get_frame_status() const
+{ return m_impl->ipc.get_frame_status(); }
 uint64_t SimEngine::get_total_energy_tolerance_accepts() const
 {
     return m_impl->ipc.energy_tolerance_accept_count;

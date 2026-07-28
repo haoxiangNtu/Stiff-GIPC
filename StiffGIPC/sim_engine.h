@@ -7,6 +7,7 @@
 #include <map>
 #include <cstdint>
 #include <Eigen/Core>
+#include "frame_fsm/frame_status.cuh"
 
 struct JointAngleControlInfo;
 struct PrismaticDrivingControlInfo;
@@ -422,6 +423,11 @@ class SimEngine
     void finalize();
 
     void step();
+
+    /// Result, work counters and capacity high-water marks for the latest
+    /// frame.  In whole-frame graph mode this is the single terminal D2H
+    /// packet; the legacy path publishes the same ABI for uniform tooling.
+    frame_fsm::FrameStatus get_frame_status() const;
 
     // ---- State queries ----
     int      get_vertex_count() const;

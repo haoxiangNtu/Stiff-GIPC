@@ -132,9 +132,9 @@ void DeviceBuffer<T>::copy_from(const std::vector<T>& host)
 template <typename T>
 void DeviceBuffer<T>::resize(size_t new_size)
 {
-    BufferLaunch()
-        .resize(*this, new_size)  //
-        .wait();
+    // Device-only resize.  No-op resizes are common on the hot path and the
+    // old unconditional wait made them capture-illegal host barriers.
+    BufferLaunch().resize(*this, new_size);
 }
 
 template <typename T>
@@ -156,9 +156,7 @@ void DeviceBuffer<T>::reserve(size_t new_capacity)
 template <typename T>
 void DeviceBuffer<T>::clear()
 {
-    BufferLaunch()
-        .clear(*this)  //
-        .wait();
+    BufferLaunch().clear(*this);
 }
 
 template <typename T>

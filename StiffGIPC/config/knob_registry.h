@@ -47,6 +47,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_EE_NOMOLLIFY, "solver") \
     X(STIFF_EE_TRACE, "diag") \
     X(STIFF_ENERGY_VALIDATE, "diag") \
+    X(STIFF_FRAME_GRAPH, "perf") \
     X(STIFF_GRAD_PRE, "diag") \
     X(STIFF_GRAD_PROBE, "diag") \
     X(STIFF_GROUND_HESS_LEGACY, "solver") \

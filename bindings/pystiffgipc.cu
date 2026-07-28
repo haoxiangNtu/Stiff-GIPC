@@ -28,6 +28,69 @@ PYBIND11_MODULE(pystiffgipc, m)
           &stiff_test_ccd_nan_max_speed_fail_fast,
           "Internal regression hook for device-CCD NaN fail-fast.");
 
+    py::enum_<frame_fsm::FrameResult>(m, "FrameResult")
+        .value("OK", frame_fsm::FRAME_OK)
+        .value("RETRY_REQUIRED", frame_fsm::FRAME_RETRY_REQUIRED)
+        .value("FATAL", frame_fsm::FRAME_FATAL)
+        .value("RUNTIME_ERROR", frame_fsm::FRAME_RUNTIME_ERROR);
+
+    py::class_<frame_fsm::FrameStatus>(m, "FrameStatus")
+        .def_readonly("result", &frame_fsm::FrameStatus::result)
+        .def_readonly("phase", &frame_fsm::FrameStatus::phase)
+        .def_readonly("invalid_bits", &frame_fsm::FrameStatus::invalid_bits)
+        .def_readonly("launch_status", &frame_fsm::FrameStatus::launch_status)
+        .def_readonly("err_env", &frame_fsm::FrameStatus::err_env)
+        .def_readonly("err_primitive", &frame_fsm::FrameStatus::err_primitive)
+        .def_readonly("err_newton_iter",
+                      &frame_fsm::FrameStatus::err_newton_iter)
+        .def_readonly("err_ls_iter", &frame_fsm::FrameStatus::err_ls_iter)
+        .def_readonly("error_code", &frame_fsm::FrameStatus::error_code)
+        .def_readonly("path_flags", &frame_fsm::FrameStatus::path_flags)
+        .def_readonly("graph_launches",
+                      &frame_fsm::FrameStatus::graph_launches)
+        .def_readonly("host_boundaries",
+                      &frame_fsm::FrameStatus::host_boundaries)
+        .def_readonly("substeps", &frame_fsm::FrameStatus::substeps)
+        .def_readonly("newton_iters", &frame_fsm::FrameStatus::newton_iters)
+        .def_readonly("pcg_iters", &frame_fsm::FrameStatus::pcg_iters)
+        .def_readonly("ls_trials", &frame_fsm::FrameStatus::ls_trials)
+        .def_readonly("hw_dcd_pairs", &frame_fsm::FrameStatus::hw_dcd_pairs)
+        .def_readonly("hw_ccd_pairs", &frame_fsm::FrameStatus::hw_ccd_pairs)
+        .def_readonly("hw_triplets", &frame_fsm::FrameStatus::hw_triplets)
+        .def_readonly("hw_unique_blocks",
+                      &frame_fsm::FrameStatus::hw_unique_blocks)
+        .def_readonly("required_dcd_pairs",
+                      &frame_fsm::FrameStatus::required_dcd_pairs)
+        .def_readonly("required_ccd_pairs",
+                      &frame_fsm::FrameStatus::required_ccd_pairs)
+        .def_readonly("required_triplets",
+                      &frame_fsm::FrameStatus::required_triplets)
+        .def_readonly("required_unique_blocks",
+                      &frame_fsm::FrameStatus::required_unique_blocks)
+        .def_readonly("hw_mas_clusters",
+                      &frame_fsm::FrameStatus::hw_mas_clusters)
+        .def_readonly("required_mas_clusters",
+                      &frame_fsm::FrameStatus::required_mas_clusters)
+        .def_readonly("root_graph_nodes",
+                      &frame_fsm::FrameStatus::root_graph_nodes)
+        .def_readonly("root_d2h_nodes",
+                      &frame_fsm::FrameStatus::root_d2h_nodes)
+        .def_readonly("terminal_graph_nodes",
+                      &frame_fsm::FrameStatus::terminal_graph_nodes)
+        .def_readonly("terminal_d2h_nodes",
+                      &frame_fsm::FrameStatus::terminal_d2h_nodes)
+        .def_readonly("final_alpha", &frame_fsm::FrameStatus::final_alpha)
+        .def_readonly("final_energy", &frame_fsm::FrameStatus::final_energy)
+        .def_readonly("max_movement",
+                      &frame_fsm::FrameStatus::max_movement)
+        .def_readonly("cfl_alpha", &frame_fsm::FrameStatus::cfl_alpha)
+        .def_readonly("kappa", &frame_fsm::FrameStatus::kappa)
+        .def_readonly("frame_id", &frame_fsm::FrameStatus::frame_id)
+        .def_readonly("attempt", &frame_fsm::FrameStatus::attempt)
+        .def_readonly("retry_count", &frame_fsm::FrameStatus::retry_count)
+        .def_readonly("retry_invalid_bits",
+                      &frame_fsm::FrameStatus::retry_invalid_bits);
+
     // ---- SimEngineConfig ----
     py::class_<SimEngineConfig>(m, "Config")
         .def(py::init<>())
@@ -411,6 +474,8 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("step", &SimEngine::step,
              py::call_guard<py::gil_scoped_release>())
+        .def("get_frame_status", &SimEngine::get_frame_status,
+             "Return the latest frame-boundary status packet.")
 
         .def("get_assets_dir", &SimEngine::get_assets_dir)
 

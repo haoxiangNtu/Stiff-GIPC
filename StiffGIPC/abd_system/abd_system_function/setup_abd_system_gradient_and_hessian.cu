@@ -42,13 +42,27 @@ void ABDSystem::_abd_binned_open(ABDSimData& sim_data)
     if(N < 1) return;
     size_t sg = (size_t)N * 12 * BINNED_K, hb = (size_t)N * 144 * BINNED_K;
     if(sg > m_abd_sysbin_cap)
-    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg; }
+    {
+        if(m_abd_sysbin) cudaFree(m_abd_sysbin);
+        CUDA_SAFE_CALL(
+            cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)));
+        m_abd_sysbin_cap = sg;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+            g_abd_sysbin, &m_abd_sysbin, sizeof(double*)));
+    }
     if(hb > m_abd_hessbin_cap)
-    { if(m_abd_hessbin) cudaFree(m_abd_hessbin); cudaMalloc((void**)&m_abd_hessbin, hb * sizeof(double)); m_abd_hessbin_cap = hb; }
-    cudaMemset(m_abd_sysbin, 0, sg * sizeof(double));
-    cudaMemset(m_abd_hessbin, 0, hb * sizeof(double));
-    cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*));
-    cudaMemcpyToSymbol(g_abd_hessbin, &m_abd_hessbin, sizeof(double*));
+    {
+        if(m_abd_hessbin) cudaFree(m_abd_hessbin);
+        CUDA_SAFE_CALL(
+            cudaMalloc((void**)&m_abd_hessbin, hb * sizeof(double)));
+        m_abd_hessbin_cap = hb;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+            g_abd_hessbin, &m_abd_hessbin, sizeof(double*)));
+    }
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_abd_sysbin, 0, sg * sizeof(double), cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_abd_hessbin, 0, hb * sizeof(double), cudaStreamPerThread));
 }
 void ABDSystem::_abd_binned_close(ABDSimData& sim_data)
 {
@@ -67,9 +81,16 @@ void ABDSystem::couple_bin_open(int n_dofs)
     if(n_dofs < 1) return;
     size_t sg = (size_t)n_dofs * BINNED_K;
     if(sg > m_abd_sysbin_cap)
-    { if(m_abd_sysbin) cudaFree(m_abd_sysbin); cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)); m_abd_sysbin_cap = sg; }
-    cudaMemset(m_abd_sysbin, 0, sg * sizeof(double));
-    cudaMemcpyToSymbol(g_abd_sysbin, &m_abd_sysbin, sizeof(double*));
+    {
+        if(m_abd_sysbin) cudaFree(m_abd_sysbin);
+        CUDA_SAFE_CALL(
+            cudaMalloc((void**)&m_abd_sysbin, sg * sizeof(double)));
+        m_abd_sysbin_cap = sg;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+            g_abd_sysbin, &m_abd_sysbin, sizeof(double*)));
+    }
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_abd_sysbin, 0, sg * sizeof(double), cudaStreamPerThread));
 }
 void ABDSystem::couple_bin_close(int n_dofs)
 {
@@ -78,9 +99,6 @@ void ABDSystem::couple_bin_close(int n_dofs)
         [g = system_gradient.viewer(), bin = m_abd_sysbin] __device__(int d) mutable
         { g(d) += binned_combine(bin + (size_t)d * BINNED_K); });
 }
-
-struct DrivingCtrlPacked  { Float target_angle;    Float strength_ratio; Float ext_torque; };
-struct PrisCtrlPacked     { Float target_distance; Float strength_ratio; Float ext_force; };
 
 //template <int ROWS, int COLS>
 __device__ inline void write_triplet_cv(Eigen::Matrix3d* triplet_value,
@@ -1401,7 +1419,7 @@ void ABDSystem::update_revolute_driving_targets(
     auto& abd = sim_data.device;
     int n = m_num_revolute_driving;
 
-    std::vector<DrivingCtrlPacked> host_ctrl(n);
+    std::vector<RevoluteDrivingControlPacked> host_ctrl(n);
     for(int i = 0; i < n && i < static_cast<int>(controls.size()); i++)
     {
         host_ctrl[i].target_angle   = static_cast<Float>(controls[i].target_angle);
@@ -1409,8 +1427,9 @@ void ABDSystem::update_revolute_driving_targets(
         host_ctrl[i].ext_torque     = static_cast<Float>(controls[i].ext_torque);  // [force-control]
     }
 
-    muda::DeviceBuffer<DrivingCtrlPacked> d_ctrl(n);
-    d_ctrl.view().copy_from(host_ctrl.data());
+    if(m_revolute_control_staging.size() != static_cast<size_t>(n))
+        m_revolute_control_staging.resize(n);
+    m_revolute_control_staging.view().copy_from(host_ctrl.data());
 
     Float kMaxStepPerFrame = parms.max_revolute_step_per_frame;
     Float sr = parms.revolute_driving_strength_ratio;
@@ -1421,7 +1440,7 @@ void ABDSystem::update_revolute_driving_targets(
                [drvs    = m_revolute_driving_data.viewer().name("revolute_driving"),
                 q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
                 masses  = body_mass.cviewer().name("body_mass"),
-                ctrls   = d_ctrl.cviewer().name("ctrls"),
+                ctrls   = m_revolute_control_staging.cviewer().name("ctrls"),
                 sr, kMaxStepPerFrame,
                 ratio = static_cast<Float>(substep_ratio)] __device__(int i) mutable
                {
@@ -1927,7 +1946,7 @@ void ABDSystem::update_prismatic_driving_targets(
     auto& abd = sim_data.device;
     int n = m_num_prismatic_driving;
 
-    std::vector<PrisCtrlPacked> host_ctrl(n);
+    std::vector<PrismaticDrivingControlPacked> host_ctrl(n);
     for(int i = 0; i < n && i < static_cast<int>(controls.size()); i++)
     {
         host_ctrl[i].target_distance = static_cast<Float>(controls[i].target_distance);
@@ -1935,8 +1954,9 @@ void ABDSystem::update_prismatic_driving_targets(
         host_ctrl[i].ext_force       = static_cast<Float>(controls[i].ext_force);
     }
 
-    muda::DeviceBuffer<PrisCtrlPacked> d_ctrl(n);
-    d_ctrl.view().copy_from(host_ctrl.data());
+    if(m_prismatic_control_staging.size() != static_cast<size_t>(n))
+        m_prismatic_control_staging.resize(n);
+    m_prismatic_control_staging.view().copy_from(host_ctrl.data());
 
     Float kMaxStepPerFrame = parms.max_prismatic_step_per_frame;
     Float sr = parms.prismatic_driving_strength_ratio;
@@ -1947,7 +1967,7 @@ void ABDSystem::update_prismatic_driving_targets(
                [drvs    = m_prismatic_driving_data.viewer().name("prismatic_driving"),
                 q_prev  = abd.body_id_to_q_prev.cviewer().name("q_prev"),
                 masses  = body_mass.cviewer().name("body_mass"),
-                ctrls   = d_ctrl.cviewer().name("ctrls"),
+                ctrls   = m_prismatic_control_staging.cviewer().name("ctrls"),
                 sr, kMaxStepPerFrame,
                 ratio = static_cast<Float>(substep_ratio)] __device__(int i) mutable
                {

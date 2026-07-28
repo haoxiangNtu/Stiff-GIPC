@@ -19,6 +19,7 @@
 #include "device_common/mirrors.h"           // [3b] audited host mirrors
 #include "multienv/mode_config.h"            // [C1] finalize-time mode snapshot
 #include "energy/energy_terms.h"             // [E2] term registry (X-macro)
+#include "frame_fsm/frame_status.cuh"         // [Phase C] frame-boundary ABI
 
 #ifdef GIPC_ENABLE_DIAGNOSTICS
 // Intrusive derivative diagnostics. These declarations and their Python
@@ -85,6 +86,12 @@ class GIPC
     // Captured host values: pointer generation, budget, the two device-count
     // energy launch bounds, and the frozen DCD snapshot copy length.
     long long m_ls_graph_sig[5]       = {-1, -1, -1, -1, -1};
+    // [Phase C] Opaque owner of conditional graphs, transaction snapshots and
+    // pinned frame-boundary packets.  Kept opaque here so the public solver
+    // header exposes only the stable FrameStatus ABI.
+    void*                   m_frame_graph_context = nullptr;
+    bool                    m_frame_graph_active  = false;
+    frame_fsm::FrameStatus  m_last_frame_status{};
     bool      m_ccd_defer_counts      = false;
     int       m_energy_bound_cp       = 0;
     int       m_energy_bound_gp       = 0;
@@ -699,6 +706,16 @@ class GIPC
                      double&           time3,
                      double&           time4);
     void IPC_Solver(device_TetraData& TetMesh);
+    void IPC_Solver_FrameGraph(device_TetraData& TetMesh);
+    void prepare_frame_graph(device_TetraData& TetMesh);
+    void destroy_frame_graph();
+    void record_legacy_frame_status(bool graph_requested,
+                                    bool callback_fallback,
+                                    int newton_iterations = 0);
+    const frame_fsm::FrameStatus& get_frame_status() const
+    {
+        return m_last_frame_status;
+    }
     void sortMesh(device_TetraData& TetMesh, int updateVertNum);
     void buildFrictionSets();
 

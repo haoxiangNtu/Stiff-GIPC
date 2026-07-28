@@ -1052,6 +1052,15 @@ class Engine:
 
     # ---- State queries ----
 
+    def get_frame_status(self):
+        """Return the latest Phase-C frame-boundary status packet.
+
+        The object has one stable layout for legacy, graph-fallback and
+        whole-frame graph execution; inspect ``path_flags`` to distinguish the
+        path actually taken.
+        """
+        return self._engine.get_frame_status()
+
     def get_vertices(self) -> np.ndarray:
         """Return vertex positions as (N, 3) float64 array."""
         return self._engine.get_vertices()

@@ -57,9 +57,16 @@ void ABDSystem::_massbin_prep(size_t total_components)
 {
     size_t need = total_components * BINNED_K;
     if(need > m_massbin_cap)
-    { if(m_massbin) cudaFree(m_massbin); cudaMalloc((void**)&m_massbin, need * sizeof(double)); m_massbin_cap = need; }
-    cudaMemset(m_massbin, 0, need * sizeof(double));
-    cudaMemcpyToSymbol(g_massbin, &m_massbin, sizeof(double*));
+    {
+        if(m_massbin) cudaFree(m_massbin);
+        CUDA_SAFE_CALL(
+            cudaMalloc((void**)&m_massbin, need * sizeof(double)));
+        m_massbin_cap = need;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+            g_massbin, &m_massbin, sizeof(double*)));
+    }
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_massbin, 0, need * sizeof(double), cudaStreamPerThread));
 }
 void ABDSystem::init_system(ABDSimData& sim_data)
 {
