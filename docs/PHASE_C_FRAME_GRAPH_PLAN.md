@@ -49,3 +49,24 @@ ccd_alpha+LS 子图。前提=C-1 + 装配 offset 设备化（或按迭代 exec-u
   可先走非图路径（同 B2' 的 !SPMV_DET 门控先例），锚免疫。
 - 已得资产：PCG device-loop（尾launch 自循环图先例）、B2' 容量网格/设备计
   数模式全套、单一代数计数器、15 段门禁+指纹配方。
+
+## C-1 完成后的修订（2026-07-28 实战回填）
+
+C-1 已落地（STIFF_LS_GRAPH，默认 0；七连环教训见 PHASE_A 战报）。两条对
+C-2/C-3 的**硬性铁律**（C-1 用 sanitizer/诊断读回逐一实证）：
+1. 任何按值进核的逐迭代/逐帧标量（c1m、κ、offset、count、bound）都必须
+   设备槽化（seed 核按值下发 + `*_dev` 尾参），否则缓存图重放用陈值——
+   症状=物理劣化（E 失配/回溯烧尽）而非崩溃，极难定位；
+2. 任何 free+malloc（resize_discard/ensure_*/grow）都必须
+   `++pcg_buffer_generation()`——迄今补齐：pair/reduce/sort/MAS 输出/
+   snapshot/摩擦 lastH 六族；症状=重放悬垂（illegal access）。
+
+C-2 侦察数据：GH 装配 offset 网 = 13 号文件 28 处 global_triplet_offset
++ 9 处镜像计数读，全部烤进各能量项装配核的 launch 参数；设备侧已有
+d_*_contact_start_id[5] 块与 d_unique_key_number（B2'-a）。C-2 路线：
+- 装配 offset 一次性打包 seed（把 h_cpNum_last 族/偏移按值下发 12-slot
+  设备数组），装配核 +offset_dev 尾参（③/C-1 同款）；
+- Newton WHILE 尾launch 图包 {GH→convert→MAS→PCG(device-loop)→ccd→LS 子图}；
+  收敛判定=残差设备归约写 status；κ 更新（postLineSearch close 检查）
+  帧内设备化或留图外（先留图外=每迭代一次小同步，C-3 再收）。
+- 验证环不变：build→anchor→套件→towel/foldshirt knob 双态→指纹→推送。
