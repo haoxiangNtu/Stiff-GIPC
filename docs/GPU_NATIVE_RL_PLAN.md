@@ -43,7 +43,7 @@ GPU-native RL.
 | Selective device reset | Not implemented | Reset/teleport and episode bookkeeping still use host paths in the RL adapters. |
 | Batched heterogeneous environments | Not implemented | Current graph requires merged mode and rejects per-env/strict overlays. |
 | Closed-loop Warp/Torch/Newton adapter | Not implemented | The engine ABI exists; adapters still contain `.numpy()` and synchronous `step()` calls. |
-| A800 proof | Not run for this revision | Build contains `sm_80` SASS, but an actual A800 Nsight Systems trace is mandatory. |
+| A800 proof | Partial (2026-07-29) | `sm_80` in-place build of a2c8b33: strict anchor bit-identical (`0544461bd82123ae`), all five graph gates PASS, gpu-rl parity bitwise (error 0.0), and the Nsight Systems steady-state capture shows h2d=0 / d2h=0 / sync=0 with 40 `cudaGraphLaunch` + 40 D2D publishes for 40 steps. Remaining for full D4: contact-rich workloads, device-policy integration, reward/done/reset on device, long-horizon/throughput/memory measurements. |
 
 The older `launch_episode_async()` API is an open-loop trajectory executor. It
 pre-uploads all actions and copies observations to pinned host slots. It remains

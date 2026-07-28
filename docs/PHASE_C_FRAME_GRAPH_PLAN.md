@@ -255,3 +255,23 @@ G17c（`scripts/verify_gates.sh`）；D2D 动作发布变体 =
 （`skip_all_collision=True` 等）。到"接触丰富场景 + 设备 reward/done/reset +
 批量环境 + A800 nsys 证明"的完整定义与四个完成块（C4/D2/D3/D4）见
 `docs/GPU_NATIVE_RL_PLAN.md`——四块全过之前，Phase C/D 不标记为最终完成。
+
+## A800 实测（2026-07-29，sm_80 就地构建 a2c8b33）
+
+容器回收后从零重引导（cmake/ninja/pybind11/numpy 以 wheel 离线解包、
+`BUILD_GL_VIEWER=OFF` 无头配置、Release+DLTO+SNK1、
+`CMAKE_CUDA_ARCHITECTURES=80`，128 核约 7 分钟）。驱动/运行时=12.8
+（≥12.4，条件节点完整支持——蓝图开放问题就此关闭）。判决：
+
+| 项 | 结果 |
+|---|---|
+| strict 锚 | **PASS `0544461bd82123ae`**（与 4090 单一金值跨架构逐位同值） |
+| frame-graph / episode-graph / episode-rl / gpu-rl / gpu-native-rl | **五 gate 全 PASS** |
+| gpu-rl 数值 | A800 上该场景基线自身逐位确定（noise=0），GPU-native 路径**逐位相等**（error 全 0.0e+00） |
+| nsys 稳态证明 | **PASS：h2d_rows=0 d2h_rows=0 sync_rows=0**（cudaProfilerApi 捕获窗 40 步） |
+
+nsys 捕获窗内 API 分布：40 次 `cudaGraphLaunch`（92.4% API 时间，均值
+~109µs 入队）+ 40 笔 D2D 动作发布（共 76µs）——宿主每步的全部工作就是把
+一张 551 节点图推进流。闭环 43 帧（3 warm + 40 稳态）全 `result=0`、
+`frame_id` 单调至 42。D4 余项=接触丰富负载、设备 policy 集成、长时程/
+显存高水位/吞吐延迟度量（见完成块清单）。
