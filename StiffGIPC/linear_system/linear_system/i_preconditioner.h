@@ -62,7 +62,12 @@ class LocalPreconditioner : public IPreconditioner
     LocalPreconditioner(DiagonalSubsystem& subsystem);
 
     virtual ~LocalPreconditioner() = default;
-    uint32_t* calculate_subsystem_bcoo_indices(int& number) const;
+    uint32_t* calculate_subsystem_bcoo_indices(
+        int& number, bool keep_count_device = false) const;
+    const int* subsystem_bcoo_count_device() const
+    {
+        return m_count.data();
+    }
     int                             get_offset() const;
     Eigen::Matrix3d* system_bcoo_matrix() const;
     int* system_bcoo_rows() const;

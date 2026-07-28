@@ -39,24 +39,41 @@ __device__ double* g_mRbin  = nullptr;
 __device__ double* g_mZbin  = nullptr;
 __device__ double* g_matbin = nullptr;
 
-__global__ void _mas_comb_mZ(Precision_T3* mZ, const double* bin, int n)
+__global__ void _mas_comb_mZ(Precision_T3* mZ,
+                             const double* bin,
+                             int n,
+                             const int2* extent)
 {
+    if(extent)
+        n = extent->y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if(i >= n) return;
     mZ[i].x = binned_combine(bin + ((size_t)i * 3 + 0) * BINNED_K);
     mZ[i].y = binned_combine(bin + ((size_t)i * 3 + 1) * BINNED_K);
     mZ[i].z = binned_combine(bin + ((size_t)i * 3 + 2) * BINNED_K);
 }
-__global__ void _mas_comb_mR(Eigen::Vector3f* mR, const double* bin, int start, int end)
+__global__ void _mas_comb_mR(Eigen::Vector3f* mR,
+                             const double* bin,
+                             int start,
+                             int end,
+                             const int2* extent)
 {
+    if(extent)
+        end = extent->y;
     int i = start + blockIdx.x * blockDim.x + threadIdx.x;
     if(i >= end) return;
     mR[i][0] = (float)binned_combine(bin + ((size_t)i * 3 + 0) * BINNED_K);
     mR[i][1] = (float)binned_combine(bin + ((size_t)i * 3 + 1) * BINNED_K);
     mR[i][2] = (float)binned_combine(bin + ((size_t)i * 3 + 2) * BINNED_K);
 }
-__global__ void _mas_comb_mat(__GEIGEN__::MasMatrixSymT* mat, const double* bin, int startC, int endC)
+__global__ void _mas_comb_mat(__GEIGEN__::MasMatrixSymT* mat,
+                              const double* bin,
+                              int startC,
+                              int endC,
+                              const int2* extent)
 {
+    if(extent)
+        endC = extent->y / BANKSIZE;
     int t    = blockIdx.x * blockDim.x + threadIdx.x;
     int nblk = (endC - startC) * MAS_NB;
     if(t >= nblk) return;
@@ -69,4 +86,3 @@ __global__ void _mas_comb_mat(__GEIGEN__::MasMatrixSymT* mat, const double* bin,
             mat[cPid].M[index](i, j) =
                 binned_combine(bin + (((size_t)cPid * MAS_NB + index) * 9 + i * 3 + j) * BINNED_K);
 }
-

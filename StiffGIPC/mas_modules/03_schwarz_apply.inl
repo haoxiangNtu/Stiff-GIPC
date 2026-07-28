@@ -162,10 +162,15 @@ __global__ void _schwarzLocalXSym6_fused8(
     double*                          mZbin,
     int                              totalMapNodes,
     int                              clusterCount,
-    size_t                           clusterCapacity)
+    size_t                           clusterCapacity,
+    const int2*                     extent)
 {
+    if(extent)
+        clusterCount = extent->y;
     constexpr int rowsPerBlock = 8;
     const int     matrixId      = blockIdx.x / 2;
+    if(matrixId * BANKSIZE >= clusterCount)
+        return;
     const int     rowBase       = (blockIdx.x & 1) * rowsPerBlock;
     const int     localRow      = rowBase + threadIdx.x / BANKSIZE;
     const int     localCol      = threadIdx.x % BANKSIZE;
@@ -357,5 +362,4 @@ __global__ void _schwarzLocalXSym9(const __GEIGEN__::MasMatrixSymf* Pred,
         atomicAdd((&(mZ[vrid].z)), rdata[2]);
     }
 }
-
 

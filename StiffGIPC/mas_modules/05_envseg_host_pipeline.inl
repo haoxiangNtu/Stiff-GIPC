@@ -414,6 +414,24 @@ void MASPreconditioner::BuildCollisionConnection(unsigned int* connectionMsk,
 #endif
 }
 #include <fstream>
+bool MASPreconditioner::deviceExtentActive() const
+{
+    return m_allocClusterTotal > 0
+           && GIPCTripletMatrix::device_count_mode();
+}
+
+int MASPreconditioner::exactClusterCountBlocking() const
+{
+    if(!deviceExtentActive())
+        return totalNumberClusters;
+    int2 extent{};
+    CUDA_SAFE_CALL(cudaMemcpy(&extent,
+                              d_levelSize + levelnum,
+                              sizeof(int2),
+                              cudaMemcpyDeviceToHost));
+    return extent.y;
+}
+
 int MASPreconditioner::ReorderRealtime(int cpNum)
 {
     CUDA_SAFE_CALL(cudaMemset(d_levelSize, 0, levelnum * sizeof(int2)));
@@ -460,9 +478,18 @@ int MASPreconditioner::ReorderRealtime(int cpNum)
 
     }
 
-    CUDA_SAFE_CALL(cudaMemcpy(&h_clevelSize, d_levelSize + levelnum, sizeof(int2), cudaMemcpyDeviceToHost));
-
-    totalNumberClusters = h_clevelSize.y;
+    if(deviceExtentActive())
+    {
+        totalNumberClusters = m_allocClusterTotal;
+    }
+    else
+    {
+        CUDA_SAFE_CALL(cudaMemcpy(&h_clevelSize,
+                                  d_levelSize + levelnum,
+                                  sizeof(int2),
+                                  cudaMemcpyDeviceToHost));
+        totalNumberClusters = h_clevelSize.y;
+    }
 
     AggregationKernel();
 
@@ -475,7 +502,8 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                                             int*             col_ids,
                                             uint32_t*        indices,
                                             int              offset,
-                                            int              triplet_number)
+                                            int              triplet_number,
+                                            const int*       d_triplet_number)
 {
     //cudaEvent_t start, end0, end1, end2;
     //cudaEventCreate(&start);
@@ -511,8 +539,11 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                  _invMatrix       = d_inverseMatMas,
                  _real_map_partId = d_real_map_partId,
                  indices,
+                 d_triplet_number,
                  triplet_values, row_ids, col_ids] __device__(int I) mutable
                 {
+                    if(d_triplet_number && I >= *d_triplet_number)
+                        return;
                     int index                              = indices[I];
                     auto vertRid_real                      = row_ids[index];
                     auto vertCid_real                       = col_ids[index];
@@ -791,16 +822,20 @@ void MASPreconditioner::PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
     if(number2 < 1)
         return;
     int numBlocks2 = (number2 + blockSize2 - 1) / blockSize2;
+    const int2* extent =
+        deviceExtentActive() ? d_levelSize + levelnum : nullptr;
 
     {  // [4.3] combine binned coarse aggregation back into d_inverseMatMas (before inversion)
         int startC = totalMapNodes / BANKSIZE;
         int endC   = totalNumberClusters / BANKSIZE;
         int nblk   = (endC - startC) * MAS_NB;
         if(nblk > 0)
-            _mas_comb_mat<<<(nblk + 255) / 256, 256>>>(d_inverseMatMas, d_matbin, startC, endC);
+            _mas_comb_mat<<<(nblk + 255) / 256, 256>>>(
+                d_inverseMatMas, d_matbin, startC, endC, extent);
     }
 
-    __inverse6_P96x96<<<numBlocks2, blockSize2>>>(d_precondMatMas, d_inverseMatMas, number2);
+    __inverse6_P96x96<<<numBlocks2, blockSize2>>>(
+        d_precondMatMas, d_inverseMatMas, number2, extent);
 
     //cudaEventRecord(end1);
 
@@ -913,6 +948,7 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
                                                uint32_t*        indices,
                                                int              offset,
                                                int              triplet_num,
+                                               const int*       d_triplet_num,
                                                int              cpNum)
 {
     if(totalNodes < 1)
@@ -947,7 +983,13 @@ void MASPreconditioner::setPreconditioner_bcoo(Eigen::Matrix3d* triplet_values,
     CUDA_SAFE_CALL(cudaMemset(
         d_MatMas, 0, totalNumberClusters / BANKSIZE * sizeof(__GEIGEN__::MasMatrixT)));
 #endif
-    PrepareHessian_bcoo(triplet_values, row_ids, col_ids, indices, offset, triplet_num);
+    PrepareHessian_bcoo(triplet_values,
+                        row_ids,
+                        col_ids,
+                        indices,
+                        offset,
+                        triplet_num,
+                        d_triplet_num);
 
     // [debug] STIFF_MAS_DUMP=<dir>: dump the FIRST assembly's raw bcoo triplet
     // input + per-bank cluster prefix, enabling a FULL external CPU oracle
@@ -1050,17 +1092,20 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
                               (size_t)m_outputClusterCap * 3 * BINNED_K * sizeof(double), 0));   // [B2'-b]
 
     BuildMultiLevelR(R);
+    const int2* extent =
+        deviceExtentActive() ? d_levelSize + levelnum : nullptr;
 
     auto runLegacyPath = [&]()
     {
         int n = totalNumberClusters - totalMapNodes;
         if(n > 0)
             _mas_comb_mR<<<(n + 255) / 256, 256>>>(d_multiLevelR, d_mRbin, totalMapNodes,
-                                                   totalNumberClusters);
+                                                   totalNumberClusters, extent);
         SchwarzLocalXSym_block3();
         n = totalNumberClusters;
         if(n > 0)
-            _mas_comb_mZ<<<(n + 255) / 256, 256>>>(d_multiLevelZ, d_mZbin, n);
+            _mas_comb_mZ<<<(n + 255) / 256, 256>>>(
+                d_multiLevelZ, d_mZbin, n, extent);
         CollectFinalZ(Z);
     };
 
@@ -1075,7 +1120,8 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
                 d_mZbin,
                 totalMapNodes,
                 totalNumberClusters,
-                clusterCapacity);
+                clusterCapacity,
+                extent);
 
         const int blocks = (totalNodes + DEFAULT_BLOCKSIZE - 1) / DEFAULT_BLOCKSIZE;
         __collectFinalZ_binned_new<<<blocks, DEFAULT_BLOCKSIZE>>>(
@@ -1086,7 +1132,8 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
             levelnum,
             totalNodes,
             totalNumberClusters,
-            clusterCapacity);
+            clusterCapacity,
+            extent);
 
         std::vector<double3> fusedOut;
         if(validateFuse)
@@ -1277,7 +1324,10 @@ void MASPreconditioner::initPreconditioner_Matrix()
                               totalNodes * sizeof(unsigned int),
                               cudaMemcpyDeviceToDevice));
 
-    int totalCluster = ReorderRealtime(0) * 1.05;
+    m_allocClusterTotal = 0;
+    const int exactCluster = ReorderRealtime(0);
+    int totalCluster =
+        std::max(exactCluster, static_cast<int>(exactCluster * 1.05));
 #ifdef SYME
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_inverseMatMas,
                               totalCluster / BANKSIZE * sizeof(__GEIGEN__::MasMatrixSymT)));
@@ -1302,6 +1352,8 @@ void MASPreconditioner::initPreconditioner_Matrix()
                               (size_t)(totalCluster / BANKSIZE) * MAS_NB * 9 * BINNED_K
                                   * sizeof(double)));
     m_outputClusterCap = totalCluster;   // [audit lens-A fix] remember the TRUE size
+    m_allocClusterTotal =
+        totalCluster / BANKSIZE * BANKSIZE;
 }
 
 // [audit lens-A fix] Grow the OUTPUT-layer buffer group when the per-frame
@@ -1351,6 +1403,9 @@ void MASPreconditioner::ensureOutputClusterCapacity(int need)
                               (size_t)(newCap / BANKSIZE) * MAS_NB * 9 * BINNED_K
                                   * sizeof(double)));
     m_outputClusterCap = newCap;
+    if(m_allocClusterTotal > 0)
+        m_allocClusterTotal =
+            newCap / BANKSIZE * BANKSIZE;
 }
 
 void MASPreconditioner::FreeMAS()
@@ -1405,4 +1460,5 @@ void MASPreconditioner::FreeMAS()
     totalNumberClusters = 0;
     m_clusterCap = 0;
     m_outputClusterCap = 0;
+    m_allocClusterTotal = 0;
 }

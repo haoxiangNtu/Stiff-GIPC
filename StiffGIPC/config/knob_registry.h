@@ -25,6 +25,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_ABD_DUMP, "diag") \
     X(STIFF_ABD_PRECOND_LEGACY, "solver") \
     X(STIFF_ALPHA_DBG, "diag") \
+    X(STIFF_ASSEMBLY_TIER_SHIFT, "diag") \
     X(STIFF_BAR_TGT0, "diag") \
     X(STIFF_BAR_TGT1, "diag") \
     X(STIFF_BAR_TRACE, "diag") \
@@ -33,6 +34,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_CCD_CANON, "mode_strict") \
     X(STIFF_CCD_VALIDATE, "diag") \
     X(STIFF_CONTACT_DBG, "diag") \
+    X(STIFF_CONVERT_DEVICE_COUNT, "perf") \
     X(STIFF_DECOUPLE_THRESH, "mode_isolated") \
     X(STIFF_DEVICE_LINESEARCH, "perf") \
     X(STIFF_DEVICE_LINESEARCH_VALIDATE, "diag") \

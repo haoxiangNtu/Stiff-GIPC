@@ -19,6 +19,7 @@
 
 #include "device_common/mirrors.h"  // [B1] HostMirror
 #include "linear_system/utils/pcg_capacity_mode.h"  // [B2'-b]
+#include <cstdlib>
 
 class GIPCTripletMatrix
 {
@@ -257,6 +258,19 @@ class GIPCTripletMatrix
     // host mirror could pick the garbage up (towel-strict OOB, 2026-07-24).
     int* d_unique_key_number = nullptr;
     int* d_assembly_scratch_count = nullptr;
+
+    // Final-convert count residency. Default-off preserves the release path;
+    // STIFF_FRAME_GRAPH enables it unless explicitly overridden. Intermediate
+    // ABD slice converts still publish exact host counts because their result
+    // sizes the following expansion stage.
+    static bool device_count_mode()
+    {
+        if(const char* value = std::getenv("STIFF_CONVERT_DEVICE_COUNT"))
+            return std::atoi(value) != 0;
+        if(const char* value = std::getenv("STIFF_FRAME_GRAPH"))
+            return std::atoi(value) != 0;
+        return false;
+    }
 
     // ②-D2H: one contiguous [5] block (abd_abd, abd_fem, fem_abd, fem_fem,
     // unique_key) so partitionContactHessian reads the 4 start-ids in a SINGLE

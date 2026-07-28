@@ -42,6 +42,9 @@ class MASPreconditioner
     int2* d_segwpe  = nullptr;   // [B3 s8] {segN, wpe} decided in-kernel per level
     int collision_node_Offset = 0;
     int totalNumberClusters = 0;
+    // Allocation-backed launch bound. When device-count mode is active the
+    // exact per-frame hierarchy extent remains in d_levelSize[levelnum].
+    int m_allocClusterTotal = 0;
     //int bankSize;
     int2  h_clevelSize{};
     int4* _collisonPairs = nullptr;
@@ -91,6 +94,8 @@ class MASPreconditioner
 
 
     int  ReorderRealtime(int cpNum);
+    bool deviceExtentActive() const;
+    int  exactClusterCountBlocking() const;
     void BuildConnectMaskL0();           // called in ReorderRealtime
     void PreparePrefixSumL0();           // called in ReorderRealtime
     void BuildLevel1();                  // called in ReorderRealtime
@@ -110,13 +115,15 @@ class MASPreconditioner
                                 uint32_t*        indices,
                                 int              offset,
                                 int              triplet_num,
+                                const int*       d_triplet_num,
                                 int              cpNum);
     void PrepareHessian_bcoo(Eigen::Matrix3d* triplet_values,
                              int*             row_ids,
                              int*             col_ids,
                              uint32_t*        indices,
                              int              offset,
-                             int              triplet_number);
+                             int              triplet_number,
+                             const int*       d_triplet_number);
 
     void preconditioning(const double3* R, double3* Z);
     void BuildMultiLevelR(const double3* R);  // called in preconditioning

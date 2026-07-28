@@ -13,16 +13,27 @@ class Converter
                  const int&         length,
                  const int&         out_start_id);
 
+    void convert(GIPCTripletMatrix& global_triplets,
+                 const int&         start,
+                 const int&         length,
+                 const int&         capacity,
+                 const int&         out_start_id);
+
+    // Frame-boundary preallocation hook. Calling this before graph capture
+    // guarantees that the binned duplicate merge cannot allocate in-frame.
+    void ensure_capacity(int capacity);
 
     void _radix_sort_indices_and_blocks(GIPCTripletMatrix& global_triplets,
                                         const int&         start,
                                         const int&         length,
+                                        const int&         capacity,
                                         const int&         out_start_id);
 
 
     void _make_unique_block_warp_reduction(GIPCTripletMatrix& global_triplets,
                                            const int&         start,
                                            const int&         length,
+                                           const int&         capacity,
                                            const int&         out_start_id);
 
 

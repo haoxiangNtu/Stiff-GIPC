@@ -17,12 +17,21 @@ namespace details
                    [diag = diag_inv.viewer().name("diag"),
                     hessian = global_triplets.block_values(),
                     rows = global_triplets.block_row_indices(),
-                    cols = global_triplets.block_col_indices()] __device__(int I) mutable
+                    cols = global_triplets.block_col_indices(),
+                    d_uniq = global_triplets.d_unique_key_number,
+                    device_count =
+                        GIPCTripletMatrix::device_count_mode()] __device__(
+                       int I) mutable
                    {
+                       if(device_count && I >= *d_uniq)
+                           return;
                        auto i           = rows[I];
                        auto j           = cols[I];
                        auto H           = hessian[I];
                        if(i != j)
+                           return;
+                       // A neutral (0,0) pad must never be inverted.
+                       if(H.isZero(0.0))
                            return;
 
                        diag(i) = eigen::inverse(H);

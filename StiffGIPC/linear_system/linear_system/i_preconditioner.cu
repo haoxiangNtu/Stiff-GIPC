@@ -1,6 +1,7 @@
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <linear_system/linear_system/linear_subsystem.h>
 #include <linear_system/linear_system/global_linear_system.h>
+#include <linear_system/utils/capacity_tier.h>
 #include <muda/cub/device/device_select.h>
 
 namespace gipc
@@ -29,7 +30,8 @@ int LocalPreconditioner::get_offset() const
     return m_subsystem->m_dof_offset / 3;
 }
 
-uint32_t* LocalPreconditioner::calculate_subsystem_bcoo_indices(int& number) const
+uint32_t* LocalPreconditioner::calculate_subsystem_bcoo_indices(
+    int& number, bool keep_count_device) const
 {
     auto offset = m_subsystem->m_dof_offset / 3;
     auto end    = offset + m_subsystem->m_right_hand_side_dof / 3;
@@ -37,22 +39,44 @@ uint32_t* LocalPreconditioner::calculate_subsystem_bcoo_indices(int& number) con
     auto index_input  = m_system->gipc_global_triplet->block_index();
     auto index_output = m_system->gipc_global_triplet->block_sort_index();
     auto flags        = m_system->gipc_global_triplet->block_temp_buffer();
+    const bool device_count =
+        GIPCTripletMatrix::device_count_mode();
+    const int host_count =
+        m_system->gipc_global_triplet->h_unique_key_number;
+    const int launch_count =
+        device_count ? assembly_capacity_tier(host_count) : host_count;
+    const int* d_exact_count =
+        m_system->gipc_global_triplet->d_unique_key_number;
+    if(launch_count == 0)
+    {
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_count.data(), 0, sizeof(int), cudaStreamPerThread));
+        number = 0;
+        return index_output;
+    }
     muda::ParallelFor()
         .kernel_name(__FUNCTION__)
-        .apply(m_system->gipc_global_triplet->h_unique_key_number,
+        .apply(launch_count,
                [rows   = m_system->gipc_global_triplet->block_row_indices(),
                 cols   = m_system->gipc_global_triplet->block_col_indices(),
                 offset = offset,
                 end    = end,
                 indices_input = index_input,
-                flags] __device__(int I) mutable
+                flags,
+                device_count,
+                d_exact_count] __device__(int I) mutable
                {
+                   indices_input[I] = I;
+                   if(device_count && I >= *d_exact_count)
+                   {
+                       flags[I] = 0;
+                       return;
+                   }
                    //auto&& [i, j, H] = bcoo(I);
                    auto i = rows[I];
                    auto j = cols[I];
                    auto in_range = [&](int m) { return m >= offset && m < end; };
                    bool valid       = in_range(i) && in_range(j);
-                   indices_input[I] = I;  // -I for invalid
                    flags[I]         = valid ? 1 : 0;
                });
 
@@ -60,15 +84,23 @@ uint32_t* LocalPreconditioner::calculate_subsystem_bcoo_indices(int& number) con
         index_input,
         flags,
         index_output,
-        m_system->gipc_global_triplet->d_assembly_scratch_count,
-        m_system->gipc_global_triplet->h_unique_key_number);
+        m_count.data(),
+        launch_count);
 
-    int h_count;
-    CUDA_SAFE_CALL(cudaMemcpy(&h_count,
-                              m_system->gipc_global_triplet->d_assembly_scratch_count,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-    number = h_count;
+    if(keep_count_device)
+    {
+        number = launch_count;
+    }
+    else
+    {
+        int h_count;
+        CUDA_SAFE_CALL(cudaMemcpy(
+            &h_count,
+            m_count.data(),
+            sizeof(int),
+            cudaMemcpyDeviceToHost));
+        number = h_count;
+    }
     return index_output;
 }
 

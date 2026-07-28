@@ -1,7 +1,10 @@
 __global__ void __inverse6_P96x96(__GEIGEN__::MasMatrixSymf* _preMatrix,
                                   __GEIGEN__::MasMatrixSymT* _invMatrix,
-                                  int                        numbers)
+                                  int                        numbers,
+                                  const int2*                extent)
 {
+    if(extent)
+        numbers = extent->y * 3;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // [audit lens-B fix] NO early return: the Gauss-Jordan loop below runs 7
     // __syncthreads() per pivot. With 96 threads/block handling 2 matrices, a
@@ -314,8 +317,11 @@ __global__ void __collectFinalZ_binned_new(double3*                  Z,
                                            int                       levelNum,
                                            int                       number,
                                            int                       clusterCount,
-                                           size_t                    clusterCapacity)
+                                           size_t                    clusterCapacity,
+                                           const int2*               extent)
 {
+    if(extent)
+        clusterCount = extent->y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -361,6 +367,4 @@ __global__ void __collectFinalZ_binned_new(double3*                  Z,
                           static_cast<double>(cy),
                           static_cast<double>(cz));
 }
-
-
 

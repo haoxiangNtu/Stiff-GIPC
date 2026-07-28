@@ -3,6 +3,7 @@
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <gipc/utils/timer.h>
+#include <linear_system/utils/capacity_tier.h>
 
 namespace gipc
 {
@@ -70,14 +71,33 @@ bool GlobalLinearSystem::build_linear_system()
     {
         auto*           gt     = gipc_global_triplet;
         const long long length = gt->global_triplet_offset;
-        gt->ensure_capacity_preserve((size_t)length, (size_t)(2LL * length));
-        if(gt->global_external_max_capcity < length)
+        const int layout =
+            GIPCTripletMatrix::device_count_mode()
+                ? assembly_capacity_tier(static_cast<int>(length))
+                : static_cast<int>(length);
+        gt->ensure_capacity_preserve(
+            static_cast<size_t>(length),
+            static_cast<size_t>(2LL * layout));
+        if(gt->global_external_max_capcity < layout)
         {
-            long long hm = length * 3 / 10;
-            long long hcap_bytes = 512ll * 1024 * 1024 / (long long)sizeof(uint64_t);
-            if(hm > hcap_bytes) hm = hcap_bytes;
-            gt->resize_collision_hash_size((size_t)(length + hm));
-            gt->global_external_max_capcity = (int)(length + hm);
+            if(GIPCTripletMatrix::device_count_mode())
+            {
+                gt->resize_collision_hash_size(static_cast<size_t>(layout));
+                gt->global_external_max_capcity = layout;
+            }
+            else
+            {
+                long long hm = length * 3 / 10;
+                long long hcap_bytes =
+                    512ll * 1024 * 1024
+                    / static_cast<long long>(sizeof(uint64_t));
+                if(hm > hcap_bytes)
+                    hm = hcap_bytes;
+                gt->resize_collision_hash_size(
+                    static_cast<size_t>(length + hm));
+                gt->global_external_max_capcity =
+                    static_cast<int>(length + hm);
+            }
         }
     }
 
@@ -257,18 +277,37 @@ void GlobalLinearSystem::convert_new()
         const long long length = gt->global_triplet_offset;
         if(length >= 1)
         {
-            gt->ensure_capacity_preserve((size_t)length, (size_t)(2LL * length));
-            if(gt->global_external_max_capcity < length)
+            const int layout =
+                GIPCTripletMatrix::device_count_mode()
+                    ? assembly_capacity_tier(static_cast<int>(length))
+                    : static_cast<int>(length);
+            gt->ensure_capacity_preserve(
+                static_cast<size_t>(length),
+                static_cast<size_t>(2LL * layout));
+            if(gt->global_external_max_capcity < layout)
             {
-                gt->resize_collision_hash_size((size_t)((long long)length * 13 / 10));
-                gt->global_external_max_capcity = (int)((long long)length * 13 / 10);
+                const int hash_capacity =
+                    GIPCTripletMatrix::device_count_mode()
+                        ? layout
+                        : static_cast<int>(length * 13 / 10);
+                gt->resize_collision_hash_size(
+                    static_cast<size_t>(hash_capacity));
+                gt->global_external_max_capcity = hash_capacity;
             }
         }
     }
-    m_converter.convert(*gipc_global_triplet,
-                        0,
-                        gipc_global_triplet->global_triplet_offset,
-                        gipc_global_triplet->global_triplet_offset);
+    const int length = gipc_global_triplet->global_triplet_offset;
+    if(GIPCTripletMatrix::device_count_mode())
+    {
+        const int layout = assembly_capacity_tier(length);
+        m_converter.convert(
+            *gipc_global_triplet, 0, length, layout, layout);
+    }
+    else
+    {
+        m_converter.convert(
+            *gipc_global_triplet, 0, length, length);
+    }
 }
 
 

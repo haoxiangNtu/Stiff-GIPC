@@ -19,14 +19,20 @@ void MAS_Preconditioner::assemble()
 {
     double collision_num = *cpNum;
     gipc::Timer timer{"precomputing mas Preconditioner"};
+    const bool  device_count =
+        GIPCTripletMatrix::device_count_mode();
     int         triplet_number  = 0;
-    uint32_t*   indices = calculate_subsystem_bcoo_indices(triplet_number);
+    uint32_t*   indices =
+        calculate_subsystem_bcoo_indices(triplet_number, device_count);
     MAS_Prec.setPreconditioner_bcoo(system_bcoo_matrix(),
                                     system_bcoo_rows(),
                                     system_bcoo_cols(),
                                     indices,
                                     get_offset(),
                                     triplet_number,
+                                    device_count
+                                        ? subsystem_bcoo_count_device()
+                                        : nullptr,
                                     collision_num);
 }
 
