@@ -1,16 +1,3 @@
-// [C-2] knob-gated device-offset arming: STIFF_C2_OFFSET_DEV=1 makes the FEM
-// assembly read its triplet offset from the device total. Transitional gate =
-// SINGLE-ENV merged only: the multi-env merged contact accumulation does not
-// match the seeded single-env formula (armed foldshirt N=4 stalled inside the
-// first solve — mis-offset FEM triplets corrupt the Hessian), and per-env has
-// different count semantics outright. Both revert to host offsets (equal
-// values) until the C-2 (3) in-graph recompute covers their formulas.
-#define _c2_offset_dev() \
-    ([&]() -> const int* { \
-        static int _c2on = -1; \
-        if(_c2on < 0) { const char* _e = getenv("STIFF_C2_OFFSET_DEV"); _c2on = _e ? atoi(_e) : 0; } \
-        return (_c2on && !m_perenv_bvh && m_active_group_count <= 1) ? m_d_contact_triplet_total : nullptr; }())
-
 // [C-2] contact-segment triplet total, computed from device-resident counts.
 // Mirrors the host accumulation exactly: barrier(live cp 2/3/4) +
 // friction(lastH stash 2/3/4 + gd stash, when armed) + ground(live gp slot 5).
@@ -19,9 +6,16 @@
 // arithmetic; the live device slots drift around frame boundaries (re-emitting
 // scans). The Newton-graph era recomputes this in-graph from device counts
 // once the contact side is device-offset too.
-__global__ void _calc_contact_triplet_total(int* d_total, int host_total)
+__global__ void _calc_contact_triplet_total(int* d_slots, int contact_total,
+                                            int fricgd_start, int ground_start,
+                                            int cd4, int cd3, int cd2,
+                                            int f4, int f3, int f2)
 {
-    *d_total = host_total;
+    d_slots[0] = contact_total;   // FEM segment base
+    d_slots[1] = fricgd_start;    // gd-friction assembly base
+    d_slots[2] = ground_start;    // ground assembly base
+    d_slots[4] = cd4; d_slots[5] = cd3; d_slots[6] = cd2;   // live barrier types
+    d_slots[7] = f4;  d_slots[8] = f3;  d_slots[9] = f2;    // lastH types
 }
 
 void GIPC::suggestKappa(double& kappa)
@@ -608,14 +602,28 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // the live _cpNum slots (ground doubles slot 5), so only the detection-fresh
     // values here match the host mirror arithmetic below.
     {
-        long long _ct = (long long)h_cpNum[4] * M12_Off + (long long)h_cpNum[3] * M9_Off
-                        + (long long)h_cpNum[2] * M6_Off;
+        const long long _barrier = (long long)h_cpNum[4] * M12_Off
+                                   + (long long)h_cpNum[3] * M9_Off
+                                   + (long long)h_cpNum[2] * M6_Off;
+        long long _fric_cp = 0, _fric_gd = 0;
 #ifdef USE_FRICTION
-        _ct += (long long)h_cpNum_last[4] * M12_Off + (long long)h_cpNum_last[3] * M9_Off
-               + (long long)h_cpNum_last[2] * M6_Off + (long long)(uint32_t)h_gpNum_last;
+        _fric_cp = (long long)h_cpNum_last[4] * M12_Off + (long long)h_cpNum_last[3] * M9_Off
+                   + (long long)h_cpNum_last[2] * M6_Off;
+        _fric_gd = (long long)(uint32_t)h_gpNum_last;
 #endif
-        _ct += (long long)(uint32_t)h_gpNum;
-        _calc_contact_triplet_total<<<1, 1>>>(m_d_contact_triplet_total, (int)_ct);
+        const long long _ground_start = _barrier + _fric_cp + _fric_gd;
+        const long long _ct = _ground_start + (long long)(uint32_t)h_gpNum;
+        _calc_contact_triplet_total<<<1, 1>>>(m_d_contact_triplet_total,
+                                              (int)_ct,
+                                              (int)(_barrier + _fric_cp),
+                                              (int)_ground_start,
+                                              (int)h_cpNum[4], (int)h_cpNum[3], (int)h_cpNum[2],
+#ifdef USE_FRICTION
+                                              (int)h_cpNum_last[4], (int)h_cpNum_last[3], (int)h_cpNum_last[2]
+#else
+                                              0, 0, 0
+#endif
+        );
     }
 
     // [P1-dyn] Grow the global triplet buffer BEFORE any assembly writes, to a PROVABLE

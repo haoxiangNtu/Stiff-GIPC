@@ -111,9 +111,12 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        double*          lastH,
                                        int              global_offset,
                                        double           coef,
-                                       const double*    vert_mu_gd)
+                                       const double*    vert_mu_gd,
+                                       const int*       offset_dev = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(offset_dev)   // [C-2] device gd-friction assembly base
+        global_offset = *offset_dev;
     if(idx >= number)
         return;
     double                 eps           = sqrt(eps2);
@@ -228,9 +231,25 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                                     int                     cd_offset2,
                                     int                     f_offset4,
                                     int                     f_offset3,
-                                    int                     f_offset2)
+                                    int                     f_offset2,
+                                    const uint32_t*         cd_dev = nullptr,
+                                    const uint32_t*         f_dev  = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // [C-2] device-resident type-count offsets (live barrier types + lastH
+    // stash) — the graph era must not bake per-iteration counts.
+    if(cd_dev)   // compact {t4, t3, t2} snapshot layout
+    {
+        cd_offset4 = (int)cd_dev[0];
+        cd_offset3 = (int)cd_dev[1];
+        cd_offset2 = (int)cd_dev[2];
+    }
+    if(f_dev)
+    {
+        f_offset4 = (int)f_dev[0];
+        f_offset3 = (int)f_dev[1];
+        f_offset2 = (int)f_dev[2];
+    }
     if(idx >= number)
         return;
     int4    MMCVIDI = _last_collisionPair[idx];

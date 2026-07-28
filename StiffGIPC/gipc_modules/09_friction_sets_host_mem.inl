@@ -404,8 +404,8 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_gp_friction, sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_cp_friction, 5 * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemset(m_scr_cp_friction, 0, 5 * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_contact_triplet_total, sizeof(int)));  // [C-2]
-    CUDA_SAFE_CALL(cudaMemset(m_d_contact_triplet_total, 0, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_contact_triplet_total, 12 * sizeof(int)));  // [C-2] offset-web snapshot
+    CUDA_SAFE_CALL(cudaMemset(m_d_contact_triplet_total, 0, 12 * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_ls_alpha, sizeof(double)));  // [C-1]
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_ls_scalars, 2 * sizeof(double)));  // [C-1] {c1m, kappa}
     CUDA_SAFE_CALL(cudaMemset(m_scr_gp_friction, 0, sizeof(uint32_t)));
@@ -683,7 +683,8 @@ void GIPC::GroundCollisionDetect()
         _point_body_id, _ground_skip_body, _ground_body_count, _gdCollapse);
 }
 
-void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int global_hessian_fem_offset)
+void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int global_hessian_fem_offset,
+                                                   const int* offset_dev, int offset_partial)
 {
     int numbers = softNum;
     if(numbers < 1)
@@ -710,7 +711,9 @@ void GIPC::computeSoftConstraintGradientAndHessian(double3* _gradient, int globa
         m_d_stitch_rest_offset,
         m_d_stitch_abd_body_id,
         reinterpret_cast<const __GEIGEN__::Vector12*>(m_d_abd_body_q),
-        softNum);
+        softNum,
+        offset_dev,
+        offset_partial);
 }
 
 void GIPC::getTotalForce(double3* _gradient0, double3* _gradient1)
@@ -752,7 +755,8 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         gipc_global_triplet.global_triplet_offset,
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,
-        m_pergroup_kappa ? m_d_p2g : nullptr);
+        m_pergroup_kappa ? m_d_p2g : nullptr,
+        _c2_offset_dev() ? _c2_offset_dev() + 2 : nullptr);  // [C-2] ground base
 }
 
 void GIPC::computeCloseGroundVal()

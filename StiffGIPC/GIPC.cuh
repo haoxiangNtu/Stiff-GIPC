@@ -83,7 +83,9 @@ class GIPC
     double*   m_d_ls_alpha            = nullptr;  // [C-1] device-resident trial alpha
     double*   m_d_ls_scalars          = nullptr;  // [C-1] {c1m, kappa} staged per line search
     uint32_t* m_scr_cp_friction       = nullptr;  // [C-1] friction-era cp counts, device-stashed
-    int*      m_d_contact_triplet_total = nullptr; // [C-2] device contact-segment triplet total
+    int*      m_d_contact_triplet_total = nullptr; // [C-2] 12-int: {contact_total,
+    // fricgd_start, ground_start, rsv, cd4, cd3, cd2, f4, f3, f2, rsv, rsv} —
+    // GH-start snapshot of the offset web (mirror-seeded transitionally)
     bool      m_ls_recording          = false;    // [C-1] capacity sizing while recording
     cudaGraphExec_t m_ls_graph_exec   = nullptr;  // [C-1] cached trial-body self-tail graph
     long long m_ls_graph_sig[2]       = {-1, -1}; //   {buffer generation, budget}
@@ -603,7 +605,9 @@ class GIPC
     void  computeGroundGradient(double3* _gradient, double mKap,
                                 bool use_group_kappa = true);
     void computeSoftConstraintGradientAndHessian(double3* _gradient,
-                                                 int global_hessian_fem_offset);
+                                                 int global_hessian_fem_offset,
+                                                 const int* offset_dev = nullptr,
+                                                 int offset_partial = 0);
 
     void getTotalForce(double3* _gradient, double3* _gradient2);
 
@@ -751,3 +755,13 @@ class GIPC
 void stiff_test_ccd_nan_max_speed_fail_fast();
 
 #endif
+
+// [C-2] knob-gated device-offset arming: STIFF_C2_OFFSET_DEV=1 makes the
+// assembly chain read triplet offsets/type counts from the GH-start device
+// snapshot. Transitional gate = SINGLE-ENV merged only (multi-env merged
+// accumulation differs; per-env differs outright). Lambda: method context.
+#define _c2_offset_dev() \
+    ([&]() -> const int* { \
+        static int _c2on = -1; \
+        if(_c2on < 0) { const char* _e = getenv("STIFF_C2_OFFSET_DEV"); _c2on = _e ? atoi(_e) : 0; } \
+        return (_c2on && !m_perenv_bvh && m_active_group_count <= 1) ? m_d_contact_triplet_total : nullptr; }())

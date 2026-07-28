@@ -63,9 +63,13 @@ __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes
                                                          const double3* stitch_rest_offset,
                                                          const int*     stitch_abd_body_id,
                                                          const __GEIGEN__::Vector12* abd_body_q,
-                                                         int number)
+                                                         int number,
+                                                         const int* offset_dev = nullptr,
+                                                         int offset_partial = 0)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(offset_dev)   // [C-2] device triplet offset (see _calculate_fem_gradient_hessian)
+        global_offset = *offset_dev + offset_partial;
     if(idx >= number)
         return;
     uint32_t vInd = targetInd[idx];

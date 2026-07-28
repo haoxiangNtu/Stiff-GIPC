@@ -109,9 +109,16 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                               int              offset2,
                                               int              number,
                                               const double*    kappa_grp = nullptr,
-                                              const int*       p2g       = nullptr)
+                                              const int*       p2g       = nullptr,
+                                              const uint32_t*  cd_dev    = nullptr)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(cd_dev)   // [C-2] compact {t4, t3, t2} snapshot layout
+    {
+        offset4 = (int)cd_dev[0];
+        offset3 = (int)cd_dev[1];
+        offset2 = (int)cd_dev[2];
+    }
     if(idx >= number)
         return;
     int4   MMCVIDI   = _collisionPair[idx];
