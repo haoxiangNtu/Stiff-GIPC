@@ -45,7 +45,7 @@ extern __global__ void _ccd_final_alpha_combine(double* slots, int have_ccd_pair
 extern __global__ void _ccd_initial_alpha_combine(double* slots, int have_ground, int have_self, int* invalid);
 extern __global__ void _fill_double(double* values, double value, int count);
 extern __global__ void _gather_abd_body_alpha(const int* body_to_group, const double* env_alpha, double* abd_body_alpha, int abd_body_num, int ng);
-extern __global__ void _global_ls_decide(const double* energy0, const double* energy1, double c1m, double alpha, double energy_abs_tol, double energy_rel_tol, int* status);
+extern __global__ void _global_ls_decide(const double* energy0, const double* energy1, double c1m, double alpha, double energy_abs_tol, double energy_rel_tol, int* status, const int* gd_collapse);
 extern __global__ void _mask_fill(int* m, int v, int n);
 extern __global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, int ng);
 extern __global__ void _newton_convergence_decide(const double* max_movement, double threshold, int* converged);

@@ -256,11 +256,12 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                                         trial_alpha,
                                         energy_abs_tol,
                                         energy_rel_tol,
-                                        m_line_search_decision);
-            int dec_of[2] = {0, 0};
+                                        m_line_search_decision,
+                                        _gdCollapse);
+            int dec_of[3] = {0, 0, 0};
             CUDA_SAFE_CALL(cudaMemcpy(dec_of,
                                       m_line_search_decision,
-                                      2 * sizeof(int),
+                                      3 * sizeof(int),
                                       cudaMemcpyDeviceToHost));
             int decision = dec_of[0];
             // [B3 trial-defer] monotone pair-overflow counter piggybacked on
@@ -285,14 +286,20 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                                             trial_alpha,
                                             energy_abs_tol,
                                             energy_rel_tol,
-                                            m_line_search_decision);
+                                            m_line_search_decision,
+                                            _gdCollapse);
                 CUDA_SAFE_CALL(cudaMemcpy(dec_of,
                                           m_line_search_decision,
-                                          2 * sizeof(int),
+                                          3 * sizeof(int),
                                           cudaMemcpyDeviceToHost));
                 decision             = dec_of[0];
                 m_pair_overflow_seen = (unsigned)dec_of[1];
             }
+            // [B3 trial-defer] deferred ground-collapse response: same trial,
+            // one call, idempotent (0 = clean). Legacy mode (defer off) already
+            // handled it inside buildCP, so gate on the flag to avoid doubling.
+            if(m_ls_defer_counts && dec_of[2] < 0)
+                handleGroundCollapse(dec_of[2]);
             if(getenv("STIFF_DEVICE_LINESEARCH_VALIDATE"))
             {
                 double h_energy[2] = {0.0, 0.0};
