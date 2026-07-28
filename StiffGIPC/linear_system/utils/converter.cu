@@ -18,6 +18,14 @@ __global__ inline void moveMemory_2(T* data, int output_start, int input_start, 
     data[output_start + idx] = data[input_start + idx];
 }
 
+// [B2'-a] the device slot becomes the count truth (+1 applied on device);
+// the host mirror is copied FROM it and in-PCG-loop consumers (spmv) read it
+// live, so the captured graph no longer bakes the count into kernel params.
+__global__ void _finalize_unique_count(int* dst, const uint32_t* last_partition)
+{
+    *dst = (int)(*last_partition) + 1;
+}
+
 constexpr bool UseRadixSort   = true;
 constexpr bool UseReduceByKey = false;
 
@@ -152,11 +160,12 @@ void Converter::_make_unique_block_warp_reduction(GIPCTripletMatrix& global_trip
                });
 
 
+    _finalize_unique_count<<<1, 1>>>(global_triplets.d_unique_key_number,
+                                     sorted_partition_output + length - 1);
     CUDA_SAFE_CALL(cudaMemcpy(global_triplets.h_unique_key_number.refresh_dst(),
-                              sorted_partition_output + length - 1,
+                              global_triplets.d_unique_key_number,
                               sizeof(int),
                               cudaMemcpyDeviceToHost));
-    global_triplets.h_unique_key_number += 1;
 
     CUDA_SAFE_CALL(cudaMemset(global_triplets.block_values(start),
                               0,
