@@ -351,10 +351,13 @@ class ABDSystem
     // non-null, body i steps by per_body_alpha[i] instead of the scalar alpha
     // (env g's bodies step by alpha_g so a CCD pair's verts move uniformly).
     // alpha is still used as fallback for bodies whose per_body_alpha[i] < 0.
+    // [C-1 ls-graph] alpha_dev: device-resident scalar trial alpha; overrides
+    // `alpha`, still overridden per body by per_body_alpha where >= 0.
     void step_forward(ABDSimData&                sim_data,
                       muda::BufferView<double3>  vertices,
                       double                     alpha,
-                      const double*              per_body_alpha = nullptr);
+                      const double*              per_body_alpha = nullptr,
+                      const double*              alpha_dev = nullptr);
 
     // when doing line search, we need calculate abd energy from q
     // copy_to_host=false leaves the reduced scalar on the device and avoids

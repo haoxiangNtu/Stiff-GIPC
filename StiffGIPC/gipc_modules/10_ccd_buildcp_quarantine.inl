@@ -291,14 +291,18 @@ void GIPC::snapshotDcdCcdPairs()
         return;
     if((int)m_dcd_snap_count > m_dcd_snap_cap)
     {
+        ++pcg_buffer_generation();  // [C-1] captured snapshot pointer moves
         if(_dcd_ccd_snapshot) CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot));
         m_dcd_snap_cap = (int)(m_dcd_snap_count + m_dcd_snap_count / 2) + 1;
         CUDA_SAFE_CALL(cudaMalloc((void**)&_dcd_ccd_snapshot,
                                   (size_t)m_dcd_snap_cap * sizeof(int4)));
     }
-    CUDA_SAFE_CALL(cudaMemcpy(_dcd_ccd_snapshot, _ccd_collisonPairs,
-                              (size_t)m_dcd_snap_count * sizeof(int4),
-                              cudaMemcpyDeviceToDevice));
+    // [C-1 capture-safe] async D2D: stream-ordered like every consumer, and
+    // the sync variant is illegal inside graph capture. The grow branch above
+    // cannot fire mid-line-search (the mirror is frozen for the whole LS).
+    CUDA_SAFE_CALL(cudaMemcpyAsync(_dcd_ccd_snapshot, _ccd_collisonPairs,
+                                   (size_t)m_dcd_snap_count * sizeof(int4),
+                                   cudaMemcpyDeviceToDevice, 0));
 }
 
 void GIPC::throwIfGroundDistanceInvalid()

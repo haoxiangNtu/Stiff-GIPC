@@ -49,3 +49,35 @@ ccd_alpha+LS 子图。前提=C-1 + 装配 offset 设备化（或按迭代 exec-u
   可先走非图路径（同 B2' 的 !SPMV_DET 门控先例），锚免疫。
 - 已得资产：PCG device-loop（尾launch 自循环图先例）、B2' 容量网格/设备计
   数模式全套、单一代数计数器、15 段门禁+指纹配方。
+
+## C-1 落地战报：LS 回溯 trial 自尾图（2026-07-28）
+
+`STIFF_LS_GRAPH`（默认 0）把首个能量试探失败后的回溯子环录成 device-launch
+CUDA Graph：设备 alpha 每轮减半，trial 体执行 step→BVH→CP(defer)→energy→
+decide，尾核按 `{decision==1 && trials<budget}` 自重发。宿主每个回溯子环只在
+图结束后读一次 24B packed status；首个试探的 12B decision 仍保留，归 C-2
+外层 Newton 图吸收。
+
+捕获安全补齐：
+- DCD/CCD snapshot 改 stream-ordered async D2D；ABD 固定拓扑 energy workspace
+  只在尺寸实际变化时 resize，避开 muda `DeviceBuffer::resize()` 的无条件 wait。
+- graph 签名覆盖 `{全局指针代际、budget、cp/gp energy launch bound、snapshot
+  长度}`；pair/sort/reduce/snapshot 指针移动均 bump 代际，脏图必销毁重录。
+- 捕获体抛异常以及 begin/end/instantiate 任一 API 失败都永久降级到宿主环，
+  不留下非法 capture 状态；释放 solver 前先销毁 graph exec。
+- strict/default-off 路径不进图；默认 15 段门禁全绿，strict 锚
+  `0544461bd82123ae`（53 Newton）逐位原位。knob-on towel 完整 recipe 打印
+  `trial self-tail graph active (budget=64)` 后 PASS；foldshirt merged N=4
+  30f 兼容冒烟 PASS（该 30f 负载没有发生回溯，故不触图）。
+
+4090 Nsight Systems 2024.6.2 指纹（同一固定种子 towel recipe，`STIFF_NVTX=1`；
+SQLite 以 runtime correlation + NVTX `line_search` 区间联查）：
+
+| 模式 | line_search 区间 | 12B decision D2H | 超出首试的 12B | 24B D2H | 额外 packed 24B | host graph launch |
+|---|---:|---:|---:|---:|---:|---:|
+| graph=0 | 1144 | 1173 | **29** | 1144 | 0 | 0 |
+| graph=1 | 1136 | 1136 | **0** | 1160 | 24 | 24 |
+
+merged 的 Newton 数本来即非逐位确定，故两行各自按本行区间数归一：graph=1 时
+12B 次数与区间数严格相等，证明所有回溯 trial 决策读均消失；24 个实际进入
+回溯的 line search 各付一次 packed 读，而非每 trial 一次宿主往返。

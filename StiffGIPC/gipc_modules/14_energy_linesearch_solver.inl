@@ -29,8 +29,12 @@ __global__ void _global_ls_decide(const double* energy0,
                                   double        energy_abs_tol,
                                   double        energy_rel_tol,
                                   int*          status,
-                                  const int*    gd_collapse)
+                                  const int*    gd_collapse,
+                                  const double* alpha_dev)
 {
+    // [C-1 ls-graph] device-resident trial alpha when armed.
+    if(alpha_dev)
+        alpha = *alpha_dev;
     const double e0  = *energy0;
     const double e1  = *energy1;
     const double rhs = __dadd_rn(e0, __dmul_rn(c1m, alpha));
@@ -49,6 +53,31 @@ __global__ void _global_ls_decide(const double* energy0,
     // [B3 trial-defer] ground-collapse flag rides the same read; the host
     // response (quarantine / typed throw) fires only on a negative value.
     status[2] = gd_collapse ? *gd_collapse : 0;
+}
+
+// [C-1 ls-graph] trial-body head: halve the device alpha, count the trial.
+__global__ void _ls_trial_begin(double* alpha_dev, int* status)
+{
+    *alpha_dev *= 0.5;
+    ++status[3];
+}
+// [C-1 ls-graph] seed before graph launch: start alpha + zeroed trial count.
+__global__ void _ls_seed(double* alpha_dev, double alpha0, int* status)
+{
+    *alpha_dev = alpha0;
+    status[3]  = 0;
+}
+// [C-1 ls-graph] trial-body tail: publish alpha bits for the single post-loop
+// host read, then self-relaunch while still backtracking with budget left
+// (same device tail-launch idiom as pcg_graph_tail_relaunch).
+__global__ void _ls_trial_tail(int* status, int budget, const double* alpha_dev)
+{
+    const unsigned long long bits =
+        (unsigned long long)__double_as_longlong(*alpha_dev);
+    status[4] = (int)(bits & 0xffffffffull);
+    status[5] = (int)(bits >> 32);
+    if(status[0] == 1 && status[3] < budget)
+        cudaGraphLaunch(cudaGetCurrentGraphExec(), cudaStreamGraphTailLaunch);
 }
 // [de-CPU S3] intersect-safety halving (was: host loop over the stale mirror + H2D).
 __global__ void _s3_halve_all(double* env_alpha, int ng)

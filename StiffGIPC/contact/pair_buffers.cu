@@ -3,6 +3,7 @@
 // Contract, division of responsibility, and the latent-OOB history live in
 // contact/pair_buffers.cuh. Host-only code: zero device code moves here.
 // ============================================================================
+#include "linear_system/utils/pcg_capacity_mode.h"  // [C-1]
 #include <cuda_runtime.h>
 #include "cuda_tools/cuda_tools.h"
 #include "contact/pair_buffers.cuh"
@@ -21,6 +22,7 @@ void pair_buffers_alloc(PairBuffers b)
 // allocation size and published cap stay equal by construction.
 void pair_buffers_grow_dcd(PairBuffers b, int new_dcd)
 {
+    ++pcg_buffer_generation();   // [C-1] pair pointers baked in the LS graph move
     CUDA_SAFE_CALL(cudaFree(b.dcd));
     CUDA_SAFE_CALL(cudaFree(b.mat));
     CUDA_SAFE_CALL(cudaMalloc((void**)&b.dcd, ((size_t)new_dcd + 1) * sizeof(int4)));
@@ -39,6 +41,7 @@ void pair_buffers_grow_dcd(PairBuffers b, int new_dcd)
 // growth; a request below the current cap is a no-op republish).
 void pair_buffers_grow_ccd(PairBuffers b, int new_ccd)
 {
+    ++pcg_buffer_generation();   // [C-1] pair pointers baked in the LS graph move
     if(new_ccd > b.ccd_cap)
     {
         CUDA_SAFE_CALL(cudaFree(b.ccd));

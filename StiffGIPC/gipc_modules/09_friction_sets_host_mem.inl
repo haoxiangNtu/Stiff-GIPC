@@ -155,6 +155,16 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 /// </summary>
 void GIPC::FREE_DEVICE_MEM()
 {
+    // Captured nodes retain every device pointer used by the trial body.
+    // Destroy the executable before any of those allocations are released.
+    if(m_ls_graph_exec)
+    {
+        cudaGraphExecDestroy(m_ls_graph_exec);
+        m_ls_graph_exec   = nullptr;
+        for(long long& value : m_ls_graph_sig)
+            value = -1;
+    }
+
     auto release = [](auto*& pointer)
     {
         if(pointer)
@@ -279,6 +289,7 @@ void GIPC::FREE_DEVICE_MEM()
     // [descriptor phase-0.3] solver scratch family
     release(m_scr_ls_eg0);   release(m_scr_ls_eg1);
     release(m_scr_gp_friction);   // [B3 s7]
+    release(m_d_ls_alpha);        // [C-1]
     release(m_scr_ls_decision_counts);
     release(m_scr_maxk);
     release(m_scr_sq_a);     release(m_scr_cnt_a);
@@ -381,11 +392,12 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_energy_slots, kEnergySlotCount * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_energy, 2 * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_compatibility_energy, sizeof(double)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, 3 * sizeof(int)));  // [B3] {decision, overflow_count, gd_collapse}
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, 6 * sizeof(int)));  // [B3/C-1] {decision, overflow, collapse, trials, alpha_lo, alpha_hi}
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_newton_convergence_decision, sizeof(int)));
     // Device-resident CCD alpha/control chain (see slot layout in GIPC.cuh).
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 9 * sizeof(double)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_gp_friction, sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_ls_alpha, sizeof(double)));  // [C-1]
     CUDA_SAFE_CALL(cudaMemset(m_scr_gp_friction, 0, sizeof(uint32_t)));
 
     CUDA_SAFE_CALL(cudaMemset(_close_cpNum, 0, sizeof(uint32_t)));
@@ -856,6 +868,7 @@ double* GIPC::ensure_reduce_scratch(int count)
     size_t need = (size_t)((count + default_threads - 1) / default_threads) + 1;
     if(need > m_reduce_cap)
     {
+        ++pcg_buffer_generation();   // [C-1] scratch pointer baked in the LS graph moves
         m_reduce_cap = need + need / 2;  // 1.5x slack → no realloc churn after warmup
         m_reduce_scratch.resize_discard(m_reduce_cap);  // [3d-2]
     }

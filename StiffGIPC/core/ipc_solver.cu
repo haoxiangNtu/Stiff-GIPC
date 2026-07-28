@@ -36,7 +36,8 @@
 // ---- host mechanism wrappers owned by the composite TU ----
 extern void calcMinMovement_DeviceOut(const double3* _moveDir, double* _queue, const int& number);
 extern void stepForward(double3* _vertexes, double3* _vertexesTemp, double3* _moveDir,
-                        int* bType, double alpha, bool moveBoundary, int numbers);
+                        int* bType, double alpha, bool moveBoundary, int numbers,
+                        const double* alpha_dev = nullptr);
 extern void throwForInvalidCcdMask(int invalid, const char* context);
 extern void validateFinalCcdStateOrThrow(const double* state, const char* context);
 
@@ -45,7 +46,10 @@ extern __global__ void _ccd_final_alpha_combine(double* slots, int have_ccd_pair
 extern __global__ void _ccd_initial_alpha_combine(double* slots, int have_ground, int have_self, int* invalid);
 extern __global__ void _fill_double(double* values, double value, int count);
 extern __global__ void _gather_abd_body_alpha(const int* body_to_group, const double* env_alpha, double* abd_body_alpha, int abd_body_num, int ng);
-extern __global__ void _global_ls_decide(const double* energy0, const double* energy1, double c1m, double alpha, double energy_abs_tol, double energy_rel_tol, int* status, const int* gd_collapse);
+extern __global__ void _global_ls_decide(const double* energy0, const double* energy1, double c1m, double alpha, double energy_abs_tol, double energy_rel_tol, int* status, const int* gd_collapse, const double* alpha_dev);
+extern __global__ void _ls_trial_begin(double* alpha_dev, int* status);
+extern __global__ void _ls_seed(double* alpha_dev, double alpha0, int* status);
+extern __global__ void _ls_trial_tail(int* status, int budget, const double* alpha_dev);
 extern __global__ void _mask_fill(int* m, int v, int n);
 extern __global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, int ng);
 extern __global__ void _newton_convergence_decide(const double* max_movement, double threshold, int* converged);

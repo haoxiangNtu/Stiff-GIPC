@@ -762,14 +762,15 @@ void stepForward(double3* _vertexes,
                  int*     bType,
                  double   alpha,
                  bool     moveBoundary,
-                 int      numbers)
+                 int      numbers,
+                 const double* alpha_dev)
 {
     const unsigned int threadNum = default_threads;
     if(numbers < 1)
         return;
     int blockNum = (numbers + threadNum - 1) / threadNum;
     _stepForward<<<blockNum, threadNum>>>(
-        _vertexes, _vertexesTemp, _moveDir, bType, alpha, moveBoundary, numbers);
+        _vertexes, _vertexesTemp, _moveDir, bType, alpha, moveBoundary, numbers, alpha_dev);
 }
 
 // [M1 substitution method] Hard-constraint projection kernel.
@@ -823,7 +824,7 @@ void apply_fem_pins(double3* _vertexes,
         n_pins);
 }
 
-void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_boundary)
+void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_boundary, const double* alpha_dev)
 {
     auto vertexes = muda::BufferView<double3>{TetMesh.vertexes, vertexNum};
     auto vertexes_temp = muda::BufferView<double3>{TetMesh.temp_double3Mem, vertexNum};
@@ -864,7 +865,8 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
                         btype.data(),
                         alpha,
                         move_boundary,
-                        fem_vertexes.size());
+                        fem_vertexes.size(),
+                        alpha_dev);
         }
     }
     if(abd_fem_count_info.abd_point_num <= 0)
@@ -878,7 +880,7 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
     const double* abd_alpha_ptr = nullptr;
     if(m_perenv_apply && m_abd_body_alpha && TetMesh.d_body_to_group)
         abd_alpha_ptr = m_abd_body_alpha;
-    m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, alpha, abd_alpha_ptr);
+    m_abd_system->step_forward(*m_abd_sim_data, abd_vertexes, alpha, abd_alpha_ptr, alpha_dev);
 
     // [M1 substitution method] After ABD step_forward updates q, project
     // pinned FEM vertices to ABD-derived positions: world = q.t + R(q)*lp.

@@ -257,7 +257,8 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                                         energy_abs_tol,
                                         energy_rel_tol,
                                         m_line_search_decision,
-                                        _gdCollapse);
+                                        _gdCollapse,
+                                        nullptr);
             int dec_of[3] = {0, 0, 0};
             CUDA_SAFE_CALL(cudaMemcpy(dec_of,
                                       m_line_search_decision,
@@ -287,7 +288,8 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                                             energy_abs_tol,
                                             energy_rel_tol,
                                             m_line_search_decision,
-                                            _gdCollapse);
+                                            _gdCollapse,
+                                            nullptr);
                 CUDA_SAFE_CALL(cudaMemcpy(dec_of,
                                           m_line_search_decision,
                                           3 * sizeof(int),
@@ -342,6 +344,152 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
 
     int    numOfLineSearch = 0;
     double LFStepSize      = alpha;
+
+    // [C-1 ls-graph] backtracking as a device self-tail-launch graph: the trial
+    // body (halve -> step -> BVH -> CP(defer) -> energy -> decide) re-launches
+    // itself on device while status[0]==1 with budget left; the host does ONE
+    // packed 24B read after the loop instead of a 12B sync per trial. Overflow
+    // and ground-collapse handling move post-loop (the packed read carries
+    // both); a truncated-emission false accept is re-adjudicated by the legacy
+    // evaluate below. Cached across line searches on the buffer generation.
+    {
+        static int s_ls_graph = -1;
+        if(s_ls_graph < 0)
+        { const char* e = getenv("STIFF_LS_GRAPH"); s_ls_graph = e ? atoi(e) : 0; }
+        if(energy_decision == 1 && s_ls_graph && device_ls && m_ls_defer_counts
+           && m_total_frames >= 1 /* frame 0 warms every lazy alloc */)
+        {
+            const long long sig[5] = {
+                pcg_buffer_generation(),
+                (long long)line_search_budget,
+                (long long)m_energy_bound_cp,
+                (long long)m_energy_bound_gp,
+                (long long)m_dcd_snap_count};
+            bool graph_sig_match = m_ls_graph_exec != nullptr;
+            for(int i = 0; graph_sig_match && i < 5; ++i)
+                graph_sig_match = m_ls_graph_sig[i] == sig[i];
+            if(m_ls_graph_exec && !graph_sig_match)
+            {
+                cudaGraphExecDestroy(m_ls_graph_exec);
+                m_ls_graph_exec = nullptr;
+            }
+            if(!m_ls_graph_exec)
+            {
+                cudaGraph_t lg = nullptr;
+                bool record_threw = false;
+                cudaError_t graph_error =
+                    cudaStreamBeginCapture(cudaStreamPerThread,
+                                           cudaStreamCaptureModeThreadLocal);
+                if(graph_error == cudaSuccess)
+                {
+                    // A capture-illegal call inside the body (sync memcpy, alloc,
+                    // muda wait) surfaces as a C++ throw: terminate the capture,
+                    // fall back to the host loop PERMANENTLY, never crash.
+                    try
+                    {
+                        _ls_trial_begin<<<1, 1>>>(m_d_ls_alpha, m_line_search_decision);
+                        step_forward(TetMesh, 0.0, false, m_d_ls_alpha);
+                        buildBVH();
+                        buildCP();
+                        computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 1);
+                        _global_ls_decide<<<1, 1>>>(m_line_search_energy + 0,
+                                                    m_line_search_energy + 1,
+                                                    c1m,
+                                                    0.0,
+                                                    energy_abs_tol,
+                                                    energy_rel_tol,
+                                                    m_line_search_decision,
+                                                    _gdCollapse,
+                                                    m_d_ls_alpha);
+                        _ls_trial_tail<<<1, 1>>>(m_line_search_decision,
+                                                 line_search_budget,
+                                                 m_d_ls_alpha);
+                    }
+                    catch(const std::exception& ex)
+                    {
+                        record_threw = true;
+                        s_ls_graph   = 0;   // permanent session fallback
+                        cudaGraph_t junk = nullptr;
+                        cudaStreamEndCapture(cudaStreamPerThread, &junk);
+                        if(junk) cudaGraphDestroy(junk);
+                        cudaGetLastError();
+                        fprintf(stderr,
+                                "[ls-graph] trial body not capturable (%s) -> "
+                                "host loop fallback for this session\n",
+                                ex.what());
+                    }
+                    if(!record_threw
+                       && (graph_error =
+                               cudaStreamEndCapture(cudaStreamPerThread, &lg))
+                              == cudaSuccess
+                       && lg
+                       && (graph_error =
+                               cudaGraphInstantiateWithFlags(
+                                   &m_ls_graph_exec,
+                                   lg,
+                                   cudaGraphInstantiateFlagDeviceLaunch))
+                              == cudaSuccess
+                       && m_ls_graph_exec)
+                    {
+                        for(int i = 0; i < 5; ++i)
+                            m_ls_graph_sig[i] = sig[i];
+                        static bool onceg = false;
+                        if(!onceg)
+                        {
+                            onceg = true;
+                            printf("[ls-graph] trial self-tail graph active (budget=%d)\n",
+                                   line_search_budget);
+                        }
+                    }
+                    else if(!record_threw)
+                    {
+                        if(graph_error == cudaSuccess)
+                            graph_error = cudaErrorUnknown;
+                        s_ls_graph = 0;   // failed API stage: do not retry every LS
+                        if(m_ls_graph_exec)
+                            cudaGraphExecDestroy(m_ls_graph_exec);
+                        m_ls_graph_exec = nullptr;
+                        fprintf(stderr,
+                                "[ls-graph] capture/instantiate failed (%s) -> "
+                                "host loop fallback for this session\n",
+                                cudaGetErrorString(graph_error));
+                    }
+                }
+                else
+                {
+                    s_ls_graph = 0;   // failed API stage: do not retry every LS
+                    fprintf(stderr,
+                            "[ls-graph] begin capture failed (%s) -> "
+                            "host loop fallback for this session\n",
+                            cudaGetErrorString(graph_error));
+                }
+                if(lg) cudaGraphDestroy(lg);
+                if(!s_ls_graph)
+                    cudaGetLastError();   // clear a sticky capture failure
+            }
+            if(m_ls_graph_exec)
+            {
+                _ls_seed<<<1, 1>>>(m_d_ls_alpha, alpha, m_line_search_decision);
+                CUDA_SAFE_CALL(cudaGraphUpload(m_ls_graph_exec, cudaStreamPerThread));
+                CUDA_SAFE_CALL(cudaGraphLaunch(m_ls_graph_exec, cudaStreamPerThread));
+                int s6[6] = {0, 0, 0, 0, 0, 0};
+                CUDA_SAFE_CALL(cudaMemcpy(s6,
+                                          m_line_search_decision,
+                                          6 * sizeof(int),
+                                          cudaMemcpyDeviceToHost));
+                energy_decision = s6[0];
+                numOfLineSearch = s6[3];
+                const unsigned long long bits =
+                    ((unsigned long long)(unsigned)s6[5] << 32)
+                    | (unsigned long long)(unsigned)s6[4];
+                memcpy(&alpha, &bits, sizeof(alpha));
+                if(s6[2] < 0)
+                    handleGroundCollapse(s6[2]);
+                if((unsigned)s6[1] != m_pair_overflow_seen)
+                    energy_decision = evaluate_trial_energy(alpha);
+            }
+        }
+    }
 
     std::cout.precision(18);
     // A larger configurable budget prevents the former hard-coded eight-step

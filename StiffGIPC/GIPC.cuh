@@ -80,6 +80,11 @@ class GIPC
     // rare trip re-runs buildCP in legacy mode (full grow+redo machinery).
     bool      m_ls_defer_counts       = false;
     uint32_t* m_scr_gp_friction       = nullptr;  // [B3 s7] friction-era gp count, device-stashed
+    double*   m_d_ls_alpha            = nullptr;  // [C-1] device-resident trial alpha
+    cudaGraphExec_t m_ls_graph_exec   = nullptr;  // [C-1] cached trial-body self-tail graph
+    // Captured host values: pointer generation, budget, the two device-count
+    // energy launch bounds, and the frozen DCD snapshot copy length.
+    long long m_ls_graph_sig[5]       = {-1, -1, -1, -1, -1};
     bool      m_ccd_defer_counts      = false;
     int       m_energy_bound_cp       = 0;
     int       m_energy_bound_gp       = 0;
@@ -562,7 +567,7 @@ class GIPC
 
     void buildBVH_FULLCCD(const double& alpha,
                           const double* alpha_dev = nullptr);
-    void step_forward(device_TetraData& TetMesh, double alpha = 1.0, bool move_boundary = false);
+    void step_forward(device_TetraData& TetMesh, double alpha = 1.0, bool move_boundary = false, const double* alpha_dev = nullptr);
 
 
     void GroundCollisionDetect();
