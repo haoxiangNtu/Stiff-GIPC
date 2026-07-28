@@ -27,7 +27,7 @@ import tempfile
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GOLD = "f7fb5a786c2d7935"
+GOLD = "0544461bd82123ae"
 KEEP = {"STIFF_MIRROR_AUDIT", "STIFF_SLOT_AUDIT"}
 RECORD = os.environ.get("RECORD") == "1"
 

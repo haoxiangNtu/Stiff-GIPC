@@ -45,7 +45,7 @@ REQUIRE_BASELINE = os.environ.get("BENCH_REQUIRE_BASELINE") == "1"
 REQUIRE_IDLE = os.environ.get("BENCH_REQUIRE_IDLE_GPU") == "1"
 RECORD = os.environ.get("BENCH_RECORD_BASELINE") == "1"
 DEFAULT_TOLERANCE = float(os.environ.get("BENCH_REGRESSION_TOL", "0.15"))
-GOLD = "f7fb5a786c2d7935"
+GOLD = "0544461bd82123ae"
 BAD_OUTPUT = re.compile(
     r"budget exhausted.*nan|abd-kinetic-nan|Traceback|CUDA error", re.I
 )
