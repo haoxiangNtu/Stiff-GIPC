@@ -108,6 +108,7 @@ struct alignas(16) FrameStatus
     int32_t required_unique_blocks;
     int32_t hw_mas_clusters;
     int32_t required_mas_clusters;
+    int32_t contact_class_count[4];
 
     int32_t root_graph_nodes;
     int32_t root_d2h_nodes;
@@ -164,6 +165,7 @@ struct alignas(16) FrameDeviceState
     int32_t required_triplets;
     int32_t required_unique_blocks;
     int32_t required_mas_clusters;
+    int32_t contact_class_count[4];
 
     double alpha;
     double cfl_alpha;

@@ -364,6 +364,8 @@ __global__ void frame_serialize_status(
     out.required_ccd_pairs = state->required_ccd_pairs;
     out.required_triplets = state->required_triplets;
     out.required_unique_blocks = state->required_unique_blocks;
+    for(int i = 0; i < 4; ++i)
+        out.contact_class_count[i] = state->contact_class_count[i];
     out.root_graph_nodes = input->root_graph_nodes;
     out.root_d2h_nodes = input->root_d2h_nodes;
     out.terminal_graph_nodes = input->terminal_graph_nodes;
@@ -733,6 +735,34 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
                              int attempt,
                              uint32_t retry_invalid_bits)
 {
+    int contact_stable_count = 0;
+    for(int s = 0; s < 4; ++s)
+        contact_stable_count +=
+            gipc_global_triplet.m_contact_class_tier[s];
+    if(contact_stable_count > 0)
+    {
+        const int sort_capacity =
+            gipc::assembly_capacity_tier(contact_stable_count);
+        const size_t need =
+            static_cast<size_t>(sort_capacity)
+            + static_cast<size_t>(contact_stable_count);
+        if(gipc_global_triplet.triplet_capacity() < need)
+        {
+            gipc_global_triplet.global_triplet_offset = 0;
+            gipc_global_triplet.global_collision_triplet_offset = 0;
+            gipc_global_triplet.open_discard_window();
+            gipc_global_triplet.ensure_capacity_discard(need);
+        }
+        if(gipc_global_triplet.global_external_max_capcity
+           < sort_capacity)
+        {
+            gipc_global_triplet.resize_collision_hash_size(
+                static_cast<size_t>(sort_capacity));
+            gipc_global_triplet.global_external_max_capcity =
+                sort_capacity;
+            ++pcg_buffer_generation();
+        }
+    }
     prepare_frame_graph(mesh);
     FrameGraphContext& context = graph_context(*this);
     snapshot_host_attempt(*this, context.host_snapshot);
@@ -778,6 +808,7 @@ void GIPC::frame_graph_begin(device_TetraData& mesh,
     if(m_global_linear_system)
         m_global_linear_system->set_frame_device_state(context.d_state);
     gipc_global_triplet.m_frame_device_state = context.d_state;
+    gipc_global_triplet.m_contact_partition_txn_ok = true;
     const char* abd_tier = std::getenv("STIFF_ABD_TIER");
     gipc_global_triplet.m_abd_tier_txn_ok =
         force_unique_tier
@@ -861,6 +892,47 @@ int GIPC::frame_graph_finish_terminal()
         gipc_global_triplet.m_abd_unique_tier[1] = std::max(
             gipc_global_triplet.m_abd_unique_tier[1], tier);
     }
+    if(m_last_frame_status.invalid_bits & frame_fsm::OVF_TRIPLETS)
+    {
+        bool grew_contact_class = false;
+        for(int s = 0; s < 4; ++s)
+        {
+            const int exact =
+                m_last_frame_status.contact_class_count[s];
+            if(exact <= gipc_global_triplet.m_contact_class_tier[s])
+                continue;
+            gipc_global_triplet.m_contact_class_tier[s] =
+                gipc::assembly_capacity_tier(exact);
+            grew_contact_class = true;
+        }
+        if(grew_contact_class)
+        {
+            int stable_count = 0;
+            for(int s = 0; s < 4; ++s)
+                stable_count +=
+                    gipc_global_triplet.m_contact_class_tier[s];
+            const int sort_capacity = gipc::assembly_capacity_tier(
+                std::max(stable_count,
+                         m_last_frame_status.required_triplets));
+            const int staging_base =
+                std::max(sort_capacity, stable_count);
+            const size_t need =
+                static_cast<size_t>(staging_base)
+                + static_cast<size_t>(stable_count);
+            // The failed attempt has already been restored and its triplets
+            // are dead. This is the legal frame-boundary discard/grow window.
+            gipc_global_triplet.global_triplet_offset = 0;
+            gipc_global_triplet.global_collision_triplet_offset = 0;
+            gipc_global_triplet.open_discard_window();
+            gipc_global_triplet.ensure_capacity_discard(need);
+            gipc_global_triplet.resize_collision_hash_size(
+                static_cast<size_t>(sort_capacity));
+            gipc_global_triplet.global_external_max_capcity =
+                std::max(gipc_global_triplet.global_external_max_capcity,
+                         sort_capacity);
+            ++pcg_buffer_generation();
+        }
+    }
     if(m_last_frame_status.result != frame_fsm::FRAME_OK)
         restore_host_attempt(*this, context.host_snapshot);
     else
@@ -872,6 +944,7 @@ int GIPC::frame_graph_finish_terminal()
     gipc_global_triplet.m_frame_device_state = nullptr;
     gipc_global_triplet.m_abd_unique_test_tier = 0;
     gipc_global_triplet.m_abd_tier_txn_ok    = false;
+    gipc_global_triplet.m_contact_partition_txn_ok = false;
     m_frame_graph_active     = false;
     m_frame_terminal_emitted = false;
     return m_last_frame_status.result;

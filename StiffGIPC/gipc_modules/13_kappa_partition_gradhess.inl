@@ -304,9 +304,117 @@ void GIPC::partitionContactHessian()
             gipc_global_triplet.d_fem_fem_contact_start_id,
             payload_count);
 
+        if(gipc_global_triplet.m_contact_partition_txn_ok)
+        {
+            const int* class_tier =
+                gipc_global_triplet.m_contact_class_tier;
+            int segment_start[4] = {0, 0, 0, 0};
+            for(int s = 1; s < 4; ++s)
+                segment_start[s] =
+                    segment_start[s - 1] + class_tier[s - 1];
+            const int stable_count =
+                segment_start[3] + class_tier[3];
+            const int staging_base =
+                std::max(sort_capacity, stable_count);
+            int staging_start[4] = {
+                staging_base, staging_base, staging_base, staging_base};
+            for(int s = 1; s < 4; ++s)
+                staging_start[s] =
+                    staging_start[s - 1] + class_tier[s - 1];
+
+            const size_t need =
+                static_cast<size_t>(staging_base)
+                + static_cast<size_t>(stable_count);
+            gipc_global_triplet.ensure_capacity_preserve(
+                static_cast<size_t>(payload_count), need);
+            if(stable_count > 0)
+            {
+                CUDA_SAFE_CALL(cudaMemsetAsync(
+                    gipc_global_triplet.block_row_indices(staging_base),
+                    0,
+                    static_cast<size_t>(stable_count) * sizeof(int),
+                    cudaStreamPerThread));
+                CUDA_SAFE_CALL(cudaMemsetAsync(
+                    gipc_global_triplet.block_col_indices(staging_base),
+                    0,
+                    static_cast<size_t>(stable_count) * sizeof(int),
+                    cudaStreamPerThread));
+                CUDA_SAFE_CALL(cudaMemsetAsync(
+                    gipc_global_triplet.block_values(staging_base),
+                    0,
+                    static_cast<size_t>(stable_count)
+                        * sizeof(Eigen::Matrix3d),
+                    cudaStreamPerThread));
+            }
+
+            _publish_contact_class_counts<<<1, 1, 0, cudaStreamPerThread>>>(
+                gipc_global_triplet.d_contact_start_block,
+                payload_count,
+                class_tier[0],
+                class_tier[1],
+                class_tier[2],
+                class_tier[3],
+                gipc_global_triplet.m_frame_device_state);
+            for(int s = 0; s < 4; ++s)
+            {
+                if(class_tier[s] <= 0)
+                    continue;
+                _stage_contact_class_segment<<<
+                    (class_tier[s] + thread_num - 1) / thread_num,
+                    thread_num,
+                    0,
+                    cudaStreamPerThread>>>(
+                    gipc_global_triplet.block_row_indices(),
+                    gipc_global_triplet.block_col_indices(),
+                    gipc_global_triplet.block_values(),
+                    gipc_global_triplet.block_row_indices(),
+                    gipc_global_triplet.block_col_indices(),
+                    gipc_global_triplet.block_values(),
+                    (const uint32_t*)
+                        gipc_global_triplet.block_sort_index(),
+                    gipc_global_triplet.d_contact_start_block,
+                    s,
+                    payload_count,
+                    staging_start[s],
+                    class_tier[s]);
+            }
+            for(int s = 0; s < 4; ++s)
+            {
+                if(class_tier[s] <= 0)
+                    continue;
+                _compact_triplet_segment<<<
+                    (class_tier[s] + thread_num - 1) / thread_num,
+                    thread_num,
+                    0,
+                    cudaStreamPerThread>>>(
+                    gipc_global_triplet.block_row_indices(),
+                    gipc_global_triplet.block_col_indices(),
+                    gipc_global_triplet.block_values(),
+                    staging_start[s],
+                    segment_start[s],
+                    class_tier[s]);
+            }
+
+            gipc_global_triplet.fem_fem_contact_num = class_tier[0];
+            gipc_global_triplet.abd_fem_contact_num = class_tier[1];
+            gipc_global_triplet.fem_abd_contact_num = class_tier[2];
+            gipc_global_triplet.abd_abd_contact_num = class_tier[3];
+            gipc_global_triplet.h_fem_fem_contact_start_id =
+                segment_start[0];
+            gipc_global_triplet.h_abd_fem_contact_start_id =
+                segment_start[1];
+            gipc_global_triplet.h_fem_abd_contact_start_id =
+                segment_start[2];
+            gipc_global_triplet.h_abd_abd_contact_start_id =
+                segment_start[3];
+            gipc_global_triplet.global_collision_triplet_offset =
+                stable_count;
+            return;
+        }
+
         // This is the last host bridge in contact partitioning. The next C2
-        // layer publishes these four ranges as a device-resident record; for
-        // now retain the historical ABI consumed by ABD setup.
+        // transaction consumes fixed class tiers and bypasses it. Frame-zero
+        // warm-up retains the exact ABI and trains those tiers.
         int h_class_start[4];
         CUDA_SAFE_CALL(cudaMemcpy(
             h_class_start,
@@ -361,6 +469,11 @@ void GIPC::partitionContactHessian()
             segment_start[2];
         gipc_global_triplet.h_abd_abd_contact_start_id =
             segment_start[3];
+        for(int s = 0; s < 4; ++s)
+            gipc_global_triplet.m_contact_class_tier[s] =
+                segment_count[s]
+                    ? gipc::assembly_capacity_tier(segment_count[s])
+                    : 0;
 
         int segment_capacity[4] = {0, 0, 0, 0};
         int staging_start[4] = {

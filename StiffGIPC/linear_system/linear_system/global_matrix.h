@@ -267,6 +267,12 @@ class GIPCTripletMatrix
     // consume an incomplete Hessian before the terminal rollback can run.
     int                          m_abd_unique_test_tier = 0;
     bool                         m_abd_tier_txn_ok   = false;
+    // Contact classes use distinct stable segments in graph transactions:
+    // [0]=FEM/FEM, [1]=ABD/FEM, [2]=FEM/ABD, [3]=ABD/ABD. Frame zero
+    // trains these tiers; an undershoot is device-reported and grown only at
+    // the frame boundary before retrying the same physical frame.
+    int                          m_contact_class_tier[4] = {0, 0, 0, 0};
+    bool                         m_contact_partition_txn_ok = false;
     frame_fsm::FrameDeviceState* m_frame_device_state = nullptr;
 
     int* d_abd_abd_contact_start_id = nullptr;

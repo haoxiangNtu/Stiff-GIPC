@@ -97,3 +97,107 @@ __global__ void _compact_triplet_segment(int*             row_ids,
     col_ids[output_start + idx]       = col_ids[input_start + idx];
     triplet_value[output_start + idx] = triplet_value[input_start + idx];
 }
+
+__device__ __forceinline__ int _contact_class_raw_start(
+    const int* legacy_starts,
+    int contact_class)
+{
+    // legacy storage order: ABD/ABD, ABD/FEM, FEM/ABD, FEM/FEM.
+    constexpr int legacy_index[4] = {3, 1, 2, 0};
+    return legacy_starts[legacy_index[contact_class]];
+}
+
+__device__ __forceinline__ int _contact_class_count(
+    const int* legacy_starts,
+    int contact_class,
+    int payload_count)
+{
+    const int start =
+        _contact_class_raw_start(legacy_starts, contact_class);
+    if(start < 0)
+        return 0;
+    int end = payload_count;
+    for(int next = contact_class + 1; next < 4; ++next)
+    {
+        const int next_start =
+            _contact_class_raw_start(legacy_starts, next);
+        if(next_start >= 0)
+        {
+            end = next_start;
+            break;
+        }
+    }
+    return end >= start ? end - start : 0;
+}
+
+__global__ void _publish_contact_class_counts(
+    const int* legacy_starts,
+    int payload_count,
+    int c0,
+    int c1,
+    int c2,
+    int c3,
+    frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x || !frame)
+        return;
+    const int capacity[4] = {c0, c1, c2, c3};
+    int required = 0;
+    bool overflow = false;
+    for(int contact_class = 0; contact_class < 4; ++contact_class)
+    {
+        const int exact = _contact_class_count(
+            legacy_starts, contact_class, payload_count);
+        frame->contact_class_count[contact_class] = exact;
+        if(exact > capacity[contact_class])
+        {
+            overflow = true;
+            required += exact;
+        }
+        else
+        {
+            required += capacity[contact_class];
+        }
+    }
+    atomicMax(&frame->hw_triplets, payload_count);
+    if(!overflow)
+        return;
+    atomicMax(&frame->required_triplets, required);
+    frame_fsm::fsm_record_error(frame,
+                                frame_fsm::ERR_CAPACITY,
+                                frame_fsm::OVF_TRIPLETS,
+                                -1,
+                                -1);
+    atomicCAS(&frame->result,
+              frame_fsm::FRAME_OK,
+              frame_fsm::FRAME_RETRY_REQUIRED);
+}
+
+__global__ void _stage_contact_class_segment(
+    const int*             row_ids_input,
+    const int*             col_ids_input,
+    const Eigen::Matrix3d* triplet_value_input,
+    int*                   row_ids,
+    int*                   col_ids,
+    Eigen::Matrix3d*       triplet_value,
+    const uint32_t*        sort_index,
+    const int*             legacy_starts,
+    int                    contact_class,
+    int                    payload_count,
+    int                    output_start,
+    int                    output_capacity)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= output_capacity)
+        return;
+    const int count = _contact_class_count(
+        legacy_starts, contact_class, payload_count);
+    if(idx >= count)
+        return;
+    const int sorted_start =
+        _contact_class_raw_start(legacy_starts, contact_class);
+    const uint32_t source = sort_index[sorted_start + idx];
+    row_ids[output_start + idx]       = row_ids_input[source];
+    col_ids[output_start + idx]       = col_ids_input[source];
+    triplet_value[output_start + idx] = triplet_value_input[source];
+}
