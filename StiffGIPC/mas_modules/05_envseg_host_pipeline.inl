@@ -854,7 +854,7 @@ void MASPreconditioner::SchwarzLocalXSym()
 
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym3<<<numBlocks, blockSize>>>(
-        d_precondMatMas, d_multiLevelR, d_multiLevelZ, number);
+        d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
 }
 
 void MASPreconditioner::SchwarzLocalXSym_block3()
@@ -868,7 +868,7 @@ void MASPreconditioner::SchwarzLocalXSym_block3()
 
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym6<<<numBlocks, blockSize>>>(
-        d_precondMatMas, d_multiLevelR, d_multiLevelZ, number);
+        d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
 }
 
 void MASPreconditioner::SchwarzLocalXSym_sym()
@@ -882,7 +882,7 @@ void MASPreconditioner::SchwarzLocalXSym_sym()
 
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym9<<<numBlocks, blockSize>>>(
-        d_precondMatMas, d_multiLevelR, d_multiLevelZ, number);
+        d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
 }
 
 void MASPreconditioner::CollectFinalZ(double3* Z)
@@ -1022,25 +1022,28 @@ void MASPreconditioner::preconditioning(const double3* R, double3* Z)
     // once at alloc in the MAS malloc routine).
     if(!fuse)
     {
+        // [B2'-b] capacity-sized (m_outputClusterCap): identical for the live
+        // range, and the byte counts stop varying per solve so a captured
+        // apply graph stays valid across Newton iterations.
         CUDA_SAFE_CALL(cudaMemsetAsync(
             d_multiLevelR + totalMapNodes,
             0,
-            (totalNumberClusters - totalMapNodes) * sizeof(Eigen::Vector3f),
+            (size_t)(m_outputClusterCap - totalMapNodes) * sizeof(Eigen::Vector3f),
             0));
         CUDA_SAFE_CALL(cudaMemsetAsync(
             d_multiLevelZ,
             0,
-            totalNumberClusters * sizeof(Precision_T3),
+            (size_t)m_outputClusterCap * sizeof(Precision_T3),
             0));
     }
 
     // [4.3] zero the binned accumulators. mR: only the COARSE
     // slots accumulate (fine [0,totalMapNodes) is set directly in __buildMultiLevelR); mZ: all.
     CUDA_SAFE_CALL(cudaMemsetAsync(d_mRbin + (size_t)totalMapNodes * 3 * BINNED_K, 0,
-                              (size_t)(totalNumberClusters - totalMapNodes) * 3 * BINNED_K
-                                  * sizeof(double), 0));
+                              (size_t)(m_outputClusterCap - totalMapNodes) * 3 * BINNED_K
+                                  * sizeof(double), 0));   // [B2'-b] capacity-sized
     CUDA_SAFE_CALL(cudaMemsetAsync(d_mZbin, 0,
-                              (size_t)totalNumberClusters * 3 * BINNED_K * sizeof(double), 0));
+                              (size_t)m_outputClusterCap * 3 * BINNED_K * sizeof(double), 0));   // [B2'-b]
 
     BuildMultiLevelR(R);
 

@@ -1,9 +1,15 @@
 __global__ void _schwarzLocalXSym3(const __GEIGEN__::MasMatrixSymf* Pred,
                                    const Eigen::Vector3f*              mR,
                                    Precision_T3*                    mZ,
-                                   int                              number)
+                                   int                              number,
+                                   const int2*                      d_lvl,
+                                   int                              lvln)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // [B2'-b] live cluster total from the device hierarchy when armed; the
+    // host grid still uses the (equal) mirror, so launches stay identical.
+    if(d_lvl)
+        number = d_lvl[lvln].y * BANKSIZE * 3;
     if(idx >= number)
         return;
 
@@ -73,9 +79,13 @@ __global__ void _schwarzLocalXSym3(const __GEIGEN__::MasMatrixSymf* Pred,
 __global__ void _schwarzLocalXSym6(const __GEIGEN__::MasMatrixSymf* Pred,
                                    const Eigen::Vector3f*           mR,
                                    Precision_T3*                    mZ,
-                                   int                              number)
+                                   int                              number,
+                                   const int2*                      d_lvl,
+                                   int                              lvln)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(d_lvl)
+        number = d_lvl[lvln].y * BANKSIZE;
     if(idx >= number)
         return;
 
@@ -257,9 +267,13 @@ __device__ void get_index(int& row, int& col, const int& hash, const int& size)
 __global__ void _schwarzLocalXSym9(const __GEIGEN__::MasMatrixSymf* Pred,
                                    const Eigen::Vector3f*           mR,
                                    Precision_T3*                    mZ,
-                                   int                              number)
+                                   int                              number,
+                                   const int2*                      d_lvl,
+                                   int                              lvln)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(d_lvl)
+        number = (d_lvl[lvln].y / BANKSIZE) * ((1 + BANKSIZE) * BANKSIZE / 2);
     if(idx >= number)
         return;
 
