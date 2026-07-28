@@ -12,8 +12,28 @@ if(UNIX)
     set(CMAKE_CXX_FLAGS "-O3")
 endif()
 
+# [dlto adoption 2026-07-28] Device link-time optimization is ON by default:
+# TUs emit LTO-IR, nvlink produces final SASS with cross-TU inlining/regalloc
+# (fused kernel 254reg/23.8KB stack -> 178reg/2KB; runtime up to -15%).
+# Costs: ~+76% clean build, ~60s serialized dlink per incremental edit, and
+# the strict anchor moved to a new (still bitwise-stable) fixed point.
+# -real entries only: final SASS per arch, no PTX JIT fallback (internal
+# builds target sm_80/89/120 exactly; plain arch entries would re-add PTX).
+option(STIFFGIPC_DLTO
+       "Enable CUDA device link-time optimization (-dlto via IPO)" ON)
+if(STIFFGIPC_DLTO)
+    # Neutralize host CXX IPO so the per-target INTERPROCEDURAL_OPTIMIZATION
+    # property affects only the CUDA side (no gcc -flto).
+    set(CMAKE_CXX_COMPILE_OPTIONS_IPO "")
+    set(CMAKE_CXX_LINK_OPTIONS_IPO "")
+    message(STATUS "StiffGIPC: CUDA device LTO (-dlto) ENABLED")
+endif()
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "80;89;120")
+    if(STIFFGIPC_DLTO)
+        set(CMAKE_CUDA_ARCHITECTURES "80-real;89-real;120-real")
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES "80;89;120")
+    endif()
 endif()
 
 project(StiffGIPC LANGUAGES CXX CUDA)
@@ -99,6 +119,10 @@ macro(set_gipc_cuda_props target)
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
         CUDA_STANDARD 17
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    if(STIFFGIPC_DLTO)
+        set_target_properties(${target} PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
     target_compile_options(${target}
         PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: ${GIPC_CUDA_PRIVATE_OPTS}>
         PUBLIC  $<$<COMPILE_LANGUAGE:CUDA>: ${GIPC_CUDA_PUBLIC_OPTS}>

@@ -4,19 +4,19 @@
       "device_name": "NVIDIA GeForce RTX 4090 D",
       "mean_step_ms": {
         "anchor": {
-          "isolated": 3.895,
-          "merged": 11.82,
-          "strict": 4.19
+          "isolated": 3.977,
+          "merged": 9.998,
+          "strict": 4.196
         },
         "foldshirt": {
-          "isolated": 1326.515,
-          "merged": 1152.516,
-          "strict": 1583.658
+          "isolated": 1348.3,
+          "merged": 1027.573,
+          "strict": 1555.182
         },
         "towel": {
-          "isolated": 23.8,
-          "merged": 27.799,
-          "strict": 33.493
+          "isolated": 19.704,
+          "merged": 24.831,
+          "strict": 30.163
         }
       },
       "regression_tolerance": 0.15
