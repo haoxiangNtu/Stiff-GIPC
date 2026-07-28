@@ -100,7 +100,7 @@ void GIPC::initKappa(device_TetraData& TetMesh)
         h_kappa_group.assign(NG, Kappa);
         CUDA_SAFE_CALL(cudaMemcpy(m_kappa_group, h_kappa_group.data(),
                                   NG * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_SAFE_CALL(cudaMemset(m_d_close_grp, 0, NG * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_d_close_grp, 0, NG * sizeof(int), 0));
         printf("[pergroup-kappa] enabled (early, in initKappa) NG=%d\n", NG);
     }
     bool perenv_kappa_filled = false;   // [decouple] set when per-env κ replaces the stub broadcast
@@ -110,8 +110,8 @@ void GIPC::initKappa(device_TetraData& TetMesh)
         double3* _gc = TetMesh.temp_double3Mem;
         //CUDA_SAFE_CALL(cudaMalloc((void**)&_gc, vertexNum * sizeof(double3)));
         //CUDA_SAFE_CALL(cudaMalloc((void**)&_GE, vertexNum * sizeof(double3)));
-        CUDA_SAFE_CALL(cudaMemset(_gc, 0, vertexNum * sizeof(double3)));
-        CUDA_SAFE_CALL(cudaMemset(_GE, 0, vertexNum * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(_gc, 0, vertexNum * sizeof(double3), 0));
+        CUDA_SAFE_CALL(cudaMemsetAsync(_GE, 0, vertexNum * sizeof(double3), 0));
         calKineticGradient(TetMesh.vertexes, TetMesh.xTilta, _GE, TetMesh.masses, vertexNum);
         // [multi-env determinism 4.3] elastic-side binned bracket: FEM + soft → g_gbin → _GE
         // (kinetic already written directly to _GE above).
@@ -210,8 +210,8 @@ void GIPC::initKappa(device_TetraData& TetMesh)
                 cudaMalloc((void**)&d_gsum_g,     kEnvAlphaSlots * sizeof(double));
                 cudaMalloc((void**)&d_gsnorm_g,   kEnvAlphaSlots * sizeof(double));
             }
-            cudaMemset(d_gsum_bin,   0, (size_t)NG * BINNED_K * sizeof(double));
-            cudaMemset(d_gsnorm_bin, 0, (size_t)NG * BINNED_K * sizeof(double));
+            cudaMemsetAsync(d_gsum_bin,   0, (size_t)NG * BINNED_K * sizeof(double), 0);
+            cudaMemsetAsync(d_gsnorm_bin, 0, (size_t)NG * BINNED_K * sizeof(double), 0);
             int bs = 256;
             if(fem_count > 0)
             {
@@ -337,10 +337,10 @@ void GIPC::partitionContactHessian()
     //gipc_global_triplet.d_fem_abd_contact_start_id = -1;
     //gipc_global_triplet.d_fem_fem_contact_start_id = -1;
 
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_abd_abd_contact_start_id, -1, sizeof(int)));
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_abd_fem_contact_start_id, -1, sizeof(int)));
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_fem_abd_contact_start_id, -1, sizeof(int)));
-    CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.d_fem_fem_contact_start_id, -1, sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_abd_abd_contact_start_id, -1, sizeof(int), 0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_abd_fem_contact_start_id, -1, sizeof(int), 0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_fem_abd_contact_start_id, -1, sizeof(int), 0));
+    CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.d_fem_fem_contact_start_id, -1, sizeof(int), 0));
 
     size_t shareMem = (threadNum + 1) * sizeof(int);
     LaunchCudaKernal_default(gipc_global_triplet.global_collision_triplet_offset,
@@ -548,16 +548,16 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         h_kappa_group.assign(NG, Kappa);
         CUDA_SAFE_CALL(cudaMemcpy(m_kappa_group, h_kappa_group.data(),
                                   NG * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_SAFE_CALL(cudaMemset(m_d_close_grp, 0, NG * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_d_close_grp, 0, NG * sizeof(int), 0));
         printf("[pergroup-kappa] enabled, NG=%d\n", NG);
     }
 
-    CUDA_SAFE_CALL(cudaMemset(TetMesh.fb, 0, vertexNum * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(TetMesh.fb, 0, vertexNum * sizeof(double3), 0));
     // [multi-env determinism 4.3] zero the binned contact/friction gradient accumulator
     // (bins start at 0; deposits add exactly). Combined back into contact_grads after ground.
-    CUDA_SAFE_CALL(cudaMemset(g_grad_binned, 0,
+    CUDA_SAFE_CALL(cudaMemsetAsync(g_grad_binned, 0,
                               3 * (size_t)vertexNum * BINNED_K * sizeof(double)));
-    CUDA_SAFE_CALL(cudaMemset(TetMesh.shape_grads, 0, vertexNum * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(TetMesh.shape_grads, 0, vertexNum * sizeof(double3), 0));
 
     // [multi-env determinism 4.3] zero the WHOLE triplet buffer (block values + row/col) to the
     // reserved capacity. The triplet count is a provable UPPER BOUND (16 slots/pair, but PP/PE/PT
@@ -567,9 +567,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         size_t cap = gipc_global_triplet.triplet_capacity();
         if(cap > 0)
         {
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int), 0));
         }
     }
 
@@ -676,9 +676,9 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
             // The whole-buffer determinism memset above ran on the OLD allocation;
             // re-zero the fresh one (grow iterations only, so effectively free).
             size_t cap = gipc_global_triplet.triplet_capacity();
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int), 0));
+            CUDA_SAFE_CALL(cudaMemsetAsync(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int), 0));
         }
         if(gipc_global_triplet.global_external_max_capcity < bound)
         {
@@ -692,7 +692,7 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
     {
         gipc::Timer timer{"cal_barrier_gradient_hessian"};
-        CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(_cpNum, 0, 5 * sizeof(uint32_t), 0));
         //calBarrierHessian();
         //calBarrierGradient(contact_grads, Kappa);
 

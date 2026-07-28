@@ -33,6 +33,23 @@ inline unsigned long long Log2(unsigned long long value)
 }
 
 
+// [C-3 probe] when set (capture-probe scope), CUDA errors THROW instead of
+// aborting so the graph-capture harness can terminate the capture, report the
+// blocking site, and fall back gracefully.
+inline bool& cuda_safe_call_throws()
+{
+    static thread_local bool v = false;
+    return v;
+}
+
+// [C-3] true while the Newton/GH graph harness is recording: capture-illegal
+// conveniences (defensive full-device syncs, diagnostics) gate on this.
+inline bool& gipc_in_graph_capture()
+{
+    static thread_local bool v = false;
+    return v;
+}
+
 inline void cuda_safe_call_(cudaError err, const char* file_name, const int num_line)
 {
     if(cudaSuccess != err)
@@ -45,6 +62,11 @@ inline void cuda_safe_call_(cudaError err, const char* file_name, const int num_
         if(err == cudaErrorCudartUnloading)
             return;
 
+        if(cuda_safe_call_throws())
+            throw std::runtime_error(std::string(file_name) + "["
+                                     + std::to_string(num_line) + "]: CUDA error "
+                                     + std::to_string((int)err) + " ("
+                                     + cudaGetErrorString(err) + ")");
         std::cerr << file_name << "[" << num_line << "]: "
                   << "CUDA Running API error[" << (int)err
                   << "]: " << cudaGetErrorString(err) << std::endl;

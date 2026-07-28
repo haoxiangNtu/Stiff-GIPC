@@ -325,7 +325,8 @@ void ABDSystem::setup_abd_system_gradient_hessian(ABDSimData& sim_data,
 {
     fem_boundary_type = fbtype;
     setup_abd_system_gradient_hessian(sim_data, global_triplets, vertex_barrier_gradient);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    if(!gipc_in_graph_capture())   // [C-3] defensive sync, PTDS ordering suffices
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     converter3x3.convert(global_triplets,
                          global_triplets.h_abd_abd_contact_start_id,
@@ -363,9 +364,12 @@ void ABDSystem::_cal_abd_body_gradient_and_hessian(ABDSimData& sim_data)
     auto& abd       = sim_data.device;
     auto  N         = sim_data.abd_fem_count_info().abd_body_num;
     auto  parameter = parms;
-    abd_body_hessian.resize(N);
-    abd_gradient.resize(N);
-    system_gradient.resize(N * 12);
+    if(abd_body_hessian.size() != (size_t)(N))   // [C-3 capture-safe: muda resize waits]
+        abd_body_hessian.resize(N);
+    if(abd_gradient.size() != (size_t)(N))   // [C-3 capture-safe: muda resize waits]
+        abd_gradient.resize(N);
+    if(system_gradient.size() != (size_t)(N * 12))   // [C-3 capture-safe: muda resize waits]
+        system_gradient.resize(N * 12);
 
     auto boundary_type = sim_data.body_id_to_boundary_type();
 
@@ -681,7 +685,12 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
         global_triplets.block_col_indices(h_abd_abd_contact_start_id
                                           + new_triplet_offset + write_offset),
         (int)body_hessian_size);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // [C-3] defensive full-device sync: PTDS ordering suffices for the device
+    // chain and the host reads below consume mirrors, not device state. Kept
+    // for the plain path, skipped while the GH graph records (capture-illegal
+    // and a per-iteration stall).
+    if(!gipc_in_graph_capture())
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
     if(bcooNum)
     {
         {
@@ -1044,7 +1053,8 @@ void ABDSystem::_cal_abd_joint_gradient_and_hessian(ABDSimData& sim_data)
     auto  kappa_fallback = parms.joint_strength_ratio;  // fallback (per-joint kappa takes priority)
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
 
-    m_joint_cross_hessian.resize(m_num_joints);
+    if(m_joint_cross_hessian.size() != (size_t)(m_num_joints))   // [C-3 capture-safe: muda resize waits]
+        m_joint_cross_hessian.resize(m_num_joints);
 
     ParallelFor(256)
         .kernel_name(__FUNCTION__)
@@ -1166,7 +1176,8 @@ void ABDSystem::init_joint_constraints(
         }
     }
 
-    m_joint_data.resize(m_num_joints);
+    if(m_joint_data.size() != (size_t)(m_num_joints))   // [C-3 capture-safe: muda resize waits]
+        m_joint_data.resize(m_num_joints);
     m_joint_data.view().copy_from(host_gpu_data.data());
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -1313,7 +1324,8 @@ void ABDSystem::init_revolute_driving(
         }
     }
 
-    m_revolute_driving_data.resize(m_num_revolute_driving);
+    if(m_revolute_driving_data.size() != (size_t)(m_num_revolute_driving))   // [C-3 capture-safe: muda resize waits]
+        m_revolute_driving_data.resize(m_num_revolute_driving);
     m_revolute_driving_data.view().copy_from(host_data.data());
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -1506,7 +1518,8 @@ Float ABDSystem::cal_abd_revolute_driving_energy(ABDSimData& sim_data,
 
     auto& abd = sim_data.device;
     if(m_revolute_driving_energy_per.size() != (size_t)m_num_revolute_driving)   // [C-1 capture-safe: muda resize waits]
-        m_revolute_driving_energy_per.resize(m_num_revolute_driving);
+        if(m_revolute_driving_energy_per.size() != (size_t)(m_num_revolute_driving))   // [C-3 capture-safe: muda resize waits]
+            m_revolute_driving_energy_per.resize(m_num_revolute_driving);
 
     ParallelFor()
         .kernel_name("cal_revolute_driving_energy")
@@ -1547,7 +1560,8 @@ void ABDSystem::_cal_abd_revolute_driving_gradient_and_hessian(ABDSimData& sim_d
     auto& abd = sim_data.device;
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
 
-    m_revolute_driving_cross_hessian.resize(m_num_revolute_driving);
+    if(m_revolute_driving_cross_hessian.size() != (size_t)(m_num_revolute_driving))   // [C-3 capture-safe: muda resize waits]
+        m_revolute_driving_cross_hessian.resize(m_num_revolute_driving);
 
     ParallelFor(256)
         .kernel_name("cal_revolute_driving_grad_hess")
@@ -1649,7 +1663,8 @@ void ABDSystem::init_prismatic_constraints(
         gp.bq_bar = gp.bp_bar;
     }
 
-    m_prismatic_data.resize(m_num_prismatic);
+    if(m_prismatic_data.size() != (size_t)(m_num_prismatic))   // [C-3 capture-safe: muda resize waits]
+        m_prismatic_data.resize(m_num_prismatic);
     m_prismatic_data.view().copy_from(host_gpu.data());
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -1712,7 +1727,8 @@ Float ABDSystem::cal_abd_prismatic_energy(ABDSimData& sim_data, bool copy_to_hos
     auto& abd = sim_data.device;
     Float kappa = parms.prismatic_strength_ratio;
     if(m_prismatic_energy_per.size() != (size_t)m_num_prismatic)   // [C-1 capture-safe: muda resize waits]
-        m_prismatic_energy_per.resize(m_num_prismatic);
+        if(m_prismatic_energy_per.size() != (size_t)(m_num_prismatic))   // [C-3 capture-safe: muda resize waits]
+            m_prismatic_energy_per.resize(m_num_prismatic);
 
     ParallelFor()
         .kernel_name("cal_prismatic_energy")
@@ -1750,7 +1766,8 @@ void ABDSystem::_cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data)
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
     Float kappa = parms.prismatic_strength_ratio;
 
-    m_prismatic_cross_hessian.resize(m_num_prismatic);
+    if(m_prismatic_cross_hessian.size() != (size_t)(m_num_prismatic))   // [C-3 capture-safe: muda resize waits]
+        m_prismatic_cross_hessian.resize(m_num_prismatic);
 
     ParallelFor(256)
         .kernel_name("cal_prismatic_grad_hess")
@@ -1849,7 +1866,8 @@ void ABDSystem::init_prismatic_driving(
         drv.ext_force       = static_cast<Float>(ctrl.ext_force);
     }
 
-    m_prismatic_driving_data.resize(m_num_prismatic_driving);
+    if(m_prismatic_driving_data.size() != (size_t)(m_num_prismatic_driving))   // [C-3 capture-safe: muda resize waits]
+        m_prismatic_driving_data.resize(m_num_prismatic_driving);
     m_prismatic_driving_data.view().copy_from(host_data.data());
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -1994,7 +2012,8 @@ Float ABDSystem::cal_abd_prismatic_driving_energy(ABDSimData& sim_data,
 
     auto& abd = sim_data.device;
     if(m_prismatic_driving_energy_per.size() != (size_t)m_num_prismatic_driving)   // [C-1 capture-safe: muda resize waits]
-        m_prismatic_driving_energy_per.resize(m_num_prismatic_driving);
+        if(m_prismatic_driving_energy_per.size() != (size_t)(m_num_prismatic_driving))   // [C-3 capture-safe: muda resize waits]
+            m_prismatic_driving_energy_per.resize(m_num_prismatic_driving);
 
     ParallelFor()
         .kernel_name("cal_prismatic_driving_energy")
@@ -2029,7 +2048,8 @@ void ABDSystem::_cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_
     auto& abd = sim_data.device;
     auto  body_id_is_fixed = sim_data.body_id_to_boundary_type();
 
-    m_prismatic_driving_cross_hessian.resize(m_num_prismatic_driving);
+    if(m_prismatic_driving_cross_hessian.size() != (size_t)(m_num_prismatic_driving))   // [C-3 capture-safe: muda resize waits]
+        m_prismatic_driving_cross_hessian.resize(m_num_prismatic_driving);
 
     ParallelFor(256)
         .kernel_name("cal_prismatic_driving_grad_hess")
@@ -2086,7 +2106,8 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
     auto  unique_point_id_to_body_id = sim_data.unique_point_id_to_body_id();
     auto  body_hessian_size = sim_data.abd_fem_count_info().abd_body_num;
 
-    abd_system_diag_preconditioner.resize(body_hessian_size);
+    if(abd_system_diag_preconditioner.size() != (size_t)(body_hessian_size))   // [C-3 capture-safe: muda resize waits]
+        abd_system_diag_preconditioner.resize(body_hessian_size);
     // Must zero-init: the scatter loop below only touches bodies that appear
     // in the contact triplet range.  Bodies with no barrier/joint coupling
     // (e.g. an isolated free rigid body) would otherwise receive uninitialized

@@ -87,6 +87,7 @@ class GIPC
     // fricgd_start, ground_start, rsv, cd4, cd3, cd2, f4, f3, f2, rsv, rsv} —
     // GH-start snapshot of the offset web (mirror-seeded transitionally)
     bool      m_ls_recording          = false;    // [C-1] capacity sizing while recording
+    bool      m_gh_recording          = false;    // [C-3] GH chain under graph capture
     cudaGraphExec_t m_ls_graph_exec   = nullptr;  // [C-1] cached trial-body self-tail graph
     long long m_ls_graph_sig[2]       = {-1, -1}; //   {buffer generation, budget}
     bool      m_ccd_defer_counts      = false;

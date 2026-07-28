@@ -840,7 +840,88 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(start));
         g_dec_k = (int)k;   // [decouple probe] expose k to computeGradientAndHessian's stage dumps
         gipc_nvtx_push("GH_assembly");
-        m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
+        // [C-3 probe] STIFF_NEWTON_GRAPH=1: record THIS iteration's assembly
+        // chain into a CUDA graph and launch it (record -> instantiate ->
+        // launch -> destroy). Host bookkeeping runs at record time, so the
+        // semantics are identical each iteration; what this buys today is a
+        // machine-checked capturability proof of the whole GH chain with a
+        // stage-marked fallback that names the first remaining blocker.
+        // Cross-iteration exec reuse (the real win) lands once the ext/ABD
+        // host bookkeeping is device-closed. Single-env merged gate as C-2.
+        {
+            static int s_ng = -1;
+            if(s_ng < 0)
+            { const char* e = getenv("STIFF_NEWTON_GRAPH"); s_ng = e ? atoi(e) : 0; }
+            bool gh_done = false;
+            if(s_ng && !m_perenv_bvh && m_active_group_count <= 1
+               && m_total_frames >= 1)
+            {
+                cudaGraph_t gg    = nullptr;
+                bool        threw = false;
+                if(cudaStreamBeginCapture(cudaStreamPerThread,
+                                          cudaStreamCaptureModeThreadLocal)
+                   == cudaSuccess)
+                {
+                    try
+                    {
+                        m_gh_recording          = true;
+                        cuda_safe_call_throws() = true;
+                        gipc_in_graph_capture() = true;
+                        m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
+                        cuda_safe_call_throws() = false;
+                        gipc_in_graph_capture() = false;
+                    }
+                    catch(const std::exception& ex)
+                    {
+                        cuda_safe_call_throws() = false;
+                        gipc_in_graph_capture() = false;
+                        threw = true;
+                        s_ng  = 0;
+                        cudaGraph_t junk = nullptr;
+                        cudaStreamEndCapture(cudaStreamPerThread, &junk);
+                        if(junk) cudaGraphDestroy(junk);
+                        cudaGetLastError();
+                        fprintf(stderr,
+                                "[gh-graph] assembly not capturable (%s) -> "
+                                "plain path for this session\n",
+                                ex.what());
+                    }
+                    m_gh_recording = false;
+                    if(!threw
+                       && cudaStreamEndCapture(cudaStreamPerThread, &gg) == cudaSuccess
+                       && gg)
+                    {
+                        cudaGraphExec_t ge = nullptr;
+                        if(cudaGraphInstantiate(&ge, gg, nullptr, nullptr, 0)
+                           == cudaSuccess && ge)
+                        {
+                            CUDA_SAFE_CALL(cudaGraphLaunch(ge, cudaStreamPerThread));
+                            cudaGraphExecDestroy(ge);
+                            gh_done = true;
+                            static bool onceg = false;
+                            if(!onceg)
+                            {
+                                onceg = true;
+                                printf("[gh-graph] assembly chain captured + "
+                                       "graph-launched (per-iteration record)\n");
+                            }
+                        }
+                        cudaGraphDestroy(gg);
+                    }
+                    else if(!threw)
+                        cudaGetLastError();
+                }
+                if(!gh_done && !threw)
+                    s_ng = 0;   // capture path unavailable: permanent fallback
+                if(threw || !gh_done)
+                    m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
+                else
+                    (void)0;
+                gh_done = true;
+            }
+            if(!gh_done)
+                m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
+        }
         gipc_nvtx_pop();
 
         // [decouple probe] PRE-SOLVE gradient dump (shape_grads + fb hold the CLEAN gradient here,

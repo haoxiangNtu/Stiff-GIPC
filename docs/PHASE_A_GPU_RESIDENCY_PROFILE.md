@@ -369,3 +369,23 @@ seed（图时代由图内累加替换——蓝图既定）。
 剩余=WHILE 捕获 harness 本体（C-1 的 try/catch+阶段标记模式复用）+ MAS
 do_assemble 计数化 + ccd 消费闭环——首次捕获尝试将以阶段报告形式给出精确
 剩余清单。
+
+---
+
+# Newton 图探针战报：首捕获落地（2026-07-28）
+
+**探针机制**（`STIFF_NEWTON_GRAPH`，默认 0）：逐迭代 录制→实例化→发射→销毁
+整条 GH 装配链（宿主簿记录制时照常执行=语义零漂移）；`cuda_safe_call_throws`
+线程局部使 CUDA_SAFE_CALL 在探针域内抛异常（原 abort 接不住），
+`gipc_in_graph_capture` 门控防御性整设备同步。探针五轮清障（每轮工具实证）：
+13 号 20 个同步 memset→Async；ABD setup 15 个 muda resize 尺寸守卫；两处防御
+性 cudaDeviceSynchronize 门控（本身即逐迭代驻留漏洞）；zeroBinnedGrad→Async。
+
+**里程碑**：towel 四 knob 齐开（LS_GRAPH+C2_OFFSET_DEV+PCG_CACHE+NEWTON_GRAPH）
+`[gh-graph] assembly chain captured + graph-launched` ——**完整 GH 装配链首次
+以 CUDA 图捕获并发射**，全程 PASS/0 耗尽/drift 1.940e-3，15 段绿锚逐位。
+
+**精确边疆**（探针命名）：13:371 的 16B contact start-ids D2H（=GH 普查最后
+0.97/iter 那笔）喂 mid-GH 宿主算术（ABD 接触段偏移）+ GH 内嵌 ABD convert
+的 unique 读回——两者的设备闭环即跨迭代 exec 复用（真正收益）的解锁条件，
+其后 WHILE 尾launch 包 Newton 环、C-3 帧图水到渠成。

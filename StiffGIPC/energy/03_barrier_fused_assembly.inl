@@ -84,8 +84,8 @@ __global__ void _gfxToGrad(double3* _grad, const double* gbin, int n)
 // contact-force getters (get_*_contact_force_*).
 void GIPC::zeroBinnedGrad()
 {
-    CUDA_SAFE_CALL(cudaMemset(g_grad_binned, 0,
-                              3 * (size_t)vertexNum * BINNED_K * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(g_grad_binned, 0,
+                                   3 * (size_t)vertexNum * BINNED_K * sizeof(double), 0));
 }
 void GIPC::combineBinnedGrad(double3* out)
 {

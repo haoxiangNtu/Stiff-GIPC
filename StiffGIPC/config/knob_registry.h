@@ -72,6 +72,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_LS_GRAPH_DIAG, "diag") \
     X(STIFF_C2_OFFSET_DEV, "perf") \
     X(STIFF_C2_OFFSET_DIAG, "diag") \
+    X(STIFF_NEWTON_GRAPH, "perf") \
     X(STIFF_PCG_EW, "solver") \
     X(STIFF_PCG_EW_ETAMAX, "solver") \
     X(STIFF_PCG_EW_GAMMA, "solver") \
