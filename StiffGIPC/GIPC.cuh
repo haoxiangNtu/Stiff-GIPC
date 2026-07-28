@@ -91,6 +91,7 @@ class GIPC
     // header exposes only the stable FrameStatus ABI.
     void*                   m_frame_graph_context = nullptr;
     bool                    m_frame_graph_active  = false;
+    bool                    m_frame_terminal_emitted = false;
     frame_fsm::FrameStatus  m_last_frame_status{};
     bool      m_ccd_defer_counts      = false;
     int       m_energy_bound_cp       = 0;
@@ -718,6 +719,17 @@ class GIPC
     void IPC_Solver_FrameGraph(device_TetraData& TetMesh);
     void prepare_frame_graph(device_TetraData& TetMesh);
     void destroy_frame_graph();
+    void frame_graph_begin(device_TetraData& TetMesh,
+                           int64_t frame_id,
+                           int attempt = 0);
+    void frame_graph_enqueue_terminal(device_TetraData& TetMesh,
+                                      int result,
+                                      int error_code,
+                                      uint32_t invalid_bits = 0,
+                                      int err_env = -1,
+                                      int err_primitive = -1);
+    int frame_graph_finish_terminal();
+    frame_fsm::FrameDeviceState* frame_graph_device_state() const;
     void record_legacy_frame_status(bool graph_requested,
                                     bool callback_fallback,
                                     int newton_iterations = 0);

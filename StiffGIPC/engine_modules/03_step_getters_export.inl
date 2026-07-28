@@ -12,17 +12,24 @@ void SimEngine::step()
     }
 
     const int newton_before = impl.ipc.m_total_newton_iters;
-    impl.ipc.IPC_Solver(impl.d_tetMesh);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
     const char* frame_graph_env = std::getenv("STIFF_FRAME_GRAPH");
     const bool frame_graph_requested =
         frame_graph_env && frame_graph_env[0] && std::atoi(frame_graph_env) != 0;
-    // Until the conditional executable is armed, publish an honest fallback
-    // packet rather than making graph-aware RL tooling special-case step().
-    impl.ipc.record_legacy_frame_status(
-        frame_graph_requested,
-        frame_graph_requested,
-        impl.ipc.m_total_newton_iters - newton_before);
+    if(frame_graph_requested)
+    {
+        impl.ipc.IPC_Solver_FrameGraph(impl.d_tetMesh);
+    }
+    else
+    {
+        impl.ipc.IPC_Solver(impl.d_tetMesh);
+        // Legacy remains synchronous at its own terminal event. Keep status
+        // publication separate so callers can distinguish it from the graph
+        // transaction path without special-casing step().
+        impl.ipc.record_legacy_frame_status(
+            false,
+            false,
+            impl.ipc.m_total_newton_iters - newton_before);
+    }
     impl.step_count++;
 
     // [NaN-sentinel] always-on lightweight NaN watchdog (~1 atomic int +

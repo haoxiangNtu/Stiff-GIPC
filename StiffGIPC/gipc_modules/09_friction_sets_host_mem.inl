@@ -155,6 +155,10 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 /// </summary>
 void GIPC::FREE_DEVICE_MEM()
 {
+    // Whole-frame graphs retain mesh, solver and transaction-snapshot
+    // pointers. They must die before any allocation referenced by a node.
+    destroy_frame_graph();
+
     // Captured nodes retain every device pointer used by the trial body.
     // Destroy the executable before any of those allocations are released.
     if(m_ls_graph_exec)
