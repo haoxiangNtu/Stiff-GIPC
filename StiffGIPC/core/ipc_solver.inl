@@ -88,8 +88,8 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
     const bool collision_body = !m_skip_all_collision;
     if(collision_body)
     {
-        m_energy_bound_cp = MAX_COLLITION_PAIRS_NUM;
-        m_energy_bound_gp = surf_vertexNum;
+        m_energy_bound_cp = m_graph_train_pairs;
+        m_energy_bound_gp = m_graph_train_ground;
     }
     else
     {
@@ -737,10 +737,13 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
     if(collision_body && !c4_collision_graph_enabled())
         throw std::runtime_error(
             "[frame-conditional] collision requires STIFF_C4_COLLISION_GRAPH=1");
-    if(m_update_boundary || softNum != 0)
+    // [C6] host-owned soft targets stay out; device-resident stitch springs
+    // are fine (the assembly kernel recomputes them from the ABD pose).
+    if(m_update_boundary
+       || (softNum != 0 && !TetMesh.soft_targets_are_device_resident()))
         throw std::runtime_error(
-            "[frame-conditional] moving boundaries and host soft targets "
-            "are not yet eligible");
+            "[frame-conditional] moving boundaries and host-owned soft "
+            "targets are not yet eligible");
     // [C5] the complete isolated bundle is eligible; a PARTIAL per-env overlay
     // (e.g. the per_env_exit pair on merged mode) is not — its host decision
     // mix has no recorded equivalent.
@@ -797,18 +800,22 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
         // Hessian while the capacity-bound energy still sees it (the
         // first-contact livelock). Live counts stay device-owned; the
         // capture caller restores the real mirrors right after recording.
+        // [C6] shape from the TRAINED extent (observed counts x headroom),
+        // not the worst-case emission capacity — see
+        // GIPC::update_graph_training_capacity.
         for(int slot = 0; slot < 5; ++slot)
             h_cpNum.refresh_dst()[slot] =
-                static_cast<uint32_t>(MAX_COLLITION_PAIRS_NUM);
-        h_gpNum = static_cast<uint32_t>(surf_vertexNum);
+                static_cast<uint32_t>(m_graph_train_cp[slot]);
+        h_gpNum = static_cast<uint32_t>(m_graph_train_ground);
 #ifdef USE_FRICTION
-        // [C4-c] lagged mirrors at capacity too: friction launch extents and
-        // triplet-offset steps recorded below must survive lagged-count
-        // changes across frames (live lagged counts ride m_pair_snap_last).
+        // [C4-c] lagged mirrors at the same trained extent: friction launch
+        // extents and triplet-offset steps recorded below must survive
+        // lagged-count changes across frames (live counts ride
+        // m_pair_snap_last).
         for(int slot = 0; slot < 5; ++slot)
             h_cpNum_last.refresh_dst()[slot] =
-                static_cast<uint32_t>(MAX_COLLITION_PAIRS_NUM);
-        h_gpNum_last = static_cast<uint32_t>(surf_vertexNum);
+                static_cast<uint32_t>(m_graph_train_cp[slot]);
+        h_gpNum_last = static_cast<uint32_t>(m_graph_train_ground);
 #endif
         CUDA_SAFE_CALL(cudaMemsetAsync(
             _gdCollapse, 0, sizeof(int), cudaStreamPerThread));

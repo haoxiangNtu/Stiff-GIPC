@@ -175,6 +175,26 @@ class device_TetraData
 
     void update_soft_constraint_target_position(int step_id, double ipc_dt);
 
+    // [C6] True when every soft target is a bilateral stitch spring and no
+    // host functor is installed. Those targets are recomputed inside the
+    // assembly kernel from the ABD anchor's CURRENT pose (translation AND
+    // rotation), so the per-frame host refresh below is pure overhead for
+    // them — and the whole-frame graph can host such scenes. A host functor
+    // (or a plain pinned target) still needs the host pass.
+    bool soft_targets_are_device_resident() const
+    {
+        if(m_soft_num < 1)
+            return true;   // nothing to refresh
+        if(update_soft_constraint_functor != nullptr)
+            return false;  // user callback: genuinely host-driven
+        if(static_cast<int>(stitch_paired_vertex.size()) < m_soft_num)
+            return false;
+        for(int i = 0; i < m_soft_num; ++i)
+            if(stitch_paired_vertex[i] < 0)
+                return false;
+        return true;
+    }
+
 
   public:
     device_TetraData() {}

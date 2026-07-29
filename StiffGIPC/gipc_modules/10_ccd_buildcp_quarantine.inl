@@ -391,8 +391,56 @@ __global__ void _snapshot_pairs_masked(const int4*     source,
 // touches must be at final capacity before capture (no cudaMalloc inside a
 // captured stream). Growth here bumps the buffer generation so stale
 // executables are re-recorded.
+// [C6] Choose the extents the recorded launches will be shaped by. Driven by
+// the counts the scene actually produced (this frame's mirrors), doubled for
+// headroom, tier-rounded, and clamped by the hard emission capacity. Never
+// MAX_COLLITION_PAIRS_NUM itself: that is the worst case the buffers COULD
+// hold, not what the scene needs, and shaping the triplet envelope from it
+// costs tens of GB on real scenes.
+void GIPC::update_graph_training_capacity()
+{
+    const int headroom = graph_train_headroom_num();
+    for(int slot = 0; slot < 5; ++slot)
+    {
+        const int want = gipc::assembly_capacity_tier(
+            std::max(256, static_cast<int>(h_cpNum[slot]) * headroom));
+        m_graph_train_cp[slot] =
+            std::max(m_graph_train_cp[slot],
+                     std::min(want, MAX_COLLITION_PAIRS_NUM));
+    }
+    m_graph_train_pairs = m_graph_train_cp[0];
+    // Remember what a REAL frame actually assembled. The a-priori bound below
+    // models FEM/contact/ground/friction but not ABD body Hessians, joints or
+    // stitch springs, so for gripper scenes it underestimates badly; the
+    // measured length is the only honest starting point.
+    if(gipc_global_triplet.global_triplet_offset > m_last_assembled_triplets)
+        m_last_assembled_triplets =
+            gipc_global_triplet.global_triplet_offset;
+    const int observed_ccd = static_cast<int>(m_last_ccd_pair_count);
+    const int want_ccd = gipc::assembly_capacity_tier(
+        std::max(1024, observed_ccd * headroom));
+    m_graph_train_ccd =
+        std::max(m_graph_train_ccd,
+                 std::min(want_ccd, MAX_CCD_COLLITION_PAIRS_NUM));
+    const int want_ground = gipc::assembly_capacity_tier(
+        std::max(256, static_cast<int>(h_gpNum) * headroom));
+    m_graph_train_ground =
+        std::max(m_graph_train_ground,
+                 std::min(want_ground, static_cast<int>(surf_vertexNum)));
+    if(getenv("STIFF_FRAME_GRAPH_DIAG"))
+        fprintf(stderr,
+                "[graph-train] observed cp=[%u,%u,%u,%u,%u] gp=%u -> trained "
+                "cp=[%d,%d,%d,%d,%d] gp=%d (caps pair=%d ccd=%d)\n",
+                h_cpNum[0], h_cpNum[1], h_cpNum[2], h_cpNum[3], h_cpNum[4],
+                (unsigned)h_gpNum,
+                m_graph_train_cp[0], m_graph_train_cp[1], m_graph_train_cp[2],
+                m_graph_train_cp[3], m_graph_train_cp[4], m_graph_train_ground,
+                MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
+}
+
 void GIPC::train_collision_graph_capacities()
 {
+    update_graph_training_capacity();
     if(m_dcd_snap_cap < MAX_COLLITION_PAIRS_NUM)
     {
         ++pcg_buffer_generation();
@@ -425,6 +473,11 @@ void GIPC::train_collision_graph_capacities()
         CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintVal,
                                   m_close_gp_cap * sizeof(double)));
     }
+    // Close-set emission is an unbounded atomicAdd (no capacity clamp in
+    // _calSelfCloseVal), so this buffer MUST cover the worst case — training
+    // it down corrupts memory the moment live pairs exceed the tier. It is
+    // small (24 B/pair); the envelope that actually had to shrink is the
+    // triplet stream below.
     if(static_cast<size_t>(MAX_COLLITION_PAIRS_NUM) > m_close_cp_cap)
     {
         ++pcg_buffer_generation();
@@ -445,6 +498,7 @@ void GIPC::train_collision_graph_capacities()
 #ifdef USE_FRICTION
     // [C4-c] friction lastH family at final capacity: the boundary
     // buildFrictionSets and the recorded lagged-count consumers never grow.
+    // Friction lastH emission is likewise an unbounded atomicAdd.
     if(static_cast<size_t>(MAX_COLLITION_PAIRS_NUM) > m_fric_cp_cap)
     {
         ++pcg_buffer_generation();
@@ -471,11 +525,17 @@ void GIPC::train_collision_graph_capacities()
     // Mirrors 13's dynamic frame-start grow evaluated at capacity counts.
     if(m_dynamic_triplet)
     {
-        const int pair_tier =
-            gipc::assembly_capacity_tier(MAX_COLLITION_PAIRS_NUM);
+        // [C6] per-ARITY envelope. The old form multiplied ONE pair tier by
+        // all three arity strides, i.e. it budgeted as if every pair were
+        // simultaneously PP, PE and PT — 3x over the true bound, on top of
+        // using the worst-case pair count.
         const long long contact_tier =
-            static_cast<long long>(pair_tier)
-            * (M12_Off + M9_Off + M6_Off);
+            static_cast<long long>(
+                gipc::assembly_capacity_tier(m_graph_train_cp[4])) * M12_Off
+            + static_cast<long long>(
+                gipc::assembly_capacity_tier(m_graph_train_cp[3])) * M9_Off
+            + static_cast<long long>(
+                gipc::assembly_capacity_tier(m_graph_train_cp[2])) * M6_Off;
         long long bound = m_fixed_triplet_base
                           + static_cast<long long>(
                               abd_fem_count_info.fem_point_num)
@@ -505,9 +565,19 @@ void GIPC::train_collision_graph_capacities()
         // ABD lifting kernels launch from their class extents and would
         // dereference null Jacobi tables in a pure-FEM scene (sanitizer-
         // confirmed) if an impossible class were given a nonzero tier.
-        const int  class_tier_full = sort_capacity;
+        // [C6] Train each contact class from ITS OWN observed count, not from
+        // the (already capacity-inflated) payload tier. The old rule set every
+        // class to the full payload tier, which compounds: each training pass
+        // fed the previous pass's inflated payload back in, taking foldshirt's
+        // assembled stream from 246k to 2.6M to 21M triplets across two passes
+        // until the contraction ran past a 41M-element buffer.
         const bool has_abd = abd_fem_count_info.abd_body_num > 0;
         const bool has_fem = abd_fem_count_info.fem_point_num > 0;
+        const int observed_class[4] = {
+            gipc_global_triplet.fem_fem_contact_num,
+            gipc_global_triplet.abd_fem_contact_num,
+            gipc_global_triplet.fem_abd_contact_num,
+            gipc_global_triplet.abd_abd_contact_num};
         // m_contact_class_tier order: fem_fem, abd_fem, fem_abd, abd_abd
         // (see partitionContactHessian's class_num assignments). Class 0
         // is ALWAYS possible: capacity-grid zero pads carry hash(0,0) and
@@ -519,14 +589,24 @@ void GIPC::train_collision_graph_capacities()
             true, has_abd && has_fem, has_abd && has_fem, has_abd};
         (void)has_fem;
         for(int s = 0; s < 4; ++s)
-            if(class_possible[s]
-               && gipc_global_triplet.m_contact_class_tier[s]
-                      < class_tier_full)
+        {
+            if(!class_possible[s])
+                continue;
+            // Class 0 additionally holds the capacity grid's zero pads
+            // (hash(0,0) sorts first), so it gets the pad allowance on top.
+            long long want = static_cast<long long>(observed_class[s])
+                             * graph_train_headroom_num();
+            if(s == 0)
+                want += std::max(0, sort_capacity
+                                        - static_cast<int>(contact_tier));
+            const int tier = gipc::assembly_capacity_tier(
+                static_cast<int>(std::max<long long>(256, want)));
+            if(gipc_global_triplet.m_contact_class_tier[s] < tier)
             {
-                gipc_global_triplet.m_contact_class_tier[s] =
-                    class_tier_full;
+                gipc_global_triplet.m_contact_class_tier[s] = tier;
                 ++pcg_buffer_generation();
             }
+        }
         long long stable_count = 0;
         for(int s = 0; s < 4; ++s)
             stable_count += gipc_global_triplet.m_contact_class_tier[s];
@@ -537,6 +617,19 @@ void GIPC::train_collision_graph_capacities()
         long long target = 2 * bound;
         if(target < staging_need)
             target = staging_need;
+        // The ABD contraction reads [offset + fem_fem, 2*offset): the buffer
+        // must hold twice the assembled length. Scale the measured length by
+        // the capacity-mirror inflation the recording will apply.
+        if(m_last_assembled_triplets > 0)
+        {
+            const int observed = std::max(1, (int)h_cpNum[0]);
+            const double inflation =
+                std::max(1.0, (double)m_graph_train_cp[0] / observed);
+            const long long measured_need =
+                2 * (long long)(m_last_assembled_triplets * inflation) + 8192;
+            if(target < measured_need)
+                target = measured_need;
+        }
         if(gipc_global_triplet.triplet_capacity()
            < static_cast<size_t>(target))
         {
@@ -595,7 +688,8 @@ void GIPC::train_collision_graph_capacities()
         // the same envelope.
         if(m_abd_system)
             m_abd_system->converter3x3.ensure_capacity(
-                gipc::assembly_capacity_tier(class_tier_full));
+                gipc::assembly_capacity_tier(
+                    gipc_global_triplet.m_contact_class_tier[3]));
     }
 }
 
@@ -864,10 +958,14 @@ void GIPC::enqueue_ccd_alpha_conditional()
     m_ccd_defer_counts = false;
 
     cfl_largestSpeed_DeviceOut(pcg_data.squeue, m_ccd_alpha_slots + 3);
+    // [C6] swept grid at the trained CCD extent; a past-extent swept count
+    // is adjudicated in-graph (OVF_CCD_PAIRS -> boundary retry -> re-record
+    // at a larger tier), so this never silently drops pairs.
+    const int ccd_train = graph_trained_ccd_extent();
     self_full_largestFeasibleStepSize_DeviceOut(
         slackness_m,
-        ensure_reduce_scratch(MAX_CCD_COLLITION_PAIRS_NUM),
-        MAX_CCD_COLLITION_PAIRS_NUM,
+        ensure_reduce_scratch(ccd_train),
+        ccd_train,
         m_ccd_alpha_slots + 4,
         _cpNum);
     _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
@@ -878,7 +976,7 @@ void GIPC::enqueue_ccd_alpha_conditional()
                                        m_ccd_refined_invalid,
                                        _cpNum,
                                        frame_graph_device_state(),
-                                       MAX_CCD_COLLITION_PAIRS_NUM);
+                                       ccd_train);
 }
 
 void GIPC::throwIfGroundDistanceInvalid()

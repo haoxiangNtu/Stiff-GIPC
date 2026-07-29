@@ -730,6 +730,42 @@ class GIPC
     // records/executes an isolated-mode frame (per-env BVH host loops are
     // not capture-safe; isolation is preserved by emission filtering).
     bool m_graph_merged_detect = false;
+
+    // [C6] Graph training capacity. C4 originally shaped every recorded
+    // launch from MAX_COLLITION_PAIRS_NUM — the WORST-CASE emission capacity.
+    // That is fine for the small gate scenes (MAX_PAIRS ~2k) but catastrophic
+    // for real ones: foldshirt's MAX_PAIRS is 737k, whose triplet envelope
+    // needs ~44 GB. The recorded shape must instead follow the counts the
+    // scene ACTUALLY produces, with headroom; overflow past the trained tier
+    // is already adjudicated in-graph (OVF_* -> boundary retry -> re-record),
+    // which is exactly the machinery that makes a smaller tier safe.
+    // Per-ARITY extents. A single "pairs" number cannot size the triplet
+    // stream: the assembly cost is tier(n4)*M12 + tier(n3)*M9 + tier(n2)*M6,
+    // and treating every pair as if it were all three arities at once
+    // over-allocates ~3x on top of the worst-case error.
+    int m_graph_train_cp[5]  = {0, 0, 0, 0, 0};
+    int m_graph_train_pairs  = 0;   // trained DCD pair extent (slot 0)
+    int m_last_assembled_triplets = 0;  // measured length of a real frame
+    int m_graph_train_ground = 0;   // trained ground pair extent
+    // Growth factor applied to the observed counts when training.
+    static int graph_train_headroom_num() { return 2; }
+    int graph_trained_pair_extent() const { return m_graph_train_pairs; }
+    int graph_trained_ground_extent() const { return m_graph_train_ground; }
+    // Swept (CCD) extent is trained INDEPENDENTLY of the DCD extent. They are
+    // wildly different in practice — foldshirt emits ~27k DCD pairs but ~324k
+    // swept ones — so deriving CCD from DCD by the buffer ratio forced a 4x
+    // DCD inflation to satisfy a CCD need, and the triplet envelope (which
+    // scales with the DCD side) blew past device memory.
+    int m_graph_train_ccd = 0;
+    int graph_trained_ccd_extent() const
+    {
+        if(m_graph_train_ccd <= 0)
+            return MAX_CCD_COLLITION_PAIRS_NUM;
+        return std::max(256,
+                        std::min(m_graph_train_ccd,
+                                 MAX_CCD_COLLITION_PAIRS_NUM));
+    }
+    void update_graph_training_capacity();
     void self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
                                                        double* mqueue,
                                                        int capacity,
@@ -827,6 +863,13 @@ class GIPC
                                       int err_primitive = -1);
     int frame_graph_finish_terminal();
     frame_fsm::FrameDeviceState* frame_graph_device_state() const;
+    // [C6] graph-coverage telemetry (see frame_status.cu). Always counted;
+    // STIFF_GRAPH_STATS=1 prints the summary at teardown.
+    int  m_frames_committed  = 0;
+    int  m_frames_full_graph = 0;
+    int  m_frames_two_graph  = 0;
+    void note_frame_graph_coverage(const frame_fsm::FrameStatus& status);
+    void print_frame_graph_coverage(const char* tag = nullptr) const;
     void record_legacy_frame_status(bool graph_requested,
                                     bool callback_fallback,
                                     int newton_iterations = 0);

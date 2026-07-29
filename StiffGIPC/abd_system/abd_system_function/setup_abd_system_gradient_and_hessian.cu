@@ -1032,27 +1032,66 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
     global_triplets.global_triplet_offset = global_triplets.global_collision_triplet_offset;
 
 
-    CUDA_SAFE_CALL(cudaMemcpyAsync(
-        global_triplets.block_values() + global_triplets.fem_fem_contact_num,
-        global_triplets.block_values() + new_triplet_offset + global_triplets.fem_fem_contact_num,
-        (new_triplet_offset - global_triplets.fem_fem_contact_num) * sizeof(Eigen::Matrix3d),
-        cudaMemcpyDeviceToDevice,
-        cudaStreamPerThread));
-    CUDA_SAFE_CALL(cudaMemcpyAsync(
-        global_triplets.block_col_indices() + global_triplets.fem_fem_contact_num,
-        global_triplets.block_col_indices() + new_triplet_offset
-            + global_triplets.fem_fem_contact_num,
-        (new_triplet_offset - global_triplets.fem_fem_contact_num) * sizeof(int),
-        cudaMemcpyDeviceToDevice,
-        cudaStreamPerThread));
+    // [C6] Under capacity-shaped recording the class tiers are inflated
+    // (zero pads sort into class 0), so this contraction can be handed a
+    // NEGATIVE span. Report the operands instead of failing with a bare
+    // "invalid argument" from cudaMemcpyAsync.
+    const long long contract_span =
+        static_cast<long long>(new_triplet_offset)
+        - static_cast<long long>(global_triplets.fem_fem_contact_num);
+    if(contract_span < 0)
+    {
+        std::fprintf(stderr,
+                     "[abd-contract] negative span: new_triplet_offset=%d "
+                     "fem_fem_contact_num=%d abd_abd=%d abd_fem=%d "
+                     "fem_abd=%d\n",
+                     new_triplet_offset,
+                     global_triplets.fem_fem_contact_num,
+                     global_triplets.abd_abd_contact_num,
+                     global_triplets.abd_fem_contact_num,
+                     global_triplets.fem_abd_contact_num);
+        throw std::runtime_error(
+            "[abd-contract] contraction span is negative — contact class "
+            "tiers exceed the assembled ABD triplet stream");
+    }
+    if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
+        std::fprintf(stderr,
+                     "[abd-contract] offset=%d fem_fem=%d span=%lld "
+                     "need_end=%lld capacity=%zu\n",
+                     new_triplet_offset,
+                     global_triplets.fem_fem_contact_num,
+                     contract_span,
+                     (long long)new_triplet_offset
+                         + global_triplets.fem_fem_contact_num
+                         + contract_span,
+                     global_triplets.triplet_capacity());
+    if(contract_span > 0)
+        CUDA_SAFE_CALL(cudaMemcpyAsync(
+            global_triplets.block_values() + global_triplets.fem_fem_contact_num,
+            global_triplets.block_values() + new_triplet_offset
+                + global_triplets.fem_fem_contact_num,
+            static_cast<size_t>(contract_span) * sizeof(Eigen::Matrix3d),
+            cudaMemcpyDeviceToDevice,
+            cudaStreamPerThread));
+    if(contract_span > 0)
+        CUDA_SAFE_CALL(cudaMemcpyAsync(
+            global_triplets.block_col_indices()
+                + global_triplets.fem_fem_contact_num,
+            global_triplets.block_col_indices() + new_triplet_offset
+                + global_triplets.fem_fem_contact_num,
+            static_cast<size_t>(contract_span) * sizeof(int),
+            cudaMemcpyDeviceToDevice,
+            cudaStreamPerThread));
 
-    CUDA_SAFE_CALL(cudaMemcpyAsync(
-        global_triplets.block_row_indices() + global_triplets.fem_fem_contact_num,
-        global_triplets.block_row_indices() + new_triplet_offset
-            + global_triplets.fem_fem_contact_num,
-        (new_triplet_offset - global_triplets.fem_fem_contact_num) * sizeof(int),
-        cudaMemcpyDeviceToDevice,
-        cudaStreamPerThread));
+    if(contract_span > 0)
+        CUDA_SAFE_CALL(cudaMemcpyAsync(
+            global_triplets.block_row_indices()
+                + global_triplets.fem_fem_contact_num,
+            global_triplets.block_row_indices() + new_triplet_offset
+                + global_triplets.fem_fem_contact_num,
+            static_cast<size_t>(contract_span) * sizeof(int),
+            cudaMemcpyDeviceToDevice,
+            cudaStreamPerThread));
 }
 
 // ============================================================================

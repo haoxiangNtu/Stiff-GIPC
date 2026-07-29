@@ -155,6 +155,9 @@ __global__ void _calFrictionLastH_DistAndTan(const double3*    _vertexes,
 /// </summary>
 void GIPC::FREE_DEVICE_MEM()
 {
+    // [C6] last chance to report how much of the run was one whole-frame
+    // graph; every scene reaches teardown, so no example needs patching.
+    print_frame_graph_coverage();
     // Whole-frame graphs retain mesh, solver and transaction-snapshot
     // pointers. They must die before any allocation referenced by a node.
     destroy_frame_graph();

@@ -201,6 +201,17 @@ void device_TetraData::update_soft_constraint_target_position(int step_id, doubl
     if(m_soft_num < 1)
         return;
 
+    // [C6] All-stitch scenes need no host refresh at all. The assembly kernel
+    // recomputes each stitch target from the ABD anchor's current pose,
+    // INCLUDING rotation (target = anchor_world + A_now * local_offset); the
+    // loop below only ever wrote the older translation-only value into a
+    // buffer the stitch path does not read. Skipping it removes a full
+    // vertex-array D2H plus a host loop from every frame — and, because that
+    // D2H was the last host dependency of these scenes, it is what lets
+    // gripper scenes qualify for the whole-frame graph at all.
+    if(soft_targets_are_device_resident())
+        return;
+
     std::vector<double3> host_vertexes(m_vertex_num);
     CUDA_SAFE_CALL(cudaMemcpy(
         host_vertexes.data(), vertexes, m_vertex_num * sizeof(double3), cudaMemcpyDeviceToHost));

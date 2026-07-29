@@ -26,4 +26,35 @@ void GIPC::record_legacy_frame_status(bool graph_requested,
     status.kappa              = Kappa;
     status.frame_id           = m_total_frames > 0 ? m_total_frames - 1 : 0;
     m_last_frame_status       = status;
+    note_frame_graph_coverage(status);
+}
+
+// [C6] Graph-coverage telemetry. Every committed frame passes through here or
+// through the transaction's terminal, so ANY scene — including the replay
+// examples, which each have their own loop — reports how much of its run
+// actually executed as one whole-frame graph. STIFF_GRAPH_STATS=1 prints the
+// summary; the counters are always maintained (two adds per frame) so a gate
+// or a Python caller can read them without re-running.
+void GIPC::note_frame_graph_coverage(const frame_fsm::FrameStatus& status)
+{
+    ++m_frames_committed;
+    if(status.path_flags & frame_fsm::PATH_FULL_CONDITIONAL_GRAPH)
+        ++m_frames_full_graph;
+    else if(status.path_flags & frame_fsm::PATH_GRAPH_ACTIVE)
+        ++m_frames_two_graph;
+}
+
+void GIPC::print_frame_graph_coverage(const char* tag) const
+{
+    if(!getenv("STIFF_GRAPH_STATS") || m_frames_committed == 0)
+        return;
+    printf("[graph-stats]%s%s frames=%d full_graph=%d (%.0f%%) "
+           "two_graph=%d legacy=%d\n",
+           tag ? " " : "", tag ? tag : "",
+           m_frames_committed,
+           m_frames_full_graph,
+           100.0 * m_frames_full_graph / m_frames_committed,
+           m_frames_two_graph,
+           m_frames_committed - m_frames_full_graph - m_frames_two_graph);
+    fflush(stdout);
 }

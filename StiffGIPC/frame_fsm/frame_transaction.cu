@@ -274,9 +274,18 @@ bool full_graph_eligible(const GIPC& ipc,
             return false;
         }
     }
-    if(context.abd_count != 0 && !allow_abd)
+    // [C6] ABD in the ordinary step() whole-frame graph. The original gate
+    // predates C4/D4: ABD + collision + friction is now proven to run inside
+    // the graph and to REUSE one executable across frames (the GPU-native RL
+    // path does 43 frames on a single 1089-node exec, zero transfers), and
+    // the frame transaction already snapshots q / q_prev / q_v / q_tilde for
+    // rollback. Opt-in first so the claim gets measured before it becomes the
+    // default, exactly how C4/C5 were introduced.
+    if(context.abd_count != 0 && !allow_abd
+       && !knob_enabled("STIFF_C6_ABD_STEP_GRAPH"))
     {
-        reason = "ABD bodies are not yet device-conditional";
+        reason =
+            "ABD bodies in ordinary step() need STIFF_C6_ABD_STEP_GRAPH=1";
         return false;
     }
     if(context.abd_count != 0
@@ -308,9 +317,18 @@ bool full_graph_eligible(const GIPC& ipc,
             return false;
         }
     }
-    if(ipc.m_update_boundary || ipc.softNum != 0)
+    if(ipc.m_update_boundary)
     {
-        reason = "moving boundaries or host soft targets are active";
+        reason = "moving boundaries are active";
+        return false;
+    }
+    // [C6] Soft targets are only a blocker when the HOST owns them. Bilateral
+    // stitch springs (every gripper scene) are recomputed on device inside the
+    // assembly kernel, so they are graph-safe; a user functor or a plain
+    // pinned target still needs the per-frame host pass and stays out.
+    if(ipc.softNum != 0 && !mesh.soft_targets_are_device_resident())
+    {
+        reason = "host-owned soft targets are active";
         return false;
     }
     if(ipc.semi_implicit_enabled)
@@ -1917,15 +1935,18 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
         frame_stats["newton"].push_back(gipc::Json::object());
         ipc.m_ls_defer_counts           = true;
         ipc.m_energy_use_device_counts = true;
+        // [C6] trained extent, not worst-case capacity.
         for(int slot = 0; slot < 5; ++slot)
             ipc.h_cpNum.refresh_dst()[slot] =
-                static_cast<uint32_t>(ipc.MAX_COLLITION_PAIRS_NUM);
-        ipc.h_gpNum = static_cast<uint32_t>(ipc.surf_vertexNum);
+                static_cast<uint32_t>(ipc.m_graph_train_cp[slot]);
+        ipc.h_gpNum =
+            static_cast<uint32_t>(ipc.graph_trained_ground_extent());
 #ifdef USE_FRICTION
         for(int slot = 0; slot < 5; ++slot)
             ipc.h_cpNum_last.refresh_dst()[slot] =
-                static_cast<uint32_t>(ipc.MAX_COLLITION_PAIRS_NUM);
-        ipc.h_gpNum_last = static_cast<uint32_t>(ipc.surf_vertexNum);
+                static_cast<uint32_t>(ipc.m_graph_train_cp[slot]);
+        ipc.h_gpNum_last =
+            static_cast<uint32_t>(ipc.graph_trained_ground_extent());
 #endif
         ipc.computeGradientAndHessian(mesh);
         ipc.calculateMovingDirection(mesh, 0, ipc.pcg_data.P_type);
@@ -1948,17 +1969,35 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
         const bool class_possible[4] = {
             true, has_abd && has_fem, has_abd && has_fem, has_abd};
         (void)has_fem;
-        bool retier = false;
-        for(int s = 0; s < 4; ++s)
-            if(class_possible[s]
-               && ipc.gipc_global_triplet.m_contact_class_tier[s]
-                      < payload_tier)
-            {
-                ipc.gipc_global_triplet.m_contact_class_tier[s] =
-                    payload_tier;
-                retier = true;
-            }
-        if(retier)
+        // [C6] The class tiers are trained from observed per-class counts in
+        // train_collision_graph_capacities. Re-deriving them here from the
+        // capacity-inflated payload is what produced the compounding blowup
+        // (246k -> 2.6M -> 21M triplets), so this pass no longer re-tiers;
+        // genuine past-tier overflow is adjudicated in-graph and grows the
+        // tier through the OVF retry path.
+        const bool retier = false;
+        (void)class_possible;
+        (void)payload_tier;
+        // [C6] The ABD contraction reads [offset + fem_fem, 2*offset), so the
+        // triplet buffer must hold TWICE the assembled length. The a-priori
+        // bound cannot predict that length (it does not model ABD body
+        // Hessians, joints or stitch springs), so guarantee it from the
+        // MEASURED length here, at the legal boundary.
+        const size_t contraction_need =
+            2 * static_cast<size_t>(
+                    ipc.gipc_global_triplet.global_triplet_offset)
+            + 4096;
+        bool grew_for_contraction = false;
+        if(ipc.gipc_global_triplet.triplet_capacity() < contraction_need)
+        {
+            ipc.gipc_global_triplet.global_triplet_offset = 0;
+            ipc.gipc_global_triplet.global_collision_triplet_offset = 0;
+            ipc.gipc_global_triplet.open_discard_window();
+            ipc.gipc_global_triplet.ensure_capacity_discard(
+                contraction_need + contraction_need / 4);
+            grew_for_contraction = true;
+        }
+        if(retier || grew_for_contraction)
         {
             ++pcg_buffer_generation();
             if(ipc.m_abd_system)
@@ -3308,6 +3347,7 @@ int GIPC::frame_graph_finish_terminal()
     if(!m_frame_terminal_emitted)
         throw std::logic_error("frame terminal graph was not emitted");
     m_last_frame_status = *context.h_status;
+    note_frame_graph_coverage(m_last_frame_status);   // [C6]
     if((m_last_frame_status.invalid_bits
         & frame_fsm::OVF_UNIQUE_BLOCKS)
        && m_last_frame_status.required_unique_blocks > 0)
@@ -3321,6 +3361,62 @@ int GIPC::frame_graph_finish_terminal()
             gipc_global_triplet.m_abd_unique_tier[0], tier);
         gipc_global_triplet.m_abd_unique_tier[1] = std::max(
             gipc_global_triplet.m_abd_unique_tier[1], tier);
+    }
+    // [C6] Pair-capacity overflow must GROW the trained extents, otherwise the
+    // retry replays the same too-small tier and burns the whole retry budget.
+    // The status packet carries what the frame actually needed.
+    if(m_last_frame_status.invalid_bits
+       & (frame_fsm::OVF_DCD_PAIRS | frame_fsm::OVF_CCD_PAIRS))
+    {
+        const int needed_dcd = std::max(
+            m_last_frame_status.required_dcd_pairs,
+            m_last_frame_status.hw_dcd_pairs);
+        const int needed_ccd = std::max(
+            m_last_frame_status.required_ccd_pairs,
+            m_last_frame_status.hw_ccd_pairs);
+        // The swept extent is derived from the DCD extent by the buffers'
+        // DCD:CCD ratio, so express the CCD requirement in DCD terms.
+        // Grow the swept extent on its own axis — inflating the DCD side to
+        // cover a swept need multiplies the triplet envelope for nothing.
+        if(needed_ccd > m_graph_train_ccd)
+        {
+            const int grown_ccd = std::min(
+                MAX_CCD_COLLITION_PAIRS_NUM,
+                gipc::assembly_capacity_tier(
+                    needed_ccd * GIPC::graph_train_headroom_num()));
+            if(grown_ccd > m_graph_train_ccd)
+            {
+                if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
+                    fprintf(stderr,
+                            "[graph-train] swept overflow: needed=%d -> "
+                            "trained ccd %d -> %d\n",
+                            needed_ccd, m_graph_train_ccd, grown_ccd);
+                m_graph_train_ccd = grown_ccd;
+                ++pcg_buffer_generation();
+            }
+        }
+        // Only grow the DCD side when the DCD side actually overflowed.
+        // Multiplying the CURRENT tier by the headroom grew it on every
+        // swept-only overflow, doubling the triplet envelope for nothing.
+        const int grown = (needed_dcd > m_graph_train_pairs)
+            ? std::min(MAX_COLLITION_PAIRS_NUM,
+                       gipc::assembly_capacity_tier(
+                           needed_dcd * GIPC::graph_train_headroom_num()))
+            : m_graph_train_pairs;
+        if(grown > m_graph_train_pairs)
+        {
+            if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
+                fprintf(stderr,
+                        "[graph-train] pair overflow: needed dcd=%d ccd=%d "
+                        "-> trained pairs %d -> %d\n",
+                        needed_dcd, needed_ccd, m_graph_train_pairs, grown);
+            m_graph_train_pairs = grown;
+            m_graph_train_cp[0] = grown;
+            for(int s = 2; s < 5; ++s)
+                m_graph_train_cp[s] =
+                    std::min(grown, std::max(m_graph_train_cp[s], grown / 2));
+            ++pcg_buffer_generation();   // force a re-record at the new tier
+        }
     }
     if(m_last_frame_status.invalid_bits & frame_fsm::OVF_TRIPLETS)
     {

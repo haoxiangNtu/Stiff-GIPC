@@ -777,12 +777,13 @@ void GIPC::enqueue_perenv_ccd_alpha_conditional(device_TetraData& TetMesh)
                                    0,
                                    2 * NG * sizeof(double),
                                    cudaStreamPerThread));
-    _per_env_selfAlpha_min<<<(MAX_CCD_COLLITION_PAIRS_NUM + bs - 1) / bs,
+    const int ccd_train = graph_trained_ccd_extent();   // [C6]
+    _per_env_selfAlpha_min<<<(ccd_train + bs - 1) / bs,
                              bs,
                              0,
                              cudaStreamPerThread>>>(
         _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
-        m_env_scratch + 2 * NG, slackness_m, MAX_CCD_COLLITION_PAIRS_NUM, NG,
+        m_env_scratch + 2 * NG, slackness_m, ccd_train, NG,
         nullptr, m_ccd_alpha_invalid, kCcdInvalidPerEnvRefined,
         m_ccd_refined_invalid + 1,
         _cpNum);

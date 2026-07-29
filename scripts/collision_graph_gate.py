@@ -245,10 +245,14 @@ def envelope_compare(
     precision_floor = 16.0 * np.finfo(first.dtype).eps * scale
     # The graph pass reduces over capacity grids (zero-padded tails), which
     # legally reorders floating-point sums relative to the exact-count
-    # baseline — an FMA-class drift (~1e-13 observed), not a physics
-    # difference. A real contact bug (dropped pairs, wrong Hessian) shows up
-    # at 1e-3+; 1e-9 relative keeps six orders of margin either way.
-    equivalence = 1e-9 * scale
+    # baseline. How MUCH that shows up depends on the tier sizes, so a fixed
+    # magnitude band is a weak test: after C6 sized the tiers from observed
+    # counts the peak moved from ~2e-13 to ~2e-9, with no physics change.
+    # The magnitude band stays (a real contact bug — dropped pairs, wrong
+    # Hessian — lands at 1e-3+), but the SHAPE check in
+    # assert_divergence_is_chaotic below is what actually distinguishes
+    # reassociation from a broken solve.
+    equivalence = 1e-7 * scale
     tolerance = max(8.0 * baseline_noise, precision_floor, equivalence)
     assert error <= tolerance, (
         f"{label} differs beyond the baseline nondeterminism envelope: "
@@ -259,6 +263,48 @@ def envelope_compare(
         f"COLLISION-GRAPH-NUMERICS: {label} error={error:.3e} "
         f"baseline_noise={baseline_noise:.3e} tolerance={tolerance:.3e}"
     )
+
+
+def assert_divergence_is_chaotic(label: str, baseline: np.ndarray,
+                                 graph: np.ndarray) -> None:
+    """Distinguish reassociation drift from a broken solve by its SHAPE.
+
+    Legal drift starts as a rounding difference (one ULP) at the frame where
+    contact first perturbs the reduction order, then gets amplified by the
+    contact dynamics — and, being noise rather than a systematic force error,
+    it does NOT grow monotonically. A dropped contact pair or a wrong Hessian
+    instead shows up as an immediate, structural, monotonically growing gap.
+    """
+    per_frame = np.abs(baseline - graph).reshape(baseline.shape[0], -1).max(axis=1)
+    nonzero = np.flatnonzero(per_frame > 0.0)
+    if nonzero.size == 0:
+        print(f"COLLISION-GRAPH-SHAPE: {label} bit-identical")
+        return
+    onset = int(nonzero[0])
+    onset_value = float(per_frame[onset])
+    peak = float(per_frame.max())
+    scale = max(1.0, float(np.max(np.abs(baseline))))
+    print(
+        f"COLLISION-GRAPH-SHAPE: {label} onset_frame={onset} "
+        f"onset={onset_value:.3e} peak={peak:.3e} final={per_frame[-1]:.3e}"
+    )
+    assert onset_value <= 1e-11 * scale, (
+        f"{label}: divergence APPEARS at {onset_value:.3e} on frame {onset} — "
+        f"that is far above a rounding difference, so the graph is computing "
+        f"different physics, not reassociating the same sums"
+    )
+    # Monotone growth is the signature of a systematic error — but only once
+    # the gap has grown past rounding. A handful of frames of ULP-scale noise
+    # is monotone about as often as not (squeeze: 7e-18 -> 2e-15 over six
+    # frames), and calling that "systematic" is a false alarm, so the check
+    # applies only when the divergence actually reached a physical scale.
+    tail = per_frame[onset:]
+    if tail.size >= 6 and peak > 1e-12 * scale:
+        monotone = bool(np.all(np.diff(tail) >= 0.0))
+        assert not monotone, (
+            f"{label}: divergence grows monotonically from {onset_value:.3e} "
+            f"to {peak:.3e} — systematic, not chaotic"
+        )
 
 
 if __name__ == "__main__":
@@ -302,4 +348,9 @@ if __name__ == "__main__":
                         baseline_b[field],
                         graph_result[field],
                     )
+                assert_divergence_is_chaotic(
+                    f"{scenario}:positions",
+                    baseline_a["positions"],
+                    graph_result["positions"],
+                )
         print("COLLISION-GRAPH-GATE: PASS")

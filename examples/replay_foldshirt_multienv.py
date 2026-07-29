@@ -209,7 +209,10 @@ def main():
         joint_strength_ratio=100.0, revolute_driving_strength_ratio=100.0,
         prismatic_strength_ratio=2000.0, semi_implicit_enabled=False,
         semi_implicit_beta_tol=5e-2, semi_implicit_min_iter=1, newton_tol=5e-2,
-        newton_iter_cap=50,
+        # The cap truncates Newton on the hardest contact frames; raising it
+        # trades speed for a more converged step. CASE39_NEWTON_CAP makes the
+        # trade measurable instead of hard-coded.
+        newton_iter_cap=int(os.environ.get("CASE39_NEWTON_CAP", "50")),
         # CASE39_PRECOND: 1 = MAS (historical default), 0 = diagonal — A/B knob.
         preconditioner_type=int(os.environ.get("CASE39_PRECOND", "1")),
         ground_offset=float(ec.get("ground_offset", 0.75)), assets_dir=_ASSETS_DIR)
@@ -313,17 +316,123 @@ def main():
         f0 = int(os.environ.get("CASE39_FRAME_START","0"))
         f1 = min(int(os.environ.get("CASE39_FRAME_END", str(len(actions)))), len(actions))
         cloth_ranges = [(env['cloth_rec'].vertex_offset, env['cloth_rec'].vertex_count) for env in envs]
+        # [correctness recording] CASE39_RECORD_MP4=<path> renders env 0's cloth
+        # to a video while the headless benchmark loop runs unchanged, so what
+        # you watch is exactly what was timed. Off by default: no import cost,
+        # no per-frame work, benchmark numbers unaffected.
+        recorder = None
+        record_path = os.environ.get("CASE39_RECORD_MP4")
+        usd_path = os.environ.get("CASE39_RECORD_USD")
+        if record_path or usd_path:
+            # FULL scene: every surface face of every body (arm links, soft
+            # fingers, cloth) across all envs — not just the cloth. ABD and
+            # FEM bodies are colored differently so the gripper reads clearly
+            # against the shirt.
+            _faces_all = np.asarray(eng.native.get_surface_faces())
+            _recs = eng.get_load_records()
+            _abd_v = np.zeros(eng.vertex_count, dtype=bool)
+            for _r in _recs:
+                if _r.body_type == 0:  # ABD (arm + gripper)
+                    _abd_v[_r.vertex_offset:_r.vertex_offset + _r.vertex_count] = True
+            _face_is_abd = _abd_v[_faces_all[:, 0]]
+            _stride = int(os.environ.get("CASE39_RECORD_STRIDE", "1"))
+            print(f"[fs-rec] FULL scene: {eng.vertex_count} verts, "
+                  f"{_faces_all.shape[0]} faces "
+                  f"({int(_face_is_abd.sum())} ABD / "
+                  f"{int((~_face_is_abd).sum())} FEM), "
+                  f"{len(_recs)} bodies", flush=True)
+            _mp4 = None
+            if record_path:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as _plt
+                from mpl_toolkits.mplot3d.art3d import Poly3DCollection as _Poly
+                import imageio.v2 as _imageio
+                _fig = _plt.figure(figsize=(7.0, 6.0), dpi=110)
+                _ax = _fig.add_subplot(111, projection="3d")
+                _writer = _imageio.get_writer(record_path, fps=20,
+                                              macro_block_size=1)
+                _mp4 = (_fig, _ax, _writer, _Poly, _plt)
+                print(f"[fs-rec] mp4 -> {record_path}", flush=True)
+            _usd = None
+            if usd_path:
+                from pxr import Usd, UsdGeom, Vt, Sdf
+                _stage = Usd.Stage.CreateNew(usd_path)
+                UsdGeom.SetStageUpAxis(_stage, UsdGeom.Tokens.y)
+                _stage.SetStartTimeCode(f0)
+                _stage.SetEndTimeCode(f1 - 1)
+                _stage.SetTimeCodesPerSecond(20)
+                _mesh = UsdGeom.Mesh.Define(_stage, "/World/scene")
+                _mesh.CreateFaceVertexCountsAttr(
+                    Vt.IntArray([3] * _faces_all.shape[0]))
+                _mesh.CreateFaceVertexIndicesAttr(
+                    Vt.IntArray(_faces_all.reshape(-1).tolist()))
+                # constant-interpolation color per face: gripper vs cloth
+                _colors = UsdGeom.Primvar(
+                    _mesh.CreateDisplayColorAttr())
+                _colors.SetInterpolation(UsdGeom.Tokens.uniform)
+                _mesh.GetDisplayColorAttr().Set(Vt.Vec3fArray(
+                    [(0.55, 0.58, 0.62) if a else (0.91, 0.64, 0.24)
+                     for a in _face_is_abd]))
+                _usd = (_stage, _mesh)
+                print(f"[fs-rec] usd -> {usd_path} (all vertices animated)",
+                      flush=True)
+            recorder = (_mp4, _usd, _faces_all, _face_is_abd, _stride)
         ms = []
         for fr in range(f0, f1):
             for e, ej in enumerate(ejs):
                 apply_frame(robot, ej, actions[(fr + e*phase) % L], close_r)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter()-t)*1000.0)
+            if recorder is not None and fr % recorder[4] == 0:
+                (_mp4, _usd, _faces_all, _face_is_abd, _st) = recorder
+                _v = np.asarray(eng.get_vertices())
+                if _usd is not None:
+                    from pxr import Vt as _Vt
+                    _usd[1].GetPointsAttr().Set(
+                        _Vt.Vec3fArray([tuple(map(float, p)) for p in _v]),
+                        float(fr))
+                if _mp4 is not None:
+                    (_fig, _ax, _writer, _Poly, _plt) = _mp4
+                    _ax.clear()
+                    # cloth first, gripper on top so the fingers stay visible
+                    _ax.add_collection3d(_Poly(
+                        _v[_faces_all[~_face_is_abd]], facecolor="#e8a33d",
+                        edgecolor="#7a5312", linewidths=0.05, alpha=0.95))
+                    _ax.add_collection3d(_Poly(
+                        _v[_faces_all[_face_is_abd]], facecolor="#8d9298",
+                        edgecolor="#3b4045", linewidths=0.05, alpha=1.0))
+                    _lo, _hi = _v.min(axis=0), _v.max(axis=0)
+                    _c = (_lo + _hi) / 2.0
+                    _s = float(np.max(_hi - _lo)) * 0.55 + 1e-6
+                    _ax.set_xlim(_c[0] - _s, _c[0] + _s)
+                    _ax.set_ylim(_c[2] - _s, _c[2] + _s)
+                    _ax.set_zlim(_c[1] - _s, _c[1] + _s)
+                    _ax.set_box_aspect((1, 1, 1))
+                    _ax.set_xlabel("x"); _ax.set_ylabel("z"); _ax.set_zlabel("y")
+                    _ax.set_title(
+                        f"foldshirt (full scene: arm+gripper+cloth)  "
+                        f"frame {fr}  "
+                        f"cap={os.environ.get('CASE39_NEWTON_CAP','50')}  "
+                        f"{ms[-1]:.0f} ms", fontsize=8)
+                    _ax.view_init(elev=24, azim=-68)
+                    _fig.canvas.draw()
+                    _writer.append_data(np.ascontiguousarray(
+                        np.asarray(_fig.canvas.buffer_rgba())[..., :3]))
             if os.environ.get("STIFF_BENCH_STATS"):
                 print(f"[bench] frame {fr} newton {eng.native.get_total_newton_iters()} ms {ms[-1]:.1f}", flush=True)
             if fr % 20 == 0:
                 v = eng.get_vertices()
                 cz = [float(v[o:o+c,1].mean()) for (o,c) in cloth_ranges]
                 print(f"[fs-hl] frame {fr:4d} step={ms[-1]:6.0f}ms cloth_y/env={['%+.3f'%z for z in cz]}", flush=True)
+        if recorder is not None:
+            (_mp4, _usd, _fa, _fabd, _st) = recorder
+            if _mp4 is not None:
+                _mp4[2].close()
+                _mp4[4].close(_mp4[0])
+                print(f"[fs-rec] wrote {record_path}", flush=True)
+            if _usd is not None:
+                _usd[0].GetRootLayer().Save()
+                print(f"[fs-rec] wrote {usd_path}", flush=True)
         mm = float(np.mean(ms))
         print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({1000.0/mm:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
         # [release gate] final-state vertex dump for the strict bitwise trio
