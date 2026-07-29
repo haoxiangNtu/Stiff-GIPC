@@ -899,8 +899,26 @@ void GIPC::enqueue_post_ls_kappa_conditional()
     double kappa_max = 100 * minKappaCoef * meanMass / (4.0e-16 * bb * H_b);
     if(meanMass == 0.0)
         kappa_max = 100 * minKappaCoef / (4.0e-16 * bb * H_b);
-    _post_ls_kappa_double<<<1, 1, 0, cudaStreamPerThread>>>(
-        m_d_close_flag, kappa_max, frame);
+    // [C6-b] The host's in-frame kappa doubling is INERT: checkCloseGroundVal
+    // and checkSelfCloseVal gate on h_close_gpNum / h_close_cpNum, and neither
+    // mirror is written anywhere in the tree, so both always return false and
+    // Kappa never moves within a frame. That is a deliberate upstream decision
+    // ("do not revive the legacy in-frame doubling path without a separately
+    // validated adaptive-contact redesign", computeSelfCloseVal).
+    //
+    // This enqueue form reads the DEVICE counters, which the recompute below
+    // does populate — so it faithfully revived the retired path and diverged
+    // from the solver it is supposed to reproduce. On foldshirt's grasp-closing
+    // frame it doubled kappa six times (41.73 -> 2670.70), which forced the
+    // line search to collapse alpha to 2.4e-31 over 127 trials and killed the
+    // frame; the host clears the same frame in 31 Newton iterations with kappa
+    // pinned at 41.729624.
+    //
+    // Default is host-equivalent (no doubling). The kernel stays behind a knob
+    // so the redesign has something to measure against.
+    if(getenv("STIFF_GRAPH_LEGACY_KAPPA_DOUBLE"))
+        _post_ls_kappa_double<<<1, 1, 0, cudaStreamPerThread>>>(
+            m_d_close_flag, kappa_max, frame);
 
     CUDA_SAFE_CALL(cudaMemsetAsync(
         _close_gpNum, 0, sizeof(uint32_t), cudaStreamPerThread));
