@@ -88,6 +88,18 @@ void Converter::ensure_capacity(int capacity)
     if(need <= m_mergebin_cap)
         return;
 
+    {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if(cudaStreamIsCapturing(cudaStreamPerThread, &status)
+               == cudaSuccess
+           && status != cudaStreamCaptureStatusNone)
+            fprintf(stderr,
+                    "[converter] IN-CAPTURE mergebin grow: capacity=%d "
+                    "need=%zu cap=%zu\n",
+                    capacity,
+                    need,
+                    m_mergebin_cap);
+    }
     if(m_mergebin)
         CUDA_SAFE_CALL(cudaFree(m_mergebin));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_mergebin, need * sizeof(double)));

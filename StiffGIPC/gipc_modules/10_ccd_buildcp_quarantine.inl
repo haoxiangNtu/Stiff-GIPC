@@ -404,6 +404,62 @@ void GIPC::train_collision_graph_capacities()
         scratch_extent = static_cast<int>(surf_vertexNum);
     (void)ensure_reduce_scratch(scratch_extent);
 
+    // [C4-b] close-set buffers and the doubling flag reach final capacity
+    // here so the in-graph postLineSearch equivalent never allocates.
+    if(static_cast<size_t>(surf_vertexNum) > m_close_gp_cap)
+    {
+        ++pcg_buffer_generation();
+        if(_closeConstraintID)
+        {
+            CUDA_SAFE_CALL(cudaFree(_closeConstraintID));
+            CUDA_SAFE_CALL(cudaFree(_closeConstraintVal));
+        }
+        m_close_gp_cap = static_cast<size_t>(surf_vertexNum);
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintID,
+                                  m_close_gp_cap * sizeof(uint32_t)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeConstraintVal,
+                                  m_close_gp_cap * sizeof(double)));
+    }
+    if(static_cast<size_t>(MAX_COLLITION_PAIRS_NUM) > m_close_cp_cap)
+    {
+        ++pcg_buffer_generation();
+        if(_closeMConstraintID)
+        {
+            CUDA_SAFE_CALL(cudaFree(_closeMConstraintID));
+            CUDA_SAFE_CALL(cudaFree(_closeMConstraintVal));
+        }
+        m_close_cp_cap = static_cast<size_t>(MAX_COLLITION_PAIRS_NUM);
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintID,
+                                  m_close_cp_cap * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_closeMConstraintVal,
+                                  m_close_cp_cap * sizeof(double)));
+    }
+    if(!m_d_close_flag)
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_close_flag, sizeof(int)));
+
+#ifdef USE_FRICTION
+    // [C4-c] friction lastH family at final capacity: the boundary
+    // buildFrictionSets and the recorded lagged-count consumers never grow.
+    if(static_cast<size_t>(MAX_COLLITION_PAIRS_NUM) > m_fric_cp_cap)
+    {
+        ++pcg_buffer_generation();
+        const size_t n = static_cast<size_t>(MAX_COLLITION_PAIRS_NUM);
+        lambda_lastH_scalar.resize_discard(n);
+        distCoord.resize_discard(n);
+        tanBasis.resize_discard(n);
+        _collisonPairs_lastH.resize_discard(n);
+        m_fric_cp_cap = n;
+    }
+    if(static_cast<size_t>(surf_vertexNum) > m_fric_gd_cap)
+    {
+        ++pcg_buffer_generation();
+        const size_t n = static_cast<size_t>(surf_vertexNum);
+        lambda_lastH_scalar_gd.resize_discard(n);
+        _collisonPairs_lastH_gd.resize_discard(n);
+        m_fric_gd_cap = n;
+    }
+#endif
+
     // The recorded assembly is shaped by capacity mirrors (all pair counts at
     // MAX), so every allocation the recording would otherwise trigger inside
     // capture must land here, at the legal frame-boundary discard window.
@@ -422,8 +478,10 @@ void GIPC::train_collision_graph_capacities()
                           + contact_scalar_extent(
                               static_cast<int>(surf_vertexNum));
 #ifdef USE_FRICTION
-        bound += make_contact_triplet_tier(h_cpNum_last).tier_triplets
-                 + contact_scalar_extent(h_gpNum_last);
+        // [C4-c] the recording shapes friction extents from capacity
+        // mirrors too — budget the lagged tiers at the same MAX counts.
+        bound += contact_tier + contact_scalar_extent(
+                     static_cast<int>(surf_vertexNum));
 #endif
         bound += 4096;
 
@@ -431,6 +489,39 @@ void GIPC::train_collision_graph_capacities()
         // sort capacity + stable region + staging region must all fit.
         const int sort_capacity = gipc::assembly_capacity_tier(
             static_cast<int>(contact_tier));
+        // [C4/D4] capacity-shaped recordings sort over zero-padded tails,
+        // and the pads land in the partition's class-0 census — so the
+        // in-graph OVF_TRIPLETS guard sees counts up to the full payload.
+        // Train the class tiers to the capacity envelope once, here, so a
+        // reused executable can never trip a tier the boundary retry path
+        // (absent inside an episode) would have had to grow. Pads carry
+        // neutral zero triplets, so oversized segments stay value-exact.
+        // Only classes the scene can actually populate are trained: the
+        // ABD lifting kernels launch from their class extents and would
+        // dereference null Jacobi tables in a pure-FEM scene (sanitizer-
+        // confirmed) if an impossible class were given a nonzero tier.
+        const int  class_tier_full = sort_capacity;
+        const bool has_abd = abd_fem_count_info.abd_body_num > 0;
+        const bool has_fem = abd_fem_count_info.fem_point_num > 0;
+        // m_contact_class_tier order: fem_fem, abd_fem, fem_abd, abd_abd
+        // (see partitionContactHessian's class_num assignments). Class 0
+        // is ALWAYS possible: capacity-grid zero pads carry hash(0,0) and
+        // land in the first sorted class regardless of scene composition —
+        // its consumer is a plain 3x3 pass-through, so oversizing it never
+        // dereferences ABD tables. The ABD lifting classes stay gated on
+        // actual scene population (null-Jacobi launch otherwise).
+        const bool class_possible[4] = {
+            true, has_abd && has_fem, has_abd && has_fem, has_abd};
+        (void)has_fem;
+        for(int s = 0; s < 4; ++s)
+            if(class_possible[s]
+               && gipc_global_triplet.m_contact_class_tier[s]
+                      < class_tier_full)
+            {
+                gipc_global_triplet.m_contact_class_tier[s] =
+                    class_tier_full;
+                ++pcg_buffer_generation();
+            }
         long long stable_count = 0;
         for(int s = 0; s < 4; ++s)
             stable_count += gipc_global_triplet.m_contact_class_tier[s];
@@ -487,6 +578,19 @@ void GIPC::train_collision_graph_capacities()
                 gipc_global_triplet.block_index(),
                 gipc_global_triplet.block_sort_index(),
                 sort_capacity);
+
+        // The final converter's merge-bin workspace is sized from the
+        // capture-time tier of the full triplet stream — grow it here, not
+        // inside the recorded convert.
+        if(m_global_linear_system)
+            m_global_linear_system->train_converter_capacity(
+                gipc::assembly_capacity_tier(static_cast<int>(bound)));
+        // The ABD slice converter's merge bin sees abd_abd_contact_num at
+        // the capacity-trained class tier during recording — train it to
+        // the same envelope.
+        if(m_abd_system)
+            m_abd_system->converter3x3.ensure_capacity(
+                gipc::assembly_capacity_tier(class_tier_full));
     }
 }
 
@@ -594,6 +698,130 @@ void GIPC::enqueue_pair_tier_guard()
         gipc::assembly_capacity_tier(static_cast<int>(h_cpNum[4])),
         gipc::assembly_capacity_tier(static_cast<int>(h_gpNum)),
         frame);
+}
+
+// [C4-b] device-kappa injection point: non-null only while the whole-frame
+// graph records a collision body. Points at FrameDeviceState::kappa, which
+// frame_begin_init seeds from the per-launch pinned input and the in-graph
+// close-set doubling advances between Newton iterations.
+const double* GIPC::graph_kappa_dev() const
+{
+    if(!m_graph_kappa_armed)
+        return nullptr;
+    frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    return frame ? &frame->kappa : nullptr;
+}
+
+// [C4-b] conditional in-graph kappa doubling: the host postLineSearch does
+// Kappa *= 2 followed by upperBoundKappa's scene-constant cap.
+__global__ void _post_ls_kappa_double(const int* flag,
+                                      double     kappa_max,
+                                      frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x || !frame)
+        return;
+    if(*flag)
+    {
+        const double doubled = frame->kappa * 2.0;
+        frame->kappa = doubled > kappa_max ? kappa_max : doubled;
+    }
+}
+
+// [C4-b] the postLineSearch equivalent, enqueue form (merged scalar-kappa
+// path): check the previous iteration's close set entirely on device, double
+// FrameDeviceState::kappa when any constraint tightened, then rebuild the
+// close set at capacity grids with device live counts. Mirrors the host
+// sequence check -> double+cap -> reset counters -> recompute.
+void GIPC::enqueue_post_ls_kappa_conditional()
+{
+    frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    if(!frame || !m_d_close_flag)
+        return;
+    const unsigned int threadNum = default_threads;
+
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_d_close_flag, 0, sizeof(int), cudaStreamPerThread));
+    if(m_close_gp_cap > 0)
+    {
+        const int capacity = static_cast<int>(m_close_gp_cap);
+        const int blocks = (capacity + threadNum - 1) / threadNum;
+        _checkGroundCloseVal<<<blocks, threadNum, 0, cudaStreamPerThread>>>(
+            _vertexes,
+            _groundOffset,
+            _groundNormal,
+            m_d_close_flag,
+            _closeConstraintID,
+            _closeConstraintVal,
+            capacity,
+            nullptr,
+            nullptr,
+            _close_gpNum);
+    }
+    if(m_close_cp_cap > 0)
+    {
+        const int capacity = static_cast<int>(m_close_cp_cap);
+        const int blocks = (capacity + threadNum - 1) / threadNum;
+        _checkSelfCloseVal<<<blocks, threadNum, 0, cudaStreamPerThread>>>(
+            _vertexes,
+            m_d_close_flag,
+            _closeMConstraintID,
+            _closeMConstraintVal,
+            capacity,
+            nullptr,
+            nullptr,
+            _close_cpNum);
+    }
+
+    // upperBoundKappa's cap is a scene constant — evaluate it once here.
+    // (defined later in this composite TU, module 12)
+    void compute_H_b(double d, double dHat, double& H);
+    double H_b;
+    double bb = bboxDiagSize2;
+    if(!getenv("STIFF_DIAG_KAPPA_MERGEDBB") && absolute_dhat > 0.0
+       && relative_dhat > 0.0)
+        bb = (absolute_dhat * absolute_dhat)
+             / (relative_dhat * relative_dhat);
+    compute_H_b(1.0e-16 * bb, dHat, H_b);
+    double kappa_max = 100 * minKappaCoef * meanMass / (4.0e-16 * bb * H_b);
+    if(meanMass == 0.0)
+        kappa_max = 100 * minKappaCoef / (4.0e-16 * bb * H_b);
+    _post_ls_kappa_double<<<1, 1, 0, cudaStreamPerThread>>>(
+        m_d_close_flag, kappa_max, frame);
+
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        _close_gpNum, 0, sizeof(uint32_t), cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        _close_cpNum, 0, sizeof(uint32_t), cudaStreamPerThread));
+    if(m_close_gp_cap > 0)
+    {
+        const int capacity = static_cast<int>(m_close_gp_cap);
+        const int blocks = (capacity + threadNum - 1) / threadNum;
+        _computeGroundCloseVal<<<blocks, threadNum, 0, cudaStreamPerThread>>>(
+            _vertexes,
+            _groundOffset,
+            _groundNormal,
+            _environment_collisionPair,
+            dTol,
+            _closeConstraintID,
+            _closeConstraintVal,
+            _close_gpNum,
+            capacity,
+            m_pair_snap_cur.data() + 5);
+    }
+    if(m_close_cp_cap > 0)
+    {
+        const int capacity = static_cast<int>(m_close_cp_cap);
+        const int blocks = (capacity + threadNum - 1) / threadNum;
+        _calSelfCloseVal<<<blocks, threadNum, 0, cudaStreamPerThread>>>(
+            _vertexes,
+            _collisonPairs,
+            _closeMConstraintID,
+            _closeMConstraintVal,
+            _close_cpNum,
+            dTol,
+            capacity,
+            m_pair_snap_cur.data() + 0);
+    }
 }
 
 // [C4-a] the merged scalar-chain CCD alpha, enqueue form: no host reads, no

@@ -276,8 +276,12 @@ __global__ void _global_energy_combine(const double* slots,
                                        double        Kappa,
                                        double        friction_rate,
                                        double        ground_friction_rate,
-                                       double*       out)
+                                       double*       out,
+                                       const double* kappa_dev = nullptr)
 {
+    // [C4-b] kappa_dev non-null = whole-frame graph: kappa advances on device.
+    if(kappa_dev)
+        Kappa = *kappa_dev;
     double e = 0.0;
     e = __dadd_rn(e, slots[0]);   // FEM kinetic
     e = __dadd_rn(e, slots[9]);   // ABD kinetic
@@ -323,7 +327,8 @@ void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar
                                      Kappa,
                                      frictionRate,
                                      gd_frictionRate,
-                                     out_scalar);
+                                     out_scalar,
+                                     graph_kappa_dev());   // [C4-b]
 
     static bool energy_validated = false;
     if(!energy_validated && getenv("STIFF_ENERGY_VALIDATE"))

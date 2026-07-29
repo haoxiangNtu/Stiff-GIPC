@@ -474,6 +474,21 @@ class SimEngine
     uintptr_t get_gpu_rl_velocities_device_ptr() const;
     uintptr_t get_gpu_rl_statuses_device_ptr() const;
     uintptr_t get_gpu_rl_frame_counter_device_ptr() const;
+    // [D2] device joint observations ({angle,rate} per revolute driving
+    // joint then {disp,rate} per prismatic driving joint, float64), written
+    // by the simulation graph itself each step.
+    uintptr_t get_gpu_rl_joint_observations_device_ptr() const;
+    int       get_gpu_rl_joint_observation_count() const;
+    // [D2] in-stream reset: replay the prepare-time state snapshot with
+    // device copies on the bound stream — no host synchronization. Episode
+    // bookkeeping (frame counter, reward accumulators) is the caller's.
+    void      launch_gpu_rl_reset_async(uintptr_t cuda_stream = 0);
+    // [D3] device env-partition handles for merged multi-env batching:
+    // point-to-group map (int per vertex, -1 = wildcard) and the per-env
+    // quarantine flags (int per env; nonzero = poisoned, treat as done).
+    uintptr_t get_point_to_group_device_ptr() const;
+    uintptr_t get_env_quarantined_device_ptr() const;
+    int       get_env_group_count() const;
     int get_gpu_rl_graph_node_count() const;
     int get_gpu_rl_graph_h2d_count() const;
     int get_gpu_rl_graph_d2h_count() const;

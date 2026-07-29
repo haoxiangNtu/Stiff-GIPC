@@ -454,6 +454,15 @@ class ABDSystem
         const PrismaticDrivingControlPacked* prismatic_actions,
         const int* frame_index);
 
+    // [D2] Device joint observations for GPU-native RL: writes
+    // {angle, angular_velocity} per revolute driving joint followed by
+    // {displacement, velocity} per prismatic driving joint into `out`
+    // (packed float64, committed q vs q_prev over dt). Enqueue-only — no
+    // host transfer or synchronization; safe inside graph capture.
+    void enqueue_joint_observations(ABDSimData& sim_data,
+                                    double*     out,
+                                    double      dt);
+
     void _cal_abd_prismatic_gradient_and_hessian(ABDSimData& sim_data);
     void _cal_abd_prismatic_driving_gradient_and_hessian(ABDSimData& sim_data);
 

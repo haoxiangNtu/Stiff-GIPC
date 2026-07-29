@@ -62,8 +62,13 @@ __global__ void _computeGroundCloseVal(const double3* vertexes,
                                        uint32_t* _closeConstraintID,
                                        double*   _closeConstraintVal,
                                        uint32_t* _close_gpNum,
-                                       int       number)
+                                       int       number,
+                                       const uint32_t* d_live = nullptr)
 {
+    // [C4-b] capacity-grid launch inside the frame graph: live ground-pair
+    // count read on device.
+    if(d_live)
+        number = static_cast<int>(*d_live);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -88,8 +93,12 @@ __global__ void _checkGroundCloseVal(const double3* vertexes,
                                      double*        _closeConstraintVal,
                                      int            number,
                                      int*           _isChange_grp = nullptr,
-                                     const int*     p2g           = nullptr)
+                                     const int*     p2g           = nullptr,
+                                     const uint32_t* d_live       = nullptr)
 {
+    // [C4-b] the previous iteration's close-set count, read on device.
+    if(d_live)
+        number = static_cast<int>(*d_live);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;

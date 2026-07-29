@@ -430,6 +430,11 @@ class GIPC
     size_t m_fric_gd_cap  = 0;  // 2 ground-sized friction buffers
     size_t m_close_gp_cap = 0;  // 2 gp-sized close buffers
     size_t m_close_cp_cap = 0;  // 2 cp-sized close buffers
+    // [C4-b] in-graph close-set doubling flag (device int) + arming bit for
+    // the device-kappa injection (set only while the whole-frame graph
+    // records a collision body).
+    int* m_d_close_flag = nullptr;
+    bool m_graph_kappa_armed = false;
     void   ensure_frictionBuffers();
 
     // [multi-env S1] per-env (per-group) feasible line-search step substrate.
@@ -701,6 +706,15 @@ class GIPC
     void snapshotDcdCcdPairsCapture();
     void enqueue_ccd_alpha_conditional();
     void enqueue_pair_tier_guard();
+    // [C4-b] non-null only while the whole-frame conditional graph records a
+    // collision body: points at FrameDeviceState::kappa so barrier/ground
+    // G/H and energy read the device-advanced kappa instead of the value
+    // baked at capture. Every other path keeps by-value semantics.
+    const double* graph_kappa_dev() const;
+    // [C4-b] the postLineSearch equivalent enqueued at the Newton-step tail:
+    // close-set check (device counts) -> conditional kappa doubling into
+    // FrameDeviceState::kappa -> close-set rebuild at capacity grids.
+    void enqueue_post_ls_kappa_conditional();
     void self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
                                                        double* mqueue,
                                                        int capacity,
@@ -763,6 +777,11 @@ class GIPC
     uintptr_t gpu_rl_velocities_device_ptr() const;
     uintptr_t gpu_rl_statuses_device_ptr() const;
     uintptr_t gpu_rl_frame_counter_device_ptr() const;
+    // [D2] packed {angle,rate}/{disp,rate} joint observations, refreshed by
+    // the frame graph itself, plus the in-stream reset-to-snapshot replay.
+    uintptr_t gpu_rl_joint_observations_device_ptr() const;
+    int       gpu_rl_joint_observation_count() const;
+    void      launch_gpu_rl_reset_async(uintptr_t cuda_stream = 0);
     int gpu_rl_graph_node_count() const;
     int gpu_rl_graph_h2d_count() const;
     int gpu_rl_graph_d2h_count() const;

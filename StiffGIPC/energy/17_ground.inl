@@ -13,7 +13,8 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
                                                double Kappa,
                                                int    number,
                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                               const uint32_t* d_live = nullptr)
+                                               const uint32_t* d_live = nullptr,
+                                               const double*   kappa_dev = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -21,6 +22,8 @@ __global__ void _computeGroundEnergy_Reduction(double*        squeue,
     extern __shared__ double tep[];
     // [B3 device-count] see _getBarrierEnergy_Reduction_3D — live count read on
     // device in trial mode; idle threads contribute exact 0.0 (bitwise-neutral).
+    // [C4-b] kappa_dev non-null = whole-frame graph: kappa advances on device.
+    if(kappa_dev) Kappa = *kappa_dev;
     if(d_live) number = (int)*d_live;
     double temp = 0.0;
     if(idx < number)
@@ -55,10 +58,14 @@ __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  int    number,
                                                  const double* kappa_grp = nullptr,
                                                  const int*    p2g       = nullptr,
-                                                 const uint32_t* d_count = nullptr)
+                                                 const uint32_t* d_count = nullptr,
+                                                 const double* kappa_dev = nullptr)
 {
     if(d_count)
         number = static_cast<int>(*d_count);
+    // [C4-b] device-resident scalar kappa (see _calBarrierGradientAndHessian).
+    if(kappa_dev)
+        Kappa_scalar = *kappa_dev;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -166,5 +173,6 @@ void GIPC::energy_launch_ground(device_TetraData& TetMesh, double* queue, int nu
                 // [C4-a] DCD-time snapshot slot, not the live counter block
                 // (see energy_launch_barrier).
                 m_energy_use_device_counts ? m_pair_snap_cur.data() + 5
-                                           : nullptr);
+                                           : nullptr,
+                graph_kappa_dev());   // [C4-b]
 }

@@ -12,7 +12,8 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
                                                double         _dHat,
                                                int            cpNum,
                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                               const uint32_t* d_live = nullptr)
+                                               const uint32_t* d_live = nullptr,
+                                               const double*   kappa_dev = nullptr)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -22,6 +23,9 @@ __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
     // slacked iteration-start bound; the LIVE pair count is read here on device
     // (no host mirror refresh per trial). Idle threads contribute exact 0.0 —
     // bitwise-neutral in the zero-padded reduction.
+    // [C4-b] kappa_dev non-null = whole-frame graph: kappa advances on device.
+    if(kappa_dev)
+        _Kappa = *kappa_dev;
     int                      numbers = d_live ? (int)*d_live : cpNum;
     double                   temp = 0.0;
     if(idx < numbers)
@@ -1145,5 +1149,6 @@ void GIPC::energy_launch_barrier(device_TetraData& TetMesh, double* queue, int n
                 // describes _collisonPairs. m_pair_snap_cur is refreshed in
                 // lockstep with the pair buffer by every buildCP.
                 m_energy_use_device_counts ? m_pair_snap_cur.data() + 0
-                                           : nullptr);
+                                           : nullptr,
+                graph_kappa_dev());   // [C4-b]
 }

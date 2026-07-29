@@ -759,6 +759,9 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
     {
         m_ls_defer_counts           = true;
         m_energy_use_device_counts = true;
+        // [C4-b] arm the device-kappa injection for every kappa-consuming
+        // launch recorded below; disarmed on every exit path.
+        m_graph_kappa_armed = true;
         // Recording-time capacity mirrors: every contact launch extent and
         // triplet-offset step recorded below must be shaped by the trained
         // capacity, not by whatever pair counts the last synchronous frame
@@ -770,8 +773,24 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
             h_cpNum.refresh_dst()[slot] =
                 static_cast<uint32_t>(MAX_COLLITION_PAIRS_NUM);
         h_gpNum = static_cast<uint32_t>(surf_vertexNum);
+#ifdef USE_FRICTION
+        // [C4-c] lagged mirrors at capacity too: friction launch extents and
+        // triplet-offset steps recorded below must survive lagged-count
+        // changes across frames (live lagged counts ride m_pair_snap_last).
+        for(int slot = 0; slot < 5; ++slot)
+            h_cpNum_last.refresh_dst()[slot] =
+                static_cast<uint32_t>(MAX_COLLITION_PAIRS_NUM);
+        h_gpNum_last = static_cast<uint32_t>(surf_vertexNum);
+#endif
         CUDA_SAFE_CALL(cudaMemsetAsync(
             _gdCollapse, 0, sizeof(int), cudaStreamPerThread));
+        // [C4-b] frame-start close-set reset (host IPC_Solver does the same
+        // memsets before solve_subIP): the first iteration's close check
+        // sees zero counts, so kappa never doubles on iteration one.
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            _close_gpNum, 0, sizeof(uint32_t), cudaStreamPerThread));
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            _close_cpNum, 0, sizeof(uint32_t), cudaStreamPerThread));
         buildBVH();
         buildCP();
     }
@@ -811,6 +830,13 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
                                 m_ccd_alpha_slots, frame);
                         lineSearchConditional(
                             TetMesh, m_ccd_alpha_slots + 5);
+                        // [C4-b] postLineSearch equivalent: close-set check
+                        // -> conditional device-kappa doubling -> close-set
+                        // rebuild. Runs exactly where the host solver runs
+                        // postLineSearch (after every line search, skipped
+                        // on the converged exit).
+                        if(collision_body)
+                            enqueue_post_ls_kappa_conditional();
                     });
 
                 _newton_tail_conditional<<<1, 1>>>(
@@ -821,10 +847,12 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
     }
     catch(...)
     {
+        m_graph_kappa_armed         = false;
         m_ls_defer_counts           = restore_defer;
         m_energy_use_device_counts = restore_energy;
         throw;
     }
+    m_graph_kappa_armed         = false;
     m_ls_defer_counts           = restore_defer;
     m_energy_use_device_counts = restore_energy;
 }

@@ -11,8 +11,13 @@ __global__ void _calSelfCloseVal(const double3* _vertexes,
                                  double*        _close_collisionVal,
                                  uint32_t*      _close_cpNum,
                                  double         dTol,
-                                 int            number)
+                                 int            number,
+                                 const uint32_t* d_live = nullptr)
 {
+    // [C4-b] capacity-grid launch inside the frame graph: the live DCD pair
+    // count is read on device (host mirrors stay frozen).
+    if(d_live)
+        number = static_cast<int>(*d_live);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;
@@ -32,8 +37,12 @@ __global__ void _checkSelfCloseVal(const double3* _vertexes,
                                    double*        _close_collisionVal,
                                    int            number,
                                    int*           _isChange_grp = nullptr,
-                                   const int*     p2g           = nullptr)
+                                   const int*     p2g           = nullptr,
+                                   const uint32_t* d_live       = nullptr)
 {
+    // [C4-b] the previous iteration's close-set count, read on device.
+    if(d_live)
+        number = static_cast<int>(*d_live);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;

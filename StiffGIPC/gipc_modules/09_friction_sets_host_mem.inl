@@ -268,6 +268,7 @@ void GIPC::FREE_DEVICE_MEM()
     release(m_line_search_decision);
     release(m_newton_convergence_decision);
     release(m_ccd_alpha_slots);
+    release(m_d_close_flag);   // [C4-b]
     release(m_ccd_alpha_invalid);
     release(m_ccd_refined_invalid);
     release(_dcd_ccd_snapshot);
@@ -777,7 +778,8 @@ void GIPC::computeGroundGradientAndHessian(double3* _gradient)
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,
         m_pergroup_kappa ? m_d_p2g : nullptr,
-        tier_mode ? m_pair_snap_cur.data() + 5 : nullptr);
+        tier_mode ? m_pair_snap_cur.data() + 5 : nullptr,
+        graph_kappa_dev());   // [C4-b] device kappa inside the frame graph
 }
 
 void GIPC::computeCloseGroundVal()

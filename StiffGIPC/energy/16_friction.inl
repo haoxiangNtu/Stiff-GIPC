@@ -16,7 +16,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
                                                 double        fricDHat,
                                                 double        eps,
                                                 double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                                const double* vert_mu = nullptr, double mu_global = 1.0
+                                                const double* vert_mu = nullptr, double mu_global = 1.0,
+                                                const uint32_t* d_live = nullptr
 
 )
 {
@@ -24,7 +25,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
     int idx  = threadIdx.x + idof;
 
     extern __shared__ double tep[];
-    int                      numbers = cpNum;
+    // [C4-c] lagged pair count read on device inside the frame graph.
+    int                      numbers = d_live ? (int)*d_live : cpNum;
     double                   temp = 0.0;
     if(idx < numbers)
     {
@@ -56,7 +58,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
                                                    const double* lastH,
                                                    double        eps,
                                                    double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                                   const double* vert_mu_gd = nullptr, double mu_global = 1.0
+                                                   const double* vert_mu_gd = nullptr, double mu_global = 1.0,
+                                                   const uint32_t* d_live = nullptr
 
 )
 {
@@ -64,7 +67,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
     int idx  = threadIdx.x + idof;
 
     extern __shared__ double tep[];
-    int                      numbers = gpNum;
+    // [C4-c] lagged ground-pair count read on device inside the frame graph.
+    int                      numbers = d_live ? (int)*d_live : gpNum;
     double                   temp = 0.0;
     if(idx < numbers)
     {
@@ -806,7 +810,15 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
 
 // ── [E2] registry members for type 5 (friction): launcher body VERBATIM from
 // the DeviceOut dispatcher switch; size = its sizing-chain entry ──
-int GIPC::energy_size_friction() { return h_cpNum_last[0]; }
+// [C4-c] capacity bound + device lagged count ONLY while the whole-frame
+// graph records (m_graph_kappa_armed); every other path — including the
+// two-graph trial defer, whose lagged sets are frozen for the frame — keeps
+// the exact host-mirror launch (bitwise-identical release semantics).
+int GIPC::energy_size_friction()
+{
+    return m_graph_kappa_armed ? m_energy_bound_cp
+                               : (int)h_cpNum_last[0];
+}
 void GIPC::energy_launch_friction(device_TetraData& TetMesh, double* queue, int numbers,
                                 int blockNum, unsigned int threadNum, unsigned int sharedMsize,
                                 double* pe, const int* p2g, int ng,
@@ -817,12 +829,18 @@ void GIPC::energy_launch_friction(device_TetraData& TetMesh, double* queue, int 
                 numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
                 fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,
-                d_vert_mu, frictionRate);  // [per-body friction]
+                d_vert_mu, frictionRate,  // [per-body friction]
+                m_graph_kappa_armed ? m_pair_snap_last.data() + 0
+                                    : nullptr);  // [C4-c]
 }
 
 // ── [E2] registry members for type 6 (friction_gd): launcher body VERBATIM from
 // the DeviceOut dispatcher switch; size = its sizing-chain entry ──
-int GIPC::energy_size_friction_gd() { return h_gpNum_last; }
+int GIPC::energy_size_friction_gd()
+{
+    return m_graph_kappa_armed ? m_energy_bound_gp
+                               : (int)h_gpNum_last;
+}
 void GIPC::energy_launch_friction_gd(device_TetraData& TetMesh, double* queue, int numbers,
                                 int blockNum, unsigned int threadNum, unsigned int sharedMsize,
                                 double* pe, const int* p2g, int ng,
@@ -833,5 +851,7 @@ void GIPC::energy_launch_friction_gd(device_TetraData& TetMesh, double* queue, i
                 _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
                 sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,
-                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
+                d_vert_mu_gd, gd_frictionRate,  // [per-body friction]
+                m_graph_kappa_armed ? m_pair_snap_last.data() + 5
+                                    : nullptr);  // [C4-c]
 }

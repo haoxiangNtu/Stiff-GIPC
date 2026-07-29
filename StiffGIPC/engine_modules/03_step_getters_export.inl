@@ -414,6 +414,43 @@ uintptr_t SimEngine::get_gpu_rl_frame_counter_device_ptr() const
     return m_impl->ipc.gpu_rl_frame_counter_device_ptr();
 }
 
+uintptr_t SimEngine::get_gpu_rl_joint_observations_device_ptr() const
+{
+    return m_impl->ipc.gpu_rl_joint_observations_device_ptr();
+}
+
+int SimEngine::get_gpu_rl_joint_observation_count() const
+{
+    return m_impl->ipc.gpu_rl_joint_observation_count();
+}
+
+void SimEngine::launch_gpu_rl_reset_async(uintptr_t cuda_stream)
+{
+    auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError(
+            "launch_gpu_rl_reset_async() requires a finalized SimEngine");
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.launch_gpu_rl_reset_async(cuda_stream);
+}
+
+uintptr_t SimEngine::get_point_to_group_device_ptr() const
+{
+    return reinterpret_cast<uintptr_t>(
+        m_impl->d_tetMesh.d_point_to_group);
+}
+
+uintptr_t SimEngine::get_env_quarantined_device_ptr() const
+{
+    return reinterpret_cast<uintptr_t>(
+        m_impl->ipc.m_d_env_quarantined.data());
+}
+
+int SimEngine::get_env_group_count() const
+{
+    return m_impl->d_tetMesh.h_group_count;
+}
+
 int SimEngine::get_gpu_rl_graph_node_count() const
 {
     return m_impl->ipc.gpu_rl_graph_node_count();

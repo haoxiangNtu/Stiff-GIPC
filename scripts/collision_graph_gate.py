@@ -33,8 +33,20 @@ sys.path.insert(0, ROOT)
 # 20 frames: contact starts around frame 15; the baseline's first kappa
 # doubling lands at frame 20, and the C4-a graph freezes kappa inside the
 # frame, so the sync-equivalence window ends there by contract.
-FRAMES = int(os.environ.get("COLLISION_GRAPH_GATE_FRAMES", "20"))
+FRAMES = int(os.environ.get("COLLISION_GRAPH_GATE_FRAMES", "24"))
 PATH_FULL_CONDITIONAL_GRAPH = 1 << 4
+
+# C4-d gate matrix. Each scenario runs baseline x2 + graph and must stay
+# inside the equivalence envelope:
+#   ground   — two-cube drop onto the ground plane (ground pairs + swept CCD)
+#   friction — same drop with mu=0.3 (C4-c lagged sets + friction energy/GH)
+#   squeeze  — upper cube dropped from height directly onto the lower one
+#              (cube-cube DCD/EE narrow-phase traffic + ground)
+SCENARIOS = {
+    "ground": {"friction": 0.0, "upper_y": 0.43},
+    "friction": {"friction": 0.3, "upper_y": 0.43},
+    "squeeze": {"friction": 0.0, "upper_y": 0.75},
+}
 
 
 def transform(y: float) -> np.ndarray:
@@ -44,9 +56,10 @@ def transform(y: float) -> np.ndarray:
     return value
 
 
-def make_engine():
+def make_engine(scenario: str):
     from stiff_physics.engine import Config, Engine
 
+    spec = SCENARIOS[scenario]
     cfg = Config(
         dt=0.01,
         gravity=(0.0, -9.8, 0.0),
@@ -54,26 +67,28 @@ def make_engine():
         assets_dir=os.path.join(ROOT, "Assets") + "/",
         multienv_mode="merged",
         preconditioner_type=1,
-        friction_rate=0.0,  # C4-a contract: friction sets stay frame-boundary
+        friction_rate=spec["friction"],
     )
     engine = Engine(cfg)
     # Lower cube: bottom starts 0.02 above the ground plane.
     engine.load_mesh("tetMesh/cube.msh", 3, "FEM", transform(0.0))
-    # Upper cube: 0.03 above the lower cube's top face.
-    engine.load_mesh("tetMesh/cube.msh", 3, "FEM", transform(0.43))
+    engine.load_mesh(
+        "tetMesh/cube.msh", 3, "FEM", transform(spec["upper_y"])
+    )
     engine.finalize()
     engine.native.set_log_level(0)
     engine.step()  # warm-up trains lazy workspaces and capacity tiers
     return engine
 
 
-def run(dump_path: str, expect_graph: bool) -> None:
-    engine = make_engine()
+def run(dump_path: str, expect_graph: bool, scenario: str) -> None:
+    engine = make_engine(scenario)
     positions: list[np.ndarray] = []
     velocities: list[np.ndarray] = []
     kappas: list[float] = []
     graph_contact_frames = 0
     fallback_frames = 0
+    dcd_frames = 0
     for frame in range(FRAMES):
         try:
             engine.step()
@@ -102,12 +117,13 @@ def run(dump_path: str, expect_graph: bool) -> None:
         )
         kappas.append(float(status.kappa))
         full = bool(status.path_flags & PATH_FULL_CONDITIONAL_GRAPH)
+        if status.hw_dcd_pairs > 0:
+            dcd_frames += 1
         if expect_graph:
-            # This scene's contact is ground-dominated (DCD self pairs stay
-            # zero), so "contact ran inside the graph" is evidenced by the
+            # "Contact ran inside the graph" is evidenced by the
             # contact-frame Newton signature: free flight always converges in
-            # one iteration, ground contact needs several. The per-frame
-            # envelope comparison then proves the contact physics matched.
+            # one iteration, contact needs several. The per-frame envelope
+            # comparison then proves the contact physics matched.
             if full and status.newton_iters > 1:
                 graph_contact_frames += 1
             if not full:
@@ -125,11 +141,15 @@ def run(dump_path: str, expect_graph: bool) -> None:
         )
 
     assert np.isfinite(np.asarray(positions)).all()
-    # kappa-quiet window: the C4-a graph freezes kappa inside the frame, so
-    # sync-equivalence is only claimed for windows where the baseline never
-    # doubles it. A failure here means the scene is out of contract, not
-    # that the graph is wrong.
-    assert min(kappas) == max(kappas), f"kappa moved in window: {kappas}"
+    # [C4-b] kappa now advances inside the graph (in-graph close-set
+    # doubling + boundary initKappa); the old kappa-quiet window contract is
+    # gone. The kappa trajectory itself is part of the envelope evidence.
+    print(
+        "COLLISION-GRAPH-KAPPA: "
+        f"first={kappas[0]:.9g} last={kappas[-1]:.9g} "
+        f"moved={int(min(kappas) != max(kappas))}"
+    )
+    print(f"COLLISION-GRAPH-DCD-FRAMES: {dcd_frames}")
     if expect_graph:
         print(
             "COLLISION-GRAPH-STATS: "
@@ -144,6 +164,7 @@ def run(dump_path: str, expect_graph: bool) -> None:
         dump_path,
         positions=np.asarray(positions),
         velocities=np.asarray(velocities),
+        kappas=np.asarray(kappas),
     )
     print("COLLISION-GRAPH-RUN: done")
 
@@ -182,9 +203,15 @@ def child_environment(graph: bool) -> dict[str, str]:
     return env
 
 
-def run_child(mode: str, dump_path: str) -> None:
+def run_child(mode: str, dump_path: str, scenario: str) -> None:
     completed = subprocess.run(
-        [sys.executable, __file__, f"--child={mode}", dump_path],
+        [
+            sys.executable,
+            __file__,
+            f"--child={mode}",
+            dump_path,
+            scenario,
+        ],
         check=True,
         cwd=ROOT,
         env=child_environment(graph=(mode == "graph")),
@@ -244,25 +271,35 @@ if __name__ == "__main__":
         None,
     )
     if child in ("baseline", "graph"):
-        run(sys.argv[2], expect_graph=(child == "graph"))
+        run(
+            sys.argv[2],
+            expect_graph=(child == "graph"),
+            scenario=sys.argv[3] if len(sys.argv) > 3 else "ground",
+        )
     else:
-        with tempfile.TemporaryDirectory(
-            prefix="stiff-collision-graph-gate-"
-        ) as tmp:
-            baseline_a_path = os.path.join(tmp, "baseline-a.npz")
-            baseline_b_path = os.path.join(tmp, "baseline-b.npz")
-            graph_path = os.path.join(tmp, "graph.npz")
-            run_child("baseline", baseline_a_path)
-            run_child("baseline", baseline_b_path)
-            run_child("graph", graph_path)
-            baseline_a = load(baseline_a_path)
-            baseline_b = load(baseline_b_path)
-            graph_result = load(graph_path)
-            for field in ("positions", "velocities"):
-                envelope_compare(
-                    field,
-                    baseline_a[field],
-                    baseline_b[field],
-                    graph_result[field],
-                )
+        wanted = os.environ.get("COLLISION_GRAPH_GATE_SCENARIOS")
+        names = (
+            [s for s in wanted.split(",") if s] if wanted else list(SCENARIOS)
+        )
+        for scenario in names:
+            print(f"COLLISION-GRAPH-SCENARIO: {scenario}")
+            with tempfile.TemporaryDirectory(
+                prefix="stiff-collision-graph-gate-"
+            ) as tmp:
+                baseline_a_path = os.path.join(tmp, "baseline-a.npz")
+                baseline_b_path = os.path.join(tmp, "baseline-b.npz")
+                graph_path = os.path.join(tmp, "graph.npz")
+                run_child("baseline", baseline_a_path, scenario)
+                run_child("baseline", baseline_b_path, scenario)
+                run_child("graph", graph_path, scenario)
+                baseline_a = load(baseline_a_path)
+                baseline_b = load(baseline_b_path)
+                graph_result = load(graph_path)
+                for field in ("positions", "velocities", "kappas"):
+                    envelope_compare(
+                        f"{scenario}:{field}",
+                        baseline_a[field],
+                        baseline_b[field],
+                        graph_result[field],
+                    )
         print("COLLISION-GRAPH-GATE: PASS")

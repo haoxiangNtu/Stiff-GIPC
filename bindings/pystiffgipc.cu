@@ -627,6 +627,11 @@ PYBIND11_MODULE(pystiffgipc, m)
              &SimEngine::end_gpu_rl,
              py::call_guard<py::gil_scoped_release>(),
              "Synchronize and release GPU-native RL episode resources.")
+        .def("launch_gpu_rl_reset_async",
+             &SimEngine::launch_gpu_rl_reset_async,
+             py::arg("cuda_stream") = uintptr_t{0},
+             "[D2] Enqueue an in-stream reset to the prepare-time state "
+             "snapshot (pure D2D on the bound stream; no host wait).")
         .def("get_gpu_rl_device_abi",
              [](const SimEngine& e)
              {
@@ -658,6 +663,21 @@ PYBIND11_MODULE(pystiffgipc, m)
                      e.get_gpu_rl_graph_h2d_count();
                  result["graph_d2h"] =
                      e.get_gpu_rl_graph_d2h_count();
+                 // [D2] graph-refreshed joint observations:
+                 // {angle, rate} per revolute driving joint, then
+                 // {displacement, rate} per prismatic driving joint.
+                 result["joint_observations"] =
+                     e.get_gpu_rl_joint_observations_device_ptr();
+                 result["joint_observation_count"] =
+                     e.get_gpu_rl_joint_observation_count();
+                 // [D3] merged multi-env batching handles: per-vertex env
+                 // id (-1 = wildcard) and per-env quarantine flags
+                 // (nonzero = poisoned env, treat as done).
+                 result["point_to_group"] =
+                     e.get_point_to_group_device_ptr();
+                 result["env_quarantined"] =
+                     e.get_env_quarantined_device_ptr();
+                 result["env_count"] = e.get_env_group_count();
                  return result;
              },
              "Return raw device pointers and the audited graph ABI. Positions "

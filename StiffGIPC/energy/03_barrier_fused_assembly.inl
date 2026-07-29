@@ -113,10 +113,16 @@ __global__ void _calBarrierGradientAndHessian(const double3*   _vertexes,
                                               int              number,
                                               const double*    kappa_grp = nullptr,
                                               const int*       p2g       = nullptr,
-                                              const uint32_t*  d_count   = nullptr)
+                                              const uint32_t*  d_count   = nullptr,
+                                              const double*    kappa_dev = nullptr)
 {
     if(d_count)
         number = static_cast<int>(*d_count);
+    // [C4-b] device-resident scalar kappa: non-null only inside the
+    // whole-frame conditional graph, where the in-graph close-set doubling
+    // advances FrameDeviceState::kappa between Newton iterations.
+    if(kappa_dev)
+        Kappa_scalar = *kappa_dev;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
         return;

@@ -164,7 +164,8 @@ void GIPC::calBarrierGradientAndHessian(double3* _gradient, double mKappa)
         numbers,
         m_pergroup_kappa ? m_kappa_group : nullptr,   // [per-group κ] nullptr → scalar
         m_pergroup_kappa ? m_d_p2g : nullptr,
-        tier_mode ? m_pair_snap_cur.data() : nullptr);
+        tier_mode ? m_pair_snap_cur.data() : nullptr,
+        graph_kappa_dev());   // [C4-b] device kappa inside the frame graph
 }
 
 

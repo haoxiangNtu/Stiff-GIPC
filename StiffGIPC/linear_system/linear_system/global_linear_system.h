@@ -117,6 +117,14 @@ class GlobalLinearSystem
     int        m_s4_ng           = 0;
     frame_fsm::FrameDeviceState* m_frame_device_state = nullptr;
 
+    // [C4/D4] frame-boundary training hook: grow the converter's merge-bin
+    // workspace to the capture-time capacity so a recorded convert never
+    // allocates inside CUDA graph capture.
+    void train_converter_capacity(int capacity)
+    {
+        m_converter.ensure_capacity(capacity);
+    }
+
   private:
     std::vector<U<ILinearSubsystem>> m_subsystems;
     std::vector<DiagonalSubsystem*>  m_inner_subsystems;

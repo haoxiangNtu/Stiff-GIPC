@@ -2177,6 +2177,117 @@ void ABDSystem::enqueue_episode_driving_targets(
 }
 
 
+// [D2] Device joint observations for GPU-native RL — same joint geometry as
+// the driving-target kernels, evaluated on the COMMITTED q (with q_prev
+// giving the finite-difference rate). Packed output layout:
+//   [2*i + 0] = revolute i angle (radians, offset-adjusted)
+//   [2*i + 1] = revolute i angular velocity
+//   [2*num_revolute + 2*j + 0] = prismatic j displacement
+//   [2*num_revolute + 2*j + 1] = prismatic j velocity
+void ABDSystem::enqueue_joint_observations(ABDSimData& sim_data,
+                                           double*     out,
+                                           double      dt)
+{
+    using namespace muda;
+    auto& abd = sim_data.device;
+    const double inv_dt = dt > 0.0 ? 1.0 / dt : 0.0;
+
+    if(m_num_revolute_driving > 0)
+    {
+        ParallelFor(256)
+            .kernel_name("gpu_rl_revolute_observations")
+            .apply(
+                m_num_revolute_driving,
+                [drvs = m_revolute_driving_data.cviewer().name(
+                     "revolute_driving"),
+                 q_cur  = abd.body_id_to_q.cviewer().name("q"),
+                 q_prev = abd.body_id_to_q_prev.cviewer().name("q_prev"),
+                 out,
+                 inv_dt] __device__(int i) mutable
+                {
+                    const auto& drv = drvs(i);
+                    const int pid = drv.parent_body_id;
+                    const int cid = drv.child_body_id;
+                    auto theta_of =
+                        [&](const Vector12& q1, const Vector12& q2)
+                    {
+                        Matrix3x3 A1, A2;
+                        A1.row(0) = q1.segment<3>(3).transpose();
+                        A1.row(1) = q1.segment<3>(6).transpose();
+                        A1.row(2) = q1.segment<3>(9).transpose();
+                        A2.row(0) = q2.segment<3>(3).transpose();
+                        A2.row(1) = q2.segment<3>(6).transpose();
+                        A2.row(2) = q2.segment<3>(9).transpose();
+                        const Vector3 p  = A1 * drv.p_bar;
+                        const Vector3 pN = A1 * drv.pN_bar;
+                        const Vector3 q  = A2 * drv.q_bar;
+                        const Vector3 qN = A2 * drv.qN_bar;
+                        const Float c =
+                            Float(0.5) * (p.dot(q) + pN.dot(qN));
+                        const Float s =
+                            Float(0.5) * (q.dot(pN) - qN.dot(p));
+                        return atan2(s, c);
+                    };
+                    // The commit has already advanced q_prev to q, so the
+                    // rate differences against the PREVIOUS observation in
+                    // the output block itself (the buffer is its own
+                    // one-frame history; prepare pre-fills it twice so the
+                    // first live rate is exact zero, not garbage).
+                    const Float theta =
+                        theta_of(q_cur(pid), q_cur(cid))
+                        + drv.initial_angle_offset;
+                    const Float theta_last =
+                        static_cast<Float>(out[2 * i + 0]);
+                    Float diff = theta - theta_last;
+                    const Float two_pi =
+                        Float(2.0 * 3.14159265358979323846);
+                    diff -= two_pi * round(diff / two_pi);
+                    out[2 * i + 0] = theta;
+                    out[2 * i + 1] = diff * inv_dt;
+                    (void)q_prev;
+                });
+    }
+    if(m_num_prismatic_driving > 0)
+    {
+        const int base = 2 * m_num_revolute_driving;
+        ParallelFor(256)
+            .kernel_name("gpu_rl_prismatic_observations")
+            .apply(
+                m_num_prismatic_driving,
+                [drvs = m_prismatic_driving_data.cviewer().name(
+                     "prismatic_driving"),
+                 q_cur  = abd.body_id_to_q.cviewer().name("q"),
+                 q_prev = abd.body_id_to_q_prev.cviewer().name("q_prev"),
+                 out,
+                 base,
+                 inv_dt] __device__(int j) mutable
+                {
+                    const auto& drv = drvs(j);
+                    const int pid = drv.parent_body_id;
+                    const int cid = drv.child_body_id;
+                    auto disp_of =
+                        [&](const Vector12& q1, const Vector12& q2)
+                    {
+                        const Vector3 Cp = ABDJacobi(drv.Cp_bar) * q1;
+                        const Vector3 Cq = ABDJacobi(drv.Cq_bar) * q2;
+                        Matrix3x3 Aq;
+                        Aq.row(0) = q2.segment<3>(3).transpose();
+                        Aq.row(1) = q2.segment<3>(6).transpose();
+                        Aq.row(2) = q2.segment<3>(9).transpose();
+                        const Vector3 tq = Aq * drv.tq_bar;
+                        return (Cq - Cp).dot(tq);
+                    };
+                    const Float d =
+                        disp_of(q_cur(pid), q_cur(cid));
+                    const Float d_last =
+                        static_cast<Float>(out[base + 2 * j + 0]);
+                    out[base + 2 * j + 0] = d;
+                    out[base + 2 * j + 1] = (d - d_last) * inv_dt;
+                    (void)q_prev;
+                });
+    }
+}
+
 // ============================================================================
 // Prismatic Driving Energy
 // ============================================================================

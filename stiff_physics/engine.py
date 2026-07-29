@@ -1096,6 +1096,16 @@ class Engine:
         """Synchronize, release episode resources and re-enable step()."""
         self._engine.end_gpu_rl()
 
+    def launch_gpu_rl_reset_async(self, cuda_stream: int = 0) -> None:
+        """Enqueue an in-stream reset to the prepare-time state snapshot.
+
+        Pure device copies on the bound stream — no host synchronization.
+        The next launched step rebuilds collision state in its own prologue.
+        Episode bookkeeping (the device frame counter, any reward
+        accumulators) is deliberately left to the caller's policy.
+        """
+        self._engine.launch_gpu_rl_reset_async(int(cuda_stream))
+
     def get_gpu_rl_device_abi(self) -> dict:
         """Return raw device pointers and the audited graph ABI.
 
@@ -1103,8 +1113,14 @@ class Engine:
         ``(joints, 3)`` float64: target, strength, external torque/force),
         ``positions``/``velocities`` (``(vertices, 3)`` float64 in
         engine-internal order), ``statuses`` (one ``status_bytes`` frame
-        packet), ``frame_counter`` (int64), and the audited
-        ``graph_nodes``/``graph_h2d``/``graph_d2h`` counts.
+        packet), ``frame_counter`` (int64), the audited
+        ``graph_nodes``/``graph_h2d``/``graph_d2h`` counts,
+        ``joint_observations``/``joint_observation_count`` (float64 block
+        written by the graph itself: {angle, rate} per revolute driving
+        joint then {displacement, rate} per prismatic driving joint), and
+        the multi-env handles ``point_to_group`` (int32 per vertex, -1 =
+        wildcard), ``env_quarantined`` (int32 per env, nonzero = poisoned)
+        and ``env_count``.
         """
         return dict(self._engine.get_gpu_rl_device_abi())
 

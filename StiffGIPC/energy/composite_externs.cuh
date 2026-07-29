@@ -32,7 +32,8 @@ extern __global__ void _computeGroundGradientAndHessian(const double3* vertexes,
                                                  int    number,
                                                  const double* kappa_grp = nullptr,
                                                  const int*    p2g       = nullptr,
-                                                 const uint32_t* d_count = nullptr);
+                                                 const uint32_t* d_count = nullptr,
+                                                 const double* kappa_dev = nullptr);
 extern __global__ void _computeGroundGradient(const double3* vertexes,
                                        const double*  g_offset,
                                        const double3* g_normal,
@@ -54,7 +55,8 @@ extern __global__ void _computeGroundEnergy_Reduction(double*        squeue,
                                                double Kappa,
                                                int    number,
                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                               const uint32_t* d_live = nullptr);  // reduction: blocking-dispatcher launch, defaults carried
+                                               const uint32_t* d_live = nullptr,
+                                               const double* kappa_dev = nullptr);  // reduction: blocking-dispatcher launch, defaults carried
 
 // ── rung 2: soft_constraints (energy/soft_constraints.cu) ──
 extern __global__ void _computeSoftConstraintGradientAndHessian(const double3* vertexes,
@@ -219,7 +221,8 @@ extern __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
                                                 double        fricDHat,
                                                 double        eps,
                                                 double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                                const double* vert_mu = nullptr, double mu_global = 1.0
+                                                const double* vert_mu = nullptr, double mu_global = 1.0,
+                                                const uint32_t* d_live = nullptr
 
 );
 extern __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
@@ -232,7 +235,8 @@ extern __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
                                                    const double* lastH,
                                                    double        eps,
                                                    double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                                   const double* vert_mu_gd = nullptr, double mu_global = 1.0
+                                                   const double* vert_mu_gd = nullptr, double mu_global = 1.0,
+                                                   const uint32_t* d_live = nullptr
 
 );
 
@@ -259,4 +263,5 @@ extern __global__ void _getBarrierEnergy_Reduction_3D(double*        squeue,
                                                double         _dHat,
                                                int            cpNum,
                                                double* penv = nullptr, const int* p2g = nullptr, int ng = 0,
-                                               const uint32_t* d_live = nullptr);
+                                               const uint32_t* d_live = nullptr,
+                                               const double* kappa_dev = nullptr);
