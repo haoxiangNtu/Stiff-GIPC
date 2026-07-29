@@ -1935,6 +1935,30 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
         frame_stats["newton"].push_back(gipc::Json::object());
         ipc.m_ls_defer_counts           = true;
         ipc.m_energy_use_device_counts = true;
+        // [C6-b] Contamination probe. The dry run is HOST-executed, so the
+        // capacity-mirror assembly can be compared against the exact-count
+        // assembly at the identical state without involving the graph at
+        // all. If the search directions differ here, the bug is in the
+        // capacity-shaped assembly, not in graph capture.
+        std::vector<double> exact_dir;
+        const bool probe_dir = std::getenv("STIFF_GRAPH_DIRPROBE") != nullptr;
+        if(probe_dir)
+        {
+            const bool defer_save  = ipc.m_ls_defer_counts;
+            const bool energy_save = ipc.m_energy_use_device_counts;
+            ipc.m_ls_defer_counts           = false;
+            ipc.m_energy_use_device_counts = false;
+            ipc.refresh_pair_counts();          // exact mirrors
+            ipc.computeGradientAndHessian(mesh);
+            ipc.calculateMovingDirection(mesh, 0, ipc.pcg_data.P_type);
+            exact_dir.resize(3 * ipc.vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(exact_dir.data(),
+                                      ipc._moveDir,
+                                      exact_dir.size() * sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+            ipc.m_ls_defer_counts           = defer_save;
+            ipc.m_energy_use_device_counts = energy_save;
+        }
         // [C6] trained extent, not worst-case capacity.
         for(int slot = 0; slot < 5; ++slot)
             ipc.h_cpNum.refresh_dst()[slot] =
@@ -1950,6 +1974,41 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
 #endif
         ipc.computeGradientAndHessian(mesh);
         ipc.calculateMovingDirection(mesh, 0, ipc.pcg_data.P_type);
+        if(probe_dir && !exact_dir.empty())
+        {
+            std::vector<double> mirror_dir(exact_dir.size());
+            CUDA_SAFE_CALL(cudaMemcpy(mirror_dir.data(),
+                                      ipc._moveDir,
+                                      mirror_dir.size() * sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+            double n_exact = 0.0, n_mirror = 0.0, n_diff = 0.0;
+            double worst = 0.0;
+            int worst_i = -1;
+            int nonfinite_mirror = 0;
+            for(size_t i = 0; i < exact_dir.size(); ++i)
+            {
+                const double a = exact_dir[i], b = mirror_dir[i];
+                if(!std::isfinite(b))
+                    ++nonfinite_mirror;
+                n_exact += a * a;
+                n_mirror += b * b;
+                const double d = std::fabs(a - b);
+                n_diff += d * d;
+                if(d > worst)
+                {
+                    worst = d;
+                    worst_i = static_cast<int>(i);
+                }
+            }
+            fprintf(stderr,
+                    "[dirprobe] |exact|=%.6e |mirror|=%.6e |diff|=%.6e "
+                    "ratio=%.3f worst=%.3e at dof %d (vertex %d) "
+                    "nonfinite_mirror=%d\n",
+                    std::sqrt(n_exact), std::sqrt(n_mirror),
+                    std::sqrt(n_diff),
+                    n_exact > 0.0 ? std::sqrt(n_mirror / n_exact) : 0.0,
+                    worst, worst_i, worst_i / 3, nonfinite_mirror);
+        }
         // The recording replays the same mirrors and the same path, so the
         // dry run's extents ARE the capture-time extents. The a-priori
         // bound formula cannot see ground/ABD contributions, so re-derive
@@ -2109,6 +2168,19 @@ bool try_launch_full_graph(GIPC& ipc,
     ipc.animation_fullRate = ipc.animation_subRate;
     arm_full_graph_attempt(ipc, context);
 
+    // [C6-b] Hypothesis probe: ABD's intermediate converter offsets are host
+    // values baked into the recorded launches, and they advance with every
+    // committed q/layout state — the original "ABD bodies are not yet
+    // device-conditional" gate said exactly this. If forcing a re-record per
+    // frame fixes ABD scenes, the executable REUSE is the defect, not the
+    // recording, and the fix is to make those offsets device-resident.
+    const bool force_rerecord =
+        knob_enabled("STIFF_C6_RERECORD") && context.abd_count != 0;
+    if(force_rerecord && context.full_exec)
+    {
+        cudaGraphExecDestroy(context.full_exec);
+        context.full_exec = nullptr;
+    }
     if(!context.full_exec
        || context.full_generation != pcg_buffer_generation())
     {
@@ -3347,6 +3419,7 @@ int GIPC::frame_graph_finish_terminal()
     if(!m_frame_terminal_emitted)
         throw std::logic_error("frame terminal graph was not emitted");
     m_last_frame_status = *context.h_status;
+    m_graph_tier_grew   = false;   // [C6-b] per-adjudication
     note_frame_graph_coverage(m_last_frame_status);   // [C6]
     if((m_last_frame_status.invalid_bits
         & frame_fsm::OVF_UNIQUE_BLOCKS)
@@ -3368,16 +3441,27 @@ int GIPC::frame_graph_finish_terminal()
     if(m_last_frame_status.invalid_bits
        & (frame_fsm::OVF_DCD_PAIRS | frame_fsm::OVF_CCD_PAIRS))
     {
-        const int needed_dcd = std::max(
+        int needed_dcd = std::max(
             m_last_frame_status.required_dcd_pairs,
             m_last_frame_status.hw_dcd_pairs);
-        const int needed_ccd = std::max(
+        int needed_ccd = std::max(
             m_last_frame_status.required_ccd_pairs,
             m_last_frame_status.hw_ccd_pairs);
         // The swept extent is derived from the DCD extent by the buffers'
         // DCD:CCD ratio, so express the CCD requirement in DCD terms.
         // Grow the swept extent on its own axis — inflating the DCD side to
         // cover a swept need multiplies the triplet envelope for nothing.
+        // The in-graph emission is capacity-clamped, so on overflow the device
+        // counter saturates AT the tier and `needed` never exceeds it — the
+        // growth test below could never fire. When the overflow bit is set but
+        // the reported need is not larger, we know it overflowed and not by how
+        // much: grow geometrically.
+        if((m_last_frame_status.invalid_bits & frame_fsm::OVF_CCD_PAIRS)
+           && needed_ccd <= m_graph_train_ccd)
+            needed_ccd = m_graph_train_ccd + 1;
+        if((m_last_frame_status.invalid_bits & frame_fsm::OVF_DCD_PAIRS)
+           && needed_dcd <= m_graph_train_pairs)
+            needed_dcd = m_graph_train_pairs + 1;
         if(needed_ccd > m_graph_train_ccd)
         {
             const int grown_ccd = std::min(
@@ -3386,6 +3470,7 @@ int GIPC::frame_graph_finish_terminal()
                     needed_ccd * GIPC::graph_train_headroom_num()));
             if(grown_ccd > m_graph_train_ccd)
             {
+                m_graph_tier_grew = true;
                 if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
                     fprintf(stderr,
                             "[graph-train] swept overflow: needed=%d -> "
@@ -3410,6 +3495,7 @@ int GIPC::frame_graph_finish_terminal()
                         "[graph-train] pair overflow: needed dcd=%d ccd=%d "
                         "-> trained pairs %d -> %d\n",
                         needed_dcd, needed_ccd, m_graph_train_pairs, grown);
+            m_graph_tier_grew   = true;
             m_graph_train_pairs = grown;
             m_graph_train_cp[0] = grown;
             for(int s = 2; s < 5; ++s)
@@ -3433,6 +3519,7 @@ int GIPC::frame_graph_finish_terminal()
         }
         if(grew_contact_class)
         {
+            m_graph_tier_grew = true;
             int stable_count = 0;
             for(int s = 0; s < 4; ++s)
                 stable_count +=
@@ -3609,8 +3696,13 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
             return;
 
         retry_invalid_bits |= m_last_frame_status.invalid_bits;
+        // A too-small tier starves the solver (dropped pairs -> wrong energy ->
+        // line-search budget exhaustion), and THAT error is what gets recorded,
+        // not the capacity bit. Retry on any outcome that carries a capacity bit
+        // as long as a tier actually grew — the grow flag is what makes this
+        // terminate: no growth, no retry.
         const bool retryable =
-            result == frame_fsm::FRAME_RETRY_REQUIRED
+            (result == frame_fsm::FRAME_RETRY_REQUIRED || m_graph_tier_grew)
             && (m_last_frame_status.invalid_bits & capacity_bits)
             && !diagnostic_rollback;
         if(retryable && attempt < max_retries)

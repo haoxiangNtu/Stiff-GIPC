@@ -420,10 +420,13 @@ def main():
                         np.asarray(_fig.canvas.buffer_rgba())[..., :3]))
             if os.environ.get("STIFF_BENCH_STATS"):
                 print(f"[bench] frame {fr} newton {eng.native.get_total_newton_iters()} ms {ms[-1]:.1f}", flush=True)
-            if fr % 20 == 0:
+            _every = int(os.environ.get("CASE39_TRACE_EVERY", "20"))
+            if _every > 0 and fr % _every == 0:
                 v = eng.get_vertices()
                 cz = [float(v[o:o+c,1].mean()) for (o,c) in cloth_ranges]
-                print(f"[fs-hl] frame {fr:4d} step={ms[-1]:6.0f}ms cloth_y/env={['%+.3f'%z for z in cz]}", flush=True)
+                _all = float(np.abs(np.asarray(v, dtype=np.float64)).sum())
+                print(f"[fs-hl] frame {fr:4d} step={ms[-1]:6.0f}ms cloth_y/env={['%+.3f'%z for z in cz]}"
+                      f" allsum={_all:.9e}", flush=True)
         if recorder is not None:
             (_mp4, _usd, _fa, _fabd, _st) = recorder
             if _mp4 is not None:

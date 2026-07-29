@@ -149,6 +149,7 @@ void GIPC::refresh_pair_counts()
     CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
     h_gpNum = cp_gp_buf[5];
+    note_pair_census_peak();
 }
 
 void GIPC::buildCP()
@@ -298,6 +299,7 @@ void GIPC::buildCP()
         CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
         h_gpNum = cp_gp_buf[5];
+        note_pair_census_peak();
     }
 
     // Overflow → grow DCD pair buffers + redo detection (BVH unchanged, no pairs
@@ -331,6 +333,7 @@ void GIPC::buildCP()
             CUDA_SAFE_CALL(cudaMemcpy(cp_gp_buf, _cpNum, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             memcpy(h_cpNum.refresh_dst(), cp_gp_buf, 5 * sizeof(uint32_t));
             h_gpNum = cp_gp_buf[5];
+            note_pair_census_peak();
         }
     }
 
@@ -403,7 +406,10 @@ void GIPC::update_graph_training_capacity()
     for(int slot = 0; slot < 5; ++slot)
     {
         const int want = gipc::assembly_capacity_tier(
-            std::max(256, static_cast<int>(h_cpNum[slot]) * headroom));
+            std::max(256,
+                     static_cast<int>(std::max(m_peak_cpNum[slot],
+                                               h_cpNum[slot]))
+                         * headroom));
         m_graph_train_cp[slot] =
             std::max(m_graph_train_cp[slot],
                      std::min(want, MAX_COLLITION_PAIRS_NUM));
@@ -416,14 +422,18 @@ void GIPC::update_graph_training_capacity()
     if(gipc_global_triplet.global_triplet_offset > m_last_assembled_triplets)
         m_last_assembled_triplets =
             gipc_global_triplet.global_triplet_offset;
-    const int observed_ccd = static_cast<int>(m_last_ccd_pair_count);
+    const int observed_ccd = static_cast<int>(
+        std::max(m_peak_ccd_pair_count, m_last_ccd_pair_count));
     const int want_ccd = gipc::assembly_capacity_tier(
         std::max(1024, observed_ccd * headroom));
     m_graph_train_ccd =
         std::max(m_graph_train_ccd,
                  std::min(want_ccd, MAX_CCD_COLLITION_PAIRS_NUM));
     const int want_ground = gipc::assembly_capacity_tier(
-        std::max(256, static_cast<int>(h_gpNum) * headroom));
+        std::max(256,
+                 static_cast<int>(std::max(m_peak_gpNum,
+                                           static_cast<uint32_t>(h_gpNum)))
+                     * headroom));
     m_graph_train_ground =
         std::max(m_graph_train_ground,
                  std::min(want_ground, static_cast<int>(surf_vertexNum)));
@@ -573,11 +583,16 @@ void GIPC::train_collision_graph_capacities()
         // until the contraction ran past a 41M-element buffer.
         const bool has_abd = abd_fem_count_info.abd_body_num > 0;
         const bool has_fem = abd_fem_count_info.fem_point_num > 0;
+        // [C6-b] Read the honest census, NOT the *_contact_num fields: under a
+        // capacity mirror those hold class_tier, so training from them feeds
+        // the previous tier back in as an observation and doubles the class-0
+        // segment every frame (foldshirt: 242k -> 524k -> 1048k -> OOM, with
+        // the ABD contraction pushed past a 2.9M-element triplet buffer).
         const int observed_class[4] = {
-            gipc_global_triplet.fem_fem_contact_num,
-            gipc_global_triplet.abd_fem_contact_num,
-            gipc_global_triplet.fem_abd_contact_num,
-            gipc_global_triplet.abd_abd_contact_num};
+            gipc_global_triplet.m_observed_class_count[0],
+            gipc_global_triplet.m_observed_class_count[1],
+            gipc_global_triplet.m_observed_class_count[2],
+            gipc_global_triplet.m_observed_class_count[3]};
         // m_contact_class_tier order: fem_fem, abd_fem, fem_abd, abd_abd
         // (see partitionContactHessian's class_num assignments). Class 0
         // is ALWAYS possible: capacity-grid zero pads carry hash(0,0) and

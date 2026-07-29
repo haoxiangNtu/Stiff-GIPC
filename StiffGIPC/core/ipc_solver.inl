@@ -763,11 +763,28 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
             "[frame-conditional] semi-implicit host beta is not eligible");
 
     const int iteration_cap = std::max(1, newton_iter_cap);
+    // [C6-b] Must be bit-identical to the host solver's _newton_thr (see the
+    // thr_bbox2 selection in the host Newton loop): the decoupled path scales
+    // the exit test by the average per-environment bbox, and a graph that keeps
+    // the whole merged scene's diagonal exits EARLIER every frame. The error is
+    // invisible for one frame and compounds — foldshirt matched the host for six
+    // frames, then blew up.
+    double graph_thr_bbox2 = bboxDiagSize2;
+    if(m_mode_config.decouple_thresh && TetMesh.h_groups_present
+       && m_avg_env_bbox2 > 0.0)
+        graph_thr_bbox2 = m_avg_env_bbox2;
     const double threshold =
         newton_velocity_tol > 0.0
             ? newton_velocity_tol * IPC_dt
             : sqrt(Newton_solver_threshold * Newton_solver_threshold
-                   * bboxDiagSize2 * IPC_dt * IPC_dt);
+                   * graph_thr_bbox2 * IPC_dt * IPC_dt);
+    if(getenv("STIFF_FRAME_GRAPH_DIAG"))
+        fprintf(stderr,
+                "[graph-thr] threshold=%.12e bbox2=%.6e avg_env_bbox2=%.6e "
+                "decouple=%d groups=%d vtol=%g\n",
+                threshold, bboxDiagSize2, m_avg_env_bbox2,
+                (int)m_mode_config.decouple_thresh,
+                (int)TetMesh.h_groups_present, newton_velocity_tol);
 
     CUDA_SAFE_CALL(cudaMemsetAsync(
         _moveDir,
@@ -1223,6 +1240,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                           cudaMemcpyDeviceToHost));
             return converged != 0;
         };
+        if(getenv("STIFF_FRAME_GRAPH_DIAG") && k == 0)
+            fprintf(stderr,
+                    "[host-thr] threshold=%.12e bbox2=%.6e avg_env_bbox2=%.6e "
+                    "decouple=%d groups=%d vtol=%g\n",
+                    _newton_thr, bboxDiagSize2, m_avg_env_bbox2,
+                    (int)m_mode_config.decouple_thresh,
+                    (int)TetMesh.h_groups_present, newton_velocity_tol);
         bool gradVanish = current_global_exit
                               ? false
                               : device_newton_converged(merged_diag_sample);
@@ -1618,6 +1642,10 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         }
         validateFinalCcdStateOrThrow(h_ccd_state, "device CCD chain");
         m_last_ccd_pair_count = static_cast<uint32_t>(std::max(0, ccd_cnt));
+        if(m_last_ccd_pair_count > m_peak_ccd_pair_count)
+            m_peak_ccd_pair_count = m_last_ccd_pair_count;
+        if(getenv("STIFF_SWEPT_DIAG"))
+            fprintf(stderr, "[swept] ccd_cnt=%d\n", ccd_cnt);
         if(getenv("STIFF_CCD_VALIDATE"))
         {
             const double host_temp = h_ccd_state[0] < h_ccd_state[1]

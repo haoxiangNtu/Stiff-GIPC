@@ -513,6 +513,10 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     bvh_f._vertexes = sf;
     bvh_e._vertexes = se;
     m_last_ccd_pair_count = static_cast<uint32_t>(h_ccd_cpNum);
+    if(m_last_ccd_pair_count > m_peak_ccd_pair_count)
+        m_peak_ccd_pair_count = m_last_ccd_pair_count;
+    if(getenv("STIFF_SWEPT_DIAG"))
+        fprintf(stderr, "[swept] perenv ccd_pairs=%u\n", (unsigned)h_ccd_cpNum);
 }
 
 void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
@@ -590,6 +594,11 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
         CUDA_SAFE_CALL(cudaMemcpy(h_ccd_cpNum.refresh_dst(), _cpNum, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     }
     m_last_ccd_pair_count = static_cast<uint32_t>(h_ccd_cpNum);
+    if(m_last_ccd_pair_count > m_peak_ccd_pair_count)
+        m_peak_ccd_pair_count = m_last_ccd_pair_count;
+    if(getenv("STIFF_SWEPT_DIAG"))
+        fprintf(stderr, "[swept] buildFullCP ccd_pairs=%u alpha=%g\n",
+                (unsigned)h_ccd_cpNum, alpha);
 }
 
 

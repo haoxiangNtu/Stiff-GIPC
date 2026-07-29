@@ -272,6 +272,12 @@ class GIPCTripletMatrix
     // trains these tiers; an undershoot is device-reported and grown only at
     // the frame boundary before retrying the same physical frame.
     int                          m_contact_class_tier[4] = {0, 0, 0, 0};
+    // [C6-b] Honest per-class census, written ONLY by the non-mirror partition
+    // path. The *_contact_num fields carry class_tier under a capacity mirror,
+    // so training must never read them back as observations: doing so feeds the
+    // previous tier in as this frame's count and doubles every pass
+    // (242k -> 524k -> 1048k -> OOM on foldshirt).
+    int                          m_observed_class_count[4] = {0, 0, 0, 0};
     bool                         m_contact_partition_txn_ok = false;
     frame_fsm::FrameDeviceState* m_frame_device_state = nullptr;
 

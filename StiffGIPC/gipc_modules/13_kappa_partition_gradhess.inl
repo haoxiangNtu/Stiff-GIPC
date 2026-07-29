@@ -461,6 +461,9 @@ void GIPC::partitionContactHessian()
         gipc_global_triplet.abd_fem_contact_num = segment_count[1];
         gipc_global_triplet.fem_abd_contact_num = segment_count[2];
         gipc_global_triplet.abd_abd_contact_num = segment_count[3];
+        // [C6-b] The only place a real, un-mirrored class census exists.
+        for(int s = 0; s < 4; ++s)
+            gipc_global_triplet.m_observed_class_count[s] = segment_count[s];
         gipc_global_triplet.h_fem_fem_contact_start_id =
             segment_start[0];
         gipc_global_triplet.h_abd_fem_contact_start_id =

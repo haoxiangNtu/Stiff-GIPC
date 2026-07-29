@@ -341,6 +341,27 @@ class GIPC
     // h_ccd_cpNum by reusing _cpNum, but frame-boundary telemetry must still
     // report the most recent CCD high-water without bypassing mirror audits.
     uint32_t m_last_ccd_pair_count = 0;
+    // [C6-b] Swept counts swing wildly WITHIN a frame (foldshirt: 58k at the
+    // last Newton iteration, 390k at the peak). Training from the last value
+    // seeds a tier that the very first recorded frame overflows, forcing a
+    // boundary retry every frame. Train from the peak instead.
+    uint32_t m_peak_ccd_pair_count = 0;
+    // [C6-b] Same story on the DCD/ground axes: h_cpNum/h_gpNum hold the LAST
+    // Newton iteration's census, which is far below the frame's peak.
+    uint32_t m_peak_cpNum[5] = {0, 0, 0, 0, 0};
+    uint32_t m_peak_gpNum    = 0;
+    // [C6-b] Set by frame_graph_finish_terminal when a capacity tier actually
+    // grew. A frame that overflowed can only be retried if the retry will run
+    // at a LARGER tier; otherwise it would replay the identical failure.
+    bool m_graph_tier_grew = false;
+    void note_pair_census_peak()
+    {
+        for(int s = 0; s < 5; ++s)
+            if(h_cpNum[s] > m_peak_cpNum[s])
+                m_peak_cpNum[s] = h_cpNum[s];
+        if(static_cast<uint32_t>(h_gpNum) > m_peak_gpNum)
+            m_peak_gpNum = static_cast<uint32_t>(h_gpNum);
+    }
     // [narrow-self snapshot] immutable copy of the DCD-time CCD pair mirror.
     // The DCD detect kernels write _collisionPair AND _ccd_collisionPair at the
     // same atomic slot, so right after buildCP the first h_cpNum[0] entries of
