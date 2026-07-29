@@ -228,12 +228,21 @@ def run(
         or key in ("STIFF_MIRROR_AUDIT", "STIFF_SLOT_AUDIT")
     }
     env.update(extra)
+    # PYTHONPATH must PREPEND, never replace: deployments that ship their
+    # interpreter's site-packages through PYTHONPATH (the A800 node mounts
+    # numpy that way) lost every third-party import when this overwrote it,
+    # and every scene failed with an import Traceback and zero samples.
+    inherited_pythonpath = os.environ.get("PYTHONPATH", "")
     env.update(
         STIFF_MULTIENV_MODE=mode,
         SCENE_MODE=mode,
         STIFF_BENCH_STATS="1",
         STIFF_LOG_LEVEL="0",
-        PYTHONPATH=str(ROOT),
+        PYTHONPATH=(
+            f"{ROOT}{os.pathsep}{inherited_pythonpath}"
+            if inherited_pythonpath
+            else str(ROOT)
+        ),
     )
     started = time.perf_counter()
     external_seen: list[str] = []
