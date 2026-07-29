@@ -349,3 +349,60 @@ buildBVH+buildCP（defer 计数模式）、Newton 体内 DCD 快照、`m_ccd_alp
 postLineSearch）→ sync 等价只在 kappa-quiet 窗口主张；摩擦系数必须为零
 （摩擦集只在同步帧重建，非零摩擦被资格拒绝——C4-b/c 的目标=图内 kappa
 自适应与摩擦 lagged 集设备重建）。验收=G18（`scripts/collision_graph_gate.py`）。
+
+## C6-b — ABD/contact scenes inside the whole-frame graph (2026-07-30)
+
+foldshirt (merged, N=1) now records **92% of frames** into the whole-frame
+graph and tracks the host statistically through frame 7 (cumulative Newton 54
+in-graph vs 53 and 54 across two host runs — the host's own run-to-run spread
+is ±5 iterations per frame, and by frame 10 its `allsum` state hash varies by
+4.4e-3 between identical runs, so anything below that is not a divergence
+signal).
+
+### Fixed
+
+1. **Census self-feeding.** Training read observed class counts from
+   `gipc_global_triplet.*_contact_num`, which a capacity-mirror assembly
+   overwrites with `class_tier`. Each frame trained on the previous frame's
+   tier: 242k → 524k → 1048k → OOM. Now reads `m_observed_class_count`,
+   written only by the non-mirror partition path.
+2. **Tiers trained from the frame's last Newton iteration, not its peak.**
+   foldshirt ends frames at ~58k swept pairs but peaks at ~390k mid-frame.
+   Peaks are now tracked on the swept, DCD and ground axes.
+3. **An overflow could not grow the tier it overflowed.** In-graph emission is
+   capacity-clamped, so the device counter saturates *at* the tier and
+   `needed > trained` was never true. Grow geometrically when the overflow bit
+   is set but the reported need is not larger.
+4. **Capacity starvation was adjudicated fatal.** A too-small tier drops pairs
+   → wrong energy → line-search budget exhaustion, and *that* error is what
+   gets recorded, not the capacity bit. Retry on any outcome carrying a
+   capacity bit, gated on a tier having actually grown.
+
+Also aligned the in-graph Newton exit threshold with the host expression
+(verified bit-identical in merged mode; the `decouple_thresh` branch matters
+for isolated).
+
+### Open — kappa runaway at the grasp-closing frame
+
+`STIFF_FRAME_GRAPH_DIAG` per-frame telemetry:
+
+```
+frames 1-8   result=0  newton=5..12  ls=5..12  alpha=1.0        kappa=41.7296  move~1.5e-3
+frame 9      result=2  newton=31     ls=127    alpha=2.43e-31   kappa=2670.70  move=5.9e-2
+```
+
+kappa moves by exactly 2^6 in one frame — six doublings of
+`_post_ls_kappa_double`. The host solves the same frame with the same Newton
+count (31) and **never** moves kappa off 41.729624, i.e. its close-set check
+returns false where the in-graph check fires. With kappa 64x too stiff the
+line search must collapse alpha to 1e-31, burns 127 trials, and the frame
+fails; the 3.8M/4.8M swept counts and `max_movement=1.35e+05` seen afterwards
+are consequences of the dead frame, not causes (host swept peak over the same
+15 frames is 634,254).
+
+Next: find why `enqueue_post_ls_kappa_conditional`'s close-set check sets
+`m_d_close_flag` where the host's `checkCloseGroundVal()/checkSelfCloseVal()`
+pair returns false. Both mask by a live count and the kernels honour `d_live`;
+the structural difference left is that the host reallocates the close-constraint
+buffers each iteration (`tempFree/tempMalloc_closeConstraint`) while the graph
+reuses MAX-sized ones.
