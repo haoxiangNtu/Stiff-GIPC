@@ -81,13 +81,46 @@ ordering without a host fence.
 
 ### C4: real collision/CCD graph
 
-1. Replace remaining host collision counts and launch bounds with device-owned
-   counters and capacity tiers.
-2. Record broad phase, narrow phase, refined CCD, friction, and rollback in the
-   whole-frame conditional graph.
-3. Preallocate all steady-state tiers; publish overflow as device status/done
-   rather than growing buffers mid-step.
-4. Prove contact-rich numerical equivalence against the synchronous solver.
+1. ~~Replace remaining host collision counts and launch bounds with
+   device-owned counters and capacity tiers.~~ (C4-a, 883b214)
+2. ~~Record broad phase, narrow phase, refined CCD and rollback in the
+   whole-frame conditional graph.~~ (C4-a; friction still excluded)
+3. ~~Preallocate all steady-state tiers; publish overflow as device
+   status/done rather than growing buffers mid-step.~~ (C4-a: recording-time
+   capacity mirrors + pre-capture dry-run training + in-graph OVF guards)
+4. ~~Prove contact numerical equivalence against the synchronous solver.~~
+   (G18: ground-contact scene, ~1e-13; contact-rich self-collision scenes
+   still to be added to the gate matrix)
+
+Remaining sub-blocks, with reconnaissance results (2026-07-29):
+
+- **C4-b in-graph kappa adaptation.** Today the graph freezes kappa at its
+  frame-boundary value (eligibility enforces a kappa-quiet window). Findings:
+  the barrier/ground G/H and energy kernels take kappa **by value**
+  (`mKappa`), so recording bakes it in — except the per-group path, which
+  already reads the device array `m_kappa_group`. But `pergroup_kappa` is an
+  isolated-mode overlay, which C-3 eligibility rejects. Plan: add a scalar
+  `kappa_dev` tail parameter (`kappa = kappa_dev ? *kappa_dev : mKappa`) to
+  the ~6 kappa-consuming kernels; devicify the postLineSearch body at the
+  Newton-loop tail: close-constraint buffers are already grow-only (train
+  capacity at the boundary), `_checkGroundCloseVal`/`_checkSelfCloseVal`
+  need a persistent device flag slot plus a capacity-grid/d_live tail
+  parameter (their `numbers` is a host mirror today), the doubling kernel is
+  trivial (`if(flag) k = min(2k, kappaMax)` with `kappaMax` a scene-constant
+  precomputed at the boundary), and the frame status already carries kappa
+  back at the boundary. Note the in-frame doubling strategy is already
+  deliberately weakened upstream (compute*CloseVal no longer feeds it
+  aggressively; kappa re-seeds each frame via gradient projection), so the
+  quiet-window contract is mild in practice.
+- **C4-c friction inside the graph.** Friction sets (lagged lastH family)
+  rebuild only at synchronous frame boundaries; eligibility rejects nonzero
+  friction. Needs: `buildFrictionSets` capture-safe (device counts, no
+  grow), plus the lagged-count mirrors (`h_cpNum_last`) devicified the same
+  way as C4-a did for the live counts.
+- **C4-d contact-rich gate matrix.** Extend G18 with a self-collision DCD
+  scene (two interpenetrating-trajectory cloth/soft bodies) and a towel
+  recipe window, so tier guards and the swept CCD overflow retry see real
+  DCD/EE traffic.
 
 ### D2: device RL semantics
 
