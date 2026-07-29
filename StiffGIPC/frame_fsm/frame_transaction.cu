@@ -3420,11 +3420,28 @@ int GIPC::frame_graph_finish_terminal()
         throw std::logic_error("frame terminal graph was not emitted");
     m_last_frame_status = *context.h_status;
     m_graph_tier_grew   = false;   // [C6-b] per-adjudication
+    if(std::getenv("STIFF_FRAME_GRAPH_DIAG") && m_ccd_alpha_slots)
+    {
+        // [C6-c] Which alpha lane collapsed? 0=ground 1=narrow-self
+        // 2=initial-combine 3=cfl 4=refined-swept. Read on the host after the
+        // graph has run; the slots persist in device memory.
+        double slots[9] = {0};
+        CUDA_SAFE_CALL(cudaMemcpy(slots, m_ccd_alpha_slots, sizeof(slots),
+                                  cudaMemcpyDeviceToHost));
+        fprintf(stderr,
+                "[alpha-lanes] ground=%.6e narrow=%.6e initial=%.6e cfl=%.6e "
+                "refined=%.6e invalid=%.0f\n",
+                slots[0], slots[1], slots[2], slots[3], slots[4], slots[7]);
+    }
     if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
         fprintf(stderr,
-                "[graph-frame] result=%d newton=%d ls=%d alpha=%.6e "
-                "cfl=%.6e kappa=%.6e move=%.6e dcd=%d ccd=%d\n",
+                "[graph-frame] result=%d err=%d inv=0x%x newton=%d ls=%d "
+                "alpha=%.6e "
+                "cfl=%.6e kappa=%.6e move=%.6e dcd=%d ccd=%d "
+                "class=[%d/%d,%d/%d,%d/%d,%d/%d]\n",
                 m_last_frame_status.result,
+                m_last_frame_status.error_code,
+                (unsigned)m_last_frame_status.invalid_bits,
                 m_last_frame_status.newton_iters,
                 m_last_frame_status.ls_trials,
                 m_last_frame_status.final_alpha,
@@ -3432,7 +3449,15 @@ int GIPC::frame_graph_finish_terminal()
                 m_last_frame_status.kappa,
                 m_last_frame_status.max_movement,
                 m_last_frame_status.hw_dcd_pairs,
-                m_last_frame_status.hw_ccd_pairs);
+                m_last_frame_status.hw_ccd_pairs,
+                m_last_frame_status.contact_class_count[0],
+                gipc_global_triplet.m_contact_class_tier[0],
+                m_last_frame_status.contact_class_count[1],
+                gipc_global_triplet.m_contact_class_tier[1],
+                m_last_frame_status.contact_class_count[2],
+                gipc_global_triplet.m_contact_class_tier[2],
+                m_last_frame_status.contact_class_count[3],
+                gipc_global_triplet.m_contact_class_tier[3]);
     note_frame_graph_coverage(m_last_frame_status);   // [C6]
     if((m_last_frame_status.invalid_bits
         & frame_fsm::OVF_UNIQUE_BLOCKS)
@@ -3511,7 +3536,14 @@ int GIPC::frame_graph_finish_terminal()
             m_graph_tier_grew   = true;
             m_graph_train_pairs = grown;
             m_graph_train_cp[0] = grown;
-            for(int s = 2; s < 5; ++s)
+            // [C6-c] Slot 1 (abd_fem) was skipped by this loop, so it could
+            // never grow past whatever it was first trained to. A class the
+            // scene has not produced yet trains to the 256 floor -- foldshirt
+            // observes abd_fem == 0 on frame 0, the only host frame -- and the
+            // first frame that does produce it overflows instantly, retries,
+            // fails to grow the one tier that mattered, and burns the whole
+            // retry budget.
+            for(int s = 1; s < 5; ++s)
                 m_graph_train_cp[s] =
                     std::min(grown, std::max(m_graph_train_cp[s], grown / 2));
             ++pcg_buffer_generation();   // force a re-record at the new tier

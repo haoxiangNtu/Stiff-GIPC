@@ -429,14 +429,21 @@ void GIPC::update_graph_training_capacity()
     m_graph_train_ccd =
         std::max(m_graph_train_ccd,
                  std::min(want_ccd, MAX_CCD_COLLITION_PAIRS_NUM));
-    const int want_ground = gipc::assembly_capacity_tier(
-        std::max(256,
-                 static_cast<int>(std::max(m_peak_gpNum,
-                                           static_cast<uint32_t>(h_gpNum)))
-                     * headroom));
-    m_graph_train_ground =
-        std::max(m_graph_train_ground,
-                 std::min(want_ground, static_cast<int>(surf_vertexNum)));
+    // [C6-c] The ground axis is trained to its WORST CASE, never to an observed
+    // count. Unlike the DCD and swept axes it has no OVF_* bit, so an in-graph
+    // truncation is undetectable and can never be adjudicated into a retry with
+    // a larger tier. It is also the axis most likely to be observed as zero:
+    // only frame 0 runs on the host, and scenes routinely start with the cloth
+    // in the air (h_gpNum == 0), which pinned the extent at the 256 floor for
+    // the whole run. foldshirt then touched down around frame 8, the recorded
+    // ground assembly covered 256 of the live constraints, the rest lost their
+    // barrier, vertices sank into the plane, and the ground CCD lane collapsed
+    // from ~0.1 (host) to 2.7e-9 — which is what killed the line search.
+    //
+    // Worst case is one constraint per surface vertex, which is what the
+    // ground buffers and the assembly envelope (contact_scalar_extent) are
+    // already sized for, so this costs launch width and nothing else.
+    m_graph_train_ground = static_cast<int>(surf_vertexNum);
     if(getenv("STIFF_FRAME_GRAPH_DIAG"))
         fprintf(stderr,
                 "[graph-train] observed cp=[%u,%u,%u,%u,%u] gp=%u -> trained "
@@ -783,12 +790,28 @@ __global__ void _pair_tier_guard(const uint32_t* d_pair_counts,
     frame->hw_dcd_pairs = live[0];
     frame->cp_count     = live[0];
     frame->gp_count     = live[4];
-    bool crossed        = false;
+    // [C6-c] Report a requirement the host can ACT on. The crossing is usually
+    // a sub-slot (PT/EE/PE/PP or ground), whose tier is far below the total
+    // tier, so reporting the total left needed_dcd < m_graph_train_pairs and the
+    // growth test never fired -- the frame retried at the identical tier until
+    // the budget ran out. The host grows the total and then sets each sub-slot
+    // to grown/2, so the total must reach twice the crossing count for the
+    // sub-slot to actually clear it.
+    bool crossed         = false;
+    int  worst_crossing  = 0;
     for(int i = 0; i < 5; ++i)
-        crossed = crossed || live[i] > tier[i];
+    {
+        if(live[i] <= tier[i])
+            continue;
+        crossed = true;
+        if(live[i] > worst_crossing)
+            worst_crossing = live[i];
+    }
     if(!crossed)
         return;
-    frame->required_dcd_pairs = live[0];
+    const int need_from_slot = 2 * worst_crossing;
+    frame->required_dcd_pairs =
+        live[0] > need_from_slot ? live[0] : need_from_slot;
     frame_fsm::fsm_record_error(frame,
                                 frame_fsm::ERR_CAPACITY,
                                 frame_fsm::OVF_DCD_PAIRS,
