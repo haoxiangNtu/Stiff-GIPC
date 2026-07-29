@@ -3420,6 +3420,19 @@ int GIPC::frame_graph_finish_terminal()
         throw std::logic_error("frame terminal graph was not emitted");
     m_last_frame_status = *context.h_status;
     m_graph_tier_grew   = false;   // [C6-b] per-adjudication
+    if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
+        fprintf(stderr,
+                "[graph-frame] result=%d newton=%d ls=%d alpha=%.6e "
+                "cfl=%.6e kappa=%.6e move=%.6e dcd=%d ccd=%d\n",
+                m_last_frame_status.result,
+                m_last_frame_status.newton_iters,
+                m_last_frame_status.ls_trials,
+                m_last_frame_status.final_alpha,
+                m_last_frame_status.cfl_alpha,
+                m_last_frame_status.kappa,
+                m_last_frame_status.max_movement,
+                m_last_frame_status.hw_dcd_pairs,
+                m_last_frame_status.hw_ccd_pairs);
     note_frame_graph_coverage(m_last_frame_status);   // [C6]
     if((m_last_frame_status.invalid_bits
         & frame_fsm::OVF_UNIQUE_BLOCKS)
