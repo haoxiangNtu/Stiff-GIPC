@@ -199,7 +199,12 @@ void GIPC::buildCP()
     set_ee_vloc((m_mode_config.ee_canon && m_vloc_built) ? m_d_vloc : nullptr);
 
     // [multi-env P2] per-env BVH path: build each env's tree on LOCAL verts + detect, looped.
-    if(m_perenv_bvh && m_d_p2g)
+    // [C5] the whole-frame graph forces the merged tree: the per-env build is
+    // a host loop over envs with variable launch extents and host-side BVH
+    // object mutation (not capture-safe). Isolation is preserved because
+    // set_self_p2g (armed under decouple_thresh) filters cross-env pairs at
+    // emission, so the pair SET is the same either way.
+    if(m_perenv_bvh && m_d_p2g && !m_graph_merged_detect)
     {
         if(m_perenv_bvh_groups == 0)
             buildPerEnvBVHIndex(m_active_group_count, m_d_p2g);
@@ -1061,3 +1066,4 @@ void stiff_test_ccd_nan_max_speed_fail_fast()
 // bucketing here is fine for the read-only diagnostic; the in-solver version (P3a
 // step2) must use fixed-order segmented reduce (cub::DeviceSegmentedReduce) so the
 // per-env sums are order-deterministic.
+

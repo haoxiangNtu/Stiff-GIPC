@@ -301,6 +301,18 @@ else
     record collision-graph FAIL "rc=$rc"
 fi
 
+echo "== G19 C5 isolated mode inside the whole-frame graph =="
+timeout 900 python3 scripts/isolated_graph_gate.py \
+    > "$GATE_LOG_DIR/isolated-graph.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "ISOLATED-GRAPH-GATE: PASS" \
+       "$GATE_LOG_DIR/isolated-graph.log"; then
+    record isolated-graph PASS ""
+else
+    record isolated-graph FAIL "rc=$rc"
+fi
+
 echo "== G17c GPU-native RL device ABI (zero-transfer graph) =="
 timeout 300 python3 scripts/gpu_rl_gate.py \
     > "$GATE_LOG_DIR/gpu-rl-graph.log" 2>&1

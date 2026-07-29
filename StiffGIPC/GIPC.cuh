@@ -715,13 +715,29 @@ class GIPC
     // close-set check (device counts) -> conditional kappa doubling into
     // FrameDeviceState::kappa -> close-set rebuild at capacity grids.
     void enqueue_post_ls_kappa_conditional();
+    // [C5] isolated-mode graph body pieces. The per-env CCD-alpha chain (S1
+    // phases A/B + the device freeze decision into FrameDeviceState) and the
+    // per-env S3 line-search WHILE loop. Contract: the recorded detection
+    // pipeline is the merged tree with env-id emission filtering — the pair
+    // SET matches the per-env-tree path (zero cross-env contacts) while the
+    // build stays capture-safe; per-env solver decisions are all on device.
+    void enqueue_perenv_ccd_alpha_conditional(device_TetraData& TetMesh);
+    void enqueue_s3_line_search_conditional(device_TetraData& TetMesh);
+    // [C5] frame-boundary training for the isolated bodies: every lazily
+    // allocated per-env scratch reaches final size before capture.
+    void train_perenv_graph_capacities(device_TetraData& TetMesh);
+    // [C5] force the merged detection pipeline while the whole-frame graph
+    // records/executes an isolated-mode frame (per-env BVH host loops are
+    // not capture-safe; isolation is preserved by emission filtering).
+    bool m_graph_merged_detect = false;
     void self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
                                                        double* mqueue,
                                                        int capacity,
                                                        double* out_slot,
                                                        const uint32_t* d_live);
     void lineSearchConditional(device_TetraData& TetMesh,
-                               const double* alpha_device);
+                               const double* alpha_device,
+                               bool save_temp = true);
     void postLineSearch(device_TetraData& TetMesh, double alpha);
 
     bool checkEdgeTriIntersectionIfAny(device_TetraData& TetMesh);

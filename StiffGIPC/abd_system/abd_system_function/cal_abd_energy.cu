@@ -304,9 +304,17 @@ double ABDSystem::cal_abd_energy_perenv(ABDSimData& sim_data,
     // last step). Binned deposit (Demmel-Nguyen, exact per-bin) is order-independent → bit-identical.
     // [descriptor phase-0b] instance-owned (was process-static, shared across
     // engines; content was memset-safe but the allocation outlived the engine).
+    // [C5 capture-safe] muda's resize() unconditionally waits on PTDS and a
+    // blocking cudaMemset is illegal inside stream capture; the frame-boundary
+    // training pass sizes this buffer, so the growth branch is a warm-up-only
+    // path and the clear is stream-ordered (same semantics: the bins are
+    // fully overwritten by the deposits that follow, in this stream).
     if(m_perenv_ebin.size() < (size_t)ng * BINNED_K)
         m_perenv_ebin.resize((size_t)ng * BINNED_K);
-    cudaMemset(m_perenv_ebin.data(), 0, (size_t)ng * BINNED_K * sizeof(double));
+    CUDA_SAFE_CALL(cudaMemsetAsync(m_perenv_ebin.data(),
+                                   0,
+                                   (size_t)ng * BINNED_K * sizeof(double),
+                                   cudaStreamPerThread));
     double* ebin = m_perenv_ebin.data();
 
     // per-body terms: kinetic, shape (element i -> body i)

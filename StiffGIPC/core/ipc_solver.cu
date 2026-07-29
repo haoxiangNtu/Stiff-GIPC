@@ -61,16 +61,17 @@ extern __global__ void _newton_step_predicate(frame_fsm::FrameDeviceState* frame
 extern __global__ void _newton_iteration_begin(frame_fsm::FrameDeviceState* frame);
 extern __global__ void _newton_unit_alpha(double* alpha_slots, frame_fsm::FrameDeviceState* frame);
 extern __global__ void _newton_tail_conditional(frame_fsm::FrameDeviceState* frame, int iteration_cap, cudaGraphConditionalHandle handle);
-extern __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng, double sq, double ccd_size, int have_ccd, double temp_alpha, double alpha_CFL, int decouple, int no_refine, double thr_cv, const double* env_bbox2, double ntol_dt, double vtol_dt, const int* refined_invalid, const int* ccd_alpha_invalid, int* cnt);
+extern __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch, int ng, double sq, double ccd_size, int have_ccd, double temp_alpha, double alpha_CFL, int decouple, int no_refine, double thr_cv, const double* env_bbox2, double ntol_dt, double vtol_dt, const int* refined_invalid, const int* ccd_alpha_invalid, int* cnt, const uint32_t* d_ccd_count = nullptr);
 extern __global__ void _per_env_groundAlpha_min(const double3* vertexes, const uint32_t* surfVertIds, const double* g_offset, const double3* g_normal, const double3* moveDir, const int* p2g, double* per_env_alpha, double slackness, int number, const int* _point_body_id, const int* _ground_skip_body, int _ground_body_count, int ng, int* ccd_alpha_invalid);
 extern __global__ void _per_env_max_cfl(const int* p2g, const double3* moveDir, const uint32_t* mSVI, double* per_env_max, int n_surf, int ng);
 extern __global__ void _per_env_max_move(const int* p2g, const double3* moveDir, double* per_env_max, int n, int ng);
-extern __global__ void _per_env_selfAlpha_min(const double3* vertexes, const int4* pairs, const double3* moveDir, const int* p2g, double* per_env_alpha, double slackness, int number, int ng, const int* vloc, int* ccd_alpha_invalid, int invalid_bit, int* refined_invalid);
+extern __global__ void _per_env_selfAlpha_min(const double3* vertexes, const int4* pairs, const double3* moveDir, const int* p2g, double* per_env_alpha, double slackness, int number, int ng, const int* vloc, int* ccd_alpha_invalid, int invalid_bit, int* refined_invalid, const uint32_t* d_live = nullptr);
 extern __global__ void _per_env_sqnorm_accum(const int* p2g, const double3* vec, double* per_env_sq, int* per_env_cnt, int n, int ng);
 extern __global__ void _per_group_kappa_double(double* kappa_group, const int* close_grp, const double* env_alpha, int ng, double kappaMax, double* maxK_out);
 extern __global__ void _promote_per_env_refined_invalid(const double* scratch, int ng, int have_ccd, double sq, double temp_alpha, double alpha_CFL, int decouple, int no_refine, const int* refined_invalid, int* ccd_alpha_invalid);
-extern __global__ void _s3_decide(const double* Eg0, const double* Eg1, double* env_alpha, int* decision_counts, int ng, double energy_abs_tol, double energy_rel_tol);
+extern __global__ void _s3_decide(const double* Eg0, const double* Eg1, double* env_alpha, int* decision_counts, int ng, double energy_abs_tol, double energy_rel_tol, const int* ground_gate = nullptr);
 extern __global__ void _s3_halve_all(double* env_alpha, int ng);
+extern __global__ void _s3_fallback_predicate(const int* counts, frame_fsm::FrameDeviceState* frame, cudaGraphConditionalHandle handle);
 extern __global__ void _scan_dir_nonfinite(const double3* dir, const int* p2g, int* flags, int n);
 extern __global__ void _zero_dir_quarantined(double3* dir, const int* p2g, const int* quar, int n);
 

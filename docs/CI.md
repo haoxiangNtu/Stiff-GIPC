@@ -117,6 +117,15 @@ SKIP_GATES=1 git push
   仿真图+D2D 观测保留（更贴近动作已驻留显存的真实 GPU policy），末尾一次
   裁决读回，轨迹对照 episode 噪声包络。契约与完成度路线图见
   `docs/GPU_NATIVE_RL_PLAN.md`。
+- **G19 isolated-graph**（`scripts/isolated_graph_gate.py`，GPU）：C5——
+  **isolated 模式整帧图**（`STIFF_C5_ISOLATED_GRAPH=1`）。四环境落地场景 20 帧
+  全图执行零回退（per-env CCD alpha 链、per-env 冻结判定、per-env S3 回溯
+  WHILE、统一步长回退 IF、图内 kappa 全在设备）。三重断言：轨迹在双基线包络内；
+  **物理隔离成立**（扰动 env3 对邻居的耦合 < 其自身位移的 1e-4）；**图化零新增
+  耦合**（图 1.79e-07 vs per-env 树基线 1.80e-07）。契约注意：isolated 承诺
+  per-env 公平性+检疫铁律，**不承诺逐位复现**（那是 strict）——所以残余抖动
+  （共享 SpMV 原子序被接触动力学放大）是预期内的。strict 仍被资格拒绝：
+  容量网格归约会合法重排求和序，准入 strict 等于换锚战役。
 - **G18 collision-graph**（`scripts/collision_graph_gate.py`，GPU）：C4-a——
   碰撞（BVH+DCD+CCD 标量链+回溯 LS）整体录进整帧条件图
   （`STIFF_C4_COLLISION_GRAPH=1` 显式 opt-in）。双 cube 落地场景 20 帧全图

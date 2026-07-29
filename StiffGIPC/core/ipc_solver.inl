@@ -46,7 +46,8 @@ static bool c4_collision_graph_enabled()
 }
 
 void GIPC::lineSearchConditional(device_TetraData& TetMesh,
-                                 const double* alpha_device)
+                                 const double* alpha_device,
+                                 bool save_temp)
 {
     auto* recorder = frame_fsm::ConditionalGraphRecorder::current();
     if(!recorder)
@@ -59,7 +60,14 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
         throw std::runtime_error(
             "[line-search-conditional] collision-domain checks require "
             "STIFF_C4_COLLISION_GRAPH=1");
-    if(m_mode_config.perenv_alpha)
+    // [C5] under perenv_alpha this is legal ONLY as the isolated fallback the
+    // host solver also takes (per-env search could not make every env
+    // descend). save_temp==false is that call: it steps from the temp
+    // configuration the per-env search already snapshotted, with
+    // m_perenv_apply cleared, i.e. a uniform-alpha search — exactly the host
+    // fall-through. A save_temp==true call would be the primary search, which
+    // must go through the per-env S3 path instead.
+    if(m_mode_config.perenv_alpha && save_temp)
         throw std::runtime_error(
             "[line-search-conditional] per-environment alpha requires the "
             "device S3 conditional path");
@@ -98,12 +106,18 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
     {
         computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
 
-        CUDA_SAFE_CALL(cudaMemcpyAsync(TetMesh.temp_double3Mem,
-                                       TetMesh.vertexes,
-                                       vertexNum * sizeof(double3),
-                                       cudaMemcpyDeviceToDevice,
-                                       cudaStreamPerThread));
-        m_abd_system->copy_q_to_q_temp(*m_abd_sim_data);
+        // [C5] the isolated fallback re-uses the temp configuration the
+        // per-env search already saved (the host solver likewise snapshots
+        // once, before S3, and both searches step from it).
+        if(save_temp)
+        {
+            CUDA_SAFE_CALL(cudaMemcpyAsync(TetMesh.temp_double3Mem,
+                                           TetMesh.vertexes,
+                                           vertexNum * sizeof(double3),
+                                           cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+            m_abd_system->copy_q_to_q_temp(*m_abd_sim_data);
+        }
 
         _ls_conditional_seed<<<1, 1>>>(
             m_d_ls_alpha,
@@ -727,11 +741,20 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
         throw std::runtime_error(
             "[frame-conditional] moving boundaries and host soft targets "
             "are not yet eligible");
-    if(m_mode_config.perenv_alpha || m_mode_config.decouple_thresh
-       || m_mode_config.segmented_pcg)
+    // [C5] the complete isolated bundle is eligible; a PARTIAL per-env overlay
+    // (e.g. the per_env_exit pair on merged mode) is not — its host decision
+    // mix has no recorded equivalent.
+    const bool isolated_body = m_mode_config.mode == ModeConfig::Isolated;
+    if(!isolated_body
+       && (m_mode_config.perenv_alpha || m_mode_config.decouple_thresh
+           || m_mode_config.segmented_pcg))
         throw std::runtime_error(
-            "[frame-conditional] per-environment Newton controls are not yet "
-            "eligible");
+            "[frame-conditional] partial per-environment overlays are not "
+            "eligible (only the complete isolated bundle is)");
+    if(isolated_body && !collision_body)
+        throw std::runtime_error(
+            "[frame-conditional] isolated mode without collision has no "
+            "per-env alpha chain to record");
     if(semi_implicit_enabled)
         throw std::runtime_error(
             "[frame-conditional] semi-implicit host beta is not eligible");
@@ -755,10 +778,15 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
     // sets keep their frame-boundary values by contract.
     const bool restore_defer  = m_ls_defer_counts;
     const bool restore_energy = m_energy_use_device_counts;
+    const bool restore_merged_detect = m_graph_merged_detect;
     if(collision_body)
     {
         m_ls_defer_counts           = true;
         m_energy_use_device_counts = true;
+        // [C5] record the merged detection pipeline even in isolated mode
+        // (the per-env tree build is a host loop; env isolation is preserved
+        // by the emission-time cross-env filter — see buildCP).
+        m_graph_merged_detect = isolated_body;
         // [C4-b] arm the device-kappa injection for every kappa-consuming
         // launch recorded below; disarmed on every exit path.
         m_graph_kappa_armed = true;
@@ -807,13 +835,24 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
                 computeGradientAndHessian(TetMesh);
                 calculateMovingDirection(
                     TetMesh, 0, pcg_data.P_type);
-                calcMinMovement_DeviceOut(
-                    _moveDir, pcg_data.squeue, vertexNum);
-                _newton_convergence_decide<<<1, 1>>>(
-                    pcg_data.squeue,
-                    threshold,
-                    m_newton_convergence_decision,
-                    frame);
+                if(isolated_body)
+                {
+                    // [C5] isolated ordering mirrors the host solver: the
+                    // per-env alpha chain runs BEFORE the exit test, because
+                    // the exit condition IS all-envs-frozen (a by-product of
+                    // that chain), not a global gradient norm.
+                    enqueue_perenv_ccd_alpha_conditional(TetMesh);
+                }
+                else
+                {
+                    calcMinMovement_DeviceOut(
+                        _moveDir, pcg_data.squeue, vertexNum);
+                    _newton_convergence_decide<<<1, 1>>>(
+                        pcg_data.squeue,
+                        threshold,
+                        m_newton_convergence_decision,
+                        frame);
+                }
 
                 recorder->if_then(
                     [&](cudaGraphConditionalHandle step_handle)
@@ -823,13 +862,41 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
                     },
                     [&](cudaGraphConditionalHandle)
                     {
-                        if(collision_body)
-                            enqueue_ccd_alpha_conditional();
+                        if(isolated_body)
+                        {
+                            // Per-env alphas already live in m_env_alpha.
+                            enqueue_s3_line_search_conditional(TetMesh);
+                            // Host parity: when the per-env search cannot
+                            // make every env descend within its budget (or a
+                            // trial went ground-invalid), the solver falls
+                            // through to the uniform-alpha search from the
+                            // SAME temp configuration.
+                            recorder->if_then(
+                                [&](cudaGraphConditionalHandle fb_handle)
+                                {
+                                    _s3_fallback_predicate<<<1, 1>>>(
+                                        m_scr_ls_decision_counts,
+                                        frame,
+                                        fb_handle);
+                                },
+                                [&](cudaGraphConditionalHandle)
+                                {
+                                    lineSearchConditional(
+                                        TetMesh,
+                                        m_ccd_alpha_slots + 5,
+                                        /*save_temp=*/false);
+                                });
+                        }
                         else
-                            _newton_unit_alpha<<<1, 1>>>(
-                                m_ccd_alpha_slots, frame);
-                        lineSearchConditional(
-                            TetMesh, m_ccd_alpha_slots + 5);
+                        {
+                            if(collision_body)
+                                enqueue_ccd_alpha_conditional();
+                            else
+                                _newton_unit_alpha<<<1, 1>>>(
+                                    m_ccd_alpha_slots, frame);
+                            lineSearchConditional(
+                                TetMesh, m_ccd_alpha_slots + 5);
+                        }
                         // [C4-b] postLineSearch equivalent: close-set check
                         // -> conditional device-kappa doubling -> close-set
                         // rebuild. Runs exactly where the host solver runs
@@ -850,11 +917,13 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
         m_graph_kappa_armed         = false;
         m_ls_defer_counts           = restore_defer;
         m_energy_use_device_counts = restore_energy;
+        m_graph_merged_detect       = restore_merged_detect;
         throw;
     }
     m_graph_kappa_armed         = false;
     m_ls_defer_counts           = restore_defer;
     m_energy_use_device_counts = restore_energy;
+    m_graph_merged_detect       = restore_merged_detect;
 }
 
 

@@ -256,6 +256,43 @@ G17c（`scripts/verify_gates.sh`）；D2D 动作发布变体 =
 批量环境 + A800 nsys 证明"的完整定义与四个完成块（C4/D2/D3/D4）见
 `docs/GPU_NATIVE_RL_PLAN.md`——四块全过之前，Phase C/D 不标记为最终完成。
 
+## C5 落地战报：isolated 模式整帧图（2026-07-29）
+
+`STIFF_C5_ISOLATED_GRAPH=1`（默认关，且要求 C4 碰撞图同开）让**完整 isolated
+bundle**（7 开关）整帧进图。宿主在 isolated 下的逐迭代参与全部消除：
+
+| 原宿主参与 | 设备化方式 |
+|---|---|
+| 12B `cnt` D2H → `all_env_frozen` → Newton 退出 | `_perenv_newton_decide` 写 `FrameDeviceState::newton_converged`；`_newton_step_predicate` 照常消费 |
+| 8B S3 决策 D2H/轮 → 回溯环控制 | S3 录成条件 WHILE：`_s3_round_begin` → per-env step → 重检测 → per-env 能量 → `_s3_decide`（原地减半）→ `_s3_tail_conditional` 置句柄 |
+| 4B ground-trial D2H/轮 | `_markGroundTrialInvalid` 的标志字直接门控 `_s3_decide`，并由尾核决定减半重试还是回退 |
+| 72B CCD 标量链 + `ccd_cnt` 网格 | 复用 C4 合并链（容量网格 + `_cpNum` 设备计数尾参进 `_per_env_selfAlpha_min`/`_per_env_alpha_compute`） |
+| 8B κ 包络 D2H | C4-b 的图内 κ 链 |
+
+**关键结构决策：图内录制合并树 + emission 级跨环境过滤，而非 per-env 树。**
+per-env 树是"宿主 env 循环 + 变长发射 + 循环中改写 BVH 对象成员"，结构上不可
+capture；而 `set_self_p2g`（isolated 下由 `decouple_thresh` 常开）在发射点滤掉
+跨环境对，**产生的接触对集合与 per-env 树路径相同**——树级隔离只是实现手段，
+隔离承诺由过滤保证。G19 实测证实：图路径跨环境耦合 1.791e-07，per-env 树基线
+1.796e-07，实质相同。
+
+宿主 parity 细节（两处必须照抄否则物理不等价）：
+- **S3 耗尽 / ground 塌陷 → 回退而非致命**：宿主在 per-env 搜索无法让所有 env
+  下降时会跌落到统一步长线搜索。图内录成 `IF(fallback){统一 LS WHILE}`，且
+  回退调用带 `save_temp=false`——宿主也是在 S3 **之前**只存一次 temp，两条搜索
+  共用同一起点。
+- **边界预热合并管线**：`train_perenv_graph_capacities` 在帧边界跑一次合并
+  build+detect。两个理由都会在捕获内致命：合并树的惰性排序 scratch 从未按全量
+  N 定尺；EE/canon/self-p2g 等设备符号设置器是**值缓存**的，per-env 与合并路径
+  发布的值不同，切换后首次调用会发同步 `cudaMemcpyToSymbol`。
+
+顺带修复：`cal_abd_energy.cu` 的 per-env 能量 bin 用的是同步 `cudaMemset`
+（捕获非法），改 stream-ordered。
+
+**strict 仍被资格拒绝**（用户 2026-07-29 决定：strict 不图化）：strict 的承诺
+是逐位复现，而容量网格归约合法重排求和序——准入 strict 等于换锚战役。
+验收=G19（`scripts/isolated_graph_gate.py`）。
+
 ## A800 实测（2026-07-29，sm_80 就地构建 a2c8b33）
 
 容器回收后从零重引导（cmake/ninja/pybind11/numpy 以 wheel 离线解包、

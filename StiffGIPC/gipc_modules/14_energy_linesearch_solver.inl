@@ -6,8 +6,14 @@ __global__ void _s3_decide(const double* Eg0,
                            int*          decision_counts,
                            int           ng,
                            double        energy_abs_tol,
-                           double        energy_rel_tol)
+                           double        energy_rel_tol,
+                           const int*    ground_gate = nullptr)
 {
+    // [C5] recorded S3 body: a ground-invalid trial round must not consume
+    // its (garbage) trial energies — the tail halves the offending envs and
+    // retries instead.
+    if(ground_gate && *ground_gate != 0)
+        return;
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
     if(env_alpha[g] <= 0.0) return;               // absent (or frozen) env
@@ -660,4 +666,229 @@ void GIPC::computeXTilta(device_TetraData& TetMesh, const double& rate)
                                             numbers);
 
     m_abd_system->cal_q_tilde(*m_abd_sim_data);
+}
+
+// ============================================================================
+// [C5] isolated-mode whole-frame graph bodies.
+//
+// Placed at the tail of the composite TU so every per-env kernel (11), the S3
+// decision (this file), the ground-trial marker (06), the ABD alpha gather
+// (08) and the device per-env energy dispatcher (energy/01) are visible.
+//
+// Isolation contract inside the graph: the recorded detection pipeline is the
+// MERGED tree with env-id emission filtering (set_self_p2g), which yields the
+// same pair SET as the per-env-tree path — zero cross-env contacts — while
+// staying capture-safe (the per-env build is a host loop over envs with
+// variable launch extents and host-side BVH object mutation). Every per-env
+// SOLVER decision (alpha, freeze, S3 backtracking, kappa) is device-resident.
+// ============================================================================
+
+// Frame-boundary training: all per-env scratch that the host path allocates
+// lazily must exist at final size before capture.
+void GIPC::train_perenv_graph_capacities(device_TetraData& TetMesh)
+{
+    if(!m_scr_env_cnt)
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_env_cnt, 3 * sizeof(int)));
+    if(!m_scr_ls_eg0)
+    {
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_ls_eg0,
+                                  kEnvAlphaSlots * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_ls_eg1,
+                                  kEnvAlphaSlots * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_scr_ls_decision_counts,
+                                  4 * sizeof(int)));
+    }
+    const int abdN = static_cast<int>(abd_fem_count_info.abd_body_num);
+    if(abdN > 0 && !m_abd_body_alpha)
+        m_abd_body_alpha.resize_discard(abdN);
+
+    // Prime the MERGED detection pipeline at the boundary. Two distinct
+    // reasons, both fatal inside capture if skipped:
+    //   1. every previous frame ran the per-env trees, so the merged tree's
+    //      lazily sized sort scratch was never allocated at full extent;
+    //   2. the device-symbol setters (EE dedup/canon/env-part/self-p2g/...)
+    //      are VALUE-CACHED — the per-env and merged paths publish different
+    //      values, so the first merged call after a per-env frame fires a
+    //      synchronous cudaMemcpyToSymbol, which is illegal in capture.
+    // Running one merged build+detect here settles both.
+    const bool restore_merged_detect = m_graph_merged_detect;
+    m_graph_merged_detect = true;
+    buildBVH();
+    buildCP();
+    m_graph_merged_detect = restore_merged_detect;
+
+    // The per-env energy dispatcher's slice block + the ABD per-env bin are
+    // lazily sized on first use; run one dispatch at the boundary so the
+    // recorded pass finds them resident.
+    if(m_env_alpha && m_scr_ls_eg0)
+        computeEnergy_perenv_dev(TetMesh, m_scr_ls_eg0);
+}
+
+// The per-env CCD-alpha chain, enqueue form: S1 phase A (direct terms over the
+// DCD-time snapshot), the merged swept chain (C4, capture-safe), S1 phase B
+// (refined / cfl / max-move) and the device freeze decision publishing
+// all_env_frozen into FrameDeviceState::newton_converged. No host reads.
+void GIPC::enqueue_perenv_ccd_alpha_conditional(device_TetraData& TetMesh)
+{
+    frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    const int    NG          = m_active_group_count;
+    const int    bs          = 256;
+    const double slackness_a = 0.9;
+    const double slackness_m = 0.8;
+
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_ccd_alpha_invalid, 0, sizeof(int), cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_refined_invalid,
+                                   0,
+                                   (1 + kEnvAlphaSlots) * sizeof(int),
+                                   cudaStreamPerThread));
+
+    // ---- S1 phase A: direct per-env ground + narrow-self terms ----
+    _fill_double<<<(2 * NG + bs - 1) / bs, bs, 0, cudaStreamPerThread>>>(
+        m_env_scratch, 1.0, 2 * NG);
+    if(surf_vertexNum >= 1)
+        _per_env_groundAlpha_min<<<(surf_vertexNum + bs - 1) / bs,
+                                   bs,
+                                   0,
+                                   cudaStreamPerThread>>>(
+            _vertexes, _surfVerts, _groundOffset, _groundNormal, _moveDir,
+            TetMesh.d_point_to_group, m_env_scratch + 0 * NG, slackness_a,
+            surf_vertexNum, _point_body_id, _ground_skip_body,
+            _ground_body_count, NG, m_ccd_alpha_invalid);
+    if(m_dcd_snap_cap > 0)
+        _per_env_selfAlpha_min<<<(m_dcd_snap_cap + bs - 1) / bs,
+                                 bs,
+                                 0,
+                                 cudaStreamPerThread>>>(
+            _vertexes, _dcd_ccd_snapshot, _moveDir, TetMesh.d_point_to_group,
+            m_env_scratch + 1 * NG, slackness_m, m_dcd_snap_cap, NG,
+            nullptr, m_ccd_alpha_invalid, kCcdInvalidPerEnvNarrow, nullptr,
+            m_pair_snap_cur.data() + 0);
+
+    // ---- the global scalar chain: also drives the swept build ----
+    // (its slots seed the uniform fallback alpha; the per-env path consumes
+    //  the fresh _ccd_collisonPairs it produces).
+    enqueue_ccd_alpha_conditional();
+
+    // ---- S1 phase B: refined-self / cfl / Newton max-move ----
+    _fill_double<<<(NG + bs - 1) / bs, bs, 0, cudaStreamPerThread>>>(
+        m_env_scratch + 2 * NG, 1.0, NG);
+    CUDA_SAFE_CALL(cudaMemsetAsync(m_env_scratch + 3 * NG,
+                                   0,
+                                   2 * NG * sizeof(double),
+                                   cudaStreamPerThread));
+    _per_env_selfAlpha_min<<<(MAX_CCD_COLLITION_PAIRS_NUM + bs - 1) / bs,
+                             bs,
+                             0,
+                             cudaStreamPerThread>>>(
+        _vertexes, _ccd_collisonPairs, _moveDir, TetMesh.d_point_to_group,
+        m_env_scratch + 2 * NG, slackness_m, MAX_CCD_COLLITION_PAIRS_NUM, NG,
+        nullptr, m_ccd_alpha_invalid, kCcdInvalidPerEnvRefined,
+        m_ccd_refined_invalid + 1,
+        _cpNum);
+    _per_env_max_cfl<<<(surf_vertexNum + bs - 1) / bs, bs, 0,
+                       cudaStreamPerThread>>>(
+        TetMesh.d_point_to_group, _moveDir, _surfVerts,
+        m_env_scratch + 3 * NG, surf_vertexNum, NG);
+    _per_env_max_move<<<(vertexNum + bs - 1) / bs, bs, 0,
+                        cudaStreamPerThread>>>(
+        TetMesh.d_point_to_group, _moveDir, m_env_scratch + 4 * NG,
+        vertexNum, NG);
+
+    // ---- device per-env alpha + freeze + Newton-exit publication ----
+    // decouple=1 by contract (isolated bundle), so the refinement gate is
+    // per-env and the host temp_alpha/alpha_CFL arguments are dead.
+    double thr_bbox2 = bboxDiagSize2;
+    if(TetMesh.h_groups_present && m_avg_env_bbox2 > 0.0)
+        thr_bbox2 = m_avg_env_bbox2;
+    const double sq = sqrt(dHat);
+    const double thr_cv =
+        (newton_velocity_tol > 0.0)
+            ? (newton_velocity_tol * IPC_dt)
+            : sqrt(Newton_solver_threshold * Newton_solver_threshold
+                   * thr_bbox2 * IPC_dt * IPC_dt);
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_scr_env_cnt, 0, 3 * sizeof(int), cudaStreamPerThread));
+    _per_env_alpha_compute<<<(NG + bs - 1) / bs, bs, 0, cudaStreamPerThread>>>(
+        m_env_alpha, m_env_scratch, NG, sq, 1.0, 1,
+        0.0, 0.0, 1,
+        0, thr_cv,
+        d_env_bbox2, Newton_solver_threshold * IPC_dt,
+        newton_velocity_tol * IPC_dt,
+        m_ccd_refined_invalid + 1, m_ccd_alpha_invalid,
+        m_scr_env_cnt,
+        _cpNum);
+    _perenv_newton_decide<<<1, 1, 0, cudaStreamPerThread>>>(
+        m_scr_env_cnt, frame);
+}
+
+// The per-env S3 line search as a conditional WHILE loop: per-env step from
+// the temp config, capture-safe rebuild in deferred-count mode, device per-env
+// energies, in-place halving, loop control on a conditional handle.
+void GIPC::enqueue_s3_line_search_conditional(device_TetraData& TetMesh)
+{
+    auto* recorder = frame_fsm::ConditionalGraphRecorder::current();
+    if(!recorder)
+        throw std::logic_error(
+            "[s3-conditional] no active conditional recorder");
+    frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    const int NG    = m_active_group_count;
+    const int abdN  = static_cast<int>(abd_fem_count_info.abd_body_num);
+    const int bs    = 256;
+    const int maxBT = 8;
+
+    computeEnergy_perenv_dev(TetMesh, m_scr_ls_eg0);
+    CUDA_SAFE_CALL(cudaMemcpyAsync(TetMesh.temp_double3Mem,
+                                   TetMesh.vertexes,
+                                   vertexNum * sizeof(double3),
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread));
+    m_abd_system->copy_q_to_q_temp(*m_abd_sim_data);
+
+    _s3_conditional_seed<<<1, 1, 0, cudaStreamPerThread>>>(
+        m_scr_ls_decision_counts, frame);
+    recorder->while_loop(
+        1,
+        cudaGraphCondAssignDefault,
+        [&](cudaGraphConditionalHandle handle)
+        {
+            _s3_round_begin<<<1, 1, 0, cudaStreamPerThread>>>(
+                m_scr_ls_decision_counts);
+            if(abdN > 0 && TetMesh.d_body_to_group)
+                _gather_abd_body_alpha<<<(abdN + bs - 1) / bs, bs, 0,
+                                         cudaStreamPerThread>>>(
+                    TetMesh.d_body_to_group, m_env_alpha, m_abd_body_alpha,
+                    abdN, NG);
+            m_perenv_apply = true;
+            step_forward(TetMesh, 0.0, false);
+            m_perenv_apply = false;
+            buildBVH();
+            // Ground-trial adjudication in device form: the host reads one
+            // int here; the recorded body publishes a flag word that gates
+            // the energy decision and steers the tail.
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                m_ground_trial_invalid, 0, sizeof(int), cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(m_env_ground_trial_invalid,
+                                           0,
+                                           NG * sizeof(int),
+                                           cudaStreamPerThread));
+            if(surf_vertexNum >= 1)
+                _markGroundTrialInvalid<<<(surf_vertexNum + bs - 1) / bs, bs,
+                                          0, cudaStreamPerThread>>>(
+                    _vertexes, _surfVerts, _groundOffset, _groundNormal,
+                    _point_body_id, _ground_skip_body, _ground_body_count,
+                    TetMesh.d_point_to_group, m_env_ground_trial_invalid,
+                    m_ground_trial_invalid, NG, surf_vertexNum);
+            buildCP();
+            computeEnergy_perenv_dev(TetMesh, m_scr_ls_eg1);
+            _s3_decide<<<(NG + bs - 1) / bs, bs, 0, cudaStreamPerThread>>>(
+                m_scr_ls_eg0, m_scr_ls_eg1, m_env_alpha,
+                m_scr_ls_decision_counts, NG,
+                energy_abs_tol, energy_rel_tol,
+                m_ground_trial_invalid);
+            _s3_tail_conditional<<<1, 1, 0, cudaStreamPerThread>>>(
+                m_scr_ls_decision_counts, m_ground_trial_invalid,
+                m_env_alpha, m_env_ground_trial_invalid, NG, maxBT,
+                handle, frame);
+        });
 }

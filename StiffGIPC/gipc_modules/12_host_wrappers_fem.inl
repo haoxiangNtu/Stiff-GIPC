@@ -121,7 +121,8 @@ void GIPC::buildBVH_FULLCCD(const double& alpha, const double* alpha_dev)
     if(m_skip_all_collision)
         return;
     // [multi-env P2] per-env mode builds swept trees inside buildFullCP; skip merged build.
-    if(m_perenv_bvh && m_perenv_bvh_groups > 0)
+    // [C5] m_graph_merged_detect forces the merged swept build (see buildCP).
+    if(m_perenv_bvh && m_perenv_bvh_groups > 0 && !m_graph_merged_detect)
         return;
     { int bs = 256, gs = (vertexNum + bs - 1) / bs;
       _addEnvOffset<<<gs, bs>>>(d_bvh_vertexes, _vertexes, d_env_offset, vertexNum); }

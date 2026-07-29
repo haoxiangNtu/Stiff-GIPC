@@ -128,8 +128,12 @@ __global__ void _per_env_alpha_compute(double* env_alpha, const double* scratch,
                                        const double* env_bbox2, double ntol_dt, double vtol_dt,
                                        const int* refined_invalid,
                                        const int* ccd_alpha_invalid,
-                                       int* cnt)
+                                       int* cnt,
+                                       const uint32_t* d_ccd_count = nullptr)
 {
+    // [C5] inside the frame graph the swept-pair gate is a device count.
+    if(d_ccd_count)
+        have_ccd = (*d_ccd_count > 0u) ? 1 : 0;
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if(g >= ng) return;
     if(g == 0 && ccd_alpha_invalid)
@@ -340,8 +344,13 @@ __global__ void _per_env_selfAlpha_min(const double3* vertexes, const int4* pair
                                        const double3* moveDir, const int* p2g,
                                        double* per_env_alpha, double slackness, int number, int ng,
                                        const int* vloc, int* ccd_alpha_invalid,
-                                       int invalid_bit, int* refined_invalid)
+                                       int invalid_bit, int* refined_invalid,
+                                       const uint32_t* d_live = nullptr)
 {
+    // [C5] capacity-grid launch inside the frame graph: the live pair count
+    // is read on device; OOB lanes fall through the min-identity.
+    if(d_live)
+        number = static_cast<int>(*d_live);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number) return;
     double CCDDistRatio = 1.0 - slackness;
@@ -517,7 +526,8 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
     }
 
     // [multi-env P2] per-env CCD path (the swept-BVH equivalent of the per-env DCD path).
-    if(m_perenv_bvh && m_d_p2g && m_perenv_bvh_groups > 0)
+    // [C5] m_graph_merged_detect forces the merged swept path (see buildCP).
+    if(m_perenv_bvh && m_d_p2g && m_perenv_bvh_groups > 0 && !m_graph_merged_detect)
     {
         buildBVH_and_CP_perenv_CCD(alpha, alpha_dev);
         return;
@@ -598,7 +608,8 @@ void GIPC::buildBVH()
     if(m_skip_all_collision)
         return;
     // [multi-env P2] per-env mode builds trees inside buildCP (per-env loop); skip the merged build.
-    if(m_perenv_bvh && m_perenv_bvh_groups > 0)
+    // [C5] m_graph_merged_detect forces the merged build (see buildCP).
+    if(m_perenv_bvh && m_perenv_bvh_groups > 0 && !m_graph_merged_detect)
         return;
     { int bs = 256, gs = (vertexNum + bs - 1) / bs;
       _addEnvOffset<<<gs, bs>>>(d_bvh_vertexes, _vertexes, d_env_offset, vertexNum); }
@@ -890,4 +901,126 @@ void GIPC::allocPerEnvPool(int K)
     for(int k = old_K; k < K; ++k)
         CUDA_SAFE_CALL(cudaStreamCreate(&m_pool_streams[k]));
     m_pool_K = K;
+}
+
+// ============================================================================
+// [C5] isolated-mode whole-frame graph — per-env device decision kernels.
+//
+// The per-env Newton exit (all_env_frozen), the S3 per-env line-search loop
+// control and the per-env ground-trial adjudication move from host readbacks
+// into FrameDeviceState + conditional handles, mirroring the merged C4 path.
+// ============================================================================
+
+// Per-env Newton convergence: replaces the 12-byte cnt D2H + host
+// all_env_frozen. cnt layout: [0]=n_env(present), [1]=n_frozen, [2]=invalid.
+__global__ void _perenv_newton_decide(const int* cnt,
+                                      frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x || !frame)
+        return;
+    const int n_env    = cnt[0];
+    const int n_frozen = cnt[1];
+    const uint32_t invalid =
+        static_cast<uint32_t>(cnt[2]) & kCcdInvalidEffectiveMask;
+    frame->newton_converged = (n_env > 0 && n_frozen == n_env) ? 1 : 0;
+    frame->phase            = frame_fsm::PHASE_NEWTON_DECIDE;
+    if(invalid)
+    {
+        frame_fsm::fsm_record_error(
+            frame, frame_fsm::ERR_CCD_INVALID, invalid, -1, -1);
+        frame->result = frame_fsm::FRAME_FATAL;
+        frame->phase  = frame_fsm::PHASE_ROLLBACK;
+    }
+}
+
+// S3 round seed: counts[0]=nfail, [1]=tol-accepts, [2]=round, [3]=budget hit.
+__global__ void _s3_conditional_seed(int* counts,
+                                     frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    counts[0] = 1;   // force at least one round
+    counts[1] = 0;
+    counts[2] = 0;
+    counts[3] = 0;
+    if(frame)
+        frame->phase = frame_fsm::PHASE_LINE_SEARCH;
+}
+
+__global__ void _s3_round_begin(int* counts)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    counts[0] = 0;
+    ++counts[2];
+}
+
+// Ground-trial gate for the recorded S3 body: when any env's trial state is
+// ground-invalid the energy decision of this round must not consume the
+// (garbage) trial energies. _s3_decide takes this as an early-out gate.
+__global__ void _s3_tail_conditional(int*        counts,
+                                     const int*  ground_invalid,
+                                     double*     env_alpha,
+                                     const int*  env_ground_invalid,
+                                     int         ng,
+                                     int         budget,
+                                     cudaGraphConditionalHandle handle,
+                                     frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    const int ground = ground_invalid ? *ground_invalid : 0;
+    bool      retry  = false;
+    if(ground & 2)
+    {
+        // Ground-collapse class: the host solver breaks out of the per-env
+        // loop and falls through to the uniform-alpha line search. Mark the
+        // fallback flag; the recorded IF replays that same fallback.
+        counts[3] = 1;
+    }
+    else if(ground)
+    {
+        // Ground-invalid trial: halve the offending envs and go again
+        // (energy decision was gated out this round).
+        for(int g = 0; g < ng; ++g)
+            if(env_ground_invalid && env_ground_invalid[g])
+                env_alpha[g] *= 0.5;
+        retry = true;
+    }
+    else if(counts[0] > 0)
+    {
+        retry = true;   // _s3_decide already halved the failing envs
+    }
+    if(retry && counts[2] > budget)
+    {
+        // Budget exhausted without per-env descent: NOT a frame failure —
+        // the host solver falls through to the uniform-alpha line search
+        // from the same temp config. Arm the fallback flag instead.
+        counts[3] = 1;
+        retry     = false;
+    }
+    const bool healthy =
+        !frame || frame->result == frame_fsm::FRAME_OK;
+    if(frame)
+    {
+        frame->ls_decision = retry ? 1 : 0;
+        ++frame->ls_trial;
+    }
+    cudaGraphSetConditional(handle, (healthy && retry) ? 1u : 0u);
+}
+
+// [C5] S3 fallback predicate: the per-env search failed to produce a descent
+// for every env (budget exhausted, or a ground-collapse trial). The host
+// solver falls through to the uniform-alpha line search from the SAME temp
+// configuration; the recorded IF replays exactly that.
+__global__ void _s3_fallback_predicate(const int* counts,
+                                       frame_fsm::FrameDeviceState* frame,
+                                       cudaGraphConditionalHandle handle)
+{
+    if(blockIdx.x || threadIdx.x)
+        return;
+    const bool healthy =
+        !frame || frame->result == frame_fsm::FRAME_OK;
+    cudaGraphSetConditional(handle,
+                            (healthy && counts[3] != 0) ? 1u : 0u);
 }

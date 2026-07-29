@@ -325,17 +325,63 @@ bool full_graph_eligible(const GIPC& ipc,
     }
 
     const ModeConfig& mode = ipc.m_mode_config;
-    const bool mode_overlay =
-        mode.mode != ModeConfig::Merged
-        || mode.bvh_envdet || mode.perenv_bvh
+    // [C5] isolated mode is eligible as a COMPLETE bundle. strict stays out:
+    // its promise is bitwise reproducibility, and capacity-grid reductions
+    // legally reassociate the sums — admitting strict would be an anchor
+    // change, not a residency change.
+    if(mode.mode == ModeConfig::Strict || mode.ee_canon || mode.ee_detgate
+       || mode.ccd_canon || mode.spmv_det)
+    {
+        reason = "strict determinism controls are active";
+        return false;
+    }
+    if(mode.mode == ModeConfig::Isolated)
+    {
+        if(!knob_enabled("STIFF_C5_ISOLATED_GRAPH"))
+        {
+            reason =
+                "isolated whole-frame graph requires "
+                "STIFF_C5_ISOLATED_GRAPH=1";
+            return false;
+        }
+        if(ipc.m_skip_all_collision)
+        {
+            reason =
+                "isolated mode without collision has no per-env alpha chain";
+            return false;
+        }
+        if(!knob_enabled("STIFF_C4_COLLISION_GRAPH"))
+        {
+            reason =
+                "isolated mode implies collision in the graph "
+                "(STIFF_C4_COLLISION_GRAPH=1)";
+            return false;
+        }
+        if(ipc.m_active_group_count <= 0)
+        {
+            reason = "isolated mode without declared environment groups";
+            return false;
+        }
+        // Telemetry/iteration-cap overlays route the solver through the host
+        // diagnostic S1 path (5 x NG D2H + host loop) — no recorded form.
+        if(mode.perenv_telem || ipc.env_newton_iter_cap > 0)
+        {
+            reason =
+                "per-env telemetry / iteration cap use the host diagnostic "
+                "S1 path";
+            return false;
+        }
+        return true;
+    }
+    const bool partial_overlay =
+        mode.bvh_envdet || mode.perenv_bvh
         || mode.decouple_thresh || mode.pergroup_kappa
         || mode.segmented_pcg || mode.perenv_alpha || mode.perenv_par
-        || mode.ee_canon || mode.ee_detgate || mode.ccd_canon
-        || mode.spmv_det || mode.perenv_telem
+        || mode.perenv_telem
         || mode.perenv_mask || mode.perenv_mask_dev;
-    if(mode_overlay)
+    if(partial_overlay)
     {
-        reason = "isolated/strict/per-env solver controls are active";
+        reason = "partial per-env solver overlay on merged mode";
         return false;
     }
     return true;
@@ -1846,11 +1892,20 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
 {
     if(ipc.m_skip_all_collision)
         return;
+    const bool isolated_body =
+        ipc.m_mode_config.mode == ModeConfig::Isolated;
     ipc.train_collision_graph_capacities();
+    if(isolated_body)
+        ipc.train_perenv_graph_capacities(mesh);
     HostAttemptSnapshot training_snapshot;
     snapshot_host_attempt(ipc, training_snapshot);
     const bool defer_before  = ipc.m_ls_defer_counts;
     const bool energy_before = ipc.m_energy_use_device_counts;
+    const bool merged_detect_before = ipc.m_graph_merged_detect;
+    // [C5] the dry run must take the SAME detection path the recording will
+    // take, otherwise the per-env tree's extents (not the merged tree's)
+    // would be the ones trained.
+    ipc.m_graph_merged_detect = isolated_body;
     // The PCG epilogue records into stats["newton"].back(); give the dry
     // run the per-iteration context solve_subIP would have set up, and
     // restore the frame's stats object afterwards.
@@ -1930,6 +1985,7 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
         frame_stats                     = stats_backup;
         ipc.m_ls_defer_counts           = defer_before;
         ipc.m_energy_use_device_counts = energy_before;
+        ipc.m_graph_merged_detect       = merged_detect_before;
         restore_host_attempt(ipc, training_snapshot);
         disarm_full_graph_attempt(ipc);
         throw;
@@ -1937,6 +1993,7 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
     frame_stats                     = stats_backup;
     ipc.m_ls_defer_counts           = defer_before;
     ipc.m_energy_use_device_counts = energy_before;
+    ipc.m_graph_merged_detect       = merged_detect_before;
     restore_host_attempt(ipc, training_snapshot);
     CUDA_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
 }
