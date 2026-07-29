@@ -117,6 +117,13 @@ SKIP_GATES=1 git push
   仿真图+D2D 观测保留（更贴近动作已驻留显存的真实 GPU policy），末尾一次
   裁决读回，轨迹对照 episode 噪声包络。契约与完成度路线图见
   `docs/GPU_NATIVE_RL_PLAN.md`。
+- **G18 collision-graph**（`scripts/collision_graph_gate.py`，GPU）：C4-a——
+  碰撞（BVH+DCD+CCD 标量链+回溯 LS）整体录进整帧条件图
+  （`STIFF_C4_COLLISION_GRAPH=1` 显式 opt-in）。双 cube 落地场景 20 帧全图
+  执行零 fallback，接触帧在图内多 Newton 迭代收敛；对照双基线，容量网格归
+  约的结合序漂移以 1e-9 相对等价容差裁决（实测 ~1e-13）。契约：kappa/
+  close-set 与摩擦集冻结在帧边界值（kappa-quiet 窗口内主张 sync 等价；摩擦
+  非零场景被资格检查拒绝，留 C4-c）。
 
 ## GPU idle 门的基础设施白名单
 

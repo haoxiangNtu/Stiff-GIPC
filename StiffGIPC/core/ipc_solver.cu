@@ -43,7 +43,7 @@ extern void throwForInvalidCcdMask(int invalid, const char* context);
 extern void validateFinalCcdStateOrThrow(const double* state, const char* context);
 
 // ---- kernels owned by their mechanism modules (composite TU) ----
-extern __global__ void _ccd_final_alpha_combine(double* slots, int have_ccd_pairs, double d_hat, double ccd_size, int* invalid, const int* refined_invalid, const uint32_t* d_ccd_count, frame_fsm::FrameDeviceState* frame);
+extern __global__ void _ccd_final_alpha_combine(double* slots, int have_ccd_pairs, double d_hat, double ccd_size, int* invalid, const int* refined_invalid, const uint32_t* d_ccd_count, frame_fsm::FrameDeviceState* frame, int ccd_capacity = 0);
 extern __global__ void _ccd_initial_alpha_combine(double* slots, int have_ground, int have_self, int* invalid);
 extern __global__ void _fill_double(double* values, double value, int count);
 extern __global__ void _gather_abd_body_alpha(const int* body_to_group, const double* env_alpha, double* abd_body_alpha, int abd_body_num, int ng);

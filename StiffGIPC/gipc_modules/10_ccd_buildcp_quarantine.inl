@@ -21,7 +21,8 @@ __global__ void _ccd_final_alpha_combine(double* slots,
                                          int* invalid,
                                          const int* refined_invalid,
                                          const uint32_t* d_ccd_count,
-                                         frame_fsm::FrameDeviceState* frame)
+                                         frame_fsm::FrameDeviceState* frame,
+                                         int ccd_capacity = 0)
 {
     // [B3 ccd-defer] when armed, the pair gate comes from the live device
     // count and the raw count rides slot 8 of the same scalar-chain read
@@ -67,6 +68,22 @@ __global__ void _ccd_final_alpha_combine(double* slots,
                                ? static_cast<int>(*d_ccd_count)
                                : have_ccd_pairs;
         frame->phase = frame_fsm::PHASE_LINE_SEARCH;
+        // [C4-a] in-graph replacement for the host legacy grow-redo: past-
+        // capacity raw counts mean the deferred refined reduction saw only a
+        // subset, so the frame must retry from a boundary with grown tiers.
+        if(ccd_capacity > 0 && d_ccd_count
+           && *d_ccd_count > static_cast<uint32_t>(ccd_capacity))
+        {
+            frame->hw_ccd_pairs = static_cast<int>(*d_ccd_count);
+            frame_fsm::fsm_record_error(
+                frame,
+                frame_fsm::ERR_CAPACITY,
+                frame_fsm::OVF_CCD_PAIRS,
+                -1,
+                -1);
+            frame->result = frame_fsm::FRAME_RETRY_REQUIRED;
+            frame->phase  = frame_fsm::PHASE_ROLLBACK;
+        }
         if(invalid_bits || !isfinite(alpha) || alpha <= 0.0 || alpha > 1.0)
         {
             frame_fsm::fsm_record_error(
@@ -347,6 +364,288 @@ void GIPC::snapshotDcdCcdPairs()
     CUDA_SAFE_CALL(cudaMemcpyAsync(_dcd_ccd_snapshot, _ccd_collisonPairs,
                                    (size_t)m_dcd_snap_count * sizeof(int4),
                                    cudaMemcpyDeviceToDevice, 0));
+}
+
+// [C4-a] device-count snapshot: the host never learns the live DCD count
+// inside the frame graph, so the copy masks itself against the pair-count
+// snapshot block instead of a host extent.
+__global__ void _snapshot_pairs_masked(const int4*     source,
+                                       int4*           destination,
+                                       const uint32_t* d_pair_counts,
+                                       int             capacity)
+{
+    const uint32_t live  = d_pair_counts[0];
+    const uint32_t bound = live < (uint32_t)capacity ? live : (uint32_t)capacity;
+    for(uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+        index < bound;
+        index += gridDim.x * blockDim.x)
+        destination[index] = source[index];
+}
+
+// [C4-a] frame-boundary training: everything the in-graph collision chain
+// touches must be at final capacity before capture (no cudaMalloc inside a
+// captured stream). Growth here bumps the buffer generation so stale
+// executables are re-recorded.
+void GIPC::train_collision_graph_capacities()
+{
+    if(m_dcd_snap_cap < MAX_COLLITION_PAIRS_NUM)
+    {
+        ++pcg_buffer_generation();
+        if(_dcd_ccd_snapshot)
+            CUDA_SAFE_CALL(cudaFree(_dcd_ccd_snapshot));
+        m_dcd_snap_cap = MAX_COLLITION_PAIRS_NUM;
+        CUDA_SAFE_CALL(cudaMalloc((void**)&_dcd_ccd_snapshot,
+                                  (size_t)m_dcd_snap_cap * sizeof(int4)));
+    }
+    int scratch_extent = MAX_CCD_COLLITION_PAIRS_NUM;
+    if(scratch_extent < m_dcd_snap_cap)
+        scratch_extent = m_dcd_snap_cap;
+    if(scratch_extent < static_cast<int>(surf_vertexNum))
+        scratch_extent = static_cast<int>(surf_vertexNum);
+    (void)ensure_reduce_scratch(scratch_extent);
+
+    // The recorded assembly is shaped by capacity mirrors (all pair counts at
+    // MAX), so every allocation the recording would otherwise trigger inside
+    // capture must land here, at the legal frame-boundary discard window.
+    // Mirrors 13's dynamic frame-start grow evaluated at capacity counts.
+    if(m_dynamic_triplet)
+    {
+        const int pair_tier =
+            gipc::assembly_capacity_tier(MAX_COLLITION_PAIRS_NUM);
+        const long long contact_tier =
+            static_cast<long long>(pair_tier)
+            * (M12_Off + M9_Off + M6_Off);
+        long long bound = m_fixed_triplet_base
+                          + static_cast<long long>(
+                              abd_fem_count_info.fem_point_num)
+                          + contact_tier
+                          + contact_scalar_extent(
+                              static_cast<int>(surf_vertexNum));
+#ifdef USE_FRICTION
+        bound += make_contact_triplet_tier(h_cpNum_last).tier_triplets
+                 + contact_scalar_extent(h_gpNum_last);
+#endif
+        bound += 4096;
+
+        // Partition staging envelope at capacity payload (13's txn block):
+        // sort capacity + stable region + staging region must all fit.
+        const int sort_capacity = gipc::assembly_capacity_tier(
+            static_cast<int>(contact_tier));
+        long long stable_count = 0;
+        for(int s = 0; s < 4; ++s)
+            stable_count += gipc_global_triplet.m_contact_class_tier[s];
+        const long long staging_base =
+            sort_capacity > stable_count ? sort_capacity : stable_count;
+        const long long staging_need = staging_base + stable_count;
+
+        long long target = 2 * bound;
+        if(target < staging_need)
+            target = staging_need;
+        if(gipc_global_triplet.triplet_capacity()
+           < static_cast<size_t>(target))
+        {
+            gipc_global_triplet.open_discard_window();
+            gipc_global_triplet.ensure_capacity_discard(
+                static_cast<size_t>(target));
+            const size_t cap = gipc_global_triplet.triplet_capacity();
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_values(),
+                0,
+                cap * 9 * sizeof(double),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_row_indices(),
+                0,
+                cap * sizeof(int),
+                cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                gipc_global_triplet.block_col_indices(),
+                0,
+                cap * sizeof(int),
+                cudaStreamPerThread));
+        }
+        long long hash_need =
+            static_cast<long long>(static_cast<double>(bound) * 1.1);
+        if(hash_need < sort_capacity)
+            hash_need = sort_capacity;
+        if(gipc_global_triplet.global_external_max_capcity < hash_need)
+        {
+            gipc_global_triplet.resize_collision_hash_size(
+                static_cast<size_t>(hash_need));
+            gipc_global_triplet.global_external_max_capcity =
+                static_cast<int>(hash_need);
+        }
+
+        // muda's radix sort grows its temp workspace on demand — train it
+        // here with the exact capture-time extent so the recorded SortPairs
+        // reuses the workspace instead of allocating inside capture. Buffer
+        // contents are irrelevant; only the size signature matters.
+        if(sort_capacity > 0)
+            muda::DeviceRadixSort().SortPairs(
+                gipc_global_triplet.block_hash_value(),
+                gipc_global_triplet.block_sort_hash_value(),
+                gipc_global_triplet.block_index(),
+                gipc_global_triplet.block_sort_index(),
+                sort_capacity);
+    }
+}
+
+void GIPC::snapshotDcdCcdPairsCapture()
+{
+    if(m_dcd_snap_cap <= 0)
+        return;
+    const int block = 256;
+    const int grid =
+        std::min(1024, (m_dcd_snap_cap + block - 1) / block);
+    _snapshot_pairs_masked<<<grid, block, 0, cudaStreamPerThread>>>(
+        _ccd_collisonPairs,
+        _dcd_ccd_snapshot,
+        m_pair_snap_cur,
+        m_dcd_snap_cap);
+}
+
+// [C4-a] capacity-grid twin of self_largestFeasibleStepSize_DeviceOut: sweeps
+// the DCD-time snapshot over its trained capacity with the live device count
+// as the in-kernel mask (OOB lanes hold the identity 1.0, so regridding stays
+// bitwise-neutral — same argument as the refined reduction).
+void GIPC::self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
+                                                         double* mqueue,
+                                                         int capacity,
+                                                         double* out_slot,
+                                                         const uint32_t* d_live)
+{
+    const unsigned int threadNum = default_threads;
+    int numbers  = capacity;
+    int blockNum = (numbers + threadNum - 1) / threadNum;
+    const unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
+
+    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        _vertexes,
+        _dcd_ccd_snapshot,
+        _moveDir,
+        mqueue,
+        slackness,
+        numbers,
+        m_ccd_alpha_invalid,
+        kCcdInvalidGlobalNarrow,
+        d_live);
+    numbers  = blockNum;
+    blockNum = (numbers + threadNum - 1) / threadNum;
+    while(numbers > 1)
+    {
+        _reduct_min_double<<<blockNum, threadNum, sharedMsize>>>(mqueue, numbers);
+        numbers  = blockNum;
+        blockNum = (numbers + threadNum - 1) / threadNum;
+    }
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+// [C4-a] final-count tier guard: assembly and energy kernels were recorded
+// with launch bounds tiered from capture-time counts. They mask down against
+// live device counts but can never launch up, so a frame whose final counts
+// cross any captured tier must retry from a boundary (step() re-records; an
+// episode consumer sees the per-frame RETRY status).
+__global__ void _pair_tier_guard(const uint32_t* d_pair_counts,
+                                 int t0,
+                                 int t2,
+                                 int t3,
+                                 int t4,
+                                 int tg,
+                                 frame_fsm::FrameDeviceState* frame)
+{
+    if(blockIdx.x || threadIdx.x || !frame)
+        return;
+    const int tier[5] = {t0, t2, t3, t4, tg};
+    const int live[5] = {static_cast<int>(d_pair_counts[0]),
+                         static_cast<int>(d_pair_counts[2]),
+                         static_cast<int>(d_pair_counts[3]),
+                         static_cast<int>(d_pair_counts[4]),
+                         static_cast<int>(d_pair_counts[5])};
+    frame->hw_dcd_pairs = live[0];
+    frame->cp_count     = live[0];
+    frame->gp_count     = live[4];
+    bool crossed        = false;
+    for(int i = 0; i < 5; ++i)
+        crossed = crossed || live[i] > tier[i];
+    if(!crossed)
+        return;
+    frame->required_dcd_pairs = live[0];
+    frame_fsm::fsm_record_error(frame,
+                                frame_fsm::ERR_CAPACITY,
+                                frame_fsm::OVF_DCD_PAIRS,
+                                -1,
+                                -1);
+    atomicCAS(&frame->result,
+              frame_fsm::FRAME_OK,
+              frame_fsm::FRAME_RETRY_REQUIRED);
+}
+
+void GIPC::enqueue_pair_tier_guard()
+{
+    frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    if(!frame)
+        return;
+    _pair_tier_guard<<<1, 1, 0, cudaStreamPerThread>>>(
+        m_pair_snap_cur,
+        gipc::assembly_capacity_tier(static_cast<int>(h_cpNum[0])),
+        gipc::assembly_capacity_tier(static_cast<int>(h_cpNum[2])),
+        gipc::assembly_capacity_tier(static_cast<int>(h_cpNum[3])),
+        gipc::assembly_capacity_tier(static_cast<int>(h_cpNum[4])),
+        gipc::assembly_capacity_tier(static_cast<int>(h_gpNum)),
+        frame);
+}
+
+// [C4-a] the merged scalar-chain CCD alpha, enqueue form: no host reads, no
+// grow-redo — validation and past-capacity retries ride FrameDeviceState.
+void GIPC::enqueue_ccd_alpha_conditional()
+{
+    const double slackness_a = 0.9;
+    const double slackness_m = 0.8;
+    const double ccd_size    = 1.0;
+
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        m_ccd_alpha_invalid, 0, sizeof(int), cudaStreamPerThread));
+    CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_refined_invalid,
+                                   0,
+                                   (1 + kEnvAlphaSlots) * sizeof(int),
+                                   cudaStreamPerThread));
+    const int g_did = surf_vertexNum >= 1 ? 1 : 0;
+    if(g_did)
+        ground_largestFeasibleStepSize_DeviceOut(
+            slackness_a, pcg_data.squeue, m_ccd_alpha_slots + 0);
+    // Count==0 degenerates every lane to the identity, so the combine may
+    // consume the slot unconditionally.
+    self_largestFeasibleStepSize_DeviceOut_Masked(
+        slackness_m,
+        ensure_reduce_scratch(m_dcd_snap_cap),
+        m_dcd_snap_cap,
+        m_ccd_alpha_slots + 1,
+        m_pair_snap_cur);
+    _ccd_initial_alpha_combine<<<1, 1>>>(
+        m_ccd_alpha_slots, g_did, 1, m_ccd_alpha_invalid);
+
+    m_ccd_defer_counts = true;
+    buildBVH_FULLCCD(1.0, m_ccd_alpha_slots + 2);
+    buildFullCP(1.0, m_ccd_alpha_slots + 2);
+    m_ccd_defer_counts = false;
+
+    cfl_largestSpeed_DeviceOut(pcg_data.squeue, m_ccd_alpha_slots + 3);
+    self_full_largestFeasibleStepSize_DeviceOut(
+        slackness_m,
+        ensure_reduce_scratch(MAX_CCD_COLLITION_PAIRS_NUM),
+        MAX_CCD_COLLITION_PAIRS_NUM,
+        m_ccd_alpha_slots + 4,
+        _cpNum);
+    _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
+                                       0,
+                                       dHat,
+                                       ccd_size,
+                                       m_ccd_alpha_invalid,
+                                       m_ccd_refined_invalid,
+                                       _cpNum,
+                                       frame_graph_device_state(),
+                                       MAX_CCD_COLLITION_PAIRS_NUM);
 }
 
 void GIPC::throwIfGroundDistanceInvalid()

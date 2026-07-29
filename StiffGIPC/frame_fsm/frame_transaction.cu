@@ -4,6 +4,7 @@
 #include "abd_system/abd_system.h"
 #include "cuda_tools/cuda_tools.h"
 #include "frame_fsm/conditional_graph.h"
+#include "gipc/statistics.h"
 #include "linear_system/linear_system/global_linear_system.h"
 #include "linear_system/utils/capacity_tier.h"
 
@@ -135,6 +136,12 @@ struct FrameGraphContext
     long long full_generation = -1;
     bool full_capture_failed   = false;
 
+    // [C4-a] pair counts the collision executable was tiered against. The
+    // boundary refresh compares live tiers to these and drops the executable
+    // when a tier boundary is crossed, so masked kernels never under-launch.
+    uint32_t captured_pair_counts[6] = {0, 0, 0, 0, 0, 0};
+    bool     captured_pair_counts_valid = false;
+
     HostAttemptSnapshot host_snapshot;
 };
 
@@ -260,8 +267,27 @@ bool full_graph_eligible(const GIPC& ipc,
     }
     if(!ipc.m_skip_all_collision)
     {
-        reason = "collision counts and CCD are not yet fully device-owned";
-        return false;
+        if(!knob_enabled("STIFF_C4_COLLISION_GRAPH"))
+        {
+            reason =
+                "collision in the whole-frame graph requires "
+                "STIFF_C4_COLLISION_GRAPH=1 (kappa/close-set and friction "
+                "sets stay frozen at frame-boundary values)";
+            return false;
+        }
+        if(ipc.MAX_COLLITION_PAIRS_NUM <= 0
+           || ipc.MAX_CCD_COLLITION_PAIRS_NUM <= 0)
+        {
+            reason = "collision pair tiers were never allocated";
+            return false;
+        }
+        if(ipc.frictionRate != 0.0 || ipc.gd_frictionRate != 0.0)
+        {
+            reason =
+                "friction sets are rebuilt only at synchronous frames; "
+                "nonzero friction is not sync-equivalent until C4-c";
+            return false;
+        }
     }
     if(ipc.m_update_boundary || ipc.softNum != 0)
     {
@@ -1201,6 +1227,10 @@ void capture_full_graph(GIPC& ipc,
         CUDA_SAFE_CALL(cudaGraphDestroy(graph));
         graph = nullptr;
         context.full_generation = pcg_buffer_generation();
+        for(int i = 0; i < 5; ++i)
+            context.captured_pair_counts[i] = ipc.h_cpNum[i];
+        context.captured_pair_counts[5] = ipc.h_gpNum;
+        context.captured_pair_counts_valid = !ipc.m_skip_all_collision;
     }
     catch(...)
     {
@@ -1779,7 +1809,15 @@ bool try_launch_full_graph(GIPC& ipc,
     std::string reason;
     if(context.full_capture_failed
        || !full_graph_eligible(ipc, mesh, context, reason))
+    {
+        if(knob_enabled("STIFF_FRAME_GRAPH_DIAG"))
+            std::fprintf(stderr,
+                         "[frame-full-graph] not eligible: %s\n",
+                         context.full_capture_failed
+                             ? "a previous capture failed permanently"
+                             : reason.c_str());
         return false;
+    }
 
     snapshot_host_attempt(ipc, context.host_snapshot);
     context.newton_begin = ipc.m_total_newton_iters;
@@ -1813,6 +1851,62 @@ bool try_launch_full_graph(GIPC& ipc,
     if(!context.full_exec
        || context.full_generation != pcg_buffer_generation())
     {
+        // [C4-a] all in-graph collision buffers must reach final capacity
+        // before capture. Explicit tier math first, then a dry-run of the
+        // assembly+solve host builders with capacity mirrors: every lazy
+        // workspace (converter staging, radix-sort temp, preconditioner
+        // levels) grows on its own real path here, outside capture, so the
+        // recorded pass allocates nothing. Running after
+        // arm_full_graph_attempt matters — the dry run must exercise the
+        // same transactional partition branch the recording will take. Its
+        // garbage triplets/gradients are overwritten by the graph's own
+        // prologue at runtime, and host bookkeeping is rolled back by the
+        // same snapshot machinery the recording itself relies on.
+        if(!ipc.m_skip_all_collision)
+        {
+            ipc.train_collision_graph_capacities();
+            HostAttemptSnapshot training_snapshot;
+            snapshot_host_attempt(ipc, training_snapshot);
+            const bool defer_before  = ipc.m_ls_defer_counts;
+            const bool energy_before = ipc.m_energy_use_device_counts;
+            // The PCG epilogue records into stats["newton"].back(); give
+            // the dry run the per-iteration context solve_subIP would have
+            // set up, and restore the frame's stats object afterwards.
+            auto& frame_stats =
+                gipc::Statistics::instance().at_current_frame();
+            const gipc::Json stats_backup = frame_stats;
+            try
+            {
+                frame_stats["newton"] = gipc::Json::array();
+                frame_stats["newton"].push_back(gipc::Json::object());
+                ipc.m_ls_defer_counts           = true;
+                ipc.m_energy_use_device_counts = true;
+                for(int slot = 0; slot < 5; ++slot)
+                    ipc.h_cpNum.refresh_dst()[slot] =
+                        static_cast<uint32_t>(
+                            ipc.MAX_COLLITION_PAIRS_NUM);
+                ipc.h_gpNum =
+                    static_cast<uint32_t>(ipc.surf_vertexNum);
+                ipc.computeGradientAndHessian(mesh);
+                ipc.calculateMovingDirection(
+                    mesh, 0, ipc.pcg_data.P_type);
+            }
+            catch(...)
+            {
+                frame_stats                     = stats_backup;
+                ipc.m_ls_defer_counts           = defer_before;
+                ipc.m_energy_use_device_counts = energy_before;
+                restore_host_attempt(ipc, training_snapshot);
+                disarm_full_graph_attempt(ipc);
+                throw;
+            }
+            frame_stats                     = stats_backup;
+            ipc.m_ls_defer_counts           = defer_before;
+            ipc.m_energy_use_device_counts = energy_before;
+            restore_host_attempt(ipc, training_snapshot);
+            CUDA_SAFE_CALL(
+                cudaStreamSynchronize(cudaStreamPerThread));
+        }
         try
         {
             capture_full_graph(ipc, mesh, context);
@@ -2930,6 +3024,40 @@ int GIPC::frame_graph_finish_terminal()
             context.host_snapshot.total_pcg_iters
             + m_last_frame_status.pcg_iters;
         animation_fullRate = animation_subRate;
+        if(!m_skip_all_collision && context.captured_pair_counts_valid
+           && context.full_exec)
+        {
+            // [C4-a] the one deliberate boundary read of the collision
+            // frame: refresh the frozen host mirrors from the device pair
+            // snapshot and drop the executable when any launch tier was
+            // crossed — masked kernels can mask down but never launch up.
+            uint32_t live[6] = {0, 0, 0, 0, 0, 0};
+            CUDA_SAFE_CALL(cudaMemcpy(live,
+                                      m_pair_snap_cur,
+                                      sizeof(live),
+                                      cudaMemcpyDeviceToHost));
+            std::memcpy(
+                h_cpNum.refresh_dst(), live, 5 * sizeof(uint32_t));
+            h_gpNum          = live[5];
+            m_dcd_snap_count = live[0];
+            bool tier_crossed = false;
+            for(int i = 0; i < 6 && !tier_crossed; ++i)
+            {
+                const int captured = static_cast<int>(
+                    context.captured_pair_counts[i]);
+                const int now = static_cast<int>(live[i]);
+                if(gipc::assembly_capacity_tier(now)
+                   != gipc::assembly_capacity_tier(captured))
+                    tier_crossed = true;
+            }
+            if(tier_crossed)
+            {
+                CUDA_SAFE_CALL(
+                    cudaGraphExecDestroy(context.full_exec));
+                context.full_exec = nullptr;
+                context.captured_pair_counts_valid = false;
+            }
+        }
     }
     else
         m_total_pcg_iters =

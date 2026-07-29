@@ -289,6 +289,18 @@ else
     record episode-rl-graph FAIL "rc=$rc"
 fi
 
+echo "== G18 C4 collision inside the whole-frame graph =="
+timeout 600 python3 scripts/collision_graph_gate.py \
+    > "$GATE_LOG_DIR/collision-graph.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -qF "COLLISION-GRAPH-GATE: PASS" \
+       "$GATE_LOG_DIR/collision-graph.log"; then
+    record collision-graph PASS ""
+else
+    record collision-graph FAIL "rc=$rc"
+fi
+
 echo "== G17c GPU-native RL device ABI (zero-transfer graph) =="
 timeout 300 python3 scripts/gpu_rl_gate.py \
     > "$GATE_LOG_DIR/gpu-rl-graph.log" 2>&1

@@ -692,6 +692,20 @@ class GIPC
     double cfl_largestSpeed(double* mqueue);
 
     bool lineSearch(device_TetraData& TetMesh, double& alpha, const double& cfl_alpha);
+    // [C4-a] collision chain inside the whole-frame conditional graph.
+    // Contract: kappa and the close-set stay frozen at their frame-boundary
+    // values (postLineSearch does not run inside the graph) and friction
+    // sets are whatever the last synchronous frame built — scenes must keep
+    // friction coefficients at zero for sync-equivalence until C4-c.
+    void train_collision_graph_capacities();
+    void snapshotDcdCcdPairsCapture();
+    void enqueue_ccd_alpha_conditional();
+    void enqueue_pair_tier_guard();
+    void self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
+                                                       double* mqueue,
+                                                       int capacity,
+                                                       double* out_slot,
+                                                       const uint32_t* d_live);
     void lineSearchConditional(device_TetraData& TetMesh,
                                const double* alpha_device);
     void postLineSearch(device_TetraData& TetMesh, double alpha);

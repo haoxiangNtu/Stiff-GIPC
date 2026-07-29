@@ -38,7 +38,7 @@ GPU-native RL.
 | Device positions, velocities, status, frame counter | Implemented | Exported by `get_gpu_rl_device_abi()`. |
 | Zero graph H2D/D2H | Implemented and fail-closed | Capture audit rejects any host node, H2D node, or D2H node. |
 | No steady-state host wait | Implemented at engine ABI | Launch only enqueues the graph and an event. `gpu_rl_ready()` and `synchronize_gpu_rl()` are explicitly optional host/debug boundaries. |
-| Real collision/contact/CCD | Not implemented in the full graph | Current eligibility still requires `skip_all_collision=true`; the captured body rejects the collision path. |
+| Real collision/contact/CCD | C4-a landed (2026-07-29) | `STIFF_C4_COLLISION_GRAPH=1` records BVH+DCD+CCD scalar chain+backtracking LS inside the whole-frame graph (G18 gate: 20 contact frames, zero fallback, ~1e-13 parity). Contract limits remain: kappa/close-set frozen at frame-boundary values, zero friction only — C4-b (in-graph kappa) and C4-c (friction set rebuild) still open. |
 | Device reward and done | Not implemented | Consumers can read device state/status, but reward/done kernels and stable ABI are still required. |
 | Selective device reset | Not implemented | Reset/teleport and episode bookkeeping still use host paths in the RL adapters. |
 | Batched heterogeneous environments | Not implemented | Current graph requires merged mode and rejects per-env/strict overlays. |

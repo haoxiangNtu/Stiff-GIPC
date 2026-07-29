@@ -36,6 +36,15 @@ struct _LsTimer {
               *acc += m; cudaEventDestroy(a); cudaEventDestroy(b); on=false; } }
 };
 
+// [C4-a] collision inside the whole-frame conditional graph is an explicit
+// opt-in while the kappa/close-set and friction chains still live at frame
+// boundaries (see GIPC.cuh contract note).
+static bool c4_collision_graph_enabled()
+{
+    const char* value = std::getenv("STIFF_C4_COLLISION_GRAPH");
+    return value && value[0] && std::atoi(value) != 0;
+}
+
 void GIPC::lineSearchConditional(device_TetraData& TetMesh,
                                  const double* alpha_device)
 {
@@ -46,10 +55,10 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
     if(!alpha_device)
         throw std::invalid_argument(
             "[line-search-conditional] null device alpha");
-    if(!m_skip_all_collision)
+    if(!m_skip_all_collision && !c4_collision_graph_enabled())
         throw std::runtime_error(
-            "[line-search-conditional] collision-domain checks are not yet "
-            "device-conditional");
+            "[line-search-conditional] collision-domain checks require "
+            "STIFF_C4_COLLISION_GRAPH=1");
     if(m_mode_config.perenv_alpha)
         throw std::runtime_error(
             "[line-search-conditional] per-environment alpha requires the "
@@ -62,33 +71,45 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
 
     const int budget =
         line_search_max_iter > 0 ? line_search_max_iter : 64;
-    computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
-
-    CUDA_SAFE_CALL(cudaMemcpyAsync(TetMesh.temp_double3Mem,
-                                   TetMesh.vertexes,
-                                   vertexNum * sizeof(double3),
-                                   cudaMemcpyDeviceToDevice,
-                                   cudaStreamPerThread));
-    m_abd_system->copy_q_to_q_temp(*m_abd_sim_data);
 
     // Host values below define only capacity-sized launch bounds while the
-    // graph is being recorded. Exact live counts remain device-owned.
-    m_energy_bound_cp =
-        static_cast<int>(h_cpNum[0])
-        + static_cast<int>(h_cpNum[0]) / 4 + 64;
-    m_energy_bound_gp =
-        static_cast<int>(h_gpNum)
-        + static_cast<int>(h_gpNum) / 4 + 64;
+    // graph is being recorded. Exact live counts remain device-owned. With
+    // collision in the graph the executable is reused across frames, so the
+    // bounds must be full trained capacities — a count-plus-slack bound
+    // recorded from a stale mirror would silently drop pairs later.
+    const bool collision_body = !m_skip_all_collision;
+    if(collision_body)
+    {
+        m_energy_bound_cp = MAX_COLLITION_PAIRS_NUM;
+        m_energy_bound_gp = surf_vertexNum;
+    }
+    else
+    {
+        m_energy_bound_cp =
+            static_cast<int>(h_cpNum[0])
+            + static_cast<int>(h_cpNum[0]) / 4 + 64;
+        m_energy_bound_gp =
+            static_cast<int>(h_gpNum)
+            + static_cast<int>(h_gpNum) / 4 + 64;
+    }
     m_ls_defer_counts           = true;
     m_energy_use_device_counts = true;
-
-    _ls_conditional_seed<<<1, 1>>>(
-        m_d_ls_alpha,
-        alpha_device,
-        m_line_search_decision,
-        frame);
     try
     {
+        computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
+
+        CUDA_SAFE_CALL(cudaMemcpyAsync(TetMesh.temp_double3Mem,
+                                       TetMesh.vertexes,
+                                       vertexNum * sizeof(double3),
+                                       cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
+        m_abd_system->copy_q_to_q_temp(*m_abd_sim_data);
+
+        _ls_conditional_seed<<<1, 1>>>(
+            m_d_ls_alpha,
+            alpha_device,
+            m_line_search_decision,
+            frame);
         recorder->while_loop(
             1,
             cudaGraphCondAssignDefault,
@@ -109,7 +130,7 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
                     energy_abs_tol,
                     energy_rel_tol,
                     m_line_search_decision,
-                    nullptr,
+                    collision_body ? _gdCollapse : nullptr,
                     m_d_ls_alpha);
                 _ls_conditional_tail<<<1, 1>>>(
                     m_line_search_decision,
@@ -698,9 +719,10 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
     if(!recorder || !frame)
         throw std::logic_error(
             "[frame-conditional] recorder/device state is unavailable");
-    if(!m_skip_all_collision)
+    const bool collision_body = !m_skip_all_collision;
+    if(collision_body && !c4_collision_graph_enabled())
         throw std::runtime_error(
-            "[frame-conditional] collision path is not yet eligible");
+            "[frame-conditional] collision requires STIFF_C4_COLLISION_GRAPH=1");
     if(m_update_boundary || softNum != 0)
         throw std::runtime_error(
             "[frame-conditional] moving boundaries and host soft targets "
@@ -726,40 +748,85 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
         0,
         vertexNum * sizeof(double3),
         cudaStreamPerThread));
-    recorder->while_loop(
-        1,
-        cudaGraphCondAssignDefault,
-        [&](cudaGraphConditionalHandle newton_handle)
-        {
-            _newton_iteration_begin<<<1, 1>>>(frame);
-            computeGradientAndHessian(TetMesh);
-            calculateMovingDirection(
-                TetMesh, 0, pcg_data.P_type);
-            calcMinMovement_DeviceOut(
-                _moveDir, pcg_data.squeue, vertexNum);
-            _newton_convergence_decide<<<1, 1>>>(
-                pcg_data.squeue,
-                threshold,
-                m_newton_convergence_decision,
-                frame);
 
-            recorder->if_then(
-                [&](cudaGraphConditionalHandle step_handle)
-                {
-                    _newton_step_predicate<<<1, 1>>>(
-                        frame, step_handle);
-                },
-                [&](cudaGraphConditionalHandle)
-                {
-                    _newton_unit_alpha<<<1, 1>>>(
-                        m_ccd_alpha_slots, frame);
-                    lineSearchConditional(
-                        TetMesh, m_ccd_alpha_slots + 5);
-                });
+    // [C4-a] collision frame prologue, in-capture: fresh broad phase + DCD
+    // narrow phase in deferred-count mode (host mirrors stay frozen; live
+    // counts ride the device pair-count snapshot). kappa and the friction
+    // sets keep their frame-boundary values by contract.
+    const bool restore_defer  = m_ls_defer_counts;
+    const bool restore_energy = m_energy_use_device_counts;
+    if(collision_body)
+    {
+        m_ls_defer_counts           = true;
+        m_energy_use_device_counts = true;
+        // Recording-time capacity mirrors: every contact launch extent and
+        // triplet-offset step recorded below must be shaped by the trained
+        // capacity, not by whatever pair counts the last synchronous frame
+        // happened to have — a tier(0) extent would bake contact out of the
+        // Hessian while the capacity-bound energy still sees it (the
+        // first-contact livelock). Live counts stay device-owned; the
+        // capture caller restores the real mirrors right after recording.
+        for(int slot = 0; slot < 5; ++slot)
+            h_cpNum.refresh_dst()[slot] =
+                static_cast<uint32_t>(MAX_COLLITION_PAIRS_NUM);
+        h_gpNum = static_cast<uint32_t>(surf_vertexNum);
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            _gdCollapse, 0, sizeof(int), cudaStreamPerThread));
+        buildBVH();
+        buildCP();
+    }
+    try
+    {
+        recorder->while_loop(
+            1,
+            cudaGraphCondAssignDefault,
+            [&](cudaGraphConditionalHandle newton_handle)
+            {
+                _newton_iteration_begin<<<1, 1>>>(frame);
+                if(collision_body)
+                    snapshotDcdCcdPairsCapture();
+                computeGradientAndHessian(TetMesh);
+                calculateMovingDirection(
+                    TetMesh, 0, pcg_data.P_type);
+                calcMinMovement_DeviceOut(
+                    _moveDir, pcg_data.squeue, vertexNum);
+                _newton_convergence_decide<<<1, 1>>>(
+                    pcg_data.squeue,
+                    threshold,
+                    m_newton_convergence_decision,
+                    frame);
 
-            _newton_tail_conditional<<<1, 1>>>(
-                frame, iteration_cap, newton_handle);
-        });
+                recorder->if_then(
+                    [&](cudaGraphConditionalHandle step_handle)
+                    {
+                        _newton_step_predicate<<<1, 1>>>(
+                            frame, step_handle);
+                    },
+                    [&](cudaGraphConditionalHandle)
+                    {
+                        if(collision_body)
+                            enqueue_ccd_alpha_conditional();
+                        else
+                            _newton_unit_alpha<<<1, 1>>>(
+                                m_ccd_alpha_slots, frame);
+                        lineSearchConditional(
+                            TetMesh, m_ccd_alpha_slots + 5);
+                    });
+
+                _newton_tail_conditional<<<1, 1>>>(
+                    frame, iteration_cap, newton_handle);
+            });
+        if(collision_body)
+            enqueue_pair_tier_guard();
+    }
+    catch(...)
+    {
+        m_ls_defer_counts           = restore_defer;
+        m_energy_use_device_counts = restore_energy;
+        throw;
+    }
+    m_ls_defer_counts           = restore_defer;
+    m_energy_use_device_counts = restore_energy;
 }
 
 

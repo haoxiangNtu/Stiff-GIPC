@@ -1139,5 +1139,11 @@ void GIPC::energy_launch_barrier(device_TetraData& TetMesh, double* queue, int n
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs,
                 energy_kappa >= 0.0 ? energy_kappa : Kappa, dHat, numbers,
                 pe, pe ? p2g : nullptr, ng,
-                m_energy_use_device_counts ? _cpNum + 0 : nullptr);
+                // [C4-a] read the DCD-time snapshot block, never the live
+                // counter: buildFullCP reuses _cpNum[0] for the swept CCD
+                // count, so after a CCD chain the live slot no longer
+                // describes _collisonPairs. m_pair_snap_cur is refreshed in
+                // lockstep with the pair buffer by every buildCP.
+                m_energy_use_device_counts ? m_pair_snap_cur.data() + 0
+                                           : nullptr);
 }

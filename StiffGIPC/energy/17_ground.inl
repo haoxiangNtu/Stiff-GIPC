@@ -163,5 +163,8 @@ void GIPC::energy_launch_ground(device_TetraData& TetMesh, double* queue, int nu
                 queue, TetMesh.vertexes, _groundOffset, _groundNormal,
                 _environment_collisionPair, dHat, Kappa, numbers,
                 pe, pe ? p2g : nullptr, ng,
-                m_energy_use_device_counts ? _cpNum + 5 : nullptr);
+                // [C4-a] DCD-time snapshot slot, not the live counter block
+                // (see energy_launch_barrier).
+                m_energy_use_device_counts ? m_pair_snap_cur.data() + 5
+                                           : nullptr);
 }

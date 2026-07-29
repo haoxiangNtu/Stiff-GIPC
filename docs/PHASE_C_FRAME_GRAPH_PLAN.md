@@ -275,3 +275,40 @@ nsys 捕获窗内 API 分布：40 次 `cudaGraphLaunch`（92.4% API 时间，均
 一张 551 节点图推进流。闭环 43 帧（3 warm + 40 稳态）全 `result=0`、
 `frame_id` 单调至 42。D4 余项=接触丰富负载、设备 policy 集成、长时程/
 显存高水位/吞吐延迟度量（见完成块清单）。
+
+## C4-a 落地战报：碰撞进整帧图（2026-07-29）
+
+`STIFF_C4_COLLISION_GRAPH=1`（默认关）把碰撞链整体录进整帧条件图：帧序幕
+buildBVH+buildCP（defer 计数模式）、Newton 体内 DCD 快照、`m_ccd_alpha_slots`
+全设备 CCD 标量链（初始 ground/self 归约→swept BVH+buildFullCP→CFL+refined
+容量网格归约→combine 图内裁决），以及消费真实 barrier/ground 能量的回溯 LS。
+无 fallback：碰到不合格场景仍诚实回退，但合格场景**每帧一次 root launch 全
+程含碰撞**。
+
+四条工程线支撑：
+
+- **录制期容量镜像**：录制时把 `h_cpNum/h_gpNum` 镜像临时置为满容量
+  （tier(MAX_PAIRS)），使装配 extents、triplet offset 步进、能量 launch
+  bound 全部按容量成形——否则从 dcd=0 的帧录出的图把接触烤没（Hessian 看
+  不见接触而能量看得见 → 首接触帧 LS 活锁，Newton 顶格 1000 迭代实证）。
+  能量核活计数改读 `m_pair_snap_cur`（DCD 时刻快照），不再读会被 buildFullCP
+  改写的 `_cpNum` 活槽。
+- **捕获前干跑训练**：显式 tier 数学（triplet/staging/hash/radix-sort
+  workspace/reduce scratch/DCD 快照满容量化）之后，以容量镜像真跑一次
+  `computeGradientAndHessian`+`calculateMovingDirection`——converter staging、
+  muda 排序 temp、预条件 per-level 缓冲在各自真实路径上于捕获外长到位（三
+  次 error-900 捕获期分配逐一实证后收敛到此方案）。干跑必须在
+  `arm_full_graph_attempt` 之后（要走与录制相同的 txn 分区分支）；宿主记账
+  由快照机制回滚，stats JSON 上下文同样备份恢复。
+- **图内溢出裁决**：`_ccd_final_alpha_combine` 增容量参数（swept 超容=
+  OVF_CCD_PAIRS→FRAME_RETRY），Newton 环出口 `_pair_tier_guard` 对照录制
+  tier 检查五路对计数（OVF_DCD_PAIRS→RETRY）；帧边界 finish 处刷新镜像
+  并在 tier 跨越时销毁 exec 强制重录（mask 只能向下，不能向上 launch）。
+- **合法漂移档**：容量网格 sum 归约相对精确计数归约合法重排浮点结合序，
+  实测位置 ~2e-13/速度 ~1e-11；G18 以 1e-9 相对容差裁决（真接触 bug 是
+  1e-3+ 级，六个数量级余量）。
+
+**C4-a 契约**（资格检查强制）：kappa 与 close-set 冻结在帧边界值（图内不跑
+postLineSearch）→ sync 等价只在 kappa-quiet 窗口主张；摩擦系数必须为零
+（摩擦集只在同步帧重建，非零摩擦被资格拒绝——C4-b/c 的目标=图内 kappa
+自适应与摩擦 lagged 集设备重建）。验收=G18（`scripts/collision_graph_gate.py`）。
