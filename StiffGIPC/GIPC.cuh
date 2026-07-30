@@ -786,6 +786,7 @@ class GIPC
                         std::min(m_graph_train_ccd,
                                  MAX_CCD_COLLITION_PAIRS_NUM));
     }
+    void ensure_graph_friction_capacity();
     void update_graph_training_capacity();
     void self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
                                                        double* mqueue,

@@ -175,14 +175,17 @@ __global__ void _ls_conditional_tail(
         }
         else if(exhausted)
         {
-            frame_fsm::fsm_record_error(
-                frame,
-                frame_fsm::ERR_SOLVER_EXCEPTION,
-                frame_fsm::INV_LS_BUDGET,
-                -1,
-                -1);
-            frame->result = frame_fsm::FRAME_FATAL;
-            frame->phase  = frame_fsm::PHASE_ROLLBACK;
+            // [C6-e] Budget exhaustion is NOT fatal on the host: it prints the
+            // "[line-search][WARN] budget exhausted ... Step accepted anyway"
+            // message, bumps m_ls_exhausted_total, and carries on; the only
+            // throw is frame 0 with a non-finite incremental potential. Killing
+            // the frame here instead diverged from the solver we are supposed to
+            // reproduce. Record the bit for step-health telemetry (the host
+            // increments its counter off it in frame_graph_finish_terminal) and
+            // accept the step. A collapse that survived the budget IS fatal --
+            // that is the branch above, matching the host's ground-trial throw.
+            atomicOr(&frame->invalid_bits,
+                     (unsigned)frame_fsm::INV_LS_BUDGET);
         }
     }
     const bool healthy = !frame || frame->result == frame_fsm::FRAME_OK;

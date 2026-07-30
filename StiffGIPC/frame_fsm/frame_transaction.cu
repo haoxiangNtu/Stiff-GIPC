@@ -2035,6 +2035,81 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
                     n_exact > 0.0 ? std::sqrt(n_mirror / n_exact) : 0.0,
                     worst, worst_i, worst_i / 3, nonfinite_mirror);
         }
+        // [C6-e] Tier-invariance probe. A tier is only a launch extent over
+        // zero-padded slots, so assembling the SAME state at two different
+        // tiers must give the same search direction. Frame 11 of foldshirt says
+        // otherwise: growing cp[4] from 1024 to 8192 turned a clean 50-iteration
+        // attempt into a 3.8M-pair swept explosion on the very next attempt.
+        // Each (tier, pre-zero) combination is assembled from identical state;
+        // if the two tiers disagree only when the buffer is NOT pre-zeroed, the
+        // pad span of the grown class is what is leaking.
+        if(std::getenv("STIFF_GRAPH_TIERPROBE"))
+        {
+            const int  saved4 = ipc.m_graph_train_cp[4];
+            const int  dofs   = 3 * static_cast<int>(ipc.vertexNum);
+            std::vector<double> pass[4];
+            long long offsets[4] = {0, 0, 0, 0};
+            for(int variant = 0; variant < 4; ++variant)
+            {
+                const bool big       = (variant % 2) != 0;
+                const bool pre_zero  = variant >= 2;
+                ipc.m_graph_train_cp[4] = big ? saved4 * 8 : saved4;
+                for(int slot = 0; slot < 5; ++slot)
+                    ipc.h_cpNum.refresh_dst()[slot] =
+                        static_cast<uint32_t>(ipc.m_graph_train_cp[slot]);
+                ipc.h_gpNum = static_cast<uint32_t>(
+                    ipc.graph_trained_ground_extent());
+#ifdef USE_FRICTION
+                for(int slot = 0; slot < 5; ++slot)
+                    ipc.h_cpNum_last.refresh_dst()[slot] =
+                        static_cast<uint32_t>(ipc.m_graph_train_cp[slot]);
+                ipc.h_gpNum_last = static_cast<uint32_t>(
+                    ipc.graph_trained_ground_extent());
+#endif
+                if(pre_zero)
+                {
+                    auto& tri = ipc.gipc_global_triplet;
+                    const size_t cap = tri.triplet_capacity();
+                    CUDA_SAFE_CALL(cudaMemset(tri.block_row_indices(0), 0,
+                                              cap * sizeof(int)));
+                    CUDA_SAFE_CALL(cudaMemset(tri.block_col_indices(0), 0,
+                                              cap * sizeof(int)));
+                    CUDA_SAFE_CALL(cudaMemset(tri.block_values(0), 0,
+                                              cap * sizeof(Eigen::Matrix3d)));
+                }
+                ipc.computeGradientAndHessian(mesh);
+                ipc.calculateMovingDirection(mesh, 0, ipc.pcg_data.P_type);
+                offsets[variant] =
+                    ipc.gipc_global_triplet.global_triplet_offset;
+                pass[variant].resize(dofs);
+                CUDA_SAFE_CALL(cudaMemcpy(pass[variant].data(),
+                                          ipc._moveDir,
+                                          static_cast<size_t>(dofs)
+                                              * sizeof(double),
+                                          cudaMemcpyDeviceToHost));
+            }
+            ipc.m_graph_train_cp[4] = saved4;
+            auto report = [&](const char* label, int a, int b) {
+                double na = 0.0, nb = 0.0, nd = 0.0;
+                for(int i = 0; i < dofs; ++i)
+                {
+                    na += pass[a][i] * pass[a][i];
+                    nb += pass[b][i] * pass[b][i];
+                    const double d = pass[a][i] - pass[b][i];
+                    nd += d * d;
+                }
+                fprintf(stderr,
+                        "[tierprobe] %s cp4=%d vs %d: |small|=%.6e "
+                        "|big|=%.6e |diff|=%.6e rel=%.3e "
+                        "offsets=%lld vs %lld\n",
+                        label, saved4, saved4 * 8,
+                        std::sqrt(na), std::sqrt(nb), std::sqrt(nd),
+                        na > 0.0 ? std::sqrt(nd / na) : 0.0,
+                        offsets[a], offsets[b]);
+            };
+            report("raw      ", 0, 1);
+            report("pre-zeroed", 2, 3);
+        }
         // The recording replays the same mirrors and the same path, so the
         // dry run's extents ARE the capture-time extents. The a-priori
         // bound formula cannot see ground/ABD contributions, so re-derive
@@ -2148,7 +2223,11 @@ bool try_launch_full_graph(GIPC& ipc,
     // the previous frame's pair state). Legal boundary host work; the value
     // enters the graph through the per-launch pinned FrameBeginInput and is
     // idempotent, so a later fallback to IPC_Solver stays value-identical.
-    if(!ipc.m_skip_all_collision && attempt == 0
+    // [C6-e] EVERY attempt, not just attempt 0. A capacity retry re-runs the
+    // whole frame from its restored start state, so the frame boundary has to be
+    // rebuilt too -- inheriting attempt 0's boundary was what turned foldshirt's
+    // grasp-closing frame into a 3.8M-pair swept explosion on the first retry.
+    if(!ipc.m_skip_all_collision
        && knob_enabled("STIFF_C4_COLLISION_GRAPH"))
     {
         ipc.upperBoundKappa(ipc.Kappa);
@@ -2161,6 +2240,10 @@ bool try_launch_full_graph(GIPC& ipc,
         // semantics; the sets are frozen for the whole frame). Also refreshes
         // h_cpNum_last/h_gpNum_last and m_pair_snap_last.
         ipc.ensure_frictionBuffers();
+        // Grow to final capacity BEFORE building: the growth is resize_discard,
+        // and training used to run it right after this block, discarding the
+        // lagged sets it had just built.
+        ipc.ensure_graph_friction_capacity();
         ipc.buildFrictionSets();
 #endif
     }
@@ -3446,6 +3529,18 @@ int GIPC::frame_graph_finish_terminal()
         throw std::logic_error("frame terminal graph was not emitted");
     m_last_frame_status = *context.h_status;
     m_graph_tier_grew   = false;   // [C6-b] per-adjudication
+    // [C6-e] Mirror the host's step-health counters: an in-graph line search
+    // that exhausted its budget accepted a non-descent step, exactly as the
+    // host's WARN path does, and an RL loop diffs these across step().
+    if(m_last_frame_status.invalid_bits & frame_fsm::INV_LS_BUDGET)
+    {
+        ++m_ls_exhausted_total;
+        if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
+            fprintf(stderr,
+                    "[line-search][WARN] in-graph budget exhausted on frame "
+                    "%lld: step accepted anyway (host policy)\n",
+                    (long long)m_last_frame_status.frame_id);
+    }
     // [C6-d] Decode a ground-collapse report: which vertex, which body, is that
     // body on the ground skip list, and what is its actual signed distance.
     // The skip mask is a host pointer + host count baked into the recorded
@@ -3786,8 +3881,80 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
     const int64_t physical_frame_id = m_total_frames;
     uint32_t retry_invalid_bits = 0;
 
+    // [C6-e] Rollback audit against the FRAME's start state, captured here,
+    // outside the retry loop. The earlier check compared the live state with
+    // context.fem_vertexes, which the begin graph refreshes at every attempt --
+    // "live == snapshot" is then trivially true and can never detect a failed
+    // restore.
+    const bool audit_rollback = std::getenv("STIFF_FRAME_GRAPH_DIAG") != nullptr;
+    std::vector<double3> frame_start;
+    std::vector<gipc::Vector12> abd_start;
+    const int abd_n = m_abd_sim_data
+                          ? (int)m_abd_sim_data->device.body_id_to_q.size()
+                          : 0;
+    if(audit_rollback && vertexNum)
+    {
+        frame_start.resize(vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(frame_start.data(),
+                                  mesh.vertexes,
+                                  vertexNum * sizeof(double3),
+                                  cudaMemcpyDeviceToHost));
+    }
+    if(audit_rollback && abd_n > 0)
+    {
+        abd_start.resize(abd_n);
+        CUDA_SAFE_CALL(cudaMemcpy(abd_start.data(),
+                                  m_abd_sim_data->device.body_id_to_q.data(),
+                                  (size_t)abd_n * sizeof(gipc::Vector12),
+                                  cudaMemcpyDeviceToHost));
+    }
+
     for(int attempt = 0; attempt <= max_retries; ++attempt)
     {
+        if(audit_rollback && attempt > 0 && !frame_start.empty())
+        {
+            std::vector<double3> live(vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(live.data(),
+                                      mesh.vertexes,
+                                      vertexNum * sizeof(double3),
+                                      cudaMemcpyDeviceToHost));
+            double worst = 0.0;
+            int    worst_i = -1;
+            for(size_t i = 0; i < live.size(); ++i)
+            {
+                const double d = std::max(
+                    std::max(std::fabs(live[i].x - frame_start[i].x),
+                             std::fabs(live[i].y - frame_start[i].y)),
+                    std::fabs(live[i].z - frame_start[i].z));
+                if(d > worst) { worst = d; worst_i = (int)i; }
+            }
+            double abd_worst = 0.0;
+            int    abd_worst_i = -1;
+            if(!abd_start.empty())
+            {
+                std::vector<gipc::Vector12> q(abd_n);
+                CUDA_SAFE_CALL(cudaMemcpy(
+                    q.data(),
+                    m_abd_sim_data->device.body_id_to_q.data(),
+                    (size_t)abd_n * sizeof(gipc::Vector12),
+                    cudaMemcpyDeviceToHost));
+                for(int b = 0; b < abd_n; ++b)
+                    for(int c = 0; c < 12; ++c)
+                    {
+                        const double d =
+                            std::fabs(q[b](c) - abd_start[b](c));
+                        if(d > abd_worst)
+                        {
+                            abd_worst   = d;
+                            abd_worst_i = b;
+                        }
+                    }
+            }
+            fprintf(stderr,
+                    "[rollback-audit] attempt %d: max|live-frameStart|=%.6e "
+                    "at vertex %d | max|q-qStart|=%.6e at body %d of %d\n",
+                    attempt, worst, worst_i, abd_worst, abd_worst_i, abd_n);
+        }
         try
         {
             const bool full_launched =

@@ -84,6 +84,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_GRAPH_DIRPROBE, "diag") \
     X(STIFF_C6_RERECORD, "diag") \
     X(STIFF_GRAPH_LEGACY_KAPPA_DOUBLE, "diag") \
+    X(STIFF_GRAPH_TIERPROBE, "diag") \
     X(STIFF_FRAME_GRAPH_DIAG, "diag") \
     X(STIFF_PCG_EW, "solver") \
     X(STIFF_PCG_EW_ETAMAX, "solver") \

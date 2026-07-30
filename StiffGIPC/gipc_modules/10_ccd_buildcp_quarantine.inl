@@ -67,6 +67,13 @@ __global__ void _ccd_final_alpha_combine(double* slots,
         frame->ccd_count = d_ccd_count
                                ? static_cast<int>(*d_ccd_count)
                                : have_ccd_pairs;
+        // [C6-e] Keep the frame's PEAK swept count, not just the overflow
+        // value. Without it the telemetry reports 0 for every frame that
+        // happens to fit, which makes it impossible to tell an anomalous sweep
+        // from a normal one. The growth path only consults this when an OVF bit
+        // is set, so recording it unconditionally changes no policy.
+        if(frame->ccd_count > frame->hw_ccd_pairs)
+            frame->hw_ccd_pairs = frame->ccd_count;
         frame->phase = frame_fsm::PHASE_LINE_SEARCH;
         // [C4-a] in-graph replacement for the host legacy grow-redo: past-
         // capacity raw counts mean the deferred refined reduction saw only a
@@ -464,6 +471,36 @@ void GIPC::update_graph_training_capacity()
                 MAX_COLLITION_PAIRS_NUM, MAX_CCD_COLLITION_PAIRS_NUM);
 }
 
+// [C6-e] friction lastH family at final capacity. Hoisted out of
+// train_collision_graph_capacities so the frame-boundary buildFrictionSets can
+// call it FIRST: these are resize_DISCARD growths, so running them after the
+// boundary build threw away the lagged sets that had just been computed. The
+// lastH emission is an unbounded atomicAdd, which is why the capacity has to be
+// the worst case rather than a trained tier.
+void GIPC::ensure_graph_friction_capacity()
+{
+#ifdef USE_FRICTION
+    if(static_cast<size_t>(MAX_COLLITION_PAIRS_NUM) > m_fric_cp_cap)
+    {
+        ++pcg_buffer_generation();
+        const size_t n = static_cast<size_t>(MAX_COLLITION_PAIRS_NUM);
+        lambda_lastH_scalar.resize_discard(n);
+        distCoord.resize_discard(n);
+        tanBasis.resize_discard(n);
+        _collisonPairs_lastH.resize_discard(n);
+        m_fric_cp_cap = n;
+    }
+    if(static_cast<size_t>(surf_vertexNum) > m_fric_gd_cap)
+    {
+        ++pcg_buffer_generation();
+        const size_t n = static_cast<size_t>(surf_vertexNum);
+        lambda_lastH_scalar_gd.resize_discard(n);
+        _collisonPairs_lastH_gd.resize_discard(n);
+        m_fric_gd_cap = n;
+    }
+#endif
+}
+
 void GIPC::train_collision_graph_capacities()
 {
     update_graph_training_capacity();
@@ -522,27 +559,7 @@ void GIPC::train_collision_graph_capacities()
         CUDA_SAFE_CALL(cudaMalloc((void**)&m_d_close_flag, sizeof(int)));
 
 #ifdef USE_FRICTION
-    // [C4-c] friction lastH family at final capacity: the boundary
-    // buildFrictionSets and the recorded lagged-count consumers never grow.
-    // Friction lastH emission is likewise an unbounded atomicAdd.
-    if(static_cast<size_t>(MAX_COLLITION_PAIRS_NUM) > m_fric_cp_cap)
-    {
-        ++pcg_buffer_generation();
-        const size_t n = static_cast<size_t>(MAX_COLLITION_PAIRS_NUM);
-        lambda_lastH_scalar.resize_discard(n);
-        distCoord.resize_discard(n);
-        tanBasis.resize_discard(n);
-        _collisonPairs_lastH.resize_discard(n);
-        m_fric_cp_cap = n;
-    }
-    if(static_cast<size_t>(surf_vertexNum) > m_fric_gd_cap)
-    {
-        ++pcg_buffer_generation();
-        const size_t n = static_cast<size_t>(surf_vertexNum);
-        lambda_lastH_scalar_gd.resize_discard(n);
-        _collisonPairs_lastH_gd.resize_discard(n);
-        m_fric_gd_cap = n;
-    }
+    ensure_graph_friction_capacity();
 #endif
 
     // The recorded assembly is shaped by capacity mirrors (all pair counts at
