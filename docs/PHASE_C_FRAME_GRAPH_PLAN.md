@@ -406,3 +406,59 @@ pair returns false. Both mask by a live count and the kernels honour `d_live`;
 the structural difference left is that the host reallocates the close-constraint
 buffers each iteration (`tempFree/tempMalloc_closeConstraint`) while the graph
 reuses MAX-sized ones.
+
+### C6-e — resolved (2026-07-30)
+
+foldshirt (merged, N=1, mu=0.8) now completes **60 frames** with **98% of frames
+(61/62)** recorded into the whole-frame graph, and it is faster than the host
+solver on the same binary and the same window:
+
+| | host | whole-frame graph |
+|---|---|---|
+| 60-frame mean | 1047.1 ms (0.96 fps) | **753.7 ms (1.33 fps)** |
+| frames 0/15/30/45 | 381 / 1339 / 1032 / 674 ms | 387 / 1129 / 571 / 570 ms |
+
+cloth_y matches the host to three decimals at frames 30 and 45; the `allsum`
+state hash differs by 1.7e-3 at frame 30, inside this scene's own 4.4e-3
+run-to-run spread. Timings here vary a lot run-to-run — one paired measurement,
+not a benchmark.
+
+The two defects were both "a retry is a fresh frame, but the code did not treat
+it as one":
+
+1. The frame-boundary block (`upperBoundKappa` / `initKappa` /
+   `buildFrictionSets`) was gated on `attempt == 0`. A capacity retry re-runs the
+   whole frame from a bit-exactly restored start, so the boundary must be rebuilt.
+   Inheriting attempt 0's boundary is what turned the grasp-closing frame into a
+   3.8M-pair swept explosion on the first retry — attempt 1 itself peaked at a
+   perfectly normal 121265.
+2. Those freshly-built friction sets were then **discarded**:
+   `train_collision_graph_capacities()` ran right after the boundary block with
+   guards that grow the lastH family via `resize_discard`. The growth is now
+   hoisted into `ensure_graph_friction_capacity()` and called *before*
+   `buildFrictionSets`. (Found by codex reading the ordering.)
+
+Plus a fifth host/graph policy mismatch: line-search budget exhaustion is not
+fatal on the host (it WARNs, bumps `m_ls_exhausted_total`, and accepts the step;
+only frame 0 with a non-finite potential throws). The graph now does the same,
+while a ground collapse that survives the budget stays fatal — matching the
+host's ground-trial throw.
+
+Dead hypotheses, recorded so they are not re-investigated:
+
+- **The rollback is bit-exact** against the true frame start, for both
+  `mesh.vertexes` and ABD `body_id_to_q`. The earlier check compared against
+  `context.fem_vertexes`, which the begin graph refreshes every attempt, so
+  "live == snapshot" was trivially true and proved nothing.
+- **The assembly is tier-invariant**: the same state at cp[4]=1024 vs 8192 agrees
+  to 2.4e-6 relative with an identical `global_triplet_offset`. The "grown tier
+  pads are not zeroed" theory is dead.
+- Newton cap 50 -> 100 does not help.
+- The host's `isIntersected()` returns false unless `GIPC_FORCE_CCD_SANITY=1`
+  (default-on false-positives every bisection), so "the host reports zero
+  intersections" was never evidence of anything.
+
+`hw_ccd_pairs` now carries the frame's PEAK swept count rather than only the
+overflow value. That is what made the diagnosis possible.
+
+Gates: G18 collision-graph PASS, G19 isolated-graph PASS.
