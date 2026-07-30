@@ -161,7 +161,8 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
                     m_d_ls_alpha,
                     m_line_search_energy + 1,
                     handle,
-                    frame);
+                    frame,
+                    getenv("STIFF_GRAPH_ACCEPT_STARVED_LS") ? 0 : 1);
             });
     }
     catch(...)

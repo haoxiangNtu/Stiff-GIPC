@@ -53,7 +53,7 @@ extern __global__ void _ls_seed(double* alpha_dev, double alpha0, int* status);
 extern __global__ void _ls_trial_tail(int* status, int budget, const double* alpha_dev);
 extern __global__ void _ls_conditional_seed(double* alpha_dev, const double* alpha0_dev, int* status, frame_fsm::FrameDeviceState* frame);
 extern __global__ void _ls_conditional_trial_begin(double* alpha_dev, int* status);
-extern __global__ void _ls_conditional_tail(int* status, int budget, const double* alpha_dev, const double* energy_trial, cudaGraphConditionalHandle handle, frame_fsm::FrameDeviceState* frame);
+extern __global__ void _ls_conditional_tail(int* status, int budget, const double* alpha_dev, const double* energy_trial, cudaGraphConditionalHandle handle, frame_fsm::FrameDeviceState* frame, int retry_starved_ls);
 extern __global__ void _mask_fill(int* m, int v, int n);
 extern __global__ void _mask_from_env_alpha(int* env_active, const double* env_alpha, int ng);
 extern __global__ void _newton_convergence_decide(const double* max_movement, double threshold, int* converged, frame_fsm::FrameDeviceState* frame);

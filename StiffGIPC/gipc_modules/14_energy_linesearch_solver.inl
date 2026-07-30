@@ -127,7 +127,8 @@ __global__ void _ls_conditional_tail(
     const double* alpha_dev,
     const double* energy_trial,
     cudaGraphConditionalHandle handle,
-    frame_fsm::FrameDeviceState* frame)
+    frame_fsm::FrameDeviceState* frame,
+    int retry_starved_ls)
 {
     if(blockIdx.x || threadIdx.x)
         return;
@@ -171,6 +172,30 @@ __global__ void _ls_conditional_tail(
                 -1,
                 status[2]);
             frame->result = frame_fsm::FRAME_FATAL;
+            frame->phase  = frame_fsm::PHASE_ROLLBACK;
+        }
+        else if(exhausted && retry_starved_ls
+                && (frame->invalid_bits
+                    & (frame_fsm::OVF_DCD_PAIRS | frame_fsm::OVF_CCD_PAIRS
+                       | frame_fsm::OVF_TRIPLETS | frame_fsm::OVF_UNIQUE_BLOCKS
+                       | frame_fsm::OVF_MAS_CLUSTERS)))
+        {
+            // [C6-g] Exhausted WITH a capacity bit already set is a starved
+            // search, not a hard one. The host's accept-anyway policy applies to
+            // a non-descent step computed from the FULL pair set; a step
+            // computed from a truncated one is not the same object. towel
+            // reproduces this exactly: the one frame per run that exhausts is
+            // also the one reporting OVF_DCD_PAIRS (inv=0x10040), and accepting
+            // its step is what moved the crumple metric from a deterministic
+            // 0.905 to a 0.90..1.03 spread. Retry at a larger tier instead --
+            // the capacity bits are retryable and the growth is bounded.
+            frame_fsm::fsm_record_error(
+                frame,
+                frame_fsm::ERR_CAPACITY,
+                frame_fsm::INV_LS_BUDGET,
+                -1,
+                -1);
+            frame->result = frame_fsm::FRAME_RETRY_REQUIRED;
             frame->phase  = frame_fsm::PHASE_ROLLBACK;
         }
         else if(exhausted)

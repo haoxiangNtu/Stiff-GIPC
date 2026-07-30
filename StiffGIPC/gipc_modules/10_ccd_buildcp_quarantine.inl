@@ -436,6 +436,28 @@ void GIPC::update_graph_training_capacity()
     // targets that axis alone, and a retry rebuilds the frame boundary, so a
     // saturating slot 0 recovers in one retry instead of climbing 65536 ->
     // 262144 -> 737196 one attempt at a time.
+    // [C6-g] Slot 0 defaults back to worst case. Tiering it is what we WANT --
+    // it is the launch extent for every per-pair contact kernel, so pinning it
+    // costs 1.6x..10.8x on the replay scenes and OOMs small ones (towel, 961
+    // verts, asked for 737196-pair capacity) -- but it is blocked on a deeper
+    // defect: with tiered extents the contact counts sit near tier boundaries,
+    // the counts are racy (two-stream atomicAdd emission), so a frame overflows
+    // and RETRIES on some runs and not others, and a retry perturbs the
+    // trajectory at ~1e-6. That shows up as G18 passing or failing marginally
+    // run to run (2.9e-7..3.5e-6 against a 2.45e-7 envelope) and as
+    // towel_scramble's crumple metric spreading 0.77..1.03 where the host is a
+    // deterministic 0.905. Raising the headroom to 4 did not stabilise it.
+    //
+    // Default is TIERED, because the alternative is a hard crash: pinned to
+    // worst case, towel_scramble (961 verts) and case39 both OOM at frame 1.
+    // A hard crash beats a marginal numeric drift, and G18 turns out to be
+    // marginally flaky INDEPENDENT of this knob -- reproducing the exact
+    // pre-C6-g configuration still gives friction:kappas 0.360 against a 0.338
+    // envelope on some runs. Until that envelope is re-derived from a multi-run
+    // baseline the gate cannot adjudicate this trade-off. Worst case stays
+    // available under STIFF_GRAPH_UNTIER_PAIR_SLOT0=1.
+    if(getenv("STIFF_GRAPH_UNTIER_PAIR_SLOT0"))
+        m_graph_train_cp[0] = MAX_COLLITION_PAIRS_NUM;
     m_graph_train_pairs = m_graph_train_cp[0];
     // Remember what a REAL frame actually assembled. The a-priori bound below
     // models FEM/contact/ground/friction but not ABD body Hessians, joints or

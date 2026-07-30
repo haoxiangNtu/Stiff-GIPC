@@ -3855,6 +3855,14 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
     // Frame zero remains the allocation/lazy-workspace warm-up boundary. It
     // runs the release solver and publishes an explicit fallback packet; no
     // graph caches a pointer until those first-use allocations have settled.
+    //
+    // [C6-g] REJECTED: gating additionally on "a frame has observed contact"
+    // (so the capacity tiers never train from a contact-free frame). It did not
+    // fix what it targeted -- towel's crumple spread stayed at 0.955..1.031 --
+    // cost coverage (98% -> 93%), and moved G18 off its calibrated noise
+    // envelope by changing WHICH frames are graphed. The specific cliffs it was
+    // aimed at are already handled: the ground axis is trained to worst case
+    // (it has no OVF bit) and the contact-class tiers grow through OVF_TRIPLETS.
     if(m_total_frames == 0)
     {
         const int before = m_total_newton_iters;

@@ -769,7 +769,26 @@ class GIPC
     int m_last_assembled_triplets = 0;  // measured length of a real frame
     int m_graph_train_ground = 0;   // trained ground pair extent
     // Growth factor applied to the observed counts when training.
-    static int graph_train_headroom_num() { return 2; }
+    // [C6-g] Tier headroom. This is a DETERMINISM knob, not just a memory one.
+    // Contact counts are emitted by racy atomicAdd across two streams, so a
+    // count sitting near a tier boundary crosses it on some runs and not
+    // others; the frame then retries on some runs and not others, and a retry
+    // is not physics-neutral (it perturbs the trajectory at ~1e-6, which
+    // chaotic contact amplifies). Symptoms of headroom=2: G18 passes or fails
+    // marginally run to run (squeeze/friction velocities 2.9e-7..3.5e-6 against
+    // a 2.45e-7 envelope, with OVF_TRIPLETS retries firing intermittently), and
+    // towel_scramble's crumple metric spreads 0.77..1.03 where the host is a
+    // deterministic 0.905. Overridable so the trade-off stays measurable.
+    static int graph_train_headroom_num()
+    {
+        if(const char* e = getenv("STIFF_GRAPH_TIER_HEADROOM"))
+        {
+            const int v = atoi(e);
+            if(v >= 1 && v <= 64)
+                return v;
+        }
+        return 2;   // known-good; headroom 4 did NOT stabilise G18 either
+    }
     int graph_trained_pair_extent() const { return m_graph_train_pairs; }
     int graph_trained_ground_extent() const { return m_graph_train_ground; }
     // Swept (CCD) extent is trained INDEPENDENTLY of the DCD extent. They are
