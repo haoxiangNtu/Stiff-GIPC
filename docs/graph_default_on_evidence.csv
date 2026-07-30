@@ -1,0 +1,13 @@
+scene,graph,rc,mean_ms,frames,wall_s,coverage,error
+foldshirt_multienv,off,0,323.8,60,20,,
+foldshirt_multienv,on,0,526.0,60,32,61/62 (98%),
+foldshirt_finray,off,0,268.5,60,17,,
+foldshirt_finray,on,0,604.5,60,37,60/61 (98%),
+cupshirt_finray,off,0,109.4,60,7,,
+cupshirt_finray,on,0,351.9,60,22,60/61 (98%),
+beaker_finray,off,0,134.4,60,9,,
+beaker_finray,on,1,,,2,4/5 (80%),[frame-fsm] frame 1 failed: result=1 phase=9 error=4 invalid=0x20000 primitive=-1 cause=ca
+case39_cup_softgripper,off,0,98.6,,6,,
+case39_cup_softgripper,on,0,263.8,,16,62/63 (98%),
+towel_scramble,off,0,22.5,,6,,
+towel_scramble,on,1,244.1,,55,39/40 (98%),

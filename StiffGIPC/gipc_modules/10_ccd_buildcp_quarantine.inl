@@ -421,15 +421,21 @@ void GIPC::update_graph_training_capacity()
             std::max(m_graph_train_cp[slot],
                      std::min(want, MAX_COLLITION_PAIRS_NUM));
     }
-    // [C6-d] Slot 0 is the DCD pair ARRAY extent, and unlike slots 2..4 it does
-    // NOT feed the triplet envelope (that is built from cp[2]*M6 + cp[3]*M9 +
-    // cp[4]*M12). Tiering it therefore buys no memory -- the array is
-    // MAX_COLLITION_PAIRS_NUM * sizeof(int4), about 12 MB -- while a tier
-    // trained from frame 0 (the only host frame) truncates the moment contact
-    // richens: foldshirt saturated 65536 at the grasp-closing frame, reported
-    // 65537, and spent its whole retry budget climbing 65536 -> 262144 ->
-    // 737196 one attempt at a time. The host never tiers this axis at all.
-    m_graph_train_cp[0] = MAX_COLLITION_PAIRS_NUM;
+    // [C6-f] Slot 0 stays TIERED (peak * headroom, from the loop above).
+    //
+    // C6-d pinned it to MAX_COLLITION_PAIRS_NUM on the argument that it does not
+    // feed the triplet envelope, so widening it costs no memory. That is true of
+    // memory and false of time: it is the launch extent for every per-pair
+    // contact kernel, so the recorded frame ran 737196-wide grids over a scene
+    // with ~28k live pairs. Paired measurement on foldshirt, same binary, same
+    // machine state, 60 frames: graph-off 341.5 ms/frame vs graph-on 629.5 ms
+    // -- the graph was 1.84x SLOWER, and foldshirt_finray 276.4 -> 692.3 ms.
+    //
+    // The reason C6-d had to widen it is now gone: the tier guard reports WHICH
+    // axis crossed with a per-axis deficit (see _pair_tier_guard), growth
+    // targets that axis alone, and a retry rebuilds the frame boundary, so a
+    // saturating slot 0 recovers in one retry instead of climbing 65536 ->
+    // 262144 -> 737196 one attempt at a time.
     m_graph_train_pairs = m_graph_train_cp[0];
     // Remember what a REAL frame actually assembled. The a-priori bound below
     // models FEM/contact/ground/friction but not ABD body Hessians, joints or
