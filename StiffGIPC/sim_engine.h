@@ -227,8 +227,9 @@ class SimEngine
 
     void add_collision_exclusion(int body_a, int body_b);
     /// Declare one group id per collision body. Non-negative ids must be dense
-    /// [0,N), N<=256. Wildcard -1 is supported only by merged-mode execution;
-    /// isolated/strict require every body to be grouped. Validated at finalize().
+    /// [0,N), N <= device_TetraData::kGroupSlotCapacity (4096). Wildcard -1 is
+    /// supported only by merged-mode execution; isolated/strict require every
+    /// body to be grouped. Validated at finalize().
     void set_body_groups(const std::vector<int>& groups);
     // [multi-env subscene] Per-VERTEX env id (length = engine vertex count). The
     // broad-phase skips contact pairs whose two vertices carry different (>=0) env
