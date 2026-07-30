@@ -131,6 +131,15 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
             {
                 _ls_conditional_trial_begin<<<1, 1>>>(
                     m_d_ls_alpha, m_line_search_decision);
+                // [C6-d] The ground detect records collapse with atomicMin, so
+                // without a per-trial reset the flag is sticky: the first
+                // infeasible trial poisons every later one and backtracking can
+                // never clear it. memsetAsync is capture-legal.
+                if(collision_body && _gdCollapse)
+                    CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse,
+                                                   0,
+                                                   sizeof(int),
+                                                   cudaStreamPerThread));
                 step_forward(TetMesh, 0.0, false, m_d_ls_alpha);
                 buildBVH();
                 buildCP();

@@ -134,7 +134,16 @@ __global__ void _ls_conditional_tail(
 
     const bool pair_overflow = status[1] != status[6];
     const bool collapse      = status[2] < 0;
-    const bool exhausted     = status[0] == 1 && status[3] >= budget;
+    // [C6-d] A ground-infeasible trial is RECOVERABLE, exactly as on the host:
+    // its line search runs a dedicated ground-trial backtracking loop
+    // (`while(ground_trial_status != 0 && backtracks < budget) { alpha *= 0.5;
+    // step_forward(...); }`) and only throws once backtracking is out of
+    // budget. Declaring the first infeasible trial FRAME_FATAL killed frames
+    // the host clears: foldshirt rests a plate vertex 3.5e-6 above the plane,
+    // so a trial step that dips it below is routine and one halving fixes it.
+    const bool descent_failed = status[0] == 1;
+    const bool want_backtrack = descent_failed || collapse;
+    const bool exhausted      = want_backtrack && status[3] >= budget;
     if(frame)
     {
         frame->alpha        = *alpha_dev;
@@ -153,7 +162,7 @@ __global__ void _ls_conditional_tail(
             frame->result = frame_fsm::FRAME_RETRY_REQUIRED;
             frame->phase  = frame_fsm::PHASE_ROLLBACK;
         }
-        if(collapse)
+        if(collapse && exhausted)
         {
             frame_fsm::fsm_record_error(
                 frame,
@@ -164,7 +173,7 @@ __global__ void _ls_conditional_tail(
             frame->result = frame_fsm::FRAME_FATAL;
             frame->phase  = frame_fsm::PHASE_ROLLBACK;
         }
-        if(exhausted)
+        else if(exhausted)
         {
             frame_fsm::fsm_record_error(
                 frame,
@@ -179,7 +188,7 @@ __global__ void _ls_conditional_tail(
     const bool healthy = !frame || frame->result == frame_fsm::FRAME_OK;
     cudaGraphSetConditional(
         handle,
-        healthy && status[0] == 1 && status[3] < budget ? 1u : 0u);
+        healthy && want_backtrack && status[3] < budget ? 1u : 0u);
 }
 
 __global__ void _newton_step_predicate(

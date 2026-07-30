@@ -1959,6 +1959,32 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
             ipc.m_ls_defer_counts           = defer_save;
             ipc.m_energy_use_device_counts = energy_save;
         }
+        // [C6-d] Did the rollback actually restore? Compare the live state with
+        // the snapshot the terminal graph restores from. Zero means restored.
+        FrameGraphContext& restore_ctx = graph_context(ipc);
+        if(std::getenv("STIFF_FRAME_GRAPH_DIAG") && restore_ctx.vertex_count)
+        {
+            std::vector<double3> live(restore_ctx.vertex_count);
+            std::vector<double3> snap(restore_ctx.vertex_count);
+            const size_t bytes = restore_ctx.vertex_count * sizeof(double3);
+            CUDA_SAFE_CALL(cudaMemcpy(live.data(), mesh.vertexes, bytes,
+                                      cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(snap.data(), restore_ctx.fem_vertexes,
+                                      bytes, cudaMemcpyDeviceToHost));
+            double worst = 0.0;
+            int    worst_i = -1;
+            for(size_t i = 0; i < live.size(); ++i)
+            {
+                const double d =
+                    std::max(std::max(std::fabs(live[i].x - snap[i].x),
+                                      std::fabs(live[i].y - snap[i].y)),
+                             std::fabs(live[i].z - snap[i].z));
+                if(d > worst) { worst = d; worst_i = (int)i; }
+            }
+            fprintf(stderr,
+                    "[restore] max|live-snap|=%.6e at vertex %d of %d\n",
+                    worst, worst_i, (int)restore_ctx.vertex_count);
+        }
         // [C6] trained extent, not worst-case capacity.
         for(int slot = 0; slot < 5; ++slot)
             ipc.h_cpNum.refresh_dst()[slot] =
@@ -3420,6 +3446,46 @@ int GIPC::frame_graph_finish_terminal()
         throw std::logic_error("frame terminal graph was not emitted");
     m_last_frame_status = *context.h_status;
     m_graph_tier_grew   = false;   // [C6-b] per-adjudication
+    // [C6-d] Decode a ground-collapse report: which vertex, which body, is that
+    // body on the ground skip list, and what is its actual signed distance.
+    // The skip mask is a host pointer + host count baked into the recorded
+    // launch, so a body that is legitimately allowed below the plane would be
+    // reported as collapsed if the recording captured a count of zero.
+    if(std::getenv("STIFF_FRAME_GRAPH_DIAG")
+       && (m_last_frame_status.invalid_bits
+           & frame_fsm::INV_START_INTERSECTING)
+       && m_last_frame_status.err_primitive < 0)
+    {
+        const int vertex = -m_last_frame_status.err_primitive - 1;
+        double3   position = make_double3(0.0, 0.0, 0.0);
+        double3   normal   = make_double3(0.0, 0.0, 0.0);
+        double    offset   = 0.0;
+        int       body     = -1;
+        int       skip     = -1;
+        if(vertex >= 0 && vertex < static_cast<int>(vertexNum))
+        {
+            CUDA_SAFE_CALL(cudaMemcpy(&position, _vertexes + vertex,
+                                      sizeof(double3), cudaMemcpyDeviceToHost));
+            if(_point_body_id)
+                CUDA_SAFE_CALL(cudaMemcpy(&body, _point_body_id + vertex,
+                                          sizeof(int), cudaMemcpyDeviceToHost));
+        }
+        if(_ground_skip_body && body >= 0 && body < _ground_body_count)
+            CUDA_SAFE_CALL(cudaMemcpy(&skip, _ground_skip_body + body,
+                                      sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(&normal, _groundNormal, sizeof(double3),
+                                  cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(&offset, _groundOffset, sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+        const double distance = normal.x * position.x + normal.y * position.y
+                                + normal.z * position.z - offset;
+        fprintf(stderr,
+                "[collapse] vertex=%d/%d body=%d skip=%d body_count=%d "
+                "pos=(%.6e,%.6e,%.6e) dist=%.6e vertexNum=%d\n",
+                vertex, m_last_frame_status.err_primitive, body, skip,
+                _ground_body_count, position.x, position.y, position.z,
+                distance, (int)vertexNum);
+    }
     if(std::getenv("STIFF_FRAME_GRAPH_DIAG") && m_ccd_alpha_slots)
     {
         // [C6-c] Which alpha lane collapsed? 0=ground 1=narrow-self
@@ -3521,31 +3587,63 @@ int GIPC::frame_graph_finish_terminal()
         // Only grow the DCD side when the DCD side actually overflowed.
         // Multiplying the CURRENT tier by the headroom grew it on every
         // swept-only overflow, doubling the triplet envelope for nothing.
-        const int grown = (needed_dcd > m_graph_train_pairs)
-            ? std::min(MAX_COLLITION_PAIRS_NUM,
-                       gipc::assembly_capacity_tier(
-                           needed_dcd * GIPC::graph_train_headroom_num()))
-            : m_graph_train_pairs;
-        if(grown > m_graph_train_pairs)
+        // [C6-d] Grow only the axes the device reported as crossed. The guard
+        // encodes them as a bitmask in err_primitive over its own entry order:
+        // 0 -> cp[0], 1 -> cp[2], 2 -> cp[3], 3 -> cp[4], 4 -> ground (which is
+        // already at worst case and must never cross). Each crossed axis is
+        // sized from the reported requirement, and unrelated axes are left
+        // alone -- inflating them all in lockstep is what blew up the triplet
+        // envelope.
+        static const int kEntryToSlot[5] = {0, 2, 3, 4, -1};
+        // fsm_record_error keeps only the FIRST error's primitive (atomicCAS on
+        // error_code), so when another error beat the tier guard to it the mask
+        // never reaches us. Falling back to "grow every axis" there is actively
+        // harmful: the capacity-mirror assembly emits abd_abd triplets over the
+        // TIERED pair extents, so inflating cp[2..4] multiplies the triplet
+        // stream, overflows the abd_abd class, grows that tier, and the next
+        // attempt emits more still -- 512k -> 2.77M -> 11.8M triplets across
+        // three retries, ending in OOM. With no mask we grow only cp[0], the one
+        // axis whose requirement is reported as an honest count.
+        const int packed = m_last_frame_status.err_primitive;
+        const int mask   = packed > 0 ? ((packed >> 15) & 0x1F) : 0x01;
+        bool      grew_any = false;
+        for(int entry = 0; entry < 5; ++entry)
         {
+            if(!(mask & (1 << entry)))
+                continue;
+            const int slot = kEntryToSlot[entry];
+            if(slot < 0)
+            {
+                fprintf(stderr,
+                        "[graph-train][WARN] ground extent crossed its trained "
+                        "value -- it is supposed to be at worst case "
+                        "(surf_vertexNum) and cannot be grown further\n");
+                continue;
+            }
+            int shift = packed > 0 ? ((packed >> (3 * entry)) & 7) : 0;
+            if(shift < 1)
+                shift = 1;
+            const long long reach =
+                static_cast<long long>(m_graph_train_cp[slot]) << shift;
+            const int want = static_cast<int>(std::min<long long>(
+                MAX_COLLITION_PAIRS_NUM,
+                gipc::assembly_capacity_tier(static_cast<int>(std::min<long long>(
+                    MAX_COLLITION_PAIRS_NUM,
+                    reach * GIPC::graph_train_headroom_num())))));
+            if(want <= m_graph_train_cp[slot])
+                continue;
             if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
                 fprintf(stderr,
-                        "[graph-train] pair overflow: needed dcd=%d ccd=%d "
-                        "-> trained pairs %d -> %d\n",
-                        needed_dcd, needed_ccd, m_graph_train_pairs, grown);
+                        "[graph-train] pair overflow: needed dcd=%d -> "
+                        "trained cp[%d] %d -> %d\n",
+                        needed_dcd, slot, m_graph_train_cp[slot], want);
+            m_graph_train_cp[slot] = want;
+            grew_any               = true;
+        }
+        if(grew_any)
+        {
             m_graph_tier_grew   = true;
-            m_graph_train_pairs = grown;
-            m_graph_train_cp[0] = grown;
-            // [C6-c] Slot 1 (abd_fem) was skipped by this loop, so it could
-            // never grow past whatever it was first trained to. A class the
-            // scene has not produced yet trains to the 256 floor -- foldshirt
-            // observes abd_fem == 0 on frame 0, the only host frame -- and the
-            // first frame that does produce it overflows instantly, retries,
-            // fails to grow the one tier that mattered, and burns the whole
-            // retry budget.
-            for(int s = 1; s < 5; ++s)
-                m_graph_train_cp[s] =
-                    std::min(grown, std::max(m_graph_train_cp[s], grown / 2));
+            m_graph_train_pairs = m_graph_train_cp[0];
             ++pcg_buffer_generation();   // force a re-record at the new tier
         }
     }

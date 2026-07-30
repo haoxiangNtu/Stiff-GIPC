@@ -414,6 +414,15 @@ void GIPC::update_graph_training_capacity()
             std::max(m_graph_train_cp[slot],
                      std::min(want, MAX_COLLITION_PAIRS_NUM));
     }
+    // [C6-d] Slot 0 is the DCD pair ARRAY extent, and unlike slots 2..4 it does
+    // NOT feed the triplet envelope (that is built from cp[2]*M6 + cp[3]*M9 +
+    // cp[4]*M12). Tiering it therefore buys no memory -- the array is
+    // MAX_COLLITION_PAIRS_NUM * sizeof(int4), about 12 MB -- while a tier
+    // trained from frame 0 (the only host frame) truncates the moment contact
+    // richens: foldshirt saturated 65536 at the grasp-closing frame, reported
+    // 65537, and spent its whole retry budget climbing 65536 -> 262144 ->
+    // 737196 one attempt at a time. The host never tiers this axis at all.
+    m_graph_train_cp[0] = MAX_COLLITION_PAIRS_NUM;
     m_graph_train_pairs = m_graph_train_cp[0];
     // Remember what a REAL frame actually assembled. The a-priori bound below
     // models FEM/contact/ground/friction but not ABD body Hessians, joints or
@@ -797,26 +806,52 @@ __global__ void _pair_tier_guard(const uint32_t* d_pair_counts,
     // the budget ran out. The host grows the total and then sets each sub-slot
     // to grown/2, so the total must reach twice the crossing count for the
     // sub-slot to actually clear it.
-    bool crossed         = false;
-    int  worst_crossing  = 0;
+    // [C6-c/d] Report WHICH axis crossed, as a bitmask over the entries above
+    // (0 -> cp[0], 1 -> cp[2], 2 -> cp[3], 3 -> cp[4], 4 -> ground), plus the
+    // worst crossing count. Growing every sub-slot to half the total tier
+    // instead -- the first attempt at this -- inflated cp[4] from 1024 to
+    // 131072 on a 425-pair observation, and since that slot contributes a 12x12
+    // block per pair the triplet envelope exploded from 367k to 4.74M and
+    // overflowed the class tier on the very next attempt. Growth has to target
+    // the axis that actually failed.
+    // Pack, per entry, BOTH "did it cross" and "by how much" -- the deficit as
+    // a power-of-two shift. Sizing every crossed axis from the single worst
+    // crossing count still cross-contaminates: cp[4] crossed by a few hundred
+    // pairs and was sized from cp[0]'s 65537, taking it from 1024 to 262144 on
+    // a 425-pair observation. Layout: bits 0..14 hold five 3-bit shifts,
+    // bits 15..19 hold the crossed mask. No ABI change -- it all rides
+    // err_primitive.
+    bool crossed      = false;
+    int  crossed_mask = 0;
+    int  shifts       = 0;
+    int  worst_live   = 0;
     for(int i = 0; i < 5; ++i)
     {
         if(live[i] <= tier[i])
             continue;
         crossed = true;
-        if(live[i] > worst_crossing)
-            worst_crossing = live[i];
+        crossed_mask |= (1 << i);
+        int shift = 1;
+        int reach = tier[i] > 0 ? tier[i] : 1;
+        while(reach < live[i] && shift < 7)
+        {
+            reach <<= 1;
+            ++shift;
+        }
+        shifts |= (shift & 7) << (3 * i);
+        if(live[i] > worst_live)
+            worst_live = live[i];
     }
     if(!crossed)
         return;
-    const int need_from_slot = 2 * worst_crossing;
     frame->required_dcd_pairs =
-        live[0] > need_from_slot ? live[0] : need_from_slot;
+        live[0] > worst_live ? live[0] : worst_live;
+
     frame_fsm::fsm_record_error(frame,
                                 frame_fsm::ERR_CAPACITY,
                                 frame_fsm::OVF_DCD_PAIRS,
                                 -1,
-                                -1);
+                                shifts | (crossed_mask << 15));
     atomicCAS(&frame->result,
               frame_fsm::FRAME_OK,
               frame_fsm::FRAME_RETRY_REQUIRED);
