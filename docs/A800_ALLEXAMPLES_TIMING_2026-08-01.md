@@ -46,6 +46,28 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
   (0.904). Measurement caveat recorded in the C6-n commit: per-frame
   [bench] timers understate the release path (async queue drains in the
   untimed get_vertices); total wall is the honest metric.
+- **C6-o then cured the pathology at the root** (the threshold is now a
+  performance choice, not a shield). nsys attribution overturned the
+  re-record hypothesis: the two-graph towel run contained NO
+  capture/instantiate calls at all -- it burned 150k PCG iterations (8x
+  the committed work) inside FAILED attempts, because the tier-shaped
+  partition flags its own truncation on the device at the first poisoned
+  iteration (OVF_TRIPLETS, result=RETRY) but the host loop never looked
+  before the frame terminal and spun starved to the 1000-Newton budget.
+  Fix 1: solve_subIP polls an async 12-byte status snapshot per
+  iteration and aborts the attempt immediately (committed trajectory
+  proven bitwise-identical to the release path). Fix 2: per-axis
+  growth-streak escalation (same axis re-crossing within 8 frames earns
+  2x/4x extra headroom; contact-class tiers previously grew with NO
+  headroom and re-crossed every ratchet frame). A800 with the threshold
+  forced OFF: towel two-graph 20 s wall with zero runaway frames; towel
+  full-graph 51 s (was 502 s); UMI forcegrip/beaker unchanged (97%/95%,
+  RC=0).
+- Pod interpreter gotcha: the canonical interpreter is plain `python3`
+  (3.12, has polyscope + matches tools/numpy). Prefixing the venv into
+  PATH for cmake leaks it into run sections (venv python lacks
+  polyscope), and /usr/bin/python3 is 3.10 (incompatible tools/numpy).
+  Keep build PATH exports out of run sections.
 - **Two graph-on failures — RESOLVED by C6-m** (fallback runs the true
   graph-off frame: `s_layout_override_off` RAII forces `device_count_mode()`
   false during a capacity-fallback attempt). Root cause: the C6-i fallback
