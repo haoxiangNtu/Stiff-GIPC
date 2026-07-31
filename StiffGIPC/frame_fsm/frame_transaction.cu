@@ -3911,6 +3911,20 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
         | frame_fsm::OVF_MAS_CLUSTERS;
     const int64_t physical_frame_id = m_total_frames;
     uint32_t retry_invalid_bits = 0;
+    // [C6-i] After a capacity overflow the frame is NOT retried in-graph.
+    // Re-recording at a grown tier changes grid shapes and reduction order, so
+    // whether a retry fired -- which depends on racy atomicAdd counts sitting
+    // near a tier boundary -- injected a ~1e-6 run-to-run perturbation that
+    // chaotic contact amplified (towel: crumple 0.77..1.11 in-graph vs a
+    // deterministic 0.905 on the host). Instead the frame is FINISHED on the
+    // release solver from its bit-exactly restored start state -- the exact
+    // code graph-off runs, deterministic where the host is -- and the tier
+    // growth adjudicated at this frame boundary shapes the NEXT frame's
+    // re-record. This is the iron law's own split: growth decisions live on
+    // the host at frame boundaries, the graph only covers the frame interior.
+    // STIFF_GRAPH_INGRAPH_RETRY=1 restores the old replay-in-graph behaviour.
+    const bool ingraph_retry = knob_enabled("STIFF_GRAPH_INGRAPH_RETRY");
+    bool       capacity_fallback = false;
 
     // [C6-e] Rollback audit against the FRAME's start state, captured here,
     // outside the retry loop. The earlier check compared the live state with
@@ -3989,7 +4003,8 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
         try
         {
             const bool full_launched =
-                knob_enabled("STIFF_FRAME_FULL_GRAPH")
+                !capacity_fallback
+                && knob_enabled("STIFF_FRAME_FULL_GRAPH")
                 && try_launch_full_graph(
                     *this,
                     mesh,
@@ -4047,7 +4062,11 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
             && (m_last_frame_status.invalid_bits & capacity_bits)
             && !diagnostic_rollback;
         if(retryable && attempt < max_retries)
+        {
+            if(!ingraph_retry)
+                capacity_fallback = true;   // [C6-i] finish on the release solver
             continue;
+        }
 
         if(retryable)
         {

@@ -115,8 +115,17 @@ def run(dump_path: str, expect_graph: bool, perturb: bool) -> None:
         f"fallback_frames={fallback_frames}"
     )
     if expect_graph:
-        assert fallback_frames == 0, (
-            f"{fallback_frames} frames fell back off the conditional graph"
+        # [C6-i] A capacity overflow is adjudicated at the frame boundary by
+        # finishing THAT frame on the release solver (the baseline path) and
+        # re-recording the next frame at the grown tier -- replaying the frame
+        # in-graph at a new tier changes grid shapes and made retries
+        # non-deterministic. Such growth frames are legitimate and rare; what
+        # this gate must still reject is a scene that cannot hold the graph at
+        # steady state. Budget: at most 2 fallback frames per episode, and the
+        # numerics assertions below stay bit-for-bit unchanged.
+        assert fallback_frames <= 2, (
+            f"{fallback_frames} frames fell back off the conditional graph "
+            "(capacity-growth frames are budgeted at 2 per episode)"
         )
     np.savez(dump_path, positions=array)
     print("ISOLATED-GRAPH-RUN: done")
