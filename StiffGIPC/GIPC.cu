@@ -9603,6 +9603,9 @@ void GIPC::buildFrictionSets()
                                                               m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     CUDA_SAFE_CALL(cudaMemcpy(h_cpNum_last, _cpNum, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    if(getenv("STIFF_FRICTION_DBG"))
+        printf("[fric-dbg] buildFrictionSets: h_cpNum[0]=%u -> h_cpNum_last[0]=%u (gp: %u -> later)\n",
+               (unsigned)h_cpNum[0], (unsigned)h_cpNum_last[0], (unsigned)h_gpNum);
     numbers = h_gpNum;
     if(numbers > 0)
     {
@@ -11975,6 +11978,9 @@ void GIPC::calBarrierGradient(double3* _gradient, double mKappa,
 void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
 {
     int                numbers   = h_cpNum_last[0];
+    if(getenv("STIFF_FRICTION_DBG"))
+        printf("[fric-dbg] calFrictionGradient: h_cpNum_last[0]=%d h_gpNum_last=%d\n",
+               numbers, (int)h_gpNum_last);
     const unsigned int threadNum = 256;
     int                blockNum  = 0;
     if(numbers > 0)
@@ -16494,6 +16500,32 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     return k;
 }
 
+
+void GIPC::snapshotFrictionForce(device_TetraData& TetMesh)
+{
+#ifdef USE_FRICTION
+    m_have_fric_snap = false;
+    if(h_cpNum_last[0] <= 0 && h_gpNum_last <= 0)
+        return;
+    const int nv = (int)vertexNum;
+    if(nv > m_fric_snap_cap)
+    {
+        if(m_d_fric_force_snap)
+            cudaFree(m_d_fric_force_snap);
+        CUDA_SAFE_CALL(cudaMalloc(&m_d_fric_force_snap, (size_t)nv * sizeof(double3)));
+        m_fric_snap_cap = nv;
+    }
+    CUDA_SAFE_CALL(cudaMemset(m_d_fric_force_snap, 0, (size_t)nv * sizeof(double3)));
+    // mirror the accessor's binned-gradient protocol exactly
+    zeroBinnedGrad();
+    calFrictionGradient(m_d_fric_force_snap, TetMesh);
+    combineBinnedGrad(m_d_fric_force_snap);
+    m_have_fric_snap = true;
+#else
+    (void)TetMesh;
+#endif
+}
+
 void GIPC::updateVelocities(device_TetraData& TetMesh)
 {
     int numbers = vertexNum;
@@ -16763,6 +16795,9 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
 #ifdef USE_FRICTION
     // [0be8da3-port] friction buffers persist across frames; freed in FREE_DEVICE_MEM.
+    // [friction snapshot] capture the lagged-friction force of THIS step before
+    // the commit below zeroes the in-step displacement it is computed from.
+    snapshotFrictionForce(TetMesh);
 #endif
 
     updateVelocities(TetMesh);

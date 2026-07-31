@@ -938,6 +938,20 @@ class Engine:
         vertex positions without a host round-trip. Valid after finalize()."""
         return self._engine.get_vertices_device_ptr()
 
+    def reset_transient_contact_state(self) -> None:
+        """[episode reset] Clear stale contact/friction carry-over after teleports.
+
+        The lagged-friction set is built from the previous solve's contact-pair
+        list; after an in-place episode reset (teleport_abd_bodies +
+        teleport_fem_vertices) that list still describes the OLD episode, and the
+        first new solve applies phantom friction from it (measured: 24 um state
+        divergence vs a fresh build). Call this once after the teleports.
+        Not called automatically: teleporting a single body mid-simulation must
+        not clear every other contact's friction state.
+        """
+        self._engine.reset_transient_contact_state()
+
+
     def get_vertex_velocities(self) -> np.ndarray:
         """Return vertex velocities as (N, 3) float64 array."""
         return self._engine.get_vertex_velocities()

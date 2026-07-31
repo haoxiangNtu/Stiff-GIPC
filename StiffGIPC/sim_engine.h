@@ -300,6 +300,17 @@ class SimEngine
     /// min(n, vertexNum) values; returns the number written.
     int get_fem_von_mises_stress(double* out, int n);
 
+    /// [episode reset] Zero the transient contact state that outlives a
+    /// teleport: the current/lagged contact-pair host mirrors and the
+    /// lagged-friction snapshot. Without this, the first solve after an
+    /// in-place teleport reset builds its friction set from the PREVIOUS
+    /// episode's pair list (measured: 1116 stale pairs -> phantom friction,
+    /// 24 um state divergence vs a fresh build). Call after teleporting
+    /// bodies between episodes. Deliberately NOT called inside the teleport
+    /// APIs themselves: teleporting one body mid-scene must not clear the
+    /// friction state of every other contact.
+    void reset_transient_contact_state();
+
     /// [per-env productization] Newton iter at which each env froze last solve
     /// (converged / timeout / diverged; -1 = ran to loop end or absent).
     /// 256 slots. Host per-env path only (per_env_exit / STIFF_PERENV_ALPHA).

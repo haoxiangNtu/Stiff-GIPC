@@ -3448,7 +3448,10 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
         return nw;
     const bool want_normal   = (components == 0 || components == 2);
     const bool want_friction = (components == 1 || components == 2);
-    const bool have_friction = (g.h_cpNum_last[0] > 0 || g.h_gpNum_last > 0);
+    // [friction snapshot] the lagged-friction gradient is a function of the
+    // in-step displacement, which the end-of-step commit zeroes -- recomputing
+    // it here always yields 0. Use the snapshot IPC_Solver took pre-commit.
+    const bool have_friction = g.m_have_fric_snap;
 
     if(want_normal)
     {
@@ -3477,11 +3480,20 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
         if(include_ground)
             g.computeGroundGradient(s_d_grad, g.Kappa);
     }
-    if(want_friction && have_friction)
-        g.calFrictionGradient(s_d_grad, impl.d_tetMesh);   // lastH set, read-only
     g.combineBinnedGrad(s_d_grad);
     CUDA_SAFE_CALL(cudaMemcpy(out3, s_d_grad, (size_t)nw * 3 * sizeof(double),
                               cudaMemcpyDeviceToHost));
+    if(want_friction && have_friction)
+    {
+        // add the pre-commit snapshot (gradient units, same as s_d_grad)
+        static std::vector<double> s_h_snap;
+        s_h_snap.resize((size_t)nw * 3);
+        CUDA_SAFE_CALL(cudaMemcpy(s_h_snap.data(), g.m_d_fric_force_snap,
+                                  (size_t)nw * 3 * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+        for(int i = 0; i < nw * 3; ++i)
+            out3[i] += s_h_snap[i];
+    }
     // The buffer holds the incremental-potential GRADIENT (dE/dx = -force*dt^2).
     // Physical contact force = -gradient/dt^2 (same convention as the
     // per-contact force magnitude path, GIPC.cu _calBarrierForces). The first
@@ -3604,6 +3616,25 @@ __global__ void _fem_scatter_vm_to_verts(const uint4* tets, const double* tet_vm
     _se_atomicMaxPosDouble(&vert_vm[t.z], v);
     _se_atomicMaxPosDouble(&vert_vm[t.w], v);
 }
+
+void SimEngine::reset_transient_contact_state()
+{
+    GIPC& g = m_impl->ipc;
+    for(int i = 0; i < 5; i++)
+    {
+        g.h_cpNum[i]      = 0;
+        g.h_cpNum_last[i] = 0;
+    }
+    g.h_gpNum          = 0;
+    g.h_gpNum_last     = 0;
+    g.m_have_fric_snap = false;
+    // Adaptive kappa carries the previous episode's contact history (measured:
+    // 0.9 um residual state divergence after the pair/friction mirrors were
+    // cleared). Zeroing it makes the next IPC_Solver re-derive kappa exactly
+    // like a fresh process (its first-solve path: Kappa < 1e-16 -> suggestKappa).
+    g.Kappa = 0.0;
+}
+
 
 int SimEngine::get_fem_von_mises_stress(double* out, int n)
 {

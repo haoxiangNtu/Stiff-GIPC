@@ -419,6 +419,10 @@ PYBIND11_MODULE(pystiffgipc, m)
             "units differ from the legacy batched API (raw gradients). "
             "Rebuilds normal contacts once when requested; the lagged-friction "
             "path is read-only on the solver's frozen friction set.")
+        .def("reset_transient_contact_state", &SimEngine::reset_transient_contact_state,
+             "[episode reset] Zero current/lagged contact-pair mirrors and the friction "
+             "snapshot so the first solve after a teleport reset does not apply the "
+             "previous episode's lagged friction. Call after teleporting between episodes.")
         .def("get_fem_von_mises_stress", [](SimEngine& e) {
                 int n = e.get_vertex_count();
                 auto arr = py::array_t<double>(n);
