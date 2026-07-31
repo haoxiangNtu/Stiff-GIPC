@@ -4156,6 +4156,24 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
                     retry_invalid_bits);
             if(!full_launched)
             {
+                // [C6-m] A fallback attempt runs with the capacity-layout
+                // machinery fully OFF, so it is bit-for-bit the graph-off
+                // frame the C6-i contract promises: exact partition, no tier
+                // guard, no truncation. RAII so throws restore the mode.
+                struct LayoutOff
+                {
+                    bool armed;
+                    explicit LayoutOff(bool on) : armed(on)
+                    {
+                        if(armed)
+                            GIPCTripletMatrix::s_layout_override_off = true;
+                    }
+                    ~LayoutOff()
+                    {
+                        if(armed)
+                            GIPCTripletMatrix::s_layout_override_off = false;
+                    }
+                } layout_off{attempt > 0};
                 // [C6-l] A fallback attempt inherits pair arrays clobbered by
                 // the aborted recording: a truncated, racy SUBSET emitted at
                 // TRIAL positions. The release solver's own frame boundary

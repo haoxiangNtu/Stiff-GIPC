@@ -298,8 +298,19 @@ class GIPCTripletMatrix
     // STIFF_FRAME_GRAPH enables it unless explicitly overridden. Intermediate
     // ABD slice converts still publish exact host counts because their result
     // sizes the following expansion stage.
+    // [C6-m] Host-side override: a C6-i fallback attempt must be EXACTLY the
+    // graph-off frame it claims to be. With the env knobs set, the fallback
+    // still ran the tier-shaped partition and its capacity guard, so a frame
+    // whose class counts exceeded the trained tiers re-flagged OVF_TRIPLETS
+    // on the fallback itself and burned the retry budget (A800
+    // case39_UMI_beaker, frame 20) -- and the tiered staging would truncate
+    // real triplets in that state. While the override is set, every
+    // device_count_mode consumer takes the pure legacy path.
+    static inline bool s_layout_override_off = false;
     static bool device_count_mode()
     {
+        if(s_layout_override_off)
+            return false;
         if(const char* value = std::getenv("STIFF_CONVERT_DEVICE_COUNT"))
             return std::atoi(value) != 0;
         if(const char* value = std::getenv("STIFF_FRAME_GRAPH"))
