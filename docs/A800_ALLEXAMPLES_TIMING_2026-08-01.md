@@ -9,7 +9,7 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
 
 | example | off ms | off fps | on ms | on/off | on status |
 |---|---|---|---|---|---|
-| towel_scramble (961v) | 25.8 | 38.8 | 2126.1 | 82.4x | pass, pathological (see below) |
+| towel_scramble (961v) | 25.8 | 38.8 | ~25 | ~1.0x | C6-n: declined to release path (whole run 6s vs off 7s; was 2126.1ms/frame, 502s) |
 | case39 | 113.2 | 8.8 | 203.9 | 1.80x | pass |
 | case39_multienv | 114.5 | 8.7 | 155.3 | 1.36x | pass |
 | cupshirt_finray | 124.8 | 8.0 | 240.4 | 1.93x | pass |
@@ -32,12 +32,20 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
   the expectation that the A800's slow host link makes saved launch
   round-trips worth more. The heaviest-contact scenes amortize best
   (sf_obb 1.09x, beaker 1.30x); the lightest pay the most (cupshirt 1.9x).
-- **towel-on anatomy** (the 82x outlier): 19 re-record-storm frames eat 219
-  of 468 s (a capture on the A800 costs ~20-30 s against ~1-3 s on the
-  4090), and the remaining frames still average 1239 ms vs 25.8 ms off —
-  the fixed capacity-width launch cost dominates a 961-vertex scene. Same
-  shape as the 4090 (11x there), amplified by the architecture. Whole-frame
-  graphs are the wrong tool for tiny scenes; nothing here is new breakage.
+- **towel-on anatomy — RESOLVED by C6-n**. The 82x outlier decomposed into
+  three layers: 19 re-record-storm frames ate 219 of 468 s (a capture on
+  the A800 costs ~20-30 s against ~1-3 s on the 4090); the remaining
+  frames paid the fixed capacity-width launch cost; and the two-graph gate
+  was no refuge (its inner graphs re-record on every capacity-generation
+  bump — one hard crumple frame spent 15.7 s recording for the same 567
+  Newton iterations the release solver finishes in 0.5 s). step() now
+  declines ALL graph machinery below STIFF_FULL_GRAPH_MIN_VERTS (default
+  1024) and runs the release frame (episodes exempt; gates pin 0).
+  A800 after C6-n: the whole 220+40-frame towel run takes 6 s with the
+  graph env vs 7 s off (was 502 s), footprint fingerprint unchanged
+  (0.904). Measurement caveat recorded in the C6-n commit: per-frame
+  [bench] timers understate the release path (async queue drains in the
+  untimed get_vertices); total wall is the honest metric.
 - **Two graph-on failures — RESOLVED by C6-m** (fallback runs the true
   graph-off frame: `s_layout_override_off` RAII forces `device_count_mode()`
   false during a capacity-fallback attempt). Root cause: the C6-i fallback
@@ -50,6 +58,9 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
   full-graph), beaker 399.8 ms (95%). Both were re-verified locally too
   (G18/G19/D4/G17e PASS, towel det stack bitwise x2).
 - Environment notes: the pod needed `polyscope` (now installed alongside
-  trimesh); `[graph-stats]` coverage lines did not appear in suite logs on
-  the A800 (delivery of the knob is proven by the timing split; the missing
-  print is unexplained and only affects telemetry, not physics or timing).
+  trimesh). SOLVED: the missing `[graph-stats]` lines in the suite logs
+  were a stale remote binary — its knob registry predated
+  STIFF_GRAPH_STATS/STIFF_C6_ABD_STEP_GRAPH and the log headers show
+  `[knob-registry][WARN] unknown STIFF_* knob` for both (silent no-op).
+  Physics and timing were unaffected; the C6-m rerun on a fresh build
+  prints coverage normally.
