@@ -4201,6 +4201,34 @@ void SimEngine::teleport_abd_bodies(const int* body_offsets, const double* mat4x
     }
     CUDA_SAFE_CALL(cudaMemcpy(abd.body_id_to_q_v.data(), host_qv.data(), buf_bytes, cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaMemcpy(abd.body_id_to_dq.data(),  host_dq.data(), buf_bytes, cudaMemcpyHostToDevice));
+
+    // [teleport-consistency] Refresh the teleported bodies' SURFACE VERTICES
+    // from the new q immediately. Without this, _vertexes keeps the old
+    // positions until a solver-internal x-from-q pass runs mid-iteration, so
+    // the first line search of the next step evaluates E0 against the OLD
+    // anchor/contact positions and every trial against the NEW ones:
+    // E(alpha -> 0) > E0 by the teleport's energy delta, and the line search
+    // "fails" its full 64-halving budget on EVERY frame that teleports
+    // (measured on the peg scene: 40/40 frames, ~0.6-4.5 s/step; clean after
+    // this fix). o_vertexes is synced too: a teleport is an instantaneous
+    // re-placement, so the committed-previous state must not imply motion.
+    if(impl.ipc.m_abd_system)
+    {
+        const auto& ci      = impl.ipc.abd_fem_count_info;
+        const int   abd_pts = ci.abd_point_num;
+        if(abd_pts > 0)
+        {
+            auto abd_verts =
+                muda::BufferView<double3>{impl.ipc._vertexes,
+                                          (size_t)impl.ipc.vertexNum}
+                    .subview(ci.abd_point_offset, abd_pts);
+            impl.ipc.m_abd_system->cal_x_from_q(*impl.ipc.m_abd_sim_data, abd_verts);
+            CUDA_SAFE_CALL(cudaMemcpy(
+                impl.d_tetMesh.o_vertexes + ci.abd_point_offset,
+                impl.ipc._vertexes + ci.abd_point_offset,
+                (size_t)abd_pts * sizeof(double3), cudaMemcpyDeviceToDevice));
+        }
+    }
 }
 
 void SimEngine::get_abd_body_velocities(const int* body_offsets, double* out_mat4x4, int count) const
