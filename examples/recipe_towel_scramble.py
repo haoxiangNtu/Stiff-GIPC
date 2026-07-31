@@ -55,6 +55,7 @@ def build_scene(tilt_deg=75.0, yaw_deg=0.0, height=0.30):
         cloth_density=200, strain_rate=100,
         poisson_rate=0.49, friction_rate=0.4, relative_dhat=1e-3,
         ground_offset=0.0, assets_dir=ASSETS,
+        preconditioner_type=int(os.environ.get("STIFF_TOWEL_PRECOND", "1")),
         collision_detection_buff_scale=16.0,   # folded cloth: many self-pairs
         linear_system_buff_scale=8.0,
     )

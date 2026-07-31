@@ -350,8 +350,21 @@ bool full_graph_eligible(const GIPC& ipc,
     // its promise is bitwise reproducibility, and capacity-grid reductions
     // legally reassociate the sums — admitting strict would be an anchor
     // change, not a residency change.
-    if(mode.mode == ModeConfig::Strict || mode.ee_canon || mode.ee_detgate
-       || mode.ccd_canon || mode.spmv_det)
+    // [C6-l] spmv_det is admitted. It is a numeric-path choice (deterministic
+    // binned SpMV/gradient reductions), not the strict anchor: strict's
+    // bitwise promise is what capacity-grid reassociation breaks, and that
+    // rejection stays below. Its lazy binned accumulators are primed outside
+    // capture by the pre-capture dry run (the same pattern the segmented PCG
+    // device loop already uses), so nothing allocates inside the recording.
+    // Measured payoff: det-SpMV kills the armed-layout SpMV order-raciness
+    // (towel pre-contact divergence gone, C6-k), making this the determinism
+    // lever for the shipped whole-frame config.
+    // ee_canon is likewise admitted (C6-l): canonical pair ORDER is exactly
+    // what makes the in-graph contact-energy sums order-free -- without it the
+    // recorded replay sums the same pair multiset in a racy slot permutation
+    // and one towel run in two explodes at first contact (newton=1000,
+    // ls=20586, alpha=1e-25) before the C6-i fallback rescues it.
+    if(mode.mode == ModeConfig::Strict || mode.ee_detgate || mode.ccd_canon)
     {
         reason = "strict determinism controls are active";
         return false;
