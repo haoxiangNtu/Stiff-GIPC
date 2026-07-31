@@ -1,3 +1,4 @@
+#include <chrono>
 #include "GIPC.cuh"
 
 #include "abd_system/abd_sim_data.h"
@@ -2299,6 +2300,7 @@ bool try_launch_full_graph(GIPC& ipc,
                            int attempt,
                            uint32_t retry_invalid_bits)
 {
+    const auto t_enter = std::chrono::steady_clock::now();
     ipc.prepare_frame_graph(mesh);
     FrameGraphContext& context = graph_context(ipc);
     std::string reason;
@@ -2446,6 +2448,7 @@ bool try_launch_full_graph(GIPC& ipc,
     context.h_terminal->terminal_graph_nodes = 0;
     context.h_terminal->terminal_d2h_nodes   = 0;
 
+    const auto t_launch = std::chrono::steady_clock::now();
     const cudaError_t launch =
         cudaGraphLaunch(context.full_exec, cudaStreamPerThread);
     if(launch != cudaSuccess)
@@ -2461,6 +2464,17 @@ bool try_launch_full_graph(GIPC& ipc,
 
     const cudaError_t boundary =
         cudaStreamSynchronize(cudaStreamPerThread);
+    if(getenv("STIFF_FRAME_SECTION_TIME"))
+    {
+        const auto t_done = std::chrono::steady_clock::now();
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        fprintf(stderr,
+                "[frame-sections] pre_launch=%.1fms graph_wait=%.1fms\n",
+                ms(t_enter, t_launch),
+                ms(t_launch, t_done));
+    }
     if(boundary != cudaSuccess)
     {
         cudaGetLastError();
@@ -3792,7 +3806,7 @@ int GIPC::frame_graph_finish_terminal()
     }
     if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
         fprintf(stderr,
-                "[graph-frame] result=%d err=%d inv=0x%x newton=%d ls=%d "
+                "[graph-frame] result=%d err=%d inv=0x%x newton=%d pcg=%d ls=%d "
                 "alpha=%.6e "
                 "cfl=%.6e kappa=%.6e move=%.6e dcd=%d ccd=%d "
                 "class=[%d/%d,%d/%d,%d/%d,%d/%d]\n",
@@ -3800,6 +3814,7 @@ int GIPC::frame_graph_finish_terminal()
                 m_last_frame_status.error_code,
                 (unsigned)m_last_frame_status.invalid_bits,
                 m_last_frame_status.newton_iters,
+                m_last_frame_status.pcg_iters,
                 m_last_frame_status.ls_trials,
                 m_last_frame_status.final_alpha,
                 m_last_frame_status.cfl_alpha,

@@ -714,6 +714,16 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
 SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter)
 {
     SizeT k = 0;
+    if(getenv("STIFF_PCG_WIDTH_DIAG"))
+    {
+        static int s_host_prints = 0;
+        if(s_host_prints < 4 && !frame_fsm::ConditionalGraphRecorder::current())
+        {
+            ++s_host_prints;
+            fprintf(stderr, "[pcg-width] HOST z.size()=%d b.size()=%d\n",
+                    (int)z.size(), (int)b.size());
+        }
+    }
 
     r.buffer_view().copy_from(b.buffer_view());
 
@@ -792,6 +802,13 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         if(K == 0)
             throw std::runtime_error(
                 "[pcg-conditional] STIFF_PCG_CHECK_K must be positive");
+        if(getenv("STIFF_PCG_WIDTH_DIAG"))
+            fprintf(stderr,
+                    "[pcg-width] RECORD z.size()=%d b.size()=%d x.size()=%d "
+                    "r.cap=%d z.cap=%d p.cap=%d\n",
+                    (int)z.size(), (int)b.size(), (int)x.size(),
+                    (int)r.buffer_view().size(), (int)z.buffer_view().size(),
+                    (int)p.buffer_view().size());
         recorder->while_loop(
             1,
             cudaGraphCondAssignDefault,
