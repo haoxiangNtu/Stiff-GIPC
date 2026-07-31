@@ -1146,8 +1146,45 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // create/destroy them or force a device-wide synchronization.
     const bool phase_time = (getenv("STIFF_PHASE_TIME") != nullptr);
 
+    // [C6-o] Host-driven layout mode: the device flags a capacity crossing
+    // (_publish_contact_class_counts / the tier guard CAS result ->
+    // RETRY_REQUIRED) the moment an iteration's tier-shaped staging
+    // truncates, but the host only read that flag at the frame terminal --
+    // so a mid-frame crossing left this loop spinning starved on truncated
+    // gradients to the full Newton budget before retry+fallback rescued it
+    // (towel two-graph: frames 17/21 burned 1000-iteration attempts, 8.5x
+    // the committed PCG work). Poll an async snapshot of the frame status
+    // once per iteration and abort the attempt as soon as a capacity retry
+    // is flagged: the rollback restores bit-exact state and the C6-m
+    // layout-off fallback completes the frame. Disarmed automatically on
+    // fallback attempts (LayoutOverrideOff makes contact_tier_layout_mode()
+    // false) and outside the transaction (frame state is null).
+    frame_fsm::FrameDeviceState* const capacity_poll_frame =
+        GIPCTripletMatrix::device_count_mode() ? frame_graph_device_state()
+                                               : nullptr;
+    static int* h_capacity_poll = nullptr;   // pinned {result, error_code, invalid_bits}
+    if(capacity_poll_frame && !h_capacity_poll)
+        CUDA_SAFE_CALL(cudaHostAlloc(
+            &h_capacity_poll, 3 * sizeof(int), cudaHostAllocDefault));
+    if(capacity_poll_frame)
+        h_capacity_poll[0] = h_capacity_poll[1] = h_capacity_poll[2] = 0;
+    bool capacity_early_abort = false;
+
     for(; k < iterCap; ++k)
     {
+        if(capacity_poll_frame
+           && (h_capacity_poll[0] == frame_fsm::FRAME_RETRY_REQUIRED
+               || (static_cast<uint32_t>(h_capacity_poll[2])
+                   & (frame_fsm::OVF_DCD_PAIRS | frame_fsm::OVF_CCD_PAIRS
+                      | frame_fsm::OVF_TRIPLETS
+                      | frame_fsm::OVF_UNIQUE_BLOCKS))))
+        {
+            capacity_early_abort = true;
+            if(g_gipc_log_level >= 1)
+                printf("  [C6-o] capacity retry flagged on device -- "
+                       "aborting attempt at Newton iter %d\n", (int)k);
+            break;
+        }
         if(g_gipc_log_level >= 1 && k > 0 && k % 10 == 0)
             printf("  Newton iter %d ...\n", k);
         stats_at_current_frame["newton"].push_back(gipc::Json::object());
@@ -1204,6 +1241,16 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         gipc_nvtx_push("GH_assembly");
         m_time_make_pd_ms += computeGradientAndHessian(TetMesh);
         gipc_nvtx_pop();
+        // [C6-o] snapshot {result, error_code, invalid_bits} right after the
+        // partition that can flag OVF; read (with 1..queue-depth iteration
+        // lag, no sync) at the top of a later iteration.
+        if(capacity_poll_frame)
+            CUDA_SAFE_CALL(
+                cudaMemcpyAsync(h_capacity_poll,
+                                &capacity_poll_frame->result,
+                                3 * sizeof(int),
+                                cudaMemcpyDeviceToHost,
+                                cudaStreamPerThread));
 
         // [decouple probe] PRE-SOLVE gradient dump (shape_grads + fb hold the CLEAN gradient here,
         // before calculateMovingDirection clobbers shape_grads as scratch). frame STIFF_DUMP_FRAME,
