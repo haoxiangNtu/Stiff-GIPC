@@ -63,6 +63,22 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
   forced OFF: towel two-graph 20 s wall with zero runaway frames; towel
   full-graph 51 s (was 502 s); UMI forcegrip/beaker unchanged (97%/95%,
   RC=0).
+- **C6-p cured the steady-state step-mode overhead at its root.** The
+  forensics eliminated every fashionable suspect with measurements: PCG
+  iteration counts and launch widths are IDENTICAL graph vs host, node
+  dispatch gaps are 0.1us median, pre-launch host work is 12.5ms. The
+  real cost was BAKED CAPACITY WIDTH: recorded kernels launch at
+  tier x headroom extents, and the 2x training headroom doubled every
+  capacity-wide pass (the converter unique-block reduction alone was
+  86ms/frame at 8.4M slots over a 4.2M payload). With C6-o's escalation
+  bounding growth storms, the default headroom flipped 2 -> 1:
+  forcegrip 4090 2.08x -> 1.39x, A800 3.25x -> 1.75x (26s -> 14s wall,
+  off 8s); beaker 4090 1.61x -> 1.21x, A800 20s RC=0. Cost: 1-2 extra
+  growth frames per run (97% -> 94% coverage). All gates PASS under the
+  new default; towel det stack bitwise x2 and committed trace identical
+  to the release path across tier widths (pad-neutrality proven). The
+  remaining 1.2-1.75x is the structural floor of baked-extent whole-
+  frame graphs: tier-quantization slack plus re-record training frames.
 - Pod interpreter gotcha: the canonical interpreter is plain `python3`
   (3.12, has polyscope + matches tools/numpy). Prefixing the venv into
   PATH for cmake leaks it into run sections (venv python lacks
