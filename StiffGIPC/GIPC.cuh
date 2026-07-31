@@ -765,6 +765,15 @@ class GIPC
     // and treating every pair as if it were all three arities at once
     // over-allocates ~3x on top of the worst-case error.
     int m_graph_train_cp[5]  = {0, 0, 0, 0, 0};
+    // [C6-o] Per-axis growth-streak escalation. A contact ratchet (towel
+    // crumple) crosses ONE axis's tier per frame, and each crossing costs a
+    // failed attempt + a whole-frame re-record -- 19 storm frames on the
+    // A800. When the SAME axis re-crosses within an 8-frame window, its next
+    // growth doubles once more per consecutive crossing (capped at 4x extra),
+    // collapsing the storm to a few growth events. Axes: 0..4 = cp slots,
+    // 5 = ccd, 6..9 = contact classes, 10 = abd unique blocks.
+    int64_t m_axis_grow_last[11]   = {};
+    int     m_axis_grow_streak[11] = {};
     int m_graph_train_pairs  = 0;   // trained DCD pair extent (slot 0)
     int m_last_assembled_triplets = 0;  // measured length of a real frame
     int m_graph_train_ground = 0;   // trained ground pair extent

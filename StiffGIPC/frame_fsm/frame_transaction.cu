@@ -3816,6 +3816,18 @@ int GIPC::frame_graph_finish_terminal()
                 m_last_frame_status.contact_class_count[3],
                 gipc_global_triplet.m_contact_class_tier[3]);
     note_frame_graph_coverage(m_last_frame_status);   // [C6]
+    // [C6-o] growth-streak escalation (see GIPC.cuh): consecutive re-crossings
+    // of the SAME axis within 8 frames earn 2x per streak step, capped at 4x.
+    auto growth_escalation = [&](int axis) -> int {
+        int64_t& last   = m_axis_grow_last[axis];
+        int&     streak = m_axis_grow_streak[axis];
+        if(last != 0 && m_total_frames - last <= 8)
+            streak = std::min(streak + 1, 2);
+        else
+            streak = 0;
+        last = m_total_frames;
+        return streak;
+    };
     if((m_last_frame_status.invalid_bits
         & frame_fsm::OVF_UNIQUE_BLOCKS)
        && m_last_frame_status.required_unique_blocks > 0)
@@ -3828,7 +3840,11 @@ int GIPC::frame_graph_finish_terminal()
         // that shapes recorded launches must force a re-record, exactly like
         // the pair/CCD tiers below.
         const int tier = gipc::assembly_capacity_tier(
-            m_last_frame_status.required_unique_blocks);
+            static_cast<int>(std::min<long long>(
+                INT_MAX / 2,
+                static_cast<long long>(
+                    m_last_frame_status.required_unique_blocks)
+                    << growth_escalation(10))));
         const int prev0 = gipc_global_triplet.m_abd_unique_tier[0];
         const int prev1 = gipc_global_triplet.m_abd_unique_tier[1];
         gipc_global_triplet.m_abd_unique_tier[0] = std::max(prev0, tier);
@@ -3864,6 +3880,11 @@ int GIPC::frame_graph_finish_terminal()
         if((m_last_frame_status.invalid_bits & frame_fsm::OVF_CCD_PAIRS)
            && needed_ccd <= m_graph_train_ccd)
             needed_ccd = m_graph_train_ccd + 1;
+        if(m_last_frame_status.invalid_bits & frame_fsm::OVF_CCD_PAIRS)
+            needed_ccd = static_cast<int>(std::min<long long>(
+                MAX_CCD_COLLITION_PAIRS_NUM,
+                static_cast<long long>(needed_ccd)
+                    << growth_escalation(5)));
         if((m_last_frame_status.invalid_bits & frame_fsm::OVF_DCD_PAIRS)
            && needed_dcd <= m_graph_train_pairs)
             needed_dcd = m_graph_train_pairs + 1;
@@ -3924,6 +3945,7 @@ int GIPC::frame_graph_finish_terminal()
             int shift = packed > 0 ? ((packed >> (3 * entry)) & 7) : 0;
             if(shift < 1)
                 shift = 1;
+            shift += growth_escalation(entry);
             const long long reach =
                 static_cast<long long>(m_graph_train_cp[slot]) << shift;
             const int want = static_cast<int>(std::min<long long>(
@@ -3958,7 +3980,10 @@ int GIPC::frame_graph_finish_terminal()
             if(exact <= gipc_global_triplet.m_contact_class_tier[s])
                 continue;
             gipc_global_triplet.m_contact_class_tier[s] =
-                gipc::assembly_capacity_tier(exact);
+                gipc::assembly_capacity_tier(static_cast<int>(
+                    std::min<long long>(INT_MAX / 2,
+                                        static_cast<long long>(exact)
+                                            << growth_escalation(6 + s))));
             grew_contact_class = true;
         }
         if(grew_contact_class)
