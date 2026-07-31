@@ -229,19 +229,27 @@ def load(path: str) -> dict[str, np.ndarray]:
 
 def envelope_compare(
     label: str,
-    first: np.ndarray,
-    second: np.ndarray,
+    baselines: list[np.ndarray],
     observed: np.ndarray,
 ) -> None:
-    assert first.shape == second.shape == observed.shape
-    baseline_noise = float(np.max(np.abs(first - second)))
-    error = min(
-        float(np.max(np.abs(observed - first))),
-        float(np.max(np.abs(observed - second))),
+    # [C6-j] The envelope is derived from N baseline runs, not 2. With two
+    # runs the noise estimate is a single pairwise sample of a chaotic
+    # distribution: whenever the two happened to land close (measured:
+    # 1e-10 noise on a scene whose true spread is 1e-6), the gate flagged a
+    # perfectly healthy graph run about one time in two. Noise is now the
+    # max pairwise spread across all baselines and the error is the distance
+    # to the NEAREST baseline. N via STIFF_G18_BASELINE_RUNS (default 4).
+    assert all(b.shape == observed.shape for b in baselines)
+    baseline_noise = max(
+        float(np.max(np.abs(a - b)))
+        for i, a in enumerate(baselines)
+        for b in baselines[i + 1 :]
     )
+    error = min(float(np.max(np.abs(observed - b))) for b in baselines)
     scale = max(
-        1.0, float(np.max(np.abs(first))), float(np.max(np.abs(second)))
+        [1.0] + [float(np.max(np.abs(b))) for b in baselines]
     )
+    first = baselines[0]
     precision_floor = 16.0 * np.finfo(first.dtype).eps * scale
     # The graph pass reduces over capacity grids (zero-padded tails), which
     # legally reorders floating-point sums relative to the exact-count
@@ -332,25 +340,26 @@ if __name__ == "__main__":
             with tempfile.TemporaryDirectory(
                 prefix="stiff-collision-graph-gate-"
             ) as tmp:
-                baseline_a_path = os.path.join(tmp, "baseline-a.npz")
-                baseline_b_path = os.path.join(tmp, "baseline-b.npz")
+                n_base = max(
+                    2, int(os.environ.get("STIFF_G18_BASELINE_RUNS", "4"))
+                )
+                baseline_runs = []
+                for index in range(n_base):
+                    path = os.path.join(tmp, f"baseline-{index}.npz")
+                    run_child("baseline", path, scenario)
+                    baseline_runs.append(load(path))
                 graph_path = os.path.join(tmp, "graph.npz")
-                run_child("baseline", baseline_a_path, scenario)
-                run_child("baseline", baseline_b_path, scenario)
                 run_child("graph", graph_path, scenario)
-                baseline_a = load(baseline_a_path)
-                baseline_b = load(baseline_b_path)
                 graph_result = load(graph_path)
                 for field in ("positions", "velocities", "kappas"):
                     envelope_compare(
                         f"{scenario}:{field}",
-                        baseline_a[field],
-                        baseline_b[field],
+                        [b[field] for b in baseline_runs],
                         graph_result[field],
                     )
                 assert_divergence_is_chaotic(
                     f"{scenario}:positions",
-                    baseline_a["positions"],
+                    baseline_runs[0]["positions"],
                     graph_result["positions"],
                 )
         print("COLLISION-GRAPH-GATE: PASS")
