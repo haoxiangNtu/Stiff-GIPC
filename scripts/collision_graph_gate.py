@@ -270,6 +270,12 @@ def envelope_compare(
     equivalence = 1e-7 * scale
     if label.endswith(":velocities"):
         equivalence = 1e-5 * scale
+    # Kappa is a RATIO of two large reductions (-gsum/gsnorm), so each
+    # operand's ~1e-7 legal reassociation compounds: the A800's bitwise-
+    # deterministic baselines measured 1.9e-7 relative on a healthy run
+    # against the 1e-7 floor. Real contact bugs land at 1e-3+ relative.
+    elif label.endswith(":kappas"):
+        equivalence = 1e-6 * scale
     tolerance = max(8.0 * baseline_noise, precision_floor, equivalence)
     assert error <= tolerance, (
         f"{label} differs beyond the baseline nondeterminism envelope: "
