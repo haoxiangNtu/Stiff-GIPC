@@ -321,10 +321,24 @@ void GIPC::partitionContactHessian()
                 gipc_global_triplet.m_contact_class_tier[1],
                 gipc_global_triplet.m_contact_class_tier[2],
                 gipc_global_triplet.m_contact_class_tier[3]};
-            if(abd_fem_count_info.fem_point_num <= 0
-               && abd_fem_count_info.abd_body_num > 0
-               && class_tier[3] < payload_count)
-                class_tier[3] = payload_count;
+            // Same contradiction, FEM flavor: a ZERO-contact FEM scene puts
+            // the whole payload into class 0 (cls=[13824,0,0,0] against a
+            // 4096 allowance-trained cap). The clamp therefore covers every
+            // provably-unsatisfiable case -- pure-ABD scenes, and any scene
+            // whose honest census observed no contact at training time --
+            // while contact-rich FEM scenes bake bit-identically to before.
+            long long observed_total = 0;
+            for(int s = 0; s < 4; ++s)
+                observed_total +=
+                    gipc_global_triplet.m_observed_class_count[s];
+            const bool abd_only =
+                abd_fem_count_info.fem_point_num <= 0
+                && abd_fem_count_info.abd_body_num > 0;
+            const int pad_class =
+                abd_fem_count_info.fem_point_num > 0 ? 0 : 3;
+            if((abd_only || observed_total == 0)
+               && class_tier[pad_class] < payload_count)
+                class_tier[pad_class] = payload_count;
             int segment_start[4] = {0, 0, 0, 0};
             for(int s = 1; s < 4; ++s)
                 segment_start[s] =
