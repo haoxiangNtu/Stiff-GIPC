@@ -2230,10 +2230,23 @@ bool try_launch_full_graph(GIPC& ipc,
     if(!ipc.m_skip_all_collision
        && knob_enabled("STIFF_C4_COLLISION_GRAPH"))
     {
-        ipc.upperBoundKappa(ipc.Kappa);
-        if(ipc.Kappa < 1e-16)
-            ipc.suggestKappa(ipc.Kappa);
-        ipc.initKappa(mesh);
+        // [C6-h] Kappa derivation runs on attempt 0 ONLY. initKappa derives
+        // kappa from the gradient buffers, and on a retry those hold the FAILED
+        // attempt's garbage: beaker frame 1 went kappa 614.4 -> 8.63 (71x too
+        // soft) between attempts 2 and 3, the barrier collapsed, the sweep hit
+        // 17.3M pairs and the retry budget burned. A retry replays the SAME
+        // frame, so it must run at the same kappa: restore_host_attempt has
+        // already put attempt 0's post-initKappa value back in ipc.Kappa (the
+        // snapshot is taken after this block), and frame_restore_kappa restored
+        // m_kappa_group on device. The friction rebuild below stays
+        // unconditional (C6-e): it reads the bit-exactly restored vertices.
+        if(attempt == 0)
+        {
+            ipc.upperBoundKappa(ipc.Kappa);
+            if(ipc.Kappa < 1e-16)
+                ipc.suggestKappa(ipc.Kappa);
+            ipc.initKappa(mesh);
+        }
 #ifdef USE_FRICTION
         // [C4-c] rebuild the lagged friction sets at the frame boundary,
         // exactly where the release IPC_Solver does (frame-start snapshot
@@ -3624,15 +3637,25 @@ int GIPC::frame_graph_finish_terminal()
         & frame_fsm::OVF_UNIQUE_BLOCKS)
        && m_last_frame_status.required_unique_blocks > 0)
     {
-        // Boundary-only tier growth.  No graph body allocation or host count
-        // refresh is needed on the retry: the terminal packet already carried
-        // the exact required count.
+        // [C6-h] Growing the unique tier without bumping the buffer generation
+        // was dead code for the recorded path: the retry replayed the SAME
+        // executable with the SAME baked unique extents, so beaker overflowed
+        // unique blocks on attempt 2, grew, and overflowed identically on
+        // attempt 3 (inv=0x80040) -- a wasted retry that then cascaded. A tier
+        // that shapes recorded launches must force a re-record, exactly like
+        // the pair/CCD tiers below.
         const int tier = gipc::assembly_capacity_tier(
             m_last_frame_status.required_unique_blocks);
-        gipc_global_triplet.m_abd_unique_tier[0] = std::max(
-            gipc_global_triplet.m_abd_unique_tier[0], tier);
-        gipc_global_triplet.m_abd_unique_tier[1] = std::max(
-            gipc_global_triplet.m_abd_unique_tier[1], tier);
+        const int prev0 = gipc_global_triplet.m_abd_unique_tier[0];
+        const int prev1 = gipc_global_triplet.m_abd_unique_tier[1];
+        gipc_global_triplet.m_abd_unique_tier[0] = std::max(prev0, tier);
+        gipc_global_triplet.m_abd_unique_tier[1] = std::max(prev1, tier);
+        if(gipc_global_triplet.m_abd_unique_tier[0] > prev0
+           || gipc_global_triplet.m_abd_unique_tier[1] > prev1)
+        {
+            m_graph_tier_grew = true;
+            ++pcg_buffer_generation();   // force a re-record at the new tier
+        }
     }
     // [C6] Pair-capacity overflow must GROW the trained extents, otherwise the
     // retry replays the same too-small tier and burns the whole retry budget.
