@@ -2493,6 +2493,14 @@ void GIPC::prepare_episode_graph(
         throw std::logic_error(
             "[episode-graph] one synchronous warm-up step is required "
             "before graph capture");
+    // [C6-l] Episode-scoped bake behaviour (see the clamp in 13_kappa): an
+    // RAII guard so every exit path -- returns and throws alike -- clears it.
+    struct EpisodeCaptureFlag
+    {
+        bool& flag;
+        explicit EpisodeCaptureFlag(bool& f) : flag(f) { flag = true; }
+        ~EpisodeCaptureFlag() { flag = false; }
+    } episode_capture_guard{m_episode_capture};
     if(m_frame_graph_active)
         throw std::logic_error(
             "[episode-graph] another graph transaction is active");
@@ -4148,6 +4156,23 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
                     retry_invalid_bits);
             if(!full_launched)
             {
+                // [C6-l] A fallback attempt inherits pair arrays clobbered by
+                // the aborted recording: a truncated, racy SUBSET emitted at
+                // TRIAL positions. The release solver's own frame boundary
+                // builds the lagged friction sets straight from those arrays
+                // (buildFrictionSets reads h_cpNum[0]/_collisonPairs, no
+                // fresh detection), which re-injected nondeterminism into an
+                // otherwise bit-exact fallback -- measured fallback Newton 17
+                // vs 19 across two runs with identical restored state.
+                // Rebuild the pair set from the restored frame-entry geometry
+                // first: same positions give the same SET, and the canonical
+                // slot order makes the arrays bitwise reproducible.
+                if(attempt > 0 && !m_skip_all_collision
+                   && !getenv("STIFF_FALLBACK_NO_REBUILD"))
+                {
+                    buildBVH();
+                    buildCP();
+                }
                 frame_graph_begin(
                     mesh,
                     physical_frame_id,

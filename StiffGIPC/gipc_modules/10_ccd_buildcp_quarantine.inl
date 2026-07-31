@@ -290,6 +290,10 @@ void GIPC::buildCP()
     CUDA_SAFE_CALL(cudaStreamWaitEvent(
         cudaStreamPerThread, m_aux_done_event, 0));
 
+    // [C6-l canon-slots] must run before the snapshot and any consumer.
+    if(m_mode_config.ee_canon)
+        canonicalizePairSlots();
+
     if(m_ls_defer_counts)
     {   // [B3 trial-defer] mirror stays invalid during trials; energies use
         // the slacked bounds + device live counts; overflow via the monotone
@@ -360,6 +364,223 @@ void GIPC::buildCP()
 // [narrow-self snapshot] copy the DCD-time CCD mirror (first h_cpNum[0] slots of
 // _ccd_collisonPairs, written by the DCD detect kernels at the same atomic slot
 // as _collisionPair) into a dedicated immutable buffer. See GIPC.cuh for why.
+
+// ============================================================================
+// [C6-l canon-slots] Deterministic pair-slot order.
+//
+// The DCD emission assigns slots with atomicAdd, so the slot PERMUTATION of an
+// identical pair set varies run to run. Every order-dependent consumer
+// inherits that: the deterministic gradient deposits and the order-free
+// duplicate-block merge are immune, but the LS energy reductions sum pair
+// energies in slot order, and in the recorded whole-frame replay the schedule
+// jitter is large enough that one towel run in two flipped a knife-edge LS
+// decision at first contact and exploded (newton=1000, ls=20586).
+//
+// Fix at the source: one stable two-pass lexicographic radix sort of the pair
+// slots (plus the ground list) right after emission. Slot order becomes a pure
+// function of the pair SET. Everything is fixed-shape at MAX capacity with
+// device-side live masking (pads key to MAX and sink to the tail), so the
+// recorded launches are identical every frame and nothing allocates in
+// capture -- the lazy allocations below are trained by the pre-capture dry
+// run, exactly like every other capacity axis.
+// ============================================================================
+__device__ __forceinline__ unsigned int _canon_ord32(int v)
+{
+    return static_cast<unsigned int>(v) ^ 0x80000000u;
+}
+
+__global__ void _canon_keys_zw(const int4*     pairs,
+                               const uint32_t* live,
+                               uint64_t*       keys,
+                               uint32_t*       index,
+                               int             capacity)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= capacity)
+        return;
+    index[i] = static_cast<uint32_t>(i);
+    if(i < static_cast<int>(*live))
+    {
+        const int4 q = pairs[i];
+        keys[i] = (static_cast<uint64_t>(_canon_ord32(q.z)) << 32)
+                  | _canon_ord32(q.w);
+    }
+    else
+        keys[i] = ~0ull;
+}
+
+__global__ void _canon_keys_xy_gather(const int4*     pairs,
+                                      const uint32_t* live,
+                                      const uint32_t* index,
+                                      uint64_t*       keys,
+                                      int             capacity)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= capacity)
+        return;
+    const uint32_t j = index[i];
+    if(j < *live)
+    {
+        const int4 q = pairs[j];
+        keys[i] = (static_cast<uint64_t>(_canon_ord32(q.x)) << 32)
+                  | _canon_ord32(q.y);
+    }
+    else
+        keys[i] = ~0ull;
+}
+
+__global__ void _canon_gather(const int4*     pairs,
+                              const int*      mat,
+                              const int4*     ccd,
+                              const uint32_t* index,
+                              const uint32_t* live,
+                              int4*           pairs_out,
+                              int*            mat_out,
+                              int4*           ccd_out,
+                              int             capacity)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= capacity || i >= static_cast<int>(*live))
+        return;
+    const uint32_t j = index[i];
+    pairs_out[i] = pairs[j];
+    mat_out[i]   = mat[j];
+    ccd_out[i]   = ccd[j];
+}
+
+__global__ void _canon_writeback(const int4*     pairs_in,
+                                 const int*      mat_in,
+                                 const int4*     ccd_in,
+                                 const uint32_t* live,
+                                 int4*           pairs,
+                                 int*            mat,
+                                 int4*           ccd,
+                                 int             capacity)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= capacity || i >= static_cast<int>(*live))
+        return;
+    pairs[i] = pairs_in[i];
+    mat[i]   = mat_in[i];
+    ccd[i]   = ccd_in[i];
+}
+
+__global__ void _canon_gp_keys(const uint32_t* gp,
+                               const uint32_t* live,
+                               uint64_t*       keys,
+                               uint32_t*       index,
+                               int             capacity)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= capacity)
+        return;
+    index[i] = static_cast<uint32_t>(i);
+    keys[i] = i < static_cast<int>(*live) ? static_cast<uint64_t>(gp[i])
+                                          : ~0ull;
+}
+
+__global__ void _canon_gp_gather(const uint32_t* gp,
+                                 const uint32_t* index,
+                                 const uint32_t* live,
+                                 uint32_t*       gp_out,
+                                 int             capacity)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= capacity || i >= static_cast<int>(*live))
+        return;
+    gp_out[i] = gp[index[i]];
+}
+
+__global__ void _canon_gp_writeback(const uint32_t* gp_in,
+                                    const uint32_t* live,
+                                    uint32_t*       gp,
+                                    int             capacity)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= capacity || i >= static_cast<int>(*live))
+        return;
+    gp[i] = gp_in[i];
+}
+
+void GIPC::canonicalizePairSlots()
+{
+    const int cap    = MAX_COLLITION_PAIRS_NUM;
+    const int gp_cap = static_cast<int>(surf_vertexNum);
+    if(cap <= 0)
+        return;
+    if(!m_canon_ready)
+    {
+        // Lazy one-time allocation; the pre-capture dry run takes this branch
+        // outside capture, so the recorded path never allocates.
+        for(int b = 0; b < 2; ++b)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_canon_keys[b],
+                                      (size_t)cap * sizeof(uint64_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_canon_idx[b],
+                                      (size_t)cap * sizeof(uint32_t)));
+        }
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_canon_pairs_tmp,
+                                  (size_t)cap * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_canon_ccd_tmp,
+                                  (size_t)cap * sizeof(int4)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_canon_mat_tmp,
+                                  (size_t)cap * sizeof(int)));
+        if(gp_cap > 0)
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_canon_gp_tmp,
+                                      (size_t)gp_cap * sizeof(uint32_t)));
+        size_t bytes = 0;
+        cub::DeviceRadixSort::SortPairs(nullptr, bytes,
+                                        m_canon_keys[0], m_canon_keys[1],
+                                        m_canon_idx[0], m_canon_idx[1],
+                                        cap);
+        m_canon_sort_tmp_bytes = bytes + 256;
+        CUDA_SAFE_CALL(cudaMalloc(&m_canon_sort_tmp,
+                                  m_canon_sort_tmp_bytes));
+        m_canon_ready = true;
+    }
+    const int tn = 256;
+    const int bn = (cap + tn - 1) / tn;
+    // Pass 1: minor key (z, w). Radix sort is stable, so sorting minor first
+    // and major second yields the full lexicographic (x, y, z, w) order.
+    _canon_keys_zw<<<bn, tn, 0, cudaStreamPerThread>>>(
+        _collisonPairs, _cpNum, m_canon_keys[0], m_canon_idx[0], cap);
+    size_t bytes = m_canon_sort_tmp_bytes;
+    CUDA_SAFE_CALL(cub::DeviceRadixSort::SortPairs(
+        m_canon_sort_tmp, bytes, m_canon_keys[0], m_canon_keys[1],
+        m_canon_idx[0], m_canon_idx[1], cap, 0, 64, cudaStreamPerThread));
+    // Pass 2: major key (x, y), gathered through pass 1's permutation.
+    _canon_keys_xy_gather<<<bn, tn, 0, cudaStreamPerThread>>>(
+        _collisonPairs, _cpNum, m_canon_idx[1], m_canon_keys[0], cap);
+    bytes = m_canon_sort_tmp_bytes;
+    CUDA_SAFE_CALL(cub::DeviceRadixSort::SortPairs(
+        m_canon_sort_tmp, bytes, m_canon_keys[0], m_canon_keys[1],
+        m_canon_idx[1], m_canon_idx[0], cap, 0, 64, cudaStreamPerThread));
+    // m_canon_idx[0] now holds the lexicographic permutation.
+    _canon_gather<<<bn, tn, 0, cudaStreamPerThread>>>(
+        _collisonPairs, _MatIndex, _ccd_collisonPairs, m_canon_idx[0],
+        _cpNum, m_canon_pairs_tmp, m_canon_mat_tmp, m_canon_ccd_tmp, cap);
+    _canon_writeback<<<bn, tn, 0, cudaStreamPerThread>>>(
+        m_canon_pairs_tmp, m_canon_mat_tmp, m_canon_ccd_tmp, _cpNum,
+        _collisonPairs, _MatIndex, _ccd_collisonPairs, cap);
+    if(gp_cap > 0 && m_canon_gp_tmp)
+    {
+        const int gbn = (gp_cap + tn - 1) / tn;
+        _canon_gp_keys<<<gbn, tn, 0, cudaStreamPerThread>>>(
+            _environment_collisionPair, _gpNum, m_canon_keys[0],
+            m_canon_idx[0], gp_cap);
+        bytes = m_canon_sort_tmp_bytes;
+        CUDA_SAFE_CALL(cub::DeviceRadixSort::SortPairs(
+            m_canon_sort_tmp, bytes, m_canon_keys[0], m_canon_keys[1],
+            m_canon_idx[0], m_canon_idx[1], gp_cap, 0, 64,
+            cudaStreamPerThread));
+        _canon_gp_gather<<<gbn, tn, 0, cudaStreamPerThread>>>(
+            _environment_collisionPair, m_canon_idx[1], _gpNum,
+            m_canon_gp_tmp, gp_cap);
+        _canon_gp_writeback<<<gbn, tn, 0, cudaStreamPerThread>>>(
+            m_canon_gp_tmp, _gpNum, _environment_collisionPair, gp_cap);
+    }
+}
+
 void GIPC::snapshotDcdCcdPairs()
 {
     m_dcd_snap_count = h_cpNum[0];

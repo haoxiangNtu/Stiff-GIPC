@@ -806,6 +806,27 @@ class GIPC
                                  MAX_CCD_COLLITION_PAIRS_NUM));
     }
     void ensure_graph_friction_capacity();
+    // [C6-l canon-slots] Deterministic pair-slot order under ee_canon: the
+    // emission's atomicAdd slot assignment is racy, and every order-dependent
+    // consumer (the LS energy trees above all) inherits that raciness in the
+    // recorded replay. One stable lexicographic sort after each DCD build
+    // makes the slot order a pure function of the pair SET.
+    uint64_t* m_canon_keys[2]   = {nullptr, nullptr};
+    uint32_t* m_canon_idx[2]    = {nullptr, nullptr};
+    int4*     m_canon_pairs_tmp = nullptr;
+    int4*     m_canon_ccd_tmp   = nullptr;
+    int*      m_canon_mat_tmp   = nullptr;
+    uint32_t* m_canon_gp_tmp    = nullptr;
+    void*     m_canon_sort_tmp  = nullptr;
+    size_t    m_canon_sort_tmp_bytes = 0;
+    bool      m_canon_ready     = false;
+    // [C6-l] True only while an EPISODE graph is being trained/captured. The
+    // zero-observation bake clamp is episode-scoped: episodes have no per-
+    // frame fallback (a failed frame aborts the episode transactionally), so
+    // they must bake overflow-proof; step-mode frames prefer the C6-i host
+    // fallback, whose parity with the baseline is what G19 asserts.
+    bool      m_episode_capture = false;
+    void      canonicalizePairSlots();
     void update_graph_training_capacity();
     void self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
                                                        double* mqueue,

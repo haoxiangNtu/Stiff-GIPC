@@ -864,6 +864,20 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
             [&](cudaGraphConditionalHandle newton_handle)
             {
                 _newton_iteration_begin<<<1, 1>>>(frame);
+                // [C6-l] The tier guard runs at the TOP of every Newton
+                // iteration, checking the counters the most recent buildCP
+                // (prologue or the previous line-search trial) left behind.
+                // It used to run only at frame end, so a mid-frame DCD
+                // overflow let the loop spin STARVED on a truncated pair set
+                // until a budget broke it -- measured 369 vs 1000 Newton
+                // iterations for the same frame across two runs, and that
+                // timing-sensitive spin duration was the whole-frame replay's
+                // dominant nondeterminism source. In-body, the frame aborts
+                // within one iteration and the C6-i boundary fallback takes
+                // over from the bit-exact restored state.
+                if(collision_body
+                   && !getenv("STIFF_GUARD_FRAME_END_ONLY"))
+                    enqueue_pair_tier_guard();
                 if(collision_body)
                     snapshotDcdCcdPairsCapture();
                 computeGradientAndHessian(TetMesh);

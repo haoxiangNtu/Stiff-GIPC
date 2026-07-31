@@ -336,7 +336,14 @@ void GIPC::partitionContactHessian()
                 && abd_fem_count_info.abd_body_num > 0;
             const int pad_class =
                 abd_fem_count_info.fem_point_num > 0 ? 0 : 3;
-            if((abd_only || observed_total == 0)
+            // Episode-scoped (C6-l): step-mode frames handle a payload the
+            // trained tiers cannot hold via the C6-i host fallback, which
+            // keeps graph-vs-baseline parity at the 1e-8 level G19 asserts;
+            // baking the payload-spanning segment there shifted the isolated
+            // graph by a stable 6.5e-6 of legal reassociation. Episodes have
+            // no per-frame fallback, so THEY must bake overflow-proof.
+            if(m_episode_capture
+               && (abd_only || observed_total == 0)
                && class_tier[pad_class] < payload_count)
                 class_tier[pad_class] = payload_count;
             int segment_start[4] = {0, 0, 0, 0};
