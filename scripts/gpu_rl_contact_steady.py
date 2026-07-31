@@ -200,6 +200,13 @@ def main() -> None:
             if status["result"] != 0:
                 import struct as _s
                 inv = _s.unpack_from("<I", raw, 8)[0]
+                hw_t = _s.unpack_from("<i", raw, 72)[0]
+                rq_t = _s.unpack_from("<i", raw, 88)[0]
+                cls = _s.unpack_from("<4i", raw, 104)
+                print(
+                    f"CONTACT-STEADY-OVF: hw_triplets={hw_t} "
+                    f"required={rq_t} class_counts={list(cls)}"
+                )
                 assert resumes == 0, (
                     f"step {frame} failed after a resume: {status} "
                     f"invalid=0x{inv:x}"

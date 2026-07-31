@@ -306,8 +306,25 @@ void GIPC::partitionContactHessian()
 
         if(gipc_global_triplet.m_contact_partition_txn_ok)
         {
-            const int* class_tier =
-                gipc_global_triplet.m_contact_class_tier;
+            // [D4-b] Pure-ABD clamp. The padded collision payload is itself a
+            // sum of class-tier segments plus fixed extras, and with no FEM
+            // points EVERY padded slot classifies as abd_abd (index 0 is an
+            // ABD body, so the hash(0,0) pads follow). A trained cap3 can
+            // therefore never satisfy cap3 >= payload = cap3 + everything
+            // else -- the in-graph class guard was structurally
+            // unsatisfiable on D4 (class_counts=[0,0,0,10240] against any
+            // trained tier). Pads are value-neutral zeros and the REAL
+            // abd_abd count cannot exceed the payload, so the bake-time
+            // segment simply spans the payload.
+            int class_tier[4] = {
+                gipc_global_triplet.m_contact_class_tier[0],
+                gipc_global_triplet.m_contact_class_tier[1],
+                gipc_global_triplet.m_contact_class_tier[2],
+                gipc_global_triplet.m_contact_class_tier[3]};
+            if(abd_fem_count_info.fem_point_num <= 0
+               && abd_fem_count_info.abd_body_num > 0
+               && class_tier[3] < payload_count)
+                class_tier[3] = payload_count;
             int segment_start[4] = {0, 0, 0, 0};
             for(int s = 1; s < 4; ++s)
                 segment_start[s] =

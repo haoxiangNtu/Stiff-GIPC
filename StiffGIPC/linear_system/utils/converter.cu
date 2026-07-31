@@ -94,16 +94,33 @@ void Converter::ensure_capacity(int capacity)
                == cudaSuccess
            && status != cudaStreamCaptureStatusNone)
             fprintf(stderr,
-                    "[converter] IN-CAPTURE mergebin grow: capacity=%d "
-                    "need=%zu cap=%zu\n",
+                    "[converter] IN-CAPTURE mergebin grow: this=%p "
+                    "capacity=%d need=%zu cap=%zu\n",
+                    (void*)this,
                     capacity,
                     need,
                     m_mergebin_cap);
     }
     if(m_mergebin)
         CUDA_SAFE_CALL(cudaFree(m_mergebin));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_mergebin, need * sizeof(double)));
-    m_mergebin_cap = need;
+    // [D4-b] Grow with 2x headroom. Baked exact counts drift a few percent
+    // between the pass that sized this scratch and the recorded replay
+    // (measured 4096-tier trained vs a 4190-wide in-capture convert), and a
+    // grow inside capture is a hard error 900. Doubling at every legal
+    // (non-capturing) grow makes any later convert of up to twice the
+    // trained width safe, independent of which pass trained it.
+    // Size-dependent headroom. Small scratches double: the width that trains
+    // them can lag the capture width by whole tier steps when the owner is
+    // rebuilt between passes (D4: trained 1024-wide, captured 4190-wide), and
+    // the cost is trivial. Large scratches get +12.5%: the drift there is a
+    // measured few percent, and doubling beaker's ~576 MB bins OOMed a 24 GB
+    // card at this very cudaMalloc.
+    const size_t kSmall = (32ull << 20) / sizeof(double);
+    const size_t reserved =
+        need < kSmall ? 2 * need : need + need / 8 + 4096;
+    CUDA_SAFE_CALL(
+        cudaMalloc((void**)&m_mergebin, reserved * sizeof(double)));
+    m_mergebin_cap = reserved;
 }
 
 void Converter::convert(GIPCTripletMatrix& global_triplets,

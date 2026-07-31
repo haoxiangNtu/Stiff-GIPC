@@ -661,20 +661,59 @@ void GIPC::train_collision_graph_capacities()
         // its consumer is a plain 3x3 pass-through, so oversizing it never
         // dereferences ABD tables. The ABD lifting classes stay gated on
         // actual scene population (null-Jacobi launch otherwise).
+        // [D4-b] The zero pads carry hash(0,0), and (0,0) classifies by the
+        // ID layout: index 0 is a FEM vertex when the scene has FEM points, so
+        // the pads land in class 0 -- but in a PURE-ABD scene index 0 is an
+        // ABD body and the pads classify as abd_abd (class 3). Granting the
+        // pad allowance to class 0 unconditionally left class 3 at its 256
+        // floor on the D4 scene, and the first recorded frame overflowed on
+        // its own pads: class_counts=[0,0,0,10240] against tier 256, contact
+        // load irrelevant. The allowance follows the pads' real class, and
+        // that class is always trainable (has_abd holds when pad_class==3).
+        const int pad_class = has_fem ? 0 : 3;
+        if(getenv("STIFF_FRAME_GRAPH_DIAG"))
+            fprintf(stderr,
+                    "[class-train] has_fem=%d has_abd=%d pad_class=%d "
+                    "sort_cap=%d contact_tier=%lld obs=[%d,%d,%d,%d] "
+                    "tier_in=[%d,%d,%d,%d]\n",
+                    (int)has_fem, (int)has_abd, pad_class, sort_capacity,
+                    (long long)contact_tier, observed_class[0],
+                    observed_class[1], observed_class[2], observed_class[3],
+                    gipc_global_triplet.m_contact_class_tier[0],
+                    gipc_global_triplet.m_contact_class_tier[1],
+                    gipc_global_triplet.m_contact_class_tier[2],
+                    gipc_global_triplet.m_contact_class_tier[3]);
         const bool class_possible[4] = {
             true, has_abd && has_fem, has_abd && has_fem, has_abd};
-        (void)has_fem;
         for(int s = 0; s < 4; ++s)
         {
             if(!class_possible[s])
                 continue;
-            // Class 0 additionally holds the capacity grid's zero pads
-            // (hash(0,0) sorts first), so it gets the pad allowance on top.
             long long want = static_cast<long long>(observed_class[s])
                              * graph_train_headroom_num();
-            if(s == 0)
-                want += std::max(0, sort_capacity
-                                        - static_cast<int>(contact_tier));
+            if(s == pad_class)
+            {
+                if(pad_class == 0)
+                {
+                    // FEM scenes: the C6-b allowance, unchanged.
+                    want += std::max(0, sort_capacity
+                                            - static_cast<int>(contact_tier));
+                }
+                else
+                {
+                    // Pure-ABD scenes: with zero real contact the ENTIRE
+                    // padded payload is pads and every one of them lands in
+                    // abd_abd, so the allowance must span all non-real slots
+                    // of the sorted extent (D4: class_counts=[0,0,0,10240]
+                    // against a 256-floor tier; the sort-tail-only allowance
+                    // left required=10496 unreachable).
+                    long long observed_total = 0;
+                    for(int c = 0; c < 4; ++c)
+                        observed_total += observed_class[c];
+                    want += std::max<long long>(
+                        0, sort_capacity - observed_total);
+                }
+            }
             const int tier = gipc::assembly_capacity_tier(
                 static_cast<int>(std::max<long long>(256, want)));
             if(gipc_global_triplet.m_contact_class_tier[s] < tier)

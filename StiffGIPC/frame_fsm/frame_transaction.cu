@@ -2138,7 +2138,26 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
         // (246k -> 2.6M -> 21M triplets), so this pass no longer re-tiers;
         // genuine past-tier overflow is adjudicated in-graph and grows the
         // tier through the OVF retry path.
-        const bool retier = false;
+        // [D4-b] One narrow re-tier is back, for the case the bottom-up model
+        // provably cannot see: in a PURE-ABD scene every padded slot of the
+        // collision payload classifies into abd_abd (index 0 is an ABD body,
+        // so the hash(0,0) pads follow), and the pad-side training models the
+        // payload as contact_tier (4864 on D4) while the dry run MEASURES the
+        // real padded payload (10240). The dry run reproduces the record
+        // layout, so its measured payload is authoritative. Class tiers do
+        // not feed the pair emission, so this converges in one pass -- the
+        // compounding loop C6 killed ran through *_contact_num being read
+        // back as observations, which the honest census already cut. FEM
+        // scenes keep the no-retier behaviour bit-for-bit.
+        bool retier = false;
+        if(!has_fem && has_abd
+           && ipc.gipc_global_triplet.m_contact_class_tier[3]
+                  < measured_payload)
+        {
+            ipc.gipc_global_triplet.m_contact_class_tier[3] =
+                gipc::assembly_capacity_tier(measured_payload);
+            retier = true;
+        }
         (void)class_possible;
         (void)payload_tier;
         // [C6] The ABD contraction reads [offset + fem_fem, 2*offset), so the
@@ -2167,8 +2186,17 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
         // reached capture with floor-sized bins (256*36) and died with error
         // 900 when the 4190-wide ABD final convert arrived. Reserve
         // unconditionally; ensure_capacity is a no-op when already large.
+        // 2x: exact baked counts drift a few percent between the dry-run and
+        // the recording pass (measured 4206 -> 4352), so a same-tier reserve
+        // can be a few slots short (need 4190*36 vs cap 4096*36).
         if(ipc.m_abd_system)
-            ipc.m_abd_system->converter3x3.ensure_capacity(payload_tier);
+        {
+            if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
+                fprintf(stderr, "[reserve] converter3x3=%p tier=%d\n",
+                        (void*)&ipc.m_abd_system->converter3x3,
+                        2 * payload_tier);
+            ipc.m_abd_system->converter3x3.ensure_capacity(2 * payload_tier);
+        }
         if(retier || grew_for_contraction)
         {
             ++pcg_buffer_generation();
@@ -2179,7 +2207,7 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
         // in-capture convert can present: the padded payload tier and both ABD
         // unique tiers. Growth inside capture is a hard 900.
         if(ipc.m_global_linear_system)
-            ipc.m_global_linear_system->train_converter_capacity(std::max(
+            ipc.m_global_linear_system->train_converter_capacity(2 * std::max(
                 {payload_tier,
                  ipc.gipc_global_triplet.m_abd_unique_tier[0],
                  ipc.gipc_global_triplet.m_abd_unique_tier[1]}));
