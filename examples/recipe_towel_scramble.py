@@ -83,6 +83,9 @@ print(f"[scramble] towel verts = {n}, drop pose: tilt={tilt:.1f} yaw={yaw:.1f} h
 import time as _bt
 for fr in range(SETTLE):
     _t0 = _bt.perf_counter(); eng.step()
+    if os.environ.get("STIFF_TOWEL_TRACE"):
+        _P = np.asarray(eng.get_vertices(), dtype=np.float64)
+        print(f"[trace] fr={fr} sum={np.abs(_P).sum():.17e}", flush=True)
     if os.environ.get("STIFF_BENCH_STATS"):
         print(f"[bench] frame {fr} newton {eng.native.get_total_newton_iters()} ms {(_bt.perf_counter()-_t0)*1000:.1f}", flush=True)
 
