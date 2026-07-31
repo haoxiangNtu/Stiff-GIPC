@@ -1106,6 +1106,18 @@ class Engine:
         """
         self._engine.launch_gpu_rl_reset_async(int(cuda_stream))
 
+    def launch_gpu_rl_reset_masked_async(
+        self, env_mask_device_ptr: int, cuda_stream: int = 0
+    ) -> None:
+        """Selective per-env reset: envs whose int32 mask entry (device
+        memory, indexed by env group id) is nonzero snap back to the
+        prepare-time snapshot; other envs are untouched. Pure device-side --
+        the mask can be written by a device done-flag kernel, so an RL loop
+        resets finished envs with zero host transfers."""
+        self._engine.launch_gpu_rl_reset_masked_async(
+            int(env_mask_device_ptr), int(cuda_stream)
+        )
+
     def get_gpu_rl_device_abi(self) -> dict:
         """Return raw device pointers and the audited graph ABI.
 

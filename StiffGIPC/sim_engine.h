@@ -483,6 +483,8 @@ class SimEngine
     // device copies on the bound stream — no host synchronization. Episode
     // bookkeeping (frame counter, reward accumulators) is the caller's.
     void      launch_gpu_rl_reset_async(uintptr_t cuda_stream = 0);
+    void      launch_gpu_rl_reset_masked_async(uintptr_t d_env_mask,
+                                                uintptr_t cuda_stream = 0);
     // [D3] device env-partition handles for merged multi-env batching:
     // point-to-group map (int per vertex, -1 = wildcard) and the per-env
     // quarantine flags (int per env; nonzero = poisoned, treat as done).

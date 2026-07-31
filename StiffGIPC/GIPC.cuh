@@ -875,6 +875,8 @@ class GIPC
     uintptr_t gpu_rl_joint_observations_device_ptr() const;
     int       gpu_rl_joint_observation_count() const;
     void      launch_gpu_rl_reset_async(uintptr_t cuda_stream = 0);
+    void      launch_gpu_rl_reset_masked_async(uintptr_t d_env_mask,
+                                                uintptr_t cuda_stream = 0);
     int gpu_rl_graph_node_count() const;
     int gpu_rl_graph_h2d_count() const;
     int gpu_rl_graph_d2h_count() const;

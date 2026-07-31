@@ -434,6 +434,18 @@ void SimEngine::launch_gpu_rl_reset_async(uintptr_t cuda_stream)
     impl.ipc.launch_gpu_rl_reset_async(cuda_stream);
 }
 
+void SimEngine::launch_gpu_rl_reset_masked_async(uintptr_t d_env_mask,
+                                                 uintptr_t cuda_stream)
+{
+    auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError(
+            "launch_gpu_rl_reset_masked_async() requires a finalized "
+            "SimEngine");
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.launch_gpu_rl_reset_masked_async(d_env_mask, cuda_stream);
+}
+
 uintptr_t SimEngine::get_point_to_group_device_ptr() const
 {
     return reinterpret_cast<uintptr_t>(

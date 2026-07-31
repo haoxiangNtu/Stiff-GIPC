@@ -632,6 +632,10 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("cuda_stream") = uintptr_t{0},
              "[D2] Enqueue an in-stream reset to the prepare-time state "
              "snapshot (pure D2D on the bound stream; no host wait).")
+        .def("launch_gpu_rl_reset_masked_async",
+             &SimEngine::launch_gpu_rl_reset_masked_async,
+             pybind11::arg("d_env_mask"),
+             pybind11::arg("cuda_stream") = 0)
         .def("get_gpu_rl_device_abi",
              [](const SimEngine& e)
              {

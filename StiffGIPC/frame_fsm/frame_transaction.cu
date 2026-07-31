@@ -201,6 +201,9 @@ struct EpisodeGraphContext
     double3* mesh_o_vertexes = nullptr;
     double3* mesh_velocities = nullptr;
     double3* mesh_x_tilta    = nullptr;
+    // [D3 mask-reset] env maps captured at prepare for the masked variant.
+    const int* reset_p2g = nullptr;   // vertex -> env group (-1 = unowned)
+    const int* reset_b2g = nullptr;   // ABD body -> env group
 
     EpisodeRuntimeInput* h_input = nullptr;
     int* h_ready            = nullptr;
@@ -2157,15 +2160,29 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
                 contraction_need + contraction_need / 4);
             grew_for_contraction = true;
         }
+        // [D4 fix] The ABD system's converter3x3 owns its OWN merge bins, and
+        // they grow with cudaFree/cudaMalloc -- illegal inside capture. This
+        // reserve used to live only in the retier branch below, so a scene
+        // whose dry-run needed no retier (D4: retier=0, no contraction growth)
+        // reached capture with floor-sized bins (256*36) and died with error
+        // 900 when the 4190-wide ABD final convert arrived. Reserve
+        // unconditionally; ensure_capacity is a no-op when already large.
+        if(ipc.m_abd_system)
+            ipc.m_abd_system->converter3x3.ensure_capacity(payload_tier);
         if(retier || grew_for_contraction)
         {
             ++pcg_buffer_generation();
-            if(ipc.m_abd_system)
-                ipc.m_abd_system->converter3x3.ensure_capacity(
-                    payload_tier);
             ipc.computeGradientAndHessian(mesh);
             ipc.calculateMovingDirection(mesh, 0, ipc.pcg_data.P_type);
         }
+        // [D4 fix] Reserve the converter merge bins at the widest extent any
+        // in-capture convert can present: the padded payload tier and both ABD
+        // unique tiers. Growth inside capture is a hard 900.
+        if(ipc.m_global_linear_system)
+            ipc.m_global_linear_system->train_converter_capacity(std::max(
+                {payload_tier,
+                 ipc.gipc_global_triplet.m_abd_unique_tier[0],
+                 ipc.gipc_global_triplet.m_abd_unique_tier[1]}));
         if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
             fprintf(stderr,
                     "[train-capture] dry-run offset=%d payload=%d "
@@ -2625,6 +2642,8 @@ void GIPC::prepare_episode_graph(
             context->mesh_o_vertexes = mesh.o_vertexes;
             context->mesh_velocities = mesh.velocities;
             context->mesh_x_tilta    = mesh.xTilta;
+            context->reset_p2g = mesh.d_point_to_group;
+            context->reset_b2g = mesh.d_body_to_group;
             if(context->reset_vertex_count)
             {
                 device_alloc(context->reset_fem_x,
@@ -3030,6 +3049,81 @@ int GIPC::gpu_rl_joint_observation_count() const
 // next frame graph launch rebuilds collision/contact state from scratch in
 // its own prologue. The device frame counter is intentionally left running
 // (episode bookkeeping is the caller's policy decision).
+// [D3 mask-reset] Selective per-env reset: envs whose mask entry is nonzero
+// snap back to the prepare-time state; every other env is untouched. Vertices
+// and bodies with no group (-1) never reset through the masked path.
+__global__ void _masked_reset_fem(double3* x, double3* ox, double3* v,
+                                  double3* xt, const double3* sx,
+                                  const double3* sox, const double3* sv,
+                                  const double3* sxt, const int* p2g,
+                                  const int* mask, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    const int g = p2g ? p2g[i] : -1;
+    if(g < 0 || !mask[g]) return;
+    x[i] = sx[i]; ox[i] = sox[i]; v[i] = sv[i]; xt[i] = sxt[i];
+}
+
+__global__ void _masked_reset_abd(gipc::Vector12* q, gipc::Vector12* qp,
+                                  gipc::Vector12* qv, gipc::Vector12* qt,
+                                  const gipc::Vector12* sq,
+                                  const gipc::Vector12* sqp,
+                                  const gipc::Vector12* sqv,
+                                  const gipc::Vector12* sqt, const int* b2g,
+                                  const int* mask, int n)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if(b >= n) return;
+    const int g = b2g ? b2g[b] : -1;
+    if(g < 0 || !mask[g]) return;
+    q[b] = sq[b]; qp[b] = sqp[b]; qv[b] = sqv[b]; qt[b] = sqt[b];
+}
+
+void GIPC::launch_gpu_rl_reset_masked_async(uintptr_t d_env_mask,
+                                            uintptr_t cuda_stream)
+{
+    EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] prepare a GPU-native RL graph before masked reset");
+    if(!d_env_mask)
+        throw std::invalid_argument("[gpu-rl] null device env mask");
+    if(!context.reset_p2g && context.reset_vertex_count)
+        throw std::logic_error(
+            "[gpu-rl] masked reset needs per-env vertex groups "
+            "(point_to_group is null -- single ungrouped scene?)");
+    if(context.in_flight && context.launch_stream && cuda_stream
+       && reinterpret_cast<cudaStream_t>(cuda_stream)
+              != context.launch_stream)
+        throw std::logic_error(
+            "[gpu-rl] masked reset must use the bound CUDA stream");
+    cudaStream_t stream = cuda_stream
+        ? reinterpret_cast<cudaStream_t>(cuda_stream)
+        : cudaStreamPerThread;
+    const int* mask = reinterpret_cast<const int*>(d_env_mask);
+    if(context.reset_vertex_count)
+    {
+        const int n = static_cast<int>(context.reset_vertex_count);
+        _masked_reset_fem<<<(n + 255) / 256, 256, 0, stream>>>(
+            context.mesh_vertexes, context.mesh_o_vertexes,
+            context.mesh_velocities, context.mesh_x_tilta,
+            context.reset_fem_x, context.reset_fem_ox, context.reset_fem_v,
+            context.reset_fem_xt, context.reset_p2g, mask, n);
+    }
+    if(context.reset_abd_count)
+    {
+        auto& abd = m_abd_sim_data->device;
+        const int n = context.reset_abd_count;
+        _masked_reset_abd<<<(n + 255) / 256, 256, 0, stream>>>(
+            abd.body_id_to_q.data(), abd.body_id_to_q_prev.data(),
+            abd.body_id_to_q_v.data(), abd.body_id_to_q_tilde.data(),
+            context.reset_abd_q, context.reset_abd_q_prev,
+            context.reset_abd_q_v, context.reset_abd_q_tilde,
+            context.reset_b2g, mask, n);
+    }
+}
+
 void GIPC::launch_gpu_rl_reset_async(uintptr_t cuda_stream)
 {
     EpisodeGraphContext& context = episode_context(*this);
