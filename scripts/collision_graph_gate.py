@@ -180,6 +180,9 @@ def child_environment(graph: bool) -> dict[str, str]:
     if graph:
         env["STIFF_FRAME_GRAPH"] = "1"
         env["STIFF_FRAME_FULL_GRAPH"] = "1"
+        # [C6-n] gate fixtures are tiny (16-vertex cubes / 2 cloths); pin the
+        # size threshold off so they keep exercising the whole-frame graph
+        env["STIFF_FULL_GRAPH_MIN_VERTS"] = "0"
         env["STIFF_C4_COLLISION_GRAPH"] = "1"
     else:
         env["STIFF_FRAME_GRAPH"] = "0"

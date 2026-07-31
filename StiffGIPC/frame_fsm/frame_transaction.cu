@@ -2255,6 +2255,44 @@ void train_collision_for_capture(GIPC& ipc, device_TetraData& mesh)
     CUDA_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// [C6-n] Whole-frame graphs price in fixed capacity-width launches plus
+// re-record storms (a capture costs 20-30s on weak-host pods); a sub-1k
+// vertex scene pays 10-80x the release frame for that structure (A800
+// towel_scramble: 2126ms graph-on vs 25.8ms off). And the two-graph gate
+// is no refuge: its inner graphs re-record on every capacity-generation
+// bump, which turns a hard crumple frame into 15.7s of captures for the
+// SAME 567 Newton iterations the release path solves in 0.5s. Ordinary
+// step() therefore lands tiny scenes on the pure release path (layout
+// machinery off, no captures). Episodes are exempt on purpose: their
+// contract is zero host blocking, not per-frame wall time.
+// STIFF_FULL_GRAPH_MIN_VERTS overrides the default of 1024; the gates pin
+// it to 0 so 16-vertex fixtures keep exercising the graph machinery.
+static bool tiny_scene_for_full_graph(uint32_t vertex_count)
+{
+    long min_verts = 1024;
+    if(const char* value = std::getenv("STIFF_FULL_GRAPH_MIN_VERTS"))
+        min_verts = std::atol(value);
+    return min_verts > 0 && (long)vertex_count < min_verts;
+}
+
+// [C6-m/C6-n] Scoped device_count_mode() kill switch: while armed, every
+// layout-mode consumer (assembly extents, partition, friction sets,
+// converter) takes the pure release path. RAII so throws restore the mode.
+struct LayoutOverrideOff
+{
+    bool armed;
+    explicit LayoutOverrideOff(bool on) : armed(on)
+    {
+        if(armed)
+            GIPCTripletMatrix::s_layout_override_off = true;
+    }
+    ~LayoutOverrideOff()
+    {
+        if(armed)
+            GIPCTripletMatrix::s_layout_override_off = false;
+    }
+};
+
 bool try_launch_full_graph(GIPC& ipc,
                            device_TetraData& mesh,
                            int64_t frame_id,
@@ -2264,6 +2302,8 @@ bool try_launch_full_graph(GIPC& ipc,
     ipc.prepare_frame_graph(mesh);
     FrameGraphContext& context = graph_context(ipc);
     std::string reason;
+    if(tiny_scene_for_full_graph(ipc.vertexNum))
+        return false;   // step() lands tiny scenes on the release path above
     if(context.full_capture_failed
        || !full_graph_eligible(ipc, mesh, context, reason))
     {
@@ -4038,6 +4078,34 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
         return;
     }
 
+    // [C6-n] Tiny scenes skip the transaction entirely and run the release
+    // frame. Arming the transaction is itself the amplifier on this scale:
+    // even with the layout machinery off, begin/terminal graphs, snapshots
+    // and the inner conditional graphs held towel at a 67ms median vs the
+    // release path's 12.4ms -- and inner-graph re-records turned one hard
+    // crumple frame into 15.7s for the same 567 Newton iterations the
+    // release solver finishes in 0.5s. Episodes never pass through here,
+    // so RL residency is untouched.
+    if(tiny_scene_for_full_graph(vertexNum))
+    {
+        static bool announced = false;
+        if(!announced && knob_enabled("STIFF_FRAME_GRAPH_DIAG"))
+        {
+            announced = true;
+            std::fprintf(stderr,
+                         "[frame-graph] declined: scene has %u vertices "
+                         "(< STIFF_FULL_GRAPH_MIN_VERTS, default 1024); "
+                         "running the release path\n",
+                         vertexNum);
+        }
+        LayoutOverrideOff layout_off{true};
+        const int         before = m_total_newton_iters;
+        IPC_Solver(mesh);
+        record_legacy_frame_status(
+            true, false, m_total_newton_iters - before);
+        return;
+    }
+
     int max_retries = 3;
     if(const char* configured = std::getenv("STIFF_FRAME_MAX_RETRIES"))
         max_retries = std::clamp(std::atoi(configured), 0, 16);
@@ -4160,20 +4228,7 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
                 // machinery fully OFF, so it is bit-for-bit the graph-off
                 // frame the C6-i contract promises: exact partition, no tier
                 // guard, no truncation. RAII so throws restore the mode.
-                struct LayoutOff
-                {
-                    bool armed;
-                    explicit LayoutOff(bool on) : armed(on)
-                    {
-                        if(armed)
-                            GIPCTripletMatrix::s_layout_override_off = true;
-                    }
-                    ~LayoutOff()
-                    {
-                        if(armed)
-                            GIPCTripletMatrix::s_layout_override_off = false;
-                    }
-                } layout_off{attempt > 0};
+                LayoutOverrideOff layout_off{attempt > 0};
                 // [C6-l] A fallback attempt inherits pair arrays clobbered by
                 // the aborted recording: a truncated, racy SUBSET emitted at
                 // TRIAL positions. The release solver's own frame boundary
