@@ -13,9 +13,9 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
 | case39 | 113.2 | 8.8 | 203.9 | 1.80x | pass |
 | case39_multienv | 114.5 | 8.7 | 155.3 | 1.36x | pass |
 | cupshirt_finray | 124.8 | 8.0 | 240.4 | 1.93x | pass |
-| case39_UMI_forcegrip | 138.0 | 7.2 | — | — | **CRASH: error 700 converter.cu:311** |
+| case39_UMI_forcegrip | 138.0 | 7.2 | 379.7 | 2.75x | pass after C6-m (97% full-graph) |
 | beaker_finray | 152.4 | 6.6 | 198.5 | 1.30x | pass |
-| case39_UMI_beaker | 192.9 | 5.2 | — | — | **FAIL: frame 20 OVF_TRIPLETS retry budget** |
+| case39_UMI_beaker | 192.9 | 5.2 | 399.8 | 2.07x | pass after C6-m (95% full-graph) |
 | foldshirt_finray | 319.1 | 3.1 | 475.1 | 1.49x | pass |
 | beaker_finray_me | 326.2 | 3.1 | 460.8 | 1.41x | pass |
 | cupshirt_finray_me | 362.4 | 2.8 | 702.5 | 1.94x | pass |
@@ -38,12 +38,17 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
   the fixed capacity-width launch cost dominates a 961-vertex scene. Same
   shape as the 4090 (11x there), amplified by the architecture. Whole-frame
   graphs are the wrong tool for tiny scenes; nothing here is new breakage.
-- **Two graph-on failures, both scenes never before run graph-on**:
-  `case39_UMI_forcegrip` crashes with an illegal access (700) at
-  converter.cu:311 (the exact-count D2H region), and `case39_UMI_beaker`
-  exhausts the capacity retry budget at frame 20 (invalid=0x40000,
-  OVF_TRIPLETS ratcheting faster than boundary growth converges). Filed as
-  follow-ups; both scenes pass graph-off.
+- **Two graph-on failures — RESOLVED by C6-m** (fallback runs the true
+  graph-off frame: `s_layout_override_off` RAII forces `device_count_mode()`
+  false during a capacity-fallback attempt). Root cause: the C6-i fallback
+  still ran the tier-shaped partition + capacity guard, so a frame whose
+  class counts exceeded the trained tiers re-flagged OVF_TRIPLETS on the
+  fallback itself and burned the retry budget (`case39_UMI_beaker` frame
+  20); the same capacity-shaped launches truncate/overrun in that state
+  (`case39_UMI_forcegrip`'s sticky 700 surfacing at converter.cu:311).
+  After C6-m both scenes pass on the A800: forcegrip 379.7 ms (97%
+  full-graph), beaker 399.8 ms (95%). Both were re-verified locally too
+  (G18/G19/D4/G17e PASS, towel det stack bitwise x2).
 - Environment notes: the pod needed `polyscope` (now installed alongside
   trimesh); `[graph-stats]` coverage lines did not appear in suite logs on
   the A800 (delivery of the knob is proven by the timing split; the missing
