@@ -260,7 +260,16 @@ def envelope_compare(
     # Hessian — lands at 1e-3+), but the SHAPE check in
     # assert_divergence_is_chaotic below is what actually distinguishes
     # reassociation from a broken solve.
+    # [C6-j A800] Velocities are a backward difference of positions over dt:
+    # any legal position-level reassociation delta reappears in velocities
+    # multiplied by 1/dt (dt=0.01 in every scenario -> x100). The A800 exposed
+    # this: its host path is BITWISE deterministic (baseline_noise = 0 across
+    # four runs), so the tolerance fell to the raw floor and a 4.9e-6 velocity
+    # delta -- exactly the passing 5e-8 position delta / dt -- failed the gate.
+    # Scale the velocity floor accordingly; positions and kappas keep theirs.
     equivalence = 1e-7 * scale
+    if label.endswith(":velocities"):
+        equivalence = 1e-5 * scale
     tolerance = max(8.0 * baseline_noise, precision_floor, equivalence)
     assert error <= tolerance, (
         f"{label} differs beyond the baseline nondeterminism envelope: "
