@@ -796,7 +796,17 @@ class GIPC
             if(v >= 1 && v <= 64)
                 return v;
         }
-        return 2;   // known-good; headroom 4 did NOT stabilise G18 either
+        // [C6-p] Default flipped 2 -> 1. Tier width is a launch-time
+        // constant inside the recorded graph, and the 2x headroom doubled
+        // every capacity-wide pass (converter unique-block reduction alone
+        // was 86ms/frame at 8.4M slots over a 4.2M payload). Measured step
+        // ratios vs graph-off, honest total wall:
+        //   forcegrip 4090: 2.08x (h2) -> 1.39x (h1); A800: 3.25x -> 1.75x
+        //   beaker    4090: 1.61x (h2) -> 1.21x (h1)
+        // The old 2x bought fewer growth re-records; C6-o's per-axis streak
+        // escalation now bounds ratchet storms, and the measured cost is
+        // 1-2 extra growth frames per run (97% -> 94% coverage).
+        return 1;
     }
     int graph_trained_pair_extent() const { return m_graph_train_pairs; }
     int graph_trained_ground_extent() const { return m_graph_train_ground; }
