@@ -223,6 +223,8 @@ def run_audit_fallback_child() -> None:
     env = os.environ.copy()
     env["STIFF_FRAME_GRAPH"] = "1"
     env["STIFF_FRAME_FULL_GRAPH"] = "1"
+    # [C6-q] tiny fixture; pin the size threshold off for the full-graph audit
+    env["STIFF_FULL_GRAPH_MIN_VERTS"] = "0"
     env["STIFF_MULTIENV_MODE"] = "merged"
     env["STIFF_MIRROR_AUDIT"] = "1"
     env["STIFF_SLOT_AUDIT"] = "1"
@@ -260,6 +262,8 @@ def run_full_child(mode: str) -> str:
     env["STIFF_FRAME_FULL_GRAPH"] = (
         "1" if mode == "full-enabled" else "0"
     )
+    # [C6-q] tiny fixture; pin the size threshold off for the full-graph audit
+    env["STIFF_FULL_GRAPH_MIN_VERTS"] = "0"
     env["STIFF_MULTIENV_MODE"] = "merged"
     for key in (
         "STIFF_BVH_ENVDET",

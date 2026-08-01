@@ -159,6 +159,9 @@ def child_environment() -> dict[str, str]:
     )
     env["STIFF_FRAME_GRAPH"] = "1"
     env["STIFF_FRAME_FULL_GRAPH"] = "1"
+    # [C6-q] gate fixtures are tiny; pin the size threshold off so the warmup
+    # step exercises the whole-frame graph this gate audits
+    env["STIFF_FULL_GRAPH_MIN_VERTS"] = "0"
     env["STIFF_MULTIENV_MODE"] = "merged"
     for key in (
         "STIFF_BVH_ENVDET",

@@ -630,7 +630,11 @@ __global__ void _snapshot_pairs_masked(const int4*     source,
 // costs tens of GB on real scenes.
 void GIPC::update_graph_training_capacity()
 {
-    const int headroom = graph_train_headroom_num();
+    // [C6-q] Episodes have no per-frame fallback: an overflow mid-episode
+    // aborts the whole episode. The C6-p default of headroom 1 is a step-mode
+    // throughput choice; episode captures keep the old 2x margin.
+    const int headroom =
+        std::max(graph_train_headroom_num(), m_episode_capture ? 2 : 1);
     for(int slot = 0; slot < 5; ++slot)
     {
         const int want = gipc::assembly_capacity_tier(
@@ -911,7 +915,8 @@ void GIPC::train_collision_graph_capacities()
             if(!class_possible[s])
                 continue;
             long long want = static_cast<long long>(observed_class[s])
-                             * graph_train_headroom_num();
+                             * std::max(graph_train_headroom_num(),
+                                        m_episode_capture ? 2 : 1);
             if(s == pad_class)
             {
                 if(pad_class == 0)

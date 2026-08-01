@@ -2304,8 +2304,30 @@ bool try_launch_full_graph(GIPC& ipc,
     ipc.prepare_frame_graph(mesh);
     FrameGraphContext& context = graph_context(ipc);
     std::string reason;
+    // [C6-n->C6-q] Tiny scenes decline the FULL graph only: capture storms
+    // and capacity-width replay price a sub-1k scene out (A800 towel: 82x),
+    // but the two-graph transaction must remain -- it is where tier training
+    // and the ABD unique-tier warm-up live, which the episode contract
+    // ("run one step(), then prepare") depends on. The original C6-n
+    // full-bypass broke exactly that (G17a: prepare threw 'tier not trained'
+    // on sub-1k scenes); the 15.7s two-graph runaway that motivated it was
+    // C6-o's starved spin, cured at the root since (towel two-graph now
+    // lands within 4-8% of the release wall). Gates that audit the FULL
+    // graph on tiny fixtures pin STIFF_FULL_GRAPH_MIN_VERTS=0.
     if(tiny_scene_for_full_graph(ipc.vertexNum))
-        return false;   // step() lands tiny scenes on the release path above
+    {
+        static bool announced = false;
+        if(!announced && knob_enabled("STIFF_FRAME_GRAPH_DIAG"))
+        {
+            announced = true;
+            std::fprintf(stderr,
+                         "[frame-full-graph] declined: scene has %u vertices "
+                         "(< STIFF_FULL_GRAPH_MIN_VERTS, default 1024); "
+                         "two-graph transaction stays active\n",
+                         ipc.vertexNum);
+        }
+        return false;
+    }
     if(context.full_capture_failed
        || !full_graph_eligible(ipc, mesh, context, reason))
     {
@@ -4115,34 +4137,6 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
         IPC_Solver(mesh);
         record_legacy_frame_status(
             true, true, m_total_newton_iters - before);
-        return;
-    }
-
-    // [C6-n] Tiny scenes skip the transaction entirely and run the release
-    // frame. Arming the transaction is itself the amplifier on this scale:
-    // even with the layout machinery off, begin/terminal graphs, snapshots
-    // and the inner conditional graphs held towel at a 67ms median vs the
-    // release path's 12.4ms -- and inner-graph re-records turned one hard
-    // crumple frame into 15.7s for the same 567 Newton iterations the
-    // release solver finishes in 0.5s. Episodes never pass through here,
-    // so RL residency is untouched.
-    if(tiny_scene_for_full_graph(vertexNum))
-    {
-        static bool announced = false;
-        if(!announced && knob_enabled("STIFF_FRAME_GRAPH_DIAG"))
-        {
-            announced = true;
-            std::fprintf(stderr,
-                         "[frame-graph] declined: scene has %u vertices "
-                         "(< STIFF_FULL_GRAPH_MIN_VERTS, default 1024); "
-                         "running the release path\n",
-                         vertexNum);
-        }
-        LayoutOverrideOff layout_off{true};
-        const int         before = m_total_newton_iters;
-        IPC_Solver(mesh);
-        record_legacy_frame_status(
-            true, false, m_total_newton_iters - before);
         return;
     }
 
