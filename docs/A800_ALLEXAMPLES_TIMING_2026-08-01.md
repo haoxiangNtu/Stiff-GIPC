@@ -167,3 +167,49 @@ Net: the sort library is NOT the blocker; the GRAPH DEPENDENCY SEMANTICS
 are. Exact-width inside graphs still needs either size-class bucketing
 (~20% residual tax) or a future driver feature (device-side rewrite of
 graph-node grid dims).
+
+## C6-t: device-side GRID DIM update — the pad tax is NOT structural
+
+CORRECTION of a claim made twice in the C6-p/C6-s writeups ("CUDA offers no
+device-side rewrite of graph-node grid dims; only the host can
+cudaGraphExecKernelNodeSetParams"). That claim is FALSE for CUDA 12.8.
+The API exists and works:
+
+  driver_types.h:  cudaGraphKernelNodeFieldGridDim  /**< Grid dimension update */
+  cuda_device_runtime_api.h:401
+      __device__ cudaError_t cudaGraphKernelNodeSetGridDim(
+          cudaGraphDeviceNode_t node, dim3 gridDim);
+  node handle: mark the node with launch attribute
+      cudaLaunchAttributeDeviceUpdatableKernelNode (attr fills in devNode)
+
+Probe results (4090, sm_89, CUDA 12.8, capacity 8.4M / block 256):
+
+1. Plain graph, resizer kernel node -> payload kernel node: the resizer
+   reads the DEVICE-RESIDENT live count and sets the payload node's grid;
+   the change takes effect IN THE SAME REPLAY, no re-record, no host.
+   live=8.4M/4.2M/1M/1024 all ran EXACT-WIDTH (blocks run == ceil(live/256)).
+2. DECISIVE: the same thing INSIDE a conditional WHILE body -- the exact
+   shape of our whole-frame graph -- also works. Marking a node inside a
+   conditional body graph device-updatable succeeds, instantiate succeeds,
+   and across 3 body iterations the payload ran exact-width every time
+   (live=2.1M: 24576 blocks run vs 98304 padded).
+
+Attribution of the graph-on extra GPU time (forcegrip, 15 frames, node
+granularity), i.e. what this could recover:
+
+  our capacity-width kernels (grid-update fixable) 2248.2 ms  77.9%
+  cub device-scope algorithms (separate approach)   247.8 ms   8.6%
+  PCG inner loop (static shape, not pad tax)        390.8 ms  13.5%
+
+So ~78% of the whole-frame graph's overhead is our own launch-width padding
+on kernels we author (the converter unique-block reduction dominates), and
+that portion is addressable with device-side grid updates: a small resizer
+node ahead of each capacity-width node, reading the live count the device
+already maintains. The cub sorts (8.6%) need either the CDP path (legal
+outside graphs, C6-s probe 3) or bucketing.
+
+Implication: the "baked width" floor asserted in C6-p is not a CUDA
+limitation, it is an unexploited API. Step-mode ratios (1.39x forcegrip /
+1.21x beaker) and the episode large-frame penalty could both move
+substantially toward parity. NOT yet implemented -- this entry records the
+proven mechanism and the measured size of the prize.
