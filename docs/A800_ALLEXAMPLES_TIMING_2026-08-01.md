@@ -133,3 +133,37 @@ trajectories additionally need the boundary-resume pattern (first
 launch died at frame 1 on tiers trained from a contact-free warmup;
 after 2 host bridge frames the re-prepared episode ran the remaining
 91/91 frames clean).
+
+## C6-s: device-side sort dispatch research (three probes, 4090, CUDA 12.8 / cub 2.7)
+
+Question: can the contact pipeline's sorts be dispatched FROM DEVICE code
+(exact live counts, no pads, no D2H), bypassing "cub is host-only"?
+
+Probe 1 (device-side cub, bare): cub::DeviceRadixSort::SortPairs called
+from a __global__ parent COMPILES AND WORKS under RDC (which this build
+already enables) + CDP2, and costs the same as host dispatch:
+64-bit keys + 32-bit payload, N=4.2M: host 1.039 ms, device 1.076 ms
+(+3.6%). Padded 2N host sort: 1.943 ms (1.87x — the pad tax measured in
+isolation, linear as expected). The earlier claim "cub device-scope
+algorithms cannot be called from device code" is REFUTED for cub 2.7.
+
+Probe 2 (inside a CUDA graph): capturing the CDP parent into a graph is
+LEGAL (capture/instantiate/replay all clean, and the replay honors a
+device-resident count change without re-record) BUT the graph's node
+edges only order against the PARENT kernel — downstream graph nodes race
+with the parent's device-launched children (check kernel saw unsorted
+data). Raw CDP inside whole-frame/episode graphs is therefore UNUSABLE;
+in-graph device-side shape freedom remains limited to prebaked
+size-class subgraph selection (the PCG self-tail pattern).
+
+Probe 3 (bare stream pipeline): work enqueued on the SAME stream behind
+the CDP parent IS fenced behind the parent's device-launched children
+(CDP2 tail-launch semantics): 0/20 iterations raced. The step-mode
+hybrid could adopt device-dispatched sorts today; the benefit there is
+only removing frame-level count readbacks (~2%), since the host path is
+already pad-free.
+
+Net: the sort library is NOT the blocker; the GRAPH DEPENDENCY SEMANTICS
+are. Exact-width inside graphs still needs either size-class bucketing
+(~20% residual tax) or a future driver feature (device-side rewrite of
+graph-node grid dims).
