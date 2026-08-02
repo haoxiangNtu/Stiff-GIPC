@@ -102,3 +102,34 @@ each example's own per-step wall-clock report; fps = 1000/mean. The local
   `[knob-registry][WARN] unknown STIFF_* knob` for both (silent no-op).
   Physics and timing were unaffected; the C6-m rerun on a fresh build
   prints coverage normally.
+
+## C6-r: replay scenes through the EPISODE channel (4090, beaker replay)
+
+The step-mode tables above beg the question "would the episode channel be
+faster for replay?" Measured (UMI beaker grasp, 94-frame recorded
+trajectory, actions baked through the same joint mapping the host loop
+uses, episode boundary-resume on capacity growth):
+
+| channel | ms/frame | vs host |
+|---|---|---|
+| host step() (release) | 156.4 | 1.00x |
+| step() whole-frame graph | 244.4 | 1.56x |
+| episode (device-resident, resume pattern) | 319-326 | ~2.05x |
+
+Episode is the SLOWEST for heavy replay, and the decomposition says why:
+prepare+launch is nearly free (0.15s), the cost is the replay itself
+(29.1s for 91 frames = 319 ms/frame pure device rate). Episode residency
+removes per-frame HOST overhead (a few ms) but charges the baked
+capacity-width tax on every kernel -- and episodes bake 2x tier headroom
+on purpose (no per-frame fallback, C6-q). On a 150 ms frame the saved
+host milliseconds are ~2%, the width tax is +50-100%.
+
+The channel economics in one line: episode residency pays when frames are
+SMALL and host overhead is comparable to GPU work (D4 articulated
+micro-frames: 4.1 ms/frame device vs 7.6-11.5 host-driven = 1.8-2.8x
+WIN, growing with per-frame host cost); it loses when frames are big
+(replay scenes: 150-400 ms of GPU work per frame). Contact-ramp
+trajectories additionally need the boundary-resume pattern (first
+launch died at frame 1 on tiers trained from a contact-free warmup;
+after 2 host bridge frames the re-prepared episode ran the remaining
+91/91 frames clean).
