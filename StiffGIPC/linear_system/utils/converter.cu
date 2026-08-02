@@ -247,9 +247,17 @@ void Converter::_make_unique_block_warp_reduction(
 
     auto row_indices = global_triplets.block_row_indices(start);
     auto col_indices = global_triplets.block_col_indices(start);
+    // [C6-t] Launch this pass at `length`, not `capacity`. Every thread with
+    // i >= length returns immediately (see the guard below), so the extra
+    // `capacity - length` threads were pure launch width -- and under
+    // device_count_mode capacity is assembly_capacity_tier(length), i.e. up
+    // to 2x length (measured: 4.2M payload launched at 8.4M). Both bounds are
+    // record-time constants, so this is equally graph-legal and bit-identical:
+    // the removed threads performed no writes. nsys attribution had this
+    // kernel as the single largest whole-frame-graph overhead item.
     ParallelFor(256)
         .kernel_name(__FUNCTION__)
-        .apply(capacity,
+        .apply(length,
                [row_indices,
                 col_indices,
                 ij_hash = global_triplets.block_sort_hash_value(),

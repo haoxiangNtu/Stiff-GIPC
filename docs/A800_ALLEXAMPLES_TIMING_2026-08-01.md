@@ -213,3 +213,39 @@ limitation, it is an unexploited API. Step-mode ratios (1.39x forcegrip /
 1.21x beaker) and the episode large-frame penalty could both move
 substantially toward parity. NOT yet implemented -- this entry records the
 proven mechanism and the measured size of the prize.
+
+### C6-t implementation, step 1: narrow the dominant kernel to `length`
+
+The device-update API turned out not to be needed for the biggest item.
+`Converter::_make_unique_block_warp_reduction`'s uniqueness pass already
+opens with `if(i >= length) return;` yet was launched over `capacity`,
+which under device_count_mode is `assembly_capacity_tier(length)` — up to
+2x (measured on forcegrip: payload 4.2M launched at 8.4M). Both bounds are
+record-time constants, so launching at `length` is equally graph-legal and
+bit-identical: the removed threads performed no writes. This kernel was
+the single largest overhead item in the nsys attribution (1284 ms of the
+2248 ms "ours" bucket over 15 frames).
+
+A third probe closed the wiring question for the remaining layers: our
+graphs are built by STREAM CAPTURE, and the pattern works there too —
+`cudaStreamGetCaptureInfo` right after a launch yields exactly that node,
+`cudaGraphKernelNodeSetAttribute` marks it device-updatable MID-CAPTURE,
+and a resizer node recorded ahead of it (reading the handle from device
+memory, published after EndCapture) resizes it at replay: live=2.1M ran
+8192 blocks against a 32768-block capacity.
+
+What the API can NOT reach here, and why the machinery is deliberately NOT
+built yet: the converter's remaining capacity-width passes (sentinel fill,
+partition flags, sort, scan) genuinely need `capacity`, because the live
+triplets are NOT a contiguous prefix — the partition stages them into four
+class segments at TIER strides with zero pads between (13_kappa_partition:
+segment_start[s] = segment_start[s-1] + class_tier[s-1]). "Shrink to the
+true live count" is meaningless against a strided layout; that padding is
+the price of the baked segment layout, not of launch width. A device
+resizer would need a consumer whose live data IS a contiguous prefix; the
+remaining profile items of that shape are small (barrier gradient/hessian
+15.8 ms). Building the resizer with no measured consumer would be
+speculative complexity — the mechanism is proven and recorded here, to be
+used when a large contiguous-prefix consumer appears (e.g. if the sort
+width is ever narrowed from `capacity` to `length`, which is the next
+candidate and carries real risk against the sentinel-pad design).
