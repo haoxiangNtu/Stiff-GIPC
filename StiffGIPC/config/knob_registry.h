@@ -88,6 +88,9 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_C4_COLLISION_GRAPH, "perf") \
     X(STIFF_C5_ISOLATED_GRAPH, "perf") \
     X(STIFF_C6_ABD_STEP_GRAPH, "perf") \
+    /* Scheme-1 contract: keep false so overflow retries cross a CPU frame
+       boundary; true is an explicit experimental in-graph replay mode. */ \
+    X(STIFF_GRAPH_INGRAPH_RETRY, "perf") \
     X(STIFF_GRAPH_STATS, "diag") \
     X(STIFF_GRAPH_DEVICE_RESIZE, "perf") \
     X(STIFF_GRAPH_RESIZE_DIAG, "diag") \
