@@ -303,11 +303,30 @@ void GlobalLinearSystem::convert_new()
     if(GIPCTripletMatrix::device_count_mode())
     {
         const int layout = assembly_capacity_tier(length);
+        // [C6-u] `length` is ALREADY a padded, record-stable constant: the
+        // graph-mode partition sizes the contact payload from the class tiers
+        // and the FEM count is static, so global_triplet_offset carries the
+        // growth headroom by construction. Tiering it again for the launch
+        // width is a SECOND headroom layer whose only effect is that the
+        // sentinel fill / partition-flag / sort / scan passes chew through
+        // (capacity - length) padded slots -- measured 2097152 vs 1125146 on
+        // forcegrip, i.e. 1.86x of real O(N) work with no stability gain
+        // (length changes only when the tiers change, which re-records
+        // anyway). The output region keeps its tiered offset so the buffer
+        // layout is untouched. STIFF_CONVERT_TIER_WIDTH=1 restores the old
+        // double-padded width.
+        // Default keeps the tiered width (HEAD behaviour). Narrowing to
+        // `length` is exact and bitwise-safe but measured within noise, so it
+        // stays opt-in rather than becoming a second thing to re-verify.
+        static const bool exact_width =
+            getenv("STIFF_CONVERT_EXACT_WIDTH")
+            && atoi(getenv("STIFF_CONVERT_EXACT_WIDTH")) != 0;
+        const bool tier_width = !exact_width;
         m_converter.convert(
             *gipc_global_triplet,
             0,
             length,
-            layout,
+            tier_width ? layout : length,
             layout,
             ConvertLayout::FinalGlobal);
     }

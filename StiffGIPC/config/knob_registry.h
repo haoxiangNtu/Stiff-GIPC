@@ -36,6 +36,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_CCD_VALIDATE, "diag") \
     X(STIFF_CONTACT_DBG, "diag") \
     X(STIFF_CONVERT_DEVICE_COUNT, "perf") \
+    X(STIFF_CONVERT_EXACT_WIDTH, "perf") \
     X(STIFF_DECOUPLE_THRESH, "mode_isolated") \
     X(STIFF_DEVICE_LINESEARCH, "perf") \
     X(STIFF_FALLBACK_NO_REBUILD, "diag") \
@@ -87,6 +88,8 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_C5_ISOLATED_GRAPH, "perf") \
     X(STIFF_C6_ABD_STEP_GRAPH, "perf") \
     X(STIFF_GRAPH_STATS, "diag") \
+    X(STIFF_GRAPH_DEVICE_RESIZE, "perf") \
+    X(STIFF_GRAPH_RESIZE_DIAG, "diag") \
     X(STIFF_GRAPH_DIRPROBE, "diag") \
     X(STIFF_C6_RERECORD, "diag") \
     X(STIFF_GRAPH_LEGACY_KAPPA_DOUBLE, "diag") \
@@ -125,6 +128,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_SKIP_F, "solver") \
     X(STIFF_SKIP_FRIC, "solver") \
     X(STIFF_SKIP_GRND, "solver") \
+    X(STIFF_SKIP_ZERO_DEPOSIT, "perf") \
     X(STIFF_SLOT_AUDIT, "audit") \
     X(STIFF_SPLIT_GH, "solver") \
     X(STIFF_SPMV_DET, "mode_strict") \

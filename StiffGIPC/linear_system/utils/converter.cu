@@ -1,3 +1,4 @@
+#include "linear_system/utils/graph_node_resize.h"
 #include <linear_system/utils/converter.h>
 #include <linear_system/utils/capacity_tier.h>
 #include <muda/cub/device/device_run_length_encode.h>
@@ -29,6 +30,21 @@ __global__ inline void moveMemory_2(T* data,
 
 // The device slot is the exact count truth. In frame-graph mode the host
 // mirror is an upper-bound layout count and this value is consumed directly.
+// [C6-v] Zero only the bins the live unique count will actually touch. The
+// memset it replaces is a graph node whose byte count is baked at record time;
+// this is a kernel node, so a device-side resizer can shrink its grid to the
+// real count at replay.
+__global__ void _zero_merge_bins(double* mbin, const int* d_unique, int per_block_doubles, int capacity_doubles)
+{
+    const long long i =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long live =
+        static_cast<long long>(*d_unique) * per_block_doubles;
+    if(i >= live || i >= capacity_doubles)
+        return;
+    mbin[i] = 0.0;
+}
+
 __global__ void _finalize_unique_count(int* dst,
                                        const uint32_t* last_partition)
 {
@@ -391,39 +407,112 @@ void Converter::_make_unique_block_warp_reduction(
     const int merge_capacity =
         bound_layout ? capacity : host_merge_count;
     ensure_capacity(merge_capacity);
-    CUDA_SAFE_CALL(cudaMemsetAsync(
-        m_mergebin,
-        0,
-        static_cast<size_t>(merge_capacity) * 9 * BINNED_K
-            * sizeof(double),
-        cudaStreamPerThread));
+    {
+        const long long bin_doubles =
+            static_cast<long long>(merge_capacity) * 9 * BINNED_K;
+        const int  zero_blocks =
+            static_cast<int>((bin_doubles + 255) / 256);
+        const int  zero_slot = graph_resize::arm(
+            global_triplets.d_unique_key_number, 9 * BINNED_K, 256, zero_blocks);
+        if(zero_slot >= 0)
+        {
+            _zero_merge_bins<<<zero_blocks, 256, 0, cudaStreamPerThread>>>(
+                m_mergebin,
+                global_triplets.d_unique_key_number,
+                9 * BINNED_K,
+                static_cast<int>(bin_doubles));
+            graph_resize::bind_last(zero_slot);
+        }
+        else
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                m_mergebin,
+                0,
+                static_cast<size_t>(merge_capacity) * 9 * BINNED_K
+                    * sizeof(double),
+                cudaStreamPerThread));
+    }
 
+    static const bool s_skip_zero = []() {
+        const char* v = getenv("STIFF_SKIP_ZERO_DEPOSIT");
+        return v && atoi(v) != 0;
+    }();
+    const bool skip_zero = s_skip_zero;
     auto* src_blocks = global_triplets.block_values(out_start_id);
     auto* dst_blocks = global_triplets.block_values(start);
     double* mbin     = m_mergebin;
 
-    ParallelFor(256)
-        .kernel_name("binned_block_merge_scatter")
-        .apply(bound_layout ? capacity : length,
-               [src_blocks,
-                mbin,
-                sorted_partition_output,
-                length] __device__(int i) mutable
-               {
-                   if(i >= length)
-                       return;
-                   const int out = sorted_partition_output[i];
-                   const double* sd =
-                       reinterpret_cast<const double*>(src_blocks + i);
-#pragma unroll
-                   for(int c = 0; c < 9; ++c)
-                       binned_deposit(
-                           mbin
-                               + (static_cast<size_t>(out) * 9 + c)
-                                     * BINNED_K,
-                           sd[c]);
+    // [C6-v] Two SEPARATE kernels, never one kernel with a runtime branch.
+    // The deposit is an atomicAdd, so the result depends on the order the
+    // atomics arrive -- and that order is a property of the generated code and
+    // its occupancy. Merely ADDING A BRANCH to this lambda (even one that is
+    // never taken) perturbs it enough to flip the frame-graph gate's
+    // graph-vs-baseline bitwise digest from 3/3 to 1/3. The default path below
+    // is therefore byte-for-byte the original lambda; the zero-skip fast path
+    // is a distinct lambda selected on the host.
+    if(!skip_zero)
+    {
+        ParallelFor(256)
+            .kernel_name("binned_block_merge_scatter")
+            .apply(bound_layout ? capacity : length,
+                   [src_blocks,
+                    mbin,
+                    sorted_partition_output,
+                    length] __device__(int i) mutable
+                   {
+                       if(i >= length)
+                           return;
+                       const int out = sorted_partition_output[i];
+                       const double* sd =
+                           reinterpret_cast<const double*>(src_blocks + i);
+    #pragma unroll
+                       for(int c = 0; c < 9; ++c)
+                           binned_deposit(
+                               mbin
+                                   + (static_cast<size_t>(out) * 9 + c)
+                                         * BINNED_K,
+                               sd[c]);
                });
+    }
+    else
+    {
+        ParallelFor(256)
+            .kernel_name("binned_block_merge_scatter")
+            .apply(bound_layout ? capacity : length,
+                   [src_blocks,
+                    mbin,
+                    sorted_partition_output,
+                    merge_bound = merge_capacity,
+                    length] __device__(int i) mutable
+                   {
+                       if(i >= length)
+                           return;
+                       const int out = sorted_partition_output[i];
+                       if(out < 0 || out >= merge_bound)
+                           return;
+                       const double* sd =
+                           reinterpret_cast<const double*>(src_blocks + i);
+                       bool nonzero = false;
+    #pragma unroll
+                       for(int c = 0; c < 9; ++c)
+                           nonzero |= (sd[c] != 0.0);
+                       if(!nonzero)
+                           return;
+    #pragma unroll
+                       for(int c = 0; c < 9; ++c)
+                           if(sd[c] != 0.0)
+                               binned_deposit(
+                                   mbin
+                                       + (static_cast<size_t>(out) * 9 + c)
+                                             * BINNED_K,
+                                   sd[c]);
+               });
+    }
 
+    const int combine_slot = graph_resize::arm(
+        global_triplets.d_unique_key_number,
+        1,
+        256,
+        (merge_capacity + 255) / 256);
     ParallelFor(256)
         .kernel_name("binned_block_merge_combine")
         .apply(merge_capacity,
@@ -443,6 +532,7 @@ void Converter::_make_unique_block_warp_reduction(
                            + (static_cast<size_t>(u) * 9 + c)
                                  * BINNED_K);
                });
+    graph_resize::bind_last(combine_slot);
 
     if(bound_layout)
     {

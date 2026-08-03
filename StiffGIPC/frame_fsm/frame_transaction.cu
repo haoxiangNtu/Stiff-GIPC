@@ -1,5 +1,6 @@
 #include <chrono>
 #include "GIPC.cuh"
+#include "linear_system/utils/graph_node_resize.h"
 
 #include "abd_system/abd_sim_data.h"
 #include "abd_system/abd_system.h"
@@ -1308,6 +1309,11 @@ void capture_full_graph(GIPC& ipc,
         CUDA_SAFE_CALL(cudaStreamEndCapture(
             cudaStreamPerThread, &captured));
         root_capture_ended_cleanly = true;
+        // [C6-v] Publish the device-updatable node handles collected during
+        // this capture, so the in-graph resizers can size their targets from
+        // live device counters at replay. Plain H2D outside the graph: no
+        // node is added, the zero-transfer episode audit is untouched.
+        gipc::graph_resize::publish();
         if(captured != graph)
             throw std::runtime_error(
                 "full frame capture returned a different root graph");
@@ -2301,6 +2307,8 @@ bool try_launch_full_graph(GIPC& ipc,
                            uint32_t retry_invalid_bits)
 {
     const auto t_enter = std::chrono::steady_clock::now();
+    // [C6-v] Allocate the resizer slot array before any capture begins.
+    gipc::graph_resize::prewarm();
     ipc.prepare_frame_graph(mesh);
     FrameGraphContext& context = graph_context(ipc);
     std::string reason;
