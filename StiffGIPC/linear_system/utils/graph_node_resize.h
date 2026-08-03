@@ -39,6 +39,13 @@ bool enabled();
 // True while cudaStreamPerThread is capturing a graph.
 bool capturing();
 
+// Open a construction: MUST be called (outside any capture) immediately
+// before the BeginCapture of a graph that will arm resizers. Each
+// construction gets its own device slot array from a ring, so coexisting
+// graph execs never alias each other's handles ([C6-aa]; the shared-array
+// version let an episode replay resize the FRAME graph's nodes).
+void begin();
+
 // Record a resizer node.  At replay it sets the target node's grid to
 // ceil((*d_count * multiplier) / block_size) blocks, clamped to
 // [1, capacity_blocks].  Returns a slot id to pass to bind_last(), or -1 if
@@ -53,8 +60,8 @@ int arm(const int* d_count, int multiplier, int block_size, int capacity_blocks)
 void bind_last(int slot);
 
 // Called once after cudaStreamEndCapture succeeds: copies the collected node
-// handles into the device slot array the resizers read.  Safe to call when
-// nothing was armed.
+// handles into the ACTIVE construction's device slot array and closes the
+// construction.  Safe to call when nothing was armed.
 void publish();
 
 // Drop pending arm/bind state (a capture that was abandoned).

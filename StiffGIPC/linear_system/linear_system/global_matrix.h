@@ -306,7 +306,10 @@ class GIPCTripletMatrix
     // case39_UMI_beaker, frame 20) -- and the tiered staging would truncate
     // real triplets in that state. While the override is set, every
     // device_count_mode consumer takes the pure legacy path.
-    static inline bool s_layout_override_off = false;
+    // [C6-aa] thread_local: engines on different threads must not toggle
+    // each other's layout mode mid-frame (the flag is RAII-scoped within one
+    // engine's frame call).
+    static inline thread_local bool s_layout_override_off = false;
     static bool device_count_mode()
     {
         if(s_layout_override_off)

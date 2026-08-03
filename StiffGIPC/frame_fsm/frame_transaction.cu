@@ -1196,6 +1196,9 @@ void capture_full_graph(GIPC& ipc,
     cudaGraph_t graph = nullptr;
     bool        root_capture_ended_cleanly = false;
     CUDA_SAFE_CALL(cudaGraphCreate(&graph, 0));
+    // [C6-aa] Open a resize-slot construction for THIS recording; publish()
+    // after the successful EndCapture below, discard() on the failure path.
+    gipc::graph_resize::begin();
     try
     {
         CUDA_SAFE_CALL(cudaStreamBeginCaptureToGraph(
@@ -1362,6 +1365,7 @@ void capture_full_graph(GIPC& ipc,
             }
         }
         cudaGetLastError();
+        gipc::graph_resize::discard();   // [C6-aa]
         if(context.full_exec)
         {
             cudaGraphExecDestroy(context.full_exec);
@@ -1546,6 +1550,10 @@ void capture_episode_graph(GIPC& ipc,
     cudaGraph_t graph = nullptr;
     bool capture_ended_cleanly = false;
     CUDA_SAFE_CALL(cudaGraphCreate(&graph, 0));
+    // [C6-aa] The episode/gpu_rl construction previously never published:
+    // its resizers read whatever the LAST published construction had left in
+    // the shared array — the frame graph's node handles — and resized those.
+    gipc::graph_resize::begin();
     try
     {
         CUDA_SAFE_CALL(cudaStreamBeginCaptureToGraph(
@@ -1843,6 +1851,7 @@ void capture_episode_graph(GIPC& ipc,
         if(captured != graph)
             throw std::runtime_error(
                 "episode capture returned a different root graph");
+        gipc::graph_resize::publish();   // [C6-aa]
 
         GraphAudit audit;
         accumulate_graph_audit(
@@ -1907,6 +1916,7 @@ void capture_episode_graph(GIPC& ipc,
             }
         }
         cudaGetLastError();
+        gipc::graph_resize::discard();   // [C6-aa]
         if(episode.exec)
         {
             cudaGraphExecDestroy(episode.exec);
@@ -3863,15 +3873,21 @@ int GIPC::frame_graph_finish_terminal()
     note_frame_graph_coverage(m_last_frame_status);   // [C6]
     // [C6-o] growth-streak escalation (see GIPC.cuh): consecutive re-crossings
     // of the SAME axis within 8 frames earn 2x per streak step, capped at 4x.
-    auto growth_escalation = [&](int axis) -> int {
-        int64_t& last   = m_axis_grow_last[axis];
-        int&     streak = m_axis_grow_streak[axis];
+    // [C6-aa] peek/commit split: the single-lambda version advanced the
+    // streak (and stamped the frame) even when the axis did NOT grow (the
+    // `want <= tier` continue paths), so a later real crossing inherited an
+    // unearned escalation step. peek computes the would-be escalation;
+    // commit records it only when growth actually happened.
+    auto escalation_peek = [&](int axis) -> int {
+        const int64_t last   = m_axis_grow_last[axis];
+        const int     streak = m_axis_grow_streak[axis];
         if(last != 0 && m_total_frames - last <= 8)
-            streak = std::min(streak + 1, 2);
-        else
-            streak = 0;
-        last = m_total_frames;
-        return streak;
+            return std::min(streak + 1, 2);
+        return 0;
+    };
+    auto escalation_commit = [&](int axis) {
+        m_axis_grow_streak[axis] = escalation_peek(axis);
+        m_axis_grow_last[axis]   = m_total_frames;
     };
     if((m_last_frame_status.invalid_bits
         & frame_fsm::OVF_UNIQUE_BLOCKS)
@@ -3889,7 +3905,7 @@ int GIPC::frame_graph_finish_terminal()
                 INT_MAX / 2,
                 static_cast<long long>(
                     m_last_frame_status.required_unique_blocks)
-                    << growth_escalation(10))));
+                    << escalation_peek(10))));
         const int prev0 = gipc_global_triplet.m_abd_unique_tier[0];
         const int prev1 = gipc_global_triplet.m_abd_unique_tier[1];
         gipc_global_triplet.m_abd_unique_tier[0] = std::max(prev0, tier);
@@ -3897,6 +3913,7 @@ int GIPC::frame_graph_finish_terminal()
         if(gipc_global_triplet.m_abd_unique_tier[0] > prev0
            || gipc_global_triplet.m_abd_unique_tier[1] > prev1)
         {
+            escalation_commit(10);
             m_graph_tier_grew = true;
             ++pcg_buffer_generation();   // force a re-record at the new tier
         }
@@ -3929,7 +3946,7 @@ int GIPC::frame_graph_finish_terminal()
             needed_ccd = static_cast<int>(std::min<long long>(
                 MAX_CCD_COLLITION_PAIRS_NUM,
                 static_cast<long long>(needed_ccd)
-                    << growth_escalation(5)));
+                    << escalation_peek(5)));
         if((m_last_frame_status.invalid_bits & frame_fsm::OVF_DCD_PAIRS)
            && needed_dcd <= m_graph_train_pairs)
             needed_dcd = m_graph_train_pairs + 1;
@@ -3941,6 +3958,7 @@ int GIPC::frame_graph_finish_terminal()
                     needed_ccd * GIPC::graph_train_headroom_num()));
             if(grown_ccd > m_graph_train_ccd)
             {
+                escalation_commit(5);
                 m_graph_tier_grew = true;
                 if(std::getenv("STIFF_FRAME_GRAPH_DIAG"))
                     fprintf(stderr,
@@ -3990,7 +4008,7 @@ int GIPC::frame_graph_finish_terminal()
             int shift = packed > 0 ? ((packed >> (3 * entry)) & 7) : 0;
             if(shift < 1)
                 shift = 1;
-            shift += growth_escalation(entry);
+            shift += escalation_peek(entry);
             const long long reach =
                 static_cast<long long>(m_graph_train_cp[slot]) << shift;
             const int want = static_cast<int>(std::min<long long>(
@@ -4007,6 +4025,7 @@ int GIPC::frame_graph_finish_terminal()
                         needed_dcd, slot, m_graph_train_cp[slot], want);
             m_graph_train_cp[slot] = want;
             grew_any               = true;
+            escalation_commit(entry);
         }
         if(grew_any)
         {
@@ -4028,8 +4047,9 @@ int GIPC::frame_graph_finish_terminal()
                 gipc::assembly_capacity_tier(static_cast<int>(
                     std::min<long long>(INT_MAX / 2,
                                         static_cast<long long>(exact)
-                                            << growth_escalation(6 + s))));
+                                            << escalation_peek(6 + s))));
             grew_contact_class = true;
+            escalation_commit(6 + s);
         }
         if(grew_contact_class)
         {

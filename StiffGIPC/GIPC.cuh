@@ -774,6 +774,9 @@ class GIPC
     // 5 = ccd, 6..9 = contact classes, 10 = abd unique blocks.
     int64_t m_axis_grow_last[11]   = {};
     int     m_axis_grow_streak[11] = {};
+    // [C6-o/C6-aa] pinned {result, error_code, invalid_bits} snapshot the
+    // host Newton loop polls; per-engine (freed in ~GIPC).
+    int* m_capacity_poll_host = nullptr;
     int m_graph_train_pairs  = 0;   // trained DCD pair extent (slot 0)
     int m_last_assembled_triplets = 0;  // measured length of a real frame
     int m_graph_train_ground = 0;   // trained ground pair extent

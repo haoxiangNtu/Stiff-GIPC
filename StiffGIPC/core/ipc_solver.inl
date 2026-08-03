@@ -1162,10 +1162,14 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     frame_fsm::FrameDeviceState* const capacity_poll_frame =
         GIPCTripletMatrix::device_count_mode() ? frame_graph_device_state()
                                                : nullptr;
-    static int* h_capacity_poll = nullptr;   // pinned {result, error_code, invalid_bits}
-    if(capacity_poll_frame && !h_capacity_poll)
+    // [C6-aa] Member, not function-static: a static was shared by every
+    // engine in the process (multi-engine sessions are routine — the towel
+    // recipe builds a second engine, lifecycle_gate builds two), so two
+    // engines would poll each other's snapshot bytes.
+    if(capacity_poll_frame && !m_capacity_poll_host)
         CUDA_SAFE_CALL(cudaHostAlloc(
-            &h_capacity_poll, 3 * sizeof(int), cudaHostAllocDefault));
+            &m_capacity_poll_host, 3 * sizeof(int), cudaHostAllocDefault));
+    int* const h_capacity_poll = m_capacity_poll_host;
     if(capacity_poll_frame)
         h_capacity_poll[0] = h_capacity_poll[1] = h_capacity_poll[2] = 0;
     bool capacity_early_abort = false;

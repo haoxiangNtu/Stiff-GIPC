@@ -583,6 +583,11 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
 GIPC::~GIPC()
 {
+    if(m_capacity_poll_host)
+    {
+        cudaFreeHost(m_capacity_poll_host);
+        m_capacity_poll_host = nullptr;
+    }
     // The auxiliary detector consumes both GIPC-owned buffers and pointers
     // borrowed from device_TetraData. Complete its work before destroying
     // events/stream or releasing either ownership domain during Engine reset.
