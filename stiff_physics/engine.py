@@ -1071,6 +1071,18 @@ class Engine:
         _assert_process_mode_signature()
         self._engine.prepare_gpu_rl()
 
+    def prepare_gpu_rl_episode(self, frames: int) -> None:
+        """Capture a multi-frame GPU-native RL episode.
+
+        After one warm-up :meth:`step`, this allocates/captures a fixed-size
+        device episode.  Write the returned action slab directly on device,
+        then call :meth:`launch_gpu_rl_episode_async` once; the graph's outer
+        conditional loop consumes all ``frames`` without a host launch per
+        frame.  ``end_gpu_rl`` remains the explicit teardown boundary.
+        """
+        _assert_process_mode_signature()
+        self._engine.prepare_gpu_rl_episode(int(frames))
+
     def launch_gpu_rl_async(self, cuda_stream: int = 0) -> None:
         """Enqueue one RL simulation step without any host wait.
 
@@ -1079,6 +1091,10 @@ class Engine:
         launches must keep using the stream chosen first.
         """
         self._engine.launch_gpu_rl_async(int(cuda_stream))
+
+    def launch_gpu_rl_episode_async(self, cuda_stream: int = 0) -> None:
+        """Launch the prepared multi-frame GPU-native episode once."""
+        self._engine.launch_gpu_rl_episode_async(int(cuda_stream))
 
     def gpu_rl_prepared(self) -> bool:
         """Return whether the GPU-native RL graph is captured and armed."""
@@ -1123,9 +1139,11 @@ class Engine:
 
         Keys include ``revolute_actions``/``prismatic_actions`` (packed
         ``(joints, 3)`` float64: target, strength, external torque/force),
-        ``positions``/``velocities`` (``(vertices, 3)`` float64 in
-        engine-internal order), ``statuses`` (one ``status_bytes`` frame
-        packet), ``frame_counter`` (int64), the audited
+        ``positions``/``velocities`` (``(vertices, 3)`` for the one-frame API
+        or ``(frames, vertices, 3)`` for a multi-frame capture, float64 in
+        engine-internal order), ``statuses`` (one ``status_bytes`` packet per
+        captured frame), ``frame_counter`` (int64), ``episode_frame_count``,
+        the audited
         ``graph_nodes``/``graph_h2d``/``graph_d2h`` counts,
         ``joint_observations``/``joint_observation_count`` (float64 block
         written by the graph itself: {angle, rate} per revolute driving

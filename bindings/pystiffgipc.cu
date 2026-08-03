@@ -609,11 +609,23 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::call_guard<py::gil_scoped_release>(),
              "Capture the reusable one-frame GPU-native RL graph. This is a "
              "setup boundary; call one warm-up step() first.")
+        .def("prepare_gpu_rl_episode",
+             &SimEngine::prepare_gpu_rl_episode,
+             py::arg("frame_count"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Capture a multi-frame device-native RL episode. The action "
+             "slab and observations remain on device and one graph launch "
+             "executes the whole conditional loop.")
         .def("launch_gpu_rl_async",
              &SimEngine::launch_gpu_rl_async,
              py::arg("cuda_stream") = uintptr_t{0},
              "Enqueue one RL simulation step without a host wait. The policy "
              "must write actions and consume outputs on this same CUDA stream.")
+        .def("launch_gpu_rl_episode_async",
+             &SimEngine::launch_gpu_rl_episode_async,
+             py::arg("cuda_stream") = uintptr_t{0},
+             "Launch the prepared multi-frame device-native episode once; "
+             "no per-frame host graph launch is required.")
         .def("gpu_rl_prepared", &SimEngine::gpu_rl_prepared)
         .def("gpu_rl_ready",
              &SimEngine::gpu_rl_ready,
@@ -669,6 +681,22 @@ PYBIND11_MODULE(pystiffgipc, m)
                      e.get_gpu_rl_graph_h2d_count();
                  result["graph_d2h"] =
                      e.get_gpu_rl_graph_d2h_count();
+                 result["episode_frame_count"] =
+                     e.get_gpu_rl_episode_frame_count();
+                 // Multi-frame device-native episodes use a contiguous
+                 // frame-major slab.  Expose byte/element strides so a
+                 // policy can populate it without guessing the layout.
+                 result["action_frame_stride"] =
+                     3 * (e.get_num_revolute_joints() +
+                          e.get_num_prismatic_joints());
+                 result["revolute_action_frame_stride"] =
+                     3 * e.get_num_revolute_joints();
+                 result["prismatic_action_frame_stride"] =
+                     3 * e.get_num_prismatic_joints();
+                 result["position_frame_stride"] = 3 * e.get_vertex_count();
+                 result["velocity_frame_stride"] = 3 * e.get_vertex_count();
+                 result["status_frame_stride"] =
+                     e.get_gpu_rl_status_size_bytes();
                  // [D2] graph-refreshed joint observations:
                  // {angle, rate} per revolute driving joint, then
                  // {displacement, rate} per prismatic driving joint.

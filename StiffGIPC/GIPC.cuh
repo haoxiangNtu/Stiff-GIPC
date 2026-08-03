@@ -904,6 +904,12 @@ class GIPC
     void launch_episode_graph_async(device_TetraData& TetMesh,
                                     int64_t base_frame_id);
     void launch_gpu_rl_graph_async(uintptr_t cuda_stream);
+    // [D2/full-episode] Launch a pre-recorded multi-frame device-native
+    // episode once. Unlike launch_gpu_rl_graph_async(), this path does not
+    // require one host cudaGraphLaunch per frame; the captured conditional
+    // episode loop consumes the pre-uploaded action slab on device.
+    void launch_gpu_rl_episode_graph_async(uintptr_t cuda_stream);
+    int  gpu_rl_episode_frame_count() const;
     bool gpu_rl_graph_prepared() const;
     bool gpu_rl_graph_ready() const;
     void synchronize_gpu_rl_graph() const;

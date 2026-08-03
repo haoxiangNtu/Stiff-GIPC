@@ -348,6 +348,37 @@ void SimEngine::prepare_gpu_rl()
     impl.episode_prismatic_actions.clear();
 }
 
+void SimEngine::prepare_gpu_rl_episode(int frame_count)
+{
+    auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError(
+            "prepare_gpu_rl_episode() requires a finalized SimEngine");
+    if(frame_count <= 1)
+        throw std::invalid_argument(
+            "prepare_gpu_rl_episode() requires frame_count > 1");
+    if(impl.ipc.episode_graph_in_flight())
+        throw LifecycleError(
+            "end the active episode before preparing GPU-native RL mode");
+
+    const int revolute_count = static_cast<int>(
+        impl.tetMesh.joint_angle_controls.size());
+    const int prismatic_count = static_cast<int>(
+        impl.tetMesh.prismatic_drive_controls.size());
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.prepare_episode_graph(
+        impl.d_tetMesh,
+        frame_count,
+        nullptr,
+        revolute_count,
+        nullptr,
+        prismatic_count,
+        true);
+    impl.episode_frames = frame_count;
+    impl.episode_revolute_actions.clear();
+    impl.episode_prismatic_actions.clear();
+}
+
 void SimEngine::launch_gpu_rl_async(uintptr_t cuda_stream)
 {
     auto& impl = *m_impl;
@@ -356,6 +387,16 @@ void SimEngine::launch_gpu_rl_async(uintptr_t cuda_stream)
             "launch_gpu_rl_async() requires a finalized SimEngine");
     cudaSetDevice(impl.cfg.cuda_device);
     impl.ipc.launch_gpu_rl_graph_async(cuda_stream);
+}
+
+void SimEngine::launch_gpu_rl_episode_async(uintptr_t cuda_stream)
+{
+    auto& impl = *m_impl;
+    if(!impl.finalized)
+        throw LifecycleError(
+            "launch_gpu_rl_episode_async() requires a finalized SimEngine");
+    cudaSetDevice(impl.cfg.cuda_device);
+    impl.ipc.launch_gpu_rl_episode_graph_async(cuda_stream);
 }
 
 bool SimEngine::gpu_rl_prepared() const
@@ -476,6 +517,11 @@ int SimEngine::get_gpu_rl_graph_h2d_count() const
 int SimEngine::get_gpu_rl_graph_d2h_count() const
 {
     return m_impl->ipc.gpu_rl_graph_d2h_count();
+}
+
+int SimEngine::get_gpu_rl_episode_frame_count() const
+{
+    return m_impl->ipc.gpu_rl_episode_frame_count();
 }
 
 int SimEngine::get_gpu_rl_status_size_bytes() const

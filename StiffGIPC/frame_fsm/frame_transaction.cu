@@ -3078,6 +3078,68 @@ void GIPC::launch_gpu_rl_graph_async(uintptr_t cuda_stream)
     m_frame_terminal_emitted = true;
 }
 
+void GIPC::launch_gpu_rl_episode_graph_async(uintptr_t cuda_stream)
+{
+    EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error(
+            "[gpu-rl] prepare a GPU-native RL graph before launch");
+    if(context.frame_count <= 1)
+        throw std::logic_error(
+            "[gpu-rl] multi-frame launch requires frame_count > 1");
+    if(context.in_flight)
+        throw std::logic_error(
+            "[gpu-rl] the prepared episode is already in flight");
+    if(!context.exec
+       || context.generation != pcg_buffer_generation())
+        throw std::runtime_error(
+            "[gpu-rl] graph buffers changed; prepare the episode again");
+
+    cudaStream_t stream = cuda_stream
+        ? reinterpret_cast<cudaStream_t>(cuda_stream)
+        : cudaStreamPerThread;
+    FrameGraphContext& frame = graph_context(*this);
+    snapshot_host_attempt(*this, context.host_snapshot);
+    animation_fullRate = animation_subRate;
+    arm_full_graph_attempt(*this, frame);
+    context.launch_stream = stream;
+
+    const cudaError_t launch = cudaGraphLaunch(context.exec, stream);
+    if(launch != cudaSuccess)
+    {
+        cudaGetLastError();
+        restore_host_attempt(*this, context.host_snapshot);
+        disarm_full_graph_attempt(*this);
+        context.launch_stream = nullptr;
+        throw std::runtime_error(
+            std::string("[gpu-rl] multi-frame graph launch failed: ")
+            + cudaGetErrorString(launch));
+    }
+    const cudaError_t record =
+        cudaEventRecord(context.completion_event, stream);
+    if(record != cudaSuccess)
+    {
+        cudaGetLastError();
+        cudaStreamSynchronize(stream);
+        restore_host_attempt(*this, context.host_snapshot);
+        disarm_full_graph_attempt(*this);
+        context.launch_stream = nullptr;
+        throw std::runtime_error(
+            std::string("[gpu-rl] multi-frame completion event record failed: ")
+            + cudaGetErrorString(record));
+    }
+    context.in_flight = true;
+    m_frame_terminal_emitted = true;
+}
+
+int GIPC::gpu_rl_episode_frame_count() const
+{
+    const EpisodeGraphContext& context = episode_context(*this);
+    if(!context.device_native)
+        throw std::logic_error("[gpu-rl] no GPU-native RL graph is prepared");
+    return context.frame_count;
+}
+
 bool GIPC::gpu_rl_graph_prepared() const
 {
     const auto* context =

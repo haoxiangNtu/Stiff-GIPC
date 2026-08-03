@@ -463,7 +463,12 @@ class SimEngine
     // contains no H2D/D2H graph nodes and performs no host synchronization.
     // Device outputs use engine-internal vertex order.
     void prepare_gpu_rl();
+    // Capture a multi-frame device-native episode. Actions and observations
+    // remain device-resident; launch_gpu_rl_episode_async() submits the
+    // whole conditional episode loop with one host graph launch.
+    void prepare_gpu_rl_episode(int frame_count);
     void launch_gpu_rl_async(uintptr_t cuda_stream = 0);
+    void launch_gpu_rl_episode_async(uintptr_t cuda_stream = 0);
     bool gpu_rl_prepared() const;
     bool gpu_rl_ready() const;
     void synchronize_gpu_rl() const;  // Explicit debug/teardown boundary.
@@ -494,6 +499,7 @@ class SimEngine
     int get_gpu_rl_graph_node_count() const;
     int get_gpu_rl_graph_h2d_count() const;
     int get_gpu_rl_graph_d2h_count() const;
+    int get_gpu_rl_episode_frame_count() const;
     int get_gpu_rl_status_size_bytes() const;
 
     /// Result, work counters and capacity high-water marks for the latest
