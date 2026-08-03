@@ -249,3 +249,44 @@ speculative complexity — the mechanism is proven and recorded here, to be
 used when a large contiguous-prefix consumer appears (e.g. if the sort
 width is ever narrowed from `capacity` to `length`, which is the next
 candidate and carries real risk against the sentinel-pad design).
+
+## C6-v: what actually costs in the whole-frame graph (4090, clean GPU)
+
+Every earlier attribution in this document was taken while an unrelated
+20 GB training job shared the card, and cross-mode nsys comparisons had a
+structural blind spot: `--cuda-graph-trace=node` does not itemise
+DEVICE-launched graphs, so graph-off's PCG self-tail loop was invisible
+and its kernel counts read 30x too low. Re-measured with the card idle and
+the device loop disabled on the off side (STIFF_PCG_DEVICE_LOOP=0), the
+comparison is finally like-for-like:
+
+    graph-on  1.20 s GPU kernel time / 173288 kernels
+    graph-off 0.68 s GPU kernel time / 132995 kernels
+
+i.e. 1.3x the kernels but 1.76x the time. The single dominant item:
+
+    delta 270.7 ms (50% of the whole gap)
+    binned_block_merge_scatter: on 93x @ 2999 us, off 62x @ 133 us
+
+22x per instance on an essentially identical element count. The cause is
+not launch width: `binned_deposit` is an `atomicAdd`, the tier-shaped
+payload is roughly half ZERO PAD triplets, and every pad carries the same
+(0,0) key -- so they all dedup to ONE unique index and every padded
+thread piled onto the same 9 bins. An atomic convoy, not a wide launch.
+
+Skipping zero components (a no-op: adding 0.0 cannot change a bin)
+removes it: forcegrip 60f, median of 3, 13.34 s -> 9.78 s (-27%), against
+6.81 s graph-off, so the step-mode ratio moves 1.96x -> 1.44x.
+
+Two lessons worth keeping:
+
+* Padded WORK is expensive; padded LAUNCH WIDTH is nearly free. Three
+  separate width-narrowing attempts (uniqueness pass to `length`, convert
+  capacity to `length`, device-side grid resizing) measured 0%, -4% and
+  0%. The device-resize machinery works exactly as designed and buys
+  nothing here.
+* The gates' bitwise graph-vs-baseline digest is brittle by nature. It
+  rests on atomic arrival order, which is a property of the generated
+  code: adding a never-taken bounds check to the scatter lambda alone
+  took frame_graph_gate from 3/3 to 1/3 passes. Anything touching that
+  kernel must be a separate kernel, not a runtime branch.
