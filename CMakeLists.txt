@@ -42,6 +42,14 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(STIFFGIPC_ENABLE_DIAGNOSTICS
        "Build intrusive finite-difference diagnostics and Python debug hooks"
        OFF)
+set(STIFFGIPC_BVH_STACK_CAP "2048" CACHE STRING
+    "Per-thread explicit LBVH traversal stack capacity (validation knob)")
+if(NOT STIFFGIPC_BVH_STACK_CAP MATCHES "^[0-9]+$"
+   OR STIFFGIPC_BVH_STACK_CAP LESS 16)
+    message(FATAL_ERROR
+        "STIFFGIPC_BVH_STACK_CAP must be an integer >= 16; got "
+        "'${STIFFGIPC_BVH_STACK_CAP}'")
+endif()
 set(STIFFGIPC_FEM_MODEL "SNK1" CACHE STRING
     "Compile-time tetrahedral constitutive model: SNK1, SNK2, or ARAP")
 set_property(CACHE STIFFGIPC_FEM_MODEL PROPERTY STRINGS SNK1 SNK2 ARAP)
@@ -136,6 +144,10 @@ file(GLOB_RECURSE GIPC_ALL_SOURCE CONFIGURE_DEPENDS
     "StiffGIPC/*.cu" "StiffGIPC/*.cpp")
 file(GLOB_RECURSE GIPC_ALL_HEADERS CONFIGURE_DEPENDS
     "StiffGIPC/*.h" "StiffGIPC/*.cuh" "StiffGIPC/*.hpp" "StiffGIPC/*.inl" "StiffGIPC/*.inc")
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/StiffGIPC/mlbvh.cu"
+    PROPERTIES COMPILE_DEFINITIONS
+               "STIFF_BVH_STACK_CAP=${STIFFGIPC_BVH_STACK_CAP}")
 
 # Exclude gl_main.cu from the library (it contains main() and GL code)
 list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "gl_main\\.cu$")

@@ -54,6 +54,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_EE_CANON, "mode_strict") \
     X(STIFF_EE_DETGATE, "mode_strict") \
     X(STIFF_EE_LB, "perf") \
+    X(STIFF_EE_RANGE_PRUNE, "perf") \
     X(STIFF_EE_NODEDUP, "solver") \
     X(STIFF_EE_NOMOLLIFY, "solver") \
     X(STIFF_EE_TRACE, "diag") \
@@ -137,6 +138,10 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_SPLIT_GH, "solver") \
     X(STIFF_SPMV_DET, "mode_strict") \
     X(STIFF_STACK_DIAG, "diag") \
+    X(STIFF_BVH_TRAVERSAL_AUDIT, "diag") \
+    X(STIFF_BVH_MARGIN_SCALE, "diag") \
+    X(STIFF_BVH_COHERENCE_AUDIT, "diag") \
+    X(STIFF_BVH_MORTON14, "perf") \
     X(STIFF_XENV, "diag") \
     X(STIFF_XENV_DUMP, "diag") \
     X(STIFF_XENV_ID, "diag") \

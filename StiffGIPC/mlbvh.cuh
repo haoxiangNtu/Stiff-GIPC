@@ -33,8 +33,27 @@ struct Node;
 void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint32_t* flags, int number, cudaStream_t stream = 0);
 void reset_max_stack();
 int get_max_stack();
+int get_bvh_stack_capacity();
 void set_bvh_audit(int v);  // [audit-gate] enable the per-pop stack-depth probe (STIFF_STACK_DIAG)
 void set_ee_vloc(const int* p);
+
+// Validation-only traversal census.  The hot kernels contain no census code
+// unless the translation unit is built with
+// STIFF_BVH_TRAVERSAL_AUDIT_BUILD; the normal simulator binary is therefore
+// unaffected.  A "primitive_test" is a leaf pair that survived body/env/
+// adjacency filtering and reached exact PT/EE classification (or CCD emit).
+struct BvhTraversalAudit
+{
+    unsigned long long queries;
+    unsigned long long node_pops;
+    unsigned long long overlapping_children;
+    unsigned long long primitive_tests;
+};
+void set_bvh_traversal_audit(int v);
+void set_bvh_traversal_margin_scale(double scale);
+void reset_bvh_traversal_audit();
+void get_bvh_traversal_audit(BvhTraversalAudit out[4]);
+void print_bvh_traversal_audit();
 
 struct AABB
 {
@@ -102,6 +121,11 @@ class lbvh
     // Computed when env-major. Lets the broad-phase prune other-env subtrees by env-id ⇒ no cross-env
     // candidates (fast) while AABBs stay LOCAL (overlap mirror ⇒ bit-identical). Allocated in MALLOC.
     int*       m_node_env            = nullptr;
+    // Validation candidate: maximum ORIGINAL primitive index in each subtree.
+    // The default EE ownership rule emits only obj_idx >= self_eid; this bound
+    // lets the range-pruned traversal discard an entire all-lower subtree
+    // while preserving exactly that directed-pair contract.
+    uint32_t*  m_node_max_element    = nullptr;
 
     // [perenv-parallel #2] cub radix-sort scratch (per instance / per pool slot, pre-allocated):
     // the per-env active-path Morton sort must do NO cudaMalloc/cudaFree — thrust's internal
@@ -117,7 +141,7 @@ class lbvh
   public:
     lbvh() {}
     ~lbvh();
-    void MALLOC_DEVICE_MEM(const int& number);
+    void MALLOC_DEVICE_MEM(const int& number, bool allocate_node_max = false);
     void FREE_DEVICE_MEM();
     //void Construct();
 };

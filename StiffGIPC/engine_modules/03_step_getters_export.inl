@@ -1173,6 +1173,48 @@ int SimEngine::get_collision_pairs_clean(int* out_flat) const
     return ncp;
 }
 
+int SimEngine::get_ccd_pairs_clean(const double* move_flat,
+                                   int           move_count,
+                                   double        alpha,
+                                   int*          out_flat) const
+{
+    auto& impl = *m_impl;
+    GIPC& g    = impl.ipc;
+    if(g.m_skip_all_collision)
+        return 0;
+    if(move_flat == nullptr || move_count != g.vertexNum)
+        throw std::runtime_error(
+            "get_ccd_pairs_clean expects one double3 motion per vertex");
+    if(!std::isfinite(alpha) || alpha < 0.0)
+        throw std::runtime_error(
+            "get_ccd_pairs_clean alpha must be finite and non-negative");
+
+    CUDA_SAFE_CALL(cudaMemcpy(g._moveDir,
+                              move_flat,
+                              static_cast<size_t>(move_count) * sizeof(double3),
+                              cudaMemcpyHostToDevice));
+    g.buildBVH_FULLCCD(alpha);
+    g.buildFullCP(alpha);
+    const int ncp = static_cast<int>(g.h_ccd_cpNum.get());
+    if(ncp < 1)
+        return 0;
+
+    int4* d_clean = nullptr;
+    CUDA_SAFE_CALL(cudaMalloc(&d_clean, ncp * sizeof(int4)));
+    const int threads = 256;
+    const int blocks  = (ncp + threads - 1) / threads;
+    _decodeCleanContactPairs<<<blocks, threads>>>(
+        g._ccd_collisonPairs, d_clean, ncp);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    if(out_flat != nullptr)
+        CUDA_SAFE_CALL(cudaMemcpy(out_flat,
+                                  d_clean,
+                                  ncp * sizeof(int4),
+                                  cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaFree(d_clean));
+    return ncp;
+}
+
 // [Step B] Compute per-contact forces into grow-only device buffers. Returns the
 // contact count (h_cpNum + h_gpNum). Buffers are read-only views valid until the
 // next call; fetch device pointers via contacts_pair_ptr()/contacts_force_ptr().

@@ -259,10 +259,14 @@ __global__ void _calcLeafBvs_ccd_indirect(const double3*      _vertexes,
 
 // Variant of _calcLeafNodes that maps the (sorted) leaf-array index back to
 // the ORIGINAL face/edge index via _active_idx, so query kernels work unchanged.
-__global__ void _calcLeafNodes_indirect(Node*           _nodes,
-                                        const uint32_t* _indices,
-                                        const int*      _active_idx,
-                                        int             number)
+template <bool TrackMax>
+static __device__ __forceinline__ void _calcLeafNodes_indirect_body(
+    Node*           _nodes,
+    const uint32_t* _indices,
+    const int*      _active_idx,
+    uint32_t*       _node_max_element,
+    bool            _node_max_sorted,
+    int             number)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= number)
@@ -279,6 +283,34 @@ __global__ void _calcLeafNodes_indirect(Node*           _nodes,
     _nodes[l_idx].right_idx   = 0xFFFFFFFF;
     _nodes[l_idx].parent_idx  = 0xFFFFFFFF;
     _nodes[l_idx].element_idx = _active_idx[_indices[idx]];
+    if constexpr(TrackMax)
+        _node_max_element[l_idx] =
+            _node_max_sorted ? (uint32_t)idx : _nodes[l_idx].element_idx;
+}
+
+__global__ void _calcLeafNodes_indirect(Node*           _nodes,
+                                        const uint32_t* _indices,
+                                        const int*      _active_idx,
+                                        int             number)
+{
+    _calcLeafNodes_indirect_body<false>(
+        _nodes, _indices, _active_idx, nullptr, false, number);
+}
+
+__global__ void _calcLeafNodes_indirect_with_max(
+    Node*           _nodes,
+    const uint32_t* _indices,
+    const int*      _active_idx,
+    uint32_t*       _node_max_element,
+    bool            _node_max_sorted,
+    int             number)
+{
+    _calcLeafNodes_indirect_body<true>(_nodes,
+                                       _indices,
+                                       _active_idx,
+                                       _node_max_element,
+                                       _node_max_sorted,
+                                       number);
 }
 
 // [env-det] env-major Morton: put the prim's env id in the HIGH bits so co-located identical envs
@@ -286,9 +318,15 @@ __global__ void _calcLeafNodes_indirect(Node*           _nodes,
 // tie-break that interleaves equal-Morton co-located prims non-deterministically. STIFF_BVH_ENVDET.
 __device__ int g_bvh_envmajor = 0;
 void set_bvh_envmajor(int v){ static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envmajor, &v, sizeof(int))); last = v; }
-__global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int* prim_env,
-                            const int* prim_localid, const double3* env_offset,
-                            const uint32_t* prim_v0)
+template <bool Morton14>
+static __device__ __forceinline__ void _calcMChash_body(
+    uint64_t*       _MChash,
+    AABB*           _bvs,
+    int             number,
+    const int*      prim_env,
+    const int*      prim_localid,
+    const double3*  env_offset,
+    const uint32_t* prim_v0)
 {
     uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= number)
@@ -308,10 +346,29 @@ __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int
                                   centerP.z - maxBv.lower.z);
 
     //printf("%d   %f     %f     %f\n", offset.x, offset.y, offset.z);
-    uint64_t mc32 = morton_code(
+    const uint64_t mc32 = morton_code(
         offset.x / SceneSize.x, offset.y / SceneSize.y, offset.z / SceneSize.z);
     uint64_t mc64;
-    if(g_bvh_envmajor && prim_env)
+    if constexpr(Morton14)
+    {
+        // Research probe: use the requested 42 Morton bits even when the
+        // production env-major layout is enabled.  The previous ordering put
+        // this branch after g_bvh_envmajor, making STIFF_BVH_MORTON14 a no-op
+        // in every FOLD-SHIRT run.  The global primitive index is a unique
+        // 22-bit tie-break.  This deliberately does not preserve env-major
+        // grouping, so multi-env performance/determinism must be judged by the
+        // candidate gates; it is not a production key layout.
+        if(number < (1 << 22))
+        {
+            const uint64_t mc42 = morton_code_14(offset.x / SceneSize.x,
+                                                 offset.y / SceneSize.y,
+                                                 offset.z / SceneSize.z);
+            mc64 = (mc42 << 22) | idx;
+        }
+        else
+            mc64 = (mc32 << 32) | idx;
+    }
+    else if(g_bvh_envmajor && prim_env)
     {   // [env(high), morton(30), ENV-LOCAL-prim-id(20 low)] — env-blocked AND the low-bits tie-break
         // is ENV-LOCAL (mirror across identical envs) so find_split/determine_range give IDENTICAL
         // subtree structure for co-located envs (global idx in the low bits made them differ → the
@@ -327,7 +384,37 @@ __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int
     _MChash[idx]  = mc64;
 }
 
-__global__ void _calcLeafNodes(Node* _nodes, const uint32_t* _indices, int number)
+__global__ void _calcMChash(uint64_t*       _MChash,
+                            AABB*           _bvs,
+                            int             number,
+                            const int*      prim_env,
+                            const int*      prim_localid,
+                            const double3*  env_offset,
+                            const uint32_t* prim_v0)
+{
+    _calcMChash_body<false>(
+        _MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
+}
+
+__global__ void _calcMChash14(uint64_t*       _MChash,
+                              AABB*           _bvs,
+                              int             number,
+                              const int*      prim_env,
+                              const int*      prim_localid,
+                              const double3*  env_offset,
+                              const uint32_t* prim_v0)
+{
+    _calcMChash_body<true>(
+        _MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
+}
+
+template <bool TrackMax>
+static __device__ __forceinline__ void _calcLeafNodes_body(
+    Node*           _nodes,
+    const uint32_t* _indices,
+    uint32_t*       _node_max_element,
+    bool            _node_max_sorted,
+    int             number)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= number)
@@ -344,6 +431,26 @@ __global__ void _calcLeafNodes(Node* _nodes, const uint32_t* _indices, int numbe
     _nodes[l_idx].right_idx   = 0xFFFFFFFF;
     _nodes[l_idx].parent_idx  = 0xFFFFFFFF;
     _nodes[l_idx].element_idx = _indices[idx];
+    if constexpr(TrackMax)
+        _node_max_element[l_idx] =
+            _node_max_sorted ? (uint32_t)idx : _nodes[l_idx].element_idx;
+}
+
+__global__ void _calcLeafNodes(Node*           _nodes,
+                               const uint32_t* _indices,
+                               int             number)
+{
+    _calcLeafNodes_body<false>(_nodes, _indices, nullptr, false, number);
+}
+
+__global__ void _calcLeafNodes_with_max(Node*           _nodes,
+                                        const uint32_t* _indices,
+                                        uint32_t*       _node_max_element,
+                                        bool            _node_max_sorted,
+                                        int             number)
+{
+    _calcLeafNodes_body<true>(
+        _nodes, _indices, _node_max_element, _node_max_sorted, number);
 }
 
 
@@ -369,7 +476,13 @@ __global__ void _calcInternalNodes(Node* _nodes, const uint64_t* _MChash, int nu
     _nodes[_nodes[idx].right_idx].parent_idx = idx;
 }
 
-__global__ void _calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flags, int number)
+template <bool TrackMax>
+static __device__ __forceinline__ void _calcInternalAABB_body(
+    const Node* _nodes,
+    AABB*       _bvs,
+    uint32_t*   flags,
+    uint32_t*   _node_max_element,
+    int         number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -391,11 +504,36 @@ __global__ void _calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flag
         const AABB lbox = _bvs[lidx];
         const AABB rbox = _bvs[ridx];
         _bvs[parent]    = merge(lbox, rbox);
+        if constexpr(TrackMax)
+        {
+            const uint32_t lmax = _node_max_element[lidx];
+            const uint32_t rmax = _node_max_element[ridx];
+            _node_max_element[parent] = lmax > rmax ? lmax : rmax;
+        }
 
         __threadfence();
 
         parent = _nodes[parent].parent_idx;
     }
+}
+
+__global__ void _calcInternalAABB(const Node* _nodes,
+                                  AABB*       _bvs,
+                                  uint32_t*   flags,
+                                  int         number)
+{
+    _calcInternalAABB_body<false>(
+        _nodes, _bvs, flags, nullptr, number);
+}
+
+__global__ void _calcInternalAABB_with_max(const Node* _nodes,
+                                           AABB*       _bvs,
+                                           uint32_t*   flags,
+                                           uint32_t*   _node_max_element,
+                                           int         number)
+{
+    _calcInternalAABB_body<true>(
+        _nodes, _bvs, flags, _node_max_element, number);
 }
 
 __global__ void _sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number)
@@ -503,4 +641,3 @@ void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint
         _propagateNodeEnv<<<bn, tn, 0, stream>>>(node_env, _nodes, flags, number);
     }
 }
-

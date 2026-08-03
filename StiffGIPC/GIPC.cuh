@@ -11,6 +11,7 @@
 #define _GIPC_H_
 #include <memory>
 #include <unordered_map>
+#include <vector>
 #include "mlbvh.cuh"
 #include "device_fem_data.cuh"
 
@@ -162,6 +163,7 @@ class GIPC
     // the same stream). Shared I/O (verts/edges/_collisionPair/_cpNum...) stays on bvh_f/bvh_e.
     struct BvhScratch { Node* nodes=nullptr; AABB* bvs=nullptr; uint64_t* mch=nullptr;
                         uint32_t* idx=nullptr; AABB* tmp=nullptr; uint32_t* flags=nullptr; int* node_env=nullptr;
+                        uint32_t* node_max_element=nullptr;
                         // [perenv-parallel #2] per-slot cub sort scratch: the Morton sort must not
                         // cudaMalloc/cudaFree (device-wide syncs serialized the pool streams).
                         void* sort_tmp=nullptr; size_t sort_bytes=0;
@@ -245,6 +247,25 @@ class GIPC
     double3* _moveDir = nullptr;
     lbvh_f   bvh_f;
     lbvh_e   bvh_e;
+
+#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+    // Shadow-only model of a DCD Verlet candidate list.  It never changes the
+    // solver's pair set: every buildCP still runs the exhaustive LBVH query.
+    // The audit only snapshots positions and counts how many successive
+    // queries a list grown by STIFF_BVH_MARGIN_SCALE could safely serve under
+    // the max-vertex-displacement completeness proof.
+    std::vector<double3> m_bvh_coherence_reference;
+    std::vector<double3> m_bvh_coherence_current;
+    unsigned long long   m_bvh_coherence_observations = 0;
+    unsigned long long   m_bvh_coherence_builds       = 0;
+    unsigned long long   m_bvh_coherence_reuses       = 0;
+    unsigned long long   m_bvh_coherence_invalidations = 0;
+    unsigned long long   m_bvh_coherence_current_span = 0;
+    unsigned long long   m_bvh_coherence_max_span     = 0;
+    double               m_bvh_coherence_max_displacement = 0.0;
+    void auditBvhTemporalCoherence();
+    void printBvhTemporalCoherence() const;
+#endif
 
     PCG_Data pcg_data;
 

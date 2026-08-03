@@ -312,6 +312,11 @@ def main():
         print(f"[fs] CASE39ME_PHASE={phase} -> envs offset across trajectory "
               f"(env e at frame fr+{phase}*e); heterogeneous difficulty", flush=True)
 
+    load_checkpoint = os.environ.get("CASE39ME_LOAD_CHECKPOINT")
+    if load_checkpoint:
+        eng.native.load_checkpoint(load_checkpoint)
+        print(f"[fs] checkpoint loaded <- {load_checkpoint}", flush=True)
+
     if int(os.environ.get("CASE39ME_HEADLESS","0")):
         f0 = int(os.environ.get("CASE39_FRAME_START","0"))
         f1 = min(int(os.environ.get("CASE39_FRAME_END", str(len(actions)))), len(actions))
@@ -448,8 +453,9 @@ def main():
             if _usd is not None:
                 _usd[0].GetRootLayer().Save()
                 print(f"[fs-rec] wrote {usd_path}", flush=True)
-        mm = float(np.mean(ms))
-        print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({1000.0/mm:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
+        mm = float(np.mean(ms)) if ms else 0.0
+        fps = 1000.0 / mm if mm > 0.0 else 0.0
+        print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({fps:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
         if graph_audit:
             print(f"[fs-graph-audit] full={graph_frames} fallback={fallback_frames} overflow={overflow_frames}", flush=True)
         # [release gate] final-state vertex dump for the strict bitwise trio
@@ -462,6 +468,44 @@ def main():
                                for r in eng.get_load_records()], dtype=np.int64)
             np.save(dump.replace(".npy", "_recs.npy"), recs)
             print(f"[fs-hl] verts dumped -> {dump} (+recs)", flush=True)
+        save_checkpoint = os.environ.get("CASE39ME_SAVE_CHECKPOINT")
+        if save_checkpoint:
+            eng.native.save_checkpoint(save_checkpoint)
+            print(f"[fs] checkpoint saved -> {save_checkpoint}", flush=True)
+        pair_dump = os.environ.get("CASE39ME_DUMP_PAIRS")
+        if pair_dump:
+            # Validation-only post-replay oracle.  Rebuilding the final DCD set
+            # happens after all timed/simulated frames, so it cannot feed back
+            # into the trajectory whose vertices were dumped above.
+            pair_rebuilds = max(
+                1, int(os.environ.get("CASE39ME_PAIR_REBUILDS", "1"))
+            )
+            clean_pairs = None
+            for _ in range(pair_rebuilds):
+                clean_pairs = eng.native.get_collision_pairs_clean()
+            np.save(pair_dump, np.asarray(clean_pairs, dtype=np.int32))
+            print(f"[fs-hl] clean pairs dumped -> {pair_dump}", flush=True)
+        ccd_pair_dump = os.environ.get("CASE39ME_DUMP_CCD_PAIRS")
+        if ccd_pair_dump:
+            # Deterministic non-rigid swept field: exercises full-CCD boxes and
+            # traversal from the exact loaded checkpoint. This is a destructive
+            # scratch diagnostic and therefore runs only after all real frames.
+            vertices = np.asarray(eng.get_vertices(), dtype=np.float64)
+            ids = np.arange(len(vertices), dtype=np.float64)
+            scale = float(os.environ.get("CASE39ME_CCD_TEST_SCALE", "1e-3"))
+            motion = scale * np.column_stack((
+                np.sin(ids * 0.017 + vertices[:, 1] * 0.31),
+                np.cos(ids * 0.013 + vertices[:, 2] * 0.29),
+                np.sin(ids * 0.011 + vertices[:, 0] * 0.37),
+            ))
+            ccd_pair_rebuilds = max(
+                1, int(os.environ.get("CASE39ME_CCD_PAIR_REBUILDS", "1"))
+            )
+            ccd_pairs = None
+            for _ in range(ccd_pair_rebuilds):
+                ccd_pairs = eng.native.get_ccd_pairs_clean(motion, 1.0)
+            np.save(ccd_pair_dump, np.asarray(ccd_pairs, dtype=np.int32))
+            print(f"[fs-hl] swept pairs dumped -> {ccd_pair_dump}", flush=True)
         return
 
     import polyscope as ps, polyscope.imgui as psim

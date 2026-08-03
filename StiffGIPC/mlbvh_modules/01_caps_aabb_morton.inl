@@ -131,6 +131,32 @@ __device__ __host__ inline std::uint32_t morton_code(double x,
     return mchash;
 }
 
+// Validation candidate: 14 bits/axis (42-bit Morton key).  The production
+// LBVH above quantizes each axis to 10 bits.  This deliberately simple loop is
+// off the default path and tests whether FOLD-SHIRT traversal is tree-quality
+// limited before investing in PLOC/treelet restructuring.
+__device__ __host__ inline std::uint64_t morton_code_14(double x,
+                                                        double y,
+                                                        double z) noexcept
+{
+    constexpr double resolution = 16384.0;
+    x = std::min(std::max(x * resolution, 0.0), resolution - 1.0);
+    y = std::min(std::max(y * resolution, 0.0), resolution - 1.0);
+    z = std::min(std::max(z * resolution, 0.0), resolution - 1.0);
+    const std::uint32_t xi = static_cast<std::uint32_t>(x);
+    const std::uint32_t yi = static_cast<std::uint32_t>(y);
+    const std::uint32_t zi = static_cast<std::uint32_t>(z);
+    std::uint64_t code = 0;
+#pragma unroll
+    for(int bit = 0; bit < 14; ++bit)
+    {
+        code |= static_cast<std::uint64_t>((xi >> bit) & 1u) << (3 * bit + 2);
+        code |= static_cast<std::uint64_t>((yi >> bit) & 1u) << (3 * bit + 1);
+        code |= static_cast<std::uint64_t>((zi >> bit) & 1u) << (3 * bit);
+    }
+    return code;
+}
+
 __device__ __host__ void AABB::combines(const double& x, const double& y, const double& z)
 {
     lower = make_double3(std::min(lower.x, x), std::min(lower.y, y), std::min(lower.z, z));
@@ -279,4 +305,3 @@ __device__ inline unsigned int find_split(const uint64_t*    node_code,
 
     return split;
 }
-

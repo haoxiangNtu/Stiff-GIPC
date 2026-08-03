@@ -19,6 +19,27 @@
 #include <fstream>
 #include "gpu_eigen_libs.cuh"
 
+#ifndef STIFF_BVH_STACK_CAP
+#define STIFF_BVH_STACK_CAP 2048
+#endif
+static_assert(STIFF_BVH_STACK_CAP >= 16,
+              "STIFF_BVH_STACK_CAP is too small for a useful traversal");
+
+// The production/default capacity keeps the original push instruction exactly.
+// Experimental smaller caps are bounds-checked and fail loudly with a CUDA
+// trap instead of dropping a subtree and silently violating IPC completeness.
+#if STIFF_BVH_STACK_CAP == 2048
+#define BVH_STACK_PUSH(node_) (*stack_ptr++ = (node_))
+#else
+#define BVH_STACK_PUSH(node_)                                                     \
+    do                                                                            \
+    {                                                                             \
+        if(stack_ptr - stack >= STIFF_BVH_STACK_CAP)                              \
+            asm volatile("trap;");                                                \
+        *stack_ptr++ = (node_);                                                   \
+    } while(0)
+#endif
+
 // --- Emit-overflow guard (dynamic, never out-of-bounds) ---------------------
 // Pair-emit kernels do `buf[atomicAdd(_cpNum,1)] = ...`. If detected pairs exceed
 // the allocated buffer this writes OOB and corrupts GPU memory. g_*_cp_cap are the
@@ -86,6 +107,107 @@ __device__ int g_bvh_audit = 0;
 void set_bvh_audit(int v){ static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_audit,&v,sizeof(int))); last = v; }
 void reset_max_stack(){ int z=0; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_max_stack,&z,sizeof(int))); }
 int get_max_stack(){ int v=0; CUDA_SAFE_CALL(cudaMemcpyFromSymbol(&v,g_max_stack,sizeof(int))); return v; }
+int get_bvh_stack_capacity(){ return STIFF_BVH_STACK_CAP; }
+
+// Validation build only: aggregate traversal work without a global atomic in
+// the inner loop.  Each participating thread keeps local counters and commits
+// four atomics after its traversal.  With the compile definition absent the
+// macros erase completely, so this experiment cannot perturb release register
+// pressure or timings.
+enum BvhAuditFamily
+{
+    kBvhVfDcd = 0,
+    kBvhEeDcd = 1,
+    kBvhVfCcd = 2,
+    kBvhEeCcd = 3,
+};
+#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+__device__ int g_bvh_traversal_audit = 0;
+__device__ double g_bvh_traversal_margin_scale = 1.0;
+__device__ unsigned long long g_bvh_traversal_counters[4][4];
+void set_bvh_traversal_audit(int v)
+{
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_traversal_audit, &v, sizeof(int)));
+}
+void set_bvh_traversal_margin_scale(double scale)
+{
+    static double last = -1.0;
+    if(scale == last)
+        return;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_traversal_margin_scale,
+                                     &scale,
+                                     sizeof(double)));
+    last = scale;
+}
+void reset_bvh_traversal_audit()
+{
+    unsigned long long zero[4][4] = {};
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_traversal_counters, zero, sizeof(zero)));
+}
+void get_bvh_traversal_audit(BvhTraversalAudit out[4])
+{
+    static_assert(sizeof(BvhTraversalAudit) == 4 * sizeof(unsigned long long),
+                  "audit host/device layout mismatch");
+    CUDA_SAFE_CALL(cudaMemcpyFromSymbol(out,
+                                       g_bvh_traversal_counters,
+                                       4 * sizeof(BvhTraversalAudit)));
+}
+void print_bvh_traversal_audit()
+{
+    BvhTraversalAudit rows[4] = {};
+    get_bvh_traversal_audit(rows);
+    static const char* names[4] = {"vf_dcd", "ee_dcd", "vf_ccd", "ee_ccd"};
+    for(int i = 0; i < 4; ++i)
+        printf("[bvh-audit] family=%s queries=%llu node_pops=%llu "
+               "overlapping_children=%llu primitive_tests=%llu\n",
+               names[i],
+               rows[i].queries,
+               rows[i].node_pops,
+               rows[i].overlapping_children,
+               rows[i].primitive_tests);
+}
+#define BVH_TRAVERSAL_AUDIT_BEGIN(family_)                                      \
+    const bool _bvh_count = g_bvh_traversal_audit != 0;                         \
+    unsigned long long _bvh_pops = 0;                                           \
+    unsigned long long _bvh_overlaps = 0;                                       \
+    unsigned long long _bvh_primitive_tests = 0;                                \
+    constexpr int _bvh_family = family_
+#define BVH_TRAVERSAL_AUDIT_POP()                                                \
+    do { if(_bvh_count) ++_bvh_pops; } while(0)
+#define BVH_TRAVERSAL_AUDIT_OVERLAP()                                            \
+    do { if(_bvh_count) ++_bvh_overlaps; } while(0)
+#define BVH_TRAVERSAL_AUDIT_PRIMITIVE()                                          \
+    do { if(_bvh_count) ++_bvh_primitive_tests; } while(0)
+#define BVH_TRAVERSAL_AUDIT_COMMIT()                                             \
+    do                                                                           \
+    {                                                                            \
+        if(_bvh_count)                                                           \
+        {                                                                        \
+            atomicAdd(&g_bvh_traversal_counters[_bvh_family][0], 1ULL);          \
+            atomicAdd(&g_bvh_traversal_counters[_bvh_family][1], _bvh_pops);     \
+            atomicAdd(&g_bvh_traversal_counters[_bvh_family][2], _bvh_overlaps); \
+            atomicAdd(&g_bvh_traversal_counters[_bvh_family][3],                 \
+                      _bvh_primitive_tests);                                     \
+        }                                                                        \
+    } while(0)
+#define BVH_TRAVERSAL_MARGIN(gap_) ((gap_) * g_bvh_traversal_margin_scale)
+#else
+void set_bvh_traversal_audit(int) {}
+void set_bvh_traversal_margin_scale(double) {}
+void reset_bvh_traversal_audit() {}
+void get_bvh_traversal_audit(BvhTraversalAudit out[4])
+{
+    memset(out, 0, 4 * sizeof(BvhTraversalAudit));
+}
+void print_bvh_traversal_audit() {}
+#define BVH_TRAVERSAL_AUDIT_BEGIN(family_) ((void)0)
+#define BVH_TRAVERSAL_AUDIT_POP() ((void)0)
+#define BVH_TRAVERSAL_AUDIT_OVERLAP() ((void)0)
+#define BVH_TRAVERSAL_AUDIT_PRIMITIVE() ((void)0)
+#define BVH_TRAVERSAL_AUDIT_COMMIT() ((void)0)
+#define BVH_TRAVERSAL_MARGIN(gap_) (gap_)
+#endif
+
 void set_ee_trace(int v) { static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); last = v; }
 __device__ int g_ee_tgt0 = -1; __device__ int g_ee_tgt1 = -1;
 void set_ee_tgt(int a, int b){ static int la = -999, lb = -999; if(a == la && b == lb) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt0,&a,sizeof(int))); CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_tgt1,&b,sizeof(int))); la = a; lb = b; }

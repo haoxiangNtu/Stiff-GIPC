@@ -159,6 +159,99 @@ void GIPC::refresh_pair_counts()
     note_pair_census_peak();
 }
 
+#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+void GIPC::auditBvhTemporalCoherence()
+{
+    if(!getenv("STIFF_BVH_COHERENCE_AUDIT") || vertexNum <= 0 || !_vertexes)
+        return;
+
+    double margin_scale = 1.0;
+    if(const char* value = getenv("STIFF_BVH_MARGIN_SCALE"))
+        margin_scale = atof(value);
+    if(!std::isfinite(margin_scale) || margin_scale <= 1.0 || dHat <= 0.0)
+        return;
+
+    m_bvh_coherence_current.resize((size_t)vertexNum);
+    CUDA_SAFE_CALL(cudaMemcpy(m_bvh_coherence_current.data(),
+                              _vertexes,
+                              (size_t)vertexNum * sizeof(double3),
+                              cudaMemcpyDeviceToHost));
+
+    ++m_bvh_coherence_observations;
+    if(m_bvh_coherence_reference.empty())
+    {
+        m_bvh_coherence_reference = m_bvh_coherence_current;
+        ++m_bvh_coherence_builds;
+        m_bvh_coherence_current_span = 1;
+        return;
+    }
+
+    double max_displacement_sq = 0.0;
+    for(int i = 0; i < vertexNum; ++i)
+    {
+        const double dx = m_bvh_coherence_current[i].x
+                          - m_bvh_coherence_reference[i].x;
+        const double dy = m_bvh_coherence_current[i].y
+                          - m_bvh_coherence_reference[i].y;
+        const double dz = m_bvh_coherence_current[i].z
+                          - m_bvh_coherence_reference[i].z;
+        const double displacement_sq = dx * dx + dy * dy + dz * dz;
+        if(displacement_sq > max_displacement_sq)
+            max_displacement_sq = displacement_sq;
+    }
+    const double max_displacement = sqrt(max_displacement_sq);
+    if(max_displacement > m_bvh_coherence_max_displacement)
+        m_bvh_coherence_max_displacement = max_displacement;
+
+    // If every vertex moved by at most delta/2, the distance between any two
+    // point/edge/triangle primitives changes by at most delta.  Therefore a
+    // raw primitive list built with radius (sqrt(dHat) + delta) still contains
+    // every pair that can enter the true sqrt(dHat) activation radius.
+    const double delta = (margin_scale - 1.0) * sqrt(dHat);
+    if(max_displacement <= 0.5 * delta)
+    {
+        ++m_bvh_coherence_reuses;
+        ++m_bvh_coherence_current_span;
+    }
+    else
+    {
+        ++m_bvh_coherence_invalidations;
+        if(m_bvh_coherence_current_span > m_bvh_coherence_max_span)
+            m_bvh_coherence_max_span = m_bvh_coherence_current_span;
+        m_bvh_coherence_reference = m_bvh_coherence_current;
+        ++m_bvh_coherence_builds;
+        m_bvh_coherence_current_span = 1;
+    }
+}
+
+void GIPC::printBvhTemporalCoherence() const
+{
+    if(!getenv("STIFF_BVH_COHERENCE_AUDIT"))
+        return;
+    const unsigned long long max_span =
+        std::max(m_bvh_coherence_max_span, m_bvh_coherence_current_span);
+    const double reuse_fraction = m_bvh_coherence_observations
+                                      ? (double)m_bvh_coherence_reuses
+                                            / (double)m_bvh_coherence_observations
+                                      : 0.0;
+    const double queries_per_build = m_bvh_coherence_builds
+                                         ? (double)m_bvh_coherence_observations
+                                               / (double)m_bvh_coherence_builds
+                                         : 0.0;
+    printf("[bvh-coherence] observations=%llu builds=%llu reuses=%llu "
+           "invalidations=%llu reuse_fraction=%.9f queries_per_build=%.9f "
+           "max_queries_per_build=%llu max_displacement=%.17g\n",
+           m_bvh_coherence_observations,
+           m_bvh_coherence_builds,
+           m_bvh_coherence_reuses,
+           m_bvh_coherence_invalidations,
+           reuse_fraction,
+           queries_per_build,
+           max_span,
+           m_bvh_coherence_max_displacement);
+}
+#endif
+
 void GIPC::buildCP()
 {
     // [3b] device truth changes below: DCD re-emission rewrites _cpNum/_gpNum
@@ -178,6 +271,10 @@ void GIPC::buildCP()
         return;
     }
 
+#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+    auditBvhTemporalCoherence();
+#endif
+
     // [env-det] EE detection settings + env-local vertex map MUST be set BEFORE the per-env branch,
     // else the per-env path (which returns early) runs the EE dedup with GLOBAL edge indices (not
     // env-local) → cross-env asymmetric. Idempotent; the merged path below re-runs harmlessly.
@@ -185,6 +282,28 @@ void GIPC::buildCP()
     set_ee_detgate(m_mode_config.ee_detgate ? 1 : 0);
     set_bvh_envpart(getenv("STIFF_BVH_ENVPART") ? 1 : 0);
     set_bvh_audit(getenv("STIFF_STACK_DIAG") ? 1 : 0);  // [audit-gate] per-pop depth probe, diag only
+#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+    const bool traversal_audit = getenv("STIFF_BVH_TRAVERSAL_AUDIT") != nullptr;
+    set_bvh_traversal_audit(traversal_audit ? 1 : 0);
+    double traversal_margin_scale = 1.0;
+    if(const char* margin_env = getenv("STIFF_BVH_MARGIN_SCALE"))
+    {
+        traversal_margin_scale = atof(margin_env);
+        if(!std::isfinite(traversal_margin_scale)
+           || traversal_margin_scale < 1.0)
+            traversal_margin_scale = 1.0;
+    }
+    set_bvh_traversal_margin_scale(traversal_margin_scale);
+    if(traversal_audit)
+    {
+        static bool traversal_audit_started = false;
+        if(!traversal_audit_started)
+        {
+            reset_bvh_traversal_audit();
+            traversal_audit_started = true;
+        }
+    }
+#endif
     // [perenv-par] per-vertex cross-env skip at self-collision emission (robust where BVH env-part is
     // bypassed by env-MIXED co-located nodes). Gated STIFF_DECOUPLE_THRESH; null = off (legacy path).
     set_self_p2g((m_mode_config.decouple_thresh && m_d_p2g) ? m_d_p2g : nullptr);
@@ -282,7 +401,7 @@ void GIPC::buildCP()
     if(!getenv("STIFF_SKIP_F")) bvh_f.SelfCollitionDetect(dHat);
     if(!getenv("STIFF_SKIP_E")) bvh_e.SelfCollitionDetect(dHat, m_aux_stream);
     if(getenv("STIFF_STACK_DIAG")) { CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        static int _sd=0; if(_sd++<3) printf("[stack] max traversal depth = %d (cap 2048)\n", get_max_stack()); }
+        static int _sd=0; if(_sd++<3) printf("[stack] max traversal depth = %d (cap %d)\n", get_max_stack(), get_bvh_stack_capacity()); }
     GroundCollisionDetect();
     // Join the auxiliary detector back into PTDS without blocking the host.
     // The following count D2H remains the algorithmic host-control wait.
@@ -1580,4 +1699,3 @@ void stiff_test_ccd_nan_max_speed_fail_fast()
 // bucketing here is fine for the read-only diagnostic; the in-solver version (P3a
 // step2) must use fixed-order segmented reduce (cub::DeviceSegmentedReduce) so the
 // per-env sums are order-deterministic.
-

@@ -658,6 +658,16 @@ class SimEngine
     /// pair count. Pass out_flat=nullptr to just get the count. Read-only path.
     int    get_collision_pairs_clean(int* out_flat) const;
 
+    /// Validation-only swept-BVH oracle. Copies an explicit host motion field
+    /// (move_count double3 values), rebuilds the full-CCD candidate set at
+    /// alpha, and decodes it with the same clean representation as the DCD
+    /// getter. This mutates the solver's scratch direction, so callers must use
+    /// it only after the last simulated frame in a disposable process.
+    int    get_ccd_pairs_clean(const double* move_flat,
+                               int           move_count,
+                               double        alpha,
+                               int*          out_flat) const;
+
     /// [Step B] GPU-resident per-contact force export for the Newton ContactSensor.
     /// compute_contacts() fills grow-only device buffers and returns the contact
     /// count; contacts_pair_ptr()/contacts_force_ptr() return raw device pointers

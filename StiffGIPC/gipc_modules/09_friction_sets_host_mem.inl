@@ -202,6 +202,7 @@ void GIPC::FREE_DEVICE_MEM()
             release(scratch.tmp);
             release(scratch.flags);
             release(scratch.node_env);
+            release(scratch.node_max_element);
             release(scratch.sort_tmp);
             release(scratch.mch_alt);
             release(scratch.idx_alt);
@@ -583,6 +584,19 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
 GIPC::~GIPC()
 {
+#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+    if(getenv("STIFF_BVH_TRAVERSAL_AUDIT"))
+    {
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        static bool printed = false;
+        if(!printed)
+        {
+            print_bvh_traversal_audit();
+            printBvhTemporalCoherence();
+            printed = true;
+        }
+    }
+#endif
     if(m_capacity_poll_host)
     {
         cudaFreeHost(m_capacity_poll_host);

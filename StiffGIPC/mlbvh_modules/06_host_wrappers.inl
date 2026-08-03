@@ -136,13 +136,25 @@ void calcLeafNodes_indirect(Node*           _nodes,
                             const uint32_t* _indices,
                             const int*      _active_idx,
                             int             n_active,
-                            cudaStream_t    stream = 0)
+                            cudaStream_t    stream = 0,
+                            uint32_t*       node_max_element = nullptr,
+                            bool            node_max_sorted = false)
 {
     if(n_active < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (n_active + threadNum - 1) / threadNum;
-    _calcLeafNodes_indirect<<<blockNum, threadNum, 0, stream>>>(_nodes, _indices, _active_idx, n_active);
+    if(node_max_element)
+        _calcLeafNodes_indirect_with_max<<<blockNum, threadNum, 0, stream>>>(
+            _nodes,
+            _indices,
+            _active_idx,
+            node_max_element,
+            node_max_sorted,
+            n_active);
+    else
+        _calcLeafNodes_indirect<<<blockNum, threadNum, 0, stream>>>(
+            _nodes, _indices, _active_idx, n_active);
 }
 
 void calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int* prim_env = nullptr,
@@ -154,17 +166,46 @@ void calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int* prim_env =
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calcMChash<<<blockNum, threadNum, 0, stream>>>(_MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
+    static const bool use_morton14 = []
+    {
+        const char* value = getenv("STIFF_BVH_MORTON14");
+        return value && atoi(value) > 0;
+    }();
+    if(use_morton14)
+        _calcMChash14<<<blockNum, threadNum, 0, stream>>>(
+            _MChash,
+            _bvs,
+            number,
+            prim_env,
+            prim_localid,
+            env_offset,
+            prim_v0);
+    else
+        _calcMChash<<<blockNum, threadNum, 0, stream>>>(_MChash,
+                                                       _bvs,
+                                                       number,
+                                                       prim_env,
+                                                       prim_localid,
+                                                       env_offset,
+                                                       prim_v0);
 }
 
-void calcLeafNodes(Node* _nodes, const uint32_t* _indices, int number)
+void calcLeafNodes(Node*           _nodes,
+                   const uint32_t* _indices,
+                   int             number,
+                   uint32_t*       node_max_element = nullptr,
+                   bool            node_max_sorted = false)
 {
     int numbers = number;
     if(numbers < 1)
         return;
     const unsigned int threadNum = default_threads;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
-    _calcLeafNodes<<<blockNum, threadNum>>>(_nodes, _indices, number);
+    if(node_max_element)
+        _calcLeafNodes_with_max<<<blockNum, threadNum>>>(
+            _nodes, _indices, node_max_element, node_max_sorted, number);
+    else
+        _calcLeafNodes<<<blockNum, threadNum>>>(_nodes, _indices, number);
 }
 
 void calcInternalNodes(Node* _nodes, const uint64_t* _MChash, int number, cudaStream_t stream = 0)
@@ -177,7 +218,12 @@ void calcInternalNodes(Node* _nodes, const uint64_t* _MChash, int number, cudaSt
     _calcInternalNodes<<<blockNum, threadNum, 0, stream>>>(_nodes, _MChash, number);
 }
 
-void calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flags, int number, cudaStream_t stream = 0)
+void calcInternalAABB(const Node* _nodes,
+                      AABB*       _bvs,
+                      uint32_t*   flags,
+                      int         number,
+                      cudaStream_t stream = 0,
+                      uint32_t*   node_max_element = nullptr)
 {
     int numbers = number;
     if(numbers < 1)
@@ -187,7 +233,12 @@ void calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flags, int numbe
     //uint32_t* flags;
     //CUDA_SAFE_CALL(cudaMalloc((void**)&flags, (numbers-1) * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemsetAsync(flags, 0xFFFFFFFF, sizeof(uint32_t) * (numbers - 1), stream));
-    _calcInternalAABB<<<blockNum, threadNum, 0, stream>>>(_nodes, _bvs, flags, numbers);
+    if(node_max_element)
+        _calcInternalAABB_with_max<<<blockNum, threadNum, 0, stream>>>(
+            _nodes, _bvs, flags, node_max_element, numbers);
+    else
+        _calcInternalAABB<<<blockNum, threadNum, 0, stream>>>(
+            _nodes, _bvs, flags, numbers);
     //CUDA_SAFE_CALL(cudaFree(flags));
 }
 
@@ -206,6 +257,8 @@ void sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number, 
 }
 
 
+static int ee_range_prune_mode();
+
 void selfQuery_ee(const int*     _bodyID,
                   const int*     _btype,
                   const double3* _vertexes,
@@ -223,6 +276,7 @@ void selfQuery_ee(const int*     _bodyID,
                   int            _collision_body_count,
                   const int*     _body_id_to_is_fem,
                   const int* node_env,
+                  const uint32_t* node_max_element,
                   cudaStream_t   stream = 0)
 {
     int numbers = number;
@@ -231,8 +285,41 @@ void selfQuery_ee(const int*     _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    // [ee-lb] STIFF_EE_LB: 0/unset = baseline (168 reg, 8 warps/SM), 2 = ≤128 reg (16 warps),
-    // 3 = ≤85 reg (24 warps). Same body — occupancy/spill A/B without swapping wheels.
+    if(node_max_element)
+    {
+        const int range_prune_mode = ee_range_prune_mode();
+        if(range_prune_mode > 0)
+        {
+            auto* range_kernel = range_prune_mode == 2
+                                     ? _selfQuery_ee_sorted_prune
+                                     : _selfQuery_ee_range_prune;
+            range_kernel<<<blockNum, threadNum, 0, stream>>>(
+                _bodyID,
+                _btype,
+                _vertexes,
+                _rest_vertexes,
+                _edges,
+                _bvs,
+                _nodes,
+                _collisonPairs,
+                _ccd_collisonPairs,
+                _cpNum,
+                MatIndex,
+                dHat,
+                numbers,
+                _collision_skip_matrix,
+                _collision_body_count,
+                _body_id_to_is_fem,
+                node_env,
+                node_max_element);
+            return;
+        }
+    }
+
+    // [ee-lb] STIFF_EE_LB occupancy A/B.  In the 2026-08-04 sm_89 DLTO
+    // validation image, baseline and lb2 both link at 106 registers while lb3
+    // links at 80; do not infer occupancy from the older 168-register comment.
+    // Frozen-state timing retains lb2 and rejects lb3 on 4090.
     static int s_ee_lb = -1;
     if(s_ee_lb < 0)
     {
@@ -274,6 +361,7 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
                          int            _collision_body_count,
                          const int*     _body_id_to_is_fem,
                          const int* node_env,
+                         const uint32_t* node_max_element,
                          cudaStream_t   stream = 0,
                          const double*  alpha_dev = nullptr)
 {
@@ -283,9 +371,17 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_ee_ccd<<<blockNum, threadNum, 0, stream>>>(
-        _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, node_env, alpha_dev);
+    if(node_max_element && ee_range_prune_mode() == 1)
+        _selfQuery_ee_ccd_range_prune<<<blockNum, threadNum, 0, stream>>>(
+            _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes,
+            _ccd_collisonPairs, _cpNum, dHat, numbers, _collision_skip_matrix,
+            _collision_body_count, _body_id_to_is_fem, node_env, alpha_dev,
+            node_max_element);
+    else
+        _selfQuery_ee_ccd<<<blockNum, threadNum, 0, stream>>>(
+            _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes,
+            _ccd_collisonPairs, _cpNum, dHat, numbers, _collision_skip_matrix,
+            _collision_body_count, _body_id_to_is_fem, node_env, alpha_dev);
 }
 
 void selfQuery_vf(const int*      _bodyID,
@@ -377,6 +473,7 @@ void lbvh::FREE_DEVICE_MEM()
     release(_flags);
     release(_tempLeafBox);
     release(m_node_env);
+    release(m_node_max_element);
     release(_sort_tmp);
     release(_mch_alt);
     release(_idx_alt);
@@ -384,12 +481,15 @@ void lbvh::FREE_DEVICE_MEM()
     _sort_cap       = 0;
 }
 
-void lbvh::MALLOC_DEVICE_MEM(const int& number)
+void lbvh::MALLOC_DEVICE_MEM(const int& number, bool allocate_node_max)
 {
     CUDA_SAFE_CALL(cudaMalloc((void**)&_indices, (number) * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_MChash, (number) * sizeof(uint64_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_nodes, (2 * number - 1) * sizeof(Node)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_node_env, (2 * number - 1) * sizeof(int)));  // [env-part B]
+    if(allocate_node_max)
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_node_max_element,
+                                  (2 * number - 1) * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_bvs, (2 * number - 1) * sizeof(AABB)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_tempLeafBox, number * sizeof(AABB)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_flags, (number - 1) * sizeof(uint32_t)));
@@ -430,7 +530,7 @@ void lbvh_f::init(int*       _mbodyID,
     _btype             = _mbtype;
     _collision_skip_matrix = collision_skip_matrix;
     _collision_body_count  = collision_body_count;
-    MALLOC_DEVICE_MEM(face_number);
+    MALLOC_DEVICE_MEM(face_number, false);
 }
 
 void lbvh_e::init(int*       _mbodyID,
@@ -460,7 +560,7 @@ void lbvh_e::init(int*       _mbodyID,
     _btype             = _mbtype;
     _collision_skip_matrix = collision_skip_matrix;
     _collision_body_count  = collision_body_count;
-    MALLOC_DEVICE_MEM(edge_number);
+    MALLOC_DEVICE_MEM(edge_number, ee_range_prune_mode() > 0);
 }
 
 AABB* lbvh_f::getSceneSize()
@@ -558,6 +658,19 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     return 0;
 }
 
+static int ee_range_prune_mode()
+{
+    static const int mode = []
+    {
+        const char* value = getenv("STIFF_EE_RANGE_PRUNE");
+        if(!value)
+            return 0;
+        const int parsed = atoi(value);
+        return parsed <= 0 ? 0 : (parsed == 2 ? 2 : 1);
+    }();
+    return mode;
+}
+
 double lbvh_e::Construct(cudaStream_t stream)
 {
     // BVH-skip #3: when _active_idx is set (face_number_active reused as edge active count)
@@ -572,9 +685,18 @@ double lbvh_e::Construct(cudaStream_t stream)
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
-        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
+        const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
+        uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
+        calcLeafNodes_indirect(
+            _nodes,
+            _indices,
+            _active_idx,
+            N,
+            stream,
+            node_max,
+            range_mode == 2);
         calcInternalNodes(_nodes, _MChash, N, stream);
-        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
         return 0;
     }
 
@@ -596,11 +718,14 @@ double lbvh_e::Construct(cudaStream_t stream)
 
     //cudaEventRecord(end1);
 
-    calcLeafNodes(_nodes, _indices, edge_number);
+    const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
+    uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
+    calcLeafNodes(
+        _nodes, _indices, edge_number, node_max, range_mode == 2);
 
     calcInternalNodes(_nodes, _MChash, edge_number);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    calcInternalAABB(_nodes, _bvs, _flags, edge_number);
+    calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
     //selfQuery(_vertexes, _edges, _bvs, _nodes, _collisionPair, _cpNum, edge_number);
     //cudaEventRecord(end2);
@@ -633,9 +758,13 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
-        calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
+        const bool range_prune = m_node_max_element
+                                 && ee_range_prune_mode() == 1;
+        uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
+        calcLeafNodes_indirect(
+            _nodes, _indices, _active_idx, N, stream, node_max, false);
         calcInternalNodes(_nodes, _MChash, N, stream);
-        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
@@ -648,11 +777,14 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     _mc_sort_active(*this, _MChash, _indices, edge_number, 0);
     sortBvs(_indices, _bvs, _tempLeafBox, edge_number);
 
-    calcLeafNodes(_nodes, _indices, edge_number);
+    const bool range_prune = m_node_max_element
+                             && ee_range_prune_mode() == 1;
+    uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
+    calcLeafNodes(_nodes, _indices, edge_number, node_max, false);
 
     calcInternalNodes(_nodes, _MChash, edge_number);
 
-    calcInternalAABB(_nodes, _bvs, _flags, edge_number);
+    calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
 
     return 0;
@@ -707,6 +839,7 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  _collision_body_count,
                  _body_id_to_is_fem,
                  m_node_env,
+                 m_node_max_element,
                  stream);
 }
 
@@ -729,7 +862,8 @@ void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
                 : (int)edge_number;
     fullCCDselfQuery_ee(
         _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, N,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, m_node_env, stream, alpha_dev);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem,
+        m_node_env, m_node_max_element, stream, alpha_dev);
 }
 
 

@@ -29,12 +29,13 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     if(par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;  // concurrency cap
               K = (int)h_perenv_active.size(); if(K > cap) K = cap; if(K < 1) K = 1; allocPerEnvPool(K); }
     // snapshot bvh scratch so we can point-swap per env + restore at the end.
-    BvhScratch of{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,
+    BvhScratch of{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,bvh_f.m_node_max_element,
                   bvh_f._sort_tmp,bvh_f._sort_tmp_bytes,bvh_f._mch_alt,bvh_f._idx_alt,bvh_f._sort_cap};
-    BvhScratch oe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,
+    BvhScratch oe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,bvh_e.m_node_max_element,
                   bvh_e._sort_tmp,bvh_e._sort_tmp_bytes,bvh_e._mch_alt,bvh_e._idx_alt,bvh_e._sort_cap};
     auto swapIn = [](lbvh& b, BvhScratch& s){ b._nodes=s.nodes; b._bvs=s.bvs; b._MChash=s.mch;
         b._indices=s.idx; b._tempLeafBox=s.tmp; b._flags=s.flags; b.m_node_env=s.node_env;
+        b.m_node_max_element=s.node_max_element;
         b._sort_tmp=s.sort_tmp; b._sort_tmp_bytes=s.sort_bytes;   // [perenv-parallel #2]
         b._mch_alt=s.mch_alt; b._idx_alt=s.idx_alt; b._sort_cap=s.sort_cap; };
   perenv_redo:

@@ -308,11 +308,12 @@ def resolve_multienv_mode(mode: str = "merged") -> str:
     # [0.8.2] determinism is POSITIVE-gated in the binary now (strict sets STIFF_SPMV_DET above;
     # merged/isolated run the fast paths by default) — the old STIFF_FAST_GRAD hint is no longer
     # read by the engine and is not set anymore.
-    # merged defaults the selfQuery_ee occupancy variant (STIFF_EE_LB=2: 128reg → 16 warps/SM,
-    # measured -5.6%/frame). NOT defaulted for strict (measured no gain: seg/binned atomics own
-    # the L2 there) nor isolated (measured 2026-07-28: noise — towel -1.6%/foldshirt +1.5%,
-    # median-of-3; per-env queries are launch/latency-bound, not occupancy-bound). Both can
-    # opt in explicitly.
+    # merged defaults the selfQuery_ee lb2 variant.  The 2026-08-04 sm_89 DLTO
+    # image links baseline/lb2 at the same 106 registers (so the old 128-reg
+    # explanation was stale), but a frozen-state 100-query test still measured
+    # lb2 -1.69% for EE-DCD. NOT defaulted for strict; isolated measured only
+    # -0.59% in that microtest and prior end-to-end trials classified it as
+    # noise. Both modes can opt in explicitly.
     if canon == "merged":
         _setdefault_tracked(_MODE_FLAGS_SET_BY_US, "STIFF_EE_LB", "2")
     return canon

@@ -455,12 +455,13 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     if(ccd_par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;
                   ccd_K = (int)h_perenv_active.size(); if(ccd_K > cap) ccd_K = cap; if(ccd_K < 1) ccd_K = 1;
                   allocPerEnvPool(ccd_K); }
-    BvhScratch cof{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,
+    BvhScratch cof{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,bvh_f.m_node_max_element,
                    bvh_f._sort_tmp,bvh_f._sort_tmp_bytes,bvh_f._mch_alt,bvh_f._idx_alt,bvh_f._sort_cap};
-    BvhScratch coe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,
+    BvhScratch coe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,bvh_e.m_node_max_element,
                    bvh_e._sort_tmp,bvh_e._sort_tmp_bytes,bvh_e._mch_alt,bvh_e._idx_alt,bvh_e._sort_cap};
     auto cswapIn = [](lbvh& b, BvhScratch& s){ b._nodes=s.nodes; b._bvs=s.bvs; b._MChash=s.mch;
         b._indices=s.idx; b._tempLeafBox=s.tmp; b._flags=s.flags; b.m_node_env=s.node_env;
+        b.m_node_max_element=s.node_max_element;
         b._sort_tmp=s.sort_tmp; b._sort_tmp_bytes=s.sort_bytes;
         b._mch_alt=s.mch_alt; b._idx_alt=s.idx_alt; b._sort_cap=s.sort_cap; };
   ccd_redo:
@@ -904,6 +905,9 @@ void GIPC::allocPerEnvPool(int K)
             CUDA_SAFE_CALL(cudaMalloc((void**)&s.tmp,nE*sizeof(AABB)));
             CUDA_SAFE_CALL(cudaMalloc((void**)&s.flags,(nE-1)*sizeof(uint32_t)));
             CUDA_SAFE_CALL(cudaMalloc((void**)&s.node_env,(2*nE-1)*sizeof(int)));
+            if(bvh_e.m_node_max_element)
+                CUDA_SAFE_CALL(cudaMalloc((void**)&s.node_max_element,
+                                          (2*nE-1)*sizeof(uint32_t)));
             allocSort(s, nE); }
     }
     m_pool_streams.resize(K);
