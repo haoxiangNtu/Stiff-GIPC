@@ -337,3 +337,36 @@ Shipped result (4090, clean GPU, 60 frames, median of 3):
 verify_gates.sh: ALL 22 GATES GREEN with the new default, gold anchor
 0544461bd82123ae unmoved (strict runs the det stack, where the change is
 provably neutral).
+
+## Cross-version reality check vs v0.8.5 (4090, clean GPU)
+
+Two workloads, both built from a v0.8.5-compatible script so the
+comparison is apples to apples (the two UMI replay wrappers are
+byte-identical between the tag and HEAD).
+
+**Large-frame replay (60 frames, median of 3).** The whole-frame graph is
+a validation vehicle here, not a performance mode:
+
+| scene | v0.8.5 | HEAD default (graph off) | HEAD graph on |
+|---|---|---|---|
+| case39_UMI_forcegrip | 7.26 s | 7.10 s (-2%) | 10.37 s (+43% vs tag) |
+| case39_UMI_beaker | 10.09 s | 10.78 s (**+7% regression**) | 13.57 s (+35% vs tag) |
+
+**RL micro-step workload** (the D4 articulated ABD chain pressed into the
+ground, 300 steps after contact priming, dt=0.01). v0.8.5 has no episode
+or gpu_rl API at all, so its only option is the host-driven step() loop:
+
+| path | ms / step | vs v0.8.5 |
+|---|---|---|
+| v0.8.5 host step() | 19.3 (18.9 / 19.3 / 19.7) | 1.00x |
+| HEAD host step() | 9.7 (9.2 / 9.7 / 10.3) | **2.0x faster** |
+| HEAD gpu_rl residency | 3.85 (3.80 / 3.84 / 3.93) | **5.0x faster** |
+
+That is the honest summary of the whole campaign: on big replay frames
+the residency work is a wash (and the graph costs 35-43%), while on the
+small-frame RL regime it is 2x from the residency work alone and 5x with
+device residency on top. The regime, not the feature, decides.
+
+Open item: the ~7% beaker regression in the DEFAULT path against v0.8.5
+is a real regression on the path every user takes, measured over 6
+interleaved runs with non-overlapping ranges.
