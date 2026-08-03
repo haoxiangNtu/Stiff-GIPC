@@ -149,3 +149,24 @@ resident graph at all. It is not guaranteed to beat v0.8.5 on every large
 contact replay: graph capture, capacity padding and CUB plans can cost more
 than the host loop. The branch therefore treats the v0.8.5 comparison as a
 benchmark gate, not as an assumption.
+
+## Current replay evidence (2026-08-03)
+
+The independent `codex/full-dynamic-graph` worktree was built with CUDA 12.8
+and replayed the bundled `episode_fold_shirt_umi.hdf5` (1551 action rows) in
+merged mode with one environment. The 7187-vertex/42-ABD scene completed all
+1551 frames without a solver exception. The replay now has an optional
+`CASE39_GRAPH_STATS=1` audit which counts full-graph, fallback and overflow
+frames from the terminal status packet; this is an audit mode, not part of the
+zero-sync steady state. Isolated mode with one environment is not a valid
+isolated qualification (the resolver requires multiple declared environment
+groups); a four-environment smoke reached the isolated path, but the full
+1551-frame four-environment run remains a separate acceptance job.
+
+CUDA Graph cannot perform arbitrary in-graph allocation or graph recapture. A
+device overflow can publish status and stop/finish the current episode, but
+rebuilding the executable still requires a host CUDA API call. The strict
+no-CPU steady-state contract is therefore: no host work inside a running
+frame/episode, preallocated capacity sufficient for that episode, and
+recapture only between episodes. Calling this “CPU-free recapture” would be
+incorrect.
