@@ -1,182 +1,261 @@
-# GPU 仿真执行方案：两条正式路线
+# GPU 仿真执行方案：两条正式路线（复审核订版）
 
-本文将后续讨论收敛为两个方案。`GPU-native episode` 不再作为独立的
-第三种路线；它只是方案一中“正常稳态帧”的一种工作方式。
+更新时间：2026-08-03
+
+审核对象：`codex/full-dynamic-graph`（当前 HEAD `ec1f1a3`）
+
+Persistent 实验分支：`codex/persistent-gpu-runtime`（当前仅分叉，尚无 runtime 实现）
+
+本文只保留两条正式路线：
+
+1. 固定拓扑 CUDA Graph，CPU 负责必要的帧边界控制、overflow、扩容和重录；
+2. Persistent GPU Runtime，由长期驻留的设备执行器自主推进仿真。
+
+本文区分“目标设计”和“当前代码事实”。未通过对应门禁前，不使用“完全
+GPU-only”或“GPU 自主无限扩容”等表述。
 
 ## 共同目标
 
-- 仿真主计算在 GPU 上执行；
-- 接触、CCD、Newton、PCG、线搜索和 RL 状态尽可能设备驻留；
-- 正常稳态帧不发生 H2D/D2H 或宿主同步；
-- merged 与 isolated 都能处理接触丰富场景；
-- overflow、失败和 reset 具有明确且可验证的语义。
+- buildBVH、接触/CCD、Newton、装配、PCG 和线搜索的主要计算留在 GPU；
+- merged 与 isolated 都能运行接触丰富场景；
+- 正常路径减少细碎 kernel 的 host launch 成本；
+- overflow、rollback、fallback、扩容和状态 commit 有明确事务语义；
+- 最终以 FOLD-SHIRT 长轨迹、nsys、数值等价和 v0.8.5 性能对比裁决。
 
-## 方案一：CUDA Graph + 边界 CPU 介入
+## 方案一：固定拓扑 CUDA Graph + CPU 边界控制
 
-### 执行模型
+### 1. 当前代码实际做了什么
+
+当前普通 `step()` 的整帧图已经把帧内部的条件循环录入 Graph，但 CPU 仍在
+**每一帧**参与控制面：
 
 ```text
-正常帧：GPU Graph 完成整帧仿真，CPU 不参与
-    ↓
-设备发现 overflow / invalid / nonfinite / tier 不足
-    ↓
-该帧在边界发布 status
-    ↓
-CPU 只在边界执行必要处理：
-  增容、重建 CUB plan、重新 capture Graph、或执行一次 fallback
-    ↓
-下一帧/下一 episode 继续 GPU Graph 稳态
+CPU 准备 FrameBegin/FrameTerminal input
+  ↓ H2D
+CPU cudaGraphLaunch(full_exec)
+  ↓
+GPU 执行 BVH → contact/CCD → Newton/PCG/LS → status
+  ↓ D2H（恰好一个 FrameStatus）
+CPU cudaStreamSynchronize
+  ↓
+CPU 裁决 status、更新 kappa/telemetry/接触计数镜像
 ```
 
-### CPU 可以参与什么
+代码证据：
 
-只允许在明确的边界做以下工作：
+- `frame_transaction.cu:1211`：Graph 内有 FrameBegin H2D；
+- `frame_transaction.cu:1293`：Graph 内有 FrameTerminal H2D；
+- `frame_transaction.cu:1304`：Graph 内有 FrameStatus D2H；
+- `frame_transaction.cu:1332`：普通 full graph 明确要求恰好一个 D2H；
+- `frame_transaction.cu:2491`：CPU 发射 `cudaGraphLaunch`；
+- `frame_transaction.cu:2505`：CPU 每帧 `cudaStreamSynchronize`；
+- `frame_transaction.cu:4178`：接触帧在边界回读设备 pair snapshot。
 
-- 读取设备 status；
-- 判断本帧是否已经 commit；
-- 扩大 buffer/tier；
-- 重建需要 host 参数的 CUB plan；
-- 重新 capture/instantiate GraphExec；
-- 在无法安全重录时运行一次普通 fallback solver；
-- 结束当前 episode 并开始下一 episode。
+因此当前准确表述是：
 
-CPU 不应在正常图帧内部参与：
+> **帧内部物理计算 Graph 化；CPU 每帧仍做一次 launch、等待、状态回读和
+> 边界裁决。**
 
-- 查询接触数；
-- 查询 Newton/PCG 收敛；
-- 每轮 launch kernel；
-- 读回位置或速度；
-- 做逐帧 reset/reward/done 判断。
+当前代码尚不符合“正常帧 CPU 完全不参与，只有 overflow 才唤醒 CPU”。
 
-### 优点
+### 2. overflow 的当前语义
 
-- 最大程度复用现有 GIPC/Newton/PCG CUDA kernel；
-- CUDA Graph 能显著降低大量细碎 kernel 的 launch 开销；
-- 失败和扩容语义容易审计；
-- 改造风险和验证成本可控；
-- merged/isolated 可以逐步加入资格检查。
+设备在图内检测 DCD/CCD/contact-triplet/unique/MAS 容量越界并写入 status。
+CPU 在当前物理帧的边界：
 
-### 缺点
+1. 读取失败 status；
+2. 恢复帧首 FEM/ABD/kappa/contact 快照；
+3. 增长对应 capacity tier 并推进 buffer generation；
+4. 默认不在新图中重试该帧，而是用 release solver 完成同一个物理帧；
+5. 下一帧按新 generation 重新 capture/instantiate GraphExec。
 
-- overflow 帧或重录边界不是 CPU-zero；
-- CUB 的 host-baked `num_items` 仍需固定容量、bucket 或边界重录；
-- 无法在标准 CUDA Graph 内任意增加节点、分配显存或重建 GraphExec；
-- 最坏情况下可能频繁 fallback，影响吞吐和 RL episode 连续性。
+`STIFF_GRAPH_INGRAPH_RETRY=1` 只是实验开关；默认是边界 fallback，因为图内
+重试改变 grid/reduction 顺序，曾放大接触场景的非确定性。
 
-### 正确的对外承诺
+该机制的方向正确，但 overflow 帧不是 GPU-only，而且 fallback 不是一项
+轻量状态处理——CPU 会重新组织并运行普通 solver 路径。
 
-> 正常稳态帧 GPU-only；容量变化、重录和必要 fallback 在帧边界由 CPU
-> 处理；边界完成后恢复 GPU-only 稳态。
+### 3. 方案一有两个可选契约
 
-这不是“任何情况下 CPU 都不参与”，但它是当前工程最稳妥的 CUDA Graph
-路线。
+#### 契约 1A：同步 host-stepped Graph（当前现实路线）
+
+- CPU 每帧发射一张 Graph；
+- CPU 每帧等待并读取一个 status；
+- 帧内部不做 Newton/PCG/LS 的逐迭代 host 往返；
+- overflow 时在同一边界恢复、扩容、fallback，下一帧重录。
+
+这是当前代码最接近且最容易完成的产品契约。对外应称为“整帧 GPU Graph”，
+不能称为“正常帧 CPU-zero”。
+
+#### 契约 1B：正常帧不触碰 CPU，仅 overflow 才返回边界
+
+这要求 GPU 自主连续推进多个帧，否则 CPU 无法在不检查每帧 status 的前提下
+知道是否 overflow。必须增加：
+
+- 设备 action/task ring；
+- 多帧设备循环或 tail-launched Graph；
+- 设备 status/done ring；
+- overflow 时停止继续 commit；
+- CPU 通过 event/轮询在异常或批次完成时介入。
+
+它仍属于固定拓扑 Graph 路线，但执行机制本质上是多帧驻留。若动作必须由
+CPU 每帧在线产生，就无法同时满足“CPU 只在 overflow 时介入”。
+
+### 4. 当前验证事实
+
+已经成立：
+
+- merged FOLD-SHIRT（7187 顶点、42 ABD）完成 1551 帧；
+- 审计结果 `full=1545, fallback=6, overflow=0`；
+- frame graph normal、rollback、unique-tier overflow retry 门禁通过；
+- 多帧 device-native Graph API 的 4 帧单次 launch 原型通过，Graph 审计
+  `h2d=0, d2h=0`。
+
+仍未成立：
+
+- isolated 四环境完整 1551 帧；
+- FOLD-SHIRT graph-vs-release 完整最终状态/状态轨迹等价；
+- C4 squeeze 的 kappa 门禁曾超过已有噪声包络；
+- 所有 CUB `num_items` 和 contact/triplet 段的设备长度覆盖；
+- A800 接触丰富长窗口 nsys 证明；
+- Graph-on 对大场景的性能优势。已有文档测量中 Graph-on 常慢于 Graph-off。
+
+### 5. CUB 和“动态图”的边界
+
+现有 CUB sort/scan/reduce 的 `num_items` 多数仍由 host 在 capture 时烤入。
+固定容量 + device live mask 可以保证正确性，但不等于所有算子都按实时长度
+执行。可选工程策略只有：
+
+- 固定容量执行并保证 padding 中性；
+- 预录有限 capacity bucket，在边界选择/重录；
+- 为高收益段实现 device-controlled primitive；
+- 接受容量宽度空转，若实测 launch width 不是瓶颈则不改。
+
+标准 CUDA Graph 不能在图内 `cudaMalloc`、增删节点或重新 instantiate
+GraphExec。
+
+### 6. 方案一准确承诺
+
+短期可承诺：
+
+> 正常帧的物理内部由一张条件 CUDA Graph 完成；CPU 每帧只负责图发射和
+> 边界状态裁决；overflow 帧在边界恢复、扩容和 fallback，随后重录。
+
+只有契约 1B 的多帧驻留门禁通过后，才可以承诺：
+
+> 正常帧 CPU-zero，仅批次完成或 overflow 时 CPU 介入。
 
 ## 方案二：Persistent GPU Runtime
 
-### 执行模型
+### 1. 目标执行模型
 
-CPU 初始化时只启动一个长期驻留 kernel：
+CPU 在初始化时发射长期驻留的 GPU 执行器：
 
 ```text
-GPU persistent runtime
-  ├─ 读取 device task/action
+Persistent scheduler
+  ├─ 读取 device action/task queue
   ├─ build BVH
   ├─ 生成 contact / CCD / triplet
-  ├─ 从 device arena 获取工作区
+  ├─ 从 device arena 分配临时工作区
   ├─ Newton { assemble → PCG → line search }
-  ├─ 设备侧 reward / done / reset
-  └─ 继续下一帧或下一 episode
+  ├─ observation / reward / done / reset
+  └─ 推进下一帧或停止并发布 terminal status
 ```
 
-设备侧 runtime 自己推进帧循环、处理分支、发布状态，不依赖 CPU 每帧
-launch Graph，也不需要 CPU 为每个 overflow 重录 Graph。
+它不是“在 GPU 上重新 capture CUDA Graph”。它需要设备 work queue、设备
+同步和设备内存生命周期，并重构当前 host orchestration。
 
-### 必须重写的部分
+### 2. 必须修正的扩容表述
 
-- 将 host orchestration 改成 device work queue；
-- 自定义 device arena allocator 和 generation 管理；
-- 自定义 device scan/sort/reduce，或设计有限 bucket；
-- 将 Newton/PCG 阶段改写成 persistent kernel 可调用的 device 函数；
-- 使用 cooperative groups 实现全局阶段同步；
-- 设计 device error、overflow、done 和 recovery 协议；
-- 解决长驻 kernel 对 policy、通信和其他 CUDA 工作的资源占用。
+Persistent runtime 不能无限自主扩大物理显存。device allocator 只能从 CPU
+初始化时已经保留/提交的 arena 中切分空间。
 
-### 重要限制
+arena 耗尽时只有三种诚实策略：
 
-Persistent runtime 不是“在 GPU 上继续调用 CUDA Graph API”。如果内部仍
-通过 CUDA Dynamic Parallelism 发射大量子 kernel，launch 开销仍然存在。
-要真正减少 launch，必须把细碎 kernel 合并为 persistent kernel 内的
-device function 或 work-queue task。
+1. 设备 fail-closed，等待 CPU 分配更大的 arena 并重启 runtime；
+2. 初始化时预留最坏容量，运行中只做设备侧子分配；
+3. 将任务分块/降级并明确报告，不允许静默丢失接触。
 
-### 优点
+因此方案二可以减少 Graph 重录，但不能承诺“显存耗尽后仍无 CPU 无限扩容”。
 
-- 可以把帧循环、动态分支和 episode 循环留在 GPU；
-- 不需要标准 CUDA Graph 的逐 episode 重录；
-- 更适合动态接触数、动态 Newton 迭代、设备 policy/reward/reset；
-- 理论上最接近真正的 GPU-native 仿真。
+### 3. kernel launch 开销
 
-### 缺点
+Persistent runtime 只有在细碎 kernel 被融合为 `__device__` 阶段或设备任务时
+才能真正消除 launch 成本。若内部继续用 CUDA Dynamic Parallelism 发射原有
+子 kernel，launch 开销和调度成本仍然存在，且可能比 CUDA Graph 更慢。
 
-- 需要重构大量现有求解器代码；
-- device 全局同步和 allocator 复杂；
-- CUB、排序、扫描和临时内存不能直接复用现有 host API；
-- 长驻 kernel 的资源、异常恢复和调试风险高；
-- 需要重新建立数值等价、sanitizer、跨架构和长时程证据。
+Newton/PCG/排序还需要跨 block 全局同步。Cooperative Groups 要求整个
+cooperative grid 满足驻留条件；问题规模过大时不能简单把所有原 kernel 塞入
+一个巨型 persistent kernel。
 
-### 正确的对外承诺
+### 4. 主要重构和风险
 
-> 初始化阶段由 CPU 启动 runtime；启动后，帧推进、动态工作区、overflow、
-> reset、reward 和 done 都由 GPU runtime 管理。
+- host orchestration → device scheduler/work queue；
+- 固定上限的 device arena、generation、rollback；
+- CUB host API → 自定义 primitive、固定 bucket 或混合子图；
+- Newton/PCG/LS 阶段的 grid-wide barrier；
+- persistent kernel 与 policy、通信、渲染的 SM 资源共存；
+- CUDA 异常后的 runtime 终止和恢复；
+- 浮点归约顺序改变后的重新定锚；
+- sanitizer、跨架构、长时程和吞吐证据全部重建。
 
-## 两个方案的直接比较
+### 5. 推荐的原型顺序
 
-| 项目 | CUDA Graph + 边界 CPU | Persistent GPU Runtime |
+在迁移完整 GIPC 前只做三个有独立裁决价值的原型：
+
+1. device task ring + persistent scheduler，连续推进简化帧状态；
+2. device arena allocate/reset/rollback/overflow，验证无越界和 generation；
+3. 一个简化 PCG 或 contact pipeline，与普通 launch 和 CUDA Graph 对比。
+
+只有原型证明吞吐或动态性收益，才逐段迁移 BVH/contact/Newton。可以考虑
+“persistent control plane + 预实例化 CUDA 子图”的混合设计，但子图拓扑和
+物理显存上限仍然固定。
+
+### 6. 方案二准确承诺
+
+可追求：
+
+> 在预分配 arena 的容量范围内，GPU runtime 自主推进帧、处理动态任务、
+> reward/done/reset 和可恢复 overflow，不需要 CPU 逐帧发射或 Graph 重录。
+
+不可承诺：
+
+> arena/物理显存耗尽后仍能无 CPU 无限扩容并继续运行。
+
+## 两个方案的修订比较
+
+| 项目 | 方案一：固定 Graph | 方案二：Persistent Runtime |
 |---|---|---|
-| 正常帧 CPU | 无 | 无 |
-| overflow 处理 | 边界 CPU | GPU runtime |
-| 扩容/重录 | 边界 CPU | 不需要 Graph 重录，但需 device arena |
-| 现有代码复用 | 高 | 低 |
-| kernel launch 优化 | CUDA Graph | 单次长驻 kernel/内部任务 |
-| 动态性 | 中等 | 高 |
+| 当前实现状态 | 整帧图已存在，仍有每帧 CPU 边界 | 只有独立分支和设计文档 |
+| 正常帧 CPU | 当前有一次 launch、sync、status 裁决 | 目标为无逐帧 CPU |
+| 物理内部 host 往返 | Newton/PCG/LS 已可消除 | 目标为全部设备调度 |
+| overflow | CPU 边界恢复、扩容、fallback | arena 内设备处理；硬耗尽仍需停机/CPU |
+| 动态显存 | CPU 边界增长 | 仅能在预分配 arena 内子分配 |
+| 现有 kernel 复用 | 高 | 低；混合子图可提高复用 |
+| launch 优化 | CUDA Graph | 融合设备阶段/长期驻留调度器 |
 | 实现风险 | 中 | 很高 |
-| 近期可交付性 | 高 | 低 |
-| 适合当前分支 | 是 | 作为后续研究路线 |
+| 近期可交付性 | 高 | 先做原型裁决 |
+| 性能结论 | 未证明普遍快于 Graph-off/v0.8.5 | 完全未知，必须实测 |
 
-## 建议的讨论顺序
+## 推荐决策
 
-### 近期工程路线
+1. 以方案一契约 1A 收口正确性和长轨迹，避免把“整帧 Graph”误称为
+   “CPU-zero”；
+2. 若产品要求 CPU 只在 overflow 时出现，在方案一内实现并验证契约 1B；
+3. Persistent 分支先完成 scheduler/arena/简化 solver 三个原型；
+4. 用 nsys 和端到端吞吐比较 1A、1B、Persistent 原型与 v0.8.5，再决定是否
+   重写完整执行器。
 
-优先推进方案一：
+## 交给下一轮审核者的问题
 
-1. 完整接触链进入整帧 Graph；
-2. 设备计数器和容量 tier 完整化；
-3. 正常帧零 H2D/D2H/同步；
-4. overflow 帧明确在边界由 CPU 处理；
-5. 证明 fallback 后下一帧/下一 episode 的语义正确；
-6. 完整 FOLD-SHIRT merged/isolated 1550 帧验证。
+请重点复核：
 
-### 长期研究路线
-
-若方案一的 fallback、重录或容量浪费成为主要瓶颈，再切入方案二，优先
-把最动态的 contact queue、设备 reset、reward/done 和容量管理改造成
-persistent GPU 子系统，Newton/PCG 主体可以暂时保留 Graph。
-
-## 最终判断标准
-
-方案一只有在以下条件同时满足时才算完成：
-
-- 稳态帧零宿主同步；
-- overflow 不污染已提交状态；
-- fallback 后数值与普通路径等价；
-- 重录后 Graph handle、容量和 episode 计数不串扰；
-- merged/isolated 完整长轨迹通过。
-
-方案二只有在以下条件同时满足时才算可用：
-
-- persistent kernel 能连续推进长 episode；
-- device arena 不越界且可复用；
-- 动态接触和 Newton/PCG 阶段无死锁；
-- GPU 侧 done/reset/reward 正确；
-- 长时间运行不需要 CPU 重启或重录；
-- 性能确实优于方案一，而不仅仅是理论上更“纯 GPU”。
-
+1. 普通 full graph 是否还有本文遗漏的每帧 host work、H2D/D2H 或同步；
+2. overflow fallback 是否在所有 FEM/ABD/contact/friction 状态上真正回到帧首；
+3. `full=1545/fallback=6` 中六个 fallback 的原因和数值影响；
+4. isolated 四环境 1551 帧为何尚未完成，是否存在结构性资格限制；
+5. CUB 固定容量路径的 padding 是否对所有消费者都数值中性；
+6. Persistent arena 硬耗尽时是否存在可行的纯设备恢复策略；
+7. Persistent + device-launched/pre-instantiated Graph 混合路线是否比巨型
+   cooperative kernel 更适合当前代码；
+8. 哪条路线在 A800 的真实接触丰富 RL 工作负载上能超过 v0.8.5。
