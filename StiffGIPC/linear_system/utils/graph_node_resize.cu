@@ -78,11 +78,20 @@ __global__ void _resize_grid_from_count(const cudaGraphDeviceNode_t* slots,
 bool enabled()
 {
     static const bool on = []() {
-        // Default OFF: the mechanism is verified (see the header) but on the
-        // measured scenes the padded launch width was never the bottleneck --
-        // resizing bought 0% while the atomic convoy fixed by
-        // STIFF_SKIP_ZERO_DEPOSIT bought 27%. Opt-in so the capability is
-        // there for a workload whose width actually dominates.
+        // Default ON. It measured 0% while the atomic convoy (C6-w) still
+        // dominated; with that gone the padded-width cost surfaced and this
+        // is where it lives -- not in kernel launch extents but in the graph's
+        // MEMSET nodes, which CUDA replays as memset32 KERNELS. Measured on
+        // forcegrip (15 frames, node-granularity nsys):
+        //   memset32 total      136 ms -> 83 ms   (-39%)
+        //   of which >10k-block  87 ms -> 35 ms   (-60%)
+        //   all-kernel GPU time 1.060 s -> 0.951 s (-10%)
+        // Wall moved only ~2% (inside noise) because this scene is not bound
+        // by kernel time. Default stays OFF: resizing a node changes the
+        // occupancy of everything downstream, which reorders the binned
+        // scatter's atomicAdds -- gpu_native_rl_gate measured a 1.1e-14
+        // velocity delta against its 3.6e-15 floor. A 27% win (the zero-skip)
+        // is worth relitigating a gate's premise; a 2% one is not.
         const char* value = std::getenv("STIFF_GRAPH_DEVICE_RESIZE");
         return value && std::atoi(value) != 0;
     }();

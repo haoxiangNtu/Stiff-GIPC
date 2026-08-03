@@ -370,3 +370,45 @@ device residency on top. The regime, not the feature, decides.
 Open item: the ~7% beaker regression in the DEFAULT path against v0.8.5
 is a real regression on the path every user takes, measured over 6
 interleaved runs with non-overlapping ranges.
+
+## C6-x: where the remaining whole-frame-graph gap actually is (profiled clean)
+
+Per-frame, engine-reported (forcegrip, 60 frames, setup excluded):
+graph on 140.0 ms vs graph off 99.5 ms. Per-frame medians from the dump:
+66.7 ms vs 48.4 ms (both distributions are heavy-tailed on the same hard
+contact frames 27-29 / 52-58; the graph is 1.8x worse on those, so the
+overhead scales with Newton iterations, not with frame count).
+
+Timeline attribution at node granularity (15 frames):
+
+| | graph on | graph off |
+|---|---|---|
+| GPU idle gaps | 279 ms | 541 ms |
+| GPU busy share | 69% | 52% |
+| host<->device copies | 1197 / 2 ms | 11533 / 16 ms |
+| **GPU time actually computing** | **0.86 s** | **0.64 s** |
+
+The graph wins every axis a graph is supposed to win -- half the idle
+gaps, a tenth of the transfers, 1.3 ms of host work before the launch
+(the 12.5 ms measured earlier was contention from an unrelated job on the
+card). It loses because it asks the GPU to do **34% more work**.
+
+Kernel-level split of the 376 ms extra (15 frames):
+
+* 136 ms (36%) memset nodes replayed as memset32 kernels: graph mode
+  zeroes 5.4 GB in 136 ms (38 GB/s) where stream mode zeroes 23.3 GB in
+  48 ms (486 GB/s). Half that time is the 50 largest, up to 151 MB each --
+  the mergebin cleared at tier capacity instead of the live unique count.
+* 68 ms (18%) extra BVH collision queries: 33 passes vs 20, identical per
+  pass. This is the pre-capture dry run plus re-records, i.e. the price of
+  having to know buffer sizes before recording.
+* 97 ms (26%) padded DATA inside O(N) passes -- converter lambdas
+  (415 us vs 188 us per instance), cub sorts, and the tier staging
+  kernels that graph-off does not run at all.
+
+STIFF_GRAPH_DEVICE_RESIZE targets the first bucket and does work
+(memset32 136 ms -> 83 ms, >10k-block ones -60%, all-kernel GPU time
+-10%), but wall moved only ~2% and it perturbs the binned scatter's
+atomic order enough to trip gpu_native_rl_gate (velocity delta 1.1e-14
+against a 3.6e-15 floor). It therefore stays default OFF: a 27% win (the
+zero-skip) is worth relitigating a gate's premise, a 2% one is not.
