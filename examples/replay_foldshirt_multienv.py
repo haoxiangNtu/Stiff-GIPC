@@ -379,10 +379,22 @@ def main():
                       flush=True)
             recorder = (_mp4, _usd, _faces_all, _face_is_abd, _stride)
         ms = []
+        graph_frames = 0
+        fallback_frames = 0
+        overflow_frames = 0
+        graph_audit = bool(int(os.environ.get("CASE39_GRAPH_STATS", "0")))
         for fr in range(f0, f1):
             for e, ej in enumerate(ejs):
                 apply_frame(robot, ej, actions[(fr + e*phase) % L], close_r)
             t = time.perf_counter(); eng.step(); ms.append((time.perf_counter()-t)*1000.0)
+            if graph_audit:
+                _st = eng.native.get_frame_status()
+                if int(_st.path_flags) & (1 << 4):
+                    graph_frames += 1
+                else:
+                    fallback_frames += 1
+                if int(_st.invalid_bits) & ((1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)):
+                    overflow_frames += 1
             if recorder is not None and fr % recorder[4] == 0:
                 (_mp4, _usd, _faces_all, _face_is_abd, _st) = recorder
                 _v = np.asarray(eng.get_vertices())
@@ -438,6 +450,8 @@ def main():
                 print(f"[fs-rec] wrote {usd_path}", flush=True)
         mm = float(np.mean(ms))
         print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({1000.0/mm:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
+        if graph_audit:
+            print(f"[fs-graph-audit] full={graph_frames} fallback={fallback_frames} overflow={overflow_frames}", flush=True)
         # [release gate] final-state vertex dump for the strict bitwise trio
         # (cross-env / batch-invariance / run-to-run). Engine-local vertices are
         # co-located across envs in strict layout, so slices compare bitwise.
