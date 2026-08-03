@@ -917,7 +917,22 @@ void GIPC::train_collision_graph_capacities()
             long long want = static_cast<long long>(observed_class[s])
                              * std::max(graph_train_headroom_num(),
                                         m_episode_capture ? 2 : 1);
-            if(s == pad_class)
+            // [C6-z] The pad-class allowance is what inflates the staged
+            // contact region: it hands the whole sort-capacity rounding slack
+            // to one class, so the convert's `length` runs 2.2x the real
+            // triplet count (measured forcegrip: 2468222 vs 1125558 graph
+            // off). It dates from C6-b, when the capacity-grid's zero pads
+            // hashed to (0,0) and therefore classified INTO that class.
+            // _set_hash_value now sentinels every slot past the exact emitted
+            // count, so the allowance may be vestigial -- STIFF_NO_PAD_CLASS
+            // _ALLOWANCE=1 drops it, and the in-graph class guard turns any
+            // wrong guess into an honest retry rather than a silent
+            // truncation.
+            static const bool s_no_allowance = []() {
+                const char* v = getenv("STIFF_NO_PAD_CLASS_ALLOWANCE");
+                return v && atoi(v) != 0;
+            }();
+            if(s == pad_class && !s_no_allowance)
             {
                 if(pad_class == 0)
                 {

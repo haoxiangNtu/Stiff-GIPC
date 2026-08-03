@@ -469,3 +469,54 @@ Bucketing the 376 ms gap by whether exact-count segments would shrink it:
 So the refactor's ceiling is 20% of the gap (~6% wall) in the subsystem
 that has produced the most defects in this campaign, while the gate fix
 above unlocks a larger share for free. It is therefore not being done.
+
+## C6-z: the segment refactor, done and measured
+
+The user asked for the exact-count segment work despite the estimate.
+Digging in found the real culprit is not how segment starts are computed
+but a single line in the class-tier training:
+
+    want = observed_class[s] * headroom;
+    if (s == pad_class)
+        want += max(0, sort_capacity - contact_total);   // whole rounding slack
+
+That allowance dates from C6-b, when the capacity grid's zero pads hashed
+to (0,0) and therefore classified INTO that class, so the class had to be
+able to hold all of them. `_set_hash_value` has since sentinelled every
+slot past the exact emitted count (`~0ull`, sorts last), which makes the
+allowance a compensation for a problem that no longer exists -- and it is
+what inflates the staged contact region.
+
+Measured on forcegrip, the convert's `length` (which drives the sort,
+the scan, the dedup, the scatter and the combine, all of them):
+
+| | length |
+|---|---|
+| graph off (true payload) | 1,125,558 |
+| graph on, today | 2,468,222 (2.19x) |
+| graph on, allowance dropped | **1,419,646 (1.26x, -42%)** |
+
+Effect, with STIFF_GRAPH_DEVICE_RESIZE also on (15-frame profiles):
+
+| | GPU kernel time | excess over graph-off |
+|---|---|---|
+| today | 1.060 s | +0.365 s |
+| resizer on | 0.951 s | +0.256 s |
+| resizer + no allowance | **0.919 s** | **+0.224 s (-39%)** |
+| graph off | 0.695 s | -- |
+
+**And the wall does not move**: forcegrip 153.6 -> 154.9 ms/frame,
+beaker 202.3 -> 199.8, both inside noise. All 22 gates green with it on.
+
+The cost that decides it: full-graph coverage 94% -> 92% and retries
+3 -> 4 over 60 frames, i.e. one extra re-record. A re-record is 1-3 s on
+the 4090 and 20-30 s on the A800 -- one of them outweighs the entire
+saving, and on a weak host it is a large net loss. So
+STIFF_NO_PAD_CLASS_ALLOWANCE stays opt-in.
+
+This is the fourth padding-reduction measured at ~0% wall (uniqueness
+pass to `length`: 0%; convert capacity exact: -4%, noise; device-side
+grid resize: ~2%; pad-class allowance: ~0%), against the one change that
+did work -- dissolving the atomic convoy, -27%. The pattern is
+consistent and worth stating plainly: on this workload the graph's wall
+cost is not the volume of padded work. Serialization was.
