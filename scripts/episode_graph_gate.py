@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import tempfile
 import sys
 
 import numpy as np
@@ -89,6 +90,9 @@ def baseline() -> None:
         "baseline", positions_array, velocities_array
     )
     result = digest(positions_array, velocities_array)
+    dump = os.environ.get("EPISODE_GATE_DUMP")
+    if dump:
+        np.save(dump, np.asarray(positions_array, dtype=np.float64))
     print(f"EPISODE-GRAPH-DIGEST: {result}")
 
 
@@ -147,10 +151,13 @@ def episode() -> None:
     assert np.array_equal(np.asarray(engine.get_vertices()), positions[-1])
     trace_frame_digests("episode", positions, velocities)
     result = digest(positions, velocities)
+    dump = os.environ.get("EPISODE_GATE_DUMP")
+    if dump:
+        np.save(dump, np.asarray(positions, dtype=np.float64))
     print(f"EPISODE-GRAPH-DIGEST: {result}")
 
 
-def child_environment() -> dict[str, str]:
+def child_environment(*, det: bool = True, dump: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("STIFF_MIRROR_AUDIT", None)
     env.pop("STIFF_SLOT_AUDIT", None)
@@ -178,15 +185,26 @@ def child_environment() -> dict[str, str]:
         "STIFF_PERENV_MASK",
     ):
         env[key] = "0"
+    # [C6-w] Bitwise episode-vs-host comparison runs on the DETERMINISTIC
+    # reduction stack, where order-free binned deposits make "residency must
+    # not change a single bit" a property of the code rather than of GPU
+    # scheduling luck. The default stack is covered by the envelope check in
+    # the parent (see frame_graph_gate for the measurements behind this).
+    if det:
+        env["STIFF_SPMV_DET"] = "1"
+    if dump:
+        env["EPISODE_GATE_DUMP"] = dump
+    else:
+        env.pop("EPISODE_GATE_DUMP", None)
     return env
 
 
-def run_child(mode: str) -> str:
+def run_child(mode: str, *, det: bool = True, dump: str | None = None) -> str:
     completed = subprocess.run(
         [sys.executable, __file__, f"--child={mode}"],
         check=True,
         cwd=ROOT,
-        env=child_environment(),
+        env=child_environment(det=det, dump=dump),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -216,5 +234,33 @@ if __name__ == "__main__":
     else:
         baseline_digest = run_child("baseline")
         episode_digest = run_child("episode")
-        assert episode_digest == baseline_digest
+        assert episode_digest == baseline_digest, (
+            "episode residency changed the result on the deterministic stack"
+        )
+        print("EPISODE-GRAPH-DET: PASS (bitwise)")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_runs = []
+            for index in range(3):
+                path = os.path.join(tmp, f"base{index}.npy")
+                run_child("baseline", det=False, dump=path)
+                base_runs.append(np.load(path))
+            episode_path = os.path.join(tmp, "episode.npy")
+            run_child("episode", det=False, dump=episode_path)
+            episode_run = np.load(episode_path)
+        scale = float(np.abs(base_runs[0]).max()) or 1.0
+        noise = max(
+            float(np.abs(a - b).max())
+            for i, a in enumerate(base_runs)
+            for b in base_runs[i + 1:]
+        )
+        error = min(float(np.abs(episode_run - b).max()) for b in base_runs)
+        budget = max(noise * 4.0, 1e-11 * scale)
+        print(
+            f"EPISODE-GRAPH-ENVELOPE: error={error:.3e} "
+            f"baseline_noise={noise:.3e} budget={budget:.3e}"
+        )
+        assert error <= budget, (
+            "episode-vs-host exceeds the host path's own run-to-run noise"
+        )
         print("EPISODE-GRAPH-GATE: PASS")

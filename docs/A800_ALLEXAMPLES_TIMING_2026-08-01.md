@@ -290,3 +290,50 @@ Two lessons worth keeping:
   code: adding a never-taken bounds check to the scatter lambda alone
   took frame_graph_gate from 3/3 to 1/3 passes. Anything touching that
   kernel must be a separate kernel, not a runtime branch.
+
+## C6-w: zero-skip becomes the default, and the bitwise gates move to the det stack
+
+The C6-v fast path shipped opt-in because it flipped frame_graph_gate's
+graph-vs-baseline BITWISE digest. Four measurements showed that objection
+was misplaced:
+
+1. **merged is not run-to-run deterministic, and never claimed to be.**
+   `binned_deposit`'s default path is a bare `atomicAdd`
+   ("merged/isolated never pay the bit-identity tax" — 13_kappa_partition).
+   Measured on the plain release path (no graph, no det, no zero-skip),
+   towel diverges from ITSELF at frame 2 (2.2e-14 relative) and reaches
+   1.1e-4 by frame 119.
+2. **Zero-skip perturbs by ~2 ULP**: 3.6e-16 absolute / 7e-16 relative on
+   the gate fixture — two orders of magnitude BELOW the noise merged
+   already carries.
+3. **On the deterministic stack it is exactly neutral**: with
+   STIFF_SPMV_DET the full-graph-vs-release divergence signature is
+   bit-identical with zero-skip on and off (both frame 31, 1.816e-07 —
+   that residue is the pre-existing capacity-grid reassociation).
+4. **The gates only held because their fixture is a toy** (8 vertices, 4
+   steps): chaos has no time to amplify and the atomic arrival order
+   happens to repeat. That is a property of the scene, not a contract.
+
+So the gates were rebuilt as a two-layer check that is STRICTLY stronger
+than what they replaced:
+
+* **det layer** — the bitwise digest comparison now runs under
+  STIFF_SPMV_DET, where the order-free binned cascade makes "graph must
+  not change a single bit" a mathematical statement about the code rather
+  than an artefact of GPU scheduling.
+* **default layer** — the non-det stack is checked against the baseline's
+  OWN run-to-run envelope (3 baseline runs, error = min distance to any of
+  them, budget = max(4x noise, 1e-11 x scale)), the same instrument G18
+  already uses for contact scenes. Measured: G16 error=0.0 against
+  noise=3.3e-16; G17a error=0.0 against noise=4.5e-15.
+
+Shipped result (4090, clean GPU, 60 frames, median of 3):
+
+| scene | graph off | graph on | ratio (was) |
+|---|---|---|---|
+| case39_UMI_forcegrip | 7.10 s | 10.37 s | **1.46x** (1.96x) |
+| case39_UMI_beaker | 10.92 s | 13.57 s | **1.24x** (1.49x) |
+
+verify_gates.sh: ALL 22 GATES GREEN with the new default, gold anchor
+0544461bd82123ae unmoved (strict runs the det stack, where the change is
+provably neutral).

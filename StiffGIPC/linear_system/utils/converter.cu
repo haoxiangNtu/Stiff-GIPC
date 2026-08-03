@@ -432,9 +432,26 @@ void Converter::_make_unique_block_warp_reduction(
                 cudaStreamPerThread));
     }
 
+    // [C6-w] Default ON. Skipping zero components is mathematically a no-op
+    // (adding 0.0 cannot change a bin) and it dissolves the atomic convoy the
+    // tier-shaped payload creates: roughly half of it is ZERO PAD triplets,
+    // all carrying the same (0,0) key, so they dedup to ONE index and every
+    // padded thread piled onto the same 9 bins -- 2999us vs 133us per convert
+    // against an identical element count. Measured -27% on the whole-frame
+    // graph (forcegrip 60f, median of 3: 13.34s -> 9.78s).
+    //
+    // It does reorder the surviving atomics, which on the DEFAULT merged stack
+    // (bare atomicAdd) perturbs results by ~2 ULP. That is legitimate there:
+    // merged never promised run-to-run determinism and does not have it --
+    // measured, the plain release path diverges from itself at frame 2
+    // (2.2e-14) and reaches 1.1e-4 by frame 119 on a contact scene, i.e. two
+    // orders of magnitude MORE than this change perturbs. On the deterministic
+    // stack (STIFF_SPMV_DET, order-free binned cascade) it is exactly neutral:
+    // the graph-vs-release divergence signature is bit-identical with it on
+    // and off. STIFF_SKIP_ZERO_DEPOSIT=0 restores the convoy.
     static const bool s_skip_zero = []() {
         const char* v = getenv("STIFF_SKIP_ZERO_DEPOSIT");
-        return v && atoi(v) != 0;
+        return !v || atoi(v) != 0;
     }();
     const bool skip_zero = s_skip_zero;
     auto* src_blocks = global_triplets.block_values(out_start_id);

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import tempfile
 import sys
 
 import numpy as np
@@ -178,6 +179,9 @@ def full_digest_case(require_full: bool) -> None:
         assert status.path_flags & (1 << 3)
     vertices = np.asarray(engine.get_vertices())
     digest = hashlib.sha256(vertices.tobytes()).hexdigest()
+    dump = os.environ.get("FRAME_GRAPH_DUMP")
+    if dump:
+        np.save(dump, np.asarray(vertices, dtype=np.float64))
     print(f"FRAME-GRAPH-FULL-DIGEST: {digest}")
 
 
@@ -251,7 +255,7 @@ def run_audit_fallback_child() -> None:
     )
 
 
-def run_full_child(mode: str) -> str:
+def run_full_child(mode: str, *, det: bool = True, dump: str | None = None) -> str:
     env = os.environ.copy()
     # The repository-wide gate arms these host-side audits globally. They are
     # intentionally ineligible for whole-frame capture and have their own
@@ -280,6 +284,23 @@ def run_full_child(mode: str) -> str:
         "STIFF_PERENV_MASK",
     ):
         env[key] = "0"
+    # [C6-w] The bitwise digest comparison runs on the DETERMINISTIC reduction
+    # stack. On the default merged stack `binned_deposit` is a bare atomicAdd,
+    # so equal bits between two processes is an empirical property of GPU
+    # scheduling, not a guarantee -- measured: the plain release path diverges
+    # run-to-run from frame 2 (2.2e-14) to 1.1e-4 by frame 119 on a contact
+    # scene, and this gate only held because its fixture is 8 vertices over 4
+    # steps. Under STIFF_SPMV_DET the deposits go through the order-free binned
+    # cascade, where "graph must not change a single bit" is a mathematical
+    # statement about the code, which is exactly the property this gate exists
+    # to defend. The default stack is still covered, by the tolerance envelope
+    # below.
+    if det:
+        env["STIFF_SPMV_DET"] = "1"
+    if dump:
+        env["FRAME_GRAPH_DUMP"] = dump
+    else:
+        env.pop("FRAME_GRAPH_DUMP", None)
     completed = subprocess.run(
         [sys.executable, __file__, f"--child={mode}"],
         check=True,
@@ -327,6 +348,40 @@ if __name__ == "__main__":
         run_audit_fallback_child()
         baseline_digest = run_full_child("full-baseline")
         enabled_digest = run_full_child("full-enabled")
-        assert enabled_digest == baseline_digest
+        assert enabled_digest == baseline_digest, (
+            "whole-frame graph changed the result on the deterministic stack"
+        )
+        print("FRAME-GRAPH-FULL-DET: PASS (bitwise)")
+
+        # [C6-w] Default (non-deterministic) stack: assert the graph lands
+        # inside the baseline's OWN run-to-run envelope. Bitwise equality is
+        # not available here by construction -- bare atomicAdd ordering -- so
+        # the honest question is whether graph-vs-baseline is distinguishable
+        # from baseline-vs-baseline.
+        with tempfile.TemporaryDirectory() as tmp:
+            base_runs = []
+            for index in range(3):
+                path = os.path.join(tmp, f"base{index}.npy")
+                run_full_child("full-baseline", det=False, dump=path)
+                base_runs.append(np.load(path))
+            graph_path = os.path.join(tmp, "graph.npy")
+            run_full_child("full-enabled", det=False, dump=graph_path)
+            graph_run = np.load(graph_path)
+        scale = float(np.abs(base_runs[0]).max()) or 1.0
+        noise = max(
+            float(np.abs(a - b).max())
+            for i, a in enumerate(base_runs)
+            for b in base_runs[i + 1:]
+        )
+        error = min(float(np.abs(graph_run - b).max()) for b in base_runs)
+        # Floor: legal reassociation on a 4-step fixture stays within a few
+        # thousand ULP. A real semantic drift (the class of bug this gate has
+        # actually caught) is many orders larger.
+        budget = max(noise * 4.0, 1e-11 * scale)
+        print(
+            f"FRAME-GRAPH-FULL-ENVELOPE: error={error:.3e} "
+            f"baseline_noise={noise:.3e} budget={budget:.3e}"
+        )
+        assert error <= budget, "graph-vs-baseline exceeds the baseline's own noise"
         print("FRAME-GRAPH-FULL: PASS")
         print("FRAME-GRAPH-GATE: PASS")
