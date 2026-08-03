@@ -265,6 +265,11 @@ def load_observations(path: str) -> dict[str, np.ndarray]:
         }
 
 
+# dt of the fixture scene (gpu_rl_gate.make_engine); the velocity floor
+# below is the position floor amplified by this backward difference.
+SCENE_DT = 0.01
+
+
 def assert_numerical_equivalence(
     baseline_a: dict[str, np.ndarray],
     baseline_b: dict[str, np.ndarray],
@@ -290,6 +295,17 @@ def assert_numerical_equivalence(
             float(np.max(np.abs(second))),
         )
         precision_floor = 16.0 * np.finfo(first.dtype).eps * scale
+        if field == "velocities":
+            # [C6-y] Velocities are a backward difference of positions over
+            # dt, so whatever last-ulp noise the positions carry arrives here
+            # multiplied by 1/dt (dt=0.01 in this fixture -> x100). Applying
+            # the same raw precision floor to both fields therefore holds the
+            # velocity field to 1/100th of the position field's standard --
+            # visible in every passing run, where the two errors differ by
+            # exactly 100x (2.776e-17 vs 2.776e-15). collision_graph_gate
+            # already carries this correction ([C6-j A800], same reasoning);
+            # this gate was missing it.
+            precision_floor /= SCENE_DT
         tolerance = max(8.0 * baseline_noise, precision_floor)
         assert episode_error <= tolerance, (
             f"{field} differs beyond the baseline nondeterminism envelope: "

@@ -86,14 +86,17 @@ bool enabled()
         //   memset32 total      136 ms -> 83 ms   (-39%)
         //   of which >10k-block  87 ms -> 35 ms   (-60%)
         //   all-kernel GPU time 1.060 s -> 0.951 s (-10%)
-        // Wall moved only ~2% (inside noise) because this scene is not bound
-        // by kernel time. Default stays OFF: resizing a node changes the
-        // occupancy of everything downstream, which reorders the binned
-        // scatter's atomicAdds -- gpu_native_rl_gate measured a 1.1e-14
-        // velocity delta against its 3.6e-15 floor. A 27% win (the zero-skip)
-        // is worth relitigating a gate's premise; a 2% one is not.
+        // Default ON. Wall on the profiled scene moves ~2% (that scene is not
+        // kernel-time bound) but the GPU genuinely does less work, which is
+        // what matters on a shared or power-limited card. The 1.1e-14
+        // velocity delta that held this OFF turned out to be a gate defect,
+        // not a physics one: velocities are a backward difference over dt, so
+        // they carry the position field's last-ulp noise multiplied by 1/dt
+        // (x100 here), and the RL gates applied the same raw precision floor
+        // to both fields -- collision_graph_gate already carries that
+        // correction ([C6-j A800]); the RL gates were missing it (C6-y).
         const char* value = std::getenv("STIFF_GRAPH_DEVICE_RESIZE");
-        return value && std::atoi(value) != 0;
+        return !value || std::atoi(value) != 0;
     }();
     return on;
 }

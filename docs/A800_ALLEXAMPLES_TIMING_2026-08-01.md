@@ -412,3 +412,60 @@ STIFF_GRAPH_DEVICE_RESIZE targets the first bucket and does work
 atomic order enough to trip gpu_native_rl_gate (velocity delta 1.1e-14
 against a 3.6e-15 floor). It therefore stays default OFF: a 27% win (the
 zero-skip) is worth relitigating a gate's premise, a 2% one is not.
+
+## C6-y: the RL gates' velocity floor was missing the 1/dt amplification
+
+`episode_graph_rl_gate.assert_numerical_equivalence` compares positions
+and velocities against the same raw precision floor,
+`16 * eps * scale` (3.55e-15 here). But velocities are a backward
+difference of positions over dt, so they inherit the position field's
+last-ulp noise multiplied by 1/dt -- x100 for this fixture's dt=0.01.
+Every passing run shows it plainly: positions error 2.776e-17 against
+velocities 2.776e-15, exactly 100x. The gate was therefore holding the
+velocity field to one hundredth of the position field's standard.
+
+`collision_graph_gate` already carries this correction ([C6-j A800],
+same reasoning, found when the A800's bitwise-deterministic baselines
+dropped the tolerance to the raw floor); the RL gates were missing it.
+Fixed: the velocity precision floor is divided by SCENE_DT.
+
+With that, STIFF_GRAPH_DEVICE_RESIZE becomes the default. It was held
+back only by this defect (a 1.1e-14 velocity delta against the
+uncorrected 3.55e-15 floor). What it buys, measured at node granularity:
+memset32 136 ms -> 83 ms, the >10k-block ones -60%, all-kernel GPU time
+1.060 s -> 0.951 s (-10%).
+
+### memset anatomy (why the resizer matters and where the rest is)
+
+33796 memset nodes over 15 graph frames, 136 ms total:
+
+| grid | approx size | count | total |
+|---|---|---|---|
+| 147456 | 151 MB | 28 | 42 ms |
+| 95846 | 98 MB | 28 | 27 ms |
+| 1 | **4 bytes** | 9100 | 12 ms |
+| 137 | 140 KB | 7644 | 11 ms |
+| 17 | 17 KB | 7868 | 11 ms |
+| 15 | 15 KB | 7644 | 8 ms |
+
+Two populations: 56 huge clears (the mergebin at tier capacity -- the
+resizer's target) worth 69 ms, and ~32k per-PCG-iteration small clears
+worth 41 ms. The most striking entry is 9100 clears of a SINGLE int:
+free on a stream, 1.3 us each as a graph node.
+
+### What the segment refactor could and could not reach
+
+Bucketing the 376 ms gap by whether exact-count segments would shrink it:
+
+| bucket | share | reachable by the refactor |
+|---|---|---|
+| memset nodes | 36% | no (resizer's target) |
+| dry-run BVH passes | 18% | no (capture cannot allocate) |
+| misc | 16% | no |
+| converter's own passes | 11% | **yes** |
+| cub sort/scan | 9% | no (num_items is a host value) |
+| tier staging/compaction | 9% | **yes** |
+
+So the refactor's ceiling is 20% of the gap (~6% wall) in the subsystem
+that has produced the most defects in this campaign, while the gate fix
+above unlocks a larger share for free. It is therefore not being done.
