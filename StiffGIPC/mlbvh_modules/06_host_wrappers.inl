@@ -646,9 +646,26 @@ static bool shouldRefitTopology(lbvh&      tree,
     const int interval = bvh_refit_interval();
     if(interval <= 1 || !(bvh_refit_mask() & family))
     {
-        tree.m_refit_topology_ready = false;
+        for(auto& state : tree.m_refit_states)
+            if(state.nodes_identity == tree._nodes)
+            {
+                state.topology_ready = false;
+                break;
+            }
         return false;
     }
+    auto state_it = std::find_if(
+        tree.m_refit_states.begin(),
+        tree.m_refit_states.end(),
+        [&](const lbvh::RefitTopologyState& state)
+        { return state.nodes_identity == tree._nodes; });
+    if(state_it == tree.m_refit_states.end())
+    {
+        tree.m_refit_states.emplace_back();
+        state_it = tree.m_refit_states.end() - 1;
+        state_it->nodes_identity = tree._nodes;
+    }
+    lbvh::RefitTopologyState& state = *state_it;
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     CUDA_SAFE_CALL(cudaStreamIsCapturing(stream, &capture_status));
     if(capture_status == cudaStreamCaptureStatusActive)
@@ -660,35 +677,31 @@ static bool shouldRefitTopology(lbvh&      tree,
         // if capture happened to contain only refits, quality would degrade
         // without bound across frames.  Force the first construction of every
         // distinct capture to be a complete build, then refit within the body.
-        if(tree.m_refit_capture_id != capture_id)
+        if(state.capture_id != capture_id)
         {
-            tree.m_refit_capture_id = capture_id;
-            tree.m_refit_topology_ready = false;
-            tree.m_refit_since_rebuild = 0;
+            state.capture_id = capture_id;
+            state.topology_ready = false;
+            state.since_rebuild = 0;
         }
     }
-    const bool same_storage = tree.m_refit_nodes_identity == tree._nodes
-                              && tree.m_refit_active_identity
-                                     == active_identity
-                              && tree.m_refit_number == number;
-    if(!same_storage)
+    const bool same_generation = state.active_identity == active_identity
+                                 && state.number == number;
+    if(!same_generation)
     {
-        tree.m_refit_topology_ready = false;
-        tree.m_refit_since_rebuild = 0;
-        tree.m_refit_nodes_identity = tree._nodes;
-        tree.m_refit_active_identity = active_identity;
-        tree.m_refit_number = number;
+        state.topology_ready = false;
+        state.since_rebuild = 0;
+        state.active_identity = active_identity;
+        state.number = number;
     }
-    if(tree.m_refit_topology_ready
-       && tree.m_refit_since_rebuild + 1 < interval)
+    if(state.topology_ready && state.since_rebuild + 1 < interval)
     {
-        ++tree.m_refit_since_rebuild;
-        ++tree.m_refit_reuses;
+        ++state.since_rebuild;
+        ++state.reuses;
         return true;
     }
-    tree.m_refit_topology_ready = true;
-    tree.m_refit_since_rebuild = 0;
-    ++tree.m_refit_rebuilds;
+    state.topology_ready = true;
+    state.since_rebuild = 0;
+    ++state.rebuilds;
     return false;
 }
 
@@ -1277,16 +1290,27 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
 
 void lbvh::FREE_DEVICE_MEM()
 {
+    unsigned long long refit_rebuilds = 0;
+    unsigned long long refit_reuses = 0;
+    unsigned int refit_max_primitives = 0;
+    for(const RefitTopologyState& state : m_refit_states)
+    {
+        refit_rebuilds += state.rebuilds;
+        refit_reuses += state.reuses;
+        refit_max_primitives = std::max(
+            refit_max_primitives,
+            static_cast<unsigned int>(state.number));
+    }
     if(getenv("STIFF_BVH_REFIT_STATS")
-       && (m_refit_rebuilds || m_refit_reuses))
+       && (refit_rebuilds || refit_reuses))
         printf("[bvh-refit-stats] primitives=%u rebuilds=%llu refits=%llu "
                "queries_per_rebuild=%.6f\n",
-               static_cast<unsigned int>(m_refit_number),
-               m_refit_rebuilds,
-               m_refit_reuses,
-               m_refit_rebuilds
-                   ? (double)(m_refit_rebuilds + m_refit_reuses)
-                         / (double)m_refit_rebuilds
+               refit_max_primitives,
+               refit_rebuilds,
+               refit_reuses,
+               refit_rebuilds
+                   ? (double)(refit_rebuilds + refit_reuses)
+                         / (double)refit_rebuilds
                    : 0.0);
     auto release = [](auto*& pointer)
     {
@@ -1310,12 +1334,17 @@ void lbvh::FREE_DEVICE_MEM()
     release(_idx_alt);
     _sort_tmp_bytes = 0;
     _sort_cap       = 0;
-    m_refit_nodes_identity = nullptr;
-    m_refit_active_identity = nullptr;
-    m_refit_number = 0;
-    m_refit_since_rebuild = 0;
-    m_refit_topology_ready = false;
-    m_refit_capture_id = 0;
+    m_refit_states.clear();
+}
+
+void lbvh::invalidateRefitTopology()
+{
+    for(RefitTopologyState& state : m_refit_states)
+    {
+        state.topology_ready = false;
+        state.since_rebuild = 0;
+        state.capture_id = 0;
+    }
 }
 
 void lbvh::MALLOC_DEVICE_MEM(const int& number, bool allocate_node_max)

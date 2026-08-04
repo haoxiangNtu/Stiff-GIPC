@@ -24,3 +24,6 @@ vf_body_pair_cache,deterministic_fold30,total_cuda_kernel_ms,17335.744,17194.224
 lbvh_refit,frozen_frame30_200dcd_200ccd,total_cuda_kernel_ms,1726.755,1634.149,-5.36%,dcd_and_ccd_encoded_multisets_exact,positive_upper_bound
 ploc3_refit128,deterministic_fold30,four_query_families_ms,3445.366,3308.522,-3.97%,positions_pairs_and_newton_exact,positive
 ploc3_refit128,deterministic_fold30,total_cuda_kernel_ms,18002.144,16944.391,-5.88%,positions_pairs_and_newton_exact,keep_opt_in_pending_free_gpu_a800
+ploc3_refit128,isolated4_frozen_frame30_200dcd_200ccd,total_cuda_kernel_ms,15168.870,14262.041,-5.98%,dcd_and_ccd_encoded_multisets_exact,positive
+ploc3_refit128,isolated4_frozen_frame30_200dcd_200ccd,four_query_families_ms,14372.751,13973.022,-2.78%,dcd_and_ccd_encoded_multisets_exact,positive
+ploc3_refit128,isolated4_frozen_frame30_200dcd_200ccd,known_bvh_build_ms_excluding_cub,380.123,280.913,-26.10%,dcd_and_ccd_encoded_multisets_exact,positive

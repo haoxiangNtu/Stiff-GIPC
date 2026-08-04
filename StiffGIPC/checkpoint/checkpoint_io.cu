@@ -1235,8 +1235,8 @@ void GIPC::load_checkpoint(device_TetraData& mesh, const char* raw_path)
         // A checkpoint may jump arbitrarily far from the topology's build
         // state.  Refit would remain complete, but can inherit a catastrophically
         // poor tree; force one quality rebuild at this explicit boundary.
-        bvh_f.m_refit_topology_ready = false;
-        bvh_e.m_refit_topology_ready = false;
+        bvh_f.invalidateRefitTopology();
+        bvh_e.invalidateRefitTopology();
         buildBVH();
         buildCP();
     }

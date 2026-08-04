@@ -303,14 +303,41 @@ symbols are now initialized by their device-zero value and process-fixed audit
 settings are copied only when they actually change, rather than issuing a
 synchronous `cudaMemcpyToSymbol` from every captured `buildCP()`.
 
-This is capture-safe, but it is not yet an isolated-mode speedup.  The C5 gate
-reported 43 full rebuilds and zero refits for each tree: isolated execution
-rotates among per-environment scratch/active-list addresses, and the exact
-pointer-identity guard correctly refuses to reuse one slot's topology in
-another.  Isolated acceleration therefore needs one topology/refit state per
-scratch slot (or stable per-environment tree storage) before its performance
-can be credited.  Merged mode does amortize successfully; the C4 synchronous
-runs measured about 57--59 queries per rebuild.
+Isolated execution originally reported 43 full rebuilds and zero refits in the
+C5 gate because one scalar topology state was shared while execution rotated
+among per-environment scratch/active-list addresses.  The implementation now
+keeps a topology generation for every `_nodes` scratch allocation.  A slot is
+reused only when its active-list pointer and primitive count still match; if a
+different environment rotates onto the slot, the mismatch forces an exact full
+rebuild.  Checkpoint load and FEM/ABD teleport invalidate all generations.
+
+After that change, ordinary C5 branches measured 5 rebuilds and 328 refits
+(66.6 queries per rebuild), while graph-capture branches measured 13 rebuilds
+and 30 refits.  The complete C5 numerical/isolation gate passed.  A four-env
+frozen FOLD gate at frames 1, 10, and 30 also retained exact geometry and exact
+physical and original-encoding multisets for both DCD and swept CCD.
+
+The exact same isolated four-env frame-30 checkpoint was then replayed for 200
+DCD and 200 CCD queries under Nsight Systems:
+
+| metric | rebuild Morton LBVH | PLOC++ / refit-128 | delta |
+|---|---:|---:|---:|
+| all CUDA kernels | 15,168.870 ms | 14,262.041 ms | **-5.98%** |
+| four query families | 14,372.751 ms | 13,973.022 ms | **-2.78%** |
+| known BVH build kernels, excluding CUB | 380.123 ms | 280.913 ms | **-26.10%** |
+| VF DCD | 3,408.726 ms | 3,330.423 ms | -2.30% |
+| EE DCD | 5,161.698 ms | 5,124.504 ms | -0.72% |
+| VF CCD | 792.702 ms | 720.843 ms | -9.07% |
+| EE CCD | 5,009.625 ms | 4,797.252 ms | -4.24% |
+
+The candidate performed 33 rebuilds and 3,177 refits, or 97.27 queries per
+rebuild.  Raw pair order changed, as expected for concurrent atomic output,
+but the physical and original encoded DCD/CCD multisets were exact.  Freely
+evolved isolated runs are intrinsically noisy here: two baseline replicas
+already diverged by `8.57e-2` in position and followed different Newton/query
+counts.  Their wall times therefore are not used as evidence.  The frozen
+fixed-workload result is the credited isolated speedup; a long trajectory and
+A800 repeat remain required before enabling the candidate by default.
 
 ### Same-topology BVH8 traversal
 
