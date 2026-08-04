@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import sysconfig
+import time as _time
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -1002,7 +1003,141 @@ class Engine:
         transaction.
         """
         _assert_process_mode_signature()
+        # [prepare-timeline] env-gated test knobs, zero-cost when unset.
+        # STIFF_AUTO_PREPARE_AT=k: before the k-th step() of this Engine,
+        # call prepare_gpu_rl() (self-contained); afterwards every step()
+        # thin-routes and synchronizes so per-frame timing stays honest.
+        # An ineligible scene prints the refusal reason once and stays on
+        # the host path. STIFF_MS_DUMP=path: np.save per-step wall ms.
+        _auto_at = os.environ.get("STIFF_AUTO_PREPARE_AT")
+        _ms_dump = os.environ.get("STIFF_MS_DUMP")
+        _t0 = _time.perf_counter() if _ms_dump else None
+        if _auto_at is not None:
+            _n = getattr(self, "_auto_prepare_count", 0)
+            self._auto_prepare_count = _n + 1
+            if _n == int(_auto_at) and not getattr(
+                self, "_auto_prepare_done", False
+            ):
+                self._auto_prepare_done = True
+                try:
+                    _tp = _time.perf_counter()
+                    self._engine.prepare_gpu_rl()
+                    print(
+                        f"[auto-prepare] engaged at step {_n} "
+                        f"({(_time.perf_counter() - _tp) * 1000:.0f}ms)",
+                        flush=True,
+                    )
+                    self._auto_prepared = True
+                except Exception as exc:  # noqa: BLE001 - report & fall back
+                    print(f"[auto-prepare] REFUSED: {exc}", flush=True)
         self._engine.step()
+        if getattr(self, "_auto_prepared", False):
+            self._engine.synchronize_gpu_rl()
+            # Health audit: a replay that overflows or no-ops must not be
+            # reported as a fast frame. Read the one-frame status packet.
+            if not hasattr(self, "_rl_status_reader"):
+                import ctypes
+
+                _abi = self.get_gpu_rl_device_abi()
+                _rt = ctypes.CDLL("libcudart.so")
+                _buf = (ctypes.c_byte * int(_abi["status_bytes"]))()
+
+                def _read_status():
+                    _rt.cudaMemcpy(
+                        ctypes.byref(_buf),
+                        ctypes.c_void_p(int(_abi["statuses"])),
+                        ctypes.c_size_t(len(_buf)),
+                        ctypes.c_int(2),
+                    )
+                    import struct
+
+                    b = bytes(_buf)
+                    return (
+                        struct.unpack_from("<i", b, 0)[0],
+                        struct.unpack_from("<I", b, 8)[0],
+                        struct.unpack_from("<i", b, 32)[0],
+                    )  # (result, invalid_bits, error_code)
+
+                self._rl_status_reader = _read_status
+                self._rl_status_fail = 0
+                self._rl_status_frames = 0
+                import atexit
+
+                atexit.register(
+                    lambda: print(
+                        f"[auto-prepare] health: "
+                        f"{self._rl_status_frames - self._rl_status_fail}"
+                        f"/{self._rl_status_frames} frames ok, "
+                        f"{self._rl_status_fail} failed",
+                        flush=True,
+                    )
+                )
+            self._rl_status_frames += 1
+            _res, _inv, _ec = self._rl_status_reader()
+            if _res != 0:
+                # Boundary protocol (design doc §5): a capacity overflow is
+                # the rare event where the CPU re-enters — the failed frame
+                # did not commit, so end residency, re-prepare (whose
+                # internal training frame re-runs THIS frame's targets on
+                # the host at the grown capacity) and continue thin.
+                self._rl_status_fail += 1
+                _n_rec = getattr(self, "_rl_recoveries", 0)
+                if _res == 1 and _ec == 1 and _n_rec < 64:
+                    self._rl_recoveries = _n_rec + 1
+                    _tr = _time.perf_counter()
+                    self._engine.end_gpu_rl()
+                    del self._rl_status_reader
+                    # Contact-class tiers only grow through the step
+                    # transaction's OVF-required feedback (the machinery the
+                    # foldshirt 1551-frame audit proved), so replay the
+                    # failed frame through ONE step-transaction frame — it
+                    # rolls back, grows from the actual requireds with the
+                    # escalation streak, and completes the physics — then
+                    # re-capture at the grown tiers and resume thin.
+                    _graph_knobs = (
+                        "STIFF_FRAME_GRAPH",
+                        "STIFF_FRAME_FULL_GRAPH",
+                        "STIFF_C4_COLLISION_GRAPH",
+                        "STIFF_C6_ABD_STEP_GRAPH",
+                    )
+                    _saved = {k: os.environ.get(k) for k in _graph_knobs}
+                    for k in _graph_knobs:
+                        os.environ[k] = "1"
+                    try:
+                        self._engine.step()
+                    finally:
+                        for k, v in _saved.items():
+                            if v is None:
+                                os.environ.pop(k, None)
+                            else:
+                                os.environ[k] = v
+                    self._engine.prepare_gpu_rl()
+                    print(
+                        f"[auto-prepare] OVF recovery #{_n_rec + 1} at "
+                        f"rl-frame {self._rl_status_frames} "
+                        f"(inv=0x{_inv:x}, "
+                        f"{(_time.perf_counter() - _tr) * 1000:.0f}ms)",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[auto-prepare] frame FAILED (no recovery): "
+                        f"result={_res} invalid=0x{_inv:x} "
+                        f"error_code={_ec}",
+                        flush=True,
+                    )
+        if _t0 is not None:
+            _log = getattr(self, "_ms_dump_log", None)
+            if _log is None:
+                _log = self._ms_dump_log = []
+                import atexit
+
+                atexit.register(
+                    lambda: np.save(
+                        _ms_dump, np.asarray(self._ms_dump_log)
+                    )
+                )
+            _log.append((_time.perf_counter() - _t0) * 1000.0)
         # [release gate] STIFF_ITER_LOG=1: per-frame Newton-iteration telemetry
         # for ANY example without touching the example (peak / anomaly audits).
         if os.environ.get("STIFF_ITER_LOG"):
