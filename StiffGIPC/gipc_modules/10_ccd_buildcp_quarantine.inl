@@ -1078,17 +1078,17 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,
     int blockNum = (numbers + threadNum - 1) / threadNum;
     const unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
 
-    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
-        _vertexes,
-        _dcd_ccd_snapshot,
-        _moveDir,
-        mqueue,
-        slackness,
-        numbers,
-        m_ccd_alpha_invalid,
-        kCcdInvalidGlobalNarrow,
-        d_live);
-    numbers  = blockNum;
+    numbers = launch_reduct_min_selfAlpha(_vertexes,
+                                          _dcd_ccd_snapshot,
+                                          _moveDir,
+                                          mqueue,
+                                          slackness,
+                                          numbers,
+                                          m_ccd_alpha_invalid,
+                                          kCcdInvalidGlobalNarrow,
+                                          d_live,
+                                          threadNum,
+                                          sharedMsize);
     blockNum = (numbers + threadNum - 1) / threadNum;
     while(numbers > 1)
     {

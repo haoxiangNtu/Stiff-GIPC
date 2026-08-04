@@ -2089,10 +2089,12 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // [alpha-stats] env-gated evidence collector for the line-search
         // certificate design: fraction of iterations whose CCD cap is 1.
         if(std::getenv("STIFF_ALPHA_STATS"))
-            printf("[alpha-stat] fr=%d k=%d ccd_alpha=%.9e\n",
+            printf("[alpha-stat] fr=%d k=%d ccd_alpha=%.9e snap=%d ccd=%u\n",
                    static_cast<int>(m_total_frames),
                    k,
-                   alpha);
+                   alpha,
+                   static_cast<int>(m_dcd_snap_count),
+                   static_cast<unsigned>(h_ccd_cpNum));
         if(merged_diag_sample)
         {
             std::vector<double3> positions(vertexNum), directions(vertexNum);

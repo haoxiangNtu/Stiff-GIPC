@@ -944,12 +944,11 @@ double GIPC::self_largestFeasibleStepSize(double slackness, double* mqueue, int 
     //double* _minSteps;
     //CUDA_SAFE_CALL(cudaMalloc((void**)&_minSteps, numbers * sizeof(double)));
     //CUDA_SAFE_CALL(cudaMemcpy(_tempMinMovement, _moveDir, number * sizeof(AABB), cudaMemcpyDeviceToDevice));
-    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+    numbers = launch_reduct_min_selfAlpha(
         _vertexes, _ccd_collisonPairs, _moveDir, mqueue, slackness, numbers,
-        m_ccd_alpha_invalid, kCcdInvalidGlobalRefined, nullptr);
+        m_ccd_alpha_invalid, kCcdInvalidGlobalRefined, nullptr, threadNum, sharedMsize);
     //_reduct_min_double3_to_double << <blockNum, threadNum, sharedMsize >> > (_moveDir, _tempMinMovement, numbers);
 
-    numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;
 
     while(numbers > 1)
@@ -1068,11 +1067,10 @@ void GIPC::self_largestFeasibleStepSize_DeviceOut(double slackness, double* mque
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
     unsigned int sharedMsize = sizeof(double) * (threadNum >> 5);
 
-    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+    numbers = launch_reduct_min_selfAlpha(
         _vertexes, _dcd_ccd_snapshot /* [narrow-self snapshot] DCD-time mirror, immune to buildFullCP clobbering */, _moveDir, mqueue, slackness, numbers,
-        m_ccd_alpha_invalid, kCcdInvalidGlobalNarrow, nullptr);
+        m_ccd_alpha_invalid, kCcdInvalidGlobalNarrow, nullptr, threadNum, sharedMsize);
 
-    numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;
     while(numbers > 1)
     {
@@ -1095,7 +1093,7 @@ void GIPC::self_full_largestFeasibleStepSize_DeviceOut(double slackness,
 
     // Refined candidates are provisional: record their raw status separately.
     // The final device gate promotes it only if refinement is actually consumed.
-    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+    numbers = launch_reduct_min_selfAlpha(
         _vertexes,
         _ccd_collisonPairs,
         _moveDir,
@@ -1104,8 +1102,9 @@ void GIPC::self_full_largestFeasibleStepSize_DeviceOut(double slackness,
         numbers,
         m_ccd_refined_invalid,
         kCcdRawInvalid,
-        d_live);
-    numbers  = blockNum;
+        d_live,
+        threadNum,
+        sharedMsize);
     blockNum = (numbers + threadNum - 1) / threadNum;
     while(numbers > 1)
     {

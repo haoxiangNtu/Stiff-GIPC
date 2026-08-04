@@ -118,7 +118,8 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
                                                 int            number,
                                                 int*           ccd_alpha_invalid,
                                                 int            invalid_bit,
-                                                const uint32_t* d_live)
+                                                const uint32_t* d_live,
+                                                int            type_filter)
 {
     int idof = blockIdx.x * blockDim.x;
     int idx  = threadIdx.x + idof;
@@ -140,7 +141,16 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
     if(idx < live)
     {
         int4 MMCVIDI = _ccd_collitionPairs[idx];
-        if(MMCVIDI.x < 0)
+        // [P0 alpha-type-split] a warp mixing PT and EE pairs executes BOTH
+        // ACCD bodies serially. Under the split launch each pass keeps every
+        // warp uniform; the other pass's lanes hold the min identity 1.0, so
+        // each pair is still computed exactly once and the minima are
+        // bitwise the single-pass ones (min is order-independent).
+        if(type_filter >= 0 && ((MMCVIDI.x < 0) != (type_filter == 1)))
+        {
+            // filtered out: keep temp == 1.0
+        }
+        else if(MMCVIDI.x < 0)
         {
             MMCVIDI.x = -MMCVIDI.x - 1;
             temp = point_triangle_ccd(vertexes[MMCVIDI.x],
@@ -185,6 +195,49 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
                            idof,
                            1.0,
                            minStepSizes + blockIdx.x);
+}
+
+// [P0 alpha-type-split] launch wrapper: two type-uniform passes over the SAME
+// pair buffer (no data movement, no order change). Pass 1 writes PT block
+// minima to mqueue[0..bn), pass 2 EE minima to mqueue[bn..2bn); the caller's
+// cascade then reduces 2*bn values. Small inputs keep the legacy single pass
+// (split gains nothing there and the reduce scratch is sized from the input
+// count). Returns the number of block minima written.
+static inline int launch_reduct_min_selfAlpha(const double3*  vertexes,
+                                              const int4*     pairs,
+                                              const double3*  moveDir,
+                                              double*         mqueue,
+                                              double          slackness,
+                                              int             numbers,
+                                              int*            invalid,
+                                              int             invalid_bit,
+                                              const uint32_t* d_live,
+                                              unsigned int    threadNum,
+                                              unsigned int    sharedMsize)
+{
+    const int blockNum = (numbers + (int)threadNum - 1) / (int)threadNum;
+    static int s_split = -1;
+    if(s_split < 0)
+    {
+        // Default OFF: measured on the 4-env foldshirt heavy segment the
+        // split is 17% SLOWER per logical reduction (1.854 vs 1.586 ms) —
+        // the detect kernels emit PT and EE pairs in contiguous slot ranges,
+        // so warps are already type-uniform and the second pass only adds
+        // header traffic + tail work. Kept as an opt-in experiment.
+        const char* e = std::getenv("STIFF_ALPHA_TYPE_SPLIT");
+        s_split       = e && e[0] ? (std::atoi(e) != 0 ? 1 : 0) : 0;
+    }
+    if(!s_split || numbers < 1024)
+    {
+        _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+            vertexes, pairs, moveDir, mqueue, slackness, numbers, invalid, invalid_bit, d_live, -1);
+        return blockNum;
+    }
+    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        vertexes, pairs, moveDir, mqueue, slackness, numbers, invalid, invalid_bit, d_live, 1);
+    _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
+        vertexes, pairs, moveDir, mqueue + blockNum, slackness, numbers, invalid, invalid_bit, d_live, 0);
+    return 2 * blockNum;
 }
 
 __global__ void _reduct_max_cfl_to_double(const double3* moveDir,
