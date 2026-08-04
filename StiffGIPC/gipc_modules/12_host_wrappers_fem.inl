@@ -134,6 +134,12 @@ void GIPC::buildBVH_FULLCCD(const double& alpha, const double* alpha_dev)
     // [C5] m_graph_merged_detect forces the merged swept build (see buildCP).
     if(m_perenv_bvh && m_perenv_bvh_groups > 0 && !m_graph_merged_detect)
         return;
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+    // Decide each swept generation from the exact start/end segments that
+    // this build will consume.  Invalid pair segments are cleared and rebased
+    // entirely on-device before either tree records its expanded margin list.
+    updateBvhCcdPairCache(alpha, alpha_dev);
+#endif
     { int bs = 256, gs = (vertexNum + bs - 1) / bs;
       _addEnvOffset<<<gs, bs>>>(d_bvh_vertexes, _vertexes, d_env_offset, vertexNum); }
     bvh_f.ConstructFullCCD(_moveDir, alpha, 0, alpha_dev);

@@ -342,6 +342,16 @@ __device__ uint32_t* g_bvh_ee_cache_counts = nullptr;
 __device__ int g_bvh_ee_cache_segment_capacity = 0;
 __device__ int* g_bvh_ee_cache_overflow = nullptr;
 __device__ const int* g_bvh_ee_node_body = nullptr;
+__device__ const unsigned char* g_bvh_ccd_cache_valid = nullptr;
+__device__ int2* g_bvh_vf_ccd_cache_candidates = nullptr;
+__device__ uint32_t* g_bvh_vf_ccd_cache_counts = nullptr;
+__device__ int g_bvh_vf_ccd_cache_segment_capacity = 0;
+__device__ int* g_bvh_vf_ccd_cache_overflow = nullptr;
+__device__ int2* g_bvh_ee_ccd_cache_candidates = nullptr;
+__device__ uint32_t* g_bvh_ee_ccd_cache_counts = nullptr;
+__device__ int g_bvh_ee_ccd_cache_segment_capacity = 0;
+__device__ int* g_bvh_ee_ccd_cache_overflow = nullptr;
+__device__ const int* g_bvh_vf_node_body = nullptr;
 __device__ uint32_t* g_bvh_vf_front_nodes = nullptr;
 __device__ uint32_t* g_bvh_vf_front_counts = nullptr;
 __device__ int g_bvh_vf_front_capacity = 0;
@@ -406,6 +416,46 @@ void set_bvh_ee_pair_cache(int2*      candidates,
         g_bvh_ee_cache_overflow, &overflow, sizeof(overflow)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(
         g_bvh_ee_node_body, &node_body, sizeof(node_body)));
+}
+
+void set_bvh_ccd_pair_cache(const unsigned char* pair_valid,
+                            int2*                vf_candidates,
+                            uint32_t*             vf_counts,
+                            int                   vf_segment_capacity,
+                            int*                  vf_overflow,
+                            int2*                ee_candidates,
+                            uint32_t*             ee_counts,
+                            int                   ee_segment_capacity,
+                            int*                  ee_overflow,
+                            const int*            vf_node_body,
+                            const int*            ee_node_body)
+{
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ccd_cache_valid, &pair_valid, sizeof(pair_valid)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_vf_ccd_cache_candidates,
+                                     &vf_candidates,
+                                     sizeof(vf_candidates)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_vf_ccd_cache_counts, &vf_counts, sizeof(vf_counts)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_vf_ccd_cache_segment_capacity,
+                                     &vf_segment_capacity,
+                                     sizeof(vf_segment_capacity)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_vf_ccd_cache_overflow, &vf_overflow, sizeof(vf_overflow)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_ee_ccd_cache_candidates,
+                                     &ee_candidates,
+                                     sizeof(ee_candidates)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_ccd_cache_counts, &ee_counts, sizeof(ee_counts)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_ee_ccd_cache_segment_capacity,
+                                     &ee_segment_capacity,
+                                     sizeof(ee_segment_capacity)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_ccd_cache_overflow, &ee_overflow, sizeof(ee_overflow)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_vf_node_body, &vf_node_body, sizeof(vf_node_body)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_node_body, &ee_node_body, sizeof(ee_node_body)));
 }
 
 void set_bvh_vf_pair_front(uint32_t* front_nodes,
@@ -574,6 +624,42 @@ void reset_bvh_vf_pair_cache_counts(cudaStream_t stream)
         stream>>>();
 }
 
+__global__ void _resetInvalidVfCcdPairCacheCounts()
+{
+    const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if(pair >= g_bvh_vf_cache_pair_count || !g_bvh_ccd_cache_valid
+       || !g_bvh_vf_ccd_cache_counts)
+        return;
+    if(!g_bvh_ccd_cache_valid[pair])
+        g_bvh_vf_ccd_cache_counts[pair] = 0;
+}
+
+__global__ void _resetInvalidEeCcdPairCacheCounts()
+{
+    const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if(pair >= g_bvh_vf_cache_pair_count || !g_bvh_ccd_cache_valid
+       || !g_bvh_ee_ccd_cache_counts)
+        return;
+    if(!g_bvh_ccd_cache_valid[pair])
+        g_bvh_ee_ccd_cache_counts[pair] = 0;
+}
+
+void reset_bvh_vf_ccd_pair_cache_counts(cudaStream_t stream)
+{
+    if(!getenv("STIFF_BVH_PAIR_CACHE") || h_bvh_vf_cache_pair_count <= 0)
+        return;
+    _resetInvalidVfCcdPairCacheCounts<<<
+        (h_bvh_vf_cache_pair_count + 255) / 256, 256, 0, stream>>>();
+}
+
+void reset_bvh_ee_ccd_pair_cache_counts(cudaStream_t stream)
+{
+    if(!getenv("STIFF_BVH_PAIR_CACHE") || h_bvh_vf_cache_pair_count <= 0)
+        return;
+    _resetInvalidEeCcdPairCacheCounts<<<
+        (h_bvh_vf_cache_pair_count + 255) / 256, 256, 0, stream>>>();
+}
+
 __device__ __forceinline__ int _bvhVfCachePairIndex(int body_a, int body_b)
 {
     if(!g_bvh_vf_cache_index || body_a < 0 || body_b < 0
@@ -699,6 +785,134 @@ __device__ __forceinline__ void _bvhEeCacheRecord(int query_body,
             + slot] = make_int2(self_edge, target_edge);
     else if(g_bvh_ee_cache_overflow)
         atomicExch(g_bvh_ee_cache_overflow, 1);
+}
+
+__device__ __forceinline__ bool _bvhVfCcdCacheEnabled()
+{
+    return g_bvh_ccd_cache_valid && g_bvh_vf_ccd_cache_candidates
+           && g_bvh_vf_ccd_cache_counts
+           && g_bvh_vf_ccd_cache_segment_capacity > 0
+           && g_bvh_vf_node_body;
+}
+
+__device__ __forceinline__ bool _bvhEeCcdCacheEnabled()
+{
+    return g_bvh_ccd_cache_valid && g_bvh_ee_ccd_cache_candidates
+           && g_bvh_ee_ccd_cache_counts
+           && g_bvh_ee_ccd_cache_segment_capacity > 0
+           && g_bvh_ee_node_body;
+}
+
+__device__ __forceinline__ bool _bvhVfCcdCacheSeedFront(
+    int query_body, uint32_t* stack, uint32_t*& stack_ptr)
+{
+    if(!g_bvh_vf_front_nodes || !g_bvh_vf_front_counts
+       || !g_bvh_vf_front_overflow || *g_bvh_vf_front_overflow
+       || !g_bvh_ccd_cache_valid || !g_bvh_vf_cache_index)
+        return false;
+    for(int target_body = 0; target_body < g_bvh_vf_cache_body_count;
+        ++target_body)
+    {
+        const int pair = _bvhVfCachePairIndex(query_body, target_body);
+        if(pair < 0 || g_bvh_ccd_cache_valid[pair])
+            continue;
+        const uint32_t count = g_bvh_vf_front_counts[target_body];
+        if(count > static_cast<uint32_t>(g_bvh_vf_front_capacity)
+           || stack_ptr - stack + count > STIFF_BVH_STACK_CAP)
+        {
+            stack_ptr = stack;
+            return false;
+        }
+        const size_t begin =
+            static_cast<size_t>(target_body) * g_bvh_vf_front_capacity;
+        for(uint32_t i = 0; i < count; ++i)
+            *stack_ptr++ = g_bvh_vf_front_nodes[begin + i];
+    }
+    return true;
+}
+
+__device__ __forceinline__ bool _bvhEeCcdCacheSeedFront(
+    int query_body, uint32_t* stack, uint32_t*& stack_ptr)
+{
+    if(!g_bvh_ee_front_nodes || !g_bvh_ee_front_counts
+       || !g_bvh_ee_front_overflow || *g_bvh_ee_front_overflow
+       || !g_bvh_ccd_cache_valid || !g_bvh_vf_cache_index)
+        return false;
+    for(int target_body = 0; target_body < g_bvh_vf_cache_body_count;
+        ++target_body)
+    {
+        const int pair = _bvhVfCachePairIndex(query_body, target_body);
+        if(pair < 0 || g_bvh_ccd_cache_valid[pair])
+            continue;
+        const uint32_t count = g_bvh_ee_front_counts[target_body];
+        if(count > static_cast<uint32_t>(g_bvh_ee_front_capacity)
+           || stack_ptr - stack + count > STIFF_BVH_STACK_CAP)
+        {
+            stack_ptr = stack;
+            return false;
+        }
+        const size_t begin =
+            static_cast<size_t>(target_body) * g_bvh_ee_front_capacity;
+        for(uint32_t i = 0; i < count; ++i)
+            *stack_ptr++ = g_bvh_ee_front_nodes[begin + i];
+    }
+    return true;
+}
+
+__device__ __forceinline__ bool _bvhVfCcdCacheSkipNode(int query_body,
+                                                        uint32_t node)
+{
+    const int target_body = g_bvh_vf_node_body[node];
+    const int pair = _bvhVfCachePairIndex(query_body, target_body);
+    return pair >= 0 && g_bvh_ccd_cache_valid[pair] != 0;
+}
+
+__device__ __forceinline__ bool _bvhEeCcdCacheSkipNode(int query_body,
+                                                        uint32_t node)
+{
+    const int target_body = g_bvh_ee_node_body[node];
+    const int pair = _bvhVfCachePairIndex(query_body, target_body);
+    return pair >= 0 && g_bvh_ccd_cache_valid[pair] != 0;
+}
+
+__device__ __forceinline__ void _bvhVfCcdCacheRecord(int query_body,
+                                                       int target_body,
+                                                       int vertex,
+                                                       int face)
+{
+    const int pair = _bvhVfCachePairIndex(query_body, target_body);
+    if(pair < 0 || g_bvh_ccd_cache_valid[pair]
+       || !g_bvh_vf_ccd_cache_counts || !g_bvh_vf_ccd_cache_candidates)
+        return;
+    const uint32_t slot = atomicAdd(&g_bvh_vf_ccd_cache_counts[pair], 1u);
+    if(slot < static_cast<uint32_t>(
+                  g_bvh_vf_ccd_cache_segment_capacity))
+        g_bvh_vf_ccd_cache_candidates[
+            static_cast<size_t>(pair)
+                * g_bvh_vf_ccd_cache_segment_capacity
+            + slot] = make_int2(vertex, face);
+    else if(g_bvh_vf_ccd_cache_overflow)
+        atomicExch(g_bvh_vf_ccd_cache_overflow, 1);
+}
+
+__device__ __forceinline__ void _bvhEeCcdCacheRecord(int query_body,
+                                                       int target_body,
+                                                       int self_edge,
+                                                       int target_edge)
+{
+    const int pair = _bvhVfCachePairIndex(query_body, target_body);
+    if(pair < 0 || g_bvh_ccd_cache_valid[pair]
+       || !g_bvh_ee_ccd_cache_counts || !g_bvh_ee_ccd_cache_candidates)
+        return;
+    const uint32_t slot = atomicAdd(&g_bvh_ee_ccd_cache_counts[pair], 1u);
+    if(slot < static_cast<uint32_t>(
+                  g_bvh_ee_ccd_cache_segment_capacity))
+        g_bvh_ee_ccd_cache_candidates[
+            static_cast<size_t>(pair)
+                * g_bvh_ee_ccd_cache_segment_capacity
+            + slot] = make_int2(self_edge, target_edge);
+    else if(g_bvh_ee_ccd_cache_overflow)
+        atomicExch(g_bvh_ee_ccd_cache_overflow, 1);
 }
 
 void set_ee_trace(int v) { static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); last = v; }

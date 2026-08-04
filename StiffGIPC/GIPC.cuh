@@ -326,6 +326,18 @@ class GIPC
     uint32_t*                m_bvh_ee_cache_counts = nullptr;
     int*                     m_bvh_ee_cache_overflow = nullptr;
     int                      m_bvh_ee_cache_segment_capacity = 0;
+    unsigned char*           m_bvh_ccd_cache_valid = nullptr;
+    int2*                    m_bvh_vf_ccd_cache_candidates = nullptr;
+    uint32_t*                m_bvh_vf_ccd_cache_counts = nullptr;
+    int*                     m_bvh_vf_ccd_cache_overflow = nullptr;
+    int2*                    m_bvh_ee_ccd_cache_candidates = nullptr;
+    uint32_t*                m_bvh_ee_ccd_cache_counts = nullptr;
+    int*                     m_bvh_ee_ccd_cache_overflow = nullptr;
+    int                      m_bvh_ccd_cache_segment_capacity = 0;
+    double3*                 m_bvh_ccd_cache_reference_start = nullptr;
+    double3*                 m_bvh_ccd_cache_reference_end = nullptr;
+    unsigned long long*      m_bvh_ccd_cache_device_stats = nullptr;
+    bool                     m_bvh_ccd_cache_seen = false;
     int                      m_bvh_pair_cache_mask = 0;
     uint32_t*                m_bvh_vf_cache_ref_offsets = nullptr;
     int*                     m_bvh_vf_cache_ref_vertices = nullptr;
@@ -351,6 +363,8 @@ class GIPC
     int*                     m_bvh_edge_body = nullptr;
     void collectBvhPairWorkload();
     void updateBvhVfPairCache();
+    void updateBvhCcdPairCache(const double& alpha,
+                               const double* alpha_dev);
     void auditBvhTemporalCoherence();
     void auditBvhSweptTemporalCoherence(const double& alpha,
                                          const double* alpha_dev);

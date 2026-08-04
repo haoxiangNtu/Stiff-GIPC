@@ -394,6 +394,45 @@ void replay_bvh_ee_pair_cache(const double3* vertexes,
         edge_count);
 }
 
+static __device__ __forceinline__ AABB _bvhSweptPointBox(
+    const double3* vertexes,
+    const double3* move_dir,
+    int            vertex,
+    double         alpha)
+{
+    const double3 start = vertexes[vertex];
+    const double3 move = move_dir[vertex];
+    AABB box;
+    box.combines(start.x, start.y, start.z);
+    box.combines(start.x - alpha * move.x,
+                 start.y - alpha * move.y,
+                 start.z - alpha * move.z);
+    return box;
+}
+
+static __device__ __forceinline__ AABB _bvhSweptEdgeBox(
+    const double3* vertexes,
+    const double3* move_dir,
+    const uint2&   edge,
+    double         alpha)
+{
+    AABB box = _bvhSweptPointBox(vertexes, move_dir, edge.x, alpha);
+    box.combines(_bvhSweptPointBox(vertexes, move_dir, edge.y, alpha));
+    return box;
+}
+
+static __device__ __forceinline__ AABB _bvhSweptFaceBox(
+    const double3* vertexes,
+    const double3* move_dir,
+    const uint3&   face,
+    double         alpha)
+{
+    AABB box = _bvhSweptPointBox(vertexes, move_dir, face.x, alpha);
+    box.combines(_bvhSweptPointBox(vertexes, move_dir, face.y, alpha));
+    box.combines(_bvhSweptPointBox(vertexes, move_dir, face.z, alpha));
+    return box;
+}
+
 __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                   const int*      _btype,
                                   const double3*  _vertexes,
@@ -419,10 +458,9 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
 
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr = stack;
-    BVH_STACK_PUSH(0);
-
-    AABB _bv;
-    idx                    = _surfVerts[idx];
+    idx = _surfVerts[idx];
+    const int query_body = _bodyID[idx];
+    const bool cache_enabled = _bvhVfCcdCacheEnabled();
 
     // BVH-skip (audit/perf-bvh-skip-isolated)
     if(_collision_skip_matrix && _collision_body_count > 0) {
@@ -435,19 +473,19 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfCcd);
     BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[idx]);
 
-    double3 current_vertex = _vertexes[idx];
-    double3 mvD            = moveDir[idx];
-    _bv.upper              = current_vertex;
-    _bv.lower              = current_vertex;
-    _bv.combines(current_vertex.x - mvD.x * alpha,
-                 current_vertex.y - mvD.y * alpha,
-                 current_vertex.z - mvD.z * alpha);
+    if(!cache_enabled
+       || !_bvhVfCcdCacheSeedFront(query_body, stack, stack_ptr))
+        BVH_STACK_PUSH(0);
+
+    const AABB _bv = _bvhSweptPointBox(_vertexes, moveDir, idx, alpha);
     //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_bvs[0].upper, _bvs[0].lower));
     //printf("%f\n", bboxDiagSize2);
-    double gapl = sqrt(dHat);
+    const double base_gap = sqrt(dHat);
+    const double gapl = cache_enabled ? BVH_TRAVERSAL_MARGIN(base_gap)
+                                      : base_gap;
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
-    do
+    while(stack < stack_ptr)
     {
         const uint32_t node_id = *--stack_ptr;
         BVH_TRAVERSAL_AUDIT_POP();
@@ -455,7 +493,9 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
-        if(overlap(_bv, _bvs[L_idx], gapl))
+        if((!cache_enabled
+            || !_bvhVfCcdCacheSkipNode(query_body, L_idx))
+           && overlap(_bv, _bvs[L_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[L_idx].element_idx;
@@ -476,11 +516,19 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                         {
                             BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
                                 _bodyID[_faces[obj_idx].x]);
-                            _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
-                                make_int4(-idx - 1,
-                                          _faces[obj_idx].x,
-                                          _faces[obj_idx].y,
-                                          _faces[obj_idx].z);
+                            _bvhVfCcdCacheRecord(
+                                query_body,
+                                _bodyID[_faces[obj_idx].x],
+                                idx,
+                                obj_idx);
+                            if(!cache_enabled
+                               || overlap(_bv, _bvs[L_idx], base_gap))
+                                _ccd_collisionPair[
+                                    _emit_slot(_cpNum, g_ccd_cp_cap)] =
+                                    make_int4(-idx - 1,
+                                              _faces[obj_idx].x,
+                                              _faces[obj_idx].y,
+                                              _faces[obj_idx].z);
                         }
                 }
             }
@@ -489,7 +537,9 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                 BVH_STACK_PUSH(L_idx);
             }
         }
-        if(overlap(_bv, _bvs[R_idx], gapl))
+        if((!cache_enabled
+            || !_bvhVfCcdCacheSkipNode(query_body, R_idx))
+           && overlap(_bv, _bvs[R_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[R_idx].element_idx;
@@ -509,11 +559,19 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                         {
                             BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
                                 _bodyID[_faces[obj_idx].x]);
-                            _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
-                                make_int4(-idx - 1,
-                                          _faces[obj_idx].x,
-                                          _faces[obj_idx].y,
-                                          _faces[obj_idx].z);
+                            _bvhVfCcdCacheRecord(
+                                query_body,
+                                _bodyID[_faces[obj_idx].x],
+                                idx,
+                                obj_idx);
+                            if(!cache_enabled
+                               || overlap(_bv, _bvs[R_idx], base_gap))
+                                _ccd_collisionPair[
+                                    _emit_slot(_cpNum, g_ccd_cp_cap)] =
+                                    make_int4(-idx - 1,
+                                              _faces[obj_idx].x,
+                                              _faces[obj_idx].y,
+                                              _faces[obj_idx].z);
                         }
                 }
             }
@@ -522,7 +580,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                 BVH_STACK_PUSH(R_idx);
             }
         }
-    } while(stack < stack_ptr);
+    }
     BVH_TRAVERSAL_AUDIT_COMMIT();
 }
 
@@ -1056,12 +1114,14 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
 
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr   = stack;
-    BVH_STACK_PUSH(0);
     idx                   = idx + number - 1;
     AABB     _bv          = _bvs[idx];
     uint32_t self_eid     = _nodes[idx].element_idx;
     int qenv = (g_bvh_envpart && node_env) ? node_env[idx] : -1;  // [env-part B] query edge env
     uint2    current_edge = _edges[self_eid];
+    const int query_body = _bodyID[current_edge.x];
+    const bool cache_enabled = RangePruneMode == 0
+                               && _bvhEeCcdCacheEnabled();
 
     // BVH-skip (audit/perf-bvh-skip-isolated)
     if(_collision_skip_matrix && _collision_body_count > 0) {
@@ -1072,14 +1132,19 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
     }
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhEeCcd);
     BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[current_edge.x]);
+    if(!cache_enabled
+       || !_bvhEeCcdCacheSeedFront(query_body, stack, stack_ptr))
+        BVH_STACK_PUSH(0);
     //double3 edge_tvert0 = __GEIGEN__::__minus(_vertexes[current_edge.x], __GEIGEN__::__s_vec_multiply(moveDir[current_edge.x], alpha));
     //double3 edge_tvert1 = __GEIGEN__::__minus(_vertexes[current_edge.y], __GEIGEN__::__s_vec_multiply(moveDir[current_edge.y], alpha));
     //_bv.combines(edge_tvert0.x, edge_tvert0.y, edge_tvert0.z);
     //_bv.combines(edge_tvert1.x, edge_tvert1.y, edge_tvert1.z);
-    double gapl = sqrt(dHat);
+    const double base_gap = sqrt(dHat);
+    const double gapl = cache_enabled ? BVH_TRAVERSAL_MARGIN(base_gap)
+                                      : base_gap;
 
     unsigned int num_found = 0;
-    do
+    while(stack < stack_ptr)
     {
         const uint32_t node_id = *--stack_ptr;
         BVH_TRAVERSAL_AUDIT_POP();
@@ -1091,7 +1156,11 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
         if constexpr(RangePruneMode == 1)
             if(!g_ee_nodedup && !g_ee_canon && node_max_element)
                 own_l = node_max_element[L_idx] >= self_eid;
-        if(own_l && (qenv < 0 || node_env[L_idx] < 0 || node_env[L_idx] == qenv) && overlap(_bv, _bvs[L_idx], gapl))
+        if(own_l
+           && (!cache_enabled
+               || !_bvhEeCcdCacheSkipNode(query_body, L_idx))
+           && (qenv < 0 || node_env[L_idx] < 0 || node_env[L_idx] == qenv)
+           && overlap(_bv, _bvs[L_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[L_idx].element_idx;
@@ -1116,11 +1185,20 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
                             {
                                 BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
                                     _bodyID[_edges[obj_idx].x]);
-                                _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
-                                    make_int4(current_edge.x,
-                                              current_edge.y,
-                                              _edges[obj_idx].x,
-                                              _edges[obj_idx].y);
+                                _bvhEeCcdCacheRecord(
+                                    query_body,
+                                    _bodyID[_edges[obj_idx].x],
+                                    self_eid,
+                                    obj_idx);
+                                if(!cache_enabled
+                                   || overlap(
+                                       _bv, _bvs[L_idx], base_gap))
+                                    _ccd_collisionPair[
+                                        _emit_slot(_cpNum, g_ccd_cp_cap)] =
+                                        make_int4(current_edge.x,
+                                                  current_edge.y,
+                                                  _edges[obj_idx].x,
+                                                  _edges[obj_idx].y);
                             }
                     }
                 }
@@ -1134,7 +1212,11 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
         if constexpr(RangePruneMode == 1)
             if(!g_ee_nodedup && !g_ee_canon && node_max_element)
                 own_r = node_max_element[R_idx] >= self_eid;
-        if(own_r && (qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv) && overlap(_bv, _bvs[R_idx], gapl))
+        if(own_r
+           && (!cache_enabled
+               || !_bvhEeCcdCacheSkipNode(query_body, R_idx))
+           && (qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv)
+           && overlap(_bv, _bvs[R_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[R_idx].element_idx;
@@ -1159,11 +1241,20 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
                             {
                                 BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
                                     _bodyID[_edges[obj_idx].x]);
-                                _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
-                                    make_int4(current_edge.x,
-                                              current_edge.y,
-                                              _edges[obj_idx].x,
-                                              _edges[obj_idx].y);
+                                _bvhEeCcdCacheRecord(
+                                    query_body,
+                                    _bodyID[_edges[obj_idx].x],
+                                    self_eid,
+                                    obj_idx);
+                                if(!cache_enabled
+                                   || overlap(
+                                       _bv, _bvs[R_idx], base_gap))
+                                    _ccd_collisionPair[
+                                        _emit_slot(_cpNum, g_ccd_cp_cap)] =
+                                        make_int4(current_edge.x,
+                                                  current_edge.y,
+                                                  _edges[obj_idx].x,
+                                                  _edges[obj_idx].y);
                             }
                     }
                 }
@@ -1173,7 +1264,7 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
                 BVH_STACK_PUSH(R_idx);
             }
         }
-    } while(stack < stack_ptr);
+    }
     BVH_TRAVERSAL_AUDIT_COMMIT();
 }
 
@@ -1198,6 +1289,133 @@ __global__ void _selfQuery_ee_ccd_range_prune(
     _SQEE_CCD_PARAMS, const uint32_t* node_max_element)
 {
     _selfQuery_ee_ccd_body<1>(_SQEE_CCD_ARGS, node_max_element);
+}
+
+// Re-evaluate the ordinary (non-margin) swept-box predicate for every raw
+// candidate in a reusable generation.  The expanded list is only a
+// completeness envelope: candidates outside the current base gap must never
+// enter the refined CCD stage, otherwise pair counts and reduction order no
+// longer match the exhaustive traversal.
+__global__ void _replayVfCcdPairCache(const double3* vertexes,
+                                      const double3* move_dir,
+                                      const uint3*   faces,
+                                      uint32_t*      cp_num,
+                                      int4*          ccd_collision_pair,
+                                      double         d_hat,
+                                      double         alpha,
+                                      const double*  alpha_dev)
+{
+    const int pair = blockIdx.x;
+    if(pair >= g_bvh_vf_cache_pair_count
+       || !g_bvh_ccd_cache_valid[pair]
+       || !_bvhVfCcdCacheEnabled())
+        return;
+    if(alpha_dev)
+        alpha = *alpha_dev;
+    const uint32_t count = min(
+        g_bvh_vf_ccd_cache_counts[pair],
+        static_cast<uint32_t>(g_bvh_vf_ccd_cache_segment_capacity));
+    const size_t begin =
+        static_cast<size_t>(pair) * g_bvh_vf_ccd_cache_segment_capacity;
+    const double gap = sqrt(d_hat);
+    for(uint32_t i = threadIdx.x; i < count; i += blockDim.x)
+    {
+        const int2 candidate = g_bvh_vf_ccd_cache_candidates[begin + i];
+        const uint3 face = faces[candidate.y];
+        const AABB query =
+            _bvhSweptPointBox(vertexes, move_dir, candidate.x, alpha);
+        const AABB target =
+            _bvhSweptFaceBox(vertexes, move_dir, face, alpha);
+        if(overlap(query, target, gap))
+            ccd_collision_pair[_emit_slot(cp_num, g_ccd_cp_cap)] =
+                make_int4(-candidate.x - 1, face.x, face.y, face.z);
+    }
+}
+
+void replay_bvh_vf_ccd_pair_cache(const double3* vertexes,
+                                  const double3* move_dir,
+                                  const uint3*   faces,
+                                  uint32_t*      cp_num,
+                                  int4*          ccd_collision_pair,
+                                  double         d_hat,
+                                  double         alpha,
+                                  const double*  alpha_dev,
+                                  cudaStream_t   stream)
+{
+    if(!getenv("STIFF_BVH_PAIR_CACHE") || h_bvh_vf_cache_pair_count <= 0)
+        return;
+    _replayVfCcdPairCache<<<
+        h_bvh_vf_cache_pair_count, 256, 0, stream>>>(vertexes,
+                                                     move_dir,
+                                                     faces,
+                                                     cp_num,
+                                                     ccd_collision_pair,
+                                                     d_hat,
+                                                     alpha,
+                                                     alpha_dev);
+}
+
+__global__ void _replayEeCcdPairCache(const double3* vertexes,
+                                      const double3* move_dir,
+                                      const uint2*   edges,
+                                      uint32_t*      cp_num,
+                                      int4*          ccd_collision_pair,
+                                      double         d_hat,
+                                      double         alpha,
+                                      const double*  alpha_dev)
+{
+    const int pair = blockIdx.x;
+    if(pair >= g_bvh_vf_cache_pair_count
+       || !g_bvh_ccd_cache_valid[pair]
+       || !_bvhEeCcdCacheEnabled())
+        return;
+    if(alpha_dev)
+        alpha = *alpha_dev;
+    const uint32_t count = min(
+        g_bvh_ee_ccd_cache_counts[pair],
+        static_cast<uint32_t>(g_bvh_ee_ccd_cache_segment_capacity));
+    const size_t begin =
+        static_cast<size_t>(pair) * g_bvh_ee_ccd_cache_segment_capacity;
+    const double gap = sqrt(d_hat);
+    for(uint32_t i = threadIdx.x; i < count; i += blockDim.x)
+    {
+        const int2 candidate = g_bvh_ee_ccd_cache_candidates[begin + i];
+        const uint2 self_edge = edges[candidate.x];
+        const uint2 other_edge = edges[candidate.y];
+        const AABB query =
+            _bvhSweptEdgeBox(vertexes, move_dir, self_edge, alpha);
+        const AABB target =
+            _bvhSweptEdgeBox(vertexes, move_dir, other_edge, alpha);
+        if(overlap(query, target, gap))
+            ccd_collision_pair[_emit_slot(cp_num, g_ccd_cp_cap)] =
+                make_int4(self_edge.x,
+                          self_edge.y,
+                          other_edge.x,
+                          other_edge.y);
+    }
+}
+
+void replay_bvh_ee_ccd_pair_cache(const double3* vertexes,
+                                  const double3* move_dir,
+                                  const uint2*   edges,
+                                  uint32_t*      cp_num,
+                                  int4*          ccd_collision_pair,
+                                  double         d_hat,
+                                  double         alpha,
+                                  const double*  alpha_dev,
+                                  cudaStream_t   stream)
+{
+    if(!getenv("STIFF_BVH_PAIR_CACHE") || h_bvh_vf_cache_pair_count <= 0)
+        return;
+    _replayEeCcdPairCache<<<
+        h_bvh_vf_cache_pair_count, 256, 0, stream>>>(vertexes,
+                                                     move_dir,
+                                                     edges,
+                                                     cp_num,
+                                                     ccd_collision_pair,
+                                                     d_hat,
+                                                     alpha,
+                                                     alpha_dev);
 }
 
 template <int RangePruneMode>

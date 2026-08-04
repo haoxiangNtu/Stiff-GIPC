@@ -54,10 +54,15 @@ TRAVERSAL_SUPPORT_PREFIXES = {
 CACHE_PREFIXES = {
     "vf_dcd_replay": ("_replayVfPairCache(",),
     "ee_dcd_replay": ("_replayEePairCache(",),
+    "vf_ccd_replay": ("_replayVfCcdPairCache(",),
+    "ee_ccd_replay": ("_replayEeCcdPairCache(",),
     "vf_cache_validity": ("_updateBvhVfPairCacheValidityDevice(",),
+    "ccd_cache_validity": ("_updateBvhCcdPairCacheValidityDevice(",),
     "vf_cache_front": ("_buildBvhVfPairFront(",),
     "ee_cache_front": ("_buildBvhEePairFront(",),
     "vf_cache_reset": ("_resetInvalidVfPairCacheCounts(",),
+    "vf_ccd_cache_reset": ("_resetInvalidVfCcdPairCacheCounts(",),
+    "ee_ccd_cache_reset": ("_resetInvalidEeCcdPairCacheCounts(",),
 }
 
 # Kernels that belong uniquely to construction/refit of this LBVH.  CUB radix

@@ -837,7 +837,7 @@ static int bvh_pair_cache_mask()
         if(!getenv("STIFF_BVH_PAIR_CACHE"))
             return 0;
         const char* value = getenv("STIFF_BVH_PAIR_CACHE_MASK");
-        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0x3)
+        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0xF)
                      : 0x1;
     }();
     return mask;
@@ -1983,13 +1983,35 @@ void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
                              && face_number_active <= (int)face_number)
                                 ? face_number_active
                                 : (int)face_number;
-    const uint32_t* wide_children =
-        buildBvh8Children(
-            _nodes, _bvs, _tempLeafBox, tree_number, kSahFaceCcd, stream);
+    const bool pair_cache = (bvh_pair_cache_mask() & 0x4) != 0;
+    const uint32_t* wide_children = pair_cache
+                                        ? nullptr
+                                        : buildBvh8Children(_nodes,
+                                                            _bvs,
+                                                            _tempLeafBox,
+                                                            tree_number,
+                                                            kSahFaceCcd,
+                                                            stream);
+    if(pair_cache)
+    {
+        reset_bvh_vf_ccd_pair_cache_counts(stream);
+        rebuild_bvh_vf_pair_front(
+            _nodes, m_node_body, tree_number, stream);
+    }
     fullCCDselfQuery_vf(
         _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
         _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem,
         wide_children, stream, alpha_dev);
+    if(pair_cache)
+        replay_bvh_vf_ccd_pair_cache(_vertexes,
+                                     moveDir,
+                                     _faces,
+                                     _cpNum,
+                                     _ccd_collisionPair,
+                                     dHat,
+                                     alpha,
+                                     alpha_dev,
+                                     stream);
 }
 
 void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
@@ -2000,13 +2022,35 @@ void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
              && face_number_active <= (int)edge_number)
                 ? face_number_active
                 : (int)edge_number;
-    const uint32_t* wide_children =
-        buildBvh8Children(
-            _nodes, _bvs, _tempLeafBox, N, kSahEdgeCcd, stream);
+    const bool pair_cache = (bvh_pair_cache_mask() & 0x8) != 0;
+    const uint32_t* wide_children = pair_cache
+                                        ? nullptr
+                                        : buildBvh8Children(_nodes,
+                                                            _bvs,
+                                                            _tempLeafBox,
+                                                            N,
+                                                            kSahEdgeCcd,
+                                                            stream);
+    if(pair_cache)
+    {
+        reset_bvh_ee_ccd_pair_cache_counts(stream);
+        rebuild_bvh_ee_pair_front(_nodes, m_node_body, N, stream);
+    }
     fullCCDselfQuery_ee(
         _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, N,
         _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem,
-        m_node_env, m_node_max_element, wide_children, stream, alpha_dev);
+        m_node_env, pair_cache ? nullptr : m_node_max_element,
+        wide_children, stream, alpha_dev);
+    if(pair_cache)
+        replay_bvh_ee_ccd_pair_cache(_vertexes,
+                                     moveDir,
+                                     _edges,
+                                     _cpNum,
+                                     _ccd_collisionPair,
+                                     dHat,
+                                     alpha,
+                                     alpha_dev,
+                                     stream);
 }
 
 

@@ -78,6 +78,17 @@ void set_bvh_ee_pair_cache(int2*       candidates,
                            int         segment_capacity,
                            int*        overflow,
                            const int*  node_body);
+void set_bvh_ccd_pair_cache(const unsigned char* pair_valid,
+                            int2*                vf_candidates,
+                            uint32_t*             vf_counts,
+                            int                   vf_segment_capacity,
+                            int*                  vf_overflow,
+                            int2*                ee_candidates,
+                            uint32_t*             ee_counts,
+                            int                   ee_segment_capacity,
+                            int*                  ee_overflow,
+                            const int*            vf_node_body,
+                            const int*            ee_node_body);
 void set_bvh_vf_pair_front(uint32_t* front_nodes,
                            uint32_t* front_counts,
                            int       front_capacity,
@@ -113,6 +124,24 @@ void replay_bvh_ee_pair_cache(const double3* vertexes,
                               double         d_hat,
                               int            edge_count,
                               cudaStream_t   stream = 0);
+void replay_bvh_vf_ccd_pair_cache(const double3* vertexes,
+                                  const double3* move_dir,
+                                  const uint3*   faces,
+                                  uint32_t*      cp_num,
+                                  int4*          ccd_collision_pair,
+                                  double         d_hat,
+                                  double         alpha,
+                                  const double*  alpha_dev,
+                                  cudaStream_t   stream = 0);
+void replay_bvh_ee_ccd_pair_cache(const double3* vertexes,
+                                  const double3* move_dir,
+                                  const uint2*   edges,
+                                  uint32_t*      cp_num,
+                                  int4*          ccd_collision_pair,
+                                  double         d_hat,
+                                  double         alpha,
+                                  const double*  alpha_dev,
+                                  cudaStream_t   stream = 0);
 
 struct AABB
 {

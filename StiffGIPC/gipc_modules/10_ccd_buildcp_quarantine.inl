@@ -287,6 +287,155 @@ __global__ void _updateBvhVfPairCacheValidityDevice(
         }
 }
 
+__global__ void _updateBvhCcdPairCacheValidityDevice(
+    const double3*          positions,
+    const double3*          movement,
+    double                 alpha,
+    const double*           alpha_dev,
+    unsigned char*         valid,
+    uint32_t*              vf_counts,
+    const int*             vf_overflow,
+    uint32_t*              ee_counts,
+    const int*             ee_overflow,
+    const uint32_t*        reference_offsets,
+    const int*             reference_vertices,
+    double3*               reference_start,
+    double3*               reference_end,
+    int                    pair_count,
+    double                 displacement_budget,
+    int                    force_rebuild,
+    int                    vf_segment_capacity,
+    int                    ee_segment_capacity,
+    unsigned long long*    stats)
+{
+    const int pair = blockIdx.x;
+    const int lane = threadIdx.x;
+    if(pair >= pair_count)
+        return;
+    if(alpha_dev)
+        alpha = *alpha_dev;
+
+    __shared__ double reduction[256];
+    __shared__ double displacement_a;
+    __shared__ double displacement_b;
+    __shared__ int reusable;
+
+    const bool forced = force_rebuild || !isfinite(alpha) || alpha < 0.0
+                        || (vf_overflow && *vf_overflow != 0)
+                        || (ee_overflow && *ee_overflow != 0);
+    for(int side = 0; side < 2; ++side)
+    {
+        double local_max_sq = 0.0;
+        const int key = 2 * pair + side;
+        const uint32_t begin = reference_offsets[key];
+        const uint32_t end = reference_offsets[key + 1];
+        if(!forced)
+            for(uint32_t entry = begin + lane; entry < end;
+                entry += blockDim.x)
+            {
+                const int vertex = reference_vertices[entry];
+                const double3 now_start = positions[vertex];
+                const double3 move = movement[vertex];
+                const double3 now_end =
+                    make_double3(now_start.x - alpha * move.x,
+                                 now_start.y - alpha * move.y,
+                                 now_start.z - alpha * move.z);
+                const double3 ref_start = reference_start[entry];
+                const double3 ref_end = reference_end[entry];
+                const double sx = now_start.x - ref_start.x;
+                const double sy = now_start.y - ref_start.y;
+                const double sz = now_start.z - ref_start.z;
+                const double ex = now_end.x - ref_end.x;
+                const double ey = now_end.y - ref_end.y;
+                const double ez = now_end.z - ref_end.z;
+                local_max_sq = fmax(
+                    local_max_sq,
+                    fmax(sx * sx + sy * sy + sz * sz,
+                         ex * ex + ey * ey + ez * ez));
+            }
+        reduction[lane] = local_max_sq;
+        __syncthreads();
+        for(int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if(lane < stride)
+                reduction[lane] =
+                    fmax(reduction[lane], reduction[lane + stride]);
+            __syncthreads();
+        }
+        if(lane == 0)
+        {
+            const double displacement = sqrt(reduction[0]);
+            if(side == 0)
+                displacement_a = displacement;
+            else
+                displacement_b = displacement;
+        }
+        __syncthreads();
+    }
+
+    if(lane == 0)
+    {
+        reusable = !forced
+                   && displacement_a + displacement_b
+                          <= displacement_budget;
+        valid[pair] = reusable ? 1 : 0;
+        if(!reusable)
+        {
+            if(vf_counts)
+                vf_counts[pair] = 0;
+            if(ee_counts)
+                ee_counts[pair] = 0;
+        }
+        if(stats)
+        {
+            if(pair == 0)
+                atomicAdd(&stats[0], 1ull);
+            atomicAdd(&stats[1], 1ull);
+            if(reusable)
+            {
+                atomicAdd(&stats[2], 1ull);
+                atomicAdd(
+                    &stats[3],
+                    static_cast<unsigned long long>(
+                        vf_counts
+                            ? min(vf_counts[pair],
+                                  static_cast<uint32_t>(
+                                      vf_segment_capacity))
+                            : 0u));
+                atomicAdd(
+                    &stats[4],
+                    static_cast<unsigned long long>(
+                        ee_counts
+                            ? min(ee_counts[pair],
+                                  static_cast<uint32_t>(
+                                      ee_segment_capacity))
+                            : 0u));
+            }
+        }
+    }
+    __syncthreads();
+
+    if(!reusable)
+        for(int side = 0; side < 2; ++side)
+        {
+            const int key = 2 * pair + side;
+            const uint32_t begin = reference_offsets[key];
+            const uint32_t end = reference_offsets[key + 1];
+            for(uint32_t entry = begin + lane; entry < end;
+                entry += blockDim.x)
+            {
+                const int vertex = reference_vertices[entry];
+                const double3 start = positions[vertex];
+                const double3 move = movement[vertex];
+                reference_start[entry] = start;
+                reference_end[entry] =
+                    make_double3(start.x - alpha * move.x,
+                                 start.y - alpha * move.y,
+                                 start.z - alpha * move.z);
+            }
+        }
+}
+
 void GIPC::collectBvhPairWorkload()
 {
     if(!m_bvh_family_coherence_initialized
@@ -595,14 +744,18 @@ void GIPC::updateBvhVfPairCache()
         return;
     int pair_cache_mask = 0x1;
     if(const char* value = getenv("STIFF_BVH_PAIR_CACHE_MASK"))
-        pair_cache_mask = atoi(value) & 0x3;
+        pair_cache_mask = atoi(value) & 0xF;
     int body_major_mask = 0x3;
     if(const char* value = getenv("STIFF_BVH_BODY_MAJOR_MASK"))
         body_major_mask = atoi(value) & 0x3;
     // Each cached family needs body-major primitives and node labels for its
     // own tree.  The original VF prototype hard-coded bit 0 here, which made
     // an EE-only (bit 1) experiment a silent no-op.
-    if(!(pair_cache_mask & body_major_mask))
+    const bool face_family_ready =
+        (pair_cache_mask & (0x1 | 0x4)) && (body_major_mask & 0x1);
+    const bool edge_family_ready =
+        (pair_cache_mask & (0x2 | 0x8)) && (body_major_mask & 0x2);
+    if(!face_family_ready && !edge_family_ready)
         return;
 
     // The isolated path point-swaps one BVH object across several per-env
@@ -699,12 +852,14 @@ void GIPC::updateBvhVfPairCache()
             getenv("STIFF_BVH_PAIR_CACHE_DEVICE") != nullptr;
         m_bvh_pair_cache_mask = 0x1;
         if(const char* value = getenv("STIFF_BVH_PAIR_CACHE_MASK"))
-            m_bvh_pair_cache_mask = atoi(value) & 0x3;
-        // EE reuses the same device-side validity generation.  Do not expose
-        // a half-host/half-device implementation for the new family.
+            m_bvh_pair_cache_mask = atoi(value) & 0xF;
+        // Only the original VF-DCD audit prototype has a host-validity path.
+        // Every other family requires the device generation it was designed
+        // and tested with.
         if(!m_bvh_vf_cache_device_validity)
-            m_bvh_pair_cache_mask &= ~0x2;
+            m_bvh_pair_cache_mask &= 0x1;
         m_bvh_ee_cache_segment_capacity = segment_capacity;
+        m_bvh_ccd_cache_segment_capacity = segment_capacity;
 
         std::vector<int> index(
             static_cast<size_t>(body_count) * body_count, -1);
@@ -743,6 +898,33 @@ void GIPC::updateBvhVfPairCache()
             CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_ee_cache_overflow,
                                       sizeof(int)));
         }
+        if(m_bvh_pair_cache_mask & 0xC)
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_ccd_cache_valid,
+                                      (size_t)m_bvh_vf_cache_pair_count));
+        if(m_bvh_pair_cache_mask & 0x4)
+        {
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_vf_ccd_cache_candidates,
+                (size_t)m_bvh_vf_cache_pair_count * segment_capacity
+                    * sizeof(int2)));
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_vf_ccd_cache_counts,
+                (size_t)m_bvh_vf_cache_pair_count * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_ccd_cache_overflow,
+                                      sizeof(int)));
+        }
+        if(m_bvh_pair_cache_mask & 0x8)
+        {
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_ee_ccd_cache_candidates,
+                (size_t)m_bvh_vf_cache_pair_count * segment_capacity
+                    * sizeof(int2)));
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_ee_ccd_cache_counts,
+                (size_t)m_bvh_vf_cache_pair_count * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_ee_ccd_cache_overflow,
+                                      sizeof(int)));
+        }
         if(m_bvh_vf_cache_device_validity)
         {
             std::vector<uint32_t> reference_offsets;
@@ -777,6 +959,18 @@ void GIPC::updateBvhVfPairCache()
             CUDA_SAFE_CALL(cudaMalloc(
                 (void**)&m_bvh_vf_cache_device_stats,
                 5 * sizeof(unsigned long long)));
+            if(m_bvh_pair_cache_mask & 0xC)
+            {
+                CUDA_SAFE_CALL(cudaMalloc(
+                    (void**)&m_bvh_ccd_cache_reference_start,
+                    reference_vertices.size() * sizeof(double3)));
+                CUDA_SAFE_CALL(cudaMalloc(
+                    (void**)&m_bvh_ccd_cache_reference_end,
+                    reference_vertices.size() * sizeof(double3)));
+                CUDA_SAFE_CALL(cudaMalloc(
+                    (void**)&m_bvh_ccd_cache_device_stats,
+                    5 * sizeof(unsigned long long)));
+            }
             CUDA_SAFE_CALL(cudaMemcpy(m_bvh_vf_cache_ref_offsets,
                                       reference_offsets.data(),
                                       reference_offsets.size()
@@ -789,8 +983,12 @@ void GIPC::updateBvhVfPairCache()
             CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_cache_device_stats,
                                       0,
                                       5 * sizeof(unsigned long long)));
+            if(m_bvh_ccd_cache_device_stats)
+                CUDA_SAFE_CALL(cudaMemset(m_bvh_ccd_cache_device_stats,
+                                          0,
+                                          5 * sizeof(unsigned long long)));
         }
-        if(m_bvh_pair_cache_mask & 0x1)
+        if(m_bvh_pair_cache_mask & (0x1 | 0x4))
         {
             CUDA_SAFE_CALL(cudaMalloc(
                 (void**)&m_bvh_vf_front_nodes,
@@ -802,7 +1000,7 @@ void GIPC::updateBvhVfPairCache()
             CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_front_overflow,
                                       sizeof(int)));
         }
-        if(m_bvh_pair_cache_mask & 0x2)
+        if(m_bvh_pair_cache_mask & (0x2 | 0x8))
         {
             CUDA_SAFE_CALL(cudaMalloc(
                 (void**)&m_bvh_ee_front_nodes,
@@ -834,6 +1032,26 @@ void GIPC::updateBvhVfPairCache()
         if(m_bvh_ee_cache_overflow)
             CUDA_SAFE_CALL(
                 cudaMemset(m_bvh_ee_cache_overflow, 0, sizeof(int)));
+        if(m_bvh_ccd_cache_valid)
+            CUDA_SAFE_CALL(cudaMemset(m_bvh_ccd_cache_valid,
+                                      0,
+                                      (size_t)m_bvh_vf_cache_pair_count));
+        if(m_bvh_vf_ccd_cache_counts)
+            CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_ccd_cache_counts,
+                                      0,
+                                      (size_t)m_bvh_vf_cache_pair_count
+                                          * sizeof(uint32_t)));
+        if(m_bvh_vf_ccd_cache_overflow)
+            CUDA_SAFE_CALL(cudaMemset(
+                m_bvh_vf_ccd_cache_overflow, 0, sizeof(int)));
+        if(m_bvh_ee_ccd_cache_counts)
+            CUDA_SAFE_CALL(cudaMemset(m_bvh_ee_ccd_cache_counts,
+                                      0,
+                                      (size_t)m_bvh_vf_cache_pair_count
+                                          * sizeof(uint32_t)));
+        if(m_bvh_ee_ccd_cache_overflow)
+            CUDA_SAFE_CALL(cudaMemset(
+                m_bvh_ee_ccd_cache_overflow, 0, sizeof(int)));
         if(m_bvh_vf_front_counts)
             CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_front_counts,
                                       0,
@@ -863,6 +1081,17 @@ void GIPC::updateBvhVfPairCache()
                               m_bvh_ee_cache_segment_capacity,
                               m_bvh_ee_cache_overflow,
                               bvh_e.m_node_body);
+        set_bvh_ccd_pair_cache(m_bvh_ccd_cache_valid,
+                               m_bvh_vf_ccd_cache_candidates,
+                               m_bvh_vf_ccd_cache_counts,
+                               m_bvh_ccd_cache_segment_capacity,
+                               m_bvh_vf_ccd_cache_overflow,
+                               m_bvh_ee_ccd_cache_candidates,
+                               m_bvh_ee_ccd_cache_counts,
+                               m_bvh_ccd_cache_segment_capacity,
+                               m_bvh_ee_ccd_cache_overflow,
+                               bvh_f.m_node_body,
+                               bvh_e.m_node_body);
         set_bvh_vf_pair_front(m_bvh_vf_front_nodes,
                               m_bvh_vf_front_counts,
                               m_bvh_vf_front_nodes
@@ -901,7 +1130,9 @@ void GIPC::updateBvhVfPairCache()
                (size_t)m_bvh_vf_cache_pair_count * segment_capacity
                    * sizeof(int2)
                    * ((m_bvh_pair_cache_mask & 0x1 ? 1 : 0)
-                      + (m_bvh_pair_cache_mask & 0x2 ? 1 : 0)),
+                      + (m_bvh_pair_cache_mask & 0x2 ? 1 : 0)
+                      + (m_bvh_pair_cache_mask & 0x4 ? 1 : 0)
+                      + (m_bvh_pair_cache_mask & 0x8 ? 1 : 0)),
                m_bvh_vf_cache_device_validity ? "device" : "host-audit",
                m_bvh_vf_cache_ref_entry_count);
     }
@@ -1042,6 +1273,49 @@ void GIPC::updateBvhVfPairCache()
                               valid.data(),
                               valid.size(),
                               cudaMemcpyHostToDevice));
+}
+
+void GIPC::updateBvhCcdPairCache(const double& alpha,
+                                  const double* alpha_dev)
+{
+    if(!m_bvh_vf_cache_ready || !m_bvh_vf_cache_device_validity
+       || !(m_bvh_pair_cache_mask & 0xC) || !m_bvh_ccd_cache_valid)
+        return;
+    double margin_scale = 1.0;
+    if(const char* value = getenv("STIFF_BVH_MARGIN_SCALE"))
+        margin_scale = atof(value);
+    if(!std::isfinite(margin_scale) || margin_scale <= 1.0 || dHat <= 0.0)
+        margin_scale = 1.0;
+    const double displacement_budget =
+        std::max(0.0, margin_scale - 1.0) * sqrt(dHat);
+    _updateBvhCcdPairCacheValidityDevice<<<
+        m_bvh_vf_cache_pair_count, 256>>>(
+        _vertexes,
+        _moveDir,
+        alpha,
+        alpha_dev,
+        m_bvh_ccd_cache_valid,
+        m_bvh_vf_ccd_cache_counts,
+        m_bvh_vf_ccd_cache_overflow,
+        m_bvh_ee_ccd_cache_counts,
+        m_bvh_ee_ccd_cache_overflow,
+        m_bvh_vf_cache_ref_offsets,
+        m_bvh_vf_cache_ref_vertices,
+        m_bvh_ccd_cache_reference_start,
+        m_bvh_ccd_cache_reference_end,
+        m_bvh_vf_cache_pair_count,
+        displacement_budget,
+        m_bvh_ccd_cache_seen ? 0 : 1,
+        m_bvh_ccd_cache_segment_capacity,
+        m_bvh_ccd_cache_segment_capacity,
+        m_bvh_ccd_cache_device_stats);
+    if(m_bvh_vf_ccd_cache_overflow)
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_bvh_vf_ccd_cache_overflow, 0, sizeof(int), 0));
+    if(m_bvh_ee_ccd_cache_overflow)
+        CUDA_SAFE_CALL(cudaMemsetAsync(
+            m_bvh_ee_ccd_cache_overflow, 0, sizeof(int), 0));
+    m_bvh_ccd_cache_seen = true;
 }
 
 void GIPC::auditBvhTemporalCoherence()
@@ -1358,6 +1632,49 @@ void GIPC::printBvhTemporalCoherence()
                    ee_front_overflow,
                    ee_roots,
                    ee_max_body_roots);
+            if(m_bvh_ccd_cache_device_stats)
+            {
+                unsigned long long ccd_stats[5] = {};
+                CUDA_SAFE_CALL(cudaMemcpy(ccd_stats,
+                                          m_bvh_ccd_cache_device_stats,
+                                          sizeof(ccd_stats),
+                                          cudaMemcpyDeviceToHost));
+                int vf_overflow = 0, ee_overflow = 0;
+                if(m_bvh_vf_ccd_cache_overflow)
+                    CUDA_SAFE_CALL(cudaMemcpy(&vf_overflow,
+                                              m_bvh_vf_ccd_cache_overflow,
+                                              sizeof(int),
+                                              cudaMemcpyDeviceToHost));
+                if(m_bvh_ee_ccd_cache_overflow)
+                    CUDA_SAFE_CALL(cudaMemcpy(&ee_overflow,
+                                              m_bvh_ee_ccd_cache_overflow,
+                                              sizeof(int),
+                                              cudaMemcpyDeviceToHost));
+                printf("[bvh-ccd-pair-cache-device-stats] queries=%llu "
+                       "pair_uses=%llu valid_pair_uses=%llu "
+                       "valid_pair_fraction=%.9f "
+                       "vf_replay_candidates=%llu "
+                       "vf_candidates_per_query=%.3f "
+                       "ee_replay_candidates=%llu "
+                       "ee_candidates_per_query=%.3f "
+                       "vf_overflow=%d ee_overflow=%d\n",
+                       ccd_stats[0],
+                       ccd_stats[1],
+                       ccd_stats[2],
+                       ccd_stats[1]
+                           ? (double)ccd_stats[2] / (double)ccd_stats[1]
+                           : 0.0,
+                       ccd_stats[3],
+                       ccd_stats[0]
+                           ? (double)ccd_stats[3] / (double)ccd_stats[0]
+                           : 0.0,
+                       ccd_stats[4],
+                       ccd_stats[0]
+                           ? (double)ccd_stats[4] / (double)ccd_stats[0]
+                           : 0.0,
+                       vf_overflow,
+                       ee_overflow);
+            }
         }
         return;
     }
