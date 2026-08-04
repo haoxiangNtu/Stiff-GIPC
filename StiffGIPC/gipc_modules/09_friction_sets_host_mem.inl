@@ -584,19 +584,6 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
 
 GIPC::~GIPC()
 {
-#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
-    if(getenv("STIFF_BVH_TRAVERSAL_AUDIT"))
-    {
-        CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        static bool printed = false;
-        if(!printed)
-        {
-            print_bvh_traversal_audit();
-            printBvhTemporalCoherence();
-            printed = true;
-        }
-    }
-#endif
     if(m_capacity_poll_host)
     {
         cudaFreeHost(m_capacity_poll_host);

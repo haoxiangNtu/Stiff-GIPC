@@ -1146,6 +1146,11 @@ PYBIND11_MODULE(pystiffgipc, m)
             }
             return out;
         }, "Validation-only: return [queries,pops,overlaps,primitive-tests].")
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+        .def("_print_bvh_coherence_audit",
+             &SimEngine::print_bvh_coherence_audit,
+             "Validation-only: print per-body/body-pair temporal-coherence census.")
+#endif
         .def("get_ccd_pairs_clean", [](const SimEngine& self,
                                         py::array_t<double,
                                             py::array::c_style |

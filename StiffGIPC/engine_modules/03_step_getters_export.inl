@@ -64,6 +64,15 @@ void SimEngine::step()
     }
 }
 
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+void SimEngine::print_bvh_coherence_audit() const
+{
+    cudaSetDevice(m_impl->cfg.cuda_device);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    m_impl->ipc.printBvhTemporalCoherence();
+}
+#endif
+
 void SimEngine::launch_episode_async(
     int frames,
     const double* revolute_actions,

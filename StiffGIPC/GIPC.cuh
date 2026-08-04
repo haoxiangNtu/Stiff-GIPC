@@ -248,7 +248,7 @@ class GIPC
     lbvh_f   bvh_f;
     lbvh_e   bvh_e;
 
-#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
     // Shadow-only model of a DCD Verlet candidate list.  It never changes the
     // solver's pair set: every buildCP still runs the exhaustive LBVH query.
     // The audit only snapshots positions and counts how many successive
@@ -263,6 +263,32 @@ class GIPC
     unsigned long long   m_bvh_coherence_current_span = 0;
     unsigned long long   m_bvh_coherence_max_span     = 0;
     double               m_bvh_coherence_max_displacement = 0.0;
+    struct BvhCoherenceStat
+    {
+        unsigned long long observations = 0;
+        unsigned long long builds = 0;
+        unsigned long long reuses = 0;
+        unsigned long long invalidations = 0;
+        unsigned long long current_span = 0;
+        unsigned long long max_span = 0;
+        double max_displacement = 0.0;
+    };
+    struct BvhCoherencePairState
+    {
+        int body_a = -1;
+        int body_b = -1;
+        std::vector<double3> reference_a;
+        std::vector<double3> reference_b;
+        BvhCoherenceStat stat;
+    };
+    bool                     m_bvh_family_coherence_initialized = false;
+    std::vector<int>         m_bvh_coherence_body_id;
+    std::vector<int>         m_bvh_coherence_body_is_fem;
+    std::vector<int>         m_bvh_coherence_skip_matrix;
+    std::vector<std::vector<int>> m_bvh_coherence_body_vertices;
+    std::vector<double3>     m_bvh_coherence_body_reference;
+    std::vector<BvhCoherenceStat> m_bvh_coherence_body_stats;
+    std::vector<BvhCoherencePairState> m_bvh_coherence_pair_states;
     void auditBvhTemporalCoherence();
     void printBvhTemporalCoherence() const;
 #endif

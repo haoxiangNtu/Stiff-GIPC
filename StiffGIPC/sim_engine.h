@@ -739,6 +739,11 @@ class SimEngine
     double get_max_collision_pairs() const;
     int    get_total_frames_done() const;
     uint64_t get_total_energy_tolerance_accepts() const;
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+    /// Validation-only host shadow report. This synchronizes and prints the
+    /// global, per-body, and eligible body-pair cache-reuse census.
+    void print_bvh_coherence_audit() const;
+#endif
 #ifdef GIPC_ENABLE_DIAGNOSTICS
     // Intrusive test-only diagnostics; omitted from production builds.
     std::vector<double> debug_fd_gradient_check(double h, int nprobes, unsigned seed);

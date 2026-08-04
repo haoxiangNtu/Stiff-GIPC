@@ -46,6 +46,8 @@ set(STIFFGIPC_BVH_STACK_CAP "2048" CACHE STRING
     "Per-thread explicit LBVH traversal stack capacity (validation knob)")
 option(STIFFGIPC_BVH_TRAVERSAL_AUDIT
        "Compile low-overhead per-query BVH traversal census counters" OFF)
+option(STIFFGIPC_BVH_COHERENCE_AUDIT
+       "Compile host-side per-body/body-pair BVH coherence shadow audit" OFF)
 if(NOT STIFFGIPC_BVH_STACK_CAP MATCHES "^[0-9]+$"
    OR STIFFGIPC_BVH_STACK_CAP LESS 16)
     message(FATAL_ERROR
@@ -154,6 +156,13 @@ endif()
 set_source_files_properties(
     "${CMAKE_CURRENT_SOURCE_DIR}/StiffGIPC/mlbvh.cu"
     PROPERTIES COMPILE_DEFINITIONS "${GIPC_MLBVH_SOURCE_DEFS}")
+if(STIFFGIPC_BVH_TRAVERSAL_AUDIT)
+    # Activation and margin setup are compiled in the GIPC composite TU.  The
+    # old mlbvh-only definition built counters but silently never armed them.
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/StiffGIPC/GIPC.cu"
+        PROPERTIES COMPILE_DEFINITIONS STIFF_BVH_TRAVERSAL_AUDIT_BUILD)
+endif()
 
 # Exclude gl_main.cu from the library (it contains main() and GL code)
 list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "gl_main\\.cu$")
@@ -161,6 +170,9 @@ if(STIFFGIPC_ENABLE_DIAGNOSTICS)
     list(APPEND GIPC_PHYSICS_DEFS GIPC_ENABLE_DIAGNOSTICS)
 else()
     list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "diagnostics/fd_check\\.cu$")
+endif()
+if(STIFFGIPC_BVH_COHERENCE_AUDIT)
+    list(APPEND GIPC_PHYSICS_DEFS STIFF_BVH_COHERENCE_AUDIT_BUILD)
 endif()
 
 add_library(stiffgipc_core SHARED ${GIPC_ALL_SOURCE} ${GIPC_ALL_HEADERS})

@@ -475,6 +475,18 @@ def main():
         pair_dump = os.environ.get("CASE39ME_DUMP_PAIRS")
         ccd_pair_dump = os.environ.get("CASE39ME_DUMP_CCD_PAIRS")
         traversal_audit = bool(os.environ.get("STIFF_BVH_TRAVERSAL_AUDIT"))
+        if traversal_audit:
+            names = ("vf_dcd", "ee_dcd", "vf_ccd", "ee_ccd")
+            rows = np.asarray(
+                eng.native._get_bvh_traversal_audit(), dtype=np.uint64
+            )
+            for name, row in zip(names, rows):
+                print(
+                    f"[bvh-audit-trajectory] family={name} queries={row[0]} "
+                    f"node_pops={row[1]} overlapping_children={row[2]} "
+                    f"primitive_tests={row[3]}",
+                    flush=True,
+                )
         if traversal_audit and (pair_dump or ccd_pair_dump):
             eng.native._reset_bvh_traversal_audit()
         if pair_dump:
@@ -521,6 +533,13 @@ def main():
                     f"primitive_tests={row[3]}",
                     flush=True,
                 )
+        if os.environ.get("STIFF_BVH_COHERENCE_AUDIT"):
+            if not hasattr(eng.native, "_print_bvh_coherence_audit"):
+                raise RuntimeError(
+                    "STIFF_BVH_COHERENCE_AUDIT requires a build configured "
+                    "with -DSTIFFGIPC_BVH_COHERENCE_AUDIT=ON"
+                )
+            eng.native._print_bvh_coherence_audit()
         return
 
     import polyscope as ps, polyscope.imgui as psim

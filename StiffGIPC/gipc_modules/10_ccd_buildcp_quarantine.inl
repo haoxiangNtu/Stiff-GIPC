@@ -159,7 +159,7 @@ void GIPC::refresh_pair_counts()
     note_pair_census_peak();
 }
 
-#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
 void GIPC::auditBvhTemporalCoherence()
 {
     if(!getenv("STIFF_BVH_COHERENCE_AUDIT") || vertexNum <= 0 || !_vertexes)
@@ -177,50 +177,210 @@ void GIPC::auditBvhTemporalCoherence()
                               (size_t)vertexNum * sizeof(double3),
                               cudaMemcpyDeviceToHost));
 
+    const bool global_first = m_bvh_coherence_reference.empty();
     ++m_bvh_coherence_observations;
-    if(m_bvh_coherence_reference.empty())
+    if(global_first)
     {
         m_bvh_coherence_reference = m_bvh_coherence_current;
         ++m_bvh_coherence_builds;
         m_bvh_coherence_current_span = 1;
-        return;
-    }
-
-    double max_displacement_sq = 0.0;
-    for(int i = 0; i < vertexNum; ++i)
-    {
-        const double dx = m_bvh_coherence_current[i].x
-                          - m_bvh_coherence_reference[i].x;
-        const double dy = m_bvh_coherence_current[i].y
-                          - m_bvh_coherence_reference[i].y;
-        const double dz = m_bvh_coherence_current[i].z
-                          - m_bvh_coherence_reference[i].z;
-        const double displacement_sq = dx * dx + dy * dy + dz * dz;
-        if(displacement_sq > max_displacement_sq)
-            max_displacement_sq = displacement_sq;
-    }
-    const double max_displacement = sqrt(max_displacement_sq);
-    if(max_displacement > m_bvh_coherence_max_displacement)
-        m_bvh_coherence_max_displacement = max_displacement;
-
-    // If every vertex moved by at most delta/2, the distance between any two
-    // point/edge/triangle primitives changes by at most delta.  Therefore a
-    // raw primitive list built with radius (sqrt(dHat) + delta) still contains
-    // every pair that can enter the true sqrt(dHat) activation radius.
-    const double delta = (margin_scale - 1.0) * sqrt(dHat);
-    if(max_displacement <= 0.5 * delta)
-    {
-        ++m_bvh_coherence_reuses;
-        ++m_bvh_coherence_current_span;
     }
     else
     {
-        ++m_bvh_coherence_invalidations;
-        if(m_bvh_coherence_current_span > m_bvh_coherence_max_span)
-            m_bvh_coherence_max_span = m_bvh_coherence_current_span;
-        m_bvh_coherence_reference = m_bvh_coherence_current;
-        ++m_bvh_coherence_builds;
-        m_bvh_coherence_current_span = 1;
+        double max_displacement_sq = 0.0;
+        for(int i = 0; i < vertexNum; ++i)
+        {
+            const double dx = m_bvh_coherence_current[i].x
+                              - m_bvh_coherence_reference[i].x;
+            const double dy = m_bvh_coherence_current[i].y
+                              - m_bvh_coherence_reference[i].y;
+            const double dz = m_bvh_coherence_current[i].z
+                              - m_bvh_coherence_reference[i].z;
+            const double displacement_sq = dx * dx + dy * dy + dz * dz;
+            if(displacement_sq > max_displacement_sq)
+                max_displacement_sq = displacement_sq;
+        }
+        const double max_displacement = sqrt(max_displacement_sq);
+        if(max_displacement > m_bvh_coherence_max_displacement)
+            m_bvh_coherence_max_displacement = max_displacement;
+
+        // If every vertex moved by at most delta/2, the distance between any
+        // two primitives changes by at most delta.
+        const double delta = (margin_scale - 1.0) * sqrt(dHat);
+        if(max_displacement <= 0.5 * delta)
+        {
+            ++m_bvh_coherence_reuses;
+            ++m_bvh_coherence_current_span;
+        }
+        else
+        {
+            ++m_bvh_coherence_invalidations;
+            if(m_bvh_coherence_current_span > m_bvh_coherence_max_span)
+                m_bvh_coherence_max_span = m_bvh_coherence_current_span;
+            m_bvh_coherence_reference = m_bvh_coherence_current;
+            ++m_bvh_coherence_builds;
+            m_bvh_coherence_current_span = 1;
+        }
+    }
+    const double delta = (margin_scale - 1.0) * sqrt(dHat);
+
+    const int body_count = bvh_f._collision_body_count;
+    if(!m_bvh_family_coherence_initialized)
+    {
+        if(body_count <= 0 || !bvh_f._bodyId)
+            return;
+        m_bvh_coherence_body_id.resize((size_t)vertexNum);
+        CUDA_SAFE_CALL(cudaMemcpy(m_bvh_coherence_body_id.data(),
+                                  bvh_f._bodyId,
+                                  (size_t)vertexNum * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+        m_bvh_coherence_body_is_fem.assign((size_t)body_count, 0);
+        if(_body_id_to_is_fem)
+            CUDA_SAFE_CALL(cudaMemcpy(m_bvh_coherence_body_is_fem.data(),
+                                      _body_id_to_is_fem,
+                                      (size_t)body_count * sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+        m_bvh_coherence_skip_matrix.assign(
+            (size_t)body_count * (size_t)body_count, 0);
+        if(bvh_f._collision_skip_matrix)
+            CUDA_SAFE_CALL(cudaMemcpy(m_bvh_coherence_skip_matrix.data(),
+                                      bvh_f._collision_skip_matrix,
+                                      (size_t)body_count * (size_t)body_count
+                                          * sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+
+        m_bvh_coherence_body_vertices.resize((size_t)body_count);
+        for(int vertex = 0; vertex < vertexNum; ++vertex)
+        {
+            const int body = m_bvh_coherence_body_id[(size_t)vertex];
+            if(body >= 0 && body < body_count)
+                m_bvh_coherence_body_vertices[(size_t)body].push_back(vertex);
+        }
+        m_bvh_coherence_body_reference = m_bvh_coherence_current;
+        m_bvh_coherence_body_stats.resize((size_t)body_count);
+        for(int body = 0; body < body_count; ++body)
+        {
+            if(m_bvh_coherence_body_vertices[(size_t)body].empty())
+                continue;
+            auto& stat = m_bvh_coherence_body_stats[(size_t)body];
+            stat.observations = stat.builds = stat.current_span = 1;
+        }
+
+        for(int a = 0; a < body_count; ++a)
+        {
+            const auto& vertices_a =
+                m_bvh_coherence_body_vertices[(size_t)a];
+            if(vertices_a.empty())
+                continue;
+            for(int b = a; b < body_count; ++b)
+            {
+                const auto& vertices_b =
+                    m_bvh_coherence_body_vertices[(size_t)b];
+                if(vertices_b.empty())
+                    continue;
+                if(m_bvh_coherence_skip_matrix[(size_t)a * body_count + b])
+                    continue;
+                if(a == b && !m_bvh_coherence_body_is_fem[(size_t)a])
+                    continue;
+                BvhCoherencePairState state;
+                state.body_a = a;
+                state.body_b = b;
+                state.reference_a.reserve(vertices_a.size());
+                state.reference_b.reserve(vertices_b.size());
+                for(int vertex : vertices_a)
+                    state.reference_a.push_back(
+                        m_bvh_coherence_current[(size_t)vertex]);
+                for(int vertex : vertices_b)
+                    state.reference_b.push_back(
+                        m_bvh_coherence_current[(size_t)vertex]);
+                state.stat.observations = state.stat.builds =
+                    state.stat.current_span = 1;
+                m_bvh_coherence_pair_states.push_back(std::move(state));
+            }
+        }
+        m_bvh_family_coherence_initialized = true;
+        return;
+    }
+
+    auto update_stat = [](BvhCoherenceStat& stat,
+                          double            displacement,
+                          bool              reusable)
+    {
+        ++stat.observations;
+        if(displacement > stat.max_displacement)
+            stat.max_displacement = displacement;
+        if(reusable)
+        {
+            ++stat.reuses;
+            ++stat.current_span;
+        }
+        else
+        {
+            ++stat.invalidations;
+            stat.max_span = std::max(stat.max_span, stat.current_span);
+            ++stat.builds;
+            stat.current_span = 1;
+        }
+    };
+    auto distance_sq = [](const double3& a, const double3& b)
+    {
+        const double x = a.x - b.x;
+        const double y = a.y - b.y;
+        const double z = a.z - b.z;
+        return x * x + y * y + z * z;
+    };
+
+    for(int body = 0; body < body_count; ++body)
+    {
+        const auto& vertices = m_bvh_coherence_body_vertices[(size_t)body];
+        if(vertices.empty())
+            continue;
+        double max_sq = 0.0;
+        for(int vertex : vertices)
+            max_sq = std::max(
+                max_sq,
+                distance_sq(m_bvh_coherence_current[(size_t)vertex],
+                            m_bvh_coherence_body_reference[(size_t)vertex]));
+        const double displacement = sqrt(max_sq);
+        const bool reusable = 2.0 * displacement <= delta;
+        auto& stat = m_bvh_coherence_body_stats[(size_t)body];
+        update_stat(stat, displacement, reusable);
+        if(!reusable)
+            for(int vertex : vertices)
+                m_bvh_coherence_body_reference[(size_t)vertex] =
+                    m_bvh_coherence_current[(size_t)vertex];
+    }
+
+    for(auto& pair : m_bvh_coherence_pair_states)
+    {
+        const auto& vertices_a =
+            m_bvh_coherence_body_vertices[(size_t)pair.body_a];
+        const auto& vertices_b =
+            m_bvh_coherence_body_vertices[(size_t)pair.body_b];
+        double max_a_sq = 0.0;
+        double max_b_sq = 0.0;
+        for(size_t i = 0; i < vertices_a.size(); ++i)
+            max_a_sq = std::max(
+                max_a_sq,
+                distance_sq(m_bvh_coherence_current[(size_t)vertices_a[i]],
+                            pair.reference_a[i]));
+        for(size_t i = 0; i < vertices_b.size(); ++i)
+            max_b_sq = std::max(
+                max_b_sq,
+                distance_sq(m_bvh_coherence_current[(size_t)vertices_b[i]],
+                            pair.reference_b[i]));
+        const double displacement = sqrt(max_a_sq) + sqrt(max_b_sq);
+        const bool reusable = displacement <= delta;
+        update_stat(pair.stat, displacement, reusable);
+        if(!reusable)
+        {
+            for(size_t i = 0; i < vertices_a.size(); ++i)
+                pair.reference_a[i] =
+                    m_bvh_coherence_current[(size_t)vertices_a[i]];
+            for(size_t i = 0; i < vertices_b.size(); ++i)
+                pair.reference_b[i] =
+                    m_bvh_coherence_current[(size_t)vertices_b[i]];
+        }
     }
 }
 
@@ -249,6 +409,117 @@ void GIPC::printBvhTemporalCoherence() const
            queries_per_build,
            max_span,
            m_bvh_coherence_max_displacement);
+
+    auto print_aggregate = [](const char* label,
+                              unsigned long long observations,
+                              unsigned long long builds,
+                              unsigned long long reuses,
+                              unsigned long long invalidations,
+                              unsigned long long max_span)
+    {
+        const double reuse_fraction = observations
+                                          ? (double)reuses / observations
+                                          : 0.0;
+        const double queries_per_build = builds
+                                             ? (double)observations / builds
+                                             : 0.0;
+        printf("[bvh-coherence-family] family=%s observations=%llu builds=%llu "
+               "reuses=%llu invalidations=%llu reuse_fraction=%.9f "
+               "queries_per_build=%.9f max_queries_per_build=%llu\n",
+               label,
+               observations,
+               builds,
+               reuses,
+               invalidations,
+               reuse_fraction,
+               queries_per_build,
+               max_span);
+    };
+
+    unsigned long long body_observations = 0, body_builds = 0;
+    unsigned long long body_reuses = 0, body_invalidations = 0;
+    unsigned long long body_max_span = 0;
+    for(size_t body = 0; body < m_bvh_coherence_body_stats.size(); ++body)
+    {
+        const auto& stat = m_bvh_coherence_body_stats[body];
+        if(stat.observations == 0)
+            continue;
+        const unsigned long long span =
+            std::max(stat.max_span, stat.current_span);
+        body_observations += stat.observations;
+        body_builds += stat.builds;
+        body_reuses += stat.reuses;
+        body_invalidations += stat.invalidations;
+        body_max_span = std::max(body_max_span, span);
+        const double reuse_fraction =
+            (double)stat.reuses / (double)stat.observations;
+        const double queries_per_build =
+            (double)stat.observations / (double)stat.builds;
+        printf("[bvh-coherence-body] body=%zu kind=%s vertices=%zu "
+               "observations=%llu builds=%llu reuse_fraction=%.9f "
+               "queries_per_build=%.9f max_queries_per_build=%llu "
+               "max_displacement=%.17g\n",
+               body,
+               m_bvh_coherence_body_is_fem[body] ? "fem" : "abd",
+               m_bvh_coherence_body_vertices[body].size(),
+               stat.observations,
+               stat.builds,
+               reuse_fraction,
+               queries_per_build,
+               span,
+               stat.max_displacement);
+    }
+    print_aggregate("body",
+                    body_observations,
+                    body_builds,
+                    body_reuses,
+                    body_invalidations,
+                    body_max_span);
+
+    struct FamilyAggregate
+    {
+        unsigned long long observations = 0, builds = 0, reuses = 0;
+        unsigned long long invalidations = 0, max_span = 0;
+    } aggregate[4];
+    static const char* family_names[4] = {
+        "fem_self", "fem_fem", "abd_fem", "abd_abd"};
+    for(const auto& pair : m_bvh_coherence_pair_states)
+    {
+        const bool a_fem = m_bvh_coherence_body_is_fem[(size_t)pair.body_a];
+        const bool b_fem = m_bvh_coherence_body_is_fem[(size_t)pair.body_b];
+        const int family = pair.body_a == pair.body_b ? 0
+                           : (a_fem && b_fem)          ? 1
+                           : (a_fem || b_fem)          ? 2
+                                                       : 3;
+        const auto& stat = pair.stat;
+        const unsigned long long span =
+            std::max(stat.max_span, stat.current_span);
+        auto& out = aggregate[family];
+        out.observations += stat.observations;
+        out.builds += stat.builds;
+        out.reuses += stat.reuses;
+        out.invalidations += stat.invalidations;
+        out.max_span = std::max(out.max_span, span);
+        printf("[bvh-coherence-pair] bodies=%d,%d family=%s observations=%llu "
+               "builds=%llu reuse_fraction=%.9f queries_per_build=%.9f "
+               "max_queries_per_build=%llu max_displacement_sum=%.17g\n",
+               pair.body_a,
+               pair.body_b,
+               family_names[family],
+               stat.observations,
+               stat.builds,
+               stat.observations ? (double)stat.reuses / stat.observations : 0.0,
+               stat.builds ? (double)stat.observations / stat.builds : 0.0,
+               span,
+               stat.max_displacement);
+    }
+    for(int family = 0; family < 4; ++family)
+        print_aggregate(family_names[family],
+                        aggregate[family].observations,
+                        aggregate[family].builds,
+                        aggregate[family].reuses,
+                        aggregate[family].invalidations,
+                        aggregate[family].max_span);
 }
 #endif
 
@@ -271,7 +542,7 @@ void GIPC::buildCP()
         return;
     }
 
-#ifdef STIFF_BVH_TRAVERSAL_AUDIT_BUILD
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
     auditBvhTemporalCoherence();
 #endif
 
