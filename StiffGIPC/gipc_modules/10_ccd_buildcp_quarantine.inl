@@ -168,15 +168,18 @@ void GIPC::refresh_pair_counts()
 __global__ void _updateBvhVfPairCacheValidityDevice(
     const double3*          positions,
     unsigned char*         valid,
-    uint32_t*              counts,
-    const int*             overflow,
+    uint32_t*              vf_counts,
+    const int*             vf_overflow,
+    uint32_t*              ee_counts,
+    const int*             ee_overflow,
     const uint32_t*        reference_offsets,
     const int*             reference_vertices,
     double3*               references,
     int                    pair_count,
     double                 displacement_budget,
     int                    force_rebuild,
-    int                    segment_capacity,
+    int                    vf_segment_capacity,
+    int                    ee_segment_capacity,
     unsigned long long*    stats)
 {
     const int pair = blockIdx.x;
@@ -189,7 +192,9 @@ __global__ void _updateBvhVfPairCacheValidityDevice(
     __shared__ double displacement_b;
     __shared__ int    reusable;
 
-    const bool forced = force_rebuild || (overflow && *overflow != 0);
+    const bool forced = force_rebuild
+                        || (vf_overflow && *vf_overflow != 0)
+                        || (ee_overflow && *ee_overflow != 0);
     for(int side = 0; side < 2; ++side)
     {
         double local_max_sq = 0.0;
@@ -235,7 +240,12 @@ __global__ void _updateBvhVfPairCacheValidityDevice(
                           <= displacement_budget;
         valid[pair] = reusable ? 1 : 0;
         if(!reusable)
-            counts[pair] = 0;
+        {
+            if(vf_counts)
+                vf_counts[pair] = 0;
+            if(ee_counts)
+                ee_counts[pair] = 0;
+        }
         if(stats)
         {
             if(pair == 0)
@@ -247,8 +257,19 @@ __global__ void _updateBvhVfPairCacheValidityDevice(
                 atomicAdd(
                     &stats[3],
                     static_cast<unsigned long long>(
-                        min(counts[pair],
-                            static_cast<uint32_t>(segment_capacity))));
+                        vf_counts
+                            ? min(vf_counts[pair],
+                                  static_cast<uint32_t>(
+                                      vf_segment_capacity))
+                            : 0u));
+                atomicAdd(
+                    &stats[4],
+                    static_cast<unsigned long long>(
+                        ee_counts
+                            ? min(ee_counts[pair],
+                                  static_cast<uint32_t>(
+                                      ee_segment_capacity))
+                            : 0u));
             }
         }
     }
@@ -311,14 +332,278 @@ void GIPC::collectBvhPairWorkload()
     m_bvh_pair_work_snapshot.swap(current);
 }
 
+void GIPC::collectBvhSweptPairWorkload()
+{
+    if(!m_bvh_swept_coherence_initialized
+       || !getenv("STIFF_BVH_PAIR_WORK_AUDIT"))
+        return;
+
+    constexpr size_t body_cap = kBvhAuditBodyCapacity;
+    constexpr size_t value_count = 4 * body_cap * body_cap;
+    std::vector<unsigned long long> current(value_count, 0);
+    auto* matrix = reinterpret_cast<
+        unsigned long long (*)[body_cap][body_cap]>(current.data());
+    get_bvh_traversal_pair_primitive_audit(matrix);
+    if(m_bvh_swept_pair_work_snapshot.size() != value_count)
+    {
+        m_bvh_swept_pair_work_snapshot.swap(current);
+        return;
+    }
+
+    for(auto& pair : m_bvh_swept_pair_states)
+    {
+        if(pair.body_a < 0 || pair.body_b < 0
+           || pair.body_a >= static_cast<int>(body_cap)
+           || pair.body_b >= static_cast<int>(body_cap))
+            continue;
+        const int a = std::min(pair.body_a, pair.body_b);
+        const int b = std::max(pair.body_a, pair.body_b);
+        for(int local_family = 0; local_family < 2; ++local_family)
+        {
+            const int family = 2 + local_family;
+            const size_t offset =
+                (static_cast<size_t>(family) * body_cap
+                 + static_cast<size_t>(a))
+                    * body_cap
+                + static_cast<size_t>(b);
+            const unsigned long long now = current[offset];
+            const unsigned long long before =
+                m_bvh_swept_pair_work_snapshot[offset];
+            const unsigned long long delta =
+                now >= before ? now - before : now;
+            pair.primitive_tests[local_family] += delta;
+            if(pair.reusable_this_observation)
+                pair.reusable_primitive_tests[local_family] += delta;
+        }
+    }
+    m_bvh_swept_pair_work_snapshot.swap(current);
+}
+
+void GIPC::auditBvhSweptTemporalCoherence(const double& alpha,
+                                           const double* alpha_dev)
+{
+    if(!getenv("STIFF_BVH_CCD_COHERENCE_AUDIT")
+       || !m_bvh_family_coherence_initialized || vertexNum <= 0
+       || !_vertexes || !_moveDir)
+        return;
+
+    double margin_scale = 1.0;
+    if(const char* value = getenv("STIFF_BVH_MARGIN_SCALE"))
+        margin_scale = atof(value);
+    if(!std::isfinite(margin_scale) || margin_scale <= 1.0 || dHat <= 0.0)
+        return;
+
+    collectBvhSweptPairWorkload();
+
+    double effective_alpha = alpha;
+    if(alpha_dev)
+        CUDA_SAFE_CALL(cudaMemcpy(&effective_alpha,
+                                  alpha_dev,
+                                  sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+    if(!std::isfinite(effective_alpha) || effective_alpha < 0.0)
+        return;
+
+    m_bvh_swept_current_start.resize((size_t)vertexNum);
+    m_bvh_swept_current_end.resize((size_t)vertexNum);
+    std::vector<double3> movement((size_t)vertexNum);
+    CUDA_SAFE_CALL(cudaMemcpy(m_bvh_swept_current_start.data(),
+                              _vertexes,
+                              (size_t)vertexNum * sizeof(double3),
+                              cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(movement.data(),
+                              _moveDir,
+                              (size_t)vertexNum * sizeof(double3),
+                              cudaMemcpyDeviceToHost));
+    for(int vertex = 0; vertex < vertexNum; ++vertex)
+    {
+        const double3& start = m_bvh_swept_current_start[(size_t)vertex];
+        const double3& move = movement[(size_t)vertex];
+        m_bvh_swept_current_end[(size_t)vertex] =
+            make_double3(start.x - effective_alpha * move.x,
+                         start.y - effective_alpha * move.y,
+                         start.z - effective_alpha * move.z);
+    }
+
+    if(!m_bvh_swept_coherence_initialized)
+    {
+        m_bvh_swept_pair_states.reserve(
+            m_bvh_coherence_pair_states.size());
+        for(const auto& source : m_bvh_coherence_pair_states)
+        {
+            BvhSweptPairState state;
+            state.body_a = source.body_a;
+            state.body_b = source.body_b;
+            const auto& vertices_a =
+                m_bvh_coherence_body_vertices[(size_t)state.body_a];
+            const auto& vertices_b =
+                m_bvh_coherence_body_vertices[(size_t)state.body_b];
+            for(int vertex : vertices_a)
+            {
+                state.reference_start_a.push_back(
+                    m_bvh_swept_current_start[(size_t)vertex]);
+                state.reference_end_a.push_back(
+                    m_bvh_swept_current_end[(size_t)vertex]);
+            }
+            for(int vertex : vertices_b)
+            {
+                state.reference_start_b.push_back(
+                    m_bvh_swept_current_start[(size_t)vertex]);
+                state.reference_end_b.push_back(
+                    m_bvh_swept_current_end[(size_t)vertex]);
+            }
+            state.stat.observations = state.stat.builds =
+                state.stat.current_span = 1;
+            m_bvh_swept_pair_states.push_back(std::move(state));
+        }
+        constexpr size_t body_cap = kBvhAuditBodyCapacity;
+        constexpr size_t value_count = 4 * body_cap * body_cap;
+        m_bvh_swept_pair_work_snapshot.assign(value_count, 0);
+        auto* matrix = reinterpret_cast<
+            unsigned long long (*)[body_cap][body_cap]>(
+            m_bvh_swept_pair_work_snapshot.data());
+        get_bvh_traversal_pair_primitive_audit(matrix);
+        m_bvh_swept_coherence_initialized = true;
+        return;
+    }
+
+    const double delta = (margin_scale - 1.0) * sqrt(dHat);
+    const auto distance_sq = [](const double3& a, const double3& b)
+    {
+        const double x = a.x - b.x;
+        const double y = a.y - b.y;
+        const double z = a.z - b.z;
+        return x * x + y * y + z * z;
+    };
+    for(auto& pair : m_bvh_swept_pair_states)
+    {
+        const auto& vertices_a =
+            m_bvh_coherence_body_vertices[(size_t)pair.body_a];
+        const auto& vertices_b =
+            m_bvh_coherence_body_vertices[(size_t)pair.body_b];
+        double max_a_sq = 0.0, max_b_sq = 0.0;
+        for(size_t i = 0; i < vertices_a.size(); ++i)
+        {
+            const size_t vertex = (size_t)vertices_a[i];
+            max_a_sq = std::max(
+                max_a_sq,
+                std::max(distance_sq(m_bvh_swept_current_start[vertex],
+                                     pair.reference_start_a[i]),
+                         distance_sq(m_bvh_swept_current_end[vertex],
+                                     pair.reference_end_a[i])));
+        }
+        for(size_t i = 0; i < vertices_b.size(); ++i)
+        {
+            const size_t vertex = (size_t)vertices_b[i];
+            max_b_sq = std::max(
+                max_b_sq,
+                std::max(distance_sq(m_bvh_swept_current_start[vertex],
+                                     pair.reference_start_b[i]),
+                         distance_sq(m_bvh_swept_current_end[vertex],
+                                     pair.reference_end_b[i])));
+        }
+        const double displacement = sqrt(max_a_sq) + sqrt(max_b_sq);
+        const bool reusable = displacement <= delta;
+        pair.reusable_this_observation = reusable;
+        ++pair.stat.observations;
+        pair.stat.max_displacement =
+            std::max(pair.stat.max_displacement, displacement);
+        if(reusable)
+        {
+            ++pair.stat.reuses;
+            ++pair.stat.current_span;
+            continue;
+        }
+        ++pair.stat.invalidations;
+        pair.stat.max_span =
+            std::max(pair.stat.max_span, pair.stat.current_span);
+        ++pair.stat.builds;
+        pair.stat.current_span = 1;
+        for(size_t i = 0; i < vertices_a.size(); ++i)
+        {
+            const size_t vertex = (size_t)vertices_a[i];
+            pair.reference_start_a[i] = m_bvh_swept_current_start[vertex];
+            pair.reference_end_a[i] = m_bvh_swept_current_end[vertex];
+        }
+        for(size_t i = 0; i < vertices_b.size(); ++i)
+        {
+            const size_t vertex = (size_t)vertices_b[i];
+            pair.reference_start_b[i] = m_bvh_swept_current_start[vertex];
+            pair.reference_end_b[i] = m_bvh_swept_current_end[vertex];
+        }
+    }
+}
+
+void GIPC::printBvhSweptTemporalCoherence()
+{
+    if(!getenv("STIFF_BVH_CCD_COHERENCE_AUDIT")
+       || !m_bvh_swept_coherence_initialized)
+        return;
+    collectBvhSweptPairWorkload();
+    unsigned long long observations = 0, builds = 0, reuses = 0;
+    unsigned long long invalidations = 0, max_span = 0;
+    unsigned long long work[2] = {}, reusable_work[2] = {};
+    for(const auto& pair : m_bvh_swept_pair_states)
+    {
+        observations += pair.stat.observations;
+        builds += pair.stat.builds;
+        reuses += pair.stat.reuses;
+        invalidations += pair.stat.invalidations;
+        max_span = std::max(
+            max_span,
+            std::max(pair.stat.max_span, pair.stat.current_span));
+        for(int family = 0; family < 2; ++family)
+        {
+            work[family] += pair.primitive_tests[family];
+            reusable_work[family] +=
+                pair.reusable_primitive_tests[family];
+        }
+    }
+    const unsigned long long queries = m_bvh_swept_pair_states.empty()
+                                           ? 0
+                                           : m_bvh_swept_pair_states[0]
+                                                 .stat.observations;
+    printf("[bvh-ccd-coherence] queries=%llu pair_observations=%llu "
+           "builds=%llu reuses=%llu invalidations=%llu "
+           "reuse_fraction=%.9f queries_per_build=%.9f "
+           "max_queries_per_build=%llu\n",
+           queries,
+           observations,
+           builds,
+           reuses,
+           invalidations,
+           observations ? (double)reuses / (double)observations : 0.0,
+           builds ? (double)observations / (double)builds : 0.0,
+           max_span);
+    static const char* names[2] = {"vf_ccd", "ee_ccd"};
+    for(int family = 0; family < 2; ++family)
+        printf("[bvh-ccd-coherence-work] query_family=%s "
+               "primitive_tests=%llu reusable_primitive_tests=%llu "
+               "weighted_reuse_fraction=%.9f\n",
+               names[family],
+               work[family],
+               reusable_work[family],
+               work[family]
+                   ? (double)reusable_work[family] / (double)work[family]
+                   : 0.0);
+}
+
 void GIPC::updateBvhVfPairCache()
 {
     if(!getenv("STIFF_BVH_PAIR_CACHE")
        || !getenv("STIFF_BVH_BODY_MAJOR"))
         return;
-    if(const char* mask = getenv("STIFF_BVH_BODY_MAJOR_MASK"))
-        if(!(atoi(mask) & 1))
-            return;
+    int pair_cache_mask = 0x1;
+    if(const char* value = getenv("STIFF_BVH_PAIR_CACHE_MASK"))
+        pair_cache_mask = atoi(value) & 0x3;
+    int body_major_mask = 0x3;
+    if(const char* value = getenv("STIFF_BVH_BODY_MAJOR_MASK"))
+        body_major_mask = atoi(value) & 0x3;
+    // Each cached family needs body-major primitives and node labels for its
+    // own tree.  The original VF prototype hard-coded bit 0 here, which made
+    // an EE-only (bit 1) experiment a silent no-op.
+    if(!(pair_cache_mask & body_major_mask))
+        return;
 
     // The isolated path point-swaps one BVH object across several per-env
     // scratch slots/streams.  This first prototype owns one global cache
@@ -412,6 +697,14 @@ void GIPC::updateBvhVfPairCache()
         m_bvh_vf_cache_segment_capacity = segment_capacity;
         m_bvh_vf_cache_device_validity =
             getenv("STIFF_BVH_PAIR_CACHE_DEVICE") != nullptr;
+        m_bvh_pair_cache_mask = 0x1;
+        if(const char* value = getenv("STIFF_BVH_PAIR_CACHE_MASK"))
+            m_bvh_pair_cache_mask = atoi(value) & 0x3;
+        // EE reuses the same device-side validity generation.  Do not expose
+        // a half-host/half-device implementation for the new family.
+        if(!m_bvh_vf_cache_device_validity)
+            m_bvh_pair_cache_mask &= ~0x2;
+        m_bvh_ee_cache_segment_capacity = segment_capacity;
 
         std::vector<int> index(
             static_cast<size_t>(body_count) * body_count, -1);
@@ -426,15 +719,30 @@ void GIPC::updateBvhVfPairCache()
                                   (size_t)m_bvh_vf_cache_pair_count));
         CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_cache_index,
                                   index.size() * sizeof(int)));
-        CUDA_SAFE_CALL(cudaMalloc(
-            (void**)&m_bvh_vf_cache_candidates,
-            (size_t)m_bvh_vf_cache_pair_count * segment_capacity
-                * sizeof(int2)));
-        CUDA_SAFE_CALL(cudaMalloc(
-            (void**)&m_bvh_vf_cache_counts,
-            (size_t)m_bvh_vf_cache_pair_count * sizeof(uint32_t)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_cache_overflow,
-                                  sizeof(int)));
+        if(m_bvh_pair_cache_mask & 0x1)
+        {
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_vf_cache_candidates,
+                (size_t)m_bvh_vf_cache_pair_count * segment_capacity
+                    * sizeof(int2)));
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_vf_cache_counts,
+                (size_t)m_bvh_vf_cache_pair_count * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_cache_overflow,
+                                      sizeof(int)));
+        }
+        if(m_bvh_pair_cache_mask & 0x2)
+        {
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_ee_cache_candidates,
+                (size_t)m_bvh_vf_cache_pair_count * segment_capacity
+                    * sizeof(int2)));
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_ee_cache_counts,
+                (size_t)m_bvh_vf_cache_pair_count * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_ee_cache_overflow,
+                                      sizeof(int)));
+        }
         if(m_bvh_vf_cache_device_validity)
         {
             std::vector<uint32_t> reference_offsets;
@@ -468,7 +776,7 @@ void GIPC::updateBvhVfPairCache()
                 reference_vertices.size() * sizeof(double3)));
             CUDA_SAFE_CALL(cudaMalloc(
                 (void**)&m_bvh_vf_cache_device_stats,
-                4 * sizeof(unsigned long long)));
+                5 * sizeof(unsigned long long)));
             CUDA_SAFE_CALL(cudaMemcpy(m_bvh_vf_cache_ref_offsets,
                                       reference_offsets.data(),
                                       reference_offsets.size()
@@ -480,29 +788,68 @@ void GIPC::updateBvhVfPairCache()
                                       cudaMemcpyHostToDevice));
             CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_cache_device_stats,
                                       0,
-                                      4 * sizeof(unsigned long long)));
+                                      5 * sizeof(unsigned long long)));
         }
-        CUDA_SAFE_CALL(cudaMalloc(
-            (void**)&m_bvh_vf_front_nodes,
-            (size_t)body_count * m_bvh_vf_front_capacity
-                * sizeof(uint32_t)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_front_counts,
-                                  (size_t)body_count * sizeof(uint32_t)));
-        CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_front_overflow,
-                                  sizeof(int)));
+        if(m_bvh_pair_cache_mask & 0x1)
+        {
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_vf_front_nodes,
+                (size_t)body_count * m_bvh_vf_front_capacity
+                    * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_front_counts,
+                                      (size_t)body_count
+                                          * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_vf_front_overflow,
+                                      sizeof(int)));
+        }
+        if(m_bvh_pair_cache_mask & 0x2)
+        {
+            CUDA_SAFE_CALL(cudaMalloc(
+                (void**)&m_bvh_ee_front_nodes,
+                (size_t)body_count * m_bvh_vf_front_capacity
+                    * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_ee_front_counts,
+                                      (size_t)body_count
+                                          * sizeof(uint32_t)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_ee_front_overflow,
+                                      sizeof(int)));
+        }
         CUDA_SAFE_CALL(cudaMemcpy(m_bvh_vf_cache_index,
                                   index.data(),
                                   index.size() * sizeof(int),
                                   cudaMemcpyHostToDevice));
-        CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_cache_counts,
-                                  0,
-                                  (size_t)m_bvh_vf_cache_pair_count
-                                      * sizeof(uint32_t)));
-        CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_cache_overflow, 0, sizeof(int)));
-        CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_front_counts,
-                                  0,
-                                  (size_t)body_count * sizeof(uint32_t)));
-        CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_front_overflow, 0, sizeof(int)));
+        if(m_bvh_vf_cache_counts)
+            CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_cache_counts,
+                                      0,
+                                      (size_t)m_bvh_vf_cache_pair_count
+                                          * sizeof(uint32_t)));
+        if(m_bvh_vf_cache_overflow)
+            CUDA_SAFE_CALL(
+                cudaMemset(m_bvh_vf_cache_overflow, 0, sizeof(int)));
+        if(m_bvh_ee_cache_counts)
+            CUDA_SAFE_CALL(cudaMemset(m_bvh_ee_cache_counts,
+                                      0,
+                                      (size_t)m_bvh_vf_cache_pair_count
+                                          * sizeof(uint32_t)));
+        if(m_bvh_ee_cache_overflow)
+            CUDA_SAFE_CALL(
+                cudaMemset(m_bvh_ee_cache_overflow, 0, sizeof(int)));
+        if(m_bvh_vf_front_counts)
+            CUDA_SAFE_CALL(cudaMemset(m_bvh_vf_front_counts,
+                                      0,
+                                      (size_t)body_count
+                                          * sizeof(uint32_t)));
+        if(m_bvh_vf_front_overflow)
+            CUDA_SAFE_CALL(
+                cudaMemset(m_bvh_vf_front_overflow, 0, sizeof(int)));
+        if(m_bvh_ee_front_counts)
+            CUDA_SAFE_CALL(cudaMemset(m_bvh_ee_front_counts,
+                                      0,
+                                      (size_t)body_count
+                                          * sizeof(uint32_t)));
+        if(m_bvh_ee_front_overflow)
+            CUDA_SAFE_CALL(
+                cudaMemset(m_bvh_ee_front_overflow, 0, sizeof(int)));
         set_bvh_vf_pair_cache(m_bvh_vf_cache_valid,
                               m_bvh_vf_cache_index,
                               body_count,
@@ -511,10 +858,23 @@ void GIPC::updateBvhVfPairCache()
                               m_bvh_vf_cache_counts,
                               segment_capacity,
                               m_bvh_vf_cache_overflow);
+        set_bvh_ee_pair_cache(m_bvh_ee_cache_candidates,
+                              m_bvh_ee_cache_counts,
+                              m_bvh_ee_cache_segment_capacity,
+                              m_bvh_ee_cache_overflow,
+                              bvh_e.m_node_body);
         set_bvh_vf_pair_front(m_bvh_vf_front_nodes,
                               m_bvh_vf_front_counts,
-                              m_bvh_vf_front_capacity,
+                              m_bvh_vf_front_nodes
+                                  ? m_bvh_vf_front_capacity
+                                  : 0,
                               m_bvh_vf_front_overflow);
+        set_bvh_ee_pair_front(m_bvh_ee_front_nodes,
+                              m_bvh_ee_front_counts,
+                              m_bvh_ee_front_nodes
+                                  ? m_bvh_vf_front_capacity
+                                  : 0,
+                              m_bvh_ee_front_overflow);
         // The DCD tree for this observation was constructed immediately
         // before buildCP(), when the front storage did not exist yet.  Build
         // its front now so the first cache generation is exhaustive by body
@@ -524,20 +884,24 @@ void GIPC::updateBvhVfPairCache()
              && bvh_f.face_number_active <= (int)bvh_f.face_number)
                 ? bvh_f.face_number_active
                 : (int)bvh_f.face_number;
-        rebuild_bvh_vf_pair_front(bvh_f._nodes,
-                                  bvh_f.m_node_body,
-                                  face_tree_count,
-                                  0);
+        if(m_bvh_pair_cache_mask & 0x1)
+            rebuild_bvh_vf_pair_front(bvh_f._nodes,
+                                      bvh_f.m_node_body,
+                                      face_tree_count,
+                                      0);
         m_bvh_vf_cache_ready = true;
         force_rebuild = true;
-        printf("[bvh-pair-cache] armed VF-DCD pairs=%d segment_cap=%d "
+        printf("[bvh-pair-cache] armed mask=0x%x pairs=%d segment_cap=%d "
                "front_cap=%d candidate_bytes=%zu validity=%s "
                "reference_entries=%d\n",
+               m_bvh_pair_cache_mask,
                m_bvh_vf_cache_pair_count,
                segment_capacity,
                m_bvh_vf_front_capacity,
                (size_t)m_bvh_vf_cache_pair_count * segment_capacity
-                   * sizeof(int2),
+                   * sizeof(int2)
+                   * ((m_bvh_pair_cache_mask & 0x1 ? 1 : 0)
+                      + (m_bvh_pair_cache_mask & 0x2 ? 1 : 0)),
                m_bvh_vf_cache_device_validity ? "device" : "host-audit",
                m_bvh_vf_cache_ref_entry_count);
     }
@@ -619,6 +983,8 @@ void GIPC::updateBvhVfPairCache()
             m_bvh_vf_cache_valid,
             m_bvh_vf_cache_counts,
             m_bvh_vf_cache_overflow,
+            m_bvh_ee_cache_counts,
+            m_bvh_ee_cache_overflow,
             m_bvh_vf_cache_ref_offsets,
             m_bvh_vf_cache_ref_vertices,
             m_bvh_vf_cache_references,
@@ -626,12 +992,17 @@ void GIPC::updateBvhVfPairCache()
             displacement_budget,
             force_rebuild ? 1 : 0,
             m_bvh_vf_cache_segment_capacity,
+            m_bvh_ee_cache_segment_capacity,
             m_bvh_vf_cache_device_stats);
         // Every pair observed the prior query's overflow bit in the validity
         // kernel.  Clearing it afterwards starts the new generation without a
         // host query or a device-wide synchronization.
-        CUDA_SAFE_CALL(cudaMemsetAsync(
-            m_bvh_vf_cache_overflow, 0, sizeof(int), 0));
+        if(m_bvh_vf_cache_overflow)
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                m_bvh_vf_cache_overflow, 0, sizeof(int), 0));
+        if(m_bvh_ee_cache_overflow)
+            CUDA_SAFE_CALL(cudaMemsetAsync(
+                m_bvh_ee_cache_overflow, 0, sizeof(int), 0));
         return;
     }
 
@@ -910,6 +1281,7 @@ void GIPC::auditBvhTemporalCoherence()
 
 void GIPC::printBvhTemporalCoherence()
 {
+    printBvhSweptTemporalCoherence();
     const bool coherence_audit =
         getenv("STIFF_BVH_COHERENCE_AUDIT") != nullptr;
     if(!coherence_audit)
@@ -920,44 +1292,72 @@ void GIPC::printBvhTemporalCoherence()
         if(m_bvh_vf_cache_ready && m_bvh_vf_cache_device_validity
            && getenv("STIFF_BVH_PAIR_CACHE_STATS"))
         {
-            unsigned long long stats[4] = {};
+            unsigned long long stats[5] = {};
             CUDA_SAFE_CALL(cudaMemcpy(stats,
                                       m_bvh_vf_cache_device_stats,
                                       sizeof(stats),
                                       cudaMemcpyDeviceToHost));
-            int front_overflow = 0;
-            CUDA_SAFE_CALL(cudaMemcpy(&front_overflow,
-                                      m_bvh_vf_front_overflow,
-                                      sizeof(int),
-                                      cudaMemcpyDeviceToHost));
-            std::vector<uint32_t> front_counts(
-                (size_t)bvh_f._collision_body_count, 0);
-            CUDA_SAFE_CALL(cudaMemcpy(front_counts.data(),
-                                      m_bvh_vf_front_counts,
-                                      front_counts.size() * sizeof(uint32_t),
-                                      cudaMemcpyDeviceToHost));
-            uint32_t roots = 0, max_body_roots = 0;
-            for(uint32_t count : front_counts)
+            int vf_front_overflow = 0, ee_front_overflow = 0;
+            uint32_t vf_roots = 0, vf_max_body_roots = 0;
+            uint32_t ee_roots = 0, ee_max_body_roots = 0;
+            const auto summarize_front = [&](const uint32_t* device_counts,
+                                             const int* device_overflow,
+                                             int& overflow,
+                                             uint32_t& roots,
+                                             uint32_t& max_body_roots)
             {
-                roots += std::min<uint32_t>(
-                    count,
-                    static_cast<uint32_t>(m_bvh_vf_front_capacity));
-                max_body_roots = std::max(max_body_roots, count);
-            }
+                if(!device_counts || !device_overflow)
+                    return;
+                CUDA_SAFE_CALL(cudaMemcpy(&overflow,
+                                          device_overflow,
+                                          sizeof(int),
+                                          cudaMemcpyDeviceToHost));
+                std::vector<uint32_t> counts(
+                    (size_t)bvh_f._collision_body_count, 0);
+                CUDA_SAFE_CALL(cudaMemcpy(counts.data(),
+                                          device_counts,
+                                          counts.size() * sizeof(uint32_t),
+                                          cudaMemcpyDeviceToHost));
+                for(uint32_t count : counts)
+                {
+                    roots += std::min<uint32_t>(
+                        count,
+                        static_cast<uint32_t>(m_bvh_vf_front_capacity));
+                    max_body_roots = std::max(max_body_roots, count);
+                }
+            };
+            summarize_front(m_bvh_vf_front_counts,
+                            m_bvh_vf_front_overflow,
+                            vf_front_overflow,
+                            vf_roots,
+                            vf_max_body_roots);
+            summarize_front(m_bvh_ee_front_counts,
+                            m_bvh_ee_front_overflow,
+                            ee_front_overflow,
+                            ee_roots,
+                            ee_max_body_roots);
             printf("[bvh-pair-cache-device-stats] queries=%llu "
                    "pair_uses=%llu valid_pair_uses=%llu "
-                   "valid_pair_fraction=%.9f replay_candidates=%llu "
-                   "candidates_per_query=%.3f front_overflow=%d "
-                   "front_roots=%u front_max_body_roots=%u\n",
+                   "valid_pair_fraction=%.9f vf_replay_candidates=%llu "
+                   "vf_candidates_per_query=%.3f ee_replay_candidates=%llu "
+                   "ee_candidates_per_query=%.3f "
+                   "vf_front_overflow=%d vf_front_roots=%u "
+                   "vf_front_max_body_roots=%u ee_front_overflow=%d "
+                   "ee_front_roots=%u ee_front_max_body_roots=%u\n",
                    stats[0],
                    stats[1],
                    stats[2],
                    stats[1] ? (double)stats[2] / (double)stats[1] : 0.0,
                    stats[3],
                    stats[0] ? (double)stats[3] / (double)stats[0] : 0.0,
-                   front_overflow,
-                   roots,
-                   max_body_roots);
+                   stats[4],
+                   stats[0] ? (double)stats[4] / (double)stats[0] : 0.0,
+                   vf_front_overflow,
+                   vf_roots,
+                   vf_max_body_roots,
+                   ee_front_overflow,
+                   ee_roots,
+                   ee_max_body_roots);
         }
         return;
     }

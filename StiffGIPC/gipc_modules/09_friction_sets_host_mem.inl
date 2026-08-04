@@ -328,13 +328,18 @@ void GIPC::FREE_DEVICE_MEM()
     {
         set_bvh_vf_pair_cache(
             nullptr, nullptr, 0, 0, nullptr, nullptr, 0, nullptr);
+        set_bvh_ee_pair_cache(nullptr, nullptr, 0, nullptr, nullptr);
         set_bvh_vf_pair_front(nullptr, nullptr, 0, nullptr);
+        set_bvh_ee_pair_front(nullptr, nullptr, 0, nullptr);
     }
     release(m_bvh_vf_cache_valid);
     release(m_bvh_vf_cache_index);
     release(m_bvh_vf_cache_candidates);
     release(m_bvh_vf_cache_counts);
     release(m_bvh_vf_cache_overflow);
+    release(m_bvh_ee_cache_candidates);
+    release(m_bvh_ee_cache_counts);
+    release(m_bvh_ee_cache_overflow);
     release(m_bvh_vf_cache_ref_offsets);
     release(m_bvh_vf_cache_ref_vertices);
     release(m_bvh_vf_cache_references);
@@ -342,11 +347,16 @@ void GIPC::FREE_DEVICE_MEM()
     release(m_bvh_vf_front_nodes);
     release(m_bvh_vf_front_counts);
     release(m_bvh_vf_front_overflow);
+    release(m_bvh_ee_front_nodes);
+    release(m_bvh_ee_front_counts);
+    release(m_bvh_ee_front_overflow);
     release(m_bvh_face_body);
     release(m_bvh_edge_body);
     m_bvh_vf_cache_ready = false;
     m_bvh_vf_cache_pair_count = 0;
     m_bvh_vf_cache_segment_capacity = 0;
+    m_bvh_ee_cache_segment_capacity = 0;
+    m_bvh_pair_cache_mask = 0;
     m_bvh_vf_cache_ref_entry_count = 0;
     m_bvh_vf_cache_device_validity = false;
 #endif

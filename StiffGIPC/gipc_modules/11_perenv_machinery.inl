@@ -538,6 +538,13 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
         return;
     }
 
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+    // A swept Verlet proof must track both segment endpoints.  Reusing the
+    // DCD cache's start-position-only decision would be incomplete whenever
+    // the Newton direction or device alpha changes.
+    auditBvhSweptTemporalCoherence(alpha, alpha_dev);
+#endif
+
     // [multi-env P2] per-env CCD path (the swept-BVH equivalent of the per-env DCD path).
     // [C5] m_graph_merged_detect forces the merged swept path (see buildCP).
     if(m_perenv_bvh && m_d_p2g && m_perenv_bvh_groups > 0 && !m_graph_merged_detect)

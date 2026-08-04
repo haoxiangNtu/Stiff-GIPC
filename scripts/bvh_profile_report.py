@@ -53,8 +53,10 @@ TRAVERSAL_SUPPORT_PREFIXES = {
 
 CACHE_PREFIXES = {
     "vf_dcd_replay": ("_replayVfPairCache(",),
+    "ee_dcd_replay": ("_replayEePairCache(",),
     "vf_cache_validity": ("_updateBvhVfPairCacheValidityDevice(",),
     "vf_cache_front": ("_buildBvhVfPairFront(",),
+    "ee_cache_front": ("_buildBvhEePairFront(",),
     "vf_cache_reset": ("_resetInvalidVfPairCacheCounts(",),
 }
 

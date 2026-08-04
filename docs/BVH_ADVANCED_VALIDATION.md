@@ -396,7 +396,8 @@ PT classifier, so distance type, active-barrier status, contact encoding, and
 all later mollification/friction work are recomputed.  A maximal uniform-body
 subtree front lets an invalid pair start at only that target body's roots;
 valid pairs skip tree traversal and replay their own segment.  EE and all CCD
-semantics remain separate.
+semantics use independent candidate families and are never inferred from a VF
+hit.
 
 `STIFF_BVH_PAIR_CACHE_DEVICE=1` removes the validation prototype's per-query
 host decision.  Pair-specific reference positions, two-sided maximum
@@ -457,6 +458,67 @@ changed the trajectory beyond the observed two-baseline RMS envelope.  The
 next cache tests must be pair-selective and must measure EE-DCD and swept CCD
 independently rather than assuming the VF result transfers.
 
+### EE-DCD extension and the shared-front concurrency boundary
+
+`STIFF_BVH_PAIR_CACHE_MASK` now selects VF-DCD with bit 0 and EE-DCD with bit
+1.  EE stores raw edge-index pairs and reruns the unchanged exact
+`_checkEEintersection<false>` path on every reuse.  A first combined prototype
+incorrectly shared one mutable front between the default-stream VF detector
+and auxiliary-stream EE detector.  The frozen oracle caught the resulting
+race: only 25,531 of the baseline's 30,832 encoded pairs survived.  VF and EE
+now own separate front arrays, counters, overflow flags, device symbols, and
+front-build kernels.  The same counterexample then retained all 30,832 rows,
+with exact physical and original-encoding multisets and zero front overflow.
+The complete frozen FOLD gate also passed for merged and isolated frames 1,
+10, and 30 with exact geometry and exact DCD/CCD physical and encoded
+multisets; isolated presently exercises the honest cache-disabled path.
+This establishes the safe scope of a shared traversal runtime: code and
+read-only interfaces may be shared, but mutable fronts must be isolated by
+tree family and concurrent stream.
+
+EE-only caching is a clear performance loss on the PLOC/refit tree.  In the
+same frozen frame-30 checkpoint repeated for 1,000 DCD rebuilds, ordinary EE
+traversal used 2,236.166 ms.  The candidate used 37.124 ms of residual
+traversal, 3,513.837 ms of exact replay, 27.783 ms of shared validity, and
+3.680 ms of front construction: 3,582.424 ms (**+60.20%**).  Total kernel time
+rose from 5,925.296 to 7,284.339 ms (**+22.94%**).  The reason is direct: each
+query replayed about 89,621 raw EE candidates, and exact EE reclassification
+cost more than traversing the already-good tree.
+
+The corrected combined VF+EE cache is still a frozen structural win because
+VF's saving is larger than EE's loss.  Against a body-major VF+EE baseline,
+1,000 rebuilds kept the exact 30,832 encoded rows while total kernel time fell
+5,526.666 to 4,885.925 ms (**-11.59%**) and the complete DCD path fell
+5,399.152 to 4,757.572 ms (**-11.88%**).  Two free-run replicas did not show a
+consistent Newton penalty (baseline 750/812, candidate 764/797), but baseline
+nondeterminism and large wall-time variance prevent crediting an end-to-end
+speedup.  EE-only is rejected; the combination remains diagnostic/opt-in.
+
+### Swept CCD endpoint-coherence audit
+
+A DCD reference position is not a valid proof for a swept query.  The new
+`STIFF_BVH_CCD_COHERENCE_AUDIT` records both endpoints of every vertex sweep
+for each body pair.  A cached list is considered complete only while
+`max_endpoint_disp(A) + max_endpoint_disp(B) <= delta`; linear interpolation
+then bounds every point of each swept primitive by the same per-body maximum.
+The audit is host-synchronized diagnostic code only and is never active in a
+timed candidate or CUDA Graph.
+
+On three freely evolved 30-frame FOLD runs, pair/work reuse was:
+
+| margin scale | pair reuse | VF-CCD weighted work reuse | EE-CCD weighted work reuse |
+|---:|---:|---:|---:|
+| 1.25 | 30.80% | 27.10% | 25.60% |
+| 1.50 | 35.35% | 31.45% | 29.29% |
+| 2.00 | 45.43% | 39.99% | 37.71% |
+
+These values are high enough to justify one real base-gap-filtered replay
+prototype, but too low to claim a win: the earlier margin census found that a
+2.0 swept list grows about 43%.  A production candidate must therefore cache
+expanded raw pairs, revalidate both endpoints on device, and filter every
+replay against the current ordinary gap so the published CCD candidate set
+remains exactly unchanged.
+
 The current cache is intentionally disabled for the isolated per-env BVH
 path.  That path point-swaps one BVH object across stream-local scratch slots;
 correct support needs independent candidate generations, references, counts,
@@ -486,6 +548,8 @@ yet.
   slice in real evolution (about 8.4% of its own path, under 1% whole-kernel
   time).  It has a much larger frozen gain when stacked with PLOC/refit, but
   changes contact publication order and increased Newton work in every tested
-  free run, so it remains opt-in and outside the winner bundle.  EE/CCD family
-  caches, isolated per-env cache generations, and the general shared traversal
-  runtime remain pending.
+  VF-only free run, so it remains opt-in and outside the winner bundle.
+  EE-DCD is implemented and rejected alone (+60% family-path cost); corrected
+  VF+EE is a frozen -11.9% DCD-path experiment but has no credited free-run
+  win.  Swept endpoint coherence is now measured and warrants a filtered CCD
+  replay prototype.  Isolated per-env cache generations remain pending.

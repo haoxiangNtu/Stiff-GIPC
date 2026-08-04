@@ -337,15 +337,27 @@ __device__ int2* g_bvh_vf_cache_candidates = nullptr;
 __device__ uint32_t* g_bvh_vf_cache_counts = nullptr;
 __device__ int g_bvh_vf_cache_segment_capacity = 0;
 __device__ int* g_bvh_vf_cache_overflow = nullptr;
+__device__ int2* g_bvh_ee_cache_candidates = nullptr;
+__device__ uint32_t* g_bvh_ee_cache_counts = nullptr;
+__device__ int g_bvh_ee_cache_segment_capacity = 0;
+__device__ int* g_bvh_ee_cache_overflow = nullptr;
+__device__ const int* g_bvh_ee_node_body = nullptr;
 __device__ uint32_t* g_bvh_vf_front_nodes = nullptr;
 __device__ uint32_t* g_bvh_vf_front_counts = nullptr;
 __device__ int g_bvh_vf_front_capacity = 0;
 __device__ int* g_bvh_vf_front_overflow = nullptr;
+__device__ uint32_t* g_bvh_ee_front_nodes = nullptr;
+__device__ uint32_t* g_bvh_ee_front_counts = nullptr;
+__device__ int g_bvh_ee_front_capacity = 0;
+__device__ int* g_bvh_ee_front_overflow = nullptr;
 static int h_bvh_vf_cache_pair_count = 0;
 static int h_bvh_vf_cache_body_count = 0;
 static int h_bvh_vf_front_capacity = 0;
 static uint32_t* h_bvh_vf_front_counts = nullptr;
 static int* h_bvh_vf_front_overflow = nullptr;
+static int h_bvh_ee_front_capacity = 0;
+static uint32_t* h_bvh_ee_front_counts = nullptr;
+static int* h_bvh_ee_front_overflow = nullptr;
 
 void set_bvh_vf_pair_cache(const unsigned char* pair_valid,
                            const int*           pair_index,
@@ -377,6 +389,25 @@ void set_bvh_vf_pair_cache(const unsigned char* pair_valid,
         g_bvh_vf_cache_overflow, &overflow, sizeof(overflow)));
 }
 
+void set_bvh_ee_pair_cache(int2*      candidates,
+                           uint32_t*  counts,
+                           int        segment_capacity,
+                           int*       overflow,
+                           const int* node_body)
+{
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_cache_candidates, &candidates, sizeof(candidates)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_cache_counts, &counts, sizeof(counts)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_ee_cache_segment_capacity,
+                                     &segment_capacity,
+                                     sizeof(segment_capacity)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_cache_overflow, &overflow, sizeof(overflow)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_node_body, &node_body, sizeof(node_body)));
+}
+
 void set_bvh_vf_pair_front(uint32_t* front_nodes,
                            uint32_t* front_counts,
                            int       front_capacity,
@@ -393,6 +424,24 @@ void set_bvh_vf_pair_front(uint32_t* front_nodes,
         g_bvh_vf_front_capacity, &front_capacity, sizeof(front_capacity)));
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(
         g_bvh_vf_front_overflow, &front_overflow, sizeof(front_overflow)));
+}
+
+void set_bvh_ee_pair_front(uint32_t* front_nodes,
+                           uint32_t* front_counts,
+                           int       front_capacity,
+                           int*      front_overflow)
+{
+    h_bvh_ee_front_capacity = front_capacity;
+    h_bvh_ee_front_counts = front_counts;
+    h_bvh_ee_front_overflow = front_overflow;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_front_nodes, &front_nodes, sizeof(front_nodes)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_front_counts, &front_counts, sizeof(front_counts)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_front_capacity, &front_capacity, sizeof(front_capacity)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(
+        g_bvh_ee_front_overflow, &front_overflow, sizeof(front_overflow)));
 }
 
 __global__ void _buildBvhVfPairFront(const Node* nodes,
@@ -445,6 +494,56 @@ void rebuild_bvh_vf_pair_front(const Node* nodes,
         h_bvh_vf_front_overflow, 0, sizeof(int), stream));
     const int node_count = 2 * primitive_count - 1;
     _buildBvhVfPairFront<<<(node_count + 255) / 256, 256, 0, stream>>>(
+        nodes, node_body, primitive_count);
+}
+
+__global__ void _buildBvhEePairFront(const Node* nodes,
+                                      const int*  node_body,
+                                      int         primitive_count)
+{
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    const int node_count = 2 * primitive_count - 1;
+    if(node >= node_count)
+        return;
+    const int body = node_body[node];
+    if(body < 0 || body >= g_bvh_vf_cache_body_count)
+        return;
+    const uint32_t parent = nodes[node].parent_idx;
+    if(parent != 0xFFFFFFFFu && node_body[parent] == body)
+        return;
+    if(nodes[node].element_idx != 0xFFFFFFFFu)
+    {
+        atomicExch(g_bvh_ee_front_overflow, 1);
+        return;
+    }
+    const uint32_t slot = atomicAdd(&g_bvh_ee_front_counts[body], 1u);
+    if(slot < static_cast<uint32_t>(g_bvh_ee_front_capacity))
+        g_bvh_ee_front_nodes[
+            static_cast<size_t>(body) * g_bvh_ee_front_capacity + slot] =
+            static_cast<uint32_t>(node);
+    else
+        atomicExch(g_bvh_ee_front_overflow, 1);
+}
+
+void rebuild_bvh_ee_pair_front(const Node* nodes,
+                               const int*  node_body,
+                               int         primitive_count,
+                               cudaStream_t stream)
+{
+    if(!getenv("STIFF_BVH_PAIR_CACHE") || h_bvh_vf_cache_body_count <= 0
+       || h_bvh_ee_front_capacity <= 0 || !h_bvh_ee_front_counts
+       || !h_bvh_ee_front_overflow || !nodes || !node_body
+       || primitive_count < 1)
+        return;
+    CUDA_SAFE_CALL(cudaMemsetAsync(h_bvh_ee_front_counts,
+                                   0,
+                                   (size_t)h_bvh_vf_cache_body_count
+                                       * sizeof(uint32_t),
+                                   stream));
+    CUDA_SAFE_CALL(cudaMemsetAsync(
+        h_bvh_ee_front_overflow, 0, sizeof(int), stream));
+    const int node_count = 2 * primitive_count - 1;
+    _buildBvhEePairFront<<<(node_count + 255) / 256, 256, 0, stream>>>(
         nodes, node_body, primitive_count);
 }
 
@@ -526,6 +625,34 @@ __device__ __forceinline__ bool _bvhVfCacheSeedFront(
     return true;
 }
 
+__device__ __forceinline__ bool _bvhEeCacheSeedFront(
+    int query_body, uint32_t* stack, uint32_t*& stack_ptr)
+{
+    if(!g_bvh_ee_front_nodes || !g_bvh_ee_front_counts
+       || !g_bvh_ee_front_overflow || *g_bvh_ee_front_overflow
+       || !g_bvh_vf_cache_valid || !g_bvh_vf_cache_index)
+        return false;
+    for(int target_body = 0; target_body < g_bvh_vf_cache_body_count;
+        ++target_body)
+    {
+        const int pair = _bvhVfCachePairIndex(query_body, target_body);
+        if(pair < 0 || g_bvh_vf_cache_valid[pair])
+            continue;
+        const uint32_t count = g_bvh_ee_front_counts[target_body];
+        if(count > static_cast<uint32_t>(g_bvh_ee_front_capacity)
+           || stack_ptr - stack + count > STIFF_BVH_STACK_CAP)
+        {
+            stack_ptr = stack;
+            return false;
+        }
+        const size_t begin =
+            static_cast<size_t>(target_body) * g_bvh_ee_front_capacity;
+        for(uint32_t i = 0; i < count; ++i)
+            *stack_ptr++ = g_bvh_ee_front_nodes[begin + i];
+    }
+    return true;
+}
+
 __device__ __forceinline__ void _bvhVfCacheRecord(int query_body,
                                                    int target_body,
                                                    int vertex,
@@ -542,6 +669,36 @@ __device__ __forceinline__ void _bvhVfCacheRecord(int query_body,
             + slot] = make_int2(vertex, face);
     else if(g_bvh_vf_cache_overflow)
         atomicExch(g_bvh_vf_cache_overflow, 1);
+}
+
+__device__ __forceinline__ bool _bvhVfCacheEnabled()
+{
+    return g_bvh_vf_cache_candidates && g_bvh_vf_cache_counts
+           && g_bvh_vf_cache_segment_capacity > 0;
+}
+
+__device__ __forceinline__ bool _bvhEeCacheEnabled()
+{
+    return g_bvh_ee_cache_candidates && g_bvh_ee_cache_counts
+           && g_bvh_ee_cache_segment_capacity > 0 && g_bvh_ee_node_body;
+}
+
+__device__ __forceinline__ void _bvhEeCacheRecord(int query_body,
+                                                   int target_body,
+                                                   int self_edge,
+                                                   int target_edge)
+{
+    const int pair = _bvhVfCachePairIndex(query_body, target_body);
+    if(pair < 0 || !g_bvh_vf_cache_valid || g_bvh_vf_cache_valid[pair]
+       || !g_bvh_ee_cache_counts || !g_bvh_ee_cache_candidates)
+        return;
+    const uint32_t slot = atomicAdd(&g_bvh_ee_cache_counts[pair], 1u);
+    if(slot < static_cast<uint32_t>(g_bvh_ee_cache_segment_capacity))
+        g_bvh_ee_cache_candidates[
+            static_cast<size_t>(pair) * g_bvh_ee_cache_segment_capacity
+            + slot] = make_int2(self_edge, target_edge);
+    else if(g_bvh_ee_cache_overflow)
+        atomicExch(g_bvh_ee_cache_overflow, 1);
 }
 
 void set_ee_trace(int v) { static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); last = v; }

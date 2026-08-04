@@ -287,6 +287,19 @@ class GIPC
         unsigned long long primitive_tests[4] = {};
         unsigned long long reusable_primitive_tests[4] = {};
     };
+    struct BvhSweptPairState
+    {
+        int body_a = -1;
+        int body_b = -1;
+        std::vector<double3> reference_start_a;
+        std::vector<double3> reference_end_a;
+        std::vector<double3> reference_start_b;
+        std::vector<double3> reference_end_b;
+        BvhCoherenceStat stat;
+        bool reusable_this_observation = false;
+        unsigned long long primitive_tests[2] = {};
+        unsigned long long reusable_primitive_tests[2] = {};
+    };
     bool                     m_bvh_family_coherence_initialized = false;
     std::vector<int>         m_bvh_coherence_body_id;
     std::vector<int>         m_bvh_coherence_body_is_fem;
@@ -296,6 +309,11 @@ class GIPC
     std::vector<BvhCoherenceStat> m_bvh_coherence_body_stats;
     std::vector<BvhCoherencePairState> m_bvh_coherence_pair_states;
     std::vector<unsigned long long> m_bvh_pair_work_snapshot;
+    std::vector<BvhSweptPairState> m_bvh_swept_pair_states;
+    std::vector<unsigned long long> m_bvh_swept_pair_work_snapshot;
+    std::vector<double3> m_bvh_swept_current_start;
+    std::vector<double3> m_bvh_swept_current_end;
+    bool m_bvh_swept_coherence_initialized = false;
     bool                     m_bvh_vf_cache_ready = false;
     int                      m_bvh_vf_cache_pair_count = 0;
     int                      m_bvh_vf_cache_segment_capacity = 0;
@@ -304,6 +322,11 @@ class GIPC
     int2*                    m_bvh_vf_cache_candidates = nullptr;
     uint32_t*                m_bvh_vf_cache_counts = nullptr;
     int*                     m_bvh_vf_cache_overflow = nullptr;
+    int2*                    m_bvh_ee_cache_candidates = nullptr;
+    uint32_t*                m_bvh_ee_cache_counts = nullptr;
+    int*                     m_bvh_ee_cache_overflow = nullptr;
+    int                      m_bvh_ee_cache_segment_capacity = 0;
+    int                      m_bvh_pair_cache_mask = 0;
     uint32_t*                m_bvh_vf_cache_ref_offsets = nullptr;
     int*                     m_bvh_vf_cache_ref_vertices = nullptr;
     double3*                 m_bvh_vf_cache_references = nullptr;
@@ -313,6 +336,9 @@ class GIPC
     uint32_t*                m_bvh_vf_front_nodes = nullptr;
     uint32_t*                m_bvh_vf_front_counts = nullptr;
     int*                     m_bvh_vf_front_overflow = nullptr;
+    uint32_t*                m_bvh_ee_front_nodes = nullptr;
+    uint32_t*                m_bvh_ee_front_counts = nullptr;
+    int*                     m_bvh_ee_front_overflow = nullptr;
     int                      m_bvh_vf_front_capacity = 128;
     unsigned long long       m_bvh_vf_cache_queries = 0;
     unsigned long long       m_bvh_vf_cache_valid_pair_uses = 0;
@@ -326,6 +352,10 @@ class GIPC
     void collectBvhPairWorkload();
     void updateBvhVfPairCache();
     void auditBvhTemporalCoherence();
+    void auditBvhSweptTemporalCoherence(const double& alpha,
+                                         const double* alpha_dev);
+    void collectBvhSweptPairWorkload();
+    void printBvhSweptTemporalCoherence();
     void printBvhTemporalCoherence();
 #endif
 

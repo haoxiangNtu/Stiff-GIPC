@@ -26,6 +26,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     AABB _bv;
     idx       = _surfVerts[idx];
     const int query_body = _bodyID[idx];
+    const bool cache_enabled = _bvhVfCacheEnabled();
 
     // BVH-skip: query vertex's body has no possible collisions → exit early.
     // (audit/perf-bvh-skip-isolated: diag[B][B]==1 marks isolated body)
@@ -39,7 +40,8 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfDcd);
     BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[idx]);
 
-    if(!_bvhVfCacheSeedFront(query_body, stack, stack_ptr))
+    if(!cache_enabled
+       || !_bvhVfCacheSeedFront(query_body, stack, stack_ptr))
         BVH_STACK_PUSH(0);
 
     _bv.upper = _vertexes[idx];
@@ -49,7 +51,8 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     // Only the cached VF-DCD list is a Verlet-style margin list.  Expanding
     // unrelated EE/CCD traversals would change their candidate workload and
     // make the cache experiment impossible to attribute fairly.
-    double gapl = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    double gapl = cache_enabled ? BVH_TRAVERSAL_MARGIN(sqrt(dHat))
+                                : sqrt(dHat);
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
     while(stack < stack_ptr)
@@ -60,8 +63,9 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
-        if(!_bvhVfCacheSkipNode(
-               query_body, node_body ? node_body[L_idx] : -1)
+        if((!cache_enabled
+            || !_bvhVfCacheSkipNode(
+                query_body, node_body ? node_body[L_idx] : -1))
            && overlap(_bv, _bvs[L_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
@@ -106,8 +110,9 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                 BVH_STACK_PUSH(L_idx);
             }
         }
-        if(!_bvhVfCacheSkipNode(
-               query_body, node_body ? node_body[R_idx] : -1)
+        if((!cache_enabled
+            || !_bvhVfCacheSkipNode(
+                query_body, node_body ? node_body[R_idx] : -1))
            && overlap(_bv, _bvs[R_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
@@ -183,6 +188,7 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
     uint32_t* stack_ptr = stack;
     idx = _surfVerts[idx];
     const int query_body = _bodyID[idx];
+    const bool cache_enabled = _bvhVfCacheEnabled();
     if(_collision_skip_matrix && _collision_body_count > 0)
     {
         const int body = _bodyID[idx];
@@ -193,12 +199,14 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfDcd);
     BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[idx]);
-    if(!_bvhVfCacheSeedFront(query_body, stack, stack_ptr))
+    if(!cache_enabled
+       || !_bvhVfCacheSeedFront(query_body, stack, stack_ptr))
         BVH_STACK_PUSH(0);
     AABB query;
     query.upper = _vertexes[idx];
     query.lower = _vertexes[idx];
-    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    const double gap = cache_enabled ? BVH_TRAVERSAL_MARGIN(sqrt(dHat))
+                                     : sqrt(dHat);
     while(stack < stack_ptr)
     {
         const uint32_t node_id = *--stack_ptr;
@@ -215,7 +223,8 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
             const uint32_t child = children[slot];
             if(child == 0xFFFFFFFFu)
                 break;
-            if(_bvhVfCacheSkipNode(
+            if(cache_enabled
+               && _bvhVfCacheSkipNode(
                    query_body, node_body ? node_body[child] : -1))
                 continue;
             if(!overlap(query, _bvs[child], gap))
@@ -270,7 +279,8 @@ __global__ void _replayVfPairCache(const double3* vertexes,
                                    double         d_hat)
 {
     const int pair = blockIdx.x;
-    if(pair >= g_bvh_vf_cache_pair_count || !g_bvh_vf_cache_valid[pair])
+    if(pair >= g_bvh_vf_cache_pair_count || !g_bvh_vf_cache_valid[pair]
+       || !_bvhVfCacheEnabled())
         return;
     const uint32_t count = min(
         g_bvh_vf_cache_counts[pair],
@@ -313,6 +323,75 @@ void replay_bvh_vf_pair_cache(const double3* vertexes,
         collision_pair,
         ccd_collision_pair,
         d_hat);
+}
+
+// Reclassify cached raw EE candidates with the unchanged exact EE path.  The
+// cache stores only edge-index pairs that already passed body/env/adjacency
+// filtering; dtype selection, mollification and barrier emission are repeated
+// for the current geometry on every replay.
+__global__ void _replayEePairCache(const double3* vertexes,
+                                   const double3* rest_vertexes,
+                                   const uint2*   edges,
+                                   uint32_t*      cp_num,
+                                   int*           mat_index,
+                                   int4*          collision_pair,
+                                   int4*          ccd_collision_pair,
+                                   double         d_hat,
+                                   int            edge_count)
+{
+    const int pair = blockIdx.x;
+    if(pair >= g_bvh_vf_cache_pair_count || !g_bvh_vf_cache_valid[pair]
+       || !_bvhEeCacheEnabled())
+        return;
+    const uint32_t count = min(
+        g_bvh_ee_cache_counts[pair],
+        static_cast<uint32_t>(g_bvh_ee_cache_segment_capacity));
+    const size_t begin =
+        static_cast<size_t>(pair) * g_bvh_ee_cache_segment_capacity;
+    for(uint32_t i = threadIdx.x; i < count; i += blockDim.x)
+    {
+        const int2 candidate = g_bvh_ee_cache_candidates[begin + i];
+        const uint2 self_edge = edges[candidate.x];
+        const uint2 other_edge = edges[candidate.y];
+        _checkEEintersection<false>(vertexes,
+                                    rest_vertexes,
+                                    self_edge.x,
+                                    self_edge.y,
+                                    other_edge.x,
+                                    other_edge.y,
+                                    candidate.y,
+                                    d_hat,
+                                    cp_num,
+                                    mat_index,
+                                    collision_pair,
+                                    ccd_collision_pair,
+                                    edge_count);
+    }
+}
+
+void replay_bvh_ee_pair_cache(const double3* vertexes,
+                              const double3* rest_vertexes,
+                              const uint2*   edges,
+                              uint32_t*      cp_num,
+                              int*           mat_index,
+                              int4*          collision_pair,
+                              int4*          ccd_collision_pair,
+                              double         d_hat,
+                              int            edge_count,
+                              cudaStream_t   stream)
+{
+    if(!getenv("STIFF_BVH_PAIR_CACHE") || h_bvh_vf_cache_pair_count <= 0)
+        return;
+    _replayEePairCache<<<h_bvh_vf_cache_pair_count, 256, 0, stream>>>(
+        vertexes,
+        rest_vertexes,
+        edges,
+        cp_num,
+        mat_index,
+        collision_pair,
+        ccd_collision_pair,
+        d_hat,
+        edge_count);
 }
 
 __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
@@ -570,18 +649,23 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
 
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr = stack;
-    BVH_STACK_PUSH(0);
 
     const uint32_t self_leaf = (uint32_t)idx;
     idx               = idx + number - 1;
     AABB     _bv      = _bvs[idx];
     uint32_t self_eid = _nodes[idx].element_idx;
     int qenv = (g_bvh_envpart && node_env) ? node_env[idx] : -1;  // [env-part B] query edge env
+    const int query_body = _bodyID[_edges[self_eid].x];
+    const bool cache_enabled = RangePruneMode == 0
+                               && _bvhEeCacheEnabled();
+    if(!cache_enabled
+       || !_bvhEeCacheSeedFront(query_body, stack, stack_ptr))
+        BVH_STACK_PUSH(0);
 
     // BVH-skip (audit/perf-bvh-skip-isolated): if both edge endpoints' body
     // is isolated, no collision is possible — exit early.
     if(_collision_skip_matrix && _collision_body_count > 0) {
-        int B = _bodyID[_edges[self_eid].x];
+        int B = query_body;
         if(B >= 0 && B < _collision_body_count
            && _collision_skip_matrix[B * _collision_body_count + B] != 0)
             return;
@@ -592,7 +676,8 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
 
     //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_bvs[0].upper, _bvs[0].lower));
     //printf("%f\n", bboxDiagSize2);
-    double gapl = sqrt(dHat);
+    double gapl = cache_enabled ? BVH_TRAVERSAL_MARGIN(sqrt(dHat))
+                                : sqrt(dHat);
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
     do
@@ -610,7 +695,12 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
         if constexpr(RangePruneMode == 2)
             if(node_max_element)
                 own_l = node_max_element[L_idx] >= self_leaf;
-        if(own_l && (qenv < 0 || node_env[L_idx] < 0 || node_env[L_idx] == qenv) && overlap(_bv, _bvs[L_idx], gapl))
+        if(own_l
+           && (!cache_enabled
+               || !_bvhVfCacheSkipNode(
+                   query_body, g_bvh_ee_node_body[L_idx]))
+           && (qenv < 0 || node_env[L_idx] < 0 || node_env[L_idx] == qenv)
+           && overlap(_bv, _bvs[L_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[L_idx].element_idx;
@@ -648,6 +738,12 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
                             {
                                 BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
                                     _bodyID[_edges[obj_idx].x]);
+                                if(cache_enabled)
+                                    _bvhEeCacheRecord(
+                                        query_body,
+                                        _bodyID[_edges[obj_idx].x],
+                                        self_eid,
+                                        obj_idx);
                                 _checkEEintersection<(RangePruneMode == 2)>(_vertexes,
                                                      _rest_vertexes,
                                                      _edges[self_eid].x,
@@ -678,7 +774,12 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
         if constexpr(RangePruneMode == 2)
             if(node_max_element)
                 own_r = node_max_element[R_idx] >= self_leaf;
-        if(own_r && (qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv) && overlap(_bv, _bvs[R_idx], gapl))
+        if(own_r
+           && (!cache_enabled
+               || !_bvhVfCacheSkipNode(
+                   query_body, g_bvh_ee_node_body[R_idx]))
+           && (qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv)
+           && overlap(_bv, _bvs[R_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[R_idx].element_idx;
@@ -714,6 +815,12 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
                             {
                                 BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
                                     _bodyID[_edges[obj_idx].x]);
+                                if(cache_enabled)
+                                    _bvhEeCacheRecord(
+                                        query_body,
+                                        _bodyID[_edges[obj_idx].x],
+                                        self_eid,
+                                        obj_idx);
                                 _checkEEintersection<(RangePruneMode == 2)>(_vertexes,
                                                      _rest_vertexes,
                                                      _edges[self_eid].x,

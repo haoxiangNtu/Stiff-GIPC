@@ -830,6 +830,19 @@ static int bvh_wide8_mask()
     return mask;
 }
 
+static int bvh_pair_cache_mask()
+{
+    static const int mask = []
+    {
+        if(!getenv("STIFF_BVH_PAIR_CACHE"))
+            return 0;
+        const char* value = getenv("STIFF_BVH_PAIR_CACHE_MASK");
+        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0x3)
+                     : 0x1;
+    }();
+    return mask;
+}
+
 static const uint32_t* buildBvh8Children(const Node* nodes,
                                          const AABB* boxes,
                                          AABB*       temp_leaf_boxes,
@@ -1044,6 +1057,32 @@ void selfQuery_ee(const int*     _bodyID,
         return;
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
+
+    // The EE cache records the baseline once-only ownership semantics and
+    // owns its own body front.  Keep this validation path independent of the
+    // range-prune/BVH8 experiments so replay can never be appended to a
+    // second exhaustive traversal variant.
+    if(bvh_pair_cache_mask() & 0x2)
+    {
+        _selfQuery_ee<<<blockNum, threadNum, 0, stream>>>(_bodyID,
+                                                         _btype,
+                                                         _vertexes,
+                                                         _rest_vertexes,
+                                                         _edges,
+                                                         _bvs,
+                                                         _nodes,
+                                                         _collisonPairs,
+                                                         _ccd_collisonPairs,
+                                                         _cpNum,
+                                                         MatIndex,
+                                                         dHat,
+                                                         numbers,
+                                                         _collision_skip_matrix,
+                                                         _collision_body_count,
+                                                         _body_id_to_is_fem,
+                                                         node_env);
+        return;
+    }
 
     if(node_max_element)
     {
@@ -1902,6 +1941,8 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
     const uint32_t* wide_children =
         buildBvh8Children(
             _nodes, _bvs, _tempLeafBox, N, kSahEdgeDcd, stream);
+    if(bvh_pair_cache_mask() & 0x2)
+        rebuild_bvh_ee_pair_front(_nodes, m_node_body, N, stream);
     selfQuery_ee(_bodyId,
                  _btype,
                  _vertexes,
@@ -1922,6 +1963,17 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  m_node_max_element,
                  wide_children,
                  stream);
+    if(bvh_pair_cache_mask() & 0x2)
+        replay_bvh_ee_pair_cache(_vertexes,
+                                 _rest_vertexes,
+                                 _edges,
+                                 _cpNum,
+                                 _MatIndex,
+                                 _collisionPair,
+                                 _ccd_collisionPair,
+                                 dHat,
+                                 N,
+                                 stream);
 }
 
 void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
