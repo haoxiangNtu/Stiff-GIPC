@@ -431,6 +431,24 @@ and 1.544 ms in a now-removed redundant reset kernel: 1,147.005 ms total, only
 the machine's current contention/noise floor.  The structural VF saving is
 positive, but not large enough to default this feature.
 
+Stacking the cache with PLOC++/refit-128 preserves that frozen structural
+gain but is not an end-to-end winner.  On one exact merged frame-30
+checkpoint, 1,000 DCD rebuilds retained the exact physical and original
+encoded contact multiset.  PLOC/refit plus body-major traversal used
+5,262.613 ms of total kernel time and 3,202.398 ms in VF-DCD.  Adding the
+device cache used 3,257.577 ms total (**-38.10%**); its VF path was 26.010 ms
+fresh traversal + 1,143.954 ms exact replay + 28.007 ms validity + 0.030 ms
+front construction (**-62.59%** versus the uncached VF query).
+
+Freely evolved 30-frame replicas exposed the missing cost: two uncached
+body-major runs completed 730/734 Newton iterations, while two cached runs
+completed 776/856.  The uncached replicas already differed by `3.26e-2` in
+maximum final position, so raw trajectory deltas are not a completeness
+oracle; frozen pair gates remain exact.  Nevertheless, the cache consistently
+changed emission/assembly order enough to follow a more expensive Newton
+path.  It is therefore rejected from the PLOC/refit winner bundle unless a
+future order-preserving publication step removes that solver-side penalty.
+
 Margin 1.5 was the only credible tested point.  It reused 43.95% of pair uses
 in the deterministic workload and reduced VF-DCD node pops from 306.7 million
 to 95.2 million without changing results.  Margin 1.25 reused too little;
@@ -466,5 +484,8 @@ yet.
 - Conservative body-pair/family coherence and a GPU-resident VF-DCD raw
   candidate cache/shared body front are implemented.  VF is a small positive
   slice in real evolution (about 8.4% of its own path, under 1% whole-kernel
-  time), so it remains opt-in.  EE/CCD family caches, isolated per-env cache
-  generations, and the general shared traversal runtime remain pending.
+  time).  It has a much larger frozen gain when stacked with PLOC/refit, but
+  changes contact publication order and increased Newton work in every tested
+  free run, so it remains opt-in and outside the winner bundle.  EE/CCD family
+  caches, isolated per-env cache generations, and the general shared traversal
+  runtime remain pending.
