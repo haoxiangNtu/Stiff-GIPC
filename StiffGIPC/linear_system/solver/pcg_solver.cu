@@ -373,7 +373,8 @@ __global__ void update_vector_dx_r_fused(
     // on every thread (otherwise alpha=inf/nan would propagate into x/r).
     if(!isfinite(dot) || dot <= 0.0)
     {
-        if(idx == 0) *d_break = 1;
+        // [pcg-exit-diag] cause code 2: safety guard, not the tolerance test.
+        if(idx == 0) *d_break = 2;
         return;
     }
     double a = (*d_rz) / dot;
@@ -424,7 +425,7 @@ __global__ void compute_alpha_kernel(const double* d_rz,
     double dot = *d_dot_res;
     if(!isfinite(dot) || dot <= 0.0)
     {
-        *d_break = 1;
+        *d_break = 2;   // [pcg-exit-diag] cause 2 = guard
         *d_alpha = 0.0;
         return;
     }
@@ -977,7 +978,32 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
             // its single terminal boundary.  Legacy callers retain one final
             // state read for their historical SizeT telemetry.
             if(frame_state)
+            {
+                // [pcg-exit-diag] one blocking readback per solve, env-gated:
+                // who ended the solve (1=tolerance, 2=guard) and where rz sat.
+                static int s_exit_diag = -1;
+                if(s_exit_diag < 0)
+                    s_exit_diag = getenv("STIFF_PCG_EXIT_DIAG") ? 1 : 0;
+                if(s_exit_diag)
+                {
+                    cudaStreamSynchronize(cudaStreamPerThread);
+                    PCGDeviceState st{};
+                    double rz = 0, rz0 = 0;
+                    int    brk = 0;
+                    cudaMemcpy(&st, d_graph_state, sizeof(st), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(&rz, d_rz, sizeof(rz), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(&rz0, d_rz0, sizeof(rz0), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(&brk, d_break, sizeof(brk), cudaMemcpyDeviceToHost);
+                    fprintf(stderr,
+                            "[pcg-exit] iters=%llu brk=%d rz=%.3e rz0=%.3e rel=%.3e\n",
+                            (unsigned long long)st.iteration,
+                            brk,
+                            rz,
+                            rz0,
+                            rz0 != 0.0 ? rz / rz0 : -1.0);
+                }
                 return 0;
+            }
             PCGDeviceState graph_state{};
             CUDA_SAFE_CALL(cudaMemcpy(&graph_state,
                                       d_graph_state,
@@ -1046,6 +1072,19 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
 
     // Final sync of break flag (in case loop exited on max_iter).
     cudaMemcpy(&h_break, d_break, sizeof(int), cudaMemcpyDeviceToHost);
+    if(getenv("STIFF_PCG_EXIT_DIAG"))
+    {
+        double rz = 0, rz0 = 0;
+        cudaMemcpy(&rz, d_rz, sizeof(rz), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&rz0, d_rz0, sizeof(rz0), cudaMemcpyDeviceToHost);
+        fprintf(stderr,
+                "[pcg-exit] iters=%zu brk=%d rz=%.3e rz0=%.3e rel=%.3e (host-loop)\n",
+                (size_t)k,
+                h_break,
+                rz,
+                rz0,
+                rz0 != 0.0 ? rz / rz0 : -1.0);
+    }
     if(getenv("STIFF_SEG_DIAG"))
     { static int _c = 0; if(_c++ < 4) printf("[seg-diag] SCALAR solve#%d: k=%zu (max=%zu)\n",
                                              _c, (size_t)k, (size_t)max_iter); }

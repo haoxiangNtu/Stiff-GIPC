@@ -42,6 +42,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_FALLBACK_NO_REBUILD, "diag") \
     X(STIFF_FRAME_SECTION_TIME, "diag") \
     X(STIFF_GRAPH_PHASE_TIME, "diag") \
+    X(STIFF_PCG_EXIT_DIAG, "diag") \
     X(STIFF_FULL_GRAPH_MIN_VERTS, "perf") \
     X(STIFF_GUARD_FRAME_END_ONLY, "diag") \
     X(STIFF_NO_PAD_CLASS_ALLOWANCE, "perf") \
