@@ -848,6 +848,10 @@ class GIPC
     // they must bake overflow-proof; step-mode frames prefer the C6-i host
     // fallback, whose parity with the baseline is what G19 asserts.
     bool      m_episode_capture = false;
+    // [graph-phase-time] STIFF_GRAPH_PHASE_TIME diag: device globaltimer
+    // stamp/accumulator buffer ([0]=last, [1..15]=phase ns), baked into the
+    // captured graph's stamp kernels. Allocated in prepare_frame_graph.
+    long long* m_phase_stamp_buf = nullptr;
     void      canonicalizePairSlots();
     void update_graph_training_capacity();
     void self_largestFeasibleStepSize_DeviceOut_Masked(double slackness,

@@ -739,10 +739,31 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     return stopped;
 }
 
+// [graph-phase-time] 1-thread stamp node: attributes the time since the
+// previous stamp to `slot` and re-arms. Guarded on last==0 so the first
+// stamp of a replay only arms (the host zeroes the buffer per launch).
+// Accumulates correctly across conditional-loop iterations — the same node
+// replays many times and `acc += now - last` sums every visit.
+__global__ void _graph_phase_stamp(long long* buf, int slot)
+{
+    long long now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    if(slot >= 0 && buf[0] != 0)
+        buf[1 + slot] += now - buf[0];
+    buf[0] = now;
+}
+
 void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
 {
     auto* recorder = frame_fsm::ConditionalGraphRecorder::current();
     frame_fsm::FrameDeviceState* frame = frame_graph_device_state();
+    // [graph-phase-time] capture-time constant: bakes stamp nodes only when
+    // the diag buffer exists (env knob read at prepare_frame_graph).
+    long long* phase_buf = m_phase_stamp_buf;
+    auto phase_stamp = [&](int slot) {
+        if(phase_buf)
+            _graph_phase_stamp<<<1, 1, 0, cudaStreamPerThread>>>(phase_buf, slot);
+    };
     if(!recorder || !frame)
         throw std::logic_error(
             "[frame-conditional] recorder/device state is unavailable");
@@ -856,8 +877,11 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
             _close_gpNum, 0, sizeof(uint32_t), cudaStreamPerThread));
         CUDA_SAFE_CALL(cudaMemsetAsync(
             _close_cpNum, 0, sizeof(uint32_t), cudaStreamPerThread));
+        phase_stamp(-1);
         buildBVH();
+        phase_stamp(0);
         buildCP();
+        phase_stamp(1);
     }
     try
     {
@@ -884,8 +908,10 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
                 if(collision_body)
                     snapshotDcdCcdPairsCapture();
                 computeGradientAndHessian(TetMesh);
+                phase_stamp(2);
                 calculateMovingDirection(
                     TetMesh, 0, pcg_data.P_type);
+                phase_stamp(3);
                 if(isolated_body)
                 {
                     // [C5] isolated ordering mirrors the host solver: the
@@ -948,6 +974,7 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
                             lineSearchConditional(
                                 TetMesh, m_ccd_alpha_slots + 5);
                         }
+                        phase_stamp(4);
                         // [C4-b] postLineSearch equivalent: close-set check
                         // -> conditional device-kappa doubling -> close-set
                         // rebuild. Runs exactly where the host solver runs
@@ -955,6 +982,7 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
                         // on the converged exit).
                         if(collision_body)
                             enqueue_post_ls_kappa_conditional();
+                        phase_stamp(5);
                     });
 
                 _newton_tail_conditional<<<1, 1>>>(
@@ -1723,11 +1751,15 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // the alpha stream: actual displacement <= alpha * maxspeed, which
         // lower-bounds how many iterations a delta-inflated pair table lives.
         if(std::getenv("STIFF_ALPHA_STATS"))
-            printf("[alpha-speed] fr=%d k=%d maxspeed=%.9e dhat_sqrt=%.9e\n",
+            printf("[alpha-speed] fr=%d k=%d maxspeed=%.9e dhat_sqrt=%.9e "
+                   "g=%.6e s=%.6e refined=%.6e\n",
                    static_cast<int>(m_total_frames),
                    k,
                    h_ccd_state[3],
-                   std::sqrt(dHat));
+                   std::sqrt(dHat),
+                   h_ccd_state[0],
+                   h_ccd_state[1],
+                   h_ccd_state[4]);
         m_last_ccd_pair_count = static_cast<uint32_t>(std::max(0, ccd_cnt));
         if(m_last_ccd_pair_count > m_peak_ccd_pair_count)
             m_peak_ccd_pair_count = m_last_ccd_pair_count;

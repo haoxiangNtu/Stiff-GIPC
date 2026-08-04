@@ -2492,6 +2492,13 @@ bool try_launch_full_graph(GIPC& ipc,
     context.h_terminal->terminal_graph_nodes = 0;
     context.h_terminal->terminal_d2h_nodes   = 0;
 
+    // [graph-phase-time] zero the stamp buffer so this replay accumulates
+    // from a clean slate (slot -1 arms without attributing).
+    if(ipc.m_phase_stamp_buf)
+        CUDA_SAFE_CALL(cudaMemsetAsync(ipc.m_phase_stamp_buf,
+                                       0,
+                                       16 * sizeof(long long),
+                                       cudaStreamPerThread));
     const auto t_launch = std::chrono::steady_clock::now();
     const cudaError_t launch =
         cudaGraphLaunch(context.full_exec, cudaStreamPerThread);
@@ -2518,6 +2525,28 @@ bool try_launch_full_graph(GIPC& ipc,
                 "[frame-sections] pre_launch=%.1fms graph_wait=%.1fms\n",
                 ms(t_enter, t_launch),
                 ms(t_launch, t_done));
+    }
+    if(ipc.m_phase_stamp_buf && boundary == cudaSuccess)
+    {
+        long long acc[16] = {};
+        CUDA_SAFE_CALL(cudaMemcpy(acc,
+                                  ipc.m_phase_stamp_buf,
+                                  sizeof(acc),
+                                  cudaMemcpyDeviceToHost));
+        const frame_fsm::FrameStatus& st = ipc.get_frame_status();
+        fprintf(stderr,
+                "[graph-phases] bvh=%.1f dcd0=%.1f gh=%.1f pcg=%.1f "
+                "ccd_ls=%.1f postls=%.1f (ms) newton=%d pcg_iters=%d "
+                "ls_trials=%d\n",
+                acc[1] / 1e6,
+                acc[2] / 1e6,
+                acc[3] / 1e6,
+                acc[4] / 1e6,
+                acc[5] / 1e6,
+                acc[6] / 1e6,
+                st.newton_iters,
+                st.pcg_iters,
+                st.ls_trials);
     }
     if(boundary != cudaSuccess)
     {
@@ -3645,6 +3674,13 @@ void GIPC::destroy_frame_graph()
 
 void GIPC::prepare_frame_graph(device_TetraData& mesh)
 {
+    // [graph-phase-time] diag buffer must exist BEFORE capture so the stamp
+    // kernel nodes can bake its pointer. Layout: [0]=last globaltimer stamp,
+    // [1..15]=per-phase accumulated ns. Host zeroes it before every launch
+    // and reads it after the boundary sync.
+    if(std::getenv("STIFF_GRAPH_PHASE_TIME") && !m_phase_stamp_buf)
+        CUDA_SAFE_CALL(
+            cudaMalloc(&m_phase_stamp_buf, 16 * sizeof(long long)));
     if(m_frame_graph_context)
         return;
 
