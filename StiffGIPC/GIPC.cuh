@@ -911,6 +911,10 @@ class GIPC
     void launch_gpu_rl_episode_graph_async(uintptr_t cuda_stream);
     int  gpu_rl_episode_frame_count() const;
     bool gpu_rl_graph_prepared() const;
+    // [step-autoroute] the stream the in-flight RL graph is bound to
+    // (0 when no launch happened yet); step() reuses it so the thin route
+    // never violates the launch-stream affinity contract.
+    uintptr_t gpu_rl_bound_stream() const;
     bool gpu_rl_graph_ready() const;
     void synchronize_gpu_rl_graph() const;
     uintptr_t gpu_rl_revolute_actions_device_ptr() const;

@@ -310,10 +310,27 @@ class GIPCTripletMatrix
     // each other's layout mode mid-frame (the flag is RAII-scoped within one
     // engine's frame call).
     static inline thread_local bool s_layout_override_off = false;
+    // [self-contained prepare] GPU-native RL mode must not depend on the
+    // STIFF_FRAME_GRAPH environment: prepare_gpu_rl() forces the capacity
+    // layout ON for its own lifecycle (tier-training frame, capture, thin
+    // step() replays) through this thread_local. The C6-m fallback override
+    // above still wins so a fallback attempt stays bit-for-bit graph-off.
+    static inline thread_local bool s_layout_force_on = false;
+    struct LayoutForceOnScope
+    {
+        bool prev;
+        LayoutForceOnScope() : prev(s_layout_force_on)
+        {
+            s_layout_force_on = true;
+        }
+        ~LayoutForceOnScope() { s_layout_force_on = prev; }
+    };
     static bool device_count_mode()
     {
         if(s_layout_override_off)
             return false;
+        if(s_layout_force_on)
+            return true;
         if(const char* value = std::getenv("STIFF_CONVERT_DEVICE_COUNT"))
             return std::atoi(value) != 0;
         if(const char* value = std::getenv("STIFF_FRAME_GRAPH"))

@@ -304,11 +304,10 @@ def gpu_native(dump_path: str) -> None:
     vertex_count = abi["vertices"]
     assert vertex_count == native.get_vertex_count()
 
-    # While GPU-native mode owns the device, the synchronous frame entry
-    # points must refuse to run.
-    expect_raises(
-        "step lockout", engine.step, "GPU-native RL", "end_gpu_rl"
-    )
+    # [step-autoroute] step() is no longer locked out: after prepare it is a
+    # thin asynchronous enqueue of the recorded graph (checked positively
+    # after the trajectory phases, so the parity comparison stays untouched).
+    # The multi-frame episode surface remains exclusive.
     expect_raises(
         "episode lockout",
         lambda: engine.launch_episode_async(
@@ -420,6 +419,23 @@ def gpu_native(dump_path: str) -> None:
         "same CUDA stream",
     )
     cuda.stream_destroy(other)
+
+    # [step-autoroute] positive contract: step() enqueues exactly one RL
+    # frame on the BOUND stream (affinity preserved) and stays healthy.
+    counter_before = cuda.read_int64(abi["frame_counter"])
+    native.set_revolute_target(0, float(revolute[TOTAL - 1, 0, 0]))
+    native.set_prismatic_target(0, float(prismatic[TOTAL - 1, 0, 0]))
+    engine.step()
+    engine.synchronize_gpu_rl()
+    counter_after = cuda.read_int64(abi["frame_counter"])
+    assert counter_after == counter_before + 1, (
+        f"step() must enqueue one RL frame "
+        f"({counter_before} -> {counter_after})"
+    )
+    _, _, autoroute_status = read_observation()
+    assert autoroute_status["result"] == 0, autoroute_status
+    assert autoroute_status["path_flags"] & PATH_GPU_NATIVE_RL
+    print("GPU-RL-STATUS: step-autoroute ok")
 
     engine.end_gpu_rl()
     assert not engine.gpu_rl_prepared()

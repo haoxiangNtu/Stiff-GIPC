@@ -990,7 +990,17 @@ class Engine:
         self._finalized = True
 
     def step(self) -> None:
-        """Advance simulation by one timestep (dt)."""
+        """Advance simulation by one timestep (dt).
+
+        After :meth:`prepare_gpu_rl` this becomes a thin asynchronous
+        enqueue of the recorded RL graph (Isaac ``simulate()`` semantics):
+        host-set joint targets are published to the device action slab and
+        the graph launch returns without any host wait.  Reads that go
+        through device memory on the engine stream are ordered behind the
+        queued frames; call :meth:`synchronize_gpu_rl` for an explicit
+        barrier.  :meth:`end_gpu_rl` restores the ordinary host-driven
+        transaction.
+        """
         _assert_process_mode_signature()
         self._engine.step()
         # [release gate] STIFF_ITER_LOG=1: per-frame Newton-iteration telemetry
@@ -1060,13 +1070,18 @@ class Engine:
         """Capture the reusable one-frame GPU-native RL graph.
 
         This is a setup boundary and may allocate, capture and synchronize;
-        run one warm-up :meth:`step` first.  Afterwards an external CUDA
-        agent (e.g. a policy holding torch tensors) writes the packed
+        run warm-up :meth:`step` calls with representative contact first so
+        the capacity tiers observe realistic peaks.  No environment knobs
+        are required: when the process never enabled STIFF_FRAME_GRAPH the
+        engine forces the capacity layout on for its own lifecycle and runs
+        one internal training step before capturing (so prepare advances the
+        simulation by one frame in that case).  Afterwards either keep
+        calling :meth:`step` (now a thin async enqueue) or drive the packed
         float64 action buffers from :meth:`get_gpu_rl_device_abi` directly
-        in device memory and calls :meth:`launch_gpu_rl_async` — the steady
+        in device memory with :meth:`launch_gpu_rl_async` — the steady
         state performs no host synchronization and its graph contains zero
-        H2D/D2H nodes.  :meth:`step` and :meth:`launch_episode_async` are
-        locked out until :meth:`end_gpu_rl`.
+        H2D/D2H nodes.  :meth:`launch_episode_async` stays locked out until
+        :meth:`end_gpu_rl`.
         """
         _assert_process_mode_signature()
         self._engine.prepare_gpu_rl()
@@ -1153,6 +1168,73 @@ class Engine:
         and ``env_count``.
         """
         return dict(self._engine.get_gpu_rl_device_abi())
+
+    def gpu_rl_tensors(self) -> dict:
+        """Zero-copy torch views of the GPU-native RL device buffers.
+
+        Returns a dict of ``torch.Tensor`` objects aliasing the ABI device
+        memory from :meth:`get_gpu_rl_device_abi` — no ``.numpy()`` staging,
+        no copies: ``actions_revolute``/``actions_prismatic`` (``(frames,
+        joints, 3)`` float64, squeezed to ``(joints, 3)`` for the one-frame
+        API; write targets here instead of memcpy), ``positions``/
+        ``velocities`` (``(vertices, 3)`` float64, or with a leading frames
+        dim for multi-frame captures), ``joint_observations`` (float64,
+        {angle, rate} per revolute then {displacement, rate} per prismatic),
+        ``statuses`` (``(frames, status_bytes)`` uint8) and
+        ``frame_counter`` (int64 scalar).
+
+        Stream discipline: the engine enqueues on CUDA's per-thread default
+        stream.  Torch work on its default (legacy) stream is implicitly
+        ordered against it; if you use a non-default torch stream, call
+        :meth:`synchronize_gpu_rl` before reading observations.
+        """
+        import torch  # local import: torch is an optional dependency
+
+        abi = self.get_gpu_rl_device_abi()
+        frames = max(1, int(abi.get("episode_frame_count", 1)))
+
+        class _DeviceArray:
+            def __init__(self, ptr: int, shape: tuple, typestr: str):
+                self.__cuda_array_interface__ = {
+                    "shape": tuple(shape),
+                    "typestr": typestr,
+                    "data": (int(ptr), False),
+                    "version": 3,
+                    "strides": None,
+                }
+
+        def view(key: str, shape: tuple, typestr: str = "<f8"):
+            return torch.as_tensor(
+                _DeviceArray(abi[key], shape, typestr), device="cuda"
+            )
+
+        def framed(shape: tuple) -> tuple:
+            return shape if frames == 1 else (frames, *shape)
+
+        rev = int(abi["revolute_joints"])
+        pri = int(abi["prismatic_joints"])
+        verts = int(abi["vertices"])
+        out = {
+            "positions": view("positions", framed((verts, 3))),
+            "velocities": view("velocities", framed((verts, 3))),
+            "joint_observations": view(
+                "joint_observations",
+                (int(abi["joint_observation_count"]),),
+            ),
+            "statuses": view(
+                "statuses", (frames, int(abi["status_bytes"])), "|u1"
+            ),
+            "frame_counter": view("frame_counter", (1,), "<i8"),
+        }
+        if rev:
+            out["actions_revolute"] = view(
+                "revolute_actions", framed((rev, 3))
+            )
+        if pri:
+            out["actions_prismatic"] = view(
+                "prismatic_actions", framed((pri, 3))
+            )
+        return out
 
     def set_log_level(self, level: int) -> None:
         """Control per-frame solver log verbosity.

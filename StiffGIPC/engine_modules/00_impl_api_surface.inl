@@ -153,6 +153,11 @@ struct SimEngine::Impl
     bool             finalize_failed  = false;
     int              step_count       = 0;
     int              episode_frames   = 0;
+    // [self-contained prepare] set when prepare_gpu_rl* forced the capacity
+    // layout on because the user ran no STIFF_FRAME_GRAPH environment; every
+    // later gpu_rl-mode entry point re-applies the same forced layout so
+    // boundary/retry logic sees the layout the graph was captured under.
+    bool             gpu_rl_layout_forced = false;
     std::vector<double> episode_revolute_actions;
     std::vector<double> episode_prismatic_actions;
     std::string      resolved_assets_dir;

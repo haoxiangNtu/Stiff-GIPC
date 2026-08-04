@@ -56,7 +56,10 @@ void GIPC::lineSearchConditional(device_TetraData& TetMesh,
     if(!alpha_device)
         throw std::invalid_argument(
             "[line-search-conditional] null device alpha");
-    if(!m_skip_all_collision && !c4_collision_graph_enabled())
+    // [self-contained prepare] episode capture is the proven RL graph shape;
+    // the C4 opt-in knob only gates the ordinary step() transaction.
+    if(!m_skip_all_collision && !c4_collision_graph_enabled()
+       && !m_episode_capture)
         throw std::runtime_error(
             "[line-search-conditional] collision-domain checks require "
             "STIFF_C4_COLLISION_GRAPH=1");
@@ -744,7 +747,7 @@ void GIPC::enqueue_frame_graph_body(device_TetraData& TetMesh)
         throw std::logic_error(
             "[frame-conditional] recorder/device state is unavailable");
     const bool collision_body = !m_skip_all_collision;
-    if(collision_body && !c4_collision_graph_enabled())
+    if(collision_body && !c4_collision_graph_enabled() && !m_episode_capture)
         throw std::runtime_error(
             "[frame-conditional] collision requires STIFF_C4_COLLISION_GRAPH=1");
     // [C6] host-owned soft targets stay out; device-resident stitch springs

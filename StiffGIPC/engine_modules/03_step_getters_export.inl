@@ -3,11 +3,61 @@ void SimEngine::step()
     auto& impl = *m_impl;
     if(!impl.finalized)
         throw LifecycleError("step() requires a finalized SimEngine");
-    if(impl.ipc.gpu_rl_graph_prepared())
-        throw LifecycleError(
-            "step() is unavailable while GPU-native RL mode is prepared; "
-            "call end_gpu_rl() first");
     cudaSetDevice(impl.cfg.cuda_device);
+    if(impl.ipc.gpu_rl_graph_prepared())
+    {
+        // [step-autoroute] Isaac-style surface: after prepare_gpu_rl() the
+        // per-frame step() becomes a thin enqueue of the recorded RL graph
+        // instead of a lifecycle error. Host-set joint targets are published
+        // to the device action slab on the engine stream, so the launch stays
+        // fully asynchronous; device reads (obs ABI, getters that copy from
+        // device memory on the same stream) are stream-ordered behind it.
+        GIPCTripletMatrix::LayoutForceOnScope layout_force_rl;
+        // Honour the launch-stream affinity contract: once an external agent
+        // bound a stream via launch_gpu_rl_async, step() publishes and
+        // launches on that same stream instead of the per-thread default.
+        const uintptr_t    bound = impl.ipc.gpu_rl_bound_stream();
+        const cudaStream_t rl_stream =
+            bound ? reinterpret_cast<cudaStream_t>(bound)
+                  : cudaStreamPerThread;
+        const auto& rev = impl.tetMesh.joint_angle_controls;
+        const auto& pri = impl.tetMesh.prismatic_drive_controls;
+        if(!rev.empty())
+        {
+            std::vector<RevoluteDrivingControlPacked> packed(rev.size());
+            for(size_t i = 0; i < rev.size(); ++i)
+                packed[i] = RevoluteDrivingControlPacked{
+                    static_cast<Float>(rev[i].target_angle),
+                    static_cast<Float>(rev[i].strength_ratio),
+                    static_cast<Float>(rev[i].ext_torque)};
+            CUDA_SAFE_CALL(cudaMemcpyAsync(
+                reinterpret_cast<void*>(
+                    impl.ipc.gpu_rl_revolute_actions_device_ptr()),
+                packed.data(),
+                packed.size() * sizeof(RevoluteDrivingControlPacked),
+                cudaMemcpyHostToDevice,
+                rl_stream));
+        }
+        if(!pri.empty())
+        {
+            std::vector<PrismaticDrivingControlPacked> packed(pri.size());
+            for(size_t i = 0; i < pri.size(); ++i)
+                packed[i] = PrismaticDrivingControlPacked{
+                    static_cast<Float>(pri[i].target_distance),
+                    static_cast<Float>(pri[i].strength_ratio),
+                    static_cast<Float>(pri[i].ext_force)};
+            CUDA_SAFE_CALL(cudaMemcpyAsync(
+                reinterpret_cast<void*>(
+                    impl.ipc.gpu_rl_prismatic_actions_device_ptr()),
+                packed.data(),
+                packed.size() * sizeof(PrismaticDrivingControlPacked),
+                cudaMemcpyHostToDevice,
+                rl_stream));
+        }
+        impl.ipc.launch_gpu_rl_graph_async(bound);
+        impl.step_count++;
+        return;
+    }
     if(impl.ipc.episode_graph_in_flight())
         throw LifecycleError(
             "step() is unavailable while an episode graph is in flight");
@@ -335,6 +385,16 @@ void SimEngine::prepare_gpu_rl()
         static_cast<int>(
             impl.tetMesh.prismatic_drive_controls.size());
     cudaSetDevice(impl.cfg.cuda_device);
+    // [self-contained prepare] Isaac-style contract: no environment knobs.
+    // If the user's warm-up frames ran in the pure host layout (no
+    // STIFF_FRAME_GRAPH), the capacity tiers were never trained; run ONE
+    // training frame with the layout forced on so every axis observes its
+    // peak from a representative frame, then capture under the same forced
+    // layout. Users who set the env keep the exact previous behaviour.
+    const bool layout_was_on = GIPCTripletMatrix::device_count_mode();
+    GIPCTripletMatrix::LayoutForceOnScope layout_force;
+    if(!layout_was_on)
+        this->step();
     impl.ipc.prepare_episode_graph(
         impl.d_tetMesh,
         1,
@@ -343,6 +403,7 @@ void SimEngine::prepare_gpu_rl()
         nullptr,
         prismatic_count,
         true);
+    impl.gpu_rl_layout_forced = !layout_was_on;
     impl.episode_frames = 1;
     impl.episode_revolute_actions.clear();
     impl.episode_prismatic_actions.clear();
@@ -366,6 +427,12 @@ void SimEngine::prepare_gpu_rl_episode(int frame_count)
     const int prismatic_count = static_cast<int>(
         impl.tetMesh.prismatic_drive_controls.size());
     cudaSetDevice(impl.cfg.cuda_device);
+    // [self-contained prepare] see prepare_gpu_rl(): train tiers with the
+    // layout forced on when the environment never enabled it.
+    const bool layout_was_on = GIPCTripletMatrix::device_count_mode();
+    GIPCTripletMatrix::LayoutForceOnScope layout_force;
+    if(!layout_was_on)
+        this->step();
     impl.ipc.prepare_episode_graph(
         impl.d_tetMesh,
         frame_count,
@@ -374,6 +441,7 @@ void SimEngine::prepare_gpu_rl_episode(int frame_count)
         nullptr,
         prismatic_count,
         true);
+    impl.gpu_rl_layout_forced = !layout_was_on;
     impl.episode_frames = frame_count;
     impl.episode_revolute_actions.clear();
     impl.episode_prismatic_actions.clear();
@@ -386,6 +454,9 @@ void SimEngine::launch_gpu_rl_async(uintptr_t cuda_stream)
         throw LifecycleError(
             "launch_gpu_rl_async() requires a finalized SimEngine");
     cudaSetDevice(impl.cfg.cuda_device);
+    // [self-contained prepare] replays and their boundary logic run under
+    // the layout the graph was captured with, independent of env knobs.
+    GIPCTripletMatrix::LayoutForceOnScope layout_force;
     impl.ipc.launch_gpu_rl_graph_async(cuda_stream);
 }
 
@@ -396,6 +467,7 @@ void SimEngine::launch_gpu_rl_episode_async(uintptr_t cuda_stream)
         throw LifecycleError(
             "launch_gpu_rl_episode_async() requires a finalized SimEngine");
     cudaSetDevice(impl.cfg.cuda_device);
+    GIPCTripletMatrix::LayoutForceOnScope layout_force;
     impl.ipc.launch_gpu_rl_episode_graph_async(cuda_stream);
 }
 
@@ -413,6 +485,7 @@ bool SimEngine::gpu_rl_ready() const
 void SimEngine::synchronize_gpu_rl() const
 {
     cudaSetDevice(m_impl->cfg.cuda_device);
+    GIPCTripletMatrix::LayoutForceOnScope layout_force;
     m_impl->ipc.synchronize_gpu_rl_graph();
 }
 
@@ -422,7 +495,11 @@ void SimEngine::end_gpu_rl()
     if(!impl.ipc.gpu_rl_graph_prepared())
         throw LifecycleError("GPU-native RL mode is not prepared");
     cudaSetDevice(impl.cfg.cuda_device);
-    impl.ipc.destroy_episode_graph();
+    {
+        GIPCTripletMatrix::LayoutForceOnScope layout_force;
+        impl.ipc.destroy_episode_graph();
+    }
+    impl.gpu_rl_layout_forced = false;
 }
 
 uintptr_t SimEngine::get_gpu_rl_revolute_actions_device_ptr() const

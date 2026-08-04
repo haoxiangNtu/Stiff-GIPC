@@ -307,7 +307,11 @@ bool full_graph_eligible(const GIPC& ipc,
     }
     if(!ipc.m_skip_all_collision)
     {
-        if(!knob_enabled("STIFF_C4_COLLISION_GRAPH"))
+        // [self-contained prepare] episode capture IS the RL whole-frame
+        // graph: collision-in-graph is its proven definition (the gpu_rl
+        // gates run exactly this shape), so the opt-in knob only gates the
+        // ordinary step() transaction, never prepare_gpu_rl().
+        if(!knob_enabled("STIFF_C4_COLLISION_GRAPH") && !ipc.m_episode_capture)
         {
             reason =
                 "collision in the whole-frame graph requires "
@@ -386,7 +390,7 @@ bool full_graph_eligible(const GIPC& ipc,
                 "isolated mode without collision has no per-env alpha chain";
             return false;
         }
-        if(!knob_enabled("STIFF_C4_COLLISION_GRAPH"))
+        if(!knob_enabled("STIFF_C4_COLLISION_GRAPH") && !ipc.m_episode_capture)
         {
             reason =
                 "isolated mode implies collision in the graph "
@@ -3146,6 +3150,16 @@ bool GIPC::gpu_rl_graph_prepared() const
         static_cast<const EpisodeGraphContext*>(
             m_episode_graph_context);
     return context && context->device_native && context->exec;
+}
+
+uintptr_t GIPC::gpu_rl_bound_stream() const
+{
+    const auto* context =
+        static_cast<const EpisodeGraphContext*>(
+            m_episode_graph_context);
+    if(!context || !context->in_flight)
+        return 0;
+    return reinterpret_cast<uintptr_t>(context->launch_stream);
 }
 
 bool GIPC::gpu_rl_graph_ready() const
