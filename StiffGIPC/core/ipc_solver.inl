@@ -2086,6 +2086,13 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         if(phase_time)
             CUDA_SAFE_CALL(cudaEventRecord(e2b));  // end S1 per-env-alpha / start lineSearch
         double alpha_before_line_search = alpha;
+        // [alpha-stats] env-gated evidence collector for the line-search
+        // certificate design: fraction of iterations whose CCD cap is 1.
+        if(std::getenv("STIFF_ALPHA_STATS"))
+            printf("[alpha-stat] fr=%d k=%d ccd_alpha=%.9e\n",
+                   static_cast<int>(m_total_frames),
+                   k,
+                   alpha);
         if(merged_diag_sample)
         {
             std::vector<double3> positions(vertexNum), directions(vertexNum);
