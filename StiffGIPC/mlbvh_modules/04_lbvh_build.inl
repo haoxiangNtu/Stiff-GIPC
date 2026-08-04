@@ -1046,6 +1046,122 @@ __global__ void _buildPlocUpper(Node*           nodes,
                         &shared_round_merges);
 }
 
+// Collapse three levels of an existing binary topology into an explicit
+// maximum-eight-child traversal front. Child references still point at the
+// original binary nodes and therefore use exactly the same boxes/topology;
+// this isolates traversal width from tree-quality changes. The destination is
+// the post-sort temporary AABB buffer (48N bytes, versus <32N bytes needed
+// here), which is dead until the next Construct call.
+static __device__ __forceinline__ double _bvh8CollapseScore(
+    const Node* nodes,
+    const AABB* boxes,
+    uint32_t    ref,
+    int         collapse_mode)
+{
+    if(nodes[ref].element_idx != 0xFFFFFFFFu)
+        return collapse_mode == 2 ? 1.7976931348623157e308 : -1.0;
+    if(collapse_mode != 2)
+        return _bvh_half_surface_area(boxes[ref]);
+    const uint32_t left  = nodes[ref].left_idx;
+    const uint32_t right = nodes[ref].right_idx;
+    return _bvh_half_surface_area(boxes[left])
+           + _bvh_half_surface_area(boxes[right])
+           - _bvh_half_surface_area(boxes[ref]);
+}
+
+__global__ void _buildBvh8Children(const Node* nodes,
+                                   const AABB* boxes,
+                                   uint32_t*   wide_children,
+                                   int         number,
+                                   int         collapse_mode)
+{
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if(node >= number - 1)
+        return;
+
+    uint32_t current[8];
+    int count = 0;
+    if(collapse_mode == 1)
+    {
+        uint32_t next[8];
+        count = 1;
+        current[0] = static_cast<uint32_t>(node);
+#pragma unroll
+        for(int level = 0; level < 3; ++level)
+        {
+            int next_count = 0;
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+            {
+                if(i >= count)
+                    break;
+                const uint32_t ref = current[i];
+                if(nodes[ref].element_idx != 0xFFFFFFFFu)
+                    next[next_count++] = ref;
+                else
+                {
+                    next[next_count++] = nodes[ref].left_idx;
+                    next[next_count++] = nodes[ref].right_idx;
+                }
+            }
+            count = next_count;
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+            {
+                if(i < count)
+                    current[i] = next[i];
+            }
+        }
+    }
+    else
+    {
+        double scores[8];
+        current[0] = nodes[node].left_idx;
+        current[1] = nodes[node].right_idx;
+        scores[0] = _bvh8CollapseScore(nodes, boxes, current[0], collapse_mode);
+        scores[1] = _bvh8CollapseScore(nodes, boxes, current[1], collapse_mode);
+        count = 2;
+        while(count < 8)
+        {
+            int best = -1;
+            double best_score = collapse_mode == 2
+                                    ? 1.7976931348623157e308
+                                    : -1.0;
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+            {
+                if(i >= count)
+                    break;
+                const uint32_t ref = current[i];
+                const double score = scores[i];
+                if(nodes[ref].element_idx != 0xFFFFFFFFu)
+                    continue;
+                if((collapse_mode == 2 && score < best_score)
+                   || (collapse_mode != 2 && score > best_score))
+                {
+                    best = i;
+                    best_score = score;
+                }
+            }
+            if(best < 0)
+                break;
+            const uint32_t ref = current[best];
+            current[best] = nodes[ref].left_idx;
+            current[count] = nodes[ref].right_idx;
+            scores[best] = _bvh8CollapseScore(
+                nodes, boxes, current[best], collapse_mode);
+            scores[count] = _bvh8CollapseScore(
+                nodes, boxes, current[count], collapse_mode);
+            ++count;
+        }
+    }
+
+    uint32_t* output = wide_children + 8 * node;
+#pragma unroll
+    for(int i = 0; i < 8; ++i)
+        output[i] = i < count ? current[i] : 0xFFFFFFFFu;
+}
+
 __global__ void _rotateSahTreelets(Node*           nodes,
                                    AABB*           boxes,
                                    const uint32_t* depths,

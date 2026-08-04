@@ -628,6 +628,48 @@ static int bvh_ploc_mode()
     return mode;
 }
 
+static int bvh_wide8_mode()
+{
+    static const int mode = []
+    {
+        const char* value = getenv("STIFF_BVH_WIDE8");
+        const int parsed = value ? atoi(value) : 0;
+        return std::max(0, std::min(3, parsed));
+    }();
+    return mode;
+}
+
+static int bvh_wide8_mask()
+{
+    static const int mask = []
+    {
+        const char* value = getenv("STIFF_BVH_WIDE8_MASK");
+        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0xF)
+                     : 0xF;
+    }();
+    return mask;
+}
+
+static const uint32_t* buildBvh8Children(const Node* nodes,
+                                         const AABB* boxes,
+                                         AABB*       temp_leaf_boxes,
+                                         int         number,
+                                         int         family,
+                                         cudaStream_t stream)
+{
+    const int mode = bvh_wide8_mode();
+    if(mode == 0 || number < 2 || (bvh_wide8_mask() & family) == 0)
+        return nullptr;
+    static_assert(sizeof(AABB) >= 8 * sizeof(uint32_t),
+                  "temporary leaf boxes cannot hold BVH8 child fronts");
+    auto* children = reinterpret_cast<uint32_t*>(temp_leaf_boxes);
+    constexpr int threads = 256;
+    const int blocks = (number - 1 + threads - 1) / threads;
+    _buildBvh8Children<<<blocks, threads, 0, stream>>>(
+        nodes, boxes, children, number, mode);
+    return children;
+}
+
 static int bvh_ploc_mask()
 {
     static const int mask = []
@@ -814,6 +856,7 @@ void selfQuery_ee(const int*     _bodyID,
                   const int*     _body_id_to_is_fem,
                   const int* node_env,
                   const uint32_t* node_max_element,
+                  const uint32_t* wide_children,
                   cudaStream_t   stream = 0)
 {
     int numbers = number;
@@ -827,30 +870,51 @@ void selfQuery_ee(const int*     _bodyID,
         const int range_prune_mode = ee_range_prune_mode();
         if(range_prune_mode > 0)
         {
-            auto* range_kernel = range_prune_mode == 2
-                                     ? _selfQuery_ee_sorted_prune
-                                     : _selfQuery_ee_range_prune;
-            range_kernel<<<blockNum, threadNum, 0, stream>>>(
-                _bodyID,
-                _btype,
-                _vertexes,
-                _rest_vertexes,
-                _edges,
-                _bvs,
-                _nodes,
-                _collisonPairs,
-                _ccd_collisonPairs,
-                _cpNum,
-                MatIndex,
-                dHat,
-                numbers,
-                _collision_skip_matrix,
-                _collision_body_count,
-                _body_id_to_is_fem,
-                node_env,
-                node_max_element);
+            if(wide_children)
+            {
+                if(range_prune_mode == 2)
+                    _selfQuery_ee_sorted_prune_wide8<<<
+                        blockNum, threadNum, 0, stream>>>(
+                        _bodyID, _btype, _vertexes, _rest_vertexes, _edges,
+                        _bvs, _nodes, _collisonPairs, _ccd_collisonPairs,
+                        _cpNum, MatIndex, dHat, numbers,
+                        _collision_skip_matrix, _collision_body_count,
+                        _body_id_to_is_fem, node_env, wide_children,
+                        node_max_element);
+                else
+                    _selfQuery_ee_range_prune_wide8<<<
+                        blockNum, threadNum, 0, stream>>>(
+                        _bodyID, _btype, _vertexes, _rest_vertexes, _edges,
+                        _bvs, _nodes, _collisonPairs, _ccd_collisonPairs,
+                        _cpNum, MatIndex, dHat, numbers,
+                        _collision_skip_matrix, _collision_body_count,
+                        _body_id_to_is_fem, node_env, wide_children,
+                        node_max_element);
+            }
+            else
+            {
+                auto* range_kernel = range_prune_mode == 2
+                                         ? _selfQuery_ee_sorted_prune
+                                         : _selfQuery_ee_range_prune;
+                range_kernel<<<blockNum, threadNum, 0, stream>>>(
+                    _bodyID, _btype, _vertexes, _rest_vertexes, _edges,
+                    _bvs, _nodes, _collisonPairs, _ccd_collisonPairs,
+                    _cpNum, MatIndex, dHat, numbers,
+                    _collision_skip_matrix, _collision_body_count,
+                    _body_id_to_is_fem, node_env, node_max_element);
+            }
             return;
         }
+    }
+
+    if(wide_children)
+    {
+        _selfQuery_ee_wide8<<<blockNum, threadNum, 0, stream>>>(
+            _bodyID, _btype, _vertexes, _rest_vertexes, _edges, _bvs,
+            _nodes, _collisonPairs, _ccd_collisonPairs, _cpNum, MatIndex,
+            dHat, numbers, _collision_skip_matrix, _collision_body_count,
+            _body_id_to_is_fem, node_env, wide_children);
+        return;
     }
 
     // [ee-lb] STIFF_EE_LB occupancy A/B.  In the 2026-08-04 sm_89 DLTO
@@ -899,6 +963,7 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
                          const int*     _body_id_to_is_fem,
                          const int* node_env,
                          const uint32_t* node_max_element,
+                         const uint32_t* wide_children,
                          cudaStream_t   stream = 0,
                          const double*  alpha_dev = nullptr)
 {
@@ -909,11 +974,28 @@ void fullCCDselfQuery_ee(const int*     _bodyID,
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
     if(node_max_element && ee_range_prune_mode() == 1)
-        _selfQuery_ee_ccd_range_prune<<<blockNum, threadNum, 0, stream>>>(
-            _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes,
-            _ccd_collisonPairs, _cpNum, dHat, numbers, _collision_skip_matrix,
-            _collision_body_count, _body_id_to_is_fem, node_env, alpha_dev,
-            node_max_element);
+    {
+        if(wide_children)
+            _selfQuery_ee_ccd_range_prune_wide8<<<
+                blockNum, threadNum, 0, stream>>>(
+                _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs,
+                _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
+                _collision_skip_matrix, _collision_body_count,
+                _body_id_to_is_fem, node_env, alpha_dev, wide_children,
+                node_max_element);
+        else
+            _selfQuery_ee_ccd_range_prune<<<blockNum, threadNum, 0, stream>>>(
+                _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs,
+                _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
+                _collision_skip_matrix, _collision_body_count,
+                _body_id_to_is_fem, node_env, alpha_dev, node_max_element);
+    }
+    else if(wide_children)
+        _selfQuery_ee_ccd_wide8<<<blockNum, threadNum, 0, stream>>>(
+            _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs,
+            _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
+            _collision_skip_matrix, _collision_body_count,
+            _body_id_to_is_fem, node_env, alpha_dev, wide_children);
     else
         _selfQuery_ee_ccd<<<blockNum, threadNum, 0, stream>>>(
             _bodyID, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes,
@@ -937,6 +1019,7 @@ void selfQuery_vf(const int*      _bodyID,
                   const int*      _collision_skip_matrix,
                   int             _collision_body_count,
                   const int*      _body_id_to_is_fem,
+                  const uint32_t* wide_children,
                   cudaStream_t    stream = 0)
 {
     int numbers = number;
@@ -945,7 +1028,26 @@ void selfQuery_vf(const int*      _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_vf<<<blockNum, threadNum, 0, stream>>>(_bodyID,
+    if(wide_children)
+        _selfQuery_vf_wide8<<<blockNum, threadNum, 0, stream>>>(_bodyID,
+                                           _btype,
+                                           _vertexes,
+                                           _faces,
+                                           _surfVerts,
+                                           _bvs,
+                                           _nodes,
+                                           _collisonPairs,
+                                           _ccd_collisonPairs,
+                                           _cpNum,
+                                           MatIndex,
+                                           dHat,
+                                           numbers,
+                                           _collision_skip_matrix,
+                                           _collision_body_count,
+                                           _body_id_to_is_fem,
+                                           wide_children);
+    else
+        _selfQuery_vf<<<blockNum, threadNum, 0, stream>>>(_bodyID,
                                            _btype,
                                            _vertexes,
                                            _faces,
@@ -979,6 +1081,7 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
                          const int*      _collision_skip_matrix,
                          int             _collision_body_count,
                          const int*      _body_id_to_is_fem,
+                         const uint32_t* wide_children,
                          cudaStream_t    stream = 0,
                          const double*   alpha_dev = nullptr)
 {
@@ -988,9 +1091,18 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
     const unsigned int threadNum = 256;
     int                blockNum  = (numbers + threadNum - 1) / threadNum;
 
-    _selfQuery_vf_ccd<<<blockNum, threadNum, 0, stream>>>(
-        _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, alpha_dev);
+    if(wide_children)
+        _selfQuery_vf_ccd_wide8<<<blockNum, threadNum, 0, stream>>>(
+            _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts,
+            _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
+            _collision_skip_matrix, _collision_body_count,
+            _body_id_to_is_fem, alpha_dev, wide_children);
+    else
+        _selfQuery_vf_ccd<<<blockNum, threadNum, 0, stream>>>(
+            _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts,
+            _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
+            _collision_skip_matrix, _collision_body_count,
+            _body_id_to_is_fem, alpha_dev);
 }
 
 void lbvh::FREE_DEVICE_MEM()
@@ -1416,7 +1528,13 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
 
 void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
 {
-
+    const int tree_number = (_active_idx != nullptr && face_number_active > 0
+                             && face_number_active <= (int)face_number)
+                                ? face_number_active
+                                : (int)face_number;
+    const uint32_t* wide_children =
+        buildBvh8Children(
+            _nodes, _bvs, _tempLeafBox, tree_number, kSahFaceDcd, stream);
     selfQuery_vf(_bodyId,
                  _btype,
                  _vertexes,
@@ -1433,6 +1551,7 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  _collision_skip_matrix,
                  _collision_body_count,
                  _body_id_to_is_fem,
+                 wide_children,
                  stream);
 }
 
@@ -1445,6 +1564,9 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
              && face_number_active <= (int)edge_number)
                 ? face_number_active
                 : (int)edge_number;
+    const uint32_t* wide_children =
+        buildBvh8Children(
+            _nodes, _bvs, _tempLeafBox, N, kSahEdgeDcd, stream);
     selfQuery_ee(_bodyId,
                  _btype,
                  _vertexes,
@@ -1463,16 +1585,24 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  _body_id_to_is_fem,
                  m_node_env,
                  m_node_max_element,
+                 wide_children,
                  stream);
 }
 
 void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
                                      cudaStream_t stream, const double* alpha_dev)
 {
-
+    const int tree_number = (_active_idx != nullptr && face_number_active > 0
+                             && face_number_active <= (int)face_number)
+                                ? face_number_active
+                                : (int)face_number;
+    const uint32_t* wide_children =
+        buildBvh8Children(
+            _nodes, _bvs, _tempLeafBox, tree_number, kSahFaceCcd, stream);
     fullCCDselfQuery_vf(
         _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
-        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem, stream, alpha_dev);
+        _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem,
+        wide_children, stream, alpha_dev);
 }
 
 void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const double& alpha,
@@ -1483,10 +1613,13 @@ void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
              && face_number_active <= (int)edge_number)
                 ? face_number_active
                 : (int)edge_number;
+    const uint32_t* wide_children =
+        buildBvh8Children(
+            _nodes, _bvs, _tempLeafBox, N, kSahEdgeCcd, stream);
     fullCCDselfQuery_ee(
         _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, N,
         _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem,
-        m_node_env, m_node_max_element, stream, alpha_dev);
+        m_node_env, m_node_max_element, wide_children, stream, alpha_dev);
 }
 
 

@@ -246,6 +246,48 @@ the topology is amortized across exact AABB refits; a topology refit remains
 collision-complete because every leaf and internal AABB is recomputed, while
 tree quality affects performance rather than correctness.
 
+### Same-topology BVH8 traversal
+
+`STIFF_BVH_WIDE8` builds a maximum-eight-child traversal front from the
+already constructed binary tree.  Child references and AABBs remain those of
+the exact binary topology, so a BVH2/BVH8 comparison cannot accidentally
+credit BVH8 with PLOC/SAH tree quality.  The child table reuses the post-sort
+temporary leaf-AABB buffer, performs no allocation or host operation, and is
+rebuilt on the caller's stream immediately before the selected query.
+
+Three collapse policies were measured: fixed three-level fronts (mode 1),
+minimum SAH-increase expansion (mode 2), and repeatedly expanding the largest
+frontier box (mode 3).  Fixed levels made the four query kernels about 16%
+slower.  Minimum-increase expansion was worse because its front construction
+was expensive and it retained large overlapping parents.  Largest-box-first
+was the only useful policy.  `STIFF_BVH_WIDE8_MASK` uses the same family bits
+as the PLOC/rotation masks.
+
+The profitable slice is face DCD only (`STIFF_BVH_WIDE8=3`,
+`STIFF_BVH_WIDE8_MASK=1`).  Two 1,000-rebuild frozen frame-30 profiles produced:
+
+| metric | binary LBVH mean | face-DCD BVH8 mean | delta |
+|---|---:|---:|---:|
+| all CUDA kernels | 5,844.237 ms | 5,571.858 ms | -4.66% |
+| DCD query kernels | 5,462.235 ms | 5,155.349 ms | -5.62% |
+| VF-DCD query | 3,616.976 ms | 3,302.339 ms | -8.70% |
+| BVH8 front construction | 0 | 34.050 ms | +34.050 ms |
+
+Enabling edge DCD as well reduced its frozen query kernel by roughly 3%, but
+changed the freely evolved merged 50-frame result by `1.101e-7`, above the
+existing `1e-8` candidate contract.  Face DCD alone passed the
+merged/isolated/strict 50-frame gate (`1.531e-9` maximum merged position delta,
+strict gold exact).  Frozen FOLD merged/isolated frames 1, 10, and 30 retained
+exact DCD and swept-CCD physical multisets and exact original encodings.
+
+BVH8 does not stack materially with the expensive full PLOC tree.  On the same
+PLOC++ R16 topology and 100 DCD rebuilds, binary queries used 492.491 ms;
+BVH8 queries used 485.380 ms plus 6.340 ms to build the fronts.  That is nearly
+break-even before the roughly 7.47-second PLOC construction cost.  The useful
+interpretation is therefore not “PLOC plus BVH8,” but “retain the cheap LBVH
+and wide only the dominant VF-DCD traversal.”  This candidate remains opt-in
+until the combined 1550-frame and A800 campaign gates are complete.
+
 ## Current conclusions
 
 - Better topology is real: 13.4--18.0% fewer node pops is available without
@@ -259,7 +301,9 @@ tree quality affects performance rather than correctness.
 - Full and hierarchical GPU PLOC/PLOC++ recover useful tree quality but lose
   when rebuilt for every query; topology amortization/refit is the remaining
   condition under which they may become profitable.
-- BVH8 is not yet implemented, and no speedup is claimed for it.
+- Same-topology software BVH8 is implemented.  Whole-pipeline and PLOC+BVH8
+  variants lose, while largest-box-first face-DCD-only wide traversal is a
+  measured 4.7% win in the query-heavy frozen test and remains a candidate.
 - Conservative body-pair/family coherence is now measured, but the actual raw
   candidate cache and unified VF/EE/CCD broad phase remain pending.  The
   dominant cloth pairs invalidate far more often than static ABD pairs, so a

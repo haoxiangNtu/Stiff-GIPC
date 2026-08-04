@@ -134,6 +134,98 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     BVH_TRAVERSAL_AUDIT_COMMIT();
 }
 
+__global__ void _selfQuery_vf_wide8(const int*      _bodyID,
+                                    const int*      _btype,
+                                    const double3*  _vertexes,
+                                    const uint3*    _faces,
+                                    const uint32_t* _surfVerts,
+                                    const AABB*     _bvs,
+                                    const Node*     _nodes,
+                                    int4*           _collisionPair,
+                                    int4*           _ccd_collisionPair,
+                                    uint32_t*       _cpNum,
+                                    int*            MatIndex,
+                                    double          dHat,
+                                    int             number,
+                                    const int*      _collision_skip_matrix,
+                                    int             _collision_body_count,
+                                    const int*      _body_id_to_is_fem,
+                                    const uint32_t* wide_children)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+
+    uint32_t  stack[STIFF_BVH_STACK_CAP];
+    uint32_t* stack_ptr = stack;
+    BVH_STACK_PUSH(0);
+    idx = _surfVerts[idx];
+    if(_collision_skip_matrix && _collision_body_count > 0)
+    {
+        const int body = _bodyID[idx];
+        if(body >= 0 && body < _collision_body_count
+           && _collision_skip_matrix[body * _collision_body_count + body] != 0)
+            return;
+    }
+
+    BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfDcd);
+    AABB query;
+    query.upper = _vertexes[idx];
+    query.lower = _vertexes[idx];
+    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    do
+    {
+        const uint32_t node_id = *--stack_ptr;
+        BVH_TRAVERSAL_AUDIT_POP();
+        if(g_bvh_audit)
+        {
+            const int depth = static_cast<int>(stack_ptr - stack);
+            atomicMax(&g_max_stack, depth);
+        }
+        const uint32_t* children = wide_children + 8 * node_id;
+#pragma unroll
+        for(int slot = 0; slot < 8; ++slot)
+        {
+            const uint32_t child = children[slot];
+            if(child == 0xFFFFFFFFu)
+                break;
+            if(!overlap(query, _bvs[child], gap))
+                continue;
+            BVH_TRAVERSAL_AUDIT_OVERLAP();
+            const uint32_t obj_idx = _nodes[child].element_idx;
+            if(obj_idx == 0xFFFFFFFFu)
+            {
+                BVH_STACK_PUSH(child);
+                continue;
+            }
+            const uint3 face = _faces[obj_idx];
+            if(!_should_check_pair(
+                   _bodyID[idx], _bodyID[face.x], _body_id_to_is_fem)
+               || _is_collision_excluded(_bodyID[idx],
+                                          _bodyID[face.x],
+                                          _collision_skip_matrix,
+                                          _collision_body_count)
+               || _cross_env_skip(idx, face.x) || !_same_env(idx, face.x)
+               || idx == face.x || idx == face.y || idx == face.z
+               || (_btype[idx] >= 2 && _btype[face.x] >= 2
+                   && _btype[face.y] >= 2 && _btype[face.z] >= 2))
+                continue;
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            _checkPTintersection(_vertexes,
+                                 idx,
+                                 face.x,
+                                 face.y,
+                                 face.z,
+                                 dHat,
+                                 _cpNum,
+                                 MatIndex,
+                                 _collisionPair,
+                                 _ccd_collisionPair);
+        }
+    } while(stack < stack_ptr);
+    BVH_TRAVERSAL_AUDIT_COMMIT();
+}
+
 __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                   const int*      _btype,
                                   const double3*  _vertexes,
@@ -258,6 +350,99 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             {
                 BVH_STACK_PUSH(R_idx);
             }
+        }
+    } while(stack < stack_ptr);
+    BVH_TRAVERSAL_AUDIT_COMMIT();
+}
+
+__global__ void _selfQuery_vf_ccd_wide8(
+    const int*      _bodyID,
+    const int*      _btype,
+    const double3*  _vertexes,
+    const double3*  moveDir,
+    double          alpha,
+    const uint3*    _faces,
+    const uint32_t* _surfVerts,
+    const AABB*     _bvs,
+    const Node*     _nodes,
+    int4*           _ccd_collisionPair,
+    uint32_t*       _cpNum,
+    double          dHat,
+    int             number,
+    const int*      _collision_skip_matrix,
+    int             _collision_body_count,
+    const int*      _body_id_to_is_fem,
+    const double*   alpha_dev,
+    const uint32_t* wide_children)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    if(alpha_dev)
+        alpha = *alpha_dev;
+
+    uint32_t  stack[STIFF_BVH_STACK_CAP];
+    uint32_t* stack_ptr = stack;
+    BVH_STACK_PUSH(0);
+    idx = _surfVerts[idx];
+    if(_collision_skip_matrix && _collision_body_count > 0)
+    {
+        const int body = _bodyID[idx];
+        if(body >= 0 && body < _collision_body_count
+           && _collision_skip_matrix[body * _collision_body_count + body] != 0)
+            return;
+    }
+
+    BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfCcd);
+    const double3 current = _vertexes[idx];
+    const double3 move    = moveDir[idx];
+    AABB query;
+    query.upper = current;
+    query.lower = current;
+    query.combines(current.x - move.x * alpha,
+                   current.y - move.y * alpha,
+                   current.z - move.z * alpha);
+    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    do
+    {
+        const uint32_t node_id = *--stack_ptr;
+        BVH_TRAVERSAL_AUDIT_POP();
+        if(g_bvh_audit)
+        {
+            const int depth = static_cast<int>(stack_ptr - stack);
+            atomicMax(&g_max_stack, depth);
+        }
+        const uint32_t* children = wide_children + 8 * node_id;
+#pragma unroll
+        for(int slot = 0; slot < 8; ++slot)
+        {
+            const uint32_t child = children[slot];
+            if(child == 0xFFFFFFFFu)
+                break;
+            if(!overlap(query, _bvs[child], gap))
+                continue;
+            BVH_TRAVERSAL_AUDIT_OVERLAP();
+            const uint32_t obj_idx = _nodes[child].element_idx;
+            if(obj_idx == 0xFFFFFFFFu)
+            {
+                BVH_STACK_PUSH(child);
+                continue;
+            }
+            const uint3 face = _faces[obj_idx];
+            if(!_should_check_pair(
+                   _bodyID[idx], _bodyID[face.x], _body_id_to_is_fem)
+               || _is_collision_excluded(_bodyID[idx],
+                                          _bodyID[face.x],
+                                          _collision_skip_matrix,
+                                          _collision_body_count)
+               || _cross_env_skip(idx, face.x) || !_same_env(idx, face.x)
+               || idx == face.x || idx == face.y || idx == face.z
+               || (_btype[idx] >= 2 && _btype[face.x] >= 2
+                   && _btype[face.y] >= 2 && _btype[face.z] >= 2))
+                continue;
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
+                make_int4(-idx - 1, face.x, face.y, face.z);
         }
     } while(stack < stack_ptr);
     BVH_TRAVERSAL_AUDIT_COMMIT();
@@ -498,6 +683,148 @@ __global__ void _selfQuery_ee_sorted_prune(_SQEE_PARAMS,
 }
 
 template <int RangePruneMode>
+static __device__ __forceinline__ void _selfQuery_ee_wide8_body(
+    _SQEE_PARAMS,
+    const uint32_t* wide_children,
+    const uint32_t* node_max_element)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+
+    uint32_t  stack[STIFF_BVH_STACK_CAP];
+    uint32_t* stack_ptr = stack;
+    BVH_STACK_PUSH(0);
+    const uint32_t self_leaf = static_cast<uint32_t>(idx);
+    idx += number - 1;
+    const AABB query = _bvs[idx];
+    const uint32_t self_eid = _nodes[idx].element_idx;
+    const uint2 self_edge = _edges[self_eid];
+    const int qenv = (g_bvh_envpart && node_env) ? node_env[idx] : -1;
+    if(_collision_skip_matrix && _collision_body_count > 0)
+    {
+        const int body = _bodyID[self_edge.x];
+        if(body >= 0 && body < _collision_body_count
+           && _collision_skip_matrix[body * _collision_body_count + body] != 0)
+            return;
+    }
+
+    BVH_TRAVERSAL_AUDIT_BEGIN(kBvhEeDcd);
+    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    do
+    {
+        const uint32_t node_id = *--stack_ptr;
+        BVH_TRAVERSAL_AUDIT_POP();
+        if(g_bvh_audit)
+        {
+            const int depth = static_cast<int>(stack_ptr - stack);
+            atomicMax(&g_max_stack, depth);
+        }
+        const uint32_t* children = wide_children + 8 * node_id;
+#pragma unroll
+        for(int slot = 0; slot < 8; ++slot)
+        {
+            const uint32_t child = children[slot];
+            if(child == 0xFFFFFFFFu)
+                break;
+            bool owned = true;
+            if constexpr(RangePruneMode == 1)
+            {
+                if(!g_ee_nodedup && !g_ee_canon && node_max_element)
+                    owned = node_max_element[child] >= self_eid;
+            }
+            if constexpr(RangePruneMode == 2)
+            {
+                if(node_max_element)
+                    owned = node_max_element[child] >= self_leaf;
+            }
+            if(!owned
+               || !(qenv < 0 || node_env[child] < 0
+                    || node_env[child] == qenv)
+               || !overlap(query, _bvs[child], gap))
+                continue;
+            BVH_TRAVERSAL_AUDIT_OVERLAP();
+            const uint32_t obj_idx = _nodes[child].element_idx;
+            if(obj_idx == 0xFFFFFFFFu)
+            {
+                BVH_STACK_PUSH(child);
+                continue;
+            }
+            if(self_eid == obj_idx)
+                continue;
+            const uint2 other_edge = _edges[obj_idx];
+            if(!_should_check_pair(_bodyID[self_edge.x],
+                                   _bodyID[other_edge.x],
+                                   _body_id_to_is_fem)
+               || _is_collision_excluded(_bodyID[self_edge.x],
+                                          _bodyID[other_edge.x],
+                                          _collision_skip_matrix,
+                                          _collision_body_count)
+               || _cross_env_skip(self_edge.x, other_edge.x)
+               || !_same_env(self_edge.x, other_edge.x))
+                continue;
+            bool duplicate = self_edge.x == other_edge.x
+                             || self_edge.x == other_edge.y
+                             || self_edge.y == other_edge.x
+                             || self_edge.y == other_edge.y;
+            if constexpr(RangePruneMode != 2)
+            {
+                duplicate = duplicate
+                            || (!g_ee_nodedup
+                                && (g_ee_canon
+                                        ? (_edge_lkey(other_edge)
+                                           < _edge_lkey(self_edge))
+                                        : (obj_idx < self_eid)));
+            }
+            if(duplicate
+               || (_btype[self_edge.x] >= 2 && _btype[self_edge.y] >= 2
+                   && _btype[other_edge.x] >= 2
+                   && _btype[other_edge.y] >= 2))
+                continue;
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            _checkEEintersection<(RangePruneMode == 2)>(_vertexes,
+                                                         _rest_vertexes,
+                                                         self_edge.x,
+                                                         self_edge.y,
+                                                         other_edge.x,
+                                                         other_edge.y,
+                                                         obj_idx,
+                                                         dHat,
+                                                         _cpNum,
+                                                         MatIndex,
+                                                         _collisionPair,
+                                                         _ccd_collisionPair,
+                                                         number);
+        }
+    } while(stack < stack_ptr);
+    BVH_TRAVERSAL_AUDIT_COMMIT();
+}
+
+__global__ void __launch_bounds__(256, 2) _selfQuery_ee_wide8(
+    _SQEE_PARAMS, const uint32_t* wide_children)
+{
+    _selfQuery_ee_wide8_body<0>(_SQEE_ARGS, wide_children, nullptr);
+}
+
+__global__ void __launch_bounds__(256, 2) _selfQuery_ee_range_prune_wide8(
+    _SQEE_PARAMS,
+    const uint32_t* wide_children,
+    const uint32_t* node_max_element)
+{
+    _selfQuery_ee_wide8_body<1>(
+        _SQEE_ARGS, wide_children, node_max_element);
+}
+
+__global__ void __launch_bounds__(256, 2) _selfQuery_ee_sorted_prune_wide8(
+    _SQEE_PARAMS,
+    const uint32_t* wide_children,
+    const uint32_t* node_max_element)
+{
+    _selfQuery_ee_wide8_body<2>(
+        _SQEE_ARGS, wide_children, node_max_element);
+}
+
+template <int RangePruneMode>
 static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
     const int*      _bodyID,
     const int*      _btype,
@@ -664,6 +991,121 @@ __global__ void _selfQuery_ee_ccd_range_prune(
     _SQEE_CCD_PARAMS, const uint32_t* node_max_element)
 {
     _selfQuery_ee_ccd_body<1>(_SQEE_CCD_ARGS, node_max_element);
+}
+
+template <int RangePruneMode>
+static __device__ __forceinline__ void _selfQuery_ee_ccd_wide8_body(
+    _SQEE_CCD_PARAMS,
+    const uint32_t* wide_children,
+    const uint32_t* node_max_element)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    if(alpha_dev)
+        alpha = *alpha_dev;
+
+    uint32_t  stack[STIFF_BVH_STACK_CAP];
+    uint32_t* stack_ptr = stack;
+    BVH_STACK_PUSH(0);
+    idx += number - 1;
+    const AABB query = _bvs[idx];
+    const uint32_t self_eid = _nodes[idx].element_idx;
+    const uint2 self_edge = _edges[self_eid];
+    const int qenv = (g_bvh_envpart && node_env) ? node_env[idx] : -1;
+    if(_collision_skip_matrix && _collision_body_count > 0)
+    {
+        const int body = _bodyID[self_edge.x];
+        if(body >= 0 && body < _collision_body_count
+           && _collision_skip_matrix[body * _collision_body_count + body] != 0)
+            return;
+    }
+
+    BVH_TRAVERSAL_AUDIT_BEGIN(kBvhEeCcd);
+    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    do
+    {
+        const uint32_t node_id = *--stack_ptr;
+        BVH_TRAVERSAL_AUDIT_POP();
+        if(g_bvh_audit)
+        {
+            const int depth = static_cast<int>(stack_ptr - stack);
+            atomicMax(&g_max_stack, depth);
+        }
+        const uint32_t* children = wide_children + 8 * node_id;
+#pragma unroll
+        for(int slot = 0; slot < 8; ++slot)
+        {
+            const uint32_t child = children[slot];
+            if(child == 0xFFFFFFFFu)
+                break;
+            bool owned = true;
+            if constexpr(RangePruneMode == 1)
+            {
+                if(!g_ee_nodedup && !g_ee_canon && node_max_element)
+                    owned = node_max_element[child] >= self_eid;
+            }
+            if(!owned
+               || !(qenv < 0 || node_env[child] < 0
+                    || node_env[child] == qenv)
+               || !overlap(query, _bvs[child], gap))
+                continue;
+            BVH_TRAVERSAL_AUDIT_OVERLAP();
+            const uint32_t obj_idx = _nodes[child].element_idx;
+            if(obj_idx == 0xFFFFFFFFu)
+            {
+                BVH_STACK_PUSH(child);
+                continue;
+            }
+            if(self_eid == obj_idx)
+                continue;
+            const uint2 other_edge = _edges[obj_idx];
+            if(!_should_check_pair(_bodyID[self_edge.x],
+                                   _bodyID[other_edge.x],
+                                   _body_id_to_is_fem)
+               || _is_collision_excluded(_bodyID[self_edge.x],
+                                          _bodyID[other_edge.x],
+                                          _collision_skip_matrix,
+                                          _collision_body_count)
+               || _cross_env_skip(self_edge.x, other_edge.x)
+               || !_same_env(self_edge.x, other_edge.x)
+               || self_edge.x == other_edge.x
+               || self_edge.x == other_edge.y
+               || self_edge.y == other_edge.x
+               || self_edge.y == other_edge.y
+               || (!g_ee_nodedup
+                   && (g_ee_canon
+                           ? (_edge_lkey(other_edge) < _edge_lkey(self_edge))
+                           : (obj_idx < self_eid)))
+               || (_btype[self_edge.x] >= 2 && _btype[self_edge.y] >= 2
+                   && _btype[other_edge.x] >= 2
+                   && _btype[other_edge.y] >= 2))
+                continue;
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
+                make_int4(self_edge.x,
+                          self_edge.y,
+                          other_edge.x,
+                          other_edge.y);
+        }
+    } while(stack < stack_ptr);
+    BVH_TRAVERSAL_AUDIT_COMMIT();
+}
+
+__global__ void _selfQuery_ee_ccd_wide8(
+    _SQEE_CCD_PARAMS, const uint32_t* wide_children)
+{
+    _selfQuery_ee_ccd_wide8_body<0>(
+        _SQEE_CCD_ARGS, wide_children, nullptr);
+}
+
+__global__ void _selfQuery_ee_ccd_range_prune_wide8(
+    _SQEE_CCD_PARAMS,
+    const uint32_t* wide_children,
+    const uint32_t* node_max_element)
+{
+    _selfQuery_ee_ccd_wide8_body<1>(
+        _SQEE_CCD_ARGS, wide_children, node_max_element);
 }
 
 #undef _SQEE_CCD_ARGS
