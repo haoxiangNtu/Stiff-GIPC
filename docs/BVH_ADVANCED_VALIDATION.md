@@ -617,8 +617,42 @@ includes:
 - the isolated whole-frame graph gate (19 graph frames after one capture
   fallback), numerical parity, and perturbation isolation.
 
-The full 1550-frame replay and A800 repeat are still release blockers, so both
-knobs remain opt-in.
+### Complete FOLD-SHIRT trajectory coverage
+
+`scripts/bvh_fold_long_gate.py` now runs the real bundled 1550-action replay,
+writes the terminal checkpoint and vertex array, rejects non-finite state and
+CUDA/retry failures, and audits whole-frame-graph coverage.  The first version
+of this gate exposed an important false proof: FOLD only declares body groups
+when it instantiates at least two environments.  Asking for `isolated` with one
+environment printed `per-env machinery disabled, running merged-equivalent`
+and produced 1550 fallback frames.  The gate now rejects that configuration
+before launch and also rejects a graph run with zero full-graph frames or more
+than a 1% fallback budget.
+
+On the RTX 4090, the complete candidate bundle
+(`PLOC=3`, refit interval 128, VF-DCD query order, per-env query subset) has the
+following long-horizon evidence:
+
+| replay | graph coverage | elapsed | result |
+|---|---:|---:|---|
+| merged, 1 env, graph off | n/a | 133.1 s (85.5 ms/frame) | 1550/1550, finite |
+| merged, 1 env, graph on | 1544 full + 6 boundary fallback | 183.0 s (117.7 ms/frame) | 1550/1550, finite |
+| isolated, 4 real groups, graph on | 1545 full + 5 boundary fallback | 674.0 s (434.3 ms/batch, 108.6 ms/env) | 1550/1550, finite |
+
+For the real isolated run, the exact fallback ids were `[0, 1, 10, 12, 13]`:
+frame 0 is the documented lazy-workspace warm-up, while device capacity status
+was published at frames `[1, 10, 12, 13]`.  Every frame after 13 used the C5
+full conditional graph.  This is the intended fixed-topology contract -- the
+device detects insufficient capacity, that frame is finished on the audited
+boundary fallback, and the next graph is recorded at the grown tier.  There
+were no late-episode overflows, exhausted retries, NaNs, or CUDA errors.
+
+The long run crosses repeated 128-construction rebuild/refit generations and
+therefore closes the obvious lifetime-risk gap for PLOC topology state.  A
+four-env graph-off long run and its repeat are still needed to form the
+trajectory noise envelope and a clean graph-on/off performance comparison.
+The A800 repeat also remains a release blocker, so all candidate knobs remain
+opt-in.
 
 ## Current conclusions
 
@@ -655,4 +689,5 @@ knobs remain opt-in.
   per-env query subset has no standalone wall benefit, but makes query sorting
   cheap enough that the combination measured about 6.8% end-to-end on the
   fixed four-env workload.  This is the second winner candidate after
-  PLOC++/refit-128, pending 1550-frame and A800 proof.
+  PLOC++/refit-128.  Both now survive the complete 1550-frame 4090 trajectory;
+  promotion still awaits the graph-off repeat/envelope and A800 proof.

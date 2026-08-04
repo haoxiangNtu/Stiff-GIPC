@@ -387,6 +387,8 @@ def main():
         graph_frames = 0
         fallback_frames = 0
         overflow_frames = 0
+        graph_fallback_ids = []
+        graph_capacity_ids = []
         graph_audit = bool(int(os.environ.get("CASE39_GRAPH_STATS", "0")))
         for fr in range(f0, f1):
             for e, ej in enumerate(ejs):
@@ -398,8 +400,14 @@ def main():
                     graph_frames += 1
                 else:
                     fallback_frames += 1
-                if int(_st.invalid_bits) & ((1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)):
+                    graph_fallback_ids.append(fr)
+                _capacity_bits = ((1 << 16) | (1 << 17) | (1 << 18)
+                                  | (1 << 19) | (1 << 20))
+                _observed_capacity = (int(_st.invalid_bits)
+                                      | int(_st.retry_invalid_bits))
+                if _observed_capacity & _capacity_bits:
                     overflow_frames += 1
+                    graph_capacity_ids.append(fr)
             if recorder is not None and fr % recorder[4] == 0:
                 (_mp4, _usd, _faces_all, _face_is_abd, _st) = recorder
                 _v = np.asarray(eng.get_vertices())
@@ -458,6 +466,8 @@ def main():
         print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({fps:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
         if graph_audit:
             print(f"[fs-graph-audit] full={graph_frames} fallback={fallback_frames} overflow={overflow_frames}", flush=True)
+            print(f"[fs-graph-detail] fallback_frames={graph_fallback_ids} "
+                  f"capacity_frames={graph_capacity_ids}", flush=True)
         # [release gate] final-state vertex dump for the strict bitwise trio
         # (cross-env / batch-invariance / run-to-run). Engine-local vertices are
         # co-located across envs in strict layout, so slices compare bitwise.

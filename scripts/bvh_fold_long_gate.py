@@ -4,14 +4,15 @@
 The short candidate gate proves frozen pair completeness.  This gate supplies
 the complementary long-horizon evidence: merged and isolated replays must each
 finish the requested number of real frames, publish finite state, and avoid
-CUDA/overflow failures.  Optional whole-frame-graph mode additionally requires
-every frame to be accounted for and no overflow status.
+CUDA failures.  Optional whole-frame-graph mode additionally requires every
+frame to be accounted for and bounds frame-boundary capacity fallbacks.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -29,6 +30,12 @@ FRAMES = int(os.environ.get("BVH_FOLD_LONG_FRAMES", "1550"))
 ENVS = int(os.environ.get("BVH_FOLD_LONG_ENVS", "1"))
 TIMEOUT = int(os.environ.get("BVH_FOLD_LONG_TIMEOUT", "10800"))
 GRAPH = bool(int(os.environ.get("BVH_FOLD_LONG_GRAPH", "0")))
+MAX_GRAPH_FALLBACK = int(
+    os.environ.get(
+        "BVH_FOLD_LONG_MAX_GRAPH_FALLBACK",
+        str(max(2, math.ceil(FRAMES * 0.01))),
+    )
+)
 MODES = tuple(
     item.strip()
     for item in os.environ.get(
@@ -50,6 +57,10 @@ SUMMARY = re.compile(
 )
 GRAPH_SUMMARY = re.compile(
     r"\[fs-graph-audit\] full=(\d+) fallback=(\d+) overflow=(\d+)"
+)
+GRAPH_DETAIL = re.compile(
+    r"\[fs-graph-detail\] fallback_frames=(\[[^\n]*\]) "
+    r"capacity_frames=(\[[^\n]*\])"
 )
 
 
@@ -137,6 +148,11 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         raise RuntimeError(
             f"{mode}: replay failed rc={return_code}; see {log_path}"
         )
+    if mode == "isolated" and "per-env machinery disabled" in output:
+        raise RuntimeError(
+            f"{mode}: replay silently disabled per-env machinery; "
+            "use at least two declared environments"
+        )
     summaries = SUMMARY.findall(output)
     if not summaries:
         raise RuntimeError(f"{mode}: missing final frame summary; see {log_path}")
@@ -158,10 +174,34 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         if not graph_rows:
             raise RuntimeError(f"{mode}: missing graph coverage summary")
         graph_full, graph_fallback, graph_overflow = map(int, graph_rows[-1])
-        if graph_full + graph_fallback != FRAMES or graph_overflow != 0:
+        if (graph_full + graph_fallback != FRAMES
+                or graph_overflow > graph_fallback):
             raise RuntimeError(
                 f"{mode}: invalid graph accounting full={graph_full} "
                 f"fallback={graph_fallback} overflow={graph_overflow}"
+            )
+        if graph_full == 0 or graph_fallback > MAX_GRAPH_FALLBACK:
+            raise RuntimeError(
+                f"{mode}: graph coverage is not steady-state evidence: "
+                f"full={graph_full} fallback={graph_fallback}, "
+                f"fallback budget={MAX_GRAPH_FALLBACK}"
+            )
+
+    graph_fallback_frames: list[int] | None = None
+    graph_capacity_frames: list[int] | None = None
+    graph_details = GRAPH_DETAIL.findall(output)
+    if graph_details:
+        graph_fallback_frames = json.loads(graph_details[-1][0])
+        graph_capacity_frames = json.loads(graph_details[-1][1])
+        if (len(graph_fallback_frames) != graph_fallback
+                or len(graph_capacity_frames) != graph_overflow
+                or not set(graph_capacity_frames).issubset(
+                    graph_fallback_frames
+                )):
+            raise RuntimeError(
+                f"{mode}: graph detail disagrees with summary: "
+                f"fallback={graph_fallback_frames}, "
+                f"capacity={graph_capacity_frames}"
             )
 
     digest = hashlib.sha256(vertices.tobytes()).hexdigest()
@@ -178,6 +218,8 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         "graph_full": graph_full,
         "graph_fallback": graph_fallback,
         "graph_overflow": graph_overflow,
+        "graph_fallback_frames": graph_fallback_frames,
+        "graph_capacity_frames": graph_capacity_frames,
         "log": str(log_path),
         "vertices": str(vertex_path),
         "checkpoint": str(checkpoint_path),
@@ -193,6 +235,12 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
 def main() -> int:
     if FRAMES <= 0 or ENVS <= 0 or not MODES:
         print("BVH-FOLD-LONG-GATE: invalid frames/envs/modes")
+        return 2
+    if "isolated" in MODES and ENVS < 2:
+        print(
+            "BVH-FOLD-LONG-GATE: invalid isolated proof: the FOLD replay "
+            "declares body groups only when BVH_FOLD_LONG_ENVS >= 2"
+        )
         return 2
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     try:
