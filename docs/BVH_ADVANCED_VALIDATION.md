@@ -175,6 +175,77 @@ better tree (and against a binary traversal of the same topology), not credited
 with the SAH result.  Per-body temporal caching and a unified broad-phase
 redesign remain independent experiments.
 
+## Full-campaign continuation: body-pair coherence and PLOC/PLOC++
+
+The continuation branch is `codex/bvh-full-campaign` in the separate worktree
+`/home/ps/Downloads/Stiff-GIPC-bvh-full-campaign`, based on this report's
+validated revision.  It still does not modify the Claude worktree.
+
+### Conservative body-pair coherence census
+
+The validation-only `STIFF_BVH_COHERENCE_AUDIT` path snapshots vertices on the
+device and measures three strict invalidation rules without changing solver
+results.  A global table remains valid while the global maximum displacement
+is at most `delta/2`.  A table for distinct bodies A/B remains valid while
+`max_disp(A) + max_disp(B) <= delta`; a self-body table uses
+`2 * max_disp(A) <= delta`.  Collision masks and FEM self-collision semantics
+are applied before counting eligible body pairs.
+
+On the first 30 FOLD frames with a 1.5x broad-phase radius, global queries per
+build were only 1.127 (merged) and 1.141 (isolated).  Body-pair granularity was
+better: merged FEM-self/FEM-FEM/ABD-FEM/ABD-ABD ratios were
+2.048/1.764/1.784/2.631, and isolated ratios were
+2.204/1.809/1.836/2.923.  However, the dominant cloth body and its principal
+pairs remained near one query per build.  On frozen frame 30, the same 1.5x
+margin increased VF/EE DCD node pops by about 19% and swept VF/EE node pops by
+about 18%; the raw swept CCD candidate list grew by about 43%.  Therefore the
+census supports segmented body-pair/family caching, but does not yet establish
+a net win for the dominant FOLD work.  Any implementation must cache only raw
+broad-phase candidates and rerun distance type, barrier, mollification,
+friction, and refined CCD on every reuse.
+
+### Capture-safe PLOC implementations
+
+Three opt-in construction controls were implemented for a direct cost test:
+
+- `STIFF_BVH_PLOC=1`: original PLOC tie semantics, entire tree in one
+  workgroup;
+- `STIFF_BVH_PLOC=2`: PLOC++ coincident-box tie semantics, entire tree in one
+  workgroup;
+- `STIFF_BVH_PLOC=3`: Morton-contiguous chunks agglomerated in parallel from
+  shared memory, followed by the PLOC++ upper-level single-workgroup pass.
+
+`STIFF_BVH_PLOC_RADIUS`, `STIFF_BVH_PLOC_CHUNK`, and
+`STIFF_BVH_PLOC_MASK` control the search radius, chunk size, and the four
+face/edge DCD/CCD families.  All paths use memory that is already dead after
+Morton sorting, perform no allocation/readback/synchronization, and are CUDA
+Graph capture-safe.
+
+The full PLOC++ R16 tree recovers most of the host SAH oracle's quality on
+frozen merged frame 30: VF-DCD/EE-DCD/VF-CCD/EE-CCD node pops fall by roughly
+13.4%/12.9%/13.6%/13.9%, with identical primitive-test counts and exact encoded
+pair multisets.  R32 reaches roughly 14--15%.  The complete frozen FOLD pair
+gate passed for merged and isolated frames 1, 10, and 30, and the 50-frame
+merged/isolated/strict trajectory gate kept the strict gold exactly.
+
+Construction cost rejects rebuilding either form for every query.  The table
+below profiles 50 DCD plus 50 swept-CCD rebuilds on the same merged frame-30
+checkpoint (406 total tree constructions, RTX 4090):
+
+| builder | all CUDA kernels | builder kernels | four query kernels |
+|---|---:|---:|---:|
+| Morton LBVH | 441.323 ms | 12.043 ms topology+AABB | 401.154 ms |
+| full PLOC++ R16 | 8,024.044 ms | 7,623.613 ms | 372.845 ms |
+| full PLOC++ R32 | 13,725.297 ms | 13,348.522 ms | 349.241 ms |
+| hierarchical shared PLOC++ C256/R16 | 640.414 ms | 226.577 ms | 386.227 ms |
+
+Thus the better tree is real, but even the optimized hierarchical builder adds
+about 214.5 ms more construction work than LBVH to save about 14.9 ms of query
+work in this test.  It remains off by default.  It should be retested only when
+the topology is amortized across exact AABB refits; a topology refit remains
+collision-complete because every leaf and internal AABB is recomputed, while
+tree quality affects performance rather than correctness.
+
 ## Current conclusions
 
 - Better topology is real: 13.4--18.0% fewer node pops is available without
@@ -185,8 +256,11 @@ redesign remain independent experiments.
 - Lightweight rotations must be selective.  Whole-tree/all-family application
   loses to its own build cost; face-DCD phase 1 is the only measured positive
   slice so far.
+- Full and hierarchical GPU PLOC/PLOC++ recover useful tree quality but lose
+  when rebuilt for every query; topology amortization/refit is the remaining
+  condition under which they may become profitable.
 - BVH8 is not yet implemented, and no speedup is claimed for it.
-- Per-body/per-family cache implementation and unified VF/EE/CCD broad phase
-  remain pending.  The existing global-cache audit already rejected one global
-  Verlet list; the next audit must prevent one fast body from invalidating all
-  slow-body caches.
+- Conservative body-pair/family coherence is now measured, but the actual raw
+  candidate cache and unified VF/EE/CCD broad phase remain pending.  The
+  dominant cloth pairs invalidate far more often than static ABD pairs, so a
+  useful cache must segment both validity and stored candidate work.

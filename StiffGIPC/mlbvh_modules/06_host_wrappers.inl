@@ -615,6 +615,117 @@ enum BvhSahRotationFamily
     kSahEdgeCcd = 8,
 };
 
+static int bvh_ploc_mode()
+{
+    static const int mode = []
+    {
+        const char* value = getenv("STIFF_BVH_PLOC");
+        if(!value)
+            return 0;
+        const int parsed = atoi(value);
+        return parsed <= 0 ? 0 : std::min(parsed, 3);
+    }();
+    return mode;
+}
+
+static int bvh_ploc_mask()
+{
+    static const int mask = []
+    {
+        const char* value = getenv("STIFF_BVH_PLOC_MASK");
+        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0xF)
+                     : 0xF;
+    }();
+    return mask;
+}
+
+static int bvh_ploc_radius()
+{
+    static const int radius = []
+    {
+        const char* value = getenv("STIFF_BVH_PLOC_RADIUS");
+        const int parsed = value ? atoi(value) : 16;
+        return std::max(1, std::min(64, parsed));
+    }();
+    return radius;
+}
+
+static int bvh_ploc_chunk_size()
+{
+    static const int chunk_size = []
+    {
+        const char* value = getenv("STIFF_BVH_PLOC_CHUNK");
+        const int parsed = value ? atoi(value) : 256;
+        return std::max(32, std::min(256, parsed));
+    }();
+    return chunk_size;
+}
+
+static bool buildPlocTopology(lbvh&         tree,
+                              int           number,
+                              int           family,
+                              cudaStream_t  stream,
+                              uint32_t*     node_max_element = nullptr)
+{
+    const int mode = bvh_ploc_mode();
+    if(mode == 0 || number < 2 || (bvh_ploc_mask() & family) == 0)
+        return false;
+
+    auto* mch_u32 = reinterpret_cast<uint32_t*>(tree._MChash);
+    auto* temp_u32 = reinterpret_cast<uint32_t*>(tree._tempLeafBox);
+    uint32_t* clusters_b = mch_u32;
+    uint32_t* nearest    = mch_u32 + number;
+    uint32_t* flags      = temp_u32;
+    uint32_t* offsets    = temp_u32 + number;
+    uint32_t* assigned   = temp_u32 + 2 * number;
+    if(mode < 3)
+    {
+        _buildPlocSingleWorkgroup<<<1, 256, 0, stream>>>(
+            tree._nodes,
+            tree._bvs,
+            tree._indices,
+            clusters_b,
+            nearest,
+            flags,
+            offsets,
+            assigned,
+            node_max_element,
+            number,
+            bvh_ploc_radius(),
+            mode == 2 ? 1 : 0);
+    }
+    else
+    {
+        const int chunk_size  = bvh_ploc_chunk_size();
+        const int chunk_count = (number + chunk_size - 1) / chunk_size;
+        uint32_t* roots = temp_u32 + 3 * number;
+        _buildPlocChunksShared<<<chunk_count, 256, 0, stream>>>(
+            tree._nodes,
+            tree._bvs,
+            roots,
+            node_max_element,
+            number,
+            chunk_size,
+            bvh_ploc_radius());
+        if(chunk_count > 1)
+            _buildPlocUpper<<<1, 256, 0, stream>>>(
+                tree._nodes,
+                tree._bvs,
+                roots,
+                tree._indices,
+                clusters_b,
+                nearest,
+                flags,
+                offsets,
+                assigned,
+                node_max_element,
+                chunk_count,
+                bvh_ploc_radius(),
+                1);
+    }
+    return true;
+}
+
 static int bvh_sah_rotation_mask()
 {
     static const int mask = []
@@ -1024,8 +1135,11 @@ double lbvh_f::Construct(cudaStream_t stream)
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
         calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
-        calcInternalNodes(_nodes, _MChash, N, stream);
-        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        if(!buildPlocTopology(*this, N, kSahFaceDcd, stream))
+        {
+            calcInternalNodes(_nodes, _MChash, N, stream);
+            calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahFaceDcd, stream);
         return 0;
@@ -1048,9 +1162,12 @@ double lbvh_f::Construct(cudaStream_t stream)
     _mc_sort_active(*this, _MChash, _indices, face_number, 0);
     sortBvs(_indices, _bvs, _tempLeafBox, face_number);
     calcLeafNodes(_nodes, _indices, face_number);
-    calcInternalNodes(_nodes, _MChash, face_number);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    if(!buildPlocTopology(*this, face_number, kSahFaceDcd, 0))
+    {
+        calcInternalNodes(_nodes, _MChash, face_number);
+        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    }
     optimizeSahTreelets(
         _nodes, _bvs, _flags, face_number, kSahFaceDcd);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
@@ -1081,8 +1198,11 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
         calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
-        calcInternalNodes(_nodes, _MChash, N, stream);
-        calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        if(!buildPlocTopology(*this, N, kSahFaceCcd, stream))
+        {
+            calcInternalNodes(_nodes, _MChash, N, stream);
+            calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahFaceCcd, stream);
         return 0;
@@ -1106,9 +1226,11 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     sortBvs(_indices, _bvs, _tempLeafBox, face_number);
 
     calcLeafNodes(_nodes, _indices, face_number);
-
-    calcInternalNodes(_nodes, _MChash, face_number);
-    calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    if(!buildPlocTopology(*this, face_number, kSahFaceCcd, 0))
+    {
+        calcInternalNodes(_nodes, _MChash, face_number);
+        calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    }
     optimizeSahTreelets(
         _nodes, _bvs, _flags, face_number, kSahFaceCcd);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
@@ -1159,8 +1281,11 @@ double lbvh_e::Construct(cudaStream_t stream)
             stream,
             node_max,
             range_mode == 2);
-        calcInternalNodes(_nodes, _MChash, N, stream);
-        calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
+        if(!buildPlocTopology(*this, N, kSahEdgeDcd, stream, node_max))
+        {
+            calcInternalNodes(_nodes, _MChash, N, stream);
+            calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
+        }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahEdgeDcd, stream, node_max);
         return 0;
@@ -1194,10 +1319,13 @@ double lbvh_e::Construct(cudaStream_t stream)
 
     calcLeafNodes(
         _nodes, _indices, edge_number, node_max, range_mode == 2);
-
-    calcInternalNodes(_nodes, _MChash, edge_number);
-    //CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
+    if(!buildPlocTopology(
+           *this, edge_number, kSahEdgeDcd, 0, node_max))
+    {
+        calcInternalNodes(_nodes, _MChash, edge_number);
+        //CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
+    }
     optimizeSahTreelets(
         _nodes, _bvs, _flags, edge_number, kSahEdgeDcd, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
@@ -1243,8 +1371,11 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
         calcLeafNodes_indirect(
             _nodes, _indices, _active_idx, N, stream, node_max, false);
-        calcInternalNodes(_nodes, _MChash, N, stream);
-        calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
+        if(!buildPlocTopology(*this, N, kSahEdgeCcd, stream, node_max))
+        {
+            calcInternalNodes(_nodes, _MChash, N, stream);
+            calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
+        }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahEdgeCcd, stream, node_max);
         return 0;
@@ -1269,10 +1400,12 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     sortBvs(_indices, _bvs, _tempLeafBox, edge_number);
 
     calcLeafNodes(_nodes, _indices, edge_number, node_max, false);
-
-    calcInternalNodes(_nodes, _MChash, edge_number);
-
-    calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
+    if(!buildPlocTopology(
+           *this, edge_number, kSahEdgeCcd, 0, node_max))
+    {
+        calcInternalNodes(_nodes, _MChash, edge_number);
+        calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
+    }
     optimizeSahTreelets(
         _nodes, _bvs, _flags, edge_number, kSahEdgeCcd, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
