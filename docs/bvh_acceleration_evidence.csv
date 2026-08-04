@@ -17,3 +17,7 @@ stack_cap_64,initial_profile,ee_dcd_mean_us,1674.652,1687.792,+0.78%,strict_anch
 morton14,frozen_frame30_ee_dcd,node_pops,39446956,39406147,-0.1035%,dcd_and_ccd_encoding_exact,reject_precision_only
 morton14,frozen_frame30_ee_ccd,node_pops,41209520,41208700,-0.0020%,dcd_and_ccd_encoding_exact,reject_precision_only
 ee_sorted_rank_prune,frozen_frame30_ee_dcd,node_pops,39446956,23389292,-40.71%,physical_set_exact_but_encoding_permuted,research_only
+vf_body_pair_cache,frozen_frame30_1000_dcd,vf_dcd_plus_replay_ms,3614.698,1105.441,-69.42%,30571_encoded_rows_exact,static_upper_bound_only
+vf_body_pair_cache,deterministic_fold30,vf_dcd_node_pops,306741277,95242959,-68.95%,positions_pairs_and_newton_exact,structural_win
+vf_body_pair_cache,deterministic_fold30,vf_dcd_path_ms,1252.761,1147.005,-8.44%,positions_pairs_and_newton_exact,keep_opt_in
+vf_body_pair_cache,deterministic_fold30,total_cuda_kernel_ms,17335.744,17194.224,-0.82%,positions_pairs_and_newton_exact,not_default

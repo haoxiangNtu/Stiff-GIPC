@@ -408,6 +408,53 @@ __global__ void _calcMChash14(uint64_t*       _MChash,
         _MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
 }
 
+// Validation candidate for segmented body-pair traversal.  Preserve the
+// already-computed 30-bit Morton code within each body, but move body id into
+// the high key bits so every body's primitives form a contiguous LBVH block.
+// The active-index variants still key by the original primitive/body id.
+// This changes topology only; it cannot add or remove collision candidates.
+template <class Primitive>
+static __device__ __forceinline__ void _bodyMajorKeyBody(
+    uint64_t*          keys,
+    const Primitive*   primitives,
+    const int*         active_idx,
+    const int*         body_id,
+    int                number)
+{
+    const int sorted_slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if(sorted_slot >= number)
+        return;
+    const int primitive = active_idx ? active_idx[sorted_slot] : sorted_slot;
+    const uint32_t vertex = primitives[primitive].x;
+    const int raw_body = body_id ? body_id[vertex] : -1;
+    const uint64_t body = static_cast<uint64_t>(
+        raw_body >= 0 && raw_body < 1023 ? raw_body : 1023);
+    const uint64_t old_key = keys[sorted_slot];
+    const uint64_t morton = g_bvh_envmajor
+                                ? ((old_key >> 26) & 0x3fffffffull)
+                                : ((old_key >> 32) & 0x3fffffffull);
+    keys[sorted_slot] = (body << 54) | (morton << 24)
+                        | (static_cast<uint64_t>(primitive) & 0xffffffull);
+}
+
+__global__ void _bodyMajorFaceKeys(uint64_t*       keys,
+                                   const uint3*    faces,
+                                   const int*      active_idx,
+                                   const int*      body_id,
+                                   int             number)
+{
+    _bodyMajorKeyBody(keys, faces, active_idx, body_id, number);
+}
+
+__global__ void _bodyMajorEdgeKeys(uint64_t*       keys,
+                                   const uint2*    edges,
+                                   const int*      active_idx,
+                                   const int*      body_id,
+                                   int             number)
+{
+    _bodyMajorKeyBody(keys, edges, active_idx, body_id, number);
+}
+
 template <bool TrackMax>
 static __device__ __forceinline__ void _calcLeafNodes_body(
     Node*           _nodes,

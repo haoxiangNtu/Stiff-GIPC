@@ -141,6 +141,14 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_BVH_TRAVERSAL_AUDIT, "diag") \
     X(STIFF_BVH_MARGIN_SCALE, "diag") \
     X(STIFF_BVH_COHERENCE_AUDIT, "diag") \
+    X(STIFF_BVH_BODY_MAJOR, "perf") \
+    X(STIFF_BVH_BODY_MAJOR_MASK, "perf") \
+    X(STIFF_BVH_PAIR_CACHE, "perf") \
+    X(STIFF_BVH_PAIR_CACHE_CAP, "perf") \
+    X(STIFF_BVH_PAIR_CACHE_DEVICE, "perf") \
+    X(STIFF_BVH_PAIR_CACHE_STATS, "diag") \
+    X(STIFF_BVH_PAIR_WORK_AUDIT, "diag") \
+    X(STIFF_BVH_PAIR_WORK_DETAIL, "diag") \
     X(STIFF_BVH_MORTON14, "perf") \
     X(STIFF_BVH_PLOC, "perf") \
     X(STIFF_BVH_PLOC_CHUNK, "perf") \

@@ -36,6 +36,13 @@ QUERY_PREFIXES = {
     ),
 }
 
+CACHE_PREFIXES = {
+    "vf_dcd_replay": ("_replayVfPairCache(",),
+    "vf_cache_validity": ("_updateBvhVfPairCacheValidityDevice(",),
+    "vf_cache_front": ("_buildBvhVfPairFront(",),
+    "vf_cache_reset": ("_resetInvalidVfPairCacheCounts(",),
+}
+
 # Kernels that belong uniquely to construction/refit of this LBVH.  CUB radix
 # sort is deliberately excluded: the same generated name is also used by
 # matrix/triplet sorting, and attributing all of it to BVH would be false.
@@ -110,6 +117,8 @@ def load_report(path: Path, frames: int | None) -> dict[str, object]:
         build_ns = 0
         build_calls = 0
         observed_query_names: dict[str, set[str]] = defaultdict(set)
+        cache_ns: dict[str, int] = defaultdict(int)
+        cache_calls: dict[str, int] = defaultdict(int)
 
         for name, duration_ns in rows:
             duration_ns = int(duration_ns)
@@ -119,6 +128,11 @@ def load_report(path: Path, frames: int | None) -> dict[str, object]:
                 query_ns[category] += duration_ns
                 query_calls[category] += 1
                 observed_query_names[category].add(name.split("(", 1)[0])
+            for cache_category, prefixes in CACHE_PREFIXES.items():
+                if name.startswith(prefixes):
+                    cache_ns[cache_category] += duration_ns
+                    cache_calls[cache_category] += 1
+                    break
             if name.startswith(BUILD_PREFIXES):
                 build_ns += duration_ns
                 build_calls += 1
@@ -149,6 +163,19 @@ def load_report(path: Path, frames: int | None) -> dict[str, object]:
                 "fraction_of_kernel_time": query_total_ns / total_ns,
             },
             "query_families": categories,
+            "cache_kernels": {
+                category: {
+                    "calls": cache_calls[category],
+                    "time_ms": cache_ns[category] / 1e6,
+                    "mean_us": (
+                        cache_ns[category] / cache_calls[category] / 1e3
+                        if cache_calls[category]
+                        else 0.0
+                    ),
+                    "fraction_of_kernel_time": cache_ns[category] / total_ns,
+                }
+                for category in CACHE_PREFIXES
+            },
             "bvh_build_excluding_cub_sort": {
                 "calls": build_calls,
                 "time_ms": build_ns / 1e6,
@@ -192,6 +219,18 @@ def print_human(report: dict[str, object]) -> None:
             f"{float(item['time_ms']):12.3f} {float(item['mean_us']):11.3f} "
             f"{100.0 * float(item['fraction_of_kernel_time']):10.2f}"
         )
+    cache = report["cache_kernels"]
+    assert isinstance(cache, dict)
+    for category in CACHE_PREFIXES:
+        item = cache[category]
+        assert isinstance(item, dict)
+        if int(item["calls"]):
+            print(
+                f"{category:16s} {int(item['calls']):6d} "
+                f"{float(item['time_ms']):12.3f} "
+                f"{float(item['mean_us']):11.3f} "
+                f"{100.0 * float(item['fraction_of_kernel_time']):10.2f}"
+            )
     build = report["bvh_build_excluding_cub_sort"]
     assert isinstance(build, dict)
     print(

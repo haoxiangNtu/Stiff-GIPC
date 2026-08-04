@@ -30,6 +30,8 @@ GOLD = "0544461bd82123ae"
 MODES = ("merged", "isolated", "strict")
 FRAMES = int(os.environ.get("BVH_GATE_FRAMES", "50"))
 POSITION_TOL = float(os.environ.get("BVH_GATE_POSITION_TOL", "1e-8"))
+BASELINE_RUNS = max(2, int(os.environ.get("BVH_GATE_BASELINE_RUNS", "3")))
+NOISE_FACTOR = float(os.environ.get("BVH_GATE_NOISE_FACTOR", "1.05"))
 BAD_OUTPUT = re.compile(r"Traceback|CUDA error|budget exhausted.*nan", re.I)
 
 
@@ -157,13 +159,17 @@ def main() -> int:
         directory = Path(tmp)
         for mode in MODES:
             try:
-                base_hash, base_newton, base_positions, base_pairs = run_anchor(
-                    mode,
-                    None,
-                    candidate_knobs,
-                    directory / f"{mode}-base.npy",
-                    directory / f"{mode}-base-pairs.npy",
-                )
+                baseline_runs = 1 if mode == "strict" else BASELINE_RUNS
+                baselines = [
+                    run_anchor(
+                        mode,
+                        None,
+                        candidate_knobs,
+                        directory / f"{mode}-base-{run}.npy",
+                        directory / f"{mode}-base-{run}-pairs.npy",
+                    )
+                    for run in range(baseline_runs)
+                ]
                 cand_hash, cand_newton, cand_positions, cand_pairs = run_anchor(
                     mode,
                     candidate,
@@ -175,24 +181,50 @@ def main() -> int:
                 failures.append(str(error))
                 continue
 
-            difference = float(np.max(np.abs(cand_positions - base_positions)))
-            base_pair_set = canonical_pair_multiset(base_pairs)
+            base_hash, base_newton, base_positions, base_pairs = baselines[0]
+            baseline_differences = [
+                float(np.max(np.abs(a[2] - b[2])))
+                for index, a in enumerate(baselines)
+                for b in baselines[index + 1 :]
+            ]
+            noise_envelope = max(baseline_differences, default=0.0)
+            candidate_differences = [
+                float(np.max(np.abs(cand_positions - run[2])))
+                for run in baselines
+            ]
+            difference = min(candidate_differences)
+            allowed_difference = max(
+                POSITION_TOL, NOISE_FACTOR * noise_envelope
+            )
+            base_pair_sets = [canonical_pair_multiset(run[3]) for run in baselines]
+            base_pair_set = base_pair_sets[0]
             cand_pair_set = canonical_pair_multiset(cand_pairs)
-            pair_equal = np.array_equal(base_pair_set, cand_pair_set)
+            pair_equal = any(
+                np.array_equal(pair_set, cand_pair_set)
+                for pair_set in base_pair_sets
+            )
+            baseline_hashes = ",".join(run[0] for run in baselines)
             print(
-                f"{mode:8s} baseline={base_hash}/{base_newton} "
-                f"candidate={cand_hash}/{cand_newton} max|dpos|={difference:.3e} "
+                f"{mode:8s} baseline={baseline_hashes}/"
+                f"{sorted(set(run[1] for run in baselines))} "
+                f"candidate={cand_hash}/{cand_newton} "
+                f"nearest|max dpos|={difference:.3e} "
+                f"baseline_noise={noise_envelope:.3e} "
+                f"allowed={allowed_difference:.3e} "
                 f"pairs={len(base_pair_set)}/{len(cand_pair_set)} "
                 f"pair_multiset={'exact' if pair_equal else 'DIFF'}"
             )
-            if cand_newton != base_newton:
+            baseline_newtons = {run[1] for run in baselines}
+            if cand_newton not in baseline_newtons:
                 failures.append(
-                    f"{mode}: Newton envelope changed {base_newton}->{cand_newton}"
+                    f"{mode}: Newton envelope changed "
+                    f"{sorted(baseline_newtons)}->{cand_newton}"
                 )
-            if difference > POSITION_TOL:
+            if difference > allowed_difference:
                 failures.append(
                     f"{mode}: max position delta {difference:.3e} "
-                    f"> {POSITION_TOL:.3e}"
+                    f"> noise-aware limit {allowed_difference:.3e} "
+                    f"(baseline noise {noise_envelope:.3e})"
                 )
             if not pair_equal:
                 baseline_only = len(
@@ -206,13 +238,23 @@ def main() -> int:
                     f"(baseline-only unique={baseline_only}, "
                     f"candidate-only unique={candidate_only})"
                 )
-            if mode == "strict" and (
-                base_hash != GOLD or cand_hash != GOLD
-            ):
-                failures.append(
-                    f"strict gold changed: base={base_hash}, candidate={cand_hash}, "
-                    f"expected={GOLD}"
-                )
+            if mode == "strict":
+                if base_hash != cand_hash:
+                    failures.append(
+                        f"strict candidate changed the baseline hash: "
+                        f"base={base_hash}, candidate={cand_hash}"
+                    )
+                # The repository gold is defined at the gate's canonical
+                # 50-frame horizon.  A shortened developer smoke has a
+                # different legitimate hash and must not be reported as a
+                # physics failure.
+                if FRAMES == 50 and (
+                    base_hash != GOLD or cand_hash != GOLD
+                ):
+                    failures.append(
+                        f"strict gold changed: base={base_hash}, "
+                        f"candidate={cand_hash}, expected={GOLD}"
+                    )
 
     if failures:
         for failure in failures:

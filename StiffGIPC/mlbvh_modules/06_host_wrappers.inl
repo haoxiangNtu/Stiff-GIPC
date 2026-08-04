@@ -639,6 +639,62 @@ static int bvh_wide8_mode()
     return mode;
 }
 
+// Bit 0 = face trees, bit 1 = edge trees.  Keeping the families separable is
+// essential for attribution: a VF-only cache must not pay the measured
+// body-major regression in the uncached EE tree.
+static int bvh_body_major_mask()
+{
+    static const int mask = []
+    {
+        const char* value = getenv("STIFF_BVH_BODY_MAJOR");
+        if(!value || atoi(value) <= 0)
+            return 0;
+        const char* explicit_mask = getenv("STIFF_BVH_BODY_MAJOR_MASK");
+        return explicit_mask ? (atoi(explicit_mask) & 3) : 3;
+    }();
+    return mask;
+}
+
+static void makeFaceKeysBodyMajor(lbvh_f& tree,
+                                  int     number,
+                                  const int* active_idx,
+                                  cudaStream_t stream)
+{
+    if(!(bvh_body_major_mask() & 1) || number < 1)
+        return;
+    _bodyMajorFaceKeys<<<(number + 255) / 256, 256, 0, stream>>>(
+        tree._MChash, tree._faces, active_idx, tree._bodyId, number);
+}
+
+static void makeEdgeKeysBodyMajor(lbvh_e& tree,
+                                  int     number,
+                                  const int* active_idx,
+                                  cudaStream_t stream)
+{
+    if(!(bvh_body_major_mask() & 2) || number < 1)
+        return;
+    _bodyMajorEdgeKeys<<<(number + 255) / 256, 256, 0, stream>>>(
+        tree._MChash, tree._edges, active_idx, tree._bodyId, number);
+}
+
+static void computeNodeBodyLabels(lbvh& tree,
+                                  int   number,
+                                  cudaStream_t stream,
+                                  bool publish_vf_front = false)
+{
+    if(!tree.m_node_body || !tree.m_prim_body || number < 1)
+        return;
+    computeNodeEnv(tree.m_node_body,
+                   tree._nodes,
+                   tree.m_prim_body,
+                   tree._flags,
+                   number,
+                   stream);
+    if(publish_vf_front)
+        rebuild_bvh_vf_pair_front(
+            tree._nodes, tree.m_node_body, number, stream);
+}
+
 static int bvh_wide8_mask()
 {
     static const int mask = []
@@ -1019,6 +1075,7 @@ void selfQuery_vf(const int*      _bodyID,
                   const int*      _collision_skip_matrix,
                   int             _collision_body_count,
                   const int*      _body_id_to_is_fem,
+                  const int*      node_body,
                   const uint32_t* wide_children,
                   cudaStream_t    stream = 0)
 {
@@ -1045,7 +1102,8 @@ void selfQuery_vf(const int*      _bodyID,
                                            _collision_skip_matrix,
                                            _collision_body_count,
                                            _body_id_to_is_fem,
-                                           wide_children);
+                                           wide_children,
+                                           node_body);
     else
         _selfQuery_vf<<<blockNum, threadNum, 0, stream>>>(_bodyID,
                                            _btype,
@@ -1062,7 +1120,8 @@ void selfQuery_vf(const int*      _bodyID,
                                            numbers,
                                            _collision_skip_matrix,
                                            _collision_body_count,
-                                           _body_id_to_is_fem);
+                                           _body_id_to_is_fem,
+                                           node_body);
 }
 
 void fullCCDselfQuery_vf(const int*      _bodyID,
@@ -1122,6 +1181,7 @@ void lbvh::FREE_DEVICE_MEM()
     release(_flags);
     release(_tempLeafBox);
     release(m_node_env);
+    release(m_node_body);
     release(m_node_max_element);
     release(_sort_tmp);
     release(_mch_alt);
@@ -1136,6 +1196,9 @@ void lbvh::MALLOC_DEVICE_MEM(const int& number, bool allocate_node_max)
     CUDA_SAFE_CALL(cudaMalloc((void**)&_MChash, (number) * sizeof(uint64_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_nodes, (2 * number - 1) * sizeof(Node)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_node_env, (2 * number - 1) * sizeof(int)));  // [env-part B]
+    if(getenv("STIFF_BVH_PAIR_CACHE"))
+        CUDA_SAFE_CALL(cudaMalloc((void**)&m_node_body,
+                                  (2 * number - 1) * sizeof(int)));
     if(allocate_node_max)
         CUDA_SAFE_CALL(cudaMalloc((void**)&m_node_max_element,
                                   (2 * number - 1) * sizeof(uint32_t)));
@@ -1239,10 +1302,12 @@ double lbvh_f::Construct(cudaStream_t stream)
                             "face-dcd-active"))
         {
             computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            computeNodeBodyLabels(*this, N, stream, true);
             return 0;
         }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        makeFaceKeysBodyMajor(*this, N, _active_idx, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
@@ -1254,6 +1319,7 @@ double lbvh_f::Construct(cudaStream_t stream)
         }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahFaceDcd, stream);
+        computeNodeBodyLabels(*this, N, stream, true);
         return 0;
     }
     calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
@@ -1262,11 +1328,13 @@ double lbvh_f::Construct(cudaStream_t stream)
                         "face-dcd"))
     {
         computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number, stream);
+        computeNodeBodyLabels(*this, face_number, stream, true);
         return 0;
     }
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
+    makeFaceKeysBodyMajor(*this, face_number, nullptr, 0);
     // [C-1 capture-safe sort] cub stable radix on pre-allocated instance
     // scratch (bit-identical order; no thrust internal malloc/free, so the
     // build can be recorded into a CUDA graph).
@@ -1283,6 +1351,7 @@ double lbvh_f::Construct(cudaStream_t stream)
     optimizeSahTreelets(
         _nodes, _bvs, _flags, face_number, kSahFaceDcd);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
+    computeNodeBodyLabels(*this, face_number, 0, true);
     return 0;  //time0 + time1 + time2;
 }
 
@@ -1302,10 +1371,12 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
                             "face-ccd-active"))
         {
             computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            computeNodeBodyLabels(*this, N, stream);
             return 0;
         }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        makeFaceKeysBodyMajor(*this, N, _active_idx, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
@@ -1317,6 +1388,7 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahFaceCcd, stream);
+        computeNodeBodyLabels(*this, N, stream);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
@@ -1326,10 +1398,12 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
                         "face-ccd"))
     {
         computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number, stream);
+        computeNodeBodyLabels(*this, face_number, stream);
         return 0;
     }
     calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
+    makeFaceKeysBodyMajor(*this, face_number, nullptr, 0);
     // [C-1 capture-safe sort] cub stable radix on pre-allocated instance
     // scratch (bit-identical order; no thrust internal malloc/free, so the
     // build can be recorded into a CUDA graph).
@@ -1346,6 +1420,7 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     optimizeSahTreelets(
         _nodes, _bvs, _flags, face_number, kSahFaceCcd);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
+    computeNodeBodyLabels(*this, face_number, 0);
 
     return 0;
 }
@@ -1378,10 +1453,12 @@ double lbvh_e::Construct(cudaStream_t stream)
                             "edge-dcd-active"))
         {
             computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            computeNodeBodyLabels(*this, N, stream);
             return 0;
         }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        makeEdgeKeysBodyMajor(*this, N, _active_idx, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
@@ -1400,6 +1477,7 @@ double lbvh_e::Construct(cudaStream_t stream)
         }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahEdgeDcd, stream, node_max);
+        computeNodeBodyLabels(*this, N, stream);
         return 0;
     }
 
@@ -1418,10 +1496,12 @@ double lbvh_e::Construct(cudaStream_t stream)
                         "edge-dcd"))
     {
         computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number, stream);
+        computeNodeBodyLabels(*this, edge_number, stream);
         return 0;
     }
     calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
+    makeEdgeKeysBodyMajor(*this, edge_number, nullptr, 0);
     // [C-1 capture-safe sort] see face variant.
     _iota_u32<<<(edge_number + 255) / 256, 256>>>(_indices, edge_number);
     _mc_sort_active(*this, _MChash, _indices, edge_number, 0);
@@ -1441,6 +1521,7 @@ double lbvh_e::Construct(cudaStream_t stream)
     optimizeSahTreelets(
         _nodes, _bvs, _flags, edge_number, kSahEdgeDcd, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
+    computeNodeBodyLabels(*this, edge_number, 0);
     //selfQuery(_vertexes, _edges, _bvs, _nodes, _collisionPair, _cpNum, edge_number);
     //cudaEventRecord(end2);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -1474,10 +1555,12 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
                             "edge-ccd-active"))
         {
             computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            computeNodeBodyLabels(*this, N, stream);
             return 0;
         }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
+        makeEdgeKeysBodyMajor(*this, N, _active_idx, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
@@ -1490,6 +1573,7 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahEdgeCcd, stream, node_max);
+        computeNodeBodyLabels(*this, N, stream);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
@@ -1502,10 +1586,12 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
                         "edge-ccd"))
     {
         computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number, stream);
+        computeNodeBodyLabels(*this, edge_number, stream);
         return 0;
     }
     calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
+    makeEdgeKeysBodyMajor(*this, edge_number, nullptr, 0);
     // [C-1 capture-safe sort] see face variant.
     _iota_u32<<<(edge_number + 255) / 256, 256>>>(_indices, edge_number);
     _mc_sort_active(*this, _MChash, _indices, edge_number, 0);
@@ -1521,6 +1607,7 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     optimizeSahTreelets(
         _nodes, _bvs, _flags, edge_number, kSahEdgeCcd, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
+    computeNodeBodyLabels(*this, edge_number, 0);
 
     return 0;
 }
@@ -1535,6 +1622,7 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
     const uint32_t* wide_children =
         buildBvh8Children(
             _nodes, _bvs, _tempLeafBox, tree_number, kSahFaceDcd, stream);
+    reset_bvh_vf_pair_cache_counts(stream);
     selfQuery_vf(_bodyId,
                  _btype,
                  _vertexes,
@@ -1551,8 +1639,17 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  _collision_skip_matrix,
                  _collision_body_count,
                  _body_id_to_is_fem,
+                 m_node_body,
                  wide_children,
                  stream);
+    replay_bvh_vf_pair_cache(_vertexes,
+                             _faces,
+                             _cpNum,
+                             _MatIndex,
+                             _collisionPair,
+                             _ccd_collisionPair,
+                             dHat,
+                             stream);
 }
 
 void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)

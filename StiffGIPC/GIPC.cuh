@@ -280,6 +280,12 @@ class GIPC
         std::vector<double3> reference_a;
         std::vector<double3> reference_b;
         BvhCoherenceStat stat;
+        // Validity of the raw margin list used by the immediately following
+        // broad-phase query.  The validation-only workload census associates
+        // each query's actual primitive tests with this exact decision.
+        bool reusable_this_observation = false;
+        unsigned long long primitive_tests[4] = {};
+        unsigned long long reusable_primitive_tests[4] = {};
     };
     bool                     m_bvh_family_coherence_initialized = false;
     std::vector<int>         m_bvh_coherence_body_id;
@@ -289,8 +295,38 @@ class GIPC
     std::vector<double3>     m_bvh_coherence_body_reference;
     std::vector<BvhCoherenceStat> m_bvh_coherence_body_stats;
     std::vector<BvhCoherencePairState> m_bvh_coherence_pair_states;
+    std::vector<unsigned long long> m_bvh_pair_work_snapshot;
+    bool                     m_bvh_vf_cache_ready = false;
+    int                      m_bvh_vf_cache_pair_count = 0;
+    int                      m_bvh_vf_cache_segment_capacity = 0;
+    unsigned char*           m_bvh_vf_cache_valid = nullptr;
+    int*                     m_bvh_vf_cache_index = nullptr;
+    int2*                    m_bvh_vf_cache_candidates = nullptr;
+    uint32_t*                m_bvh_vf_cache_counts = nullptr;
+    int*                     m_bvh_vf_cache_overflow = nullptr;
+    uint32_t*                m_bvh_vf_cache_ref_offsets = nullptr;
+    int*                     m_bvh_vf_cache_ref_vertices = nullptr;
+    double3*                 m_bvh_vf_cache_references = nullptr;
+    unsigned long long*      m_bvh_vf_cache_device_stats = nullptr;
+    int                      m_bvh_vf_cache_ref_entry_count = 0;
+    bool                     m_bvh_vf_cache_device_validity = false;
+    uint32_t*                m_bvh_vf_front_nodes = nullptr;
+    uint32_t*                m_bvh_vf_front_counts = nullptr;
+    int*                     m_bvh_vf_front_overflow = nullptr;
+    int                      m_bvh_vf_front_capacity = 128;
+    unsigned long long       m_bvh_vf_cache_queries = 0;
+    unsigned long long       m_bvh_vf_cache_valid_pair_uses = 0;
+    unsigned long long       m_bvh_vf_cache_pair_uses = 0;
+    unsigned long long       m_bvh_vf_cache_replay_candidates = 0;
+    unsigned long long       m_bvh_vf_front_fallbacks = 0;
+    uint32_t                 m_bvh_vf_front_max_roots = 0;
+    uint32_t                 m_bvh_vf_front_max_body_roots = 0;
+    int*                     m_bvh_face_body = nullptr;
+    int*                     m_bvh_edge_body = nullptr;
+    void collectBvhPairWorkload();
+    void updateBvhVfPairCache();
     void auditBvhTemporalCoherence();
-    void printBvhTemporalCoherence() const;
+    void printBvhTemporalCoherence();
 #endif
 
     PCG_Data pcg_data;

@@ -33,6 +33,13 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
                   bvh_f._sort_tmp,bvh_f._sort_tmp_bytes,bvh_f._mch_alt,bvh_f._idx_alt,bvh_f._sort_cap};
     BvhScratch oe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,bvh_e.m_node_max_element,
                   bvh_e._sort_tmp,bvh_e._sort_tmp_bytes,bvh_e._mch_alt,bvh_e._idx_alt,bvh_e._sort_cap};
+    int* saved_f_node_body = bvh_f.m_node_body;
+    int* saved_e_node_body = bvh_e.m_node_body;
+    // Per-env pool slots do not yet own body-label arrays.  The cache is
+    // explicitly disabled above for this execution mode, so suppress these
+    // otherwise shared writes (which would race when STIFF_PERENV_PAR=1).
+    bvh_f.m_node_body = nullptr;
+    bvh_e.m_node_body = nullptr;
     auto swapIn = [](lbvh& b, BvhScratch& s){ b._nodes=s.nodes; b._bvs=s.bvs; b._MChash=s.mch;
         b._indices=s.idx; b._tempLeafBox=s.tmp; b._flags=s.flags; b.m_node_env=s.node_env;
         b.m_node_max_element=s.node_max_element;
@@ -92,6 +99,8 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     }
     bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;
     bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
+    bvh_f.m_node_body = saved_f_node_body;
+    bvh_e.m_node_body = saved_e_node_body;
     bvh_f._vertexes = saved_f;
     bvh_e._vertexes = saved_e;
     CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection

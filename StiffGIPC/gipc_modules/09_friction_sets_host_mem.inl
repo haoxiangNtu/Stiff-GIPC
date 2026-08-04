@@ -320,6 +320,37 @@ void GIPC::FREE_DEVICE_MEM()
     release(d_vert_mu);
     release(d_vert_mu_gd);
 
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+    // Unpublish validation-cache pointers before releasing their storage.
+    // CUDA device symbols are process-global and otherwise retain dangling
+    // addresses across Engine destruction/recreation in one Python process.
+    if(m_bvh_vf_cache_ready)
+    {
+        set_bvh_vf_pair_cache(
+            nullptr, nullptr, 0, 0, nullptr, nullptr, 0, nullptr);
+        set_bvh_vf_pair_front(nullptr, nullptr, 0, nullptr);
+    }
+    release(m_bvh_vf_cache_valid);
+    release(m_bvh_vf_cache_index);
+    release(m_bvh_vf_cache_candidates);
+    release(m_bvh_vf_cache_counts);
+    release(m_bvh_vf_cache_overflow);
+    release(m_bvh_vf_cache_ref_offsets);
+    release(m_bvh_vf_cache_ref_vertices);
+    release(m_bvh_vf_cache_references);
+    release(m_bvh_vf_cache_device_stats);
+    release(m_bvh_vf_front_nodes);
+    release(m_bvh_vf_front_counts);
+    release(m_bvh_vf_front_overflow);
+    release(m_bvh_face_body);
+    release(m_bvh_edge_body);
+    m_bvh_vf_cache_ready = false;
+    m_bvh_vf_cache_pair_count = 0;
+    m_bvh_vf_cache_segment_capacity = 0;
+    m_bvh_vf_cache_ref_entry_count = 0;
+    m_bvh_vf_cache_device_validity = false;
+#endif
+
     pcg_data.FREE_DEVICE_MEM();
 
     bvh_e.FREE_DEVICE_MEM();
@@ -434,6 +465,26 @@ void GIPC::MALLOC_DEVICE_MEM()
 }
 
 
+__global__ static void _cache_face_body(const uint3* faces,
+                                        const int*   vertex_body,
+                                        int*         primitive_body,
+                                        int          count)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < count)
+        primitive_body[i] = vertex_body[faces[i].x];
+}
+
+__global__ static void _cache_edge_body(const uint2* edges,
+                                        const int*   vertex_body,
+                                        int*         primitive_body,
+                                        int          count)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < count)
+        primitive_body[i] = vertex_body[edges[i].x];
+}
+
 void GIPC::initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix, int _collision_body_count)
 {
 
@@ -468,6 +519,28 @@ void GIPC::initBVH(int* _btype, int* _bodyId, int* _collision_skip_matrix, int _
     // assignment in do_init_bvh_and_solver).
     bvh_e._body_id_to_is_fem = _body_id_to_is_fem;
     bvh_f._body_id_to_is_fem = _body_id_to_is_fem;
+    if(getenv("STIFF_BVH_PAIR_CACHE"))
+    {
+        int body_major_mask = 3;
+        if(const char* value = getenv("STIFF_BVH_BODY_MAJOR_MASK"))
+            body_major_mask = atoi(value) & 3;
+        if(body_major_mask & 1)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_face_body,
+                                      (size_t)surface_Num * sizeof(int)));
+            _cache_face_body<<<(surface_Num + 255) / 256, 256>>>(
+                _faces, _bodyId, m_bvh_face_body, surface_Num);
+            bvh_f.m_prim_body = m_bvh_face_body;
+        }
+        if(body_major_mask & 2)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&m_bvh_edge_body,
+                                      (size_t)edge_Num * sizeof(int)));
+            _cache_edge_body<<<(edge_Num + 255) / 256, 256>>>(
+                _edges, _bodyId, m_bvh_edge_body, edge_Num);
+            bvh_e.m_prim_body = m_bvh_edge_body;
+        }
+    }
 }
 
 void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double3 maxConer, double buffScale)

@@ -49,11 +49,46 @@ struct BvhTraversalAudit
     unsigned long long overlapping_children;
     unsigned long long primitive_tests;
 };
+constexpr int kBvhAuditBodyCapacity = 128;
 void set_bvh_traversal_audit(int v);
+void set_bvh_pair_work_audit(int v);
 void set_bvh_traversal_margin_scale(double scale);
 void reset_bvh_traversal_audit();
 void get_bvh_traversal_audit(BvhTraversalAudit out[4]);
+void get_bvh_traversal_body_audit(
+    BvhTraversalAudit out[4][kBvhAuditBodyCapacity]);
+void get_bvh_traversal_pair_primitive_audit(
+    unsigned long long out[4][kBvhAuditBodyCapacity]
+                               [kBvhAuditBodyCapacity]);
 void print_bvh_traversal_audit();
+
+// Validation-only VF-DCD body-pair raw-candidate cache.  All setters become
+// no-ops unless the owning GIPC instance explicitly arms the cache.
+void set_bvh_vf_pair_cache(const unsigned char* pair_valid,
+                           const int*           pair_index,
+                           int                  body_count,
+                           int                  pair_count,
+                           int2*                candidates,
+                           uint32_t*            counts,
+                           int                  segment_capacity,
+                           int*                 overflow);
+void set_bvh_vf_pair_front(uint32_t* front_nodes,
+                           uint32_t* front_counts,
+                           int       front_capacity,
+                           int*      front_overflow);
+void rebuild_bvh_vf_pair_front(const Node* nodes,
+                               const int*  node_body,
+                               int         primitive_count,
+                               cudaStream_t stream = 0);
+void reset_bvh_vf_pair_cache_counts(cudaStream_t stream = 0);
+void replay_bvh_vf_pair_cache(const double3* vertexes,
+                              const uint3*   faces,
+                              uint32_t*      cp_num,
+                              int*           mat_index,
+                              int4*          collision_pair,
+                              int4*          ccd_collision_pair,
+                              double         d_hat,
+                              cudaStream_t   stream = 0);
 
 struct AABB
 {
@@ -121,6 +156,10 @@ class lbvh
     // Computed when env-major. Lets the broad-phase prune other-env subtrees by env-id ⇒ no cross-env
     // candidates (fast) while AABBs stay LOCAL (overlap mirror ⇒ bit-identical). Allocated in MALLOC.
     int*       m_node_env            = nullptr;
+    // Uniform collision body for each subtree, or -1 for a mixed subtree.
+    // Allocated only by the experimental body-pair cache path.
+    int*       m_node_body           = nullptr;
+    const int* m_prim_body           = nullptr;
     // Validation candidate: maximum ORIGINAL primitive index in each subtree.
     // The default EE ownership rule emits only obj_idx >= self_eid; this bound
     // lets the range-pruned traversal discard an entire all-lower subtree

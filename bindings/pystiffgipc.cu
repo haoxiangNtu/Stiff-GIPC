@@ -1146,6 +1146,24 @@ PYBIND11_MODULE(pystiffgipc, m)
             }
             return out;
         }, "Validation-only: return [queries,pops,overlaps,primitive-tests].")
+        .def("_get_bvh_traversal_body_audit", [](const SimEngine&) {
+            BvhTraversalAudit rows[4][kBvhAuditBodyCapacity] = {};
+            get_bvh_traversal_body_audit(rows);
+            auto out = py::array_t<unsigned long long>(
+                {4, kBvhAuditBodyCapacity, 4});
+            auto view = out.mutable_unchecked<3>();
+            for(int family = 0; family < 4; ++family)
+                for(int body = 0; body < kBvhAuditBodyCapacity; ++body)
+                {
+                    view(family, body, 0) = rows[family][body].queries;
+                    view(family, body, 1) = rows[family][body].node_pops;
+                    view(family, body, 2) =
+                        rows[family][body].overlapping_children;
+                    view(family, body, 3) =
+                        rows[family][body].primitive_tests;
+                }
+            return out;
+        }, "Validation-only: return per-family/per-query-body traversal work.")
 #ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
         .def("_print_bvh_coherence_audit",
              &SimEngine::print_bvh_coherence_audit,

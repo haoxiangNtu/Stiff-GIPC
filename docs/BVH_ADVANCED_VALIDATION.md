@@ -288,6 +288,65 @@ interpretation is therefore not “PLOC plus BVH8,” but “retain the cheap LB
 and wide only the dominant VF-DCD traversal.”  This candidate remains opt-in
 until the combined 1550-frame and A800 campaign gates are complete.
 
+## Body-pair VF cache and shared traversal front
+
+The first real per-body/per-family cache is now implemented for VF-DCD behind
+`STIFF_BVH_PAIR_CACHE=1`.  It stores only raw `(vertex, face)` broad-phase
+candidates in fixed body-pair segments.  Every reuse calls the unchanged exact
+PT classifier, so distance type, active-barrier status, contact encoding, and
+all later mollification/friction work are recomputed.  A maximal uniform-body
+subtree front lets an invalid pair start at only that target body's roots;
+valid pairs skip tree traversal and replay their own segment.  EE and all CCD
+semantics remain separate.
+
+`STIFF_BVH_PAIR_CACHE_DEVICE=1` removes the validation prototype's per-query
+host decision.  Pair-specific reference positions, two-sided maximum
+displacement reductions, the conservative
+`max_disp(A) + max_disp(B) <= delta` decision, invalid-generation rebasing,
+segment-count reset, and overflow invalidation all execute in one device
+kernel.  Static topology discovery and allocation happen once before steady
+state; terminal statistics are copied only after the run.  The implementation
+has 33 eligible FOLD body pairs and 56,314 pair-specific reference entries.
+
+Correctness evidence for margin 1.5 includes:
+
+- a deterministic merged 30-frame FOLD run where two baselines, the old
+  host-audit cache, and device validity all produced the same vertex hash
+  `642ddf01b9afc6fb`, pair hash `5dc74cc216dd2a8e`, 52,761 encoded pairs, and
+  identical per-frame Newton counts;
+- the 50-frame merged/isolated/strict candidate gate, with strict gold
+  `0544461bd82123ae` exact and non-strict deltas inside measured multi-baseline
+  noise envelopes;
+- a frozen frame-30, 1,000-rebuild test with exactly the same 30,571 encoded
+  DCD rows and no traversal-front fallback.
+
+The frozen-state upper bound is large: VF-DCD traversal plus cache replay fell
+from 3,614.698 ms to 1,105.441 ms (about 69.4%), while the paired EE control
+changed by only 0.2%.  Real evolution is much less favorable.  In an nsys
+capture of the exact deterministic 30-frame workload, ordinary VF-DCD used
+1,252.761 ms.  The candidate used 860.298 ms of fresh traversal, 267.449 ms of
+exact replay, 16.053 ms of device validity, 1.661 ms of front construction,
+and 1.544 ms in a now-removed redundant reset kernel: 1,147.005 ms total, only
+8.44% less.  Total CUDA kernel time fell from 17,335.744 ms to 17,194.224 ms
+(0.82%); unrelated paired kernels show that this whole-process delta is near
+the machine's current contention/noise floor.  The structural VF saving is
+positive, but not large enough to default this feature.
+
+Margin 1.5 was the only credible tested point.  It reused 43.95% of pair uses
+in the deterministic workload and reduced VF-DCD node pops from 306.7 million
+to 95.2 million without changing results.  Margin 1.25 reused too little;
+margin 2.0 replayed 21.4 million raw candidates in a 30-frame free run and
+changed the trajectory beyond the observed two-baseline RMS envelope.  The
+next cache tests must be pair-selective and must measure EE-DCD and swept CCD
+independently rather than assuming the VF result transfers.
+
+The current cache is intentionally disabled for the isolated per-env BVH
+path.  That path point-swaps one BVH object across stream-local scratch slots;
+correct support needs independent candidate generations, references, counts,
+and fronts per environment.  It will be implemented only if the combined
+family ROI survives the remaining tests.  No 1550-frame or A800 claim is made
+yet.
+
 ## Current conclusions
 
 - Better topology is real: 13.4--18.0% fewer node pops is available without
@@ -304,7 +363,8 @@ until the combined 1550-frame and A800 campaign gates are complete.
 - Same-topology software BVH8 is implemented.  Whole-pipeline and PLOC+BVH8
   variants lose, while largest-box-first face-DCD-only wide traversal is a
   measured 4.7% win in the query-heavy frozen test and remains a candidate.
-- Conservative body-pair/family coherence is now measured, but the actual raw
-  candidate cache and unified VF/EE/CCD broad phase remain pending.  The
-  dominant cloth pairs invalidate far more often than static ABD pairs, so a
-  useful cache must segment both validity and stored candidate work.
+- Conservative body-pair/family coherence and a GPU-resident VF-DCD raw
+  candidate cache/shared body front are implemented.  VF is a small positive
+  slice in real evolution (about 8.4% of its own path, under 1% whole-kernel
+  time), so it remains opt-in.  EE/CCD family caches, isolated per-env cache
+  generations, and the general shared traversal runtime remain pending.

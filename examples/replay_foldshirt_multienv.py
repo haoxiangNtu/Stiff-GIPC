@@ -487,6 +487,22 @@ def main():
                     f"primitive_tests={row[3]}",
                     flush=True,
                 )
+            if os.environ.get("STIFF_BVH_BODY_AUDIT"):
+                body_rows = np.asarray(
+                    eng.native._get_bvh_traversal_body_audit(),
+                    dtype=np.uint64,
+                )
+                for family, name in enumerate(names):
+                    for body, row in enumerate(body_rows[family]):
+                        if row[0]:
+                            print(
+                                f"[bvh-audit-body-trajectory] family={name} "
+                                f"body={body} queries={row[0]} "
+                                f"node_pops={row[1]} "
+                                f"overlapping_children={row[2]} "
+                                f"primitive_tests={row[3]}",
+                                flush=True,
+                            )
         if traversal_audit and (pair_dump or ccd_pair_dump):
             eng.native._reset_bvh_traversal_audit()
         if pair_dump:
@@ -533,10 +549,26 @@ def main():
                     f"primitive_tests={row[3]}",
                     flush=True,
                 )
-        if os.environ.get("STIFF_BVH_COHERENCE_AUDIT"):
+            if os.environ.get("STIFF_BVH_BODY_AUDIT"):
+                body_rows = np.asarray(
+                    eng.native._get_bvh_traversal_body_audit(),
+                    dtype=np.uint64,
+                )
+                for family, name in enumerate(names):
+                    for body, row in enumerate(body_rows[family]):
+                        if row[0]:
+                            print(
+                                f"[bvh-audit-body] family={name} body={body} "
+                                f"queries={row[0]} node_pops={row[1]} "
+                                f"overlapping_children={row[2]} "
+                                f"primitive_tests={row[3]}",
+                                flush=True,
+                            )
+        if (os.environ.get("STIFF_BVH_COHERENCE_AUDIT")
+                or os.environ.get("STIFF_BVH_PAIR_CACHE_STATS")):
             if not hasattr(eng.native, "_print_bvh_coherence_audit"):
                 raise RuntimeError(
-                    "STIFF_BVH_COHERENCE_AUDIT requires a build configured "
+                    "BVH cache/coherence stats require a build configured "
                     "with -DSTIFFGIPC_BVH_COHERENCE_AUDIT=ON"
                 )
             eng.native._print_bvh_coherence_audit()

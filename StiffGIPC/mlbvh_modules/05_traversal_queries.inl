@@ -13,7 +13,8 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                               int             number,
                               const int*      _collision_skip_matrix,
                               int             _collision_body_count,
-                              const int*      _body_id_to_is_fem)
+                              const int*      _body_id_to_is_fem,
+                              const int*      node_body)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -21,10 +22,10 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
 
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr = stack;
-    BVH_STACK_PUSH(0);
 
     AABB _bv;
     idx       = _surfVerts[idx];
+    const int query_body = _bodyID[idx];
 
     // BVH-skip: query vertex's body has no possible collisions → exit early.
     // (audit/perf-bvh-skip-isolated: diag[B][B]==1 marks isolated body)
@@ -36,15 +37,22 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     }
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfDcd);
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[idx]);
+
+    if(!_bvhVfCacheSeedFront(query_body, stack, stack_ptr))
+        BVH_STACK_PUSH(0);
 
     _bv.upper = _vertexes[idx];
     _bv.lower = _vertexes[idx];
     //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_bvs[0].upper, _bvs[0].lower));
     //printf("%f\n", bboxDiagSize2);
-    double gapl = BVH_TRAVERSAL_MARGIN(sqrt(dHat));  // audit-only expanded broad phase
+    // Only the cached VF-DCD list is a Verlet-style margin list.  Expanding
+    // unrelated EE/CCD traversals would change their candidate workload and
+    // make the cache experiment impossible to attribute fairly.
+    double gapl = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
-    do
+    while(stack < stack_ptr)
     {
         const uint32_t node_id = *--stack_ptr;
         BVH_TRAVERSAL_AUDIT_POP();
@@ -52,7 +60,9 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
         const uint32_t L_idx   = _nodes[node_id].left_idx;
         const uint32_t R_idx   = _nodes[node_id].right_idx;
 
-        if(overlap(_bv, _bvs[L_idx], gapl))
+        if(!_bvhVfCacheSkipNode(
+               query_body, node_body ? node_body[L_idx] : -1)
+           && overlap(_bv, _bvs[L_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[L_idx].element_idx;
@@ -71,7 +81,12 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                              && _btype[_faces[obj_idx].y] >= 2
                              && _btype[_faces[obj_idx].z] >= 2))
                         {
-                            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                _bodyID[_faces[obj_idx].x]);
+                            _bvhVfCacheRecord(query_body,
+                                              _bodyID[_faces[obj_idx].x],
+                                              idx,
+                                              obj_idx);
                             _checkPTintersection(_vertexes,
                                                  idx,
                                                  _faces[obj_idx].x,
@@ -91,7 +106,9 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                 BVH_STACK_PUSH(L_idx);
             }
         }
-        if(overlap(_bv, _bvs[R_idx], gapl))
+        if(!_bvhVfCacheSkipNode(
+               query_body, node_body ? node_body[R_idx] : -1)
+           && overlap(_bv, _bvs[R_idx], gapl))
         {
             BVH_TRAVERSAL_AUDIT_OVERLAP();
             const auto obj_idx = _nodes[R_idx].element_idx;
@@ -110,7 +127,12 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                              && _btype[_faces[obj_idx].y] >= 2
                              && _btype[_faces[obj_idx].z] >= 2))
                         {
-                            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                _bodyID[_faces[obj_idx].x]);
+                            _bvhVfCacheRecord(query_body,
+                                              _bodyID[_faces[obj_idx].x],
+                                              idx,
+                                              obj_idx);
                             _checkPTintersection(_vertexes,
                                                  idx,
                                                  _faces[obj_idx].x,
@@ -130,7 +152,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                 BVH_STACK_PUSH(R_idx);
             }
         }
-    } while(stack < stack_ptr);
+    }
     BVH_TRAVERSAL_AUDIT_COMMIT();
 }
 
@@ -150,7 +172,8 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
                                     const int*      _collision_skip_matrix,
                                     int             _collision_body_count,
                                     const int*      _body_id_to_is_fem,
-                                    const uint32_t* wide_children)
+                                    const uint32_t* wide_children,
+                                    const int*      node_body)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -158,8 +181,8 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
 
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr = stack;
-    BVH_STACK_PUSH(0);
     idx = _surfVerts[idx];
+    const int query_body = _bodyID[idx];
     if(_collision_skip_matrix && _collision_body_count > 0)
     {
         const int body = _bodyID[idx];
@@ -169,11 +192,14 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
     }
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfDcd);
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[idx]);
+    if(!_bvhVfCacheSeedFront(query_body, stack, stack_ptr))
+        BVH_STACK_PUSH(0);
     AABB query;
     query.upper = _vertexes[idx];
     query.lower = _vertexes[idx];
     const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
-    do
+    while(stack < stack_ptr)
     {
         const uint32_t node_id = *--stack_ptr;
         BVH_TRAVERSAL_AUDIT_POP();
@@ -189,6 +215,9 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
             const uint32_t child = children[slot];
             if(child == 0xFFFFFFFFu)
                 break;
+            if(_bvhVfCacheSkipNode(
+                   query_body, node_body ? node_body[child] : -1))
+                continue;
             if(!overlap(query, _bvs[child], gap))
                 continue;
             BVH_TRAVERSAL_AUDIT_OVERLAP();
@@ -210,7 +239,9 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
                || (_btype[idx] >= 2 && _btype[face.x] >= 2
                    && _btype[face.y] >= 2 && _btype[face.z] >= 2))
                 continue;
-            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(_bodyID[face.x]);
+            _bvhVfCacheRecord(
+                query_body, _bodyID[face.x], idx, obj_idx);
             _checkPTintersection(_vertexes,
                                  idx,
                                  face.x,
@@ -222,8 +253,66 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
                                  _collisionPair,
                                  _ccd_collisionPair);
         }
-    } while(stack < stack_ptr);
+    }
     BVH_TRAVERSAL_AUDIT_COMMIT();
+}
+
+// Reclassify cached raw VF candidates.  One block owns one body-pair segment;
+// device counts control the effective length, so launch topology is fixed and
+// CUDA-Graph friendly.  This deliberately invokes the same exact classifier
+// as a fresh tree traversal.
+__global__ void _replayVfPairCache(const double3* vertexes,
+                                   const uint3*   faces,
+                                   uint32_t*      cp_num,
+                                   int*           mat_index,
+                                   int4*          collision_pair,
+                                   int4*          ccd_collision_pair,
+                                   double         d_hat)
+{
+    const int pair = blockIdx.x;
+    if(pair >= g_bvh_vf_cache_pair_count || !g_bvh_vf_cache_valid[pair])
+        return;
+    const uint32_t count = min(
+        g_bvh_vf_cache_counts[pair],
+        static_cast<uint32_t>(g_bvh_vf_cache_segment_capacity));
+    const size_t begin =
+        static_cast<size_t>(pair) * g_bvh_vf_cache_segment_capacity;
+    for(uint32_t i = threadIdx.x; i < count; i += blockDim.x)
+    {
+        const int2 candidate = g_bvh_vf_cache_candidates[begin + i];
+        const uint3 face = faces[candidate.y];
+        _checkPTintersection(vertexes,
+                             candidate.x,
+                             face.x,
+                             face.y,
+                             face.z,
+                             d_hat,
+                             cp_num,
+                             mat_index,
+                             collision_pair,
+                             ccd_collision_pair);
+    }
+}
+
+void replay_bvh_vf_pair_cache(const double3* vertexes,
+                              const uint3*   faces,
+                              uint32_t*      cp_num,
+                              int*           mat_index,
+                              int4*          collision_pair,
+                              int4*          ccd_collision_pair,
+                              double         d_hat,
+                              cudaStream_t   stream)
+{
+    if(!getenv("STIFF_BVH_PAIR_CACHE") || h_bvh_vf_cache_pair_count <= 0)
+        return;
+    _replayVfPairCache<<<h_bvh_vf_cache_pair_count, 256, 0, stream>>>(
+        vertexes,
+        faces,
+        cp_num,
+        mat_index,
+        collision_pair,
+        ccd_collision_pair,
+        d_hat);
 }
 
 __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
@@ -265,6 +354,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
     }
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfCcd);
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[idx]);
 
     double3 current_vertex = _vertexes[idx];
     double3 mvD            = moveDir[idx];
@@ -275,7 +365,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                  current_vertex.z - mvD.z * alpha);
     //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_bvs[0].upper, _bvs[0].lower));
     //printf("%f\n", bboxDiagSize2);
-    double gapl = BVH_TRAVERSAL_MARGIN(sqrt(dHat));  // audit-only expanded broad phase
+    double gapl = sqrt(dHat);
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
     do
@@ -305,7 +395,8 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                         if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                            && idx != _faces[obj_idx].z)
                         {
-                            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                _bodyID[_faces[obj_idx].x]);
                             _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                 make_int4(-idx - 1,
                                           _faces[obj_idx].x,
@@ -337,7 +428,8 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                         if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                            && idx != _faces[obj_idx].z)
                         {
-                            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                _bodyID[_faces[obj_idx].x]);
                             _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                 make_int4(-idx - 1,
                                           _faces[obj_idx].x,
@@ -394,6 +486,7 @@ __global__ void _selfQuery_vf_ccd_wide8(
     }
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhVfCcd);
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[idx]);
     const double3 current = _vertexes[idx];
     const double3 move    = moveDir[idx];
     AABB query;
@@ -402,7 +495,7 @@ __global__ void _selfQuery_vf_ccd_wide8(
     query.combines(current.x - move.x * alpha,
                    current.y - move.y * alpha,
                    current.z - move.z * alpha);
-    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    const double gap = sqrt(dHat);
     do
     {
         const uint32_t node_id = *--stack_ptr;
@@ -440,7 +533,7 @@ __global__ void _selfQuery_vf_ccd_wide8(
                || (_btype[idx] >= 2 && _btype[face.x] >= 2
                    && _btype[face.y] >= 2 && _btype[face.z] >= 2))
                 continue;
-            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(_bodyID[face.x]);
             _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                 make_int4(-idx - 1, face.x, face.y, face.z);
         }
@@ -495,10 +588,11 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
     }
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhEeDcd);
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[_edges[self_eid].x]);
 
     //double bboxDiagSize2 = __GEIGEN__::__squaredNorm(__GEIGEN__::__minus(_bvs[0].upper, _bvs[0].lower));
     //printf("%f\n", bboxDiagSize2);
-    double gapl = BVH_TRAVERSAL_MARGIN(sqrt(dHat));  // audit-only expanded broad phase
+    double gapl = sqrt(dHat);
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
     do
@@ -552,7 +646,8 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
                                  && _btype[_edges[obj_idx].x] >= 2
                                  && _btype[_edges[obj_idx].y] >= 2))
                             {
-                                BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                                BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                    _bodyID[_edges[obj_idx].x]);
                                 _checkEEintersection<(RangePruneMode == 2)>(_vertexes,
                                                      _rest_vertexes,
                                                      _edges[self_eid].x,
@@ -617,7 +712,8 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
                                  && _btype[_edges[obj_idx].x] >= 2
                                  && _btype[_edges[obj_idx].y] >= 2))
                             {
-                                BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                                BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                    _bodyID[_edges[obj_idx].x]);
                                 _checkEEintersection<(RangePruneMode == 2)>(_vertexes,
                                                      _rest_vertexes,
                                                      _edges[self_eid].x,
@@ -710,7 +806,8 @@ static __device__ __forceinline__ void _selfQuery_ee_wide8_body(
     }
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhEeDcd);
-    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[self_edge.x]);
+    const double gap = sqrt(dHat);
     do
     {
         const uint32_t node_id = *--stack_ptr;
@@ -781,7 +878,7 @@ static __device__ __forceinline__ void _selfQuery_ee_wide8_body(
                    && _btype[other_edge.x] >= 2
                    && _btype[other_edge.y] >= 2))
                 continue;
-            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(_bodyID[other_edge.x]);
             _checkEEintersection<(RangePruneMode == 2)>(_vertexes,
                                                          _rest_vertexes,
                                                          self_edge.x,
@@ -867,11 +964,12 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
             return;
     }
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhEeCcd);
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[current_edge.x]);
     //double3 edge_tvert0 = __GEIGEN__::__minus(_vertexes[current_edge.x], __GEIGEN__::__s_vec_multiply(moveDir[current_edge.x], alpha));
     //double3 edge_tvert1 = __GEIGEN__::__minus(_vertexes[current_edge.y], __GEIGEN__::__s_vec_multiply(moveDir[current_edge.y], alpha));
     //_bv.combines(edge_tvert0.x, edge_tvert0.y, edge_tvert0.z);
     //_bv.combines(edge_tvert1.x, edge_tvert1.y, edge_tvert1.z);
-    double gapl = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    double gapl = sqrt(dHat);
 
     unsigned int num_found = 0;
     do
@@ -909,7 +1007,8 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
                                  || current_edge.y == _edges[obj_idx].x
                                  || current_edge.y == _edges[obj_idx].y || (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_edges[obj_idx]) < _edge_lkey(current_edge)) : (obj_idx < self_eid)))))
                             {
-                                BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                                BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                    _bodyID[_edges[obj_idx].x]);
                                 _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                     make_int4(current_edge.x,
                                               current_edge.y,
@@ -951,7 +1050,8 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_body(
                                  || current_edge.y == _edges[obj_idx].x
                                  || current_edge.y == _edges[obj_idx].y || (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_edges[obj_idx]) < _edge_lkey(current_edge)) : (obj_idx < self_eid)))))
                             {
-                                BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+                                BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(
+                                    _bodyID[_edges[obj_idx].x]);
                                 _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                     make_int4(current_edge.x,
                                               current_edge.y,
@@ -1022,7 +1122,8 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_wide8_body(
     }
 
     BVH_TRAVERSAL_AUDIT_BEGIN(kBvhEeCcd);
-    const double gap = BVH_TRAVERSAL_MARGIN(sqrt(dHat));
+    BVH_TRAVERSAL_AUDIT_SET_BODY(_bodyID[self_edge.x]);
+    const double gap = sqrt(dHat);
     do
     {
         const uint32_t node_id = *--stack_ptr;
@@ -1081,7 +1182,7 @@ static __device__ __forceinline__ void _selfQuery_ee_ccd_wide8_body(
                    && _btype[other_edge.x] >= 2
                    && _btype[other_edge.y] >= 2))
                 continue;
-            BVH_TRAVERSAL_AUDIT_PRIMITIVE();
+            BVH_TRAVERSAL_AUDIT_PRIMITIVE_PAIR(_bodyID[other_edge.x]);
             _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                 make_int4(self_edge.x,
                           self_edge.y,
