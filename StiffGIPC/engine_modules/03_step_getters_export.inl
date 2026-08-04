@@ -2498,6 +2498,8 @@ void SimEngine::teleport_abd_bodies(const int* body_offsets, const double* mat4x
         }
         if(!g.m_skip_all_collision)
         {
+            g.bvh_f.m_refit_topology_ready = false;
+            g.bvh_e.m_refit_topology_ready = false;
             g.buildBVH();
             g.buildCP();
         }

@@ -136,11 +136,26 @@ __device__ unsigned long long
         [4][kBvhAuditBodyCapacity][kBvhAuditBodyCapacity];
 void set_bvh_traversal_audit(int v)
 {
+    // The audit build is also used to validate whole-frame CUDA Graphs.  A
+    // synchronous symbol copy is illegal while a stream is capturing, and
+    // buildCP() republishes this process-fixed diagnostic knob on every
+    // invocation.  Device globals are zero-initialized, so treating zero as
+    // the initial published value makes the disabled audit a no-op even when
+    // the first collision build happens inside capture.  An enabled audit is
+    // still published once at the normal warm-up boundary.
+    static int last = 0;
+    if(v == last)
+        return;
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_traversal_audit, &v, sizeof(int)));
+    last = v;
 }
 void set_bvh_pair_work_audit(int v)
 {
+    static int last = 0;
+    if(v == last)
+        return;
     CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_pair_work_audit, &v, sizeof(int)));
+    last = v;
 }
 void set_bvh_traversal_margin_scale(double scale)
 {

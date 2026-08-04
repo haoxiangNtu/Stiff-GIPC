@@ -177,6 +177,19 @@ class lbvh
     int       _sort_cap       = 0;         // element capacity of the alt buffers
     void ensure_sort_scratch(int N);       // (re)alloc to fit N (syncing malloc; pre-size pool slots)
 
+    // Validation candidate: reuse an existing leaf mapping/binary topology and
+    // recompute only leaf/internal AABBs.  Pointer/active-list identities make
+    // point-swapped per-env scratch conservative: a different scratch slot
+    // always triggers a full rebuild instead of borrowing another env's tree.
+    Node*      m_refit_nodes_identity  = nullptr;
+    const int* m_refit_active_identity = nullptr;
+    int        m_refit_number          = 0;
+    int        m_refit_since_rebuild   = 0;
+    bool       m_refit_topology_ready  = false;
+    unsigned long long m_refit_capture_id = 0;
+    unsigned long long m_refit_reuses  = 0;
+    unsigned long long m_refit_rebuilds = 0;
+
   public:
     lbvh() {}
     ~lbvh();

@@ -615,6 +615,117 @@ enum BvhSahRotationFamily
     kSahEdgeCcd = 8,
 };
 
+static int bvh_refit_interval()
+{
+    static const int interval = []
+    {
+        const char* value = getenv("STIFF_BVH_REFIT_INTERVAL");
+        const int parsed = value ? atoi(value) : 1;
+        return std::max(1, std::min(1000000, parsed));
+    }();
+    return interval;
+}
+
+static int bvh_refit_mask()
+{
+    static const int mask = []
+    {
+        const char* value = getenv("STIFF_BVH_REFIT_MASK");
+        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0xF)
+                     : 0xF;
+    }();
+    return mask;
+}
+
+static bool shouldRefitTopology(lbvh&      tree,
+                                int        number,
+                                int        family,
+                                const int* active_identity,
+                                cudaStream_t stream)
+{
+    const int interval = bvh_refit_interval();
+    if(interval <= 1 || !(bvh_refit_mask() & family))
+    {
+        tree.m_refit_topology_ready = false;
+        return false;
+    }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_SAFE_CALL(cudaStreamIsCapturing(stream, &capture_status));
+    if(capture_status == cudaStreamCaptureStatusActive)
+    {
+        unsigned long long capture_id = 0;
+        CUDA_SAFE_CALL(cudaStreamGetCaptureInfo(
+            stream, &capture_status, &capture_id));
+        // A graph replay repeats the captured build/refit pattern forever;
+        // if capture happened to contain only refits, quality would degrade
+        // without bound across frames.  Force the first construction of every
+        // distinct capture to be a complete build, then refit within the body.
+        if(tree.m_refit_capture_id != capture_id)
+        {
+            tree.m_refit_capture_id = capture_id;
+            tree.m_refit_topology_ready = false;
+            tree.m_refit_since_rebuild = 0;
+        }
+    }
+    const bool same_storage = tree.m_refit_nodes_identity == tree._nodes
+                              && tree.m_refit_active_identity
+                                     == active_identity
+                              && tree.m_refit_number == number;
+    if(!same_storage)
+    {
+        tree.m_refit_topology_ready = false;
+        tree.m_refit_since_rebuild = 0;
+        tree.m_refit_nodes_identity = tree._nodes;
+        tree.m_refit_active_identity = active_identity;
+        tree.m_refit_number = number;
+    }
+    if(tree.m_refit_topology_ready
+       && tree.m_refit_since_rebuild + 1 < interval)
+    {
+        ++tree.m_refit_since_rebuild;
+        ++tree.m_refit_reuses;
+        return true;
+    }
+    tree.m_refit_topology_ready = true;
+    tree.m_refit_since_rebuild = 0;
+    ++tree.m_refit_rebuilds;
+    return false;
+}
+
+template <class element_type, bool Swept>
+static void refitTopology(lbvh&               tree,
+                          const element_type* elements,
+                          const double3*      move_dir,
+                          double              alpha,
+                          int                 number,
+                          int                 type,
+                          cudaStream_t        stream,
+                          const double*       alpha_dev,
+                          uint32_t*           node_max_element = nullptr)
+{
+    constexpr int threads = 256;
+    _refitLeafBvs<element_type, Swept><<<
+        (number + threads - 1) / threads, threads, 0, stream>>>(
+        tree._vertexes,
+        move_dir,
+        alpha,
+        elements,
+        tree._nodes,
+        tree._bvs,
+        number,
+        type,
+        tree._bodyId,
+        tree._collision_skip_matrix,
+        tree._collision_body_count,
+        alpha_dev);
+    calcInternalAABB(tree._nodes,
+                     tree._bvs,
+                     tree._flags,
+                     number,
+                     stream,
+                     node_max_element);
+}
+
 static int bvh_ploc_mode()
 {
     static const int mode = []
@@ -1166,6 +1277,17 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
 
 void lbvh::FREE_DEVICE_MEM()
 {
+    if(getenv("STIFF_BVH_REFIT_STATS")
+       && (m_refit_rebuilds || m_refit_reuses))
+        printf("[bvh-refit-stats] primitives=%u rebuilds=%llu refits=%llu "
+               "queries_per_rebuild=%.6f\n",
+               static_cast<unsigned int>(m_refit_number),
+               m_refit_rebuilds,
+               m_refit_reuses,
+               m_refit_rebuilds
+                   ? (double)(m_refit_rebuilds + m_refit_reuses)
+                         / (double)m_refit_rebuilds
+                   : 0.0);
     auto release = [](auto*& pointer)
     {
         if(pointer)
@@ -1188,6 +1310,12 @@ void lbvh::FREE_DEVICE_MEM()
     release(_idx_alt);
     _sort_tmp_bytes = 0;
     _sort_cap       = 0;
+    m_refit_nodes_identity = nullptr;
+    m_refit_active_identity = nullptr;
+    m_refit_number = 0;
+    m_refit_since_rebuild = 0;
+    m_refit_topology_ready = false;
+    m_refit_capture_id = 0;
 }
 
 void lbvh::MALLOC_DEVICE_MEM(const int& number, bool allocate_node_max)
@@ -1296,6 +1424,12 @@ double lbvh_f::Construct(cudaStream_t stream)
        && face_number_active <= (int)face_number)
     {
         const int N = face_number_active;
+        if(shouldRefitTopology(*this, N, kSahFaceDcd, _active_idx, stream))
+        {
+            refitTopology<uint3, false>(
+                *this, _faces, nullptr, 0.0, N, 0, stream, nullptr);
+            return 0;
+        }
         // [perenv-parallel #1] fully async on `stream` (no host sync) so per-env builds overlap.
         calcLeafBvs_indirect(_vertexes, _faces, _active_idx, _bvs, N, 0, stream);
         if(build_sah_oracle(*this, N, _active_idx, stream, nullptr,
@@ -1320,6 +1454,18 @@ double lbvh_f::Construct(cudaStream_t stream)
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahFaceDcd, stream);
         computeNodeBodyLabels(*this, N, stream, true);
+        return 0;
+    }
+    if(shouldRefitTopology(*this, face_number, kSahFaceDcd, nullptr, stream))
+    {
+        refitTopology<uint3, false>(*this,
+                                    _faces,
+                                    nullptr,
+                                    0.0,
+                                    face_number,
+                                    0,
+                                    stream,
+                                    nullptr);
         return 0;
     }
     calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
@@ -1362,6 +1508,12 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
        && face_number_active <= (int)face_number)
     {
         const int N = face_number_active;
+        if(shouldRefitTopology(*this, N, kSahFaceCcd, _active_idx, stream))
+        {
+            refitTopology<uint3, true>(
+                *this, _faces, moveDir, alpha, N, 0, stream, alpha_dev);
+            return 0;
+        }
         // [perenv-parallel #2] fully async on `stream` (mirrors the DCD active path): swept-leaf
         // build -> async max-BV -> Morton -> cub sort (pre-alloc scratch) -> tree. No host sync,
         // no malloc/free -> concurrent per-env swept builds+queries actually overlap.
@@ -1389,6 +1541,18 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahFaceCcd, stream);
         computeNodeBodyLabels(*this, N, stream);
+        return 0;
+    }
+    if(shouldRefitTopology(*this, face_number, kSahFaceCcd, nullptr, stream))
+    {
+        refitTopology<uint3, true>(*this,
+                                   _faces,
+                                   moveDir,
+                                   alpha,
+                                   face_number,
+                                   0,
+                                   stream,
+                                   alpha_dev);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
@@ -1445,10 +1609,16 @@ double lbvh_e::Construct(cudaStream_t stream)
        && face_number_active <= (int)edge_number)
     {
         const int N = face_number_active;
-        // [perenv-parallel #1] fully async on `stream` (no host sync) so per-env builds overlap.
-        calcLeafBvs_indirect(_vertexes, _edges, _active_idx, _bvs, N, 1, stream);
         const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
         uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
+        if(shouldRefitTopology(*this, N, kSahEdgeDcd, _active_idx, stream))
+        {
+            refitTopology<uint2, false>(
+                *this, _edges, nullptr, 0.0, N, 1, stream, nullptr, node_max);
+            return 0;
+        }
+        // [perenv-parallel #1] fully async on `stream` (no host sync) so per-env builds overlap.
+        calcLeafBvs_indirect(_vertexes, _edges, _active_idx, _bvs, N, 1, stream);
         if(build_sah_oracle(*this, N, _active_idx, stream, node_max,
                             "edge-dcd-active"))
         {
@@ -1488,10 +1658,23 @@ double lbvh_e::Construct(cudaStream_t stream)
     cudaEventCreate(&end2);
 
     cudaEventRecord(start);*/
-    calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1,
-                _bodyId, _collision_skip_matrix, _collision_body_count);
     const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
     uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
+    if(shouldRefitTopology(*this, edge_number, kSahEdgeDcd, nullptr, stream))
+    {
+        refitTopology<uint2, false>(*this,
+                                    _edges,
+                                    nullptr,
+                                    0.0,
+                                    edge_number,
+                                    1,
+                                    stream,
+                                    nullptr,
+                                    node_max);
+        return 0;
+    }
+    calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1,
+                _bodyId, _collision_skip_matrix, _collision_body_count);
     if(build_sah_oracle(*this, edge_number, nullptr, stream, node_max,
                         "edge-dcd"))
     {
@@ -1545,12 +1728,25 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
        && face_number_active <= (int)edge_number)
     {
         const int N = face_number_active;
-        // [perenv-parallel #2] fully async on `stream` (mirrors the DCD active path).
-        calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _edges,
-                                     _active_idx, _bvs, N, 1, stream, alpha_dev);
         const bool range_prune = m_node_max_element
                                  && ee_range_prune_mode() == 1;
         uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
+        if(shouldRefitTopology(*this, N, kSahEdgeCcd, _active_idx, stream))
+        {
+            refitTopology<uint2, true>(*this,
+                                       _edges,
+                                       moveDir,
+                                       alpha,
+                                       N,
+                                       1,
+                                       stream,
+                                       alpha_dev,
+                                       node_max);
+            return 0;
+        }
+        // [perenv-parallel #2] fully async on `stream` (mirrors the DCD active path).
+        calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _edges,
+                                     _active_idx, _bvs, N, 1, stream, alpha_dev);
         if(build_sah_oracle(*this, N, _active_idx, stream, node_max,
                             "edge-ccd-active"))
         {
@@ -1576,12 +1772,25 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         computeNodeBodyLabels(*this, N, stream);
         return 0;
     }
-    calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
-                        _bodyId, _collision_skip_matrix, _collision_body_count,
-                        alpha_dev);
     const bool range_prune = m_node_max_element
                              && ee_range_prune_mode() == 1;
     uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
+    if(shouldRefitTopology(*this, edge_number, kSahEdgeCcd, nullptr, stream))
+    {
+        refitTopology<uint2, true>(*this,
+                                   _edges,
+                                   moveDir,
+                                   alpha,
+                                   edge_number,
+                                   1,
+                                   stream,
+                                   alpha_dev,
+                                   node_max);
+        return 0;
+    }
+    calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
+                        _bodyId, _collision_skip_matrix, _collision_body_count,
+                        alpha_dev);
     if(build_sah_oracle(*this, edge_number, nullptr, stream, node_max,
                         "edge-ccd"))
     {

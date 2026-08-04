@@ -55,6 +55,11 @@ BUILD_PREFIXES = (
     "_calcLeafNodes",
     "_calcInternalNodes(",
     "_calcInternalAABB",
+    "void _refitLeafBvs",
+    "_refitLeafBvs",
+    "_buildPlocSingleWorkgroup",
+    "_buildPlocChunksShared",
+    "_buildPlocUpper",
     "_calcInternalDepths(",
     "_rotateSahTreelets(",
 )

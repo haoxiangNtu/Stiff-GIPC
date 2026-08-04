@@ -246,6 +246,72 @@ the topology is amortized across exact AABB refits; a topology refit remains
 collision-complete because every leaf and internal AABB is recomputed, while
 tree quality affects performance rather than correctness.
 
+### Exact topology refit changes the PLOC decision
+
+`STIFF_BVH_REFIT_INTERVAL=N` now performs that missing amortization.  A full
+build persists each leaf's original primitive `element_idx` and the binary
+topology.  A refit reconstructs every current or swept leaf AABB directly in
+that persistent leaf slot, then recomputes every internal AABB bottom-up.  It
+does not reuse an old box and cannot omit a primitive; an arbitrarily poor
+tree remains collision-complete and only traverses more nodes.  Checkpoint
+restore and FEM/ABD teleport explicitly invalidate topology quality and force
+one complete rebuild.  Scratch-pointer, active-list, and primitive-count
+identity checks prevent one isolated/per-env scratch slot from borrowing
+another slot's topology.
+
+The initial frozen frame-30 scan used 200 DCD plus 200 deterministic swept-CCD
+rebuilds.  Pure LBVH refit reduced all CUDA kernel time from 1,726.755 ms to
+1,634.149 ms (5.36%) with exact DCD and CCD physical/encoded multisets.
+Hierarchical PLOC++ rebuilt every 32 constructions used 1,627.996 ms; keeping
+one PLOC++ topology for the whole frozen interval used 1,551.486 ms (10.15%
+below baseline).  Full single-workgroup PLOC++ still lost most of its query
+gain to even a few expensive builds and is rejected.
+
+Frozen geometry hides tree degradation, so intervals 16/32/64/128/192/256
+and effectively infinite were then profiled on the exact same deterministic
+30-frame FOLD trajectory.  All candidates produced the same vertex hash
+`642ddf01b9afc6fb`, pair hash `5dc74cc216dd2a8e`, 52,761 encoded pairs, and
+per-frame Newton sequence.  Hierarchical PLOC++ interval 128 was the measured
+optimum:
+
+| candidate | all CUDA kernels | four query families | PLOC builds | refit leaves |
+|---|---:|---:|---:|---:|
+| rebuild Morton LBVH every query | 18,002.144 ms | 3,445.366 ms | 0 | 0 |
+| pure LBVH, effectively infinite refit | 17,940.421 ms | 4,395.125 ms | 0 | 12.355 ms |
+| hierarchical PLOC++, interval 64 | 17,147.050 ms | 3,331.408 ms | 27.214 ms | 12.201 ms |
+| hierarchical PLOC++, interval 128 | **16,944.391 ms** | **3,308.522 ms** | 14.303 ms | 12.322 ms |
+| hierarchical PLOC++, interval 192 | 17,483.807 ms | 3,357.927 ms | 9.923 ms | 12.318 ms |
+| hierarchical PLOC++, interval 256 | 17,505.885 ms | 3,384.903 ms | 7.837 ms | 12.226 ms |
+| hierarchical PLOC++, effectively infinite | 17,323.274 ms | 3,554.668 ms | 2.379 ms | 12.331 ms |
+
+The interval-128 observed whole-kernel reduction is 5.88%; directly
+attributable query/build/refit work supports a more conservative roughly
+2.7% gain.  A separate IsaacSim process occupied the RTX 4090 at 97--99%
+during these captures, so free-GPU and A800 repeats remain mandatory before a
+default change.
+
+The frozen FOLD gate passed at frames 1/10/30 for merged and isolated with
+exact original DCD and CCD encodings.  The 50-frame merged/isolated/strict gate
+also passed and retained strict gold `0544461bd82123ae`.  CUDA stream capture
+forces the first construction in each distinct capture to be a full build, so
+replay cannot accidentally repeat an all-refit graph forever.  The candidate
+then passed the frame-graph transaction gate, all three C4 collision scenarios,
+the C5 isolated whole-frame gate, episode graph, articulated episode graph,
+GPU-RL, and GPU-native-RL gates.  The traversal-audit validation build exposed
+and fixed a pre-existing capture hazard as part of that run: disabled audit
+symbols are now initialized by their device-zero value and process-fixed audit
+settings are copied only when they actually change, rather than issuing a
+synchronous `cudaMemcpyToSymbol` from every captured `buildCP()`.
+
+This is capture-safe, but it is not yet an isolated-mode speedup.  The C5 gate
+reported 43 full rebuilds and zero refits for each tree: isolated execution
+rotates among per-environment scratch/active-list addresses, and the exact
+pointer-identity guard correctly refuses to reuse one slot's topology in
+another.  Isolated acceleration therefore needs one topology/refit state per
+scratch slot (or stable per-environment tree storage) before its performance
+can be credited.  Merged mode does amortize successfully; the C4 synchronous
+runs measured about 57--59 queries per rebuild.
+
 ### Same-topology BVH8 traversal
 
 `STIFF_BVH_WIDE8` builds a maximum-eight-child traversal front from the
@@ -357,9 +423,10 @@ yet.
 - Lightweight rotations must be selective.  Whole-tree/all-family application
   loses to its own build cost; face-DCD phase 1 is the only measured positive
   slice so far.
-- Full and hierarchical GPU PLOC/PLOC++ recover useful tree quality but lose
-  when rebuilt for every query; topology amortization/refit is the remaining
-  condition under which they may become profitable.
+- Full PLOC/PLOC++ remains too expensive.  Hierarchical PLOC++ becomes a real
+  candidate when amortized with exact topology refit; interval 128 measured
+  about 5.9% observed and at least 2.7% directly attributable whole-kernel
+  improvement on deterministic 30-frame FOLD, with exact state and pairs.
 - Same-topology software BVH8 is implemented.  Whole-pipeline and PLOC+BVH8
   variants lose, while largest-box-first face-DCD-only wide traversal is a
   measured 4.7% win in the query-heavy frozen test and remains a candidate.

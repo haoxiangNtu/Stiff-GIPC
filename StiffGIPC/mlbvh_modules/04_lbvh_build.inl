@@ -257,6 +257,66 @@ __global__ void _calcLeafBvs_ccd_indirect(const double3*      _vertexes,
     _bvs[t] = _bv;
 }
 
+// Exact topology refit.  Leaf slots are no longer in original primitive
+// order after the first sort/PLOC build, so read the persistent element_idx
+// from each leaf node and rebuild that slot directly.  The internal pass then
+// recomputes every ancestor AABB; topology quality affects only traversal
+// cost, never collision completeness.
+template <class element_type, bool Swept>
+__global__ void _refitLeafBvs(const double3*      vertexes,
+                              const double3*      move_dir,
+                              double              alpha,
+                              const element_type* elements,
+                              const Node*         nodes,
+                              AABB*               boxes,
+                              int                 number,
+                              int                 type,
+                              const int*          body_id,
+                              const int*          collision_skip_matrix,
+                              int                 collision_body_count,
+                              const double*       alpha_dev = nullptr)
+{
+    const int slot = threadIdx.x + blockIdx.x * blockDim.x;
+    if(slot >= number)
+        return;
+    if constexpr(Swept)
+        if(alpha_dev)
+            alpha = *alpha_dev;
+
+    const uint32_t primitive = nodes[number - 1 + slot].element_idx;
+    const element_type element = elements[primitive];
+    AABB box;
+    if(body_id && collision_skip_matrix && collision_body_count > 0)
+    {
+        const int body = body_id[element.x];
+        if(body >= 0 && body < collision_body_count
+           && collision_skip_matrix[
+               body * collision_body_count + body] != 0)
+        {
+            boxes[number - 1 + slot] = box;
+            return;
+        }
+    }
+
+    auto add_vertex = [&](uint32_t vertex)
+    {
+        const double3 position = vertexes[vertex];
+        box.combines(position.x, position.y, position.z);
+        if constexpr(Swept)
+        {
+            const double3 motion = move_dir[vertex];
+            box.combines(position.x - motion.x * alpha,
+                         position.y - motion.y * alpha,
+                         position.z - motion.z * alpha);
+        }
+    };
+    add_vertex(element.x);
+    add_vertex(element.y);
+    if(type == 0)
+        add_vertex(*((const uint32_t*)(&element) + 2));
+    boxes[number - 1 + slot] = box;
+}
+
 // Variant of _calcLeafNodes that maps the (sorted) leaf-array index back to
 // the ORIGINAL face/edge index via _active_idx, so query kernels work unchanged.
 template <bool TrackMax>
