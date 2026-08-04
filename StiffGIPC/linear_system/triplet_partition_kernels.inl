@@ -193,7 +193,22 @@ __global__ void _stage_contact_class_segment(
     const int count = _contact_class_count(
         legacy_starts, contact_class, payload_count);
     if(idx >= count)
+    {
+        // [graph-stale-tail] the downstream class convert consumes the FULL
+        // trained width. A lane that merely returns leaves the PREVIOUS
+        // iteration's triplet in its slot — a stale, valid-keyed, nonzero
+        // contribution that contaminates the merged Hessian on frames whose
+        // live count SHRINKS between Newton iterations (fs4: in-graph PCG at
+        // 61-163 iters/Newton vs the host's 8-9 against the same tolerance).
+        // Writing the zero triplet restores the pad-is-zero invariant the
+        // graph layout was designed around: the (0,0) key dedups to one slot
+        // and the zero-skip scatter drops the deposit entirely. Gate scenes
+        // keep bitwise results (their tails were never-written zeros already).
+        row_ids[output_start + idx] = 0;
+        col_ids[output_start + idx] = 0;
+        triplet_value[output_start + idx].setZero();
         return;
+    }
     const int sorted_start =
         _contact_class_raw_start(legacy_starts, contact_class);
     const uint32_t source = sort_index[sorted_start + idx];
