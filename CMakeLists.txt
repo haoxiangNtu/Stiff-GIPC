@@ -44,6 +44,8 @@ option(STIFFGIPC_ENABLE_DIAGNOSTICS
        OFF)
 set(STIFFGIPC_BVH_STACK_CAP "2048" CACHE STRING
     "Per-thread explicit LBVH traversal stack capacity (validation knob)")
+option(STIFFGIPC_BVH_TRAVERSAL_AUDIT
+       "Compile low-overhead per-query BVH traversal census counters" OFF)
 if(NOT STIFFGIPC_BVH_STACK_CAP MATCHES "^[0-9]+$"
    OR STIFFGIPC_BVH_STACK_CAP LESS 16)
     message(FATAL_ERROR
@@ -144,10 +146,14 @@ file(GLOB_RECURSE GIPC_ALL_SOURCE CONFIGURE_DEPENDS
     "StiffGIPC/*.cu" "StiffGIPC/*.cpp")
 file(GLOB_RECURSE GIPC_ALL_HEADERS CONFIGURE_DEPENDS
     "StiffGIPC/*.h" "StiffGIPC/*.cuh" "StiffGIPC/*.hpp" "StiffGIPC/*.inl" "StiffGIPC/*.inc")
+set(GIPC_MLBVH_SOURCE_DEFS
+    "STIFF_BVH_STACK_CAP=${STIFFGIPC_BVH_STACK_CAP}")
+if(STIFFGIPC_BVH_TRAVERSAL_AUDIT)
+    list(APPEND GIPC_MLBVH_SOURCE_DEFS STIFF_BVH_TRAVERSAL_AUDIT_BUILD)
+endif()
 set_source_files_properties(
     "${CMAKE_CURRENT_SOURCE_DIR}/StiffGIPC/mlbvh.cu"
-    PROPERTIES COMPILE_DEFINITIONS
-               "STIFF_BVH_STACK_CAP=${STIFFGIPC_BVH_STACK_CAP}")
+    PROPERTIES COMPILE_DEFINITIONS "${GIPC_MLBVH_SOURCE_DEFS}")
 
 # Exclude gl_main.cu from the library (it contains main() and GL code)
 list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "gl_main\\.cu$")

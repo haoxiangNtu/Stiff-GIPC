@@ -48,6 +48,8 @@ BUILD_PREFIXES = (
     "_calcLeafNodes",
     "_calcInternalNodes(",
     "_calcInternalAABB",
+    "_calcInternalDepths(",
+    "_rotateSahTreelets(",
 )
 
 

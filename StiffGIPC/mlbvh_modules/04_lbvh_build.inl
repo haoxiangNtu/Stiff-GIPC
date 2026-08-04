@@ -536,6 +536,123 @@ __global__ void _calcInternalAABB_with_max(const Node* _nodes,
         _nodes, _bvs, flags, _node_max_element, number);
 }
 
+// Experimental graph-safe LBVH treelet optimizer.  A binary rotation at P
+// replaces one internal child C=(A,B) and P's other child S with either
+// C'=(A,S), P'=(C',B), or C'=(S,B), P'=(A,C').  P still covers exactly the
+// same primitives, so only C's box (and optional subtree maximum) changes.
+//
+// Nodes whose depths have the same value modulo three have disjoint write
+// footprints: a rotation touches depths d..d+2, while the next selected
+// descendant starts at d+3.  Depths are recomputed before every phase because
+// earlier rotations can move a subtree by one level.  This makes each phase
+// race-free and deterministic without locks or host/device communication.
+__global__ void _calcInternalDepths(const Node* nodes,
+                                    uint32_t*   depths,
+                                    int         number)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number - 1)
+        return;
+    uint32_t depth  = 0;
+    uint32_t parent = nodes[idx].parent_idx;
+    while(parent != 0xFFFFFFFFu && depth < static_cast<uint32_t>(number))
+    {
+        ++depth;
+        parent = nodes[parent].parent_idx;
+    }
+    depths[idx] = depth;
+}
+
+__device__ __forceinline__ double _bvh_half_surface_area(const AABB& box)
+{
+    const double x = max(0.0, box.upper.x - box.lower.x);
+    const double y = max(0.0, box.upper.y - box.lower.y);
+    const double z = max(0.0, box.upper.z - box.lower.z);
+    return x * y + y * z + z * x;
+}
+
+__global__ void _rotateSahTreelets(Node*           nodes,
+                                   AABB*           boxes,
+                                   const uint32_t* depths,
+                                   uint32_t*       node_max_element,
+                                   int             number,
+                                   int             phase)
+{
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if(p >= number - 1 || static_cast<int>(depths[p] % 3u) != phase)
+        return;
+
+    const uint32_t children[2] = {nodes[p].left_idx, nodes[p].right_idx};
+    double         best_gain   = 0.0;
+    int            best_side   = -1;
+    int            best_inside = -1;
+
+#pragma unroll
+    for(int side = 0; side < 2; ++side)
+    {
+        const uint32_t c = children[side];
+        const uint32_t s = children[1 - side];
+        if(c >= static_cast<uint32_t>(number - 1)
+           || s == 0xFFFFFFFFu)
+            continue;
+        const uint32_t a = nodes[c].left_idx;
+        const uint32_t b = nodes[c].right_idx;
+        if(a == 0xFFFFFFFFu || b == 0xFFFFFFFFu)
+            continue;
+
+        const double old_cost = _bvh_half_surface_area(boxes[c]);
+        const double gain_a =
+            old_cost - _bvh_half_surface_area(merge(boxes[a], boxes[s]));
+        const double gain_b =
+            old_cost - _bvh_half_surface_area(merge(boxes[s], boxes[b]));
+        if(gain_a > best_gain)
+        {
+            best_gain   = gain_a;
+            best_side   = side;
+            best_inside = 0;
+        }
+        if(gain_b > best_gain)
+        {
+            best_gain   = gain_b;
+            best_side   = side;
+            best_inside = 1;
+        }
+    }
+
+    const double tolerance =
+        1.0e-12 * (_bvh_half_surface_area(boxes[p]) + 1.0);
+    if(best_side < 0 || !(best_gain > tolerance))
+        return;
+
+    const uint32_t c = children[best_side];
+    const uint32_t s = children[1 - best_side];
+    const uint32_t a = nodes[c].left_idx;
+    const uint32_t b = nodes[c].right_idx;
+    const uint32_t inside  = best_inside == 0 ? a : b;
+    const uint32_t outside = best_inside == 0 ? b : a;
+
+    // Keep C in its original P slot.  Keep the selected original grandchild
+    // in its original C slot, insert S in the other, and promote `outside`.
+    if(best_side == 0)
+        nodes[p].right_idx = outside;
+    else
+        nodes[p].left_idx = outside;
+    if(best_inside == 0)
+        nodes[c].right_idx = s;
+    else
+        nodes[c].left_idx = s;
+
+    nodes[outside].parent_idx = static_cast<uint32_t>(p);
+    nodes[s].parent_idx       = c;
+    boxes[c]                  = merge(boxes[inside], boxes[s]);
+    if(node_max_element)
+    {
+        const uint32_t lhs = node_max_element[inside];
+        const uint32_t rhs = node_max_element[s];
+        node_max_element[c] = lhs > rhs ? lhs : rhs;
+    }
+}
+
 __global__ void _sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;

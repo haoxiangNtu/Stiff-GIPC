@@ -473,6 +473,10 @@ def main():
             eng.native.save_checkpoint(save_checkpoint)
             print(f"[fs] checkpoint saved -> {save_checkpoint}", flush=True)
         pair_dump = os.environ.get("CASE39ME_DUMP_PAIRS")
+        ccd_pair_dump = os.environ.get("CASE39ME_DUMP_CCD_PAIRS")
+        traversal_audit = bool(os.environ.get("STIFF_BVH_TRAVERSAL_AUDIT"))
+        if traversal_audit and (pair_dump or ccd_pair_dump):
+            eng.native._reset_bvh_traversal_audit()
         if pair_dump:
             # Validation-only post-replay oracle.  Rebuilding the final DCD set
             # happens after all timed/simulated frames, so it cannot feed back
@@ -485,7 +489,6 @@ def main():
                 clean_pairs = eng.native.get_collision_pairs_clean()
             np.save(pair_dump, np.asarray(clean_pairs, dtype=np.int32))
             print(f"[fs-hl] clean pairs dumped -> {pair_dump}", flush=True)
-        ccd_pair_dump = os.environ.get("CASE39ME_DUMP_CCD_PAIRS")
         if ccd_pair_dump:
             # Deterministic non-rigid swept field: exercises full-CCD boxes and
             # traversal from the exact loaded checkpoint. This is a destructive
@@ -506,6 +509,18 @@ def main():
                 ccd_pairs = eng.native.get_ccd_pairs_clean(motion, 1.0)
             np.save(ccd_pair_dump, np.asarray(ccd_pairs, dtype=np.int32))
             print(f"[fs-hl] swept pairs dumped -> {ccd_pair_dump}", flush=True)
+        if traversal_audit and (pair_dump or ccd_pair_dump):
+            names = ("vf_dcd", "ee_dcd", "vf_ccd", "ee_ccd")
+            rows = np.asarray(
+                eng.native._get_bvh_traversal_audit(), dtype=np.uint64
+            )
+            for name, row in zip(names, rows):
+                print(
+                    f"[bvh-audit] family={name} queries={row[0]} "
+                    f"node_pops={row[1]} overlapping_children={row[2]} "
+                    f"primitive_tests={row[3]}",
+                    flush=True,
+                )
         return
 
     import polyscope as ps, polyscope.imgui as psim

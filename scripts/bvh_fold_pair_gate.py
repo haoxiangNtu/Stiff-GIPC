@@ -72,6 +72,10 @@ def invoke(env: dict[str, str], label: str) -> str:
         timeout=1800,
     )
     output = process.stdout + process.stderr
+    if bool(int(os.environ.get("BVH_FOLD_GATE_ECHO_AUDIT", "0"))):
+        for line in output.splitlines():
+            if line.startswith(("[bvh-audit]", "[bvh-sah-oracle]")):
+                print(f"[{label}] {line}")
     if process.returncode or BAD_OUTPUT.search(output):
         sys.stderr.write(output[-6000:])
         raise RuntimeError(f"{label} failed with rc={process.returncode}")

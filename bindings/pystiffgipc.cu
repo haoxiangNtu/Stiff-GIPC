@@ -1128,6 +1128,24 @@ PYBIND11_MODULE(pystiffgipc, m)
            "array of plain vertex indices (-1 padded for PP/PE), UIPC-style. The "
            "solver keeps its MMCVID packing; this is a read-only decoded view. "
            "Call AFTER step().")
+        .def("_reset_bvh_traversal_audit", [](const SimEngine&) {
+            set_bvh_traversal_audit(1);
+            reset_bvh_traversal_audit();
+        }, "Validation-only: reset the four aggregate BVH traversal counters.")
+        .def("_get_bvh_traversal_audit", [](const SimEngine&) {
+            BvhTraversalAudit rows[4] = {};
+            get_bvh_traversal_audit(rows);
+            auto out = py::array_t<unsigned long long>({4, 4});
+            auto view = out.mutable_unchecked<2>();
+            for(int family = 0; family < 4; ++family)
+            {
+                view(family, 0) = rows[family].queries;
+                view(family, 1) = rows[family].node_pops;
+                view(family, 2) = rows[family].overlapping_children;
+                view(family, 3) = rows[family].primitive_tests;
+            }
+            return out;
+        }, "Validation-only: return [queries,pops,overlaps,primitive-tests].")
         .def("get_ccd_pairs_clean", [](const SimEngine& self,
                                         py::array_t<double,
                                             py::array::c_style |

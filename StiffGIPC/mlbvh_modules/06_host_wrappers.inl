@@ -1,3 +1,355 @@
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace
+{
+// Validation-only upper bound for tree quality.  This deliberately uses a
+// host binned-SAH builder, then uploads the topology before the unchanged GPU
+// traversal.  It is NOT a production path (it synchronizes and cannot be
+// captured); its purpose is to answer the cheaper question before a PLOC or
+// treelet implementation: can a materially better binary tree reduce enough
+// node visits on the exact same IPC queries to repay a GPU builder?
+constexpr int kSahOracleBuckets = 16;
+
+struct SahOracleItem
+{
+    AABB     box;
+    uint32_t element = 0;
+};
+
+struct SahOracleBucket
+{
+    AABB box;
+    int  count = 0;
+};
+
+static bool bvh_sah_oracle_enabled()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("STIFF_BVH_SAH_ORACLE");
+        return value && std::atoi(value) > 0;
+    }();
+    return enabled;
+}
+
+static double sah_oracle_area(const AABB& box)
+{
+    const double x = std::max(0.0, box.upper.x - box.lower.x);
+    const double y = std::max(0.0, box.upper.y - box.lower.y);
+    const double z = std::max(0.0, box.upper.z - box.lower.z);
+    return 2.0 * (x * y + x * z + y * z);
+}
+
+static double sah_oracle_center_axis(const SahOracleItem& item, int axis)
+{
+    if(axis == 0)
+        return (item.box.lower.x + item.box.upper.x) * 0.5;
+    if(axis == 1)
+        return (item.box.lower.y + item.box.upper.y) * 0.5;
+    return (item.box.lower.z + item.box.upper.z) * 0.5;
+}
+
+static double sah_oracle_lower_axis(const AABB& box, int axis)
+{
+    return axis == 0 ? box.lower.x : axis == 1 ? box.lower.y : box.lower.z;
+}
+
+static double sah_oracle_upper_axis(const AABB& box, int axis)
+{
+    return axis == 0 ? box.upper.x : axis == 1 ? box.upper.y : box.upper.z;
+}
+
+static int sah_oracle_bucket(double center, double lo, double hi)
+{
+    if(!(hi > lo))
+        return 0;
+    int bucket = static_cast<int>(
+        (center - lo) * static_cast<double>(kSahOracleBuckets) / (hi - lo));
+    return std::max(0, std::min(kSahOracleBuckets - 1, bucket));
+}
+
+class SahOracleBuilder
+{
+  public:
+    SahOracleBuilder(std::vector<SahOracleItem> input, int count)
+        : items(std::move(input))
+        , nodes(static_cast<size_t>(2 * count - 1))
+        , boxes(static_cast<size_t>(2 * count - 1))
+        , maxima(static_cast<size_t>(2 * count - 1), 0)
+        , leaf_base(count - 1)
+    {
+        for(Node& node : nodes)
+        {
+            node.parent_idx = 0xFFFFFFFFu;
+            node.left_idx   = 0xFFFFFFFFu;
+            node.right_idx  = 0xFFFFFFFFu;
+            node.element_idx = 0xFFFFFFFFu;
+        }
+    }
+
+    void build()
+    {
+        const uint32_t root = build_node(0, static_cast<int>(items.size()),
+                                         0xFFFFFFFFu, 0);
+        if(root != 0 || internal_next != leaf_base || leaf_next != (int)items.size())
+            throw std::runtime_error("SAH oracle produced an invalid node layout");
+    }
+
+    std::vector<Node>     nodes;
+    std::vector<AABB>     boxes;
+    std::vector<uint32_t> maxima;
+    int                   max_depth = 0;
+    double                internal_area_sum = 0.0;
+
+  private:
+    AABB range_box(int begin, int end) const
+    {
+        AABB box;
+        for(int i = begin; i < end; ++i)
+            box.combines(items[i].box);
+        return box;
+    }
+
+    int partition(int begin, int end)
+    {
+        AABB centroid_box;
+        for(int i = begin; i < end; ++i)
+        {
+            const double x = sah_oracle_center_axis(items[i], 0);
+            const double y = sah_oracle_center_axis(items[i], 1);
+            const double z = sah_oracle_center_axis(items[i], 2);
+            centroid_box.combines(x, y, z);
+        }
+
+        double best_cost = std::numeric_limits<double>::infinity();
+        int    best_axis = -1;
+        int    best_split = -1;
+        for(int axis = 0; axis < 3; ++axis)
+        {
+            const double lo = sah_oracle_lower_axis(centroid_box, axis);
+            const double hi = sah_oracle_upper_axis(centroid_box, axis);
+            if(!(hi > lo))
+                continue;
+
+            SahOracleBucket buckets[kSahOracleBuckets];
+            for(int i = begin; i < end; ++i)
+            {
+                const int bucket = sah_oracle_bucket(
+                    sah_oracle_center_axis(items[i], axis), lo, hi);
+                ++buckets[bucket].count;
+                buckets[bucket].box.combines(items[i].box);
+            }
+
+            AABB left_box[kSahOracleBuckets - 1];
+            AABB right_box[kSahOracleBuckets - 1];
+            int  left_count[kSahOracleBuckets - 1] = {};
+            int  right_count[kSahOracleBuckets - 1] = {};
+            AABB prefix;
+            AABB suffix;
+            int  prefix_count = 0;
+            int  suffix_count = 0;
+            for(int i = 0; i < kSahOracleBuckets - 1; ++i)
+            {
+                prefix_count += buckets[i].count;
+                if(buckets[i].count)
+                    prefix.combines(buckets[i].box);
+                left_count[i] = prefix_count;
+                left_box[i]   = prefix;
+
+                const int r = kSahOracleBuckets - 1 - i;
+                suffix_count += buckets[r].count;
+                if(buckets[r].count)
+                    suffix.combines(buckets[r].box);
+                right_count[r - 1] = suffix_count;
+                right_box[r - 1]   = suffix;
+            }
+
+            for(int split = 0; split < kSahOracleBuckets - 1; ++split)
+            {
+                if(left_count[split] == 0 || right_count[split] == 0)
+                    continue;
+                const double cost =
+                    sah_oracle_area(left_box[split]) * left_count[split]
+                    + sah_oracle_area(right_box[split]) * right_count[split];
+                if(cost < best_cost)
+                {
+                    best_cost  = cost;
+                    best_axis  = axis;
+                    best_split = split;
+                }
+            }
+        }
+
+        if(best_axis >= 0)
+        {
+            const double lo = sah_oracle_lower_axis(centroid_box, best_axis);
+            const double hi = sah_oracle_upper_axis(centroid_box, best_axis);
+            auto middle = std::stable_partition(
+                items.begin() + begin,
+                items.begin() + end,
+                [=](const SahOracleItem& item)
+                {
+                    return sah_oracle_bucket(
+                               sah_oracle_center_axis(item, best_axis), lo, hi)
+                           <= best_split;
+                });
+            const int split = static_cast<int>(middle - items.begin());
+            if(split > begin && split < end)
+                return split;
+        }
+
+        int fallback_axis = 0;
+        double longest = sah_oracle_upper_axis(centroid_box, 0)
+                         - sah_oracle_lower_axis(centroid_box, 0);
+        for(int axis = 1; axis < 3; ++axis)
+        {
+            const double extent = sah_oracle_upper_axis(centroid_box, axis)
+                                  - sah_oracle_lower_axis(centroid_box, axis);
+            if(extent > longest)
+            {
+                longest = extent;
+                fallback_axis = axis;
+            }
+        }
+        std::stable_sort(items.begin() + begin,
+                         items.begin() + end,
+                         [=](const SahOracleItem& lhs, const SahOracleItem& rhs)
+                         {
+                             const double a = sah_oracle_center_axis(lhs, fallback_axis);
+                             const double b = sah_oracle_center_axis(rhs, fallback_axis);
+                             return a == b ? lhs.element < rhs.element : a < b;
+                         });
+        return begin + (end - begin) / 2;
+    }
+
+    uint32_t build_node(int begin, int end, uint32_t parent, int depth)
+    {
+        max_depth = std::max(max_depth, depth);
+        if(end - begin == 1)
+        {
+            const uint32_t node_idx = static_cast<uint32_t>(leaf_base + leaf_next++);
+            nodes[node_idx].parent_idx  = parent;
+            nodes[node_idx].element_idx = items[begin].element;
+            boxes[node_idx]              = items[begin].box;
+            maxima[node_idx]             = items[begin].element;
+            return node_idx;
+        }
+
+        const uint32_t node_idx = static_cast<uint32_t>(internal_next++);
+        const int split = partition(begin, end);
+        const uint32_t left  = build_node(begin, split, node_idx, depth + 1);
+        const uint32_t right = build_node(split, end, node_idx, depth + 1);
+        nodes[node_idx].parent_idx = parent;
+        nodes[node_idx].left_idx   = left;
+        nodes[node_idx].right_idx  = right;
+        boxes[node_idx] = boxes[left];
+        boxes[node_idx].combines(boxes[right]);
+        maxima[node_idx] = std::max(maxima[left], maxima[right]);
+        internal_area_sum += sah_oracle_area(boxes[node_idx]);
+        return node_idx;
+    }
+
+    std::vector<SahOracleItem> items;
+    int internal_next = 0;
+    int leaf_next = 0;
+    int leaf_base = 0;
+};
+
+static bool build_sah_oracle(lbvh&          tree,
+                             int            count,
+                             const int*     active_idx,
+                             cudaStream_t   stream,
+                             uint32_t*      node_max_element,
+                             const char*    label)
+{
+    if(!bvh_sah_oracle_enabled() || count < 2)
+        return false;
+
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_SAFE_CALL(cudaStreamIsCapturing(stream, &capture_status));
+    if(capture_status != cudaStreamCaptureStatusNone)
+        throw std::runtime_error(
+            "STIFF_BVH_SAH_ORACLE is a host-synchronized validation path and "
+            "cannot run inside CUDA stream capture");
+
+    const auto start = std::chrono::steady_clock::now();
+    // Some legacy full-world leaf launchers still use PTDS even when their
+    // caller supplies an auxiliary stream.  The oracle is intentionally
+    // synchronous, so make that cross-stream boundary explicit before reading
+    // the just-produced leaves.
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    std::vector<AABB> leaf_boxes(static_cast<size_t>(count));
+    std::vector<int>  original_indices(static_cast<size_t>(count));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(leaf_boxes.data(),
+                                   tree._bvs + count - 1,
+                                   static_cast<size_t>(count) * sizeof(AABB),
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
+    if(active_idx)
+        CUDA_SAFE_CALL(cudaMemcpyAsync(original_indices.data(),
+                                       active_idx,
+                                       static_cast<size_t>(count) * sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       stream));
+    CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
+    if(!active_idx)
+        std::iota(original_indices.begin(), original_indices.end(), 0);
+
+    std::vector<SahOracleItem> items(static_cast<size_t>(count));
+    for(int i = 0; i < count; ++i)
+    {
+        items[i].box     = leaf_boxes[i];
+        items[i].element = static_cast<uint32_t>(original_indices[i]);
+    }
+    SahOracleBuilder builder(std::move(items), count);
+    builder.build();
+
+    CUDA_SAFE_CALL(cudaMemcpyAsync(tree._nodes,
+                                   builder.nodes.data(),
+                                   builder.nodes.size() * sizeof(Node),
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+    CUDA_SAFE_CALL(cudaMemcpyAsync(tree._bvs,
+                                   builder.boxes.data(),
+                                   builder.boxes.size() * sizeof(AABB),
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+    if(node_max_element)
+        CUDA_SAFE_CALL(cudaMemcpyAsync(node_max_element,
+                                       builder.maxima.data(),
+                                       builder.maxima.size() * sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+    CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
+
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+    static int reports = 0;
+    if(reports++ < 12)
+    {
+        const double root_area = sah_oracle_area(builder.boxes[0]);
+        std::fprintf(stderr,
+                     "[bvh-sah-oracle] %s leaves=%d depth=%d "
+                     "normalized_internal_area=%.6f host_build_upload_ms=%.3f\n",
+                     label,
+                     count,
+                     builder.max_depth,
+                     root_area > 0.0 ? builder.internal_area_sum / root_area : 0.0,
+                     elapsed_ms);
+    }
+    return true;
+}
+}  // namespace
+
 AABB calcMaxBV(AABB* _leafBoxes, AABB* _tempLeafBox, const int& number)
 {
 
@@ -240,6 +592,80 @@ void calcInternalAABB(const Node* _nodes,
         _calcInternalAABB<<<blockNum, threadNum, 0, stream>>>(
             _nodes, _bvs, flags, numbers);
     //CUDA_SAFE_CALL(cudaFree(flags));
+}
+
+static int bvh_sah_rotation_cycles()
+{
+    static const int cycles = []
+    {
+        const char* value = getenv("STIFF_BVH_SAH_ROTATIONS");
+        if(!value)
+            return 0;
+        const int parsed = atoi(value);
+        return parsed < 0 ? 0 : (parsed > 8 ? 8 : parsed);
+    }();
+    return cycles;
+}
+
+enum BvhSahRotationFamily
+{
+    kSahFaceDcd = 1,
+    kSahEdgeDcd = 2,
+    kSahFaceCcd = 4,
+    kSahEdgeCcd = 8,
+};
+
+static int bvh_sah_rotation_mask()
+{
+    static const int mask = []
+    {
+        const char* value = getenv("STIFF_BVH_SAH_ROTATION_MASK");
+        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0xF)
+                     : 0xF;
+    }();
+    return mask;
+}
+
+static int bvh_sah_rotation_phase()
+{
+    static const int phase = []
+    {
+        const char* value = getenv("STIFF_BVH_SAH_ROTATION_PHASE");
+        if(!value)
+            return -1;
+        const int parsed = atoi(value);
+        return parsed >= 0 && parsed < 3 ? parsed : -1;
+    }();
+    return phase;
+}
+
+void optimizeSahTreelets(Node*         nodes,
+                         AABB*         boxes,
+                         uint32_t*     depths,
+                         int           number,
+                         int           family,
+                         cudaStream_t  stream = 0,
+                         uint32_t*     node_max_element = nullptr)
+{
+    const int cycles = bvh_sah_rotation_cycles();
+    if(cycles == 0 || number < 3
+       || (bvh_sah_rotation_mask() & family) == 0)
+        return;
+    const unsigned int threads = default_threads;
+    const int blocks = (number - 1 + threads - 1) / threads;
+    const int selected_phase = bvh_sah_rotation_phase();
+    for(int cycle = 0; cycle < cycles; ++cycle)
+    {
+        for(int phase = 0; phase < 3; ++phase)
+        {
+            if(selected_phase >= 0 && phase != selected_phase)
+                continue;
+            _calcInternalDepths<<<blocks, threads, 0, stream>>>(
+                nodes, depths, number);
+            _rotateSahTreelets<<<blocks, threads, 0, stream>>>(
+                nodes, boxes, depths, node_max_element, number, phase);
+        }
+    }
 }
 
 void sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number, cudaStream_t stream = 0)
@@ -586,6 +1012,12 @@ double lbvh_f::Construct(cudaStream_t stream)
         const int N = face_number_active;
         // [perenv-parallel #1] fully async on `stream` (no host sync) so per-env builds overlap.
         calcLeafBvs_indirect(_vertexes, _faces, _active_idx, _bvs, N, 0, stream);
+        if(build_sah_oracle(*this, N, _active_idx, stream, nullptr,
+                            "face-dcd-active"))
+        {
+            computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            return 0;
+        }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
@@ -594,10 +1026,18 @@ double lbvh_f::Construct(cudaStream_t stream)
         calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
         calcInternalNodes(_nodes, _MChash, N, stream);
         calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        optimizeSahTreelets(
+            _nodes, _bvs, _flags, N, kSahFaceDcd, stream);
         return 0;
     }
     calcLeafBvs(_vertexes, _faces, _bvs, face_number, 0,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
+    if(build_sah_oracle(*this, face_number, nullptr, stream, nullptr,
+                        "face-dcd"))
+    {
+        computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number, stream);
+        return 0;
+    }
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
@@ -611,6 +1051,8 @@ double lbvh_f::Construct(cudaStream_t stream)
     calcInternalNodes(_nodes, _MChash, face_number);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    optimizeSahTreelets(
+        _nodes, _bvs, _flags, face_number, kSahFaceDcd);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
     return 0;  //time0 + time1 + time2;
 }
@@ -627,6 +1069,12 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         // no malloc/free -> concurrent per-env swept builds+queries actually overlap.
         calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _faces,
                                      _active_idx, _bvs, N, 0, stream, alpha_dev);
+        if(build_sah_oracle(*this, N, _active_idx, stream, nullptr,
+                            "face-ccd-active"))
+        {
+            computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            return 0;
+        }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
@@ -635,11 +1083,19 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         calcLeafNodes_indirect(_nodes, _indices, _active_idx, N, stream);
         calcInternalNodes(_nodes, _MChash, N, stream);
         calcInternalAABB(_nodes, _bvs, _flags, N, stream);
+        optimizeSahTreelets(
+            _nodes, _bvs, _flags, N, kSahFaceCcd, stream);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _faces, _bvs, face_number, 0,
                         _bodyId, _collision_skip_matrix, _collision_body_count,
                         alpha_dev);
+    if(build_sah_oracle(*this, face_number, nullptr, stream, nullptr,
+                        "face-ccd"))
+    {
+        computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number, stream);
+        return 0;
+    }
     calcMaxBV_async(_bvs, _tempLeafBox, face_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, face_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     // [C-1 capture-safe sort] cub stable radix on pre-allocated instance
@@ -653,6 +1109,8 @@ double lbvh_f::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
 
     calcInternalNodes(_nodes, _MChash, face_number);
     calcInternalAABB(_nodes, _bvs, _flags, face_number);
+    optimizeSahTreelets(
+        _nodes, _bvs, _flags, face_number, kSahFaceCcd);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
 
     return 0;
@@ -680,13 +1138,19 @@ double lbvh_e::Construct(cudaStream_t stream)
         const int N = face_number_active;
         // [perenv-parallel #1] fully async on `stream` (no host sync) so per-env builds overlap.
         calcLeafBvs_indirect(_vertexes, _edges, _active_idx, _bvs, N, 1, stream);
+        const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
+        uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
+        if(build_sah_oracle(*this, N, _active_idx, stream, node_max,
+                            "edge-dcd-active"))
+        {
+            computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            return 0;
+        }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
-        const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
-        uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
         calcLeafNodes_indirect(
             _nodes,
             _indices,
@@ -697,6 +1161,8 @@ double lbvh_e::Construct(cudaStream_t stream)
             range_mode == 2);
         calcInternalNodes(_nodes, _MChash, N, stream);
         calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
+        optimizeSahTreelets(
+            _nodes, _bvs, _flags, N, kSahEdgeDcd, stream, node_max);
         return 0;
     }
 
@@ -709,6 +1175,14 @@ double lbvh_e::Construct(cudaStream_t stream)
     cudaEventRecord(start);*/
     calcLeafBvs(_vertexes, _edges, _bvs, edge_number, 1,
                 _bodyId, _collision_skip_matrix, _collision_body_count);
+    const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
+    uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
+    if(build_sah_oracle(*this, edge_number, nullptr, stream, node_max,
+                        "edge-dcd"))
+    {
+        computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number, stream);
+        return 0;
+    }
     calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     // [C-1 capture-safe sort] see face variant.
@@ -718,14 +1192,14 @@ double lbvh_e::Construct(cudaStream_t stream)
 
     //cudaEventRecord(end1);
 
-    const int range_mode = m_node_max_element ? ee_range_prune_mode() : 0;
-    uint32_t* node_max = range_mode ? m_node_max_element : nullptr;
     calcLeafNodes(
         _nodes, _indices, edge_number, node_max, range_mode == 2);
 
     calcInternalNodes(_nodes, _MChash, edge_number);
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
     calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
+    optimizeSahTreelets(
+        _nodes, _bvs, _flags, edge_number, kSahEdgeDcd, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
     //selfQuery(_vertexes, _edges, _bvs, _nodes, _collisionPair, _cpNum, edge_number);
     //cudaEventRecord(end2);
@@ -753,23 +1227,40 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
         // [perenv-parallel #2] fully async on `stream` (mirrors the DCD active path).
         calcLeafBvs_fullCCD_indirect(_vertexes, moveDir, alpha, _edges,
                                      _active_idx, _bvs, N, 1, stream, alpha_dev);
+        const bool range_prune = m_node_max_element
+                                 && ee_range_prune_mode() == 1;
+        uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
+        if(build_sah_oracle(*this, N, _active_idx, stream, node_max,
+                            "edge-ccd-active"))
+        {
+            computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
+            return 0;
+        }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
         calcMChash(_MChash, _bvs, N, nullptr, nullptr, nullptr, nullptr, stream);
         _iota_u32<<<(N + 255) / 256, 256, 0, stream>>>(_indices, N);
         _mc_sort_active(*this, _MChash, _indices, N, stream);
         sortBvs(_indices, _bvs, _tempLeafBox, N, stream);
-        const bool range_prune = m_node_max_element
-                                 && ee_range_prune_mode() == 1;
-        uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
         calcLeafNodes_indirect(
             _nodes, _indices, _active_idx, N, stream, node_max, false);
         calcInternalNodes(_nodes, _MChash, N, stream);
         calcInternalAABB(_nodes, _bvs, _flags, N, stream, node_max);
+        optimizeSahTreelets(
+            _nodes, _bvs, _flags, N, kSahEdgeCcd, stream, node_max);
         return 0;
     }
     calcLeafBvs_fullCCD(_vertexes, moveDir, alpha, _edges, _bvs, edge_number, 1,
                         _bodyId, _collision_skip_matrix, _collision_body_count,
                         alpha_dev);
+    const bool range_prune = m_node_max_element
+                             && ee_range_prune_mode() == 1;
+    uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
+    if(build_sah_oracle(*this, edge_number, nullptr, stream, node_max,
+                        "edge-ccd"))
+    {
+        computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number, stream);
+        return 0;
+    }
     calcMaxBV_async(_bvs, _tempLeafBox, edge_number, 0);  // [B3 bbox-async] root AABB stays device-resident
     calcMChash(_MChash, _bvs, edge_number, m_prim_env, m_prim_localid, m_env_offset, m_prim_v0);
     // [C-1 capture-safe sort] see face variant.
@@ -777,14 +1268,13 @@ double lbvh_e::ConstructFullCCD(const double3* moveDir, const double& alpha, cud
     _mc_sort_active(*this, _MChash, _indices, edge_number, 0);
     sortBvs(_indices, _bvs, _tempLeafBox, edge_number);
 
-    const bool range_prune = m_node_max_element
-                             && ee_range_prune_mode() == 1;
-    uint32_t* node_max = range_prune ? m_node_max_element : nullptr;
     calcLeafNodes(_nodes, _indices, edge_number, node_max, false);
 
     calcInternalNodes(_nodes, _MChash, edge_number);
 
     calcInternalAABB(_nodes, _bvs, _flags, edge_number, 0, node_max);
+    optimizeSahTreelets(
+        _nodes, _bvs, _flags, edge_number, kSahEdgeCcd, 0, node_max);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, edge_number);  // [env-part B]
 
     return 0;
