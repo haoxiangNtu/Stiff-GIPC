@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -30,6 +31,12 @@ FRAMES = int(os.environ.get("BVH_FOLD_LONG_FRAMES", "1550"))
 ENVS = int(os.environ.get("BVH_FOLD_LONG_ENVS", "1"))
 TIMEOUT = int(os.environ.get("BVH_FOLD_LONG_TIMEOUT", "10800"))
 GRAPH = bool(int(os.environ.get("BVH_FOLD_LONG_GRAPH", "0")))
+REQUIRE_IDLE = bool(int(os.environ.get("BVH_FOLD_LONG_REQUIRE_IDLE", "0")))
+IDLE_ALLOWLIST = tuple(
+    item.strip()
+    for item in os.environ.get("BVH_FOLD_LONG_IDLE_ALLOWLIST", "").split(",")
+    if item.strip()
+)
 MAX_GRAPH_FALLBACK = int(
     os.environ.get(
         "BVH_FOLD_LONG_MAX_GRAPH_FALLBACK",
@@ -62,6 +69,40 @@ GRAPH_DETAIL = re.compile(
     r"\[fs-graph-detail\] fallback_frames=(\[[^\n]*\]) "
     r"capacity_frames=(\[[^\n]*\])"
 )
+
+
+def compute_apps() -> list[str]:
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"GPU idle audit failed: {error}") from error
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def external_apps(records: list[str], own_pid: int | None) -> list[str]:
+    external: list[str] = []
+    for record in records:
+        try:
+            pid = int(record.split(",", 1)[0])
+        except (ValueError, IndexError):
+            external.append(record)
+            continue
+        if own_pid is not None and pid == own_pid:
+            continue
+        if any(token in record for token in IDLE_ALLOWLIST):
+            continue
+        external.append(record)
+    return external
 
 
 def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
@@ -109,8 +150,15 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         env.pop("CASE39_GRAPH_STATS", None)
 
     command = [sys.executable, str(ROOT / "examples/replay_foldshirt_multienv.py")]
+    if REQUIRE_IDLE:
+        preflight = external_apps(compute_apps(), None)
+        if preflight:
+            raise RuntimeError(
+                f"{mode}: GPU is not idle before launch: {preflight}"
+            )
     started = time.monotonic()
     output_lines: list[str] = []
+    external_seen: list[str] = []
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -121,6 +169,28 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
             text=True,
             bufsize=1,
         )
+        stop_monitor = threading.Event()
+
+        def monitor_gpu() -> None:
+            while not stop_monitor.wait(5.0):
+                try:
+                    current = external_apps(compute_apps(), process.pid)
+                except RuntimeError as error:
+                    current = [str(error)]
+                for record in current:
+                    if record not in external_seen:
+                        external_seen.append(record)
+                if current and process.poll() is None:
+                    process.terminate()
+                    return
+
+        monitor = (
+            threading.Thread(target=monitor_gpu, daemon=True)
+            if REQUIRE_IDLE
+            else None
+        )
+        if monitor:
+            monitor.start()
         assert process.stdout is not None
         try:
             for line in process.stdout:
@@ -139,11 +209,19 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
                     )
             return_code = process.wait()
         finally:
+            stop_monitor.set()
+            if monitor:
+                monitor.join(timeout=10)
             if process.poll() is None:
                 process.terminate()
 
     elapsed = time.monotonic() - started
     output = "".join(output_lines)
+    if external_seen:
+        raise RuntimeError(
+            f"{mode}: performance sample contaminated by external CUDA "
+            f"processes: {external_seen}; see {log_path}"
+        )
     if return_code or BAD_OUTPUT.search(output):
         raise RuntimeError(
             f"{mode}: replay failed rc={return_code}; see {log_path}"

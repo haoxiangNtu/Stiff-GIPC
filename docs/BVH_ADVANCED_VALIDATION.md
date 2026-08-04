@@ -649,10 +649,37 @@ were no late-episode overflows, exhausted retries, NaNs, or CUDA errors.
 
 The long run crosses repeated 128-construction rebuild/refit generations and
 therefore closes the obvious lifetime-risk gap for PLOC topology state.  A
-four-env graph-off long run and its repeat are still needed to form the
-trajectory noise envelope and a clean graph-on/off performance comparison.
-The A800 repeat also remains a release blocker, so all candidate knobs remain
-opt-in.
+same-binary, graph-off merged matrix then ran every variant twice on the whole
+1550-frame episode:
+
+| merged 1-env variant | two runs (ms/frame) | mean | versus baseline |
+|---|---:|---:|---:|
+| all candidates off | 98.5 / 93.6 | 96.05 | baseline |
+| PLOC++ / refit-128 | 88.2 / 87.3 | **87.75** | **-8.64%** |
+| VF-DCD query order | 91.1 / 89.6 | **90.35** | **-5.93%** |
+| PLOC/refit + query order | 89.1 / 89.6 | 89.35 | -6.98% |
+
+Both individual candidates are therefore real merged-trajectory wins: their
+slowest repeat is faster than the fastest baseline.  They do not stack
+additively.  The combined bundle is about 1.8% slower than PLOC/refit alone,
+because both target overlapping VF traversal work and the changed publication
+order also changes the chaotic Newton path.  PLOC/refit alone is the merged
+winner; query order remains a useful independent opt-in, not part of the
+default merged bundle.
+
+Terminal positions support rather than weaken that interpretation.  The two
+baseline runs differ by 0.4442 maximum absolute position and 0.1100 RMS over
+the complete chaotic trajectory.  Every candidate terminal state is closer
+to at least one baseline than the baselines are to each other (maximum
+0.0652--0.3751), while the frozen-frame gates still prove exact DCD/CCD
+physical and encoded candidate multisets.
+
+The four-env isolated graph-off baseline has also completed twice (326.5 and
+318.4 ms/batch).  First candidate samples put PLOC/refit at 326.5,
+query-order+subset at 319.7, and the combined bundle at 315.7 ms/batch.  Those
+signals are at or below the baseline's 2.5% run spread, so candidate repeats
+are required before an isolated performance claim.  The A800 repeat also
+remains a release blocker, so all candidate knobs remain opt-in.
 
 ## Current conclusions
 
