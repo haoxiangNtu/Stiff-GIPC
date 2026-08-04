@@ -134,6 +134,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_SKIP_GRND, "solver") \
     X(STIFF_SKIP_ZERO_DEPOSIT, "perf") \
     X(STIFF_ALPHA_TYPE_SPLIT, "perf") \
+    X(STIFF_CONVERT_HOST_BOUND, "perf") \
     X(STIFF_ALPHA_STATS, "diag") \
     X(STIFF_AUTO_PREPARE_AT, "diag") \
     X(STIFF_MS_DUMP, "diag") \

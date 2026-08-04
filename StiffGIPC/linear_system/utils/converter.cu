@@ -16,6 +16,20 @@
 namespace gipc
 {
 
+// [P2-1 host-bound] opt-in: class converts may reuse a trained tier as the
+// launch bound outside an episode transaction, killing the per-convert
+// exact-count D2H. Requires device_count_mode() (masked consumers).
+static bool host_bound_convert_enabled()
+{
+    static int v = -1;
+    if(v < 0)
+    {
+        const char* e = getenv("STIFF_CONVERT_HOST_BOUND");
+        v             = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
+    }
+    return v != 0;
+}
+
 template <typename T>
 __global__ inline void moveMemory_2(T* data,
                                     int output_start,
@@ -311,7 +325,14 @@ void Converter::_make_unique_block_warp_reduction(
         global_triplets.h_unique_key_number = length;
     }
     else if(GIPCTripletMatrix::device_count_mode()
-            && global_triplets.m_abd_tier_txn_ok
+            && (global_triplets.m_abd_tier_txn_ok
+                // [P2-1 host-bound] outside an episode transaction the armed
+                // tier is still a legal bound once trained (first exact
+                // convert of the run trains it): the clamp below tightens it
+                // to this convert's input length, downstream consumers are
+                // already masked under device_count_mode, and the exact-count
+                // D2H (the census's top per-iteration sync) disappears.
+                || host_bound_convert_enabled())
             && global_triplets.m_abd_unique_tier[tier_index] > 0)
     {
         // A tier trained on an earlier frame may exceed this frame's raw
@@ -404,8 +425,16 @@ void Converter::_make_unique_block_warp_reduction(
         cudaStreamPerThread));
 
     // Deterministic, order-independent duplicate-block merge.
+    // [P2-1 host-bound] a captured graph must span the full capacity (counts
+    // vary across replays), but a host-mode bound convert knows its clamped
+    // bound per call — merging at capacity width was pure pad tax there.
     const int merge_capacity =
-        bound_layout ? capacity : host_merge_count;
+        bound_layout
+            ? (host_bound_convert_enabled() && !global_triplets.m_abd_tier_txn_ok
+                       && armed_abd_tier > 0
+                   ? armed_abd_tier
+                   : capacity)
+            : host_merge_count;
     ensure_capacity(merge_capacity);
     {
         const long long bin_doubles =
