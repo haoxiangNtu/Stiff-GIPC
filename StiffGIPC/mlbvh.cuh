@@ -243,6 +243,7 @@ class lbvh
         int        number          = 0;
         int        since_rebuild   = 0;
         bool       topology_ready  = false;
+        bool       pair_front_ready = false;
         unsigned long long capture_id = 0;
         unsigned long long reuses      = 0;
         unsigned long long rebuilds    = 0;

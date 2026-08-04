@@ -650,6 +650,7 @@ static bool shouldRefitTopology(lbvh&      tree,
             if(state.nodes_identity == tree._nodes)
             {
                 state.topology_ready = false;
+                state.pair_front_ready = false;
                 break;
             }
         return false;
@@ -681,6 +682,7 @@ static bool shouldRefitTopology(lbvh&      tree,
         {
             state.capture_id = capture_id;
             state.topology_ready = false;
+            state.pair_front_ready = false;
             state.since_rebuild = 0;
         }
     }
@@ -689,6 +691,7 @@ static bool shouldRefitTopology(lbvh&      tree,
     if(!same_generation)
     {
         state.topology_ready = false;
+        state.pair_front_ready = false;
         state.since_rebuild = 0;
         state.active_identity = active_identity;
         state.number = number;
@@ -700,9 +703,32 @@ static bool shouldRefitTopology(lbvh&      tree,
         return true;
     }
     state.topology_ready = true;
+    state.pair_front_ready = false;
     state.since_rebuild = 0;
     ++state.rebuilds;
     return false;
+}
+
+// DCD and swept-CCD refits share the exact same binary topology inside one
+// face or edge BVH.  Uniform-body subtree roots therefore remain valid until
+// the next true topology rebuild.  This opt-in claim is host-side metadata
+// only; the front arrays themselves remain family-private device storage.
+static bool shouldRebuildPairFront(lbvh& tree)
+{
+    if(!getenv("STIFF_BVH_FRONT_REUSE"))
+        return true;
+    auto state_it = std::find_if(
+        tree.m_refit_states.begin(),
+        tree.m_refit_states.end(),
+        [&](const lbvh::RefitTopologyState& state)
+        { return state.nodes_identity == tree._nodes; });
+    if(state_it == tree.m_refit_states.end()
+       || !state_it->topology_ready)
+        return true;
+    if(state_it->pair_front_ready)
+        return false;
+    state_it->pair_front_ready = true;
+    return true;
 }
 
 template <class element_type, bool Swept>
@@ -1381,6 +1407,7 @@ void lbvh::invalidateRefitTopology()
     for(RefitTopologyState& state : m_refit_states)
     {
         state.topology_ready = false;
+        state.pair_front_ready = false;
         state.since_rebuild = 0;
         state.capture_id = 0;
     }
@@ -1504,7 +1531,7 @@ double lbvh_f::Construct(cudaStream_t stream)
                             "face-dcd-active"))
         {
             computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, N, stream);
-            computeNodeBodyLabels(*this, N, stream, true);
+            computeNodeBodyLabels(*this, N, stream);
             return 0;
         }
         calcMaxBV_async(_bvs, _tempLeafBox, N, stream);
@@ -1521,7 +1548,7 @@ double lbvh_f::Construct(cudaStream_t stream)
         }
         optimizeSahTreelets(
             _nodes, _bvs, _flags, N, kSahFaceDcd, stream);
-        computeNodeBodyLabels(*this, N, stream, true);
+        computeNodeBodyLabels(*this, N, stream);
         return 0;
     }
     if(shouldRefitTopology(*this, face_number, kSahFaceDcd, nullptr, stream))
@@ -1542,7 +1569,7 @@ double lbvh_f::Construct(cudaStream_t stream)
                         "face-dcd"))
     {
         computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number, stream);
-        computeNodeBodyLabels(*this, face_number, stream, true);
+        computeNodeBodyLabels(*this, face_number, stream);
         return 0;
     }
     //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -1565,7 +1592,7 @@ double lbvh_f::Construct(cudaStream_t stream)
     optimizeSahTreelets(
         _nodes, _bvs, _flags, face_number, kSahFaceDcd);
     computeNodeEnv(m_node_env, _nodes, m_prim_env, _flags, face_number);  // [env-part B]
-    computeNodeBodyLabels(*this, face_number, 0, true);
+    computeNodeBodyLabels(*this, face_number, 0);
     return 0;  //time0 + time1 + time2;
 }
 
@@ -1899,6 +1926,10 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
     const uint32_t* wide_children =
         buildBvh8Children(
             _nodes, _bvs, _tempLeafBox, tree_number, kSahFaceDcd, stream);
+    if((bvh_pair_cache_mask() & 0x1)
+       && shouldRebuildPairFront(*this))
+        rebuild_bvh_vf_pair_front(
+            _nodes, m_node_body, tree_number, stream);
     reset_bvh_vf_pair_cache_counts(stream);
     selfQuery_vf(_bodyId,
                  _btype,
@@ -1941,7 +1972,8 @@ void lbvh_e::SelfCollitionDetect(double dHat, cudaStream_t stream)
     const uint32_t* wide_children =
         buildBvh8Children(
             _nodes, _bvs, _tempLeafBox, N, kSahEdgeDcd, stream);
-    if(bvh_pair_cache_mask() & 0x2)
+    if((bvh_pair_cache_mask() & 0x2)
+       && shouldRebuildPairFront(*this))
         rebuild_bvh_ee_pair_front(_nodes, m_node_body, N, stream);
     selfQuery_ee(_bodyId,
                  _btype,
@@ -1995,8 +2027,9 @@ void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
     if(pair_cache)
     {
         reset_bvh_vf_ccd_pair_cache_counts(stream);
-        rebuild_bvh_vf_pair_front(
-            _nodes, m_node_body, tree_number, stream);
+        if(shouldRebuildPairFront(*this))
+            rebuild_bvh_vf_pair_front(
+                _nodes, m_node_body, tree_number, stream);
     }
     fullCCDselfQuery_vf(
         _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
@@ -2034,7 +2067,8 @@ void lbvh_e::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
     if(pair_cache)
     {
         reset_bvh_ee_ccd_pair_cache_counts(stream);
-        rebuild_bvh_ee_pair_front(_nodes, m_node_body, N, stream);
+        if(shouldRebuildPairFront(*this))
+            rebuild_bvh_ee_pair_front(_nodes, m_node_body, N, stream);
     }
     fullCCDselfQuery_ee(
         _bodyId, _btype, _vertexes, moveDir, alpha, _edges, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, N,

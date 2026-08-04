@@ -142,6 +142,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_BVH_MARGIN_SCALE, "diag") \
     X(STIFF_BVH_COHERENCE_AUDIT, "diag") \
     X(STIFF_BVH_CCD_COHERENCE_AUDIT, "diag") \
+    X(STIFF_BVH_FRONT_REUSE, "perf") \
     X(STIFF_BVH_BODY_MAJOR, "perf") \
     X(STIFF_BVH_BODY_MAJOR_MASK, "perf") \
     X(STIFF_BVH_PAIR_CACHE, "perf") \
