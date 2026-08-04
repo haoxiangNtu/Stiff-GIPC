@@ -49,6 +49,7 @@ QUERY_PREFIXES = {
 
 TRAVERSAL_SUPPORT_PREFIXES = {
     "bvh8_front": ("_buildBvh8Children(",),
+    "vf_query_order_keys": ("void _calcVfQueryKeys<",),
 }
 
 CACHE_PREFIXES = {

@@ -2,11 +2,11 @@
 
 Date: 2026-08-04
 
-Branch: `codex/bvh-advanced-validation`
+Branch: `codex/bvh-full-campaign`
 
-Base: `96b52fb` (`codex/bvh-accel-validation`)
+Campaign base: `7e0bdab` (`codex/bvh-advanced-validation`)
 
-Worktree: `/home/ps/Downloads/Stiff-GIPC-bvh-advanced-validation`
+Worktree: `/home/ps/Downloads/Stiff-GIPC-bvh-full-campaign`
 
 This worktree is isolated from
 `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph`.  The Claude worktree is not
@@ -526,6 +526,100 @@ and fronts per environment.  It will be implemented only if the combined
 family ROI survives the remaining tests.  No 1550-frame or A800 claim is made
 yet.
 
+### Swept replay result
+
+The endpoint audit was followed by a real device-resident VF/EE swept-cache
+replay.  Each body-pair segment stores only expanded raw candidates, validates
+both sweep endpoints on device, and invokes the unchanged exact CCD filter on
+every reuse.  Frozen frame-30 DCD/CCD physical and original-encoding multisets
+were exact in merged and isolated modes at frames 1, 10, and 30.  The isolated
+path deliberately remains cache-disabled because it has no per-slot cache
+generation yet.
+
+On the fixed short CCD profile, including device validity, reset, front build,
+fresh traversal, and exact replay, the selected CCD-family path changed as
+follows:
+
+| cache mask | baseline path | candidate path | delta | decision |
+|---|---:|---:|---:|---|
+| VF-CCD | 47.069 ms | 40.136 ms | -14.73% | structural only |
+| EE-CCD | 47.069 ms | 44.692 ms | -5.05% | reject alone |
+| VF+EE-CCD | 47.069 ms | 38.816 ms | -17.53% | opt-in only |
+
+The combined whole-profile kernel sum changed only 176.824 to 175.901 ms
+(-0.52%).  Freely evolved contact publication order is still not canonical,
+and no end-to-end solver gain was established.  Therefore no swept cache is
+part of the winner bundle.
+
+### Reusing traversal fronts across exact refits
+
+`STIFF_BVH_FRONT_REUSE=1` preserves the already-built uniform-body subtree
+roots while PLOC topology is only refitted.  DCD and swept boxes change, but
+the binary topology and every subtree's body membership do not, so the front
+is still exact.  VF front builds fell from 83 to 3 and EE builds from 82 to 2
+in the frozen probe.  This saved only about 0.375 ms out of roughly 149 ms
+(about 0.25%).  It is a correct shared-runtime primitive, but too small to
+include in the performance bundle.
+
+## RBS-style VF query ordering and isolated query domains
+
+The RBS audit's transferable Morton idea is now implemented behind
+`STIFF_BVH_QUERY_ORDER`.  Bit 0 sorts VF-DCD query vertices; bit 2 sorts
+VF-CCD queries.  Keys are `(30-bit Morton, global vertex id)`, so ties have a
+unique deterministic order.  The implementation uses preallocated CUB key,
+value, and temporary buffers on the caller's stream: no hot allocation,
+readback, or synchronization is introduced, and stream capture remains valid.
+EE is unchanged because it already assigns lanes in Morton-sorted leaf order.
+
+For merged one-environment FOLD frame 30 with PLOC++/refit-128, 500 DCD and
+500 swept rebuilds gave:
+
+| metric | two-baseline mean | VF-DCD ordered | delta |
+|---|---:|---:|---:|
+| all CUDA kernels | 3,849.372 ms | 3,290.131 ms | **-14.53%** |
+| four query families | 3,711.971 ms | 3,044.489 ms | **-17.98%** |
+| VF-DCD | 1,704.666 ms | 1,035.710 ms | **-39.24%** |
+| query-key kernels | 0 | 3.935 ms | +3.935 ms |
+
+Sorting VF-CCD alone reduced that kernel by about 14.4%, but radix cost made
+the complete fixed workload 0.5--1.0% slower.  Enabling both DCD and CCD was
+also worse than DCD alone (3,332.117 versus 3,290.131 ms).  The accepted slice
+is therefore mask 1 only; mask 4 and mask 5 are rejected.
+
+The isolated implementation exposed a separate inefficiency: each per-env
+face tree queried every scene surface vertex and rejected foreign environments
+only at the leaves.  `STIFF_BVH_PERENV_QUERY_SUBSET=1` builds topology-static
+lists of global surface-vertex ids for each environment and launches only that
+exact subset.  This does not replace any geometric or IPC filter.  A four-env
+frame-30 traversal audit changed VF query launches from 220,000 to 55,000
+(-75%) while retaining exactly the same overlap counts, primitive tests, DCD
+rows, and swept rows.  Node pops fell only 4.74% for DCD and 4.27% for CCD,
+showing that the removed foreign queries were cheap.
+
+That distinction matters for performance.  The subset alone was equal to its
+adjacent baseline (11.148 versus 11.145 seconds for 500 DCD + 500 CCD
+rebuilds).  Sorting the full global list alone was only about 1--2% faster in
+clean interleaved runs.  The combination sorts each smaller per-env list and
+was repeatably useful: three clean samples were 10.389, 10.451, and 10.403
+seconds, against a 11.162-second adjacent-baseline median, or **-6.80%**.
+Samples overlapped by an unrelated container CUDA diagnostic were discarded,
+not averaged into this result.
+
+Correctness coverage for the combined PLOC/refit/query-order/subset bundle now
+includes:
+
+- four-env frozen FOLD frames 1, 10, and 30 in merged and isolated modes, with
+  exact geometry and exact DCD/CCD physical and original-encoding multisets;
+- the 50-frame merged/isolated/strict candidate gate; strict retained gold
+  `0544461bd82123ae` bitwise;
+- merged frame-graph normal, rollback, unique retry, retry exhaustion, and
+  full-digest gates, plus all three collision-graph scenarios;
+- the isolated whole-frame graph gate (19 graph frames after one capture
+  fallback), numerical parity, and perturbation isolation.
+
+The full 1550-frame replay and A800 repeat are still release blockers, so both
+knobs remain opt-in.
+
 ## Current conclusions
 
 - Better topology is real: 13.4--18.0% fewer node pops is available without
@@ -552,4 +646,13 @@ yet.
   EE-DCD is implemented and rejected alone (+60% family-path cost); corrected
   VF+EE is a frozen -11.9% DCD-path experiment but has no credited free-run
   win.  Swept endpoint coherence is now measured and warrants a filtered CCD
-  replay prototype.  Isolated per-env cache generations remain pending.
+  replay prototype.  That replay is now implemented but saves only 0.52% of
+  the short whole profile, so it remains outside the bundle.  Isolated
+  per-env cache generations remain pending.
+- The RBS-style query-order idea is useful specifically for VF-DCD: about
+  39.2% off that merged kernel and 14.5% off the fixed merged workload.
+  VF-CCD sorting loses after radix overhead.  In isolated mode, an exact
+  per-env query subset has no standalone wall benefit, but makes query sorting
+  cheap enough that the combination measured about 6.8% end-to-end on the
+  fixed four-env workload.  This is the second winner candidate after
+  PLOC++/refit-128, pending 1550-frame and A800 proof.

@@ -287,6 +287,7 @@ void GIPC::FREE_DEVICE_MEM()
     release(g_grad_binned);
     release(d_perenv_face_idx);
     release(d_perenv_edge_idx);
+    release(d_perenv_surf_idx);
     release(d_xenv_lid);
     release(d_xenv_buf);
     release(d_face_env);

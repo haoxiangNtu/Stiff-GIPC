@@ -1057,6 +1057,59 @@ void sortBvs(const uint32_t* _indices, AABB* _bvs, AABB* _temp_bvs, int number, 
 
 static int ee_range_prune_mode();
 
+static int bvh_query_order_mask()
+{
+    static const int mask = []
+    {
+        const char* value = getenv("STIFF_BVH_QUERY_ORDER");
+        return value ? (static_cast<int>(strtol(value, nullptr, 0)) & 0x5)
+                     : 0;
+    }();
+    return mask;
+}
+
+template <bool Swept>
+static const uint32_t* makeVfQueryOrder(lbvh_f&          tree,
+                                        const uint32_t*  query_vertices,
+                                        int              number,
+                                        const double3*   move_dir,
+                                        double           alpha,
+                                        const double*    alpha_dev,
+                                        int              family_bit,
+                                        cudaStream_t     stream)
+{
+    if(!(bvh_query_order_mask() & family_bit) || number < 1)
+        return nullptr;
+    if(!tree._sort_tmp || !tree._mch_alt || !tree._idx_alt
+       || tree._sort_cap < number)
+        return nullptr;
+    constexpr int threads = 256;
+    _calcVfQueryKeys<Swept><<<(number + threads - 1) / threads,
+                              threads,
+                              0,
+                              stream>>>(tree._MChash,
+                                        tree._indices,
+                                        tree._vertexes,
+                                        move_dir,
+                                        alpha,
+                                        alpha_dev,
+                                        query_vertices,
+                                        tree._bvs,
+                                        number);
+    size_t bytes = tree._sort_tmp_bytes;
+    cub::DeviceRadixSort::SortPairs(tree._sort_tmp,
+                                    bytes,
+                                    tree._MChash,
+                                    tree._mch_alt,
+                                    tree._indices,
+                                    tree._idx_alt,
+                                    number,
+                                    0,
+                                    64,
+                                    stream);
+    return tree._idx_alt;
+}
+
 void selfQuery_ee(const int*     _bodyID,
                   const int*     _btype,
                   const double3* _vertexes,
@@ -1266,6 +1319,7 @@ void selfQuery_vf(const int*      _bodyID,
                   const int*      _body_id_to_is_fem,
                   const int*      node_body,
                   const uint32_t* wide_children,
+                  const uint32_t* query_order,
                   cudaStream_t    stream = 0)
 {
     int numbers = number;
@@ -1292,7 +1346,8 @@ void selfQuery_vf(const int*      _bodyID,
                                            _collision_body_count,
                                            _body_id_to_is_fem,
                                            wide_children,
-                                           node_body);
+                                           node_body,
+                                           query_order);
     else
         _selfQuery_vf<<<blockNum, threadNum, 0, stream>>>(_bodyID,
                                            _btype,
@@ -1310,7 +1365,8 @@ void selfQuery_vf(const int*      _bodyID,
                                            _collision_skip_matrix,
                                            _collision_body_count,
                                            _body_id_to_is_fem,
-                                           node_body);
+                                           node_body,
+                                           query_order);
 }
 
 void fullCCDselfQuery_vf(const int*      _bodyID,
@@ -1330,6 +1386,7 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
                          int             _collision_body_count,
                          const int*      _body_id_to_is_fem,
                          const uint32_t* wide_children,
+                         const uint32_t* query_order,
                          cudaStream_t    stream = 0,
                          const double*   alpha_dev = nullptr)
 {
@@ -1344,13 +1401,13 @@ void fullCCDselfQuery_vf(const int*      _bodyID,
             _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts,
             _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
             _collision_skip_matrix, _collision_body_count,
-            _body_id_to_is_fem, alpha_dev, wide_children);
+            _body_id_to_is_fem, alpha_dev, wide_children, query_order);
     else
         _selfQuery_vf_ccd<<<blockNum, threadNum, 0, stream>>>(
             _bodyID, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts,
             _bvs, _nodes, _ccd_collisonPairs, _cpNum, dHat, numbers,
             _collision_skip_matrix, _collision_body_count,
-            _body_id_to_is_fem, alpha_dev);
+            _body_id_to_is_fem, alpha_dev, query_order);
 }
 
 void lbvh::FREE_DEVICE_MEM()
@@ -1413,10 +1470,15 @@ void lbvh::invalidateRefitTopology()
     }
 }
 
-void lbvh::MALLOC_DEVICE_MEM(const int& number, bool allocate_node_max)
+void lbvh::MALLOC_DEVICE_MEM(const int& number,
+                             bool       allocate_node_max,
+                             int        key_capacity)
 {
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_indices, (number) * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&_MChash, (number) * sizeof(uint64_t)));
+    key_capacity = std::max(number, key_capacity);
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_indices,
+                              (size_t)key_capacity * sizeof(uint32_t)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&_MChash,
+                              (size_t)key_capacity * sizeof(uint64_t)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_nodes, (2 * number - 1) * sizeof(Node)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_node_env, (2 * number - 1) * sizeof(int)));  // [env-part B]
     if(getenv("STIFF_BVH_PAIR_CACHE"))
@@ -1465,7 +1527,10 @@ void lbvh_f::init(int*       _mbodyID,
     _btype             = _mbtype;
     _collision_skip_matrix = collision_skip_matrix;
     _collision_body_count  = collision_body_count;
-    MALLOC_DEVICE_MEM(face_number, false);
+    const int query_capacity = bvh_query_order_mask() ? vert_number : 0;
+    MALLOC_DEVICE_MEM(face_number, false, query_capacity);
+    if(query_capacity > 0)
+        ensure_sort_scratch(query_capacity);
 }
 
 void lbvh_e::init(int*       _mbodyID,
@@ -1931,11 +1996,22 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
         rebuild_bvh_vf_pair_front(
             _nodes, m_node_body, tree_number, stream);
     reset_bvh_vf_pair_cache_counts(stream);
+    const bool has_query_subset = _active_query_idx
+                                  && query_number_active > 0
+                                  && query_number_active <= (int)vert_number;
+    const uint32_t* query_vertices = has_query_subset
+                                         ? _active_query_idx
+                                         : _surfVerts;
+    const int query_number = has_query_subset
+                                 ? query_number_active
+                                 : (int)vert_number;
+    const uint32_t* query_order = makeVfQueryOrder<false>(
+        *this, query_vertices, query_number, nullptr, 0.0, nullptr, 0x1, stream);
     selfQuery_vf(_bodyId,
                  _btype,
                  _vertexes,
                  _faces,
-                 _surfVerts,
+                 query_vertices,
                  _bvs,
                  _nodes,
                  _collisionPair,
@@ -1943,12 +2019,13 @@ void lbvh_f::SelfCollitionDetect(double dHat, cudaStream_t stream)
                  _cpNum,
                  _MatIndex,
                  dHat,
-                 vert_number,
+                 query_number,
                  _collision_skip_matrix,
                  _collision_body_count,
                  _body_id_to_is_fem,
                  m_node_body,
                  wide_children,
+                 query_order,
                  stream);
     replay_bvh_vf_pair_cache(_vertexes,
                              _faces,
@@ -2031,10 +2108,21 @@ void lbvh_f::SelfCollitionFullDetect(double dHat, const double3* moveDir, const 
             rebuild_bvh_vf_pair_front(
                 _nodes, m_node_body, tree_number, stream);
     }
+    const bool has_query_subset = _active_query_idx
+                                  && query_number_active > 0
+                                  && query_number_active <= (int)vert_number;
+    const uint32_t* query_vertices = has_query_subset
+                                         ? _active_query_idx
+                                         : _surfVerts;
+    const int query_number = has_query_subset
+                                 ? query_number_active
+                                 : (int)vert_number;
+    const uint32_t* query_order = makeVfQueryOrder<true>(
+        *this, query_vertices, query_number, moveDir, alpha, alpha_dev, 0x4, stream);
     fullCCDselfQuery_vf(
-        _bodyId, _btype, _vertexes, moveDir, alpha, _faces, _surfVerts, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, vert_number,
+        _bodyId, _btype, _vertexes, moveDir, alpha, _faces, query_vertices, _bvs, _nodes, _ccd_collisionPair, _cpNum, dHat, query_number,
         _collision_skip_matrix, _collision_body_count, _body_id_to_is_fem,
-        wide_children, stream, alpha_dev);
+        wide_children, query_order, stream, alpha_dev);
     if(pair_cache)
         replay_bvh_vf_ccd_pair_cache(_vertexes,
                                      moveDir,

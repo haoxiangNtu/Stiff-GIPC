@@ -254,7 +254,9 @@ class lbvh
   public:
     lbvh() {}
     ~lbvh();
-    void MALLOC_DEVICE_MEM(const int& number, bool allocate_node_max = false);
+    void MALLOC_DEVICE_MEM(const int& number,
+                           bool       allocate_node_max = false,
+                           int        key_capacity = 0);
     void FREE_DEVICE_MEM();
     //void Construct();
 };
@@ -266,6 +268,11 @@ class lbvh_f : public lbvh
     uint32_t  face_number = 0;
     uint3*    _faces = nullptr;
     uint32_t* _surfVerts = nullptr;
+    // Optional exact query subset. Per-env BVHs otherwise build a local face
+    // tree but redundantly launch every scene surface vertex against it;
+    // leaf-time _same_env filtering makes those extra queries physically inert.
+    const uint32_t* _active_query_idx = nullptr;
+    int             query_number_active = 0;
 
   public:
     void   init(int*       _bodyID,

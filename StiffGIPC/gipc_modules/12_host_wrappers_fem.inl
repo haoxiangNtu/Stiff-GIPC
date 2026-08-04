@@ -60,6 +60,14 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
             if(par) swapIn(bvh_f, m_pool_f[i % K]);
             bvh_f._active_idx        = d_perenv_face_idx + h_perenv_face_off[e];
             bvh_f.face_number_active = h_perenv_face_cnt[e];
+            bvh_f._active_query_idx = nullptr;
+            bvh_f.query_number_active = 0;
+            if(d_perenv_surf_idx && h_perenv_surf_cnt[e] > 0)
+            {
+                bvh_f._active_query_idx = d_perenv_surf_idx
+                                          + h_perenv_surf_off[e];
+                bvh_f.query_number_active = h_perenv_surf_cnt[e];
+            }
             bvh_f.Construct(st);
             bvh_f.SelfCollitionDetect(dHat, st);
         }
@@ -98,6 +106,7 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
         goto perenv_redo;
     }
     bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;
+    bvh_f._active_query_idx = nullptr; bvh_f.query_number_active = 0;
     bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
     bvh_f.m_node_body = saved_f_node_body;
     bvh_e.m_node_body = saved_e_node_body;

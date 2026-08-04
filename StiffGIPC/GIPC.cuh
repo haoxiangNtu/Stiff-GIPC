@@ -152,8 +152,10 @@ class GIPC
     // env candidates) — the root fix for cross-env divergence. Built once (topology static).
     int*              d_perenv_face_idx = nullptr;   // face indices, env-contiguous
     int*              d_perenv_edge_idx = nullptr;   // edge indices, env-contiguous
+    uint32_t*         d_perenv_surf_idx = nullptr;   // global vertex ids, env-contiguous
     std::vector<int>  h_perenv_face_off, h_perenv_face_cnt;  // per-env [off,cnt) into face_idx
     std::vector<int>  h_perenv_edge_off, h_perenv_edge_cnt;
+    std::vector<int>  h_perenv_surf_off, h_perenv_surf_cnt;
     std::vector<int>  h_perenv_active;               // env ids with ≥1 face or edge (skip empty NG slots)
     int               m_perenv_bvh_groups = 0;       // NG once built; 0 = not built
     bool              m_perenv_bvh = false;          // STIFF_PERENV_BVH gate

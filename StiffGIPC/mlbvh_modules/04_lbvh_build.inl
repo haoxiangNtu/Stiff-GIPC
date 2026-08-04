@@ -468,6 +468,52 @@ __global__ void _calcMChash14(uint64_t*       _MChash,
         _MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
 }
 
+// RBS/UIPC's stackless traversal sorts independent query AABBs by Morton code
+// before assigning them to lanes.  EE self-query already gets that property
+// for free here: it walks the Morton-sorted BVH leaves.  VF point queries do
+// not, because _surfVerts retains mesh order.  This validation kernel builds
+// a capture-safe VF query order into the BVH's pre-sized CUB buffers.  The low
+// 32 bits make every key unique, so CUB's stable/unstable tie policy cannot
+// alter the order across runs.
+template <bool Swept>
+__global__ void _calcVfQueryKeys(uint64_t*       keys,
+                                 uint32_t*       values,
+                                 const double3*  vertexes,
+                                 const double3*  move_dir,
+                                 double          alpha,
+                                 const double*   alpha_dev,
+                                 const uint32_t* query_vertices,
+                                 const AABB*     bvs,
+                                 int             number)
+{
+    const int slot = threadIdx.x + blockIdx.x * blockDim.x;
+    if(slot >= number)
+        return;
+    if constexpr(Swept)
+        if(alpha_dev)
+            alpha = *alpha_dev;
+
+    const uint32_t vertex = query_vertices[slot];
+    double3 center = vertexes[vertex];
+    if constexpr(Swept)
+    {
+        const double3 direction = move_dir[vertex];
+        center.x -= 0.5 * alpha * direction.x;
+        center.y -= 0.5 * alpha * direction.y;
+        center.z -= 0.5 * alpha * direction.z;
+    }
+    const AABB root = bvs[0];
+    const double sx = root.upper.x - root.lower.x;
+    const double sy = root.upper.y - root.lower.y;
+    const double sz = root.upper.z - root.lower.z;
+    const double nx = sx > 0.0 ? (center.x - root.lower.x) / sx : 0.5;
+    const double ny = sy > 0.0 ? (center.y - root.lower.y) / sy : 0.5;
+    const double nz = sz > 0.0 ? (center.z - root.lower.z) / sz : 0.5;
+    const uint64_t morton = morton_code(nx, ny, nz);
+    keys[slot] = (morton << 32) | static_cast<uint64_t>(vertex);
+    values[slot] = vertex;
+}
+
 // Validation candidate for segmented body-pair traversal.  Preserve the
 // already-computed 30-bit Morton code within each body, but move body id into
 // the high key bits so every body's primitives form a contiguous LBVH block.

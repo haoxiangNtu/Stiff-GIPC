@@ -14,7 +14,8 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
                               const int*      _collision_skip_matrix,
                               int             _collision_body_count,
                               const int*      _body_id_to_is_fem,
-                              const int*      node_body)
+                              const int*      node_body,
+                              const uint32_t* query_order)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -24,7 +25,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     uint32_t* stack_ptr = stack;
 
     AABB _bv;
-    idx       = _surfVerts[idx];
+    idx       = query_order ? query_order[idx] : _surfVerts[idx];
     const int query_body = _bodyID[idx];
     const bool cache_enabled = _bvhVfCacheEnabled();
 
@@ -178,7 +179,8 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
                                     int             _collision_body_count,
                                     const int*      _body_id_to_is_fem,
                                     const uint32_t* wide_children,
-                                    const int*      node_body)
+                                    const int*      node_body,
+                                    const uint32_t* query_order)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -186,7 +188,7 @@ __global__ void _selfQuery_vf_wide8(const int*      _bodyID,
 
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr = stack;
-    idx = _surfVerts[idx];
+    idx = query_order ? query_order[idx] : _surfVerts[idx];
     const int query_body = _bodyID[idx];
     const bool cache_enabled = _bvhVfCacheEnabled();
     if(_collision_skip_matrix && _collision_body_count > 0)
@@ -449,7 +451,8 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
                                   const int*      _collision_skip_matrix,
                                   int             _collision_body_count,
                                   const int*      _body_id_to_is_fem,
-                                  const double*   alpha_dev = nullptr)
+                                  const double*   alpha_dev,
+                                  const uint32_t* query_order)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -458,7 +461,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
 
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr = stack;
-    idx = _surfVerts[idx];
+    idx = query_order ? query_order[idx] : _surfVerts[idx];
     const int query_body = _bodyID[idx];
     const bool cache_enabled = _bvhVfCcdCacheEnabled();
 
@@ -602,7 +605,8 @@ __global__ void _selfQuery_vf_ccd_wide8(
     int             _collision_body_count,
     const int*      _body_id_to_is_fem,
     const double*   alpha_dev,
-    const uint32_t* wide_children)
+    const uint32_t* wide_children,
+    const uint32_t* query_order)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -613,7 +617,7 @@ __global__ void _selfQuery_vf_ccd_wide8(
     uint32_t  stack[STIFF_BVH_STACK_CAP];
     uint32_t* stack_ptr = stack;
     BVH_STACK_PUSH(0);
-    idx = _surfVerts[idx];
+    idx = query_order ? query_order[idx] : _surfVerts[idx];
     if(_collision_skip_matrix && _collision_body_count > 0)
     {
         const int body = _bodyID[idx];
