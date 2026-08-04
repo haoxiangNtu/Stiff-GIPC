@@ -1719,6 +1719,15 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             }
         }
         validateFinalCcdStateOrThrow(h_ccd_state, "device CCD chain");
+        // [P1 margin-table sizing] per-iteration max move-dir norm alongside
+        // the alpha stream: actual displacement <= alpha * maxspeed, which
+        // lower-bounds how many iterations a delta-inflated pair table lives.
+        if(std::getenv("STIFF_ALPHA_STATS"))
+            printf("[alpha-speed] fr=%d k=%d maxspeed=%.9e dhat_sqrt=%.9e\n",
+                   static_cast<int>(m_total_frames),
+                   k,
+                   h_ccd_state[3],
+                   std::sqrt(dHat));
         m_last_ccd_pair_count = static_cast<uint32_t>(std::max(0, ccd_cnt));
         if(m_last_ccd_pair_count > m_peak_ccd_pair_count)
             m_peak_ccd_pair_count = m_last_ccd_pair_count;
