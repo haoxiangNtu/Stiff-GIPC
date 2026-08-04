@@ -27,3 +27,6 @@ ploc3_refit128,deterministic_fold30,total_cuda_kernel_ms,18002.144,16944.391,-5.
 ploc3_refit128,isolated4_frozen_frame30_200dcd_200ccd,total_cuda_kernel_ms,15168.870,14262.041,-5.98%,dcd_and_ccd_encoded_multisets_exact,positive
 ploc3_refit128,isolated4_frozen_frame30_200dcd_200ccd,four_query_families_ms,14372.751,13973.022,-2.78%,dcd_and_ccd_encoded_multisets_exact,positive
 ploc3_refit128,isolated4_frozen_frame30_200dcd_200ccd,known_bvh_build_ms_excluding_cub,380.123,280.913,-26.10%,dcd_and_ccd_encoded_multisets_exact,positive
+ploc3_refit128_plus_vf_bvh8,isolated4_frozen_frame30_200dcd_200ccd,total_cuda_kernel_ms,13726.146,13816.766,+0.66%,dcd_and_ccd_encoded_multisets_exact,reject_stacking
+ploc3_refit128_plus_vf_bvh8,isolated4_frozen_frame30_200dcd_200ccd,vf_dcd_query_ms,3266.159,3345.213,+2.42%,dcd_and_ccd_encoded_multisets_exact,reject_stacking
+ploc3_refit128_plus_vf_bvh8,isolated4_frozen_frame30_200dcd_200ccd,bvh8_front_ms,0,26.279,+26.279ms,dcd_and_ccd_encoded_multisets_exact,reject_stacking

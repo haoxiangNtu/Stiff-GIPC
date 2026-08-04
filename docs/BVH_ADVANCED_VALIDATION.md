@@ -376,10 +376,16 @@ exact DCD and swept-CCD physical multisets and exact original encodings.
 BVH8 does not stack materially with the expensive full PLOC tree.  On the same
 PLOC++ R16 topology and 100 DCD rebuilds, binary queries used 492.491 ms;
 BVH8 queries used 485.380 ms plus 6.340 ms to build the fronts.  That is nearly
-break-even before the roughly 7.47-second PLOC construction cost.  The useful
-interpretation is therefore not “PLOC plus BVH8,” but “retain the cheap LBVH
-and wide only the dominant VF-DCD traversal.”  This candidate remains opt-in
-until the combined 1550-frame and A800 campaign gates are complete.
+break-even before the roughly 7.47-second PLOC construction cost.
+
+The final fair stacking test used the same isolated four-env frame-30
+checkpoint for 200 DCD and 200 CCD rebuilds.  Both physical and original
+encoded pair multisets were exact.  PLOC++/refit-128 alone used 13,726.146 ms
+of total kernel time; adding face-DCD BVH8 used 13,816.766 ms (**+0.66%**).
+VF-DCD itself increased from 3,266.159 to 3,345.213 ms, plus 26.279 ms for
+1,608 front constructions.  Therefore BVH8 is rejected from the PLOC/refit
+winner bundle.  Its earlier gain applies only to the cheap Morton LBVH branch,
+which remains an independent opt-in candidate rather than a cumulative win.
 
 ## Body-pair VF cache and shared traversal front
 

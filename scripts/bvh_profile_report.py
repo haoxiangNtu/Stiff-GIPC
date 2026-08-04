@@ -21,19 +21,34 @@ from pathlib import Path
 
 
 QUERY_PREFIXES = {
-    "vf_dcd": ("_selfQuery_vf(",),
+    "vf_dcd": (
+        "_selfQuery_vf(",
+        "_selfQuery_vf_wide8(",
+    ),
     "ee_dcd": (
         "_selfQuery_ee(",
         "_selfQuery_ee_lb2(",
         "_selfQuery_ee_lb3(",
         "_selfQuery_ee_range_prune(",
         "_selfQuery_ee_sorted_prune(",
+        "_selfQuery_ee_wide8(",
+        "_selfQuery_ee_range_prune_wide8(",
+        "_selfQuery_ee_sorted_prune_wide8(",
     ),
-    "vf_ccd": ("_selfQuery_vf_ccd(",),
+    "vf_ccd": (
+        "_selfQuery_vf_ccd(",
+        "_selfQuery_vf_ccd_wide8(",
+    ),
     "ee_ccd": (
         "_selfQuery_ee_ccd(",
         "_selfQuery_ee_ccd_range_prune(",
+        "_selfQuery_ee_ccd_wide8(",
+        "_selfQuery_ee_ccd_range_prune_wide8(",
     ),
+}
+
+TRAVERSAL_SUPPORT_PREFIXES = {
+    "bvh8_front": ("_buildBvh8Children(",),
 }
 
 CACHE_PREFIXES = {
@@ -124,6 +139,8 @@ def load_report(path: Path, frames: int | None) -> dict[str, object]:
         observed_query_names: dict[str, set[str]] = defaultdict(set)
         cache_ns: dict[str, int] = defaultdict(int)
         cache_calls: dict[str, int] = defaultdict(int)
+        support_ns: dict[str, int] = defaultdict(int)
+        support_calls: dict[str, int] = defaultdict(int)
 
         for name, duration_ns in rows:
             duration_ns = int(duration_ns)
@@ -137,6 +154,11 @@ def load_report(path: Path, frames: int | None) -> dict[str, object]:
                 if name.startswith(prefixes):
                     cache_ns[cache_category] += duration_ns
                     cache_calls[cache_category] += 1
+                    break
+            for support_category, prefixes in TRAVERSAL_SUPPORT_PREFIXES.items():
+                if name.startswith(prefixes):
+                    support_ns[support_category] += duration_ns
+                    support_calls[support_category] += 1
                     break
             if name.startswith(BUILD_PREFIXES):
                 build_ns += duration_ns
@@ -180,6 +202,19 @@ def load_report(path: Path, frames: int | None) -> dict[str, object]:
                     "fraction_of_kernel_time": cache_ns[category] / total_ns,
                 }
                 for category in CACHE_PREFIXES
+            },
+            "traversal_support_kernels": {
+                category: {
+                    "calls": support_calls[category],
+                    "time_ms": support_ns[category] / 1e6,
+                    "mean_us": (
+                        support_ns[category] / support_calls[category] / 1e3
+                        if support_calls[category]
+                        else 0.0
+                    ),
+                    "fraction_of_kernel_time": support_ns[category] / total_ns,
+                }
+                for category in TRAVERSAL_SUPPORT_PREFIXES
             },
             "bvh_build_excluding_cub_sort": {
                 "calls": build_calls,
@@ -228,6 +263,18 @@ def print_human(report: dict[str, object]) -> None:
     assert isinstance(cache, dict)
     for category in CACHE_PREFIXES:
         item = cache[category]
+        assert isinstance(item, dict)
+        if int(item["calls"]):
+            print(
+                f"{category:16s} {int(item['calls']):6d} "
+                f"{float(item['time_ms']):12.3f} "
+                f"{float(item['mean_us']):11.3f} "
+                f"{100.0 * float(item['fraction_of_kernel_time']):10.2f}"
+            )
+    support = report["traversal_support_kernels"]
+    assert isinstance(support, dict)
+    for category in TRAVERSAL_SUPPORT_PREFIXES:
+        item = support[category]
         assert isinstance(item, dict)
         if int(item["calls"]):
             print(
