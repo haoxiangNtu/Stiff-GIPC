@@ -477,6 +477,14 @@ __global__ void _pcg_phase_stamp(long long* buf, int slot)
     buf[10] = now;
 }
 
+// [pcg-sub] stash a device scalar's bits into the stamp buffer so the frame
+// boundary can print it for the in-graph path (which has no host exit).
+__global__ void _pcg_capture_scalar(long long* buf, const double* src, int slot)
+{
+    double v = *src;
+    buf[slot] = __double_as_longlong(v);
+}
+
 __global__ void pcg_graph_state_init(gipc::PCGDeviceState* state,
                                      unsigned long long max_iteration,
                                      int segmented,
@@ -753,6 +761,15 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                          &cub_temp_ptr, &cub_temp_bytes);
     copy_scalar_kernel<<<1, 1>>>(d_rz0, d_rz);
     cudaMemsetAsync(d_break, 0, sizeof(int));
+    // [pcg-sub] rz0 of this solve -> buf[15] (graph path has no host exit;
+    // the frame boundary reinterprets the bits).
+    {
+        long long* _b = system_ptr() ? system_ptr()->phase_stamp_buf() : nullptr;
+        if(!_b)
+            _b = d_pcg_phase_buf;
+        if(_b)
+            _pcg_capture_scalar<<<1, 1, 0, cudaStreamPerThread>>>(_b, d_rz0, 15);
+    }
 
     // Stream-ordered D2D copy.  DeviceDenseVector::operator= waits on its
     // BufferLaunch and therefore cannot be used while Phase C records an
@@ -778,6 +795,23 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     // p/rz/brk — x and r are bit-identical to the old mid-iteration-check loop at every exit point.
     long long* pcg_phase_buf =
         system_ptr() ? system_ptr()->phase_stamp_buf() : nullptr;
+    // [pcg-sub host] the frame graph owns a stamp buffer; the HOST path has
+    // none, so the same sub-phase chain was only ever measured in-graph.
+    // Allocate a solver-owned buffer (once, outside capture) so host and
+    // graph per-iteration costs are comparable with the same instrument.
+    if(!pcg_phase_buf && getenv("STIFF_GRAPH_PHASE_TIME"))
+    {
+        if(!d_pcg_phase_buf)
+            CUDA_SAFE_CALL(
+                cudaMalloc(&d_pcg_phase_buf, 16 * sizeof(long long)));
+        pcg_phase_buf = d_pcg_phase_buf;
+        // per-solve attribution on the host path (slots 10..14 only, the
+        // frame-level chain in 0..6 is untouched)
+        CUDA_SAFE_CALL(cudaMemsetAsync(pcg_phase_buf + 10,
+                                       0,
+                                       5 * sizeof(long long),
+                                       cudaStreamPerThread));
+    }
     auto pcg_stamp = [&](int slot) {
         if(pcg_phase_buf)
             _pcg_phase_stamp<<<1, 1>>>(pcg_phase_buf, slot);
@@ -1050,6 +1084,20 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                         rz,
                         rz0,
                         rz0 != 0.0 ? rz / rz0 : -1.0);
+                if(d_pcg_phase_buf)
+                {
+                    long long ph[16] = {};
+                    cudaMemcpy(ph, d_pcg_phase_buf, sizeof(ph), cudaMemcpyDeviceToHost);
+                    fprintf(stderr,
+                            "[pcg-sub-host] iters=%zu spmv=%.3f mix1=%.3f "
+                            "precond=%.3f mix2=%.3f (ms) per_iter=%.4f\n",
+                            (size_t)k,
+                            ph[11] / 1e6,
+                            ph[12] / 1e6,
+                            ph[13] / 1e6,
+                            ph[14] / 1e6,
+                            k ? (ph[11] + ph[12] + ph[13] + ph[14]) / 1e6 / k : 0.0);
+                }
             }
             return k;
         }

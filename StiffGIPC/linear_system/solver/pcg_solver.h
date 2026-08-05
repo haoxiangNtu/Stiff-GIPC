@@ -65,6 +65,9 @@ class PCGSolver : public IterativeSolver
     // no D2H.  Legacy callers still read this record once for their historical
     // SizeT return value.
     PCGDeviceState* d_graph_state = nullptr;
+    // [pcg-sub host] solver-owned stamp buffer used when no frame-graph
+    // buffer is available (host path); slots 10..14, see pcg_solver.cu.
+    long long*      d_pcg_phase_buf = nullptr;
     // Device-launchable executable is retained across Newton solves.  A fresh
     // capture updates pointer/grid/kernel arguments; re-instantiation is only
     // needed when CUDA reports a real topology incompatibility.

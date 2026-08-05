@@ -133,6 +133,9 @@ class MASPreconditioner
     void BuildMultiLevelR(const double3* R);  // called in preconditioning
     void SchwarzLocalXSym();                  // called in preconditioning
     void SchwarzLocalXSym_block3();                  // called in preconditioning
+    // [mas-apply-resize] device-resident total cluster count
+    // (d_levelSize[levelnum].y) for the graph node resizer.
+    const int* device_cluster_count() const;
     void SchwarzLocalXSym_sym();           // called in preconditioning
     void CollectFinalZ(double3* Z);           // called in preconditioning
 

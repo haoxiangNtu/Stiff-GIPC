@@ -915,6 +915,34 @@ void MASPreconditioner::BuildMultiLevelR(const double3* R)
 #endif
 }
 
+// [mas-apply-resize] The Schwarz apply launches are the in-graph PCG's
+// dominant per-iteration cost: under deviceExtentActive the cluster extent
+// is the ALLOCATED capacity (ReorderRealtime pins totalNumberClusters =
+// m_allocClusterTotal), so every replayed iteration does real work on every
+// padded cluster -- measured 63-65% of the in-graph PCG body, 3.3x the spmv.
+// Unlike the spmv (whose pad lanes exit on the masked count), these kernels
+// have no per-thread live guard, so the only fix is to narrow the recorded
+// grid itself: arm the device resizer with the device-resident cluster count
+// (d_levelSize[levelnum].y, the same value exactClusterCountBlocking reads).
+// Outside capture arm() self-disables and returns -1.
+static bool mas_apply_resize_enabled()
+{
+    static int v = -1;
+    if(v < 0)
+    {
+        const char* e = getenv("STIFF_MAS_APPLY_RESIZE");
+        v             = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
+    }
+    return v != 0;
+}
+
+const int* MASPreconditioner::device_cluster_count() const
+{
+    // int2{x, y}: the total cluster count is the y component of the entry
+    // one past the last level.
+    return reinterpret_cast<const int*>(d_levelSize + levelnum) + 1;
+}
+
 void MASPreconditioner::SchwarzLocalXSym()
 {
     //int matNum    = totalNumberClusters / BANKSIZE;
@@ -925,9 +953,15 @@ void MASPreconditioner::SchwarzLocalXSym()
     int blockSize = BANKSIZE * BANKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
 
+    const int _rs_slot =
+        mas_apply_resize_enabled()
+            ? gipc::graph_resize::arm(device_cluster_count(), BANKSIZE * 3, blockSize, numBlocks)
+            : -1;
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym3<<<numBlocks, blockSize>>>(
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
+    if(_rs_slot >= 0)
+        gipc::graph_resize::bind_last(_rs_slot);
 }
 
 void MASPreconditioner::SchwarzLocalXSym_block3()
@@ -940,9 +974,15 @@ void MASPreconditioner::SchwarzLocalXSym_block3()
     int blockSize = BANKSIZE * BANKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
 
+    const int _rs_slot =
+        mas_apply_resize_enabled()
+            ? gipc::graph_resize::arm(device_cluster_count(), BANKSIZE, blockSize, numBlocks)
+            : -1;
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym6<<<numBlocks, blockSize>>>(
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
+    if(_rs_slot >= 0)
+        gipc::graph_resize::bind_last(_rs_slot);
 }
 
 void MASPreconditioner::SchwarzLocalXSym_sym()
@@ -955,9 +995,17 @@ void MASPreconditioner::SchwarzLocalXSym_sym()
     int blockSize = BANKSIZE * BANKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
 
+    // (1+BANKSIZE)/2 is not integral: round the multiplier UP so the resized
+    // grid is never narrower than the work.
+    const int _rs_slot =
+        mas_apply_resize_enabled()
+            ? gipc::graph_resize::arm(device_cluster_count(), (2 + BANKSIZE) / 2, blockSize, numBlocks)
+            : -1;
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym9<<<numBlocks, blockSize>>>(
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
+    if(_rs_slot >= 0)
+        gipc::graph_resize::bind_last(_rs_slot);
 }
 
 void MASPreconditioner::CollectFinalZ(double3* Z)

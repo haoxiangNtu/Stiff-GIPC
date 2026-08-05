@@ -2547,6 +2547,9 @@ bool try_launch_full_graph(GIPC& ipc,
                 st.newton_iters,
                 st.pcg_iters,
                 st.ls_trials);
+        double last_rz0 = 0.0;
+        std::memcpy(&last_rz0, &acc[15], sizeof(last_rz0));
+        fprintf(stderr, "[pcg-rz0] last_solve_rz0=%.6e\n", last_rz0);
         fprintf(stderr,
                 "[pcg-sub] spmv=%.1f mix1=%.1f precond=%.1f mix2=%.1f (ms)\n",
                 acc[11] / 1e6,
