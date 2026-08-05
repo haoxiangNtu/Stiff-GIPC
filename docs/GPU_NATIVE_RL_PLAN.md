@@ -43,7 +43,7 @@ GPU-native RL.
 | Selective device reset | Whole-scene in-stream reset done; per-env masks open (2026-07-29) | `launch_gpu_rl_reset_async` replays the prepare-time snapshot with pure D2D on the bound stream. Per-env mask-driven partial reset needs per-env vertex slicing and remains open. |
 | Batched heterogeneous environments | Merged + isolated done (2026-07-29, C5); strict deliberately out | Merged multi-env works through the ABI (point_to_group / env_quarantined / env_count handles). **Isolated mode now runs entirely inside the whole-frame graph** (`STIFF_C5_ISOLATED_GRAPH=1`): per-env CCD alpha chain, per-env freeze decision publishing the Newton exit, the per-env S3 backtracking WHILE with its uniform-alpha fallback IF, and in-graph kappa — G19 shows 20/20 frames graph-executed with zero fallback and no added cross-env coupling. Strict stays rejected on purpose: capacity-grid reductions legally reassociate sums, so admitting strict is an anchor-change decision, not a residency one. |
 | Closed-loop Warp/Torch/Newton adapter | Not implemented | The engine ABI exists; adapters still contain `.numpy()` and synchronous `step()` calls. |
-| A800 proof | Contact-load proof complete (2026-07-29, at 8c4e504) | `sm_80` in-place rebuild: strict anchor bit-identical (`0544461bd82123ae`), G18 collision matrix PASS, gpu-rl gate PASS, contact-load closed loop PASS, and the Nsight Systems steady-state capture **under collision+friction+joint-drive load** shows h2d=0 / d2h=0 / sync=0 — 40 `cudaGraphLaunch` (~214µs mean enqueue on the A800's slow host link, i.e. the exact motivation for residency) + 80 small D2D publishes are the host's entire steady-state workload. Remaining measurements (long-horizon stability, memory high-water, throughput curves) are routine benchmarking, not correctness gaps. |
+| A800 proof | Core contact-load/no-transfer proof complete; full D4 remains open | The original 2026-07-29 proof was independently repeated on 2026-08-06 from a clean `sm_80` Release build: strict anchor bit-identical (`0544461bd82123ae`), contact closed loop PASS, and node-level Nsight shows 40 launches, 5655 graph-node events, 80 D2D action publishes, zero H2D/D2H, and zero host synchronization inside the submission loop. Complete 1550-frame contact-rich FOLD graph runs also pass for merged and isolated. Device-policy integration, masked per-env reset, RL long-horizon/memory high-water, and throughput curves remain open, so this is not a claim that all of D4 is complete. |
 
 The older `launch_episode_async()` API is an open-loop trajectory executor. It
 pre-uploads all actions and copies observations to pinned host slots. It remains
@@ -94,6 +94,38 @@ scripts/nsys_gpu_rl_audit.py \
   artifacts/nsys-contact-4090/contact-steady-node.sqlite \
   --expected-steps 40
 ```
+
+### A800 node-level Nsight recheck (2026-08-06)
+
+The same standalone contact+friction+joint-drive smoke was rebuilt in Release
+mode with DLTO and `CMAKE_CUDA_ARCHITECTURES=80-real` on an
+NVIDIA A800-SXM4-80GB.  `cuobjdump` confirms `code for sm_80` in the exact
+core and Python shared objects.  The smoke reports 1057 captured nodes, graph
+H2D=0/D2H=0, and 43/43 completed frames with `result=0`.
+
+Nsight Systems 2026.3.1 recorded the 40-step steady region with node-level
+Graph tracing.  The independent SQLite audit reports:
+
+- 40 `cudaGraphLaunch`, 40 non-blocking event records, and 80 D2D action
+  publishes;
+- 5655 executed CUDA Graph node events;
+- zero H2D and zero D2H rows over the capture;
+- zero synchronization API rows and zero CUPTI synchronization activities
+  inside the 11.571851 ms host submission window.
+
+As on the 4090, the exported trace contains one API synchronization and two
+CUPTI synchronization activities only after final submission, at the profiler
+stop/drain boundary.  The precise result is therefore zero transfer and zero
+host wait in the steady submission loop.  It does not mean that the CPU is
+absent: the current ABI still enqueues one graph and two small D2D publishes
+per environment step.
+
+Raw evidence is retained under `artifacts/a800-fa6e03e/`:
+`contact-steady-node.nsys-rep`, `contact-steady-node.sqlite`,
+`nsys-audit.log`, `contact-smoke.log`, and `sm80-sass.log`.  The same evidence
+directory also contains all two-repeat 1550-frame merged/isolated BVH runs and
+the contact-rich whole-frame Graph runs; those performance conclusions are in
+`docs/BVH_ADVANCED_VALIDATION.md`.
 
 ## Device ABI (foundation block)
 

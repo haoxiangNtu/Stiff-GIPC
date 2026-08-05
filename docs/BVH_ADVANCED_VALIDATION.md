@@ -145,8 +145,9 @@ On one frozen frame-30 FOLD checkpoint, 202 identical DCD rebuilds produced:
 Phase 1 is a credible narrow candidate (about 3.0% for this DCD-only frozen
 workload), not yet a whole-simulator speedup claim.  A freely evolved 30-frame
 capture changed the number of Newton/query launches, so its much larger
-apparent gain is deliberately not credited.  Repeated deterministic long-run
-and A800 measurements are still required before changing any default.
+apparent gain is deliberately not credited.  At this stage of the campaign,
+repeated deterministic long-run and A800 measurements were still required;
+the complete cross-architecture result is reported below.
 
 The repository's 22-segment `verify_gates.sh` passed once with all new knobs
 unset and once with face-DCD/phase-1 enabled.  Both runs kept strict gold
@@ -154,7 +155,8 @@ unset and once with face-DCD/phase-1 enabled.  Both runs kept strict gold
 frame/episode/articulated-RL graphs, C4 collision graph, isolated whole-frame
 graph, GPU-native RL, knob registry, and the FOLD smoke test.  The candidate
 kernels are therefore demonstrated capture-safe on the existing Phase-C/D
-graph gates; this does not replace the still-missing A800 performance run.
+graph gates; this did not replace the A800 performance run, which was
+subsequently completed in the cross-architecture closure below.
 
 ### Decision threshold
 
@@ -287,8 +289,9 @@ optimum:
 The interval-128 observed whole-kernel reduction is 5.88%; directly
 attributable query/build/refit work supports a more conservative roughly
 2.7% gain.  A separate IsaacSim process occupied the RTX 4090 at 97--99%
-during these captures, so free-GPU and A800 repeats remain mandatory before a
-default change.
+during these captures, so these particular samples were not used for a
+default decision.  The later free-GPU 4090 and A800 matrices provide that
+decision evidence.
 
 The frozen FOLD gate passed at frames 1/10/30 for merged and isolated with
 exact original DCD and CCD encodings.  The 50-frame merged/isolated/strict gate
@@ -337,7 +340,7 @@ evolved isolated runs are intrinsically noisy here: two baseline replicas
 already diverged by `8.57e-2` in position and followed different Newton/query
 counts.  Their wall times therefore are not used as evidence.  The frozen
 fixed-workload result is the credited isolated speedup; a long trajectory and
-A800 repeat remain required before enabling the candidate by default.
+A800 repeat were still required at this point.  Both are closed below.
 
 ### Same-topology BVH8 traversal
 
@@ -688,14 +691,15 @@ the baseline's 2.5% run spread; they remain isolated opt-ins rather than
 standalone winners.  The combination is different: both repeats beat the
 fastest baseline and its mean is 3.92% lower.  It is the measured isolated
 bundle, although the modest effect still warrants an A800 repeat before any
-default change.
+default change.  The repeat below shows that this 4090 result does not
+generalize to A800 isolated mode.
 
 The terminal-state envelope remains conservative.  Baseline-to-baseline max
 position difference is 0.3907 (RMS 0.0291); the two combined runs are only
 0.1025--0.1112 from their nearest baseline (RMS 0.0064--0.0068) and 0.1120
 from each other.  Frozen frames continue to carry the stronger exact pair-set
-proof.  The A800 repeat remains a release blocker, so all candidate knobs stay
-opt-in.
+proof.  All candidate knobs remain opt-in pending the cross-architecture
+decision below.
 
 Whole-frame Graph is a residency/correctness result on this 4090, not the
 throughput winner.  The one graph-on sample was 117.7 ms/frame for merged,
@@ -705,6 +709,91 @@ Those comparisons are not credited as two-repeat performance estimates, but
 the gap is too large to describe conditional Graph as an acceleration on this
 machine.  The BVH winner claims above therefore use graph-off A/B runs; Graph
 coverage separately proves that the candidates remain capture-safe.
+
+### A800 cross-architecture closure (2026-08-06)
+
+The complete campaign was repeated on the managed
+`stiffgipc-v083-a800-sm80` worker with one NVIDIA A800-SXM4-80GB.  The tested
+Release build used CUDA 12.8, DLTO, Python bindings, no viewer, audit knobs
+off, and `CMAKE_CUDA_ARCHITECTURES=80-real`.  `cuobjdump --list-elf` and
+`--dump-sass` report only `lto.sm_80.cubin` and `code for sm_80` in both the
+core and Python shared objects.  The strict anchor remains bit-identical at
+`0544461bd82123ae`.
+
+A clean audit-off build first exposed a real configuration defect hidden by
+the incremental audit build: the face/edge body-order metadata pointers were
+declared inside `STIFF_BVH_COHERENCE_AUDIT_BUILD` even though production query
+ordering uses them.  Moving those two declarations to production state fixes
+both clean 4090 and A800 builds; it does not alter any numerical path.  The
+managed worker also reports a host PID through NVML that is different from
+the container PID.  The long gate therefore gained an explicit, default-off
+single-alias claim: it may associate exactly one initially unknown NVML PID
+with its just-launched child, but any simultaneous or later unknown CUDA
+process still terminates and rejects the sample.  All measurements below used
+that idle audit, and no additional CUDA process appeared.
+
+Before timing, the combined candidate passed the 50-frame
+merged/isolated/strict gate.  More importantly, the frozen FOLD pair oracle at
+frames 1, 10, and 30 passed in both modes.  It compared 26,741--31,826 active
+DCD rows and 77,507--105,970 swept CCD rows per checkpoint: geometry,
+canonical multisets, and original encodings were all exact between baseline
+and candidate.  This closes contact completeness on a real contact-rich
+state, rather than relying on the zero-pair strict anchor.
+
+Every graph-off cell below is two independent, GPU-idle-audited 1550-frame
+runs.  All 16 runs completed 1550/1550 with finite state, and their logs have
+zero quarantine, failure, retry-exhaustion, overflow, illegal-access, NaN, or
+CUDA-error matches.
+
+| A800 merged, 1 env | two runs (ms/frame) | mean | versus all-off |
+|---|---:|---:|---:|
+| all candidates off | 116.6 / 117.2 | 116.90 | baseline |
+| PLOC++ / refit-128 | 114.7 / 115.0 | 114.85 | -1.75% |
+| VF-DCD query order | 111.4 / 112.2 | 111.80 | -4.36% |
+| PLOC/refit + query order | 108.8 / 113.0 | **110.90** | **-5.13%** |
+
+All six candidate samples beat the fastest baseline sample.  The A800 merged
+winner is therefore the combined bundle, unlike the 4090 where PLOC/refit
+alone wins.  Baseline terminal replicas differ by max 0.413831 and RMS
+0.106016; every candidate is closer to one baseline than that envelope (max
+at most 0.289620, RMS at most 0.040946).  Exact frozen pair sets remain the
+strong correctness oracle because the freely evolved trajectory is chaotic.
+
+| A800 isolated, 4 env | two runs (ms/batch) | mean | versus all-off |
+|---|---:|---:|---:|
+| all candidates off | 461.0 / 470.2 | **465.60** | baseline |
+| PLOC++ / refit-128 | 459.3 / 498.9 | 479.10 | +2.90% |
+| VF-DCD query order + per-env subset | 498.5 / 446.4 | 472.45 | +1.47% |
+| PLOC/refit + query order + subset | 480.1 / 496.7 | 488.40 | +4.90% |
+
+No isolated candidate earns a speed claim on A800: every two-run mean
+regresses and the first two candidates have 8.3--11.0% repeat spread.  One
+query-order sample is the fastest isolated sample, but its other repeat is the
+slowest, which is precisely why isolated all-off remains the A800 decision.
+Candidate terminal deviations are in the same chaotic scale as the baseline
+replicas; the frozen-frame exact pair oracle above is the non-statistical
+correctness proof.
+
+Complete whole-frame Graph coverage also passed on contact-rich FOLD:
+
+| A800 replay | graph coverage | graph-on | matching graph-off mean | result |
+|---|---:|---:|---:|---|
+| merged, combined bundle | 1544 full + 6 boundary fallback | 128.5 ms/frame | 110.9 ms/frame | 1550/1550, finite |
+| isolated, all-off | 1544 full + 6 boundary fallback | 480.2 ms/batch | 465.6 ms/batch | 1550/1550, finite |
+
+The merged fallback ids are `[0, 1, 6, 11, 13, 14]`, with capacity status on
+the latter five.  Isolated uses `[0, 1, 5, 10, 12, 13]`, again with five
+capacity frames after warm-up.  Thus both modes return to the graph after
+boundary growth and execute every frame after 14 or 13 in the graph.  The
+single graph runs are residency/correctness evidence, not speed estimates:
+they are respectively 15.87% and 3.14% slower than their matching two-run
+graph-off means.
+
+The cross-architecture decision is consequently mode-specific and remains
+opt-in: retain PLOC/refit and query order as useful merged candidates, use the
+combined bundle for the measured A800 merged workload, and leave A800
+isolated all-off.  There is no evidence for one universal default across the
+4090/A800 and merged/isolated matrix.
 
 ### Clean v0.8.5 comparison
 
@@ -765,6 +854,8 @@ same-binary terminal envelopes carry that proof.
   per-env query subset has no standalone wall benefit, but makes query sorting
   cheap enough that the combination measured about 6.8% end-to-end on the
   fixed four-env workload.  This is the second winner candidate after
-  PLOC++/refit-128.  Both now survive the complete 1550-frame 4090 trajectory;
-  the graph-off two-repeat/envelope matrix is complete, while promotion still
-  awaits the A800 proof.
+  PLOC++/refit-128.  Both survive complete 1550-frame 4090 and A800
+  trajectories and exact frozen contact gates.  On A800 merged, their combined
+  bundle wins by 5.13%; on A800 isolated every candidate mean regresses, so
+  all-off remains the decision.  The architecture/mode disagreement rules out
+  a universal default and keeps the candidates explicit opt-ins.
