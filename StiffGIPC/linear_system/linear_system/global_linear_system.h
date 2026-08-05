@@ -81,6 +81,10 @@ class GlobalLinearSystem
     {
         return m_frame_device_state;
     }
+    // [graph-phase-time] optional diag stamp buffer (owner: GIPC). Slots
+    // 10..14 are reserved for the PCG-body sub-phase chain.
+    void set_phase_stamp_buf(long long* buf) { m_phase_stamp_buf = buf; }
+    long long* phase_stamp_buf() const { return m_phase_stamp_buf; }
     // [seg-fused dot] arm the NEXT spmv to also accumulate the per-env x·(aAx) into `partials`
     // (one-shot; see Spmv::set_seg_dot_accum). Used by seg_pcg's fast path.
     void set_seg_dot_accum(double* partials, int ng) { m_spmv.set_seg_dot_accum(partials, ng); }
@@ -116,6 +120,7 @@ class GlobalLinearSystem
     const int* m_s4_dof_to_group = nullptr;
     int        m_s4_ng           = 0;
     frame_fsm::FrameDeviceState* m_frame_device_state = nullptr;
+    long long*                   m_phase_stamp_buf    = nullptr;
 
     // [C4/D4] frame-boundary training hook: grow the converter's merge-bin
     // workspace to the capture-time capacity so a recorded convert never

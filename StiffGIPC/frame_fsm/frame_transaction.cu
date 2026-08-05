@@ -2547,6 +2547,12 @@ bool try_launch_full_graph(GIPC& ipc,
                 st.newton_iters,
                 st.pcg_iters,
                 st.ls_trials);
+        fprintf(stderr,
+                "[pcg-sub] spmv=%.1f mix1=%.1f precond=%.1f mix2=%.1f (ms)\n",
+                acc[11] / 1e6,
+                acc[12] / 1e6,
+                acc[13] / 1e6,
+                acc[14] / 1e6);
     }
     if(boundary != cudaSuccess)
     {
@@ -3681,6 +3687,10 @@ void GIPC::prepare_frame_graph(device_TetraData& mesh)
     if(std::getenv("STIFF_GRAPH_PHASE_TIME") && !m_phase_stamp_buf)
         CUDA_SAFE_CALL(
             cudaMalloc(&m_phase_stamp_buf, 16 * sizeof(long long)));
+    // [graph-phase-time] hand the buffer to the linear system so the PCG
+    // body can stamp its sub-phases (slots 10..14) into the same readout.
+    if(m_phase_stamp_buf && m_global_linear_system)
+        m_global_linear_system->set_phase_stamp_buf(m_phase_stamp_buf);
     if(m_frame_graph_context)
         return;
 

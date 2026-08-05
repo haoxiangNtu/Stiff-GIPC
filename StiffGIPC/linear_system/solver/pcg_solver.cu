@@ -465,6 +465,18 @@ __global__ void copy_scalar_kernel(double* dst, const double* src)
 // the same as the host K-stride loop while the convergence decision stays on
 // the GPU.  Device graph launch is available before conditional graph nodes
 // (CUDA 12.0 vs 12.3), which keeps this path usable on the A800's R535 driver.
+// [graph-phase-time] PCG-body sub-phase stamp: buf[10]=chain last,
+// buf[11..14]=accumulated ns per sub-phase. Independent of the frame-level
+// chain in buf[0..6] so both attributions stay exact.
+__global__ void _pcg_phase_stamp(long long* buf, int slot)
+{
+    long long now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    if(slot >= 0 && buf[10] != 0)
+        buf[11 + slot] += now - buf[10];
+    buf[10] = now;
+}
+
 __global__ void pcg_graph_state_init(gipc::PCGDeviceState* state,
                                      unsigned long long max_iteration,
                                      int segmented,
@@ -764,11 +776,19 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     // [pcg-graph] one FULL iteration of the (shape-constant-within-a-solve) inner loop. The break
     // check moved to ITERATION BOUNDARIES (same K cadence): the second half-iteration only touches
     // p/rz/brk — x and r are bit-identical to the old mid-iteration-check loop at every exit point.
+    long long* pcg_phase_buf =
+        system_ptr() ? system_ptr()->phase_stamp_buf() : nullptr;
+    auto pcg_stamp = [&](int slot) {
+        if(pcg_phase_buf)
+            _pcg_phase_stamp<<<1, 1>>>(pcg_phase_buf, slot);
+    };
     auto body = [&]()
     {
         pcg_iteration_begin<<<1, 1>>>(d_graph_state, d_break);
+        pcg_stamp(-1);
         // Ap = A * p
         spmv(p.cview(), Ap.view());
+        pcg_stamp(0);   // buf[11] spmv
         // Step E: cub fused dot(p, Ap) -> d_dot_res (1 launch instead of 2-3).
         Cub_PCG_DotReduction(p.buffer_view().data(), Ap.buffer_view().data(), z.size(),
                              d_dot_res, &cub_temp_ptr, &cub_temp_bytes);
@@ -780,7 +800,9 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                                  (const double*)d_rz, (const double*)d_dot_res,
                                  d_break, (int)z.size(),
                                  (const PCGDeviceState*)d_graph_state);
+        pcg_stamp(1);   // buf[12] dot+axpy
         apply_preconditioner(z, r);
+        pcg_stamp(2);   // buf[13] precond apply
         // Step E: cub fused dot(r, z) -> d_rz_new.
         Cub_PCG_DotReduction(r.buffer_view().data(), z.buffer_view().data(), z.size(),
                              d_rz_new, &cub_temp_ptr, &cub_temp_bytes);
@@ -793,6 +815,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
         // Step E: combined swap (d_rz = d_rz_new) + convergence check.
         post_iter_swap_and_check<<<1, 1>>>(
             d_rz, d_rz_new, d_rz0, pcg_tol, d_break, d_graph_state);
+        pcg_stamp(3);   // buf[14] dot2+axpy2+check
     };
 
     // Phase C owns the top-level graph.  Compose PCG as a nested WHILE body;
