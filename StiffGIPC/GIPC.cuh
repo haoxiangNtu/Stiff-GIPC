@@ -250,6 +250,13 @@ class GIPC
     lbvh_f   bvh_f;
     lbvh_e   bvh_e;
 
+    // Production metadata used by the optional body-major broad-phase
+    // ordering.  These buffers are not audit-only: initBVH() allocates them
+    // whenever STIFF_BVH_PAIR_CACHE is enabled, including normal release
+    // builds.
+    int*     m_bvh_face_body = nullptr;
+    int*     m_bvh_edge_body = nullptr;
+
 #ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
     // Shadow-only model of a DCD Verlet candidate list.  It never changes the
     // solver's pair set: every buildCP still runs the exhaustive LBVH query.
@@ -361,8 +368,6 @@ class GIPC
     unsigned long long       m_bvh_vf_front_fallbacks = 0;
     uint32_t                 m_bvh_vf_front_max_roots = 0;
     uint32_t                 m_bvh_vf_front_max_body_roots = 0;
-    int*                     m_bvh_face_body = nullptr;
-    int*                     m_bvh_edge_body = nullptr;
     void collectBvhPairWorkload();
     void updateBvhVfPairCache();
     void updateBvhCcdPairCache(const double& alpha,

@@ -39,6 +39,9 @@ ENVS = int(os.environ.get("BVH_FOLD_LONG_ENVS", "1"))
 TIMEOUT = int(os.environ.get("BVH_FOLD_LONG_TIMEOUT", "10800"))
 GRAPH = bool(int(os.environ.get("BVH_FOLD_LONG_GRAPH", "0")))
 REQUIRE_IDLE = bool(int(os.environ.get("BVH_FOLD_LONG_REQUIRE_IDLE", "0")))
+CLAIM_SINGLE_NVML_ALIAS = bool(
+    int(os.environ.get("BVH_FOLD_LONG_CLAIM_SINGLE_NVML_ALIAS", "0"))
+)
 IDLE_ALLOWLIST = tuple(
     item.strip()
     for item in os.environ.get("BVH_FOLD_LONG_IDLE_ALLOWLIST", "").split(",")
@@ -101,15 +104,23 @@ def compute_apps() -> list[str]:
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
-def external_apps(records: list[str], own_pid: int | None) -> list[str]:
+def record_pid(record: str) -> int | None:
+    try:
+        return int(record.split(",", 1)[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def external_apps(
+    records: list[str], own_pids: set[int] | None
+) -> list[str]:
     external: list[str] = []
     for record in records:
-        try:
-            pid = int(record.split(",", 1)[0])
-        except (ValueError, IndexError):
+        pid = record_pid(record)
+        if pid is None:
             external.append(record)
             continue
-        if own_pid is not None and pid == own_pid:
+        if own_pids is not None and pid in own_pids:
             continue
         if any(token in record for token in IDLE_ALLOWLIST):
             continue
@@ -177,6 +188,7 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
     started = time.monotonic()
     output_lines: list[str] = []
     external_seen: list[str] = []
+    claimed_nvml_aliases: list[int] = []
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -188,13 +200,32 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
             bufsize=1,
         )
         stop_monitor = threading.Event()
+        own_pids = {process.pid}
 
         def monitor_gpu() -> None:
             while not stop_monitor.wait(5.0):
                 try:
-                    current = external_apps(compute_apps(), process.pid)
+                    current = external_apps(compute_apps(), own_pids)
                 except RuntimeError as error:
                     current = [str(error)]
+                # Some managed containers expose namespace-local PIDs through
+                # /proc while NVML reports the outer host PID.  Keep the
+                # default fail-closed.  The explicit opt-in below may claim
+                # exactly one new NVML record as this child; any simultaneous
+                # or later unknown record still contaminates and kills the
+                # sample.
+                if (
+                    current
+                    and CLAIM_SINGLE_NVML_ALIAS
+                    and not claimed_nvml_aliases
+                    and process.poll() is None
+                ):
+                    aliases = [record_pid(record) for record in current]
+                    if len(aliases) == 1 and aliases[0] is not None:
+                        alias = aliases[0]
+                        own_pids.add(alias)
+                        claimed_nvml_aliases.append(alias)
+                        current = []
                 for record in current:
                     if record not in external_seen:
                         external_seen.append(record)
@@ -320,6 +351,8 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         "native_dir": env.get("STIFFGIPC_NATIVE_DIR"),
         "gpu_idle_audited": REQUIRE_IDLE,
         "gpu_idle_allowlist": list(IDLE_ALLOWLIST),
+        "gpu_claim_single_nvml_alias": CLAIM_SINGLE_NVML_ALIAS,
+        "gpu_claimed_nvml_aliases": claimed_nvml_aliases,
         "elapsed_s": elapsed,
         "mean_step_ms": float(mean_ms),
         "vertex_shape": list(vertices.shape),
