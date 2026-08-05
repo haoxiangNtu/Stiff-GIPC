@@ -1,3 +1,4 @@
+#include "linear_system/utils/graph_node_resize.h"
 #include <linear_system/linear_system/global_linear_system.h>
 #include "device_common/nvtx_ranges.h"  // [B3] sub-phase attribution
 #include <linear_system/linear_system/i_linear_system_solver.h>
@@ -355,6 +356,43 @@ void GlobalLinearSystem::spmv(Float                         a,
     const int _spmv_bound = pcg_grid_capacity_mode()
                                 ? (int)gipc_global_triplet->triplet_capacity()
                                 : (int)gipc_global_triplet->h_unique_key_number;
+    // [pcg-width-audit] capture-time width vs capacity: the recorded spmv
+    // grid is baked from the mirror value visible HERE — under frame-graph
+    // capture that is the trained/armed extent, not the live count.
+    if(getenv("STIFF_PCG_WIDTH_DIAG"))
+    {
+        static int s_prints = 0;
+        if(s_prints < 24)
+        {
+            ++s_prints;
+            cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(cudaStreamPerThread, &cap_st);
+            fprintf(stderr,
+                    "[spmv-width] bound=%d capacity=%zu capture=%d\n",
+                    _spmv_bound,
+                    gipc_global_triplet->triplet_capacity(),
+                    cap_st != cudaStreamCaptureStatusNone ? 1 : 0);
+        }
+    }
+    // [spmv-resize] Under frame-graph capture the recorded grid is the
+    // trained/armed extent — measured 12.2x the live unique count on fs4
+    // (1.66M vs 136k), which is the in-graph PCG's ~7x per-iteration cost
+    // (the kernel masks by d_unique_key_number, but every replayed iteration
+    // still schedules the full padded grid). Arm the device resizer so each
+    // replay launches ceil(live/256) blocks instead. Opt-in while A/B'd.
+    static int s_spmv_resize = -1;
+    if(s_spmv_resize < 0)
+    {
+        const char* e = getenv("STIFF_SPMV_RESIZE");
+        s_spmv_resize = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
+    }
+    int spmv_slot = -1;
+    if(s_spmv_resize)
+        spmv_slot = graph_resize::arm(
+            gipc_global_triplet->d_unique_key_number,
+            1,
+            256,
+            (_spmv_bound + 255) / 256);
     m_spmv.warp_reduce_sym_spmv(a,
                                 gipc_global_triplet->block_values(),
                                 gipc_global_triplet->block_row_indices(),
@@ -367,5 +405,7 @@ void GlobalLinearSystem::spmv(Float                         a,
                                 m_s4_dof_to_group,
                                 m_s4_ng,
                                 gipc_global_triplet->d_unique_key_number);  // [B2'-a]
+    if(spmv_slot >= 0)
+        graph_resize::bind_last(spmv_slot);
 }
 }  // namespace gipc

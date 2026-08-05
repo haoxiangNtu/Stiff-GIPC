@@ -1011,6 +1011,23 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                                       cudaMemcpyDeviceToHost));
             k       = static_cast<SizeT>(graph_state.iteration);
             h_break = graph_state.converged;
+            if(getenv("STIFF_PCG_EXIT_DIAG"))
+            {
+                double rz = 0, rz0 = 0;
+                int    brk = 0;
+                cudaMemcpy(&rz, d_rz, sizeof(rz), cudaMemcpyDeviceToHost);
+                cudaMemcpy(&rz0, d_rz0, sizeof(rz0), cudaMemcpyDeviceToHost);
+                cudaMemcpy(&brk, d_break, sizeof(brk), cudaMemcpyDeviceToHost);
+                fprintf(stderr,
+                        "[pcg-exit] iters=%zu brk=%d conv=%d rz=%.3e rz0=%.3e "
+                        "rel=%.3e (device-loop)\n",
+                        (size_t)k,
+                        brk,
+                        graph_state.converged,
+                        rz,
+                        rz0,
+                        rz0 != 0.0 ? rz / rz0 : -1.0);
+            }
             return k;
         }
 
