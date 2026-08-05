@@ -12,6 +12,7 @@
 //  - Cross-module file-scope dependencies (device globals g_*, statics,
 //    templates) are ALLOWED for now — they are what Phase 2 will untangle.
 // ============================================================================
+#include "linear_system/utils/graph_node_resize.h"
 #include "gipc_modules/00_prelude_common.inl"
 #include "energy/02_contact_energy_device.inl"
 #include "gipc_modules/01_contact_energy_device.inl"

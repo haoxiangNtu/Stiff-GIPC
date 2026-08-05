@@ -203,6 +203,27 @@ __global__ void _reduct_min_selfAlpha_to_double(const double3* vertexes,
 // cascade then reduces 2*bn values. Small inputs keep the legacy single pass
 // (split gains nothing there and the reduce scratch is sized from the input
 // count). Returns the number of block minima written.
+__global__ void _fill_double(double* values, double value, int count);   // module 11
+
+// [alpha-resize] The masked CCD reduction sweeps the TRAINED pair capacity so
+// the recorded grid stays valid across replays; lanes past the live count hold
+// the min identity 1.0, so a fully-masked block writes exactly 1.0 into its
+// partial slot. That makes narrowing the grid BITWISE NEUTRAL provided the
+// partial slots the narrowed grid never writes already hold 1.0 -- hence the
+// identity fill below (blockNum doubles, negligible) before the resized
+// launch. The host-width cascade that follows then reduces the same values it
+// would have reduced at full width.
+static bool alpha_resize_enabled()
+{
+    static int v = -1;
+    if(v < 0)
+    {
+        const char* e = getenv("STIFF_ALPHA_RESIZE");
+        v             = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
+    }
+    return v != 0;
+}
+
 static inline int launch_reduct_min_selfAlpha(const double3*  vertexes,
                                               const int4*     pairs,
                                               const double3*  moveDir,
@@ -229,8 +250,18 @@ static inline int launch_reduct_min_selfAlpha(const double3*  vertexes,
     }
     if(!s_split || numbers < 1024)
     {
+        int rs_slot = -1;
+        if(d_live && alpha_resize_enabled())
+        {
+            _fill_double<<<(blockNum + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                mqueue, 1.0, blockNum);
+            rs_slot = gipc::graph_resize::arm(
+                reinterpret_cast<const int*>(d_live), 1, (int)threadNum, blockNum);
+        }
         _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
             vertexes, pairs, moveDir, mqueue, slackness, numbers, invalid, invalid_bit, d_live, -1);
+        if(rs_slot >= 0)
+            gipc::graph_resize::bind_last(rs_slot);
         return blockNum;
     }
     _reduct_min_selfAlpha_to_double<<<blockNum, threadNum, sharedMsize>>>(
