@@ -6,6 +6,10 @@ the complementary long-horizon evidence: merged and isolated replays must each
 finish the requested number of real frames, publish finite state, and avoid
 CUDA failures.  Optional whole-frame-graph mode additionally requires every
 frame to be accounted for and bounds frame-boundary capacity fallbacks.
+
+Historical comparisons may point BVH_FOLD_LONG_REPLAY_ROOT at another clean
+worktree.  Set BVH_FOLD_LONG_REQUIRE_CHECKPOINT=0 only for revisions whose
+replay predates checkpoint output; terminal vertices remain mandatory.
 """
 
 from __future__ import annotations
@@ -27,6 +31,9 @@ from bvh_candidate_gate import candidate_environment
 
 
 ROOT = Path(__file__).resolve().parent.parent
+REPLAY_ROOT = Path(
+    os.environ.get("BVH_FOLD_LONG_REPLAY_ROOT", str(ROOT))
+).resolve()
 FRAMES = int(os.environ.get("BVH_FOLD_LONG_FRAMES", "1550"))
 ENVS = int(os.environ.get("BVH_FOLD_LONG_ENVS", "1"))
 TIMEOUT = int(os.environ.get("BVH_FOLD_LONG_TIMEOUT", "10800"))
@@ -37,6 +44,10 @@ IDLE_ALLOWLIST = tuple(
     for item in os.environ.get("BVH_FOLD_LONG_IDLE_ALLOWLIST", "").split(",")
     if item.strip()
 )
+REQUIRE_CHECKPOINT = bool(
+    int(os.environ.get("BVH_FOLD_LONG_REQUIRE_CHECKPOINT", "1"))
+)
+PROGRESS_EVERY = int(os.environ.get("BVH_FOLD_LONG_PROGRESS_EVERY", "1"))
 MAX_GRAPH_FALLBACK = int(
     os.environ.get(
         "BVH_FOLD_LONG_MAX_GRAPH_FALLBACK",
@@ -69,6 +80,7 @@ GRAPH_DETAIL = re.compile(
     r"\[fs-graph-detail\] fallback_frames=(\[[^\n]*\]) "
     r"capacity_frames=(\[[^\n]*\])"
 )
+FRAME_PROGRESS = re.compile(r"\[fs-hl\] frame\s+(\d+)")
 
 
 def compute_apps() -> list[str]:
@@ -123,10 +135,13 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         CASE39_FRAME_START="0",
         CASE39_FRAME_END=str(FRAMES),
         CASE39ME_DUMP_VERTS=str(vertex_path),
-        CASE39ME_SAVE_CHECKPOINT=str(checkpoint_path),
         STIFF_MULTIENV_MODE=mode,
         GIPC_LOG_LEVEL="0",
     )
+    if REQUIRE_CHECKPOINT:
+        env["CASE39ME_SAVE_CHECKPOINT"] = str(checkpoint_path)
+    else:
+        env.pop("CASE39ME_SAVE_CHECKPOINT", None)
     graph_knobs = (
         "STIFF_FRAME_GRAPH",
         "STIFF_FRAME_FULL_GRAPH",
@@ -149,7 +164,10 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
     else:
         env.pop("CASE39_GRAPH_STATS", None)
 
-    command = [sys.executable, str(ROOT / "examples/replay_foldshirt_multienv.py")]
+    command = [
+        sys.executable,
+        str(REPLAY_ROOT / "examples/replay_foldshirt_multienv.py"),
+    ]
     if REQUIRE_IDLE:
         preflight = external_apps(compute_apps(), None)
         if preflight:
@@ -162,7 +180,7 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
-            cwd=ROOT,
+            cwd=REPLAY_ROOT,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -196,7 +214,15 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
             for line in process.stdout:
                 output_lines.append(line)
                 log.write(line)
-                if line.startswith(("[fs-hl] frame", "[fs-graph-audit]")):
+                frame_match = FRAME_PROGRESS.match(line)
+                show_frame = bool(
+                    frame_match
+                    and (
+                        PROGRESS_EVERY <= 1
+                        or int(frame_match.group(1)) % PROGRESS_EVERY == 0
+                    )
+                )
+                if show_frame or line.startswith("[fs-graph-audit]"):
                     print(f"[{mode}] {line.rstrip()}", flush=True)
                 if time.monotonic() - started > TIMEOUT:
                     process.terminate()
@@ -240,7 +266,8 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
             f"{mode}: completed {frame_count} frames/{env_count} envs, "
             f"expected {FRAMES}/{ENVS}"
         )
-    if not vertex_path.is_file() or not checkpoint_path.is_file():
+    if (not vertex_path.is_file()
+            or (REQUIRE_CHECKPOINT and not checkpoint_path.is_file())):
         raise RuntimeError(f"{mode}: final artifacts were not written")
     vertices = np.load(vertex_path)
     if not np.isfinite(vertices).all():
@@ -288,6 +315,11 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         "frames": FRAMES,
         "envs": ENVS,
         "graph": GRAPH,
+        "candidate": dict(sorted(candidate.items())),
+        "replay_root": str(REPLAY_ROOT),
+        "native_dir": env.get("STIFFGIPC_NATIVE_DIR"),
+        "gpu_idle_audited": REQUIRE_IDLE,
+        "gpu_idle_allowlist": list(IDLE_ALLOWLIST),
         "elapsed_s": elapsed,
         "mean_step_ms": float(mean_ms),
         "vertex_shape": list(vertices.shape),
@@ -300,7 +332,7 @@ def run_mode(mode: str, candidate: dict[str, str]) -> dict[str, object]:
         "graph_capacity_frames": graph_capacity_frames,
         "log": str(log_path),
         "vertices": str(vertex_path),
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(checkpoint_path) if REQUIRE_CHECKPOINT else None,
     }
     print(
         f"FOLD-LONG: {mode} PASS frames={FRAMES} elapsed={elapsed:.1f}s "

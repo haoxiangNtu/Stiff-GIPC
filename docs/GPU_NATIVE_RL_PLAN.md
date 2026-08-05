@@ -33,7 +33,7 @@ GPU-native RL.
 | Capability | Status | Evidence / remaining gap |
 | --- | --- | --- |
 | Newton, PCG, and line-search device continuation | Partial | Implemented for the whole-frame graph's eligible scene subset. |
-| Reusable articulated one-frame graph | Implemented for the current no-collision gate | `prepare_gpu_rl()` captures once; `launch_gpu_rl_async(stream)` reuses the executable. |
+| Reusable articulated one-frame graph | Implemented for the eligible collision subset | `prepare_gpu_rl()` captures once; `launch_gpu_rl_async(stream)` reuses the executable. The 4090 contact+friction gate records 1057 nodes. |
 | Device actions | Implemented | Writable packed float64 revolute/prismatic buffers are exported as raw device pointers. |
 | Device positions, velocities, status, frame counter | Implemented | Exported by `get_gpu_rl_device_abi()`. |
 | Zero graph H2D/D2H | Implemented and fail-closed | Capture audit rejects any host node, H2D node, or D2H node. |
@@ -49,6 +49,51 @@ The older `launch_episode_async()` API is an open-loop trajectory executor. It
 pre-uploads all actions and copies observations to pinned host slots. It remains
 useful for regression and throughput experiments, but it does **not** satisfy
 the definition above.
+
+### RTX 4090 node-level Nsight recheck (2026-08-05)
+
+`scripts/gpu_rl_contact_steady.py` is now self-contained: it arms the frame,
+full-frame, collision, and ABD-step graph knobs before its warm-up.  Previously
+those settings existed only in other gates' child environments, so invoking
+this script directly took the release layout and failed to train the ABD final
+assembly tier before `prepare_gpu_rl()`.
+
+The repaired standalone smoke reports 1057 graph nodes, graph H2D=0/D2H=0,
+43/43 completed frames and `result=0`.  Nsight Systems 2024.6.2 then captured
+the 40-step steady region with `--cuda-graph-trace=node`, rather than the
+default graph-level black box.  `scripts/nsys_gpu_rl_audit.py` reports:
+
+- 40 `cudaGraphLaunch`, 40 non-blocking completion-event records, and 80
+  24-byte D2D action publishes;
+- 5655 executed CUDA Graph node events, proving node-level tracing was active;
+- zero H2D and zero D2H rows over the complete capture;
+- zero synchronization API rows and zero CUPTI synchronization activities
+  inside the 2.461 ms host submission interval.
+
+The complete SQLite table contains one `cuCtxSynchronize` API row and two
+CUPTI synchronization activities **after** the final submission.  Timeline
+inspection places them in the `cudaProfilerStop`/Nsight flush boundary while
+the already-enqueued GPU work drains (the first starts 24 us after the last
+event record).  They are profiler-boundary work, not a simulation-step wait.
+Accordingly the precise claim is “zero synchronization in the steady
+submission loop,” not the misleading stronger claim “the exported SQLite
+contains zero synchronization rows.”
+
+Reproduction:
+
+```bash
+STIFFGIPC_NATIVE_DIR="$PWD/build-campaign-audit" \
+LD_LIBRARY_PATH="$PWD/build-campaign-audit" \
+nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --cuda-graph-trace=node --export=sqlite --force-overwrite=true \
+  --output=artifacts/nsys-contact-4090/contact-steady-node \
+  python3.10 scripts/gpu_rl_contact_steady.py --nsys
+
+scripts/nsys_gpu_rl_audit.py \
+  artifacts/nsys-contact-4090/contact-steady-node.sqlite \
+  --expected-steps 40
+```
 
 ## Device ABI (foundation block)
 

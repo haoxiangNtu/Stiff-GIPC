@@ -41,6 +41,19 @@ STEPS = int(os.environ.get("GPU_RL_CONTACT_STEPS", "40"))
 MEMCPY_D2D = 3
 
 
+def configure_graph_environment() -> None:
+    """Make the standalone D4 gate train and capture the intended path."""
+    # Unlike gpu_rl_gate.py, this script does not spawn a child with a
+    # prepared environment.  Without these process-local settings its
+    # synchronous warm-up uses the release layout, so it cannot train the ABD
+    # assembly tiers required by prepare_gpu_rl().
+    os.environ["STIFF_FRAME_GRAPH"] = "1"
+    os.environ["STIFF_FRAME_FULL_GRAPH"] = "1"
+    os.environ["STIFF_C4_COLLISION_GRAPH"] = "1"
+    os.environ["STIFF_C6_ABD_STEP_GRAPH"] = "1"
+    os.environ["STIFF_MULTIENV_MODE"] = "merged"
+
+
 def make_engine():
     from stiff_physics.engine import Config, Engine
 
@@ -116,6 +129,7 @@ def actions(total: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def main() -> None:
+    configure_graph_environment()
     nsys = "--nsys" in sys.argv[1:]
     engine = make_engine()
     cuda = Cudart()

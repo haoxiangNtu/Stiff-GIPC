@@ -674,12 +674,61 @@ to at least one baseline than the baselines are to each other (maximum
 0.0652--0.3751), while the frozen-frame gates still prove exact DCD/CCD
 physical and encoded candidate multisets.
 
-The four-env isolated graph-off baseline has also completed twice (326.5 and
-318.4 ms/batch).  First candidate samples put PLOC/refit at 326.5,
-query-order+subset at 319.7, and the combined bundle at 315.7 ms/batch.  Those
-signals are at or below the baseline's 2.5% run spread, so candidate repeats
-are required before an isolated performance claim.  The A800 repeat also
-remains a release blocker, so all candidate knobs remain opt-in.
+The same two-repeat matrix is complete for four real isolated environments:
+
+| isolated 4-env variant | two runs (ms/batch) | mean | versus baseline |
+|---|---:|---:|---:|
+| all candidates off | 326.5 / 318.4 | 322.45 | baseline |
+| PLOC++ / refit-128 | 326.5 / 311.4 | 318.95 | -1.09% |
+| VF-DCD query order + per-env subset | 319.7 / 313.1 | 316.40 | -1.88% |
+| PLOC/refit + query order + subset | 315.7 / 303.9 | **309.80** | **-3.92%** |
+
+PLOC/refit alone and query-order/subset alone are smaller than, or overlap,
+the baseline's 2.5% run spread; they remain isolated opt-ins rather than
+standalone winners.  The combination is different: both repeats beat the
+fastest baseline and its mean is 3.92% lower.  It is the measured isolated
+bundle, although the modest effect still warrants an A800 repeat before any
+default change.
+
+The terminal-state envelope remains conservative.  Baseline-to-baseline max
+position difference is 0.3907 (RMS 0.0291); the two combined runs are only
+0.1025--0.1112 from their nearest baseline (RMS 0.0064--0.0068) and 0.1120
+from each other.  Frozen frames continue to carry the stronger exact pair-set
+proof.  The A800 repeat remains a release blocker, so all candidate knobs stay
+opt-in.
+
+Whole-frame Graph is a residency/correctness result on this 4090, not the
+throughput winner.  The one graph-on sample was 117.7 ms/frame for merged,
+versus 89.35 ms for the matching graph-off combined-bundle mean (+31.7%).  For
+four isolated environments it was 434.3 versus 309.80 ms/batch (+40.2%).
+Those comparisons are not credited as two-repeat performance estimates, but
+the gap is too large to describe conditional Graph as an acceleration on this
+machine.  The BVH winner claims above therefore use graph-off A/B runs; Graph
+coverage separately proves that the candidates remain capture-safe.
+
+### Clean v0.8.5 comparison
+
+A separate clean worktree at tag `v0.8.5` (`2efaa72`) was built for sm_89 in
+Release mode with the viewer disabled and Python bindings enabled.  The
+historical tree has no `STIFFGIPC_DLTO` option; the campaign binary uses its
+normal DLTO-on Release configuration.  This is therefore a product-version
+comparison, not a claim that every cross-version delta comes from BVH alone.
+The causal BVH numbers remain the same-current-binary all-off/candidate A/B
+matrices above.
+
+Both historical variants completed two uncontaminated 1550-frame runs:
+
+| mode | v0.8.5 two runs | v0.8.5 mean | current all-off | current winner |
+|---|---:|---:|---:|---:|
+| merged, 1 env | 96.8 / 104.5 ms/frame | 100.65 | 96.05 (-4.57%) | PLOC/refit 87.75 (**-12.82%**) |
+| isolated, 4 env | 346.4 / 348.9 ms/batch | 347.65 | 322.45 (-7.25%) | combined 309.80 (**-10.89%**) |
+
+All four historical runs completed 1550/1550 with finite terminal vertices.
+The v0.8.5 isolated repeats differ by max 0.3756 and RMS 0.0239 at the
+terminal state, inside the same chaotic long-horizon scale already observed
+for current baselines.  Cross-version terminal hashes are deliberately not a
+correctness oracle; exact frozen-frame pair multisets, strict gold, and the
+same-binary terminal envelopes carry that proof.
 
 ## Current conclusions
 
@@ -706,9 +755,9 @@ remains a release blocker, so all candidate knobs remain opt-in.
   VF-only free run, so it remains opt-in and outside the winner bundle.
   EE-DCD is implemented and rejected alone (+60% family-path cost); corrected
   VF+EE is a frozen -11.9% DCD-path experiment but has no credited free-run
-  win.  Swept endpoint coherence is now measured and warrants a filtered CCD
-  replay prototype.  That replay is now implemented but saves only 0.52% of
-  the short whole profile, so it remains outside the bundle.  Isolated
+  win.  Swept endpoint coherence led to a filtered CCD replay prototype, but
+  that implementation saves only 0.52% of the short whole profile, so it
+  remains outside the bundle.  Isolated
   per-env cache generations remain pending.
 - The RBS-style query-order idea is useful specifically for VF-DCD: about
   39.2% off that merged kernel and 14.5% off the fixed merged workload.
@@ -717,4 +766,5 @@ remains a release blocker, so all candidate knobs remain opt-in.
   cheap enough that the combination measured about 6.8% end-to-end on the
   fixed four-env workload.  This is the second winner candidate after
   PLOC++/refit-128.  Both now survive the complete 1550-frame 4090 trajectory;
-  promotion still awaits the graph-off repeat/envelope and A800 proof.
+  the graph-off two-repeat/envelope matrix is complete, while promotion still
+  awaits the A800 proof.
