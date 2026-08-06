@@ -2384,14 +2384,41 @@ void GIPC::update_graph_training_capacity()
         std::max(graph_train_headroom_num(), m_episode_capture ? 2 : 1);
     for(int slot = 0; slot < 5; ++slot)
     {
-        const int want = gipc::assembly_capacity_tier(
-            std::max(256,
-                     static_cast<int>(std::max(m_peak_cpNum[slot],
-                                               h_cpNum[slot]))
-                         * headroom));
+        // [width-fit probe] the FIT variant must also drop m_peak_cpNum --
+        // that mirror is a RUNNING PEAK over the whole run (never reset), so
+        // using it would keep the trained width pinned to the peak even with
+        // the monotone max below removed.
+        static int s_fit_want = -1;
+        if(s_fit_want < 0)
+        {
+            const char* e = getenv("STIFF_GRAPH_TRAIN_FIT");
+            s_fit_want = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
+        }
+        const int observed =
+            s_fit_want ? static_cast<int>(h_cpNum[slot])
+                       : static_cast<int>(std::max(m_peak_cpNum[slot],
+                                                   h_cpNum[slot]));
+        const int want =
+            gipc::assembly_capacity_tier(std::max(256, observed * headroom));
+        // [width-fit probe] STIFF_GRAPH_TRAIN_FIT=1 drops the monotone peak
+        // and lets the trained width TRACK the current frame. The default
+        // policy is a running max, so one heavy frame pins every later light
+        // frame to the peak launch width for the rest of the run -- the
+        // suspected cause of the measured light-frame penalty (graph is
+        // -14.9% on heavy frames but +159.6% on light ones). Diagnostic only:
+        // shrinking mid-run makes the next heavier frame overflow into the
+        // existing boundary fallback, which is exactly what the bucketed
+        // multi-exec design would avoid.
+        static int s_fit = -1;
+        if(s_fit < 0)
+        {
+            const char* e = getenv("STIFF_GRAPH_TRAIN_FIT");
+            s_fit = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
+        }
         m_graph_train_cp[slot] =
-            std::max(m_graph_train_cp[slot],
-                     std::min(want, MAX_COLLITION_PAIRS_NUM));
+            s_fit ? std::min(want, MAX_COLLITION_PAIRS_NUM)
+                  : std::max(m_graph_train_cp[slot],
+                             std::min(want, MAX_COLLITION_PAIRS_NUM));
     }
     // [C6-f] Slot 0 stays TIERED (peak * headroom, from the loop above).
     //
