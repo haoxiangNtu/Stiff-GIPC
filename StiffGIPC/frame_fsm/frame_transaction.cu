@@ -239,6 +239,9 @@ struct EpisodeGraphContext
     HostAttemptSnapshot host_snapshot;
 };
 
+std::chrono::steady_clock::time_point g_frame_txn_entry =
+    std::chrono::steady_clock::now();
+
 bool knob_enabled(const char* name)
 {
     const char* value = std::getenv(name);
@@ -2522,7 +2525,9 @@ bool try_launch_full_graph(GIPC& ipc,
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
         fprintf(stderr,
-                "[frame-sections] pre_launch=%.1fms graph_wait=%.1fms\n",
+                "[frame-sections] boundary=%.1fms pre_launch=%.1fms "
+                "graph_wait=%.1fms\n",
+                ms(g_frame_txn_entry, t_enter),
                 ms(t_enter, t_launch),
                 ms(t_launch, t_done));
     }
@@ -4292,6 +4297,13 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
             true, true, m_total_newton_iters - before);
         return;
     }
+
+    // [frame-sections] transaction entry stamp: everything between here and
+    // t_enter (kappa re-init, friction rebuild, snapshots, capture training)
+    // is host-side per-frame cost that the existing pre_launch number does
+    // NOT cover. Light frames spend only 26-125 ms inside the graph but take
+    // 700-800 ms of wall, so that gap has to live in this span.
+    g_frame_txn_entry = std::chrono::steady_clock::now();
 
     int max_retries = 3;
     if(const char* configured = std::getenv("STIFF_FRAME_MAX_RETRIES"))
