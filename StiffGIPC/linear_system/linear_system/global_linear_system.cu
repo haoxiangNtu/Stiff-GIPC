@@ -374,25 +374,13 @@ void GlobalLinearSystem::spmv(Float                         a,
                     cap_st != cudaStreamCaptureStatusNone ? 1 : 0);
         }
     }
-    // [spmv-resize] Under frame-graph capture the recorded grid is the
-    // trained/armed extent — measured 12.2x the live unique count on fs4
-    // (1.66M vs 136k), which is the in-graph PCG's ~7x per-iteration cost
-    // (the kernel masks by d_unique_key_number, but every replayed iteration
-    // still schedules the full padded grid). Arm the device resizer so each
-    // replay launches ceil(live/256) blocks instead. Opt-in while A/B'd.
-    static int s_spmv_resize = -1;
-    if(s_spmv_resize < 0)
-    {
-        const char* e = getenv("STIFF_SPMV_RESIZE");
-        s_spmv_resize = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
-    }
-    int spmv_slot = -1;
-    if(s_spmv_resize)
-        spmv_slot = graph_resize::arm(
-            gipc_global_triplet->d_unique_key_number,
-            1,
-            256,
-            (_spmv_bound + 255) / 256);
+    // [resize cost model] The spmv node was armed with the device resizer and
+    // MEASURED A NET LOSS: three interleaved wall-clock rounds were unanimous
+    // (graph 1099/1027/1059 ms vs 1121/1070/1141 with the resizer). The resize
+    // kernel is itself a graph node, so it runs on every replay -- one <<<1,1>>>
+    // per PCG iteration, thousands per frame -- against a saving of nearly zero
+    // because masked blocks already exit immediately. The resizer belongs on
+    // frame-rate nodes with large padding, never inside the solver loop.
     m_spmv.warp_reduce_sym_spmv(a,
                                 gipc_global_triplet->block_values(),
                                 gipc_global_triplet->block_row_indices(),
@@ -405,7 +393,5 @@ void GlobalLinearSystem::spmv(Float                         a,
                                 m_s4_dof_to_group,
                                 m_s4_ng,
                                 gipc_global_triplet->d_unique_key_number);  // [B2'-a]
-    if(spmv_slot >= 0)
-        graph_resize::bind_last(spmv_slot);
 }
 }  // namespace gipc

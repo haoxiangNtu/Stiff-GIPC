@@ -953,15 +953,9 @@ void MASPreconditioner::SchwarzLocalXSym()
     int blockSize = BANKSIZE * BANKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
 
-    const int _rs_slot =
-        mas_apply_resize_enabled()
-            ? gipc::graph_resize::arm(device_cluster_count(), BANKSIZE * 3, blockSize, numBlocks)
-            : -1;
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym3<<<numBlocks, blockSize>>>(
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
-    if(_rs_slot >= 0)
-        gipc::graph_resize::bind_last(_rs_slot);
 }
 
 void MASPreconditioner::SchwarzLocalXSym_block3()
@@ -974,15 +968,9 @@ void MASPreconditioner::SchwarzLocalXSym_block3()
     int blockSize = BANKSIZE * BANKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
 
-    const int _rs_slot =
-        mas_apply_resize_enabled()
-            ? gipc::graph_resize::arm(device_cluster_count(), BANKSIZE, blockSize, numBlocks)
-            : -1;
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym6<<<numBlocks, blockSize>>>(
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
-    if(_rs_slot >= 0)
-        gipc::graph_resize::bind_last(_rs_slot);
 }
 
 void MASPreconditioner::SchwarzLocalXSym_sym()
@@ -995,17 +983,9 @@ void MASPreconditioner::SchwarzLocalXSym_sym()
     int blockSize = BANKSIZE * BANKSIZE;
     int numBlocks = (number + blockSize - 1) / blockSize;
 
-    // (1+BANKSIZE)/2 is not integral: round the multiplier UP so the resized
-    // grid is never narrower than the work.
-    const int _rs_slot =
-        mas_apply_resize_enabled()
-            ? gipc::graph_resize::arm(device_cluster_count(), (2 + BANKSIZE) / 2, blockSize, numBlocks)
-            : -1;
     //_schwarzLocalXSym1<<<numBlocks, blockSize>>>(d_MatMas, d_multiLevelR, d_multiLevelZ, number);
     _schwarzLocalXSym9<<<numBlocks, blockSize>>>(
         d_precondMatMas, d_multiLevelR, d_multiLevelZ, number, d_levelSize, levelnum);
-    if(_rs_slot >= 0)
-        gipc::graph_resize::bind_last(_rs_slot);
 }
 
 void MASPreconditioner::CollectFinalZ(double3* Z)
