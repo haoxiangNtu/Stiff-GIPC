@@ -483,6 +483,11 @@ class GIPC
     // [C6-b] Same story on the DCD/ground axes: h_cpNum/h_gpNum hold the LAST
     // Newton iteration's census, which is far below the frame's peak.
     uint32_t m_peak_cpNum[5] = {0, 0, 0, 0, 0};
+    // [width-shrink] consecutive frames each slot's load has been at least a
+    // tier below its trained width (hysteresis for STIFF_GRAPH_TRAIN_SHRINK).
+    int      m_train_low_streak[5] = {0, 0, 0, 0, 0};
+    int      m_width_rerecords      = 0;   // [width-shrink] policy activity
+    int      m_class_low_streak[4]  = {0, 0, 0, 0};
     uint32_t m_peak_gpNum    = 0;
     // [C6-b] Set by frame_graph_finish_terminal when a capacity tier actually
     // grew. A frame that overflowed can only be retried if the retry will run

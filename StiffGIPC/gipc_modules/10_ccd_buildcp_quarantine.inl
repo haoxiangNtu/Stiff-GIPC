@@ -2382,43 +2382,84 @@ void GIPC::update_graph_training_capacity()
     // throughput choice; episode captures keep the old 2x margin.
     const int headroom =
         std::max(graph_train_headroom_num(), m_episode_capture ? 2 : 1);
+    // [width-shrink] The legacy policy is a MONOTONE RUNNING PEAK: the
+    // trained width only ever grows, and m_peak_cpNum (its input) is a
+    // whole-run peak that is never reset. One heavy frame therefore pins
+    // every later frame to the peak launch width. Measured on A800 fs4-4env
+    // (3 rounds, pure replay time): letting the width track the load cuts
+    // total graph replay 14.9% and heavy-frame replay 30%, with zero
+    // overflow fallbacks -- the campaign's first reproducible win.
+    //
+    // Shrinking is hysteretic: a width only comes down after the load has
+    // stayed at least one tier below it for `hold` consecutive frames, so a
+    // single quiet frame cannot start a re-record oscillation. Growth stays
+    // immediate. A width change forces one re-record (buffers are NOT
+    // reallocated -- they keep the larger allocation and we simply launch
+    // narrower), measured at 25-28 ms.
+    //
+    // STIFF_GRAPH_TRAIN_SHRINK=<hold frames>; 0/unset keeps the legacy
+    // monotone policy.
+    static int s_hold = -1;
+    if(s_hold < 0)
+    {
+        const char* e = getenv("STIFF_GRAPH_TRAIN_SHRINK");
+        s_hold        = e && e[0] ? std::max(0, atoi(e)) : 0;
+    }
+    const bool shrink_on = s_hold > 0;
+    bool       width_changed = false;
     for(int slot = 0; slot < 5; ++slot)
     {
-        // [width-fit probe] the FIT variant must also drop m_peak_cpNum --
-        // that mirror is a RUNNING PEAK over the whole run (never reset), so
-        // using it would keep the trained width pinned to the peak even with
-        // the monotone max below removed.
-        static int s_fit_want = -1;
-        if(s_fit_want < 0)
-        {
-            const char* e = getenv("STIFF_GRAPH_TRAIN_FIT");
-            s_fit_want = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
-        }
         const int observed =
-            s_fit_want ? static_cast<int>(h_cpNum[slot])
-                       : static_cast<int>(std::max(m_peak_cpNum[slot],
-                                                   h_cpNum[slot]));
-        const int want =
-            gipc::assembly_capacity_tier(std::max(256, observed * headroom));
-        // [width-fit probe] STIFF_GRAPH_TRAIN_FIT=1 drops the monotone peak
-        // and lets the trained width TRACK the current frame. The default
-        // policy is a running max, so one heavy frame pins every later light
-        // frame to the peak launch width for the rest of the run -- the
-        // suspected cause of the measured light-frame penalty (graph is
-        // -14.9% on heavy frames but +159.6% on light ones). Diagnostic only:
-        // shrinking mid-run makes the next heavier frame overflow into the
-        // existing boundary fallback, which is exactly what the bucketed
-        // multi-exec design would avoid.
-        static int s_fit = -1;
-        if(s_fit < 0)
+            shrink_on ? static_cast<int>(h_cpNum[slot])
+                      : static_cast<int>(
+                            std::max(m_peak_cpNum[slot], h_cpNum[slot]));
+        const int want = std::min(
+            gipc::assembly_capacity_tier(std::max(256, observed * headroom)),
+            MAX_COLLITION_PAIRS_NUM);
+        const int cur = m_graph_train_cp[slot];
+        if(want > cur)
         {
-            const char* e = getenv("STIFF_GRAPH_TRAIN_FIT");
-            s_fit = e && e[0] ? (atoi(e) != 0 ? 1 : 0) : 0;
+            // Under the legacy monotone policy a width increase could stay
+            // silent: the recorded (narrower) launch would overflow, the
+            // frame would fall back to the host solver, and the boundary
+            // would then grow and re-record. That reactive path costs a whole
+            // host-mode frame. Once shrinking is enabled the load rises again
+            // routinely, so pay the cheap proactive re-record (~25 ms)
+            // instead of the expensive fallback.
+            m_graph_train_cp[slot]   = want;
+            m_train_low_streak[slot] = 0;
+            if(shrink_on)
+                width_changed = true;
         }
-        m_graph_train_cp[slot] =
-            s_fit ? std::min(want, MAX_COLLITION_PAIRS_NUM)
-                  : std::max(m_graph_train_cp[slot],
-                             std::min(want, MAX_COLLITION_PAIRS_NUM));
+        else if(shrink_on && want < cur)
+        {
+            if(++m_train_low_streak[slot] >= s_hold)
+            {
+                m_graph_train_cp[slot]   = want;
+                m_train_low_streak[slot] = 0;
+                width_changed            = true;
+            }
+        }
+        else
+        {
+            m_train_low_streak[slot] = 0;
+        }
+    }
+    if(width_changed)
+    {
+        ++m_width_rerecords;
+        if(getenv("STIFF_GRAPH_TRAIN_SHRINK_DIAG"))
+            fprintf(stderr,
+                    "[width-train] frame=%d rerecords=%d widths=[%d %d %d %d %d]\n",
+                    static_cast<int>(m_total_frames),
+                    m_width_rerecords,
+                    m_graph_train_cp[0], m_graph_train_cp[1],
+                    m_graph_train_cp[2], m_graph_train_cp[3],
+                    m_graph_train_cp[4]);
+        // Same signal the tier-GROWTH path uses: the recorded launches carry
+        // the old extents, so the executable must be re-recorded.
+        m_graph_tier_grew = true;
+        ++pcg_buffer_generation();
     }
     // [C6-f] Slot 0 stays TIERED (peak * headroom, from the loop above).
     //
@@ -2684,6 +2725,13 @@ void GIPC::train_collision_graph_capacities()
                     gipc_global_triplet.m_contact_class_tier[3]);
         const bool class_possible[4] = {
             true, has_abd && has_fem, has_abd && has_fem, has_abd};
+        static int s_class_hold = -1;
+        if(s_class_hold < 0)
+        {
+            const char* e = getenv("STIFF_GRAPH_TRAIN_SHRINK");
+            s_class_hold  = e && e[0] ? std::max(0, atoi(e)) : 0;
+        }
+        const int class_shrink_hold = s_class_hold;
         for(int s = 0; s < 4; ++s)
         {
             if(!class_possible[s])
@@ -2731,10 +2779,36 @@ void GIPC::train_collision_graph_capacities()
             }
             const int tier = gipc::assembly_capacity_tier(
                 static_cast<int>(std::max<long long>(256, want)));
-            if(gipc_global_triplet.m_contact_class_tier[s] < tier)
+            // [width-shrink] THIS is where the graph's real padding lives: the
+            // contact-class tiers shape the staging/convert/assembly extents
+            // (measured 971k live in a 2097k tier). Like the pair tiers they
+            // were monotone, so one heavy frame pinned every later frame to
+            // the peak layout -- the +119.5% light-frame penalty. Same
+            // hysteretic policy: grow at once, shrink only after the demand
+            // has stayed a tier below for `hold` consecutive frames. Both
+            // directions bump the generation, so the executable is re-recorded
+            // at the new extents (~25 ms) instead of discovering them through
+            // an overflow fallback.
+            const int cur_tier = gipc_global_triplet.m_contact_class_tier[s];
+            if(cur_tier < tier)
             {
                 gipc_global_triplet.m_contact_class_tier[s] = tier;
+                m_class_low_streak[s]                       = 0;
                 ++pcg_buffer_generation();
+            }
+            else if(class_shrink_hold > 0 && tier < cur_tier)
+            {
+                if(++m_class_low_streak[s] >= class_shrink_hold)
+                {
+                    gipc_global_triplet.m_contact_class_tier[s] = tier;
+                    m_class_low_streak[s]                       = 0;
+                    ++m_width_rerecords;
+                    ++pcg_buffer_generation();
+                }
+            }
+            else
+            {
+                m_class_low_streak[s] = 0;
             }
         }
         long long stable_count = 0;
