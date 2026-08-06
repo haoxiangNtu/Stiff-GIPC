@@ -116,6 +116,8 @@ void SimEngine::teleport_fem_vertices(const double* xyz, int count,
     // set gives the first post-reset step a garbage descent direction).
     if(!m_impl->ipc.m_skip_all_collision)
     {
+        m_impl->ipc.bvh_f.invalidateRefitTopology();
+        m_impl->ipc.bvh_e.invalidateRefitTopology();
         m_impl->ipc.buildBVH();
         m_impl->ipc.buildCP();
     }

@@ -42,6 +42,18 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(STIFFGIPC_ENABLE_DIAGNOSTICS
        "Build intrusive finite-difference diagnostics and Python debug hooks"
        OFF)
+set(STIFFGIPC_BVH_STACK_CAP "2048" CACHE STRING
+    "Per-thread explicit LBVH traversal stack capacity (validation knob)")
+option(STIFFGIPC_BVH_TRAVERSAL_AUDIT
+       "Compile low-overhead per-query BVH traversal census counters" OFF)
+option(STIFFGIPC_BVH_COHERENCE_AUDIT
+       "Compile host-side per-body/body-pair BVH coherence shadow audit" OFF)
+if(NOT STIFFGIPC_BVH_STACK_CAP MATCHES "^[0-9]+$"
+   OR STIFFGIPC_BVH_STACK_CAP LESS 16)
+    message(FATAL_ERROR
+        "STIFFGIPC_BVH_STACK_CAP must be an integer >= 16; got "
+        "'${STIFFGIPC_BVH_STACK_CAP}'")
+endif()
 set(STIFFGIPC_FEM_MODEL "SNK1" CACHE STRING
     "Compile-time tetrahedral constitutive model: SNK1, SNK2, or ARAP")
 set_property(CACHE STIFFGIPC_FEM_MODEL PROPERTY STRINGS SNK1 SNK2 ARAP)
@@ -136,6 +148,21 @@ file(GLOB_RECURSE GIPC_ALL_SOURCE CONFIGURE_DEPENDS
     "StiffGIPC/*.cu" "StiffGIPC/*.cpp")
 file(GLOB_RECURSE GIPC_ALL_HEADERS CONFIGURE_DEPENDS
     "StiffGIPC/*.h" "StiffGIPC/*.cuh" "StiffGIPC/*.hpp" "StiffGIPC/*.inl" "StiffGIPC/*.inc")
+set(GIPC_MLBVH_SOURCE_DEFS
+    "STIFF_BVH_STACK_CAP=${STIFFGIPC_BVH_STACK_CAP}")
+if(STIFFGIPC_BVH_TRAVERSAL_AUDIT)
+    list(APPEND GIPC_MLBVH_SOURCE_DEFS STIFF_BVH_TRAVERSAL_AUDIT_BUILD)
+endif()
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/StiffGIPC/mlbvh.cu"
+    PROPERTIES COMPILE_DEFINITIONS "${GIPC_MLBVH_SOURCE_DEFS}")
+if(STIFFGIPC_BVH_TRAVERSAL_AUDIT)
+    # Activation and margin setup are compiled in the GIPC composite TU.  The
+    # old mlbvh-only definition built counters but silently never armed them.
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/StiffGIPC/GIPC.cu"
+        PROPERTIES COMPILE_DEFINITIONS STIFF_BVH_TRAVERSAL_AUDIT_BUILD)
+endif()
 
 # Exclude gl_main.cu from the library (it contains main() and GL code)
 list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "gl_main\\.cu$")
@@ -143,6 +170,9 @@ if(STIFFGIPC_ENABLE_DIAGNOSTICS)
     list(APPEND GIPC_PHYSICS_DEFS GIPC_ENABLE_DIAGNOSTICS)
 else()
     list(FILTER GIPC_ALL_SOURCE EXCLUDE REGEX "diagnostics/fd_check\\.cu$")
+endif()
+if(STIFFGIPC_BVH_COHERENCE_AUDIT)
+    list(APPEND GIPC_PHYSICS_DEFS STIFF_BVH_COHERENCE_AUDIT_BUILD)
 endif()
 
 add_library(stiffgipc_core SHARED ${GIPC_ALL_SOURCE} ${GIPC_ALL_HEADERS})

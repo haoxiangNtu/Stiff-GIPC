@@ -46,4 +46,12 @@ print("VHASH", hashlib.sha256(V.tobytes()).hexdigest()[:16])
 print("NEWTON", eng.native.get_total_newton_iters())   # [C3] envelope input
 if os.environ.get("DUMP_POS"):                          # [C3] equivalence input
     np.save(os.environ["DUMP_POS"], V)
+if os.environ.get("DUMP_PAIRS"):                        # BVH candidate-set oracle
+    # This diagnostic rebuilds the post-step DCD set but cannot affect V above.
+    # The candidate gate runs it in a disposable child process, after the last
+    # simulated frame, so it also cannot perturb a later solver iteration.
+    np.save(
+        os.environ["DUMP_PAIRS"],
+        np.asarray(eng.native.get_collision_pairs_clean(), dtype=np.int32),
+    )
 print("SCENE_OK")

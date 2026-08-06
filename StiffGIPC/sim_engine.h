@@ -658,6 +658,16 @@ class SimEngine
     /// pair count. Pass out_flat=nullptr to just get the count. Read-only path.
     int    get_collision_pairs_clean(int* out_flat) const;
 
+    /// Validation-only swept-BVH oracle. Copies an explicit host motion field
+    /// (move_count double3 values), rebuilds the full-CCD candidate set at
+    /// alpha, and decodes it with the same clean representation as the DCD
+    /// getter. This mutates the solver's scratch direction, so callers must use
+    /// it only after the last simulated frame in a disposable process.
+    int    get_ccd_pairs_clean(const double* move_flat,
+                               int           move_count,
+                               double        alpha,
+                               int*          out_flat) const;
+
     /// [Step B] GPU-resident per-contact force export for the Newton ContactSensor.
     /// compute_contacts() fills grow-only device buffers and returns the contact
     /// count; contacts_pair_ptr()/contacts_force_ptr() return raw device pointers
@@ -729,6 +739,11 @@ class SimEngine
     double get_max_collision_pairs() const;
     int    get_total_frames_done() const;
     uint64_t get_total_energy_tolerance_accepts() const;
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+    /// Validation-only host shadow report. This synchronizes and prints the
+    /// global, per-body, and eligible body-pair cache-reuse census.
+    void print_bvh_coherence_audit() const;
+#endif
 #ifdef GIPC_ENABLE_DIAGNOSTICS
     // Intrusive test-only diagnostics; omitted from production builds.
     std::vector<double> debug_fd_gradient_check(double h, int nprobes, unsigned seed);

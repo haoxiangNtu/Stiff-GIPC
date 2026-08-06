@@ -59,6 +59,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_EE_CANON, "mode_strict") \
     X(STIFF_EE_DETGATE, "mode_strict") \
     X(STIFF_EE_LB, "perf") \
+    X(STIFF_EE_RANGE_PRUNE, "perf") \
     X(STIFF_EE_NODEDUP, "solver") \
     X(STIFF_EE_NOMOLLIFY, "solver") \
     X(STIFF_EE_TRACE, "diag") \
@@ -147,6 +148,36 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_SPLIT_GH, "solver") \
     X(STIFF_SPMV_DET, "mode_strict") \
     X(STIFF_STACK_DIAG, "diag") \
+    X(STIFF_BVH_TRAVERSAL_AUDIT, "diag") \
+    X(STIFF_BVH_MARGIN_SCALE, "diag") \
+    X(STIFF_BVH_COHERENCE_AUDIT, "diag") \
+    X(STIFF_BVH_CCD_COHERENCE_AUDIT, "diag") \
+    X(STIFF_BVH_FRONT_REUSE, "perf") \
+    X(STIFF_BVH_QUERY_ORDER, "perf") \
+    X(STIFF_BVH_PERENV_QUERY_SUBSET, "perf") \
+    X(STIFF_BVH_BODY_MAJOR, "perf") \
+    X(STIFF_BVH_BODY_MAJOR_MASK, "perf") \
+    X(STIFF_BVH_PAIR_CACHE, "perf") \
+    X(STIFF_BVH_PAIR_CACHE_CAP, "perf") \
+    X(STIFF_BVH_PAIR_CACHE_DEVICE, "perf") \
+    X(STIFF_BVH_PAIR_CACHE_MASK, "perf") \
+    X(STIFF_BVH_PAIR_CACHE_STATS, "diag") \
+    X(STIFF_BVH_PAIR_WORK_AUDIT, "diag") \
+    X(STIFF_BVH_PAIR_WORK_DETAIL, "diag") \
+    X(STIFF_BVH_MORTON14, "perf") \
+    X(STIFF_BVH_PLOC, "perf") \
+    X(STIFF_BVH_PLOC_CHUNK, "perf") \
+    X(STIFF_BVH_REFIT_INTERVAL, "perf") \
+    X(STIFF_BVH_REFIT_MASK, "perf") \
+    X(STIFF_BVH_REFIT_STATS, "diag") \
+    X(STIFF_BVH_PLOC_MASK, "perf") \
+    X(STIFF_BVH_PLOC_RADIUS, "perf") \
+    X(STIFF_BVH_WIDE8, "perf") \
+    X(STIFF_BVH_WIDE8_MASK, "perf") \
+    X(STIFF_BVH_SAH_ORACLE, "diag") \
+    X(STIFF_BVH_SAH_ROTATIONS, "perf") \
+    X(STIFF_BVH_SAH_ROTATION_MASK, "perf") \
+    X(STIFF_BVH_SAH_ROTATION_PHASE, "perf") \
     X(STIFF_XENV, "diag") \
     X(STIFF_XENV_DUMP, "diag") \
     X(STIFF_XENV_ID, "diag") \

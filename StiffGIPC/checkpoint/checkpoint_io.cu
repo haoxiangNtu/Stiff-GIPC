@@ -1232,6 +1232,11 @@ void GIPC::load_checkpoint(device_TetraData& mesh, const char* raw_path)
     // Same reconstruct-on-restore principle as friction anchors and Kappa.
     if(!m_skip_all_collision)
     {
+        // A checkpoint may jump arbitrarily far from the topology's build
+        // state.  Refit would remain complete, but can inherit a catastrophically
+        // poor tree; force one quality rebuild at this explicit boundary.
+        bvh_f.invalidateRefitTopology();
+        bvh_e.invalidateRefitTopology();
         buildBVH();
         buildCP();
     }

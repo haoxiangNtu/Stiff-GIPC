@@ -455,12 +455,19 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
     if(ccd_par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;
                   ccd_K = (int)h_perenv_active.size(); if(ccd_K > cap) ccd_K = cap; if(ccd_K < 1) ccd_K = 1;
                   allocPerEnvPool(ccd_K); }
-    BvhScratch cof{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,
+    BvhScratch cof{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,bvh_f.m_node_max_element,
                    bvh_f._sort_tmp,bvh_f._sort_tmp_bytes,bvh_f._mch_alt,bvh_f._idx_alt,bvh_f._sort_cap};
-    BvhScratch coe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,
+    BvhScratch coe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,bvh_e.m_node_max_element,
                    bvh_e._sort_tmp,bvh_e._sort_tmp_bytes,bvh_e._mch_alt,bvh_e._idx_alt,bvh_e._sort_cap};
+    int* saved_f_node_body = bvh_f.m_node_body;
+    int* saved_e_node_body = bvh_e.m_node_body;
+    // See the DCD per-env path: pool slots have no cache-generation-local
+    // body labels yet, so never race on the main tree's arrays.
+    bvh_f.m_node_body = nullptr;
+    bvh_e.m_node_body = nullptr;
     auto cswapIn = [](lbvh& b, BvhScratch& s){ b._nodes=s.nodes; b._bvs=s.bvs; b._MChash=s.mch;
         b._indices=s.idx; b._tempLeafBox=s.tmp; b._flags=s.flags; b.m_node_env=s.node_env;
+        b.m_node_max_element=s.node_max_element;
         b._sort_tmp=s.sort_tmp; b._sort_tmp_bytes=s.sort_bytes;
         b._mch_alt=s.mch_alt; b._idx_alt=s.idx_alt; b._sort_cap=s.sort_cap; };
   ccd_redo:
@@ -479,6 +486,14 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
                 if(ccd_par) cswapIn(bvh_f, m_pool_f[ci % ccd_K]);
                 bvh_f._active_idx        = d_perenv_face_idx + h_perenv_face_off[e];
                 bvh_f.face_number_active = h_perenv_face_cnt[e];
+                bvh_f._active_query_idx = nullptr;
+                bvh_f.query_number_active = 0;
+                if(d_perenv_surf_idx && h_perenv_surf_cnt[e] > 0)
+                {
+                    bvh_f._active_query_idx = d_perenv_surf_idx
+                                              + h_perenv_surf_off[e];
+                    bvh_f.query_number_active = h_perenv_surf_cnt[e];
+                }
                 bvh_f.ConstructFullCCD(_moveDir, alpha, st, aedev);
                 bvh_f.SelfCollitionFullDetect(dHat, _moveDir, alpha, st, aedev);
             }
@@ -509,7 +524,10 @@ void GIPC::buildBVH_and_CP_perenv_CCD(double alpha, const double* alpha_dev)
         goto ccd_redo;
     }
     bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;
+    bvh_f._active_query_idx = nullptr; bvh_f.query_number_active = 0;
     bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
+    bvh_f.m_node_body = saved_f_node_body;
+    bvh_e.m_node_body = saved_e_node_body;
     bvh_f._vertexes = sf;
     bvh_e._vertexes = se;
     m_last_ccd_pair_count = static_cast<uint32_t>(h_ccd_cpNum);
@@ -528,6 +546,13 @@ void GIPC::buildFullCP(const double& alpha, const double* alpha_dev)
         m_last_ccd_pair_count = 0;
         return;
     }
+
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+    // A swept Verlet proof must track both segment endpoints.  Reusing the
+    // DCD cache's start-position-only decision would be incomplete whenever
+    // the Newton direction or device alpha changes.
+    auditBvhSweptTemporalCoherence(alpha, alpha_dev);
+#endif
 
     // [multi-env P2] per-env CCD path (the swept-BVH equivalent of the per-env DCD path).
     // [C5] m_graph_merged_detect forces the merged swept path (see buildCP).
@@ -760,6 +785,66 @@ static void _build_perenv_list(const int* d_env, int n, int NG,
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_idx, (size_t)(acc > 0 ? acc : 1) * sizeof(int)));
     if(acc) CUDA_SAFE_CALL(cudaMemcpy(d_idx, idx.data(), (size_t)acc * sizeof(int), cudaMemcpyHostToDevice));
 }
+
+// Surface queries need GLOBAL vertex ids rather than slots in _surfVerts.
+// Build the topology-static per-env lists once on the host, just like the
+// primitive lists above.  This is an exact launch-domain reduction: the old
+// path queried every environment and rejected foreign leaves via _same_env.
+static void _build_perenv_surface_list(const uint32_t* d_surf,
+                                       int             n_surf,
+                                       const int*      d_p2g,
+                                       int             n_vertex,
+                                       int             NG,
+                                       uint32_t*&      d_idx,
+                                       std::vector<int>& off,
+                                       std::vector<int>& cnt)
+{
+    std::vector<uint32_t> surf(n_surf);
+    std::vector<int> p2g(n_vertex);
+    CUDA_SAFE_CALL(cudaMemcpy(surf.data(), d_surf,
+                              (size_t)n_surf * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(p2g.data(), d_p2g,
+                              (size_t)n_vertex * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+    off.assign(NG, 0);
+    cnt.assign(NG, 0);
+    int ungrouped = 0;
+    for(uint32_t vertex : surf)
+    {
+        const int env = vertex < (uint32_t)n_vertex ? p2g[vertex] : -1;
+        if(env >= 0 && env < NG)
+            ++cnt[env];
+        else
+            ++ungrouped;
+    }
+    int total = 0;
+    for(int env = 0; env < NG; ++env)
+    {
+        off[env] = total;
+        total += cnt[env];
+    }
+    std::vector<uint32_t> idx(total);
+    std::vector<int> cursor(off);
+    for(uint32_t vertex : surf)
+    {
+        const int env = vertex < (uint32_t)n_vertex ? p2g[vertex] : -1;
+        if(env >= 0 && env < NG)
+            idx[cursor[env]++] = vertex;
+    }
+    if(ungrouped)
+        printf("[perenv-bvh] WARNING %d/%d surface vertices ungrouped; excluded from query subsets\n",
+               ungrouped, n_surf);
+    if(d_idx)
+        CUDA_SAFE_CALL(cudaFree(d_idx));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_idx,
+                              (size_t)(total > 0 ? total : 1)
+                                  * sizeof(uint32_t)));
+    if(total)
+        CUDA_SAFE_CALL(cudaMemcpy(d_idx, idx.data(),
+                                  (size_t)total * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice));
+}
 // [env-det] enable env-major Morton on the MERGED BVH: compute per-prim env id (p2g of the prim's
 // first vertex) once, point the BVHs at it, and turn on the env-major sort key. Co-located identical
 // envs then build env-blocked (mirror) trees ⇒ env-symmetric broad-phase enumeration.
@@ -848,6 +933,17 @@ void GIPC::buildPerEnvBVHIndex(int NG, const int* p2g)
     _build_perenv_list(d_eenv, nE, NG, d_perenv_edge_idx,
                        h_perenv_edge_off, h_perenv_edge_cnt,
                        ekey.empty() ? nullptr : &ekey, m_mode_config.bvh_envdet);
+    const char* subset_env = getenv("STIFF_BVH_PERENV_QUERY_SUBSET");
+    const bool query_subset = subset_env && strtol(subset_env, nullptr, 0) != 0;
+    if(query_subset)
+        _build_perenv_surface_list(bvh_f._surfVerts,
+                                   (int)bvh_f.vert_number,
+                                   p2g,
+                                   vertexNum,
+                                   NG,
+                                   d_perenv_surf_idx,
+                                   h_perenv_surf_off,
+                                   h_perenv_surf_cnt);
     CUDA_SAFE_CALL(cudaFree(d_fenv));
     CUDA_SAFE_CALL(cudaFree(d_eenv));
     int tf = 0, te = 0;
@@ -857,8 +953,9 @@ void GIPC::buildPerEnvBVHIndex(int NG, const int* p2g)
         tf += h_perenv_face_cnt[e]; te += h_perenv_edge_cnt[e];
         if(h_perenv_face_cnt[e] > 0 || h_perenv_edge_cnt[e] > 0) h_perenv_active.push_back(e);
     }
-    printf("[perenv-bvh] built per-env index: NG=%d active=%zu faces %d/%d edges %d/%d\n",
-           NG, h_perenv_active.size(), tf, nF, te, nE);
+    printf("[perenv-bvh] built per-env index: NG=%d active=%zu faces %d/%d edges %d/%d query-subset=%s\n",
+           NG, h_perenv_active.size(), tf, nF, te, nE,
+           query_subset ? "on" : "off");
 }
 
 // P2: per-env Construct+Detect on LOCAL _vertexes (full precision, per-env identical, no cross-
@@ -904,6 +1001,9 @@ void GIPC::allocPerEnvPool(int K)
             CUDA_SAFE_CALL(cudaMalloc((void**)&s.tmp,nE*sizeof(AABB)));
             CUDA_SAFE_CALL(cudaMalloc((void**)&s.flags,(nE-1)*sizeof(uint32_t)));
             CUDA_SAFE_CALL(cudaMalloc((void**)&s.node_env,(2*nE-1)*sizeof(int)));
+            if(bvh_e.m_node_max_element)
+                CUDA_SAFE_CALL(cudaMalloc((void**)&s.node_max_element,
+                                          (2*nE-1)*sizeof(uint32_t)));
             allocSort(s, nE); }
     }
     m_pool_streams.resize(K);

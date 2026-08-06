@@ -312,6 +312,11 @@ def main():
         print(f"[fs] CASE39ME_PHASE={phase} -> envs offset across trajectory "
               f"(env e at frame fr+{phase}*e); heterogeneous difficulty", flush=True)
 
+    load_checkpoint = os.environ.get("CASE39ME_LOAD_CHECKPOINT")
+    if load_checkpoint:
+        eng.native.load_checkpoint(load_checkpoint)
+        print(f"[fs] checkpoint loaded <- {load_checkpoint}", flush=True)
+
     if int(os.environ.get("CASE39ME_HEADLESS","0")):
         f0 = int(os.environ.get("CASE39_FRAME_START","0"))
         f1 = min(int(os.environ.get("CASE39_FRAME_END", str(len(actions)))), len(actions))
@@ -382,6 +387,8 @@ def main():
         graph_frames = 0
         fallback_frames = 0
         overflow_frames = 0
+        graph_fallback_ids = []
+        graph_capacity_ids = []
         graph_audit = bool(int(os.environ.get("CASE39_GRAPH_STATS", "0")))
         for fr in range(f0, f1):
             for e, ej in enumerate(ejs):
@@ -393,8 +400,14 @@ def main():
                     graph_frames += 1
                 else:
                     fallback_frames += 1
-                if int(_st.invalid_bits) & ((1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)):
+                    graph_fallback_ids.append(fr)
+                _capacity_bits = ((1 << 16) | (1 << 17) | (1 << 18)
+                                  | (1 << 19) | (1 << 20))
+                _observed_capacity = (int(_st.invalid_bits)
+                                      | int(_st.retry_invalid_bits))
+                if _observed_capacity & _capacity_bits:
                     overflow_frames += 1
+                    graph_capacity_ids.append(fr)
             if recorder is not None and fr % recorder[4] == 0:
                 (_mp4, _usd, _faces_all, _face_is_abd, _st) = recorder
                 _v = np.asarray(eng.get_vertices())
@@ -448,10 +461,13 @@ def main():
             if _usd is not None:
                 _usd[0].GetRootLayer().Save()
                 print(f"[fs-rec] wrote {usd_path}", flush=True)
-        mm = float(np.mean(ms))
-        print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({1000.0/mm:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
+        mm = float(np.mean(ms)) if ms else 0.0
+        fps = 1000.0 / mm if mm > 0.0 else 0.0
+        print(f"\n[fs-hl] {num_envs} envs, {len(ms)} frames: mean {mm:.1f}ms ({fps:.2f} fps) = {mm/num_envs:.1f} ms/env", flush=True)
         if graph_audit:
             print(f"[fs-graph-audit] full={graph_frames} fallback={fallback_frames} overflow={overflow_frames}", flush=True)
+            print(f"[fs-graph-detail] fallback_frames={graph_fallback_ids} "
+                  f"capacity_frames={graph_capacity_ids}", flush=True)
         # [release gate] final-state vertex dump for the strict bitwise trio
         # (cross-env / batch-invariance / run-to-run). Engine-local vertices are
         # co-located across envs in strict layout, so slices compare bitwise.
@@ -462,6 +478,110 @@ def main():
                                for r in eng.get_load_records()], dtype=np.int64)
             np.save(dump.replace(".npy", "_recs.npy"), recs)
             print(f"[fs-hl] verts dumped -> {dump} (+recs)", flush=True)
+        save_checkpoint = os.environ.get("CASE39ME_SAVE_CHECKPOINT")
+        if save_checkpoint:
+            eng.native.save_checkpoint(save_checkpoint)
+            print(f"[fs] checkpoint saved -> {save_checkpoint}", flush=True)
+        pair_dump = os.environ.get("CASE39ME_DUMP_PAIRS")
+        ccd_pair_dump = os.environ.get("CASE39ME_DUMP_CCD_PAIRS")
+        traversal_audit = bool(os.environ.get("STIFF_BVH_TRAVERSAL_AUDIT"))
+        if traversal_audit:
+            names = ("vf_dcd", "ee_dcd", "vf_ccd", "ee_ccd")
+            rows = np.asarray(
+                eng.native._get_bvh_traversal_audit(), dtype=np.uint64
+            )
+            for name, row in zip(names, rows):
+                print(
+                    f"[bvh-audit-trajectory] family={name} queries={row[0]} "
+                    f"node_pops={row[1]} overlapping_children={row[2]} "
+                    f"primitive_tests={row[3]}",
+                    flush=True,
+                )
+            if os.environ.get("STIFF_BVH_BODY_AUDIT"):
+                body_rows = np.asarray(
+                    eng.native._get_bvh_traversal_body_audit(),
+                    dtype=np.uint64,
+                )
+                for family, name in enumerate(names):
+                    for body, row in enumerate(body_rows[family]):
+                        if row[0]:
+                            print(
+                                f"[bvh-audit-body-trajectory] family={name} "
+                                f"body={body} queries={row[0]} "
+                                f"node_pops={row[1]} "
+                                f"overlapping_children={row[2]} "
+                                f"primitive_tests={row[3]}",
+                                flush=True,
+                            )
+        if traversal_audit and (pair_dump or ccd_pair_dump):
+            eng.native._reset_bvh_traversal_audit()
+        if pair_dump:
+            # Validation-only post-replay oracle.  Rebuilding the final DCD set
+            # happens after all timed/simulated frames, so it cannot feed back
+            # into the trajectory whose vertices were dumped above.
+            pair_rebuilds = max(
+                1, int(os.environ.get("CASE39ME_PAIR_REBUILDS", "1"))
+            )
+            clean_pairs = None
+            for _ in range(pair_rebuilds):
+                clean_pairs = eng.native.get_collision_pairs_clean()
+            np.save(pair_dump, np.asarray(clean_pairs, dtype=np.int32))
+            print(f"[fs-hl] clean pairs dumped -> {pair_dump}", flush=True)
+        if ccd_pair_dump:
+            # Deterministic non-rigid swept field: exercises full-CCD boxes and
+            # traversal from the exact loaded checkpoint. This is a destructive
+            # scratch diagnostic and therefore runs only after all real frames.
+            vertices = np.asarray(eng.get_vertices(), dtype=np.float64)
+            ids = np.arange(len(vertices), dtype=np.float64)
+            scale = float(os.environ.get("CASE39ME_CCD_TEST_SCALE", "1e-3"))
+            motion = scale * np.column_stack((
+                np.sin(ids * 0.017 + vertices[:, 1] * 0.31),
+                np.cos(ids * 0.013 + vertices[:, 2] * 0.29),
+                np.sin(ids * 0.011 + vertices[:, 0] * 0.37),
+            ))
+            ccd_pair_rebuilds = max(
+                1, int(os.environ.get("CASE39ME_CCD_PAIR_REBUILDS", "1"))
+            )
+            ccd_pairs = None
+            for _ in range(ccd_pair_rebuilds):
+                ccd_pairs = eng.native.get_ccd_pairs_clean(motion, 1.0)
+            np.save(ccd_pair_dump, np.asarray(ccd_pairs, dtype=np.int32))
+            print(f"[fs-hl] swept pairs dumped -> {ccd_pair_dump}", flush=True)
+        if traversal_audit and (pair_dump or ccd_pair_dump):
+            names = ("vf_dcd", "ee_dcd", "vf_ccd", "ee_ccd")
+            rows = np.asarray(
+                eng.native._get_bvh_traversal_audit(), dtype=np.uint64
+            )
+            for name, row in zip(names, rows):
+                print(
+                    f"[bvh-audit] family={name} queries={row[0]} "
+                    f"node_pops={row[1]} overlapping_children={row[2]} "
+                    f"primitive_tests={row[3]}",
+                    flush=True,
+                )
+            if os.environ.get("STIFF_BVH_BODY_AUDIT"):
+                body_rows = np.asarray(
+                    eng.native._get_bvh_traversal_body_audit(),
+                    dtype=np.uint64,
+                )
+                for family, name in enumerate(names):
+                    for body, row in enumerate(body_rows[family]):
+                        if row[0]:
+                            print(
+                                f"[bvh-audit-body] family={name} body={body} "
+                                f"queries={row[0]} node_pops={row[1]} "
+                                f"overlapping_children={row[2]} "
+                                f"primitive_tests={row[3]}",
+                                flush=True,
+                            )
+        if (os.environ.get("STIFF_BVH_COHERENCE_AUDIT")
+                or os.environ.get("STIFF_BVH_PAIR_CACHE_STATS")):
+            if not hasattr(eng.native, "_print_bvh_coherence_audit"):
+                raise RuntimeError(
+                    "BVH cache/coherence stats require a build configured "
+                    "with -DSTIFFGIPC_BVH_COHERENCE_AUDIT=ON"
+                )
+            eng.native._print_bvh_coherence_audit()
         return
 
     import polyscope as ps, polyscope.imgui as psim

@@ -10,6 +10,7 @@
 #ifndef _MLBVH_CUH_
 #define _MLBVH_CUH_
 #include <cstdint>
+#include <vector>
 #include <cuda_runtime.h>
 #include "device_launch_parameters.h"
 
@@ -33,8 +34,114 @@ struct Node;
 void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint32_t* flags, int number, cudaStream_t stream = 0);
 void reset_max_stack();
 int get_max_stack();
+int get_bvh_stack_capacity();
 void set_bvh_audit(int v);  // [audit-gate] enable the per-pop stack-depth probe (STIFF_STACK_DIAG)
 void set_ee_vloc(const int* p);
+
+// Validation-only traversal census.  The hot kernels contain no census code
+// unless the translation unit is built with
+// STIFF_BVH_TRAVERSAL_AUDIT_BUILD; the normal simulator binary is therefore
+// unaffected.  A "primitive_test" is a leaf pair that survived body/env/
+// adjacency filtering and reached exact PT/EE classification (or CCD emit).
+struct BvhTraversalAudit
+{
+    unsigned long long queries;
+    unsigned long long node_pops;
+    unsigned long long overlapping_children;
+    unsigned long long primitive_tests;
+};
+constexpr int kBvhAuditBodyCapacity = 128;
+void set_bvh_traversal_audit(int v);
+void set_bvh_pair_work_audit(int v);
+void set_bvh_traversal_margin_scale(double scale);
+void reset_bvh_traversal_audit();
+void get_bvh_traversal_audit(BvhTraversalAudit out[4]);
+void get_bvh_traversal_body_audit(
+    BvhTraversalAudit out[4][kBvhAuditBodyCapacity]);
+void get_bvh_traversal_pair_primitive_audit(
+    unsigned long long out[4][kBvhAuditBodyCapacity]
+                               [kBvhAuditBodyCapacity]);
+void print_bvh_traversal_audit();
+
+// Validation-only VF-DCD body-pair raw-candidate cache.  All setters become
+// no-ops unless the owning GIPC instance explicitly arms the cache.
+void set_bvh_vf_pair_cache(const unsigned char* pair_valid,
+                           const int*           pair_index,
+                           int                  body_count,
+                           int                  pair_count,
+                           int2*                candidates,
+                           uint32_t*            counts,
+                           int                  segment_capacity,
+                           int*                 overflow);
+void set_bvh_ee_pair_cache(int2*       candidates,
+                           uint32_t*   counts,
+                           int         segment_capacity,
+                           int*        overflow,
+                           const int*  node_body);
+void set_bvh_ccd_pair_cache(const unsigned char* pair_valid,
+                            int2*                vf_candidates,
+                            uint32_t*             vf_counts,
+                            int                   vf_segment_capacity,
+                            int*                  vf_overflow,
+                            int2*                ee_candidates,
+                            uint32_t*             ee_counts,
+                            int                   ee_segment_capacity,
+                            int*                  ee_overflow,
+                            const int*            vf_node_body,
+                            const int*            ee_node_body);
+void set_bvh_vf_pair_front(uint32_t* front_nodes,
+                           uint32_t* front_counts,
+                           int       front_capacity,
+                           int*      front_overflow);
+void set_bvh_ee_pair_front(uint32_t* front_nodes,
+                           uint32_t* front_counts,
+                           int       front_capacity,
+                           int*      front_overflow);
+void rebuild_bvh_vf_pair_front(const Node* nodes,
+                               const int*  node_body,
+                               int         primitive_count,
+                               cudaStream_t stream = 0);
+void rebuild_bvh_ee_pair_front(const Node* nodes,
+                               const int*  node_body,
+                               int         primitive_count,
+                               cudaStream_t stream = 0);
+void reset_bvh_vf_pair_cache_counts(cudaStream_t stream = 0);
+void replay_bvh_vf_pair_cache(const double3* vertexes,
+                              const uint3*   faces,
+                              uint32_t*      cp_num,
+                              int*           mat_index,
+                              int4*          collision_pair,
+                              int4*          ccd_collision_pair,
+                              double         d_hat,
+                              cudaStream_t   stream = 0);
+void replay_bvh_ee_pair_cache(const double3* vertexes,
+                              const double3* rest_vertexes,
+                              const uint2*   edges,
+                              uint32_t*      cp_num,
+                              int*           mat_index,
+                              int4*          collision_pair,
+                              int4*          ccd_collision_pair,
+                              double         d_hat,
+                              int            edge_count,
+                              cudaStream_t   stream = 0);
+void replay_bvh_vf_ccd_pair_cache(const double3* vertexes,
+                                  const double3* move_dir,
+                                  const uint3*   faces,
+                                  uint32_t*      cp_num,
+                                  int4*          ccd_collision_pair,
+                                  double         d_hat,
+                                  double         alpha,
+                                  const double*  alpha_dev,
+                                  cudaStream_t   stream = 0);
+void replay_bvh_ee_ccd_pair_cache(const double3* vertexes,
+                                  const double3* move_dir,
+                                  const uint2*   edges,
+                                  uint32_t*      cp_num,
+                                  int4*          ccd_collision_pair,
+                                  double         d_hat,
+                                  double         alpha,
+                                  const double*  alpha_dev,
+                                  cudaStream_t   stream = 0);
 
 struct AABB
 {
@@ -102,6 +209,15 @@ class lbvh
     // Computed when env-major. Lets the broad-phase prune other-env subtrees by env-id ⇒ no cross-env
     // candidates (fast) while AABBs stay LOCAL (overlap mirror ⇒ bit-identical). Allocated in MALLOC.
     int*       m_node_env            = nullptr;
+    // Uniform collision body for each subtree, or -1 for a mixed subtree.
+    // Allocated only by the experimental body-pair cache path.
+    int*       m_node_body           = nullptr;
+    const int* m_prim_body           = nullptr;
+    // Validation candidate: maximum ORIGINAL primitive index in each subtree.
+    // The default EE ownership rule emits only obj_idx >= self_eid; this bound
+    // lets the range-pruned traversal discard an entire all-lower subtree
+    // while preserving exactly that directed-pair contract.
+    uint32_t*  m_node_max_element    = nullptr;
 
     // [perenv-parallel #2] cub radix-sort scratch (per instance / per pool slot, pre-allocated):
     // the per-env active-path Morton sort must do NO cudaMalloc/cudaFree — thrust's internal
@@ -114,10 +230,33 @@ class lbvh
     int       _sort_cap       = 0;         // element capacity of the alt buffers
     void ensure_sort_scratch(int N);       // (re)alloc to fit N (syncing malloc; pre-size pool slots)
 
+    // Validation candidate: each point-swapped per-env scratch allocation
+    // owns an independent refit generation.  One scalar state on lbvh would
+    // see slot0/slot1/slot2 as a topology change on every host iteration and
+    // therefore rebuild forever.  The node allocation is the stable slot key;
+    // active-list identity/count still invalidate that slot if another env is
+    // mapped onto it.
+    struct RefitTopologyState
+    {
+        Node*      nodes_identity  = nullptr;
+        const int* active_identity = nullptr;
+        int        number          = 0;
+        int        since_rebuild   = 0;
+        bool       topology_ready  = false;
+        bool       pair_front_ready = false;
+        unsigned long long capture_id = 0;
+        unsigned long long reuses      = 0;
+        unsigned long long rebuilds    = 0;
+    };
+    std::vector<RefitTopologyState> m_refit_states;
+    void invalidateRefitTopology();
+
   public:
     lbvh() {}
     ~lbvh();
-    void MALLOC_DEVICE_MEM(const int& number);
+    void MALLOC_DEVICE_MEM(const int& number,
+                           bool       allocate_node_max = false,
+                           int        key_capacity = 0);
     void FREE_DEVICE_MEM();
     //void Construct();
 };
@@ -129,6 +268,11 @@ class lbvh_f : public lbvh
     uint32_t  face_number = 0;
     uint3*    _faces = nullptr;
     uint32_t* _surfVerts = nullptr;
+    // Optional exact query subset. Per-env BVHs otherwise build a local face
+    // tree but redundantly launch every scene surface vertex against it;
+    // leaf-time _same_env filtering makes those extra queries physically inert.
+    const uint32_t* _active_query_idx = nullptr;
+    int             query_number_active = 0;
 
   public:
     void   init(int*       _bodyID,

@@ -29,12 +29,20 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
     if(par) { int cap = getenv("STIFF_PERENV_K") ? atoi(getenv("STIFF_PERENV_K")) : 8;  // concurrency cap
               K = (int)h_perenv_active.size(); if(K > cap) K = cap; if(K < 1) K = 1; allocPerEnvPool(K); }
     // snapshot bvh scratch so we can point-swap per env + restore at the end.
-    BvhScratch of{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,
+    BvhScratch of{bvh_f._nodes,bvh_f._bvs,bvh_f._MChash,bvh_f._indices,bvh_f._tempLeafBox,bvh_f._flags,bvh_f.m_node_env,bvh_f.m_node_max_element,
                   bvh_f._sort_tmp,bvh_f._sort_tmp_bytes,bvh_f._mch_alt,bvh_f._idx_alt,bvh_f._sort_cap};
-    BvhScratch oe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,
+    BvhScratch oe{bvh_e._nodes,bvh_e._bvs,bvh_e._MChash,bvh_e._indices,bvh_e._tempLeafBox,bvh_e._flags,bvh_e.m_node_env,bvh_e.m_node_max_element,
                   bvh_e._sort_tmp,bvh_e._sort_tmp_bytes,bvh_e._mch_alt,bvh_e._idx_alt,bvh_e._sort_cap};
+    int* saved_f_node_body = bvh_f.m_node_body;
+    int* saved_e_node_body = bvh_e.m_node_body;
+    // Per-env pool slots do not yet own body-label arrays.  The cache is
+    // explicitly disabled above for this execution mode, so suppress these
+    // otherwise shared writes (which would race when STIFF_PERENV_PAR=1).
+    bvh_f.m_node_body = nullptr;
+    bvh_e.m_node_body = nullptr;
     auto swapIn = [](lbvh& b, BvhScratch& s){ b._nodes=s.nodes; b._bvs=s.bvs; b._MChash=s.mch;
         b._indices=s.idx; b._tempLeafBox=s.tmp; b._flags=s.flags; b.m_node_env=s.node_env;
+        b.m_node_max_element=s.node_max_element;
         b._sort_tmp=s.sort_tmp; b._sort_tmp_bytes=s.sort_bytes;   // [perenv-parallel #2]
         b._mch_alt=s.mch_alt; b._idx_alt=s.idx_alt; b._sort_cap=s.sort_cap; };
   perenv_redo:
@@ -52,6 +60,14 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
             if(par) swapIn(bvh_f, m_pool_f[i % K]);
             bvh_f._active_idx        = d_perenv_face_idx + h_perenv_face_off[e];
             bvh_f.face_number_active = h_perenv_face_cnt[e];
+            bvh_f._active_query_idx = nullptr;
+            bvh_f.query_number_active = 0;
+            if(d_perenv_surf_idx && h_perenv_surf_cnt[e] > 0)
+            {
+                bvh_f._active_query_idx = d_perenv_surf_idx
+                                          + h_perenv_surf_off[e];
+                bvh_f.query_number_active = h_perenv_surf_cnt[e];
+            }
             bvh_f.Construct(st);
             bvh_f.SelfCollitionDetect(dHat, st);
         }
@@ -90,7 +106,10 @@ void GIPC::buildBVH_and_CP_perenv(double dHat)
         goto perenv_redo;
     }
     bvh_f._active_idx = nullptr; bvh_f.face_number_active = 0;
+    bvh_f._active_query_idx = nullptr; bvh_f.query_number_active = 0;
     bvh_e._active_idx = nullptr; bvh_e.face_number_active = 0;
+    bvh_f.m_node_body = saved_f_node_body;
+    bvh_e.m_node_body = saved_e_node_body;
     bvh_f._vertexes = saved_f;
     bvh_e._vertexes = saved_e;
     CUDA_SAFE_CALL(cudaMemsetAsync(_gdCollapse, 0, sizeof(int), 0));  // [d-floor fail-fast] reset per detection
@@ -124,6 +143,12 @@ void GIPC::buildBVH_FULLCCD(const double& alpha, const double* alpha_dev)
     // [C5] m_graph_merged_detect forces the merged swept build (see buildCP).
     if(m_perenv_bvh && m_perenv_bvh_groups > 0 && !m_graph_merged_detect)
         return;
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+    // Decide each swept generation from the exact start/end segments that
+    // this build will consume.  Invalid pair segments are cleared and rebased
+    // entirely on-device before either tree records its expanded margin list.
+    updateBvhCcdPairCache(alpha, alpha_dev);
+#endif
     { int bs = 256, gs = (vertexNum + bs - 1) / bs;
       _addEnvOffset<<<gs, bs>>>(d_bvh_vertexes, _vertexes, d_env_offset, vertexNum); }
     bvh_f.ConstructFullCCD(_moveDir, alpha, 0, alpha_dev);

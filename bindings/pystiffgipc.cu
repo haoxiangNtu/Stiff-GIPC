@@ -1128,6 +1128,68 @@ PYBIND11_MODULE(pystiffgipc, m)
            "array of plain vertex indices (-1 padded for PP/PE), UIPC-style. The "
            "solver keeps its MMCVID packing; this is a read-only decoded view. "
            "Call AFTER step().")
+        .def("_reset_bvh_traversal_audit", [](const SimEngine&) {
+            set_bvh_traversal_audit(1);
+            reset_bvh_traversal_audit();
+        }, "Validation-only: reset the four aggregate BVH traversal counters.")
+        .def("_get_bvh_traversal_audit", [](const SimEngine&) {
+            BvhTraversalAudit rows[4] = {};
+            get_bvh_traversal_audit(rows);
+            auto out = py::array_t<unsigned long long>({4, 4});
+            auto view = out.mutable_unchecked<2>();
+            for(int family = 0; family < 4; ++family)
+            {
+                view(family, 0) = rows[family].queries;
+                view(family, 1) = rows[family].node_pops;
+                view(family, 2) = rows[family].overlapping_children;
+                view(family, 3) = rows[family].primitive_tests;
+            }
+            return out;
+        }, "Validation-only: return [queries,pops,overlaps,primitive-tests].")
+        .def("_get_bvh_traversal_body_audit", [](const SimEngine&) {
+            BvhTraversalAudit rows[4][kBvhAuditBodyCapacity] = {};
+            get_bvh_traversal_body_audit(rows);
+            auto out = py::array_t<unsigned long long>(
+                {4, kBvhAuditBodyCapacity, 4});
+            auto view = out.mutable_unchecked<3>();
+            for(int family = 0; family < 4; ++family)
+                for(int body = 0; body < kBvhAuditBodyCapacity; ++body)
+                {
+                    view(family, body, 0) = rows[family][body].queries;
+                    view(family, body, 1) = rows[family][body].node_pops;
+                    view(family, body, 2) =
+                        rows[family][body].overlapping_children;
+                    view(family, body, 3) =
+                        rows[family][body].primitive_tests;
+                }
+            return out;
+        }, "Validation-only: return per-family/per-query-body traversal work.")
+#ifdef STIFF_BVH_COHERENCE_AUDIT_BUILD
+        .def("_print_bvh_coherence_audit",
+             &SimEngine::print_bvh_coherence_audit,
+             "Validation-only: print per-body/body-pair temporal-coherence census.")
+#endif
+        .def("get_ccd_pairs_clean", [](const SimEngine& self,
+                                        py::array_t<double,
+                                            py::array::c_style |
+                                            py::array::forcecast> move,
+                                        double alpha) {
+            const py::buffer_info info = move.request();
+            if(info.ndim != 2 || info.shape[1] != 3)
+                throw std::runtime_error(
+                    "motion must have shape (vertex_count, 3)");
+            const auto* data = static_cast<const double*>(info.ptr);
+            const int count = static_cast<int>(info.shape[0]);
+            const int n = self.get_ccd_pairs_clean(data, count, alpha, nullptr);
+            auto out = py::array_t<int>({n, 4});
+            if(n > 0)
+                self.get_ccd_pairs_clean(
+                    data, count, alpha, static_cast<int*>(out.request().ptr));
+            return out;
+        }, py::arg("motion"), py::arg("alpha") = 1.0,
+           "Validation-only clean export of the swept full-CCD candidate set "
+           "for an explicit (N,3) host motion field. Mutates direction scratch; "
+           "call only after the last frame in a disposable process.")
         .def("get_contacts_device", [](SimEngine& self) {
             int n = self.compute_contacts();
             return py::make_tuple(n, self.contacts_pair_ptr(), self.contacts_force_ptr());

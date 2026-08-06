@@ -119,6 +119,7 @@ __device__ inline bool _checkPTintersection(const double3*  _vertexes,
 }
 
 
+template <bool ForceCanonicalOrder = false>
 __device__ inline bool _checkEEintersection(const double3*  _vertexes,
                                             const double3*  _rest_vertexes,
                                             uint32_t        id0,
@@ -144,7 +145,7 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
 
     // [xenv pin/fix] canonicalize each edge's endpoint order by POSITION (env-invariant) so
     // _dType_EE is order-independent → identical envs classify identically.
-    if(g_ee_canon)
+    if(g_ee_canon || ForceCanonicalOrder)
     {
         // (1) internal endpoint order within each edge — TOTAL order (position, env-local id)
         if(_vless(v1, id1, v0, id0)) { double3 t=v0; v0=v1; v1=t; uint32_t s=id0; id0=id1; id1=s; }
@@ -520,4 +521,3 @@ __device__ inline bool _checkEEintersection(const double3*  _vertexes,
             break;
     }
 }
-

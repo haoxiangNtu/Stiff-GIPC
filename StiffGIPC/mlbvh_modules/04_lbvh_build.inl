@@ -257,12 +257,76 @@ __global__ void _calcLeafBvs_ccd_indirect(const double3*      _vertexes,
     _bvs[t] = _bv;
 }
 
+// Exact topology refit.  Leaf slots are no longer in original primitive
+// order after the first sort/PLOC build, so read the persistent element_idx
+// from each leaf node and rebuild that slot directly.  The internal pass then
+// recomputes every ancestor AABB; topology quality affects only traversal
+// cost, never collision completeness.
+template <class element_type, bool Swept>
+__global__ void _refitLeafBvs(const double3*      vertexes,
+                              const double3*      move_dir,
+                              double              alpha,
+                              const element_type* elements,
+                              const Node*         nodes,
+                              AABB*               boxes,
+                              int                 number,
+                              int                 type,
+                              const int*          body_id,
+                              const int*          collision_skip_matrix,
+                              int                 collision_body_count,
+                              const double*       alpha_dev = nullptr)
+{
+    const int slot = threadIdx.x + blockIdx.x * blockDim.x;
+    if(slot >= number)
+        return;
+    if constexpr(Swept)
+        if(alpha_dev)
+            alpha = *alpha_dev;
+
+    const uint32_t primitive = nodes[number - 1 + slot].element_idx;
+    const element_type element = elements[primitive];
+    AABB box;
+    if(body_id && collision_skip_matrix && collision_body_count > 0)
+    {
+        const int body = body_id[element.x];
+        if(body >= 0 && body < collision_body_count
+           && collision_skip_matrix[
+               body * collision_body_count + body] != 0)
+        {
+            boxes[number - 1 + slot] = box;
+            return;
+        }
+    }
+
+    auto add_vertex = [&](uint32_t vertex)
+    {
+        const double3 position = vertexes[vertex];
+        box.combines(position.x, position.y, position.z);
+        if constexpr(Swept)
+        {
+            const double3 motion = move_dir[vertex];
+            box.combines(position.x - motion.x * alpha,
+                         position.y - motion.y * alpha,
+                         position.z - motion.z * alpha);
+        }
+    };
+    add_vertex(element.x);
+    add_vertex(element.y);
+    if(type == 0)
+        add_vertex(*((const uint32_t*)(&element) + 2));
+    boxes[number - 1 + slot] = box;
+}
+
 // Variant of _calcLeafNodes that maps the (sorted) leaf-array index back to
 // the ORIGINAL face/edge index via _active_idx, so query kernels work unchanged.
-__global__ void _calcLeafNodes_indirect(Node*           _nodes,
-                                        const uint32_t* _indices,
-                                        const int*      _active_idx,
-                                        int             number)
+template <bool TrackMax>
+static __device__ __forceinline__ void _calcLeafNodes_indirect_body(
+    Node*           _nodes,
+    const uint32_t* _indices,
+    const int*      _active_idx,
+    uint32_t*       _node_max_element,
+    bool            _node_max_sorted,
+    int             number)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= number)
@@ -279,6 +343,34 @@ __global__ void _calcLeafNodes_indirect(Node*           _nodes,
     _nodes[l_idx].right_idx   = 0xFFFFFFFF;
     _nodes[l_idx].parent_idx  = 0xFFFFFFFF;
     _nodes[l_idx].element_idx = _active_idx[_indices[idx]];
+    if constexpr(TrackMax)
+        _node_max_element[l_idx] =
+            _node_max_sorted ? (uint32_t)idx : _nodes[l_idx].element_idx;
+}
+
+__global__ void _calcLeafNodes_indirect(Node*           _nodes,
+                                        const uint32_t* _indices,
+                                        const int*      _active_idx,
+                                        int             number)
+{
+    _calcLeafNodes_indirect_body<false>(
+        _nodes, _indices, _active_idx, nullptr, false, number);
+}
+
+__global__ void _calcLeafNodes_indirect_with_max(
+    Node*           _nodes,
+    const uint32_t* _indices,
+    const int*      _active_idx,
+    uint32_t*       _node_max_element,
+    bool            _node_max_sorted,
+    int             number)
+{
+    _calcLeafNodes_indirect_body<true>(_nodes,
+                                       _indices,
+                                       _active_idx,
+                                       _node_max_element,
+                                       _node_max_sorted,
+                                       number);
 }
 
 // [env-det] env-major Morton: put the prim's env id in the HIGH bits so co-located identical envs
@@ -286,9 +378,15 @@ __global__ void _calcLeafNodes_indirect(Node*           _nodes,
 // tie-break that interleaves equal-Morton co-located prims non-deterministically. STIFF_BVH_ENVDET.
 __device__ int g_bvh_envmajor = 0;
 void set_bvh_envmajor(int v){ static int last = -999; if(v == last) return; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_envmajor, &v, sizeof(int))); last = v; }
-__global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int* prim_env,
-                            const int* prim_localid, const double3* env_offset,
-                            const uint32_t* prim_v0)
+template <bool Morton14>
+static __device__ __forceinline__ void _calcMChash_body(
+    uint64_t*       _MChash,
+    AABB*           _bvs,
+    int             number,
+    const int*      prim_env,
+    const int*      prim_localid,
+    const double3*  env_offset,
+    const uint32_t* prim_v0)
 {
     uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= number)
@@ -308,10 +406,29 @@ __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int
                                   centerP.z - maxBv.lower.z);
 
     //printf("%d   %f     %f     %f\n", offset.x, offset.y, offset.z);
-    uint64_t mc32 = morton_code(
+    const uint64_t mc32 = morton_code(
         offset.x / SceneSize.x, offset.y / SceneSize.y, offset.z / SceneSize.z);
     uint64_t mc64;
-    if(g_bvh_envmajor && prim_env)
+    if constexpr(Morton14)
+    {
+        // Research probe: use the requested 42 Morton bits even when the
+        // production env-major layout is enabled.  The previous ordering put
+        // this branch after g_bvh_envmajor, making STIFF_BVH_MORTON14 a no-op
+        // in every FOLD-SHIRT run.  The global primitive index is a unique
+        // 22-bit tie-break.  This deliberately does not preserve env-major
+        // grouping, so multi-env performance/determinism must be judged by the
+        // candidate gates; it is not a production key layout.
+        if(number < (1 << 22))
+        {
+            const uint64_t mc42 = morton_code_14(offset.x / SceneSize.x,
+                                                 offset.y / SceneSize.y,
+                                                 offset.z / SceneSize.z);
+            mc64 = (mc42 << 22) | idx;
+        }
+        else
+            mc64 = (mc32 << 32) | idx;
+    }
+    else if(g_bvh_envmajor && prim_env)
     {   // [env(high), morton(30), ENV-LOCAL-prim-id(20 low)] — env-blocked AND the low-bits tie-break
         // is ENV-LOCAL (mirror across identical envs) so find_split/determine_range give IDENTICAL
         // subtree structure for co-located envs (global idx in the low bits made them differ → the
@@ -327,7 +444,130 @@ __global__ void _calcMChash(uint64_t* _MChash, AABB* _bvs, int number, const int
     _MChash[idx]  = mc64;
 }
 
-__global__ void _calcLeafNodes(Node* _nodes, const uint32_t* _indices, int number)
+__global__ void _calcMChash(uint64_t*       _MChash,
+                            AABB*           _bvs,
+                            int             number,
+                            const int*      prim_env,
+                            const int*      prim_localid,
+                            const double3*  env_offset,
+                            const uint32_t* prim_v0)
+{
+    _calcMChash_body<false>(
+        _MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
+}
+
+__global__ void _calcMChash14(uint64_t*       _MChash,
+                              AABB*           _bvs,
+                              int             number,
+                              const int*      prim_env,
+                              const int*      prim_localid,
+                              const double3*  env_offset,
+                              const uint32_t* prim_v0)
+{
+    _calcMChash_body<true>(
+        _MChash, _bvs, number, prim_env, prim_localid, env_offset, prim_v0);
+}
+
+// RBS/UIPC's stackless traversal sorts independent query AABBs by Morton code
+// before assigning them to lanes.  EE self-query already gets that property
+// for free here: it walks the Morton-sorted BVH leaves.  VF point queries do
+// not, because _surfVerts retains mesh order.  This validation kernel builds
+// a capture-safe VF query order into the BVH's pre-sized CUB buffers.  The low
+// 32 bits make every key unique, so CUB's stable/unstable tie policy cannot
+// alter the order across runs.
+template <bool Swept>
+__global__ void _calcVfQueryKeys(uint64_t*       keys,
+                                 uint32_t*       values,
+                                 const double3*  vertexes,
+                                 const double3*  move_dir,
+                                 double          alpha,
+                                 const double*   alpha_dev,
+                                 const uint32_t* query_vertices,
+                                 const AABB*     bvs,
+                                 int             number)
+{
+    const int slot = threadIdx.x + blockIdx.x * blockDim.x;
+    if(slot >= number)
+        return;
+    if constexpr(Swept)
+        if(alpha_dev)
+            alpha = *alpha_dev;
+
+    const uint32_t vertex = query_vertices[slot];
+    double3 center = vertexes[vertex];
+    if constexpr(Swept)
+    {
+        const double3 direction = move_dir[vertex];
+        center.x -= 0.5 * alpha * direction.x;
+        center.y -= 0.5 * alpha * direction.y;
+        center.z -= 0.5 * alpha * direction.z;
+    }
+    const AABB root = bvs[0];
+    const double sx = root.upper.x - root.lower.x;
+    const double sy = root.upper.y - root.lower.y;
+    const double sz = root.upper.z - root.lower.z;
+    const double nx = sx > 0.0 ? (center.x - root.lower.x) / sx : 0.5;
+    const double ny = sy > 0.0 ? (center.y - root.lower.y) / sy : 0.5;
+    const double nz = sz > 0.0 ? (center.z - root.lower.z) / sz : 0.5;
+    const uint64_t morton = morton_code(nx, ny, nz);
+    keys[slot] = (morton << 32) | static_cast<uint64_t>(vertex);
+    values[slot] = vertex;
+}
+
+// Validation candidate for segmented body-pair traversal.  Preserve the
+// already-computed 30-bit Morton code within each body, but move body id into
+// the high key bits so every body's primitives form a contiguous LBVH block.
+// The active-index variants still key by the original primitive/body id.
+// This changes topology only; it cannot add or remove collision candidates.
+template <class Primitive>
+static __device__ __forceinline__ void _bodyMajorKeyBody(
+    uint64_t*          keys,
+    const Primitive*   primitives,
+    const int*         active_idx,
+    const int*         body_id,
+    int                number)
+{
+    const int sorted_slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if(sorted_slot >= number)
+        return;
+    const int primitive = active_idx ? active_idx[sorted_slot] : sorted_slot;
+    const uint32_t vertex = primitives[primitive].x;
+    const int raw_body = body_id ? body_id[vertex] : -1;
+    const uint64_t body = static_cast<uint64_t>(
+        raw_body >= 0 && raw_body < 1023 ? raw_body : 1023);
+    const uint64_t old_key = keys[sorted_slot];
+    const uint64_t morton = g_bvh_envmajor
+                                ? ((old_key >> 26) & 0x3fffffffull)
+                                : ((old_key >> 32) & 0x3fffffffull);
+    keys[sorted_slot] = (body << 54) | (morton << 24)
+                        | (static_cast<uint64_t>(primitive) & 0xffffffull);
+}
+
+__global__ void _bodyMajorFaceKeys(uint64_t*       keys,
+                                   const uint3*    faces,
+                                   const int*      active_idx,
+                                   const int*      body_id,
+                                   int             number)
+{
+    _bodyMajorKeyBody(keys, faces, active_idx, body_id, number);
+}
+
+__global__ void _bodyMajorEdgeKeys(uint64_t*       keys,
+                                   const uint2*    edges,
+                                   const int*      active_idx,
+                                   const int*      body_id,
+                                   int             number)
+{
+    _bodyMajorKeyBody(keys, edges, active_idx, body_id, number);
+}
+
+template <bool TrackMax>
+static __device__ __forceinline__ void _calcLeafNodes_body(
+    Node*           _nodes,
+    const uint32_t* _indices,
+    uint32_t*       _node_max_element,
+    bool            _node_max_sorted,
+    int             number)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= number)
@@ -344,6 +584,26 @@ __global__ void _calcLeafNodes(Node* _nodes, const uint32_t* _indices, int numbe
     _nodes[l_idx].right_idx   = 0xFFFFFFFF;
     _nodes[l_idx].parent_idx  = 0xFFFFFFFF;
     _nodes[l_idx].element_idx = _indices[idx];
+    if constexpr(TrackMax)
+        _node_max_element[l_idx] =
+            _node_max_sorted ? (uint32_t)idx : _nodes[l_idx].element_idx;
+}
+
+__global__ void _calcLeafNodes(Node*           _nodes,
+                               const uint32_t* _indices,
+                               int             number)
+{
+    _calcLeafNodes_body<false>(_nodes, _indices, nullptr, false, number);
+}
+
+__global__ void _calcLeafNodes_with_max(Node*           _nodes,
+                                        const uint32_t* _indices,
+                                        uint32_t*       _node_max_element,
+                                        bool            _node_max_sorted,
+                                        int             number)
+{
+    _calcLeafNodes_body<true>(
+        _nodes, _indices, _node_max_element, _node_max_sorted, number);
 }
 
 
@@ -369,7 +629,13 @@ __global__ void _calcInternalNodes(Node* _nodes, const uint64_t* _MChash, int nu
     _nodes[_nodes[idx].right_idx].parent_idx = idx;
 }
 
-__global__ void _calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flags, int number)
+template <bool TrackMax>
+static __device__ __forceinline__ void _calcInternalAABB_body(
+    const Node* _nodes,
+    AABB*       _bvs,
+    uint32_t*   flags,
+    uint32_t*   _node_max_element,
+    int         number)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= number)
@@ -391,10 +657,743 @@ __global__ void _calcInternalAABB(const Node* _nodes, AABB* _bvs, uint32_t* flag
         const AABB lbox = _bvs[lidx];
         const AABB rbox = _bvs[ridx];
         _bvs[parent]    = merge(lbox, rbox);
+        if constexpr(TrackMax)
+        {
+            const uint32_t lmax = _node_max_element[lidx];
+            const uint32_t rmax = _node_max_element[ridx];
+            _node_max_element[parent] = lmax > rmax ? lmax : rmax;
+        }
 
         __threadfence();
 
         parent = _nodes[parent].parent_idx;
+    }
+}
+
+__global__ void _calcInternalAABB(const Node* _nodes,
+                                  AABB*       _bvs,
+                                  uint32_t*   flags,
+                                  int         number)
+{
+    _calcInternalAABB_body<false>(
+        _nodes, _bvs, flags, nullptr, number);
+}
+
+__global__ void _calcInternalAABB_with_max(const Node* _nodes,
+                                           AABB*       _bvs,
+                                           uint32_t*   flags,
+                                           uint32_t*   _node_max_element,
+                                           int         number)
+{
+    _calcInternalAABB_body<true>(
+        _nodes, _bvs, flags, _node_max_element, number);
+}
+
+// Experimental graph-safe LBVH treelet optimizer.  A binary rotation at P
+// replaces one internal child C=(A,B) and P's other child S with either
+// C'=(A,S), P'=(C',B), or C'=(S,B), P'=(A,C').  P still covers exactly the
+// same primitives, so only C's box (and optional subtree maximum) changes.
+//
+// Nodes whose depths have the same value modulo three have disjoint write
+// footprints: a rotation touches depths d..d+2, while the next selected
+// descendant starts at d+3.  Depths are recomputed before every phase because
+// earlier rotations can move a subtree by one level.  This makes each phase
+// race-free and deterministic without locks or host/device communication.
+__global__ void _calcInternalDepths(const Node* nodes,
+                                    uint32_t*   depths,
+                                    int         number)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number - 1)
+        return;
+    uint32_t depth  = 0;
+    uint32_t parent = nodes[idx].parent_idx;
+    while(parent != 0xFFFFFFFFu && depth < static_cast<uint32_t>(number))
+    {
+        ++depth;
+        parent = nodes[parent].parent_idx;
+    }
+    depths[idx] = depth;
+}
+
+__device__ __forceinline__ double _bvh_half_surface_area(const AABB& box)
+{
+    const double x = max(0.0, box.upper.x - box.lower.x);
+    const double y = max(0.0, box.upper.y - box.lower.y);
+    const double z = max(0.0, box.upper.z - box.lower.z);
+    return x * y + y * z + z * x;
+}
+
+// One PLOC workgroup. Representatives must remain Morton ordered. Every round
+// performs the range-nearest search, mutual merge, and stable compaction. The
+// helper is used both by the diagnostic all-in-one-block implementation and by
+// the hierarchical implementation below.
+static __device__ __forceinline__ void _buildPlocWorkgroup(
+    Node*           nodes,
+    AABB*           boxes,
+    const uint32_t* initial_clusters,
+    uint32_t*       clusters_a,
+    uint32_t*       clusters_b,
+    uint32_t*       nearest,
+    uint32_t*       flags,
+    uint32_t*       offsets,
+    uint32_t*       assigned,
+    uint32_t*       node_max_element,
+    uint32_t*       root_output,
+    int             number,
+    int             leaf_base,
+    int             next_internal,
+    int             radius,
+    int             ploc_plus_plus,
+    int*            shared_count,
+    int*            shared_new_count,
+    int*            shared_next_internal,
+    int*            shared_round_merges)
+{
+    for(int i = threadIdx.x; i < number; i += blockDim.x)
+        clusters_a[i] = initial_clusters
+                            ? initial_clusters[i]
+                            : static_cast<uint32_t>(leaf_base + i);
+    if(threadIdx.x == 0)
+    {
+        *shared_count         = number;
+        *shared_new_count     = number;
+        *shared_next_internal = next_internal;
+        *shared_round_merges  = 0;
+    }
+    __syncthreads();
+
+    uint32_t* input  = clusters_a;
+    uint32_t* output = clusters_b;
+    int count = number;
+
+    // Symmetric merge distance guarantees at least one mutual-nearest pair
+    // per iteration.  The number guard is a corruption fail-safe; the forced
+    // adjacent pair below also guarantees forward progress in a tie/NaN
+    // corner case without involving the host.
+    for(int round = 0; count > 1 && round < number; ++round)
+    {
+        const int local_radius = min(radius, count - 1);
+        for(int i = threadIdx.x; i < count; i += blockDim.x)
+        {
+            int best = -1;
+            if(ploc_plus_plus)
+            {
+                // PLOC++'s equal-box corner-case rule: seed even/odd adjacent
+                // pairs so identical representatives reduce logarithmically.
+                best = ((i & 1) == 0 && i + 1 < count) ? i + 1 : i - 1;
+                if(best < 0)
+                    best = i + 1;
+            }
+            else
+            {
+                best = max(0, i - local_radius);
+                if(best == i)
+                    best = min(count - 1, i + 1);
+            }
+
+            double best_cost = _bvh_half_surface_area(
+                merge(boxes[input[i]], boxes[input[best]]));
+            const int begin = max(0, i - local_radius);
+            const int end   = min(count - 1, i + local_radius);
+            for(int j = begin; j <= end; ++j)
+            {
+                if(j == i || j == best)
+                    continue;
+                const double cost = _bvh_half_surface_area(
+                    merge(boxes[input[i]], boxes[input[j]]));
+                // Original PLOC is left-first on exact ties.  PLOC++ keeps
+                // the adjacent seed on ties, which is its documented fix for
+                // coincident primitives.
+                if(cost < best_cost
+                   || (!ploc_plus_plus && cost == best_cost && j < best))
+                {
+                    best      = j;
+                    best_cost = cost;
+                }
+            }
+            nearest[i] = static_cast<uint32_t>(best);
+        }
+        __syncthreads();
+
+        if(threadIdx.x == 0)
+        {
+            int out_count   = 0;
+            int merge_count = 0;
+            for(int i = 0; i < count; ++i)
+            {
+                const int j = static_cast<int>(nearest[i]);
+                const bool mutual = j >= 0 && j < count
+                                    && nearest[j] == static_cast<uint32_t>(i);
+                const bool merge_left  = mutual && i < j;
+                const bool merge_right = mutual && i > j;
+                flags[i]   = merge_right ? 0u : 1u;
+                offsets[i] = static_cast<uint32_t>(out_count);
+                assigned[i] = 0xFFFFFFFFu;
+                if(!merge_right)
+                    ++out_count;
+                if(merge_left)
+                {
+                    assigned[i] = static_cast<uint32_t>(
+                        *shared_next_internal - merge_count);
+                    ++merge_count;
+                }
+            }
+
+            if(merge_count == 0)
+            {
+                // Defensive deterministic progress for non-finite AABBs or a
+                // future distance change that breaks the mutual-pair lemma.
+                nearest[0] = 1u;
+                nearest[1] = 0u;
+                out_count = 0;
+                for(int i = 0; i < count; ++i)
+                {
+                    if(i >= 2)
+                        nearest[i] = static_cast<uint32_t>(i);
+                    flags[i]   = i == 1 ? 0u : 1u;
+                    offsets[i] = static_cast<uint32_t>(out_count);
+                    assigned[i] = i == 0
+                                      ? static_cast<uint32_t>(
+                                            *shared_next_internal)
+                                      : 0xFFFFFFFFu;
+                    if(i != 1)
+                        ++out_count;
+                }
+                merge_count = 1;
+            }
+            *shared_new_count     = out_count;
+            *shared_round_merges  = merge_count;
+        }
+        __syncthreads();
+
+        for(int i = threadIdx.x; i < count; i += blockDim.x)
+        {
+            if(flags[i] == 0u)
+                continue;
+            const uint32_t out = offsets[i];
+            const int j = static_cast<int>(nearest[i]);
+            const bool merge_left = j > i && j < count
+                                    && nearest[j] == static_cast<uint32_t>(i);
+            if(merge_left)
+            {
+                const uint32_t node = assigned[i];
+                const uint32_t left = input[i];
+                const uint32_t right = input[j];
+                nodes[node].parent_idx  = 0xFFFFFFFFu;
+                nodes[node].left_idx    = left;
+                nodes[node].right_idx   = right;
+                nodes[node].element_idx = 0xFFFFFFFFu;
+                nodes[left].parent_idx  = node;
+                nodes[right].parent_idx = node;
+                boxes[node]             = merge(boxes[left], boxes[right]);
+                if(node_max_element)
+                {
+                    const uint32_t a = node_max_element[left];
+                    const uint32_t b = node_max_element[right];
+                    node_max_element[node] = a > b ? a : b;
+                }
+                output[out] = node;
+            }
+            else
+                output[out] = input[i];
+        }
+        __syncthreads();
+
+        if(threadIdx.x == 0)
+        {
+            *shared_next_internal -= *shared_round_merges;
+            *shared_count = *shared_new_count;
+        }
+        __syncthreads();
+        count = *shared_count;
+        uint32_t* swap = input;
+        input  = output;
+        output = swap;
+    }
+
+    if(threadIdx.x == 0 && root_output)
+        *root_output = input[0];
+}
+
+// Capture-safe diagnostic implementation that starts the entire tree in one
+// workgroup. It is intentionally retained as an oracle/performance control;
+// large FOLD trees demonstrate why PLOC++ only recommends this path for upper
+// levels.
+__global__ void _buildPlocSingleWorkgroup(Node*           nodes,
+                                           AABB*           boxes,
+                                           uint32_t*       clusters_a,
+                                           uint32_t*       clusters_b,
+                                           uint32_t*       nearest,
+                                           uint32_t*       flags,
+                                           uint32_t*       offsets,
+                                           uint32_t*       assigned,
+                                           uint32_t*       node_max_element,
+                                           int             number,
+                                           int             radius,
+                                           int             ploc_plus_plus)
+{
+    if(number <= 1)
+        return;
+    __shared__ int shared_count;
+    __shared__ int shared_new_count;
+    __shared__ int shared_next_internal;
+    __shared__ int shared_round_merges;
+    _buildPlocWorkgroup(nodes,
+                        boxes,
+                        nullptr,
+                        clusters_a,
+                        clusters_b,
+                        nearest,
+                        flags,
+                        offsets,
+                        assigned,
+                        node_max_element,
+                        nullptr,
+                        number,
+                        number - 1,
+                        number - 2,
+                        radius,
+                        ploc_plus_plus,
+                        &shared_count,
+                        &shared_new_count,
+                        &shared_next_internal,
+                        &shared_round_merges);
+}
+
+// Hierarchical PLOC++ lower level. Morton-contiguous chunks are independent,
+// so one workgroup can agglomerate each chunk without a global barrier. A FOLD
+// chunk
+// needs only 256 representatives, so both representative IDs and AABBs fit in
+// shared memory. Nearest-neighbour rounds then touch global memory only when a
+// new internal node is committed. Internal ID ranges are disjoint and reserve
+// [0, chunk_count-2] for the upper tree.
+__global__ void _buildPlocChunksShared(Node*       nodes,
+                                       AABB*       boxes,
+                                       uint32_t*   roots,
+                                       uint32_t*   node_max_element,
+                                       int         number,
+                                       int         chunk_size,
+                                       int         radius)
+{
+    constexpr int kMaxChunk = 256;
+    const int chunk = static_cast<int>(blockIdx.x);
+    const int start = chunk * chunk_size;
+    if(start >= number)
+        return;
+    const int initial_count = min(chunk_size, number - start);
+    if(initial_count == 1)
+    {
+        if(threadIdx.x == 0)
+            roots[chunk] = static_cast<uint32_t>(number - 1 + start);
+        return;
+    }
+
+    __shared__ uint32_t ids_a[kMaxChunk];
+    __shared__ uint32_t ids_b[kMaxChunk];
+    __shared__ AABB     boxes_a[kMaxChunk];
+    __shared__ AABB     boxes_b[kMaxChunk];
+    __shared__ uint32_t nearest[kMaxChunk];
+    __shared__ uint32_t offsets[kMaxChunk];
+    __shared__ uint32_t assigned[kMaxChunk];
+    __shared__ int      shared_count;
+    __shared__ int      shared_new_count;
+    __shared__ int      shared_next_internal;
+    __shared__ int      shared_round_merges;
+
+    const int chunk_count = (number + chunk_size - 1) / chunk_size;
+    const int internal_first = chunk_count - 1 + start - chunk;
+    for(int i = threadIdx.x; i < initial_count; i += blockDim.x)
+    {
+        const uint32_t leaf = static_cast<uint32_t>(number - 1 + start + i);
+        ids_a[i]   = leaf;
+        boxes_a[i] = boxes[leaf];
+    }
+    if(threadIdx.x == 0)
+    {
+        shared_count         = initial_count;
+        shared_new_count     = initial_count;
+        shared_next_internal = internal_first + initial_count - 2;
+        shared_round_merges  = 0;
+    }
+    __syncthreads();
+
+    uint32_t* input_ids  = ids_a;
+    uint32_t* output_ids = ids_b;
+    AABB* input_boxes    = boxes_a;
+    AABB* output_boxes   = boxes_b;
+    int count = initial_count;
+    for(int round = 0; count > 1 && round < initial_count; ++round)
+    {
+        const int local_radius = min(radius, count - 1);
+        for(int i = threadIdx.x; i < count; i += blockDim.x)
+        {
+            int best = ((i & 1) == 0 && i + 1 < count) ? i + 1 : i - 1;
+            if(best < 0)
+                best = i + 1;
+            double best_cost = _bvh_half_surface_area(
+                merge(input_boxes[i], input_boxes[best]));
+            const int begin = max(0, i - local_radius);
+            const int end   = min(count - 1, i + local_radius);
+            for(int j = begin; j <= end; ++j)
+            {
+                if(j == i || j == best)
+                    continue;
+                const double cost = _bvh_half_surface_area(
+                    merge(input_boxes[i], input_boxes[j]));
+                if(cost < best_cost)
+                {
+                    best      = j;
+                    best_cost = cost;
+                }
+            }
+            nearest[i] = static_cast<uint32_t>(best);
+        }
+        __syncthreads();
+
+        if(threadIdx.x == 0)
+        {
+            int out_count   = 0;
+            int merge_count = 0;
+            for(int i = 0; i < count; ++i)
+            {
+                const int j = static_cast<int>(nearest[i]);
+                const bool mutual = j >= 0 && j < count
+                                    && nearest[j] == static_cast<uint32_t>(i);
+                const bool merge_left  = mutual && i < j;
+                const bool merge_right = mutual && i > j;
+                offsets[i]  = static_cast<uint32_t>(out_count);
+                assigned[i] = 0xFFFFFFFFu;
+                if(!merge_right)
+                    ++out_count;
+                if(merge_left)
+                {
+                    assigned[i] = static_cast<uint32_t>(
+                        shared_next_internal - merge_count);
+                    ++merge_count;
+                }
+            }
+            if(merge_count == 0)
+            {
+                nearest[0] = 1u;
+                nearest[1] = 0u;
+                out_count = 0;
+                for(int i = 0; i < count; ++i)
+                {
+                    if(i >= 2)
+                        nearest[i] = static_cast<uint32_t>(i);
+                    offsets[i] = static_cast<uint32_t>(out_count);
+                    assigned[i] = i == 0
+                                      ? static_cast<uint32_t>(
+                                            shared_next_internal)
+                                      : 0xFFFFFFFFu;
+                    if(i != 1)
+                        ++out_count;
+                }
+                merge_count = 1;
+            }
+            shared_new_count    = out_count;
+            shared_round_merges = merge_count;
+        }
+        __syncthreads();
+
+        for(int i = threadIdx.x; i < count; i += blockDim.x)
+        {
+            const int j = static_cast<int>(nearest[i]);
+            const bool mutual = j >= 0 && j < count
+                                && nearest[j] == static_cast<uint32_t>(i);
+            if(mutual && i > j)
+                continue;
+            const uint32_t out = offsets[i];
+            if(mutual && i < j)
+            {
+                const uint32_t node  = assigned[i];
+                const uint32_t left  = input_ids[i];
+                const uint32_t right = input_ids[j];
+                const AABB merged_box = merge(input_boxes[i], input_boxes[j]);
+                nodes[node].parent_idx  = 0xFFFFFFFFu;
+                nodes[node].left_idx    = left;
+                nodes[node].right_idx   = right;
+                nodes[node].element_idx = 0xFFFFFFFFu;
+                nodes[left].parent_idx  = node;
+                nodes[right].parent_idx = node;
+                boxes[node]             = merged_box;
+                if(node_max_element)
+                {
+                    const uint32_t a = node_max_element[left];
+                    const uint32_t b = node_max_element[right];
+                    node_max_element[node] = a > b ? a : b;
+                }
+                output_ids[out]   = node;
+                output_boxes[out] = merged_box;
+            }
+            else
+            {
+                output_ids[out]   = input_ids[i];
+                output_boxes[out] = input_boxes[i];
+            }
+        }
+        __syncthreads();
+
+        if(threadIdx.x == 0)
+        {
+            shared_next_internal -= shared_round_merges;
+            shared_count = shared_new_count;
+        }
+        __syncthreads();
+        count = shared_count;
+        uint32_t* ids_swap = input_ids;
+        input_ids  = output_ids;
+        output_ids = ids_swap;
+        AABB* boxes_swap = input_boxes;
+        input_boxes  = output_boxes;
+        output_boxes = boxes_swap;
+    }
+    if(threadIdx.x == 0)
+        roots[chunk] = input_ids[0];
+}
+
+// PLOC++ upper level: after the lower kernel completes, only chunk_count
+// representatives remain. Their tree consumes the reserved leading internal
+// IDs, ending at root node zero. This separate launch is stream ordered and is
+// fully CUDA Graph capture-safe.
+__global__ void _buildPlocUpper(Node*           nodes,
+                                AABB*           boxes,
+                                const uint32_t* roots,
+                                uint32_t*       clusters_a,
+                                uint32_t*       clusters_b,
+                                uint32_t*       nearest,
+                                uint32_t*       flags,
+                                uint32_t*       offsets,
+                                uint32_t*       assigned,
+                                uint32_t*       node_max_element,
+                                int             chunk_count,
+                                int             radius,
+                                int             ploc_plus_plus)
+{
+    if(chunk_count <= 1)
+        return;
+    __shared__ int shared_count;
+    __shared__ int shared_new_count;
+    __shared__ int shared_next_internal;
+    __shared__ int shared_round_merges;
+    _buildPlocWorkgroup(nodes,
+                        boxes,
+                        roots,
+                        clusters_a,
+                        clusters_b,
+                        nearest,
+                        flags,
+                        offsets,
+                        assigned,
+                        node_max_element,
+                        nullptr,
+                        chunk_count,
+                        0,
+                        chunk_count - 2,
+                        radius,
+                        ploc_plus_plus,
+                        &shared_count,
+                        &shared_new_count,
+                        &shared_next_internal,
+                        &shared_round_merges);
+}
+
+// Collapse three levels of an existing binary topology into an explicit
+// maximum-eight-child traversal front. Child references still point at the
+// original binary nodes and therefore use exactly the same boxes/topology;
+// this isolates traversal width from tree-quality changes. The destination is
+// the post-sort temporary AABB buffer (48N bytes, versus <32N bytes needed
+// here), which is dead until the next Construct call.
+static __device__ __forceinline__ double _bvh8CollapseScore(
+    const Node* nodes,
+    const AABB* boxes,
+    uint32_t    ref,
+    int         collapse_mode)
+{
+    if(nodes[ref].element_idx != 0xFFFFFFFFu)
+        return collapse_mode == 2 ? 1.7976931348623157e308 : -1.0;
+    if(collapse_mode != 2)
+        return _bvh_half_surface_area(boxes[ref]);
+    const uint32_t left  = nodes[ref].left_idx;
+    const uint32_t right = nodes[ref].right_idx;
+    return _bvh_half_surface_area(boxes[left])
+           + _bvh_half_surface_area(boxes[right])
+           - _bvh_half_surface_area(boxes[ref]);
+}
+
+__global__ void _buildBvh8Children(const Node* nodes,
+                                   const AABB* boxes,
+                                   uint32_t*   wide_children,
+                                   int         number,
+                                   int         collapse_mode)
+{
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if(node >= number - 1)
+        return;
+
+    uint32_t current[8];
+    int count = 0;
+    if(collapse_mode == 1)
+    {
+        uint32_t next[8];
+        count = 1;
+        current[0] = static_cast<uint32_t>(node);
+#pragma unroll
+        for(int level = 0; level < 3; ++level)
+        {
+            int next_count = 0;
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+            {
+                if(i >= count)
+                    break;
+                const uint32_t ref = current[i];
+                if(nodes[ref].element_idx != 0xFFFFFFFFu)
+                    next[next_count++] = ref;
+                else
+                {
+                    next[next_count++] = nodes[ref].left_idx;
+                    next[next_count++] = nodes[ref].right_idx;
+                }
+            }
+            count = next_count;
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+            {
+                if(i < count)
+                    current[i] = next[i];
+            }
+        }
+    }
+    else
+    {
+        double scores[8];
+        current[0] = nodes[node].left_idx;
+        current[1] = nodes[node].right_idx;
+        scores[0] = _bvh8CollapseScore(nodes, boxes, current[0], collapse_mode);
+        scores[1] = _bvh8CollapseScore(nodes, boxes, current[1], collapse_mode);
+        count = 2;
+        while(count < 8)
+        {
+            int best = -1;
+            double best_score = collapse_mode == 2
+                                    ? 1.7976931348623157e308
+                                    : -1.0;
+#pragma unroll
+            for(int i = 0; i < 8; ++i)
+            {
+                if(i >= count)
+                    break;
+                const uint32_t ref = current[i];
+                const double score = scores[i];
+                if(nodes[ref].element_idx != 0xFFFFFFFFu)
+                    continue;
+                if((collapse_mode == 2 && score < best_score)
+                   || (collapse_mode != 2 && score > best_score))
+                {
+                    best = i;
+                    best_score = score;
+                }
+            }
+            if(best < 0)
+                break;
+            const uint32_t ref = current[best];
+            current[best] = nodes[ref].left_idx;
+            current[count] = nodes[ref].right_idx;
+            scores[best] = _bvh8CollapseScore(
+                nodes, boxes, current[best], collapse_mode);
+            scores[count] = _bvh8CollapseScore(
+                nodes, boxes, current[count], collapse_mode);
+            ++count;
+        }
+    }
+
+    uint32_t* output = wide_children + 8 * node;
+#pragma unroll
+    for(int i = 0; i < 8; ++i)
+        output[i] = i < count ? current[i] : 0xFFFFFFFFu;
+}
+
+__global__ void _rotateSahTreelets(Node*           nodes,
+                                   AABB*           boxes,
+                                   const uint32_t* depths,
+                                   uint32_t*       node_max_element,
+                                   int             number,
+                                   int             phase)
+{
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if(p >= number - 1 || static_cast<int>(depths[p] % 3u) != phase)
+        return;
+
+    const uint32_t children[2] = {nodes[p].left_idx, nodes[p].right_idx};
+    double         best_gain   = 0.0;
+    int            best_side   = -1;
+    int            best_inside = -1;
+
+#pragma unroll
+    for(int side = 0; side < 2; ++side)
+    {
+        const uint32_t c = children[side];
+        const uint32_t s = children[1 - side];
+        if(c >= static_cast<uint32_t>(number - 1)
+           || s == 0xFFFFFFFFu)
+            continue;
+        const uint32_t a = nodes[c].left_idx;
+        const uint32_t b = nodes[c].right_idx;
+        if(a == 0xFFFFFFFFu || b == 0xFFFFFFFFu)
+            continue;
+
+        const double old_cost = _bvh_half_surface_area(boxes[c]);
+        const double gain_a =
+            old_cost - _bvh_half_surface_area(merge(boxes[a], boxes[s]));
+        const double gain_b =
+            old_cost - _bvh_half_surface_area(merge(boxes[s], boxes[b]));
+        if(gain_a > best_gain)
+        {
+            best_gain   = gain_a;
+            best_side   = side;
+            best_inside = 0;
+        }
+        if(gain_b > best_gain)
+        {
+            best_gain   = gain_b;
+            best_side   = side;
+            best_inside = 1;
+        }
+    }
+
+    const double tolerance =
+        1.0e-12 * (_bvh_half_surface_area(boxes[p]) + 1.0);
+    if(best_side < 0 || !(best_gain > tolerance))
+        return;
+
+    const uint32_t c = children[best_side];
+    const uint32_t s = children[1 - best_side];
+    const uint32_t a = nodes[c].left_idx;
+    const uint32_t b = nodes[c].right_idx;
+    const uint32_t inside  = best_inside == 0 ? a : b;
+    const uint32_t outside = best_inside == 0 ? b : a;
+
+    // Keep C in its original P slot.  Keep the selected original grandchild
+    // in its original C slot, insert S in the other, and promote `outside`.
+    if(best_side == 0)
+        nodes[p].right_idx = outside;
+    else
+        nodes[p].left_idx = outside;
+    if(best_inside == 0)
+        nodes[c].right_idx = s;
+    else
+        nodes[c].left_idx = s;
+
+    nodes[outside].parent_idx = static_cast<uint32_t>(p);
+    nodes[s].parent_idx       = c;
+    boxes[c]                  = merge(boxes[inside], boxes[s]);
+    if(node_max_element)
+    {
+        const uint32_t lhs = node_max_element[inside];
+        const uint32_t rhs = node_max_element[s];
+        node_max_element[c] = lhs > rhs ? lhs : rhs;
     }
 }
 
@@ -503,4 +1502,3 @@ void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint
         _propagateNodeEnv<<<bn, tn, 0, stream>>>(node_env, _nodes, flags, number);
     }
 }
-
