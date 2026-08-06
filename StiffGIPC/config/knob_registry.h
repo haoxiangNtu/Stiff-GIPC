@@ -49,6 +49,7 @@ extern "C" { extern char** environ; }  // POSIX, global scope
     X(STIFF_GRAPH_TRAIN_FIT, "diag") \
     X(STIFF_GRAPH_TRAIN_SHRINK, "perf") \
     X(STIFF_GRAPH_TRAIN_SHRINK_DIAG, "diag") \
+    X(STIFF_TIER_STEPS, "perf") \
     X(STIFF_FULL_GRAPH_MIN_VERTS, "perf") \
     X(STIFF_GUARD_FRAME_END_ONLY, "diag") \
     X(STIFF_NO_PAD_CLASS_ALLOWANCE, "perf") \
