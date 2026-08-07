@@ -41,22 +41,35 @@ __global__ void _ccd_final_alpha_combine(double* slots,
     {
         const double max_speed = slots[3];
         refined  = slots[4];
-        // [alpha-tune] CFL is a swept-BVH inflation guard, not a correctness
-        // bound: on the fs4 heavy segment it CAPS alpha below what ACCD
-        // already certified in 22.6% of iterations (median 1.48x). The factor
-        // is a knob so the cap-vs-query-cost trade can be measured.
-        alpha_cfl = __dmul_rn(__ddiv_rn(__dsqrt_rn(d_hat), max_speed), cfl_factor);
+        // [alpha-tune] The CFL term has TWO roles that must scale separately.
+        // As a CAP it is a swept-BVH inflation guard, not a correctness
+        // bound -- on the fs4 heavy segment it caps alpha below the
+        // ACCD-certified value in 22.6% of iterations (median 1.48x), and
+        // raising the cap is safe because alpha stays bounded by the
+        // certified refined/temp values. As a FLOOR it OVERRIDES a tiny
+        // certified refined value with a heuristic sqrt(dHat)-scale step;
+        // scaling that up multiplies an uncertified displacement and risks
+        // tunneling through thin geometry, so the floor stays at the legacy
+        // 0.5 factor regardless of the knob.
+        const double cfl_base =
+            __ddiv_rn(__dsqrt_rn(d_hat), max_speed);
+        alpha_cfl = __dmul_rn(cfl_base, cfl_factor);
+        const double cfl_floor = __dmul_rn(cfl_base, 0.5);
         // Keep comparison semantics deliberate: a NaN alpha_cfl propagates to
         // alpha and is rejected by the single host validation below.
         alpha = temp_alpha < alpha_cfl ? temp_alpha : alpha_cfl;
-        if(temp_alpha > __dmul_rn(2.0, alpha_cfl))
+        // The refined-consult trigger keeps the LEGACY threshold (2x the
+        // legacy 0.5-factor CFL): the swept ACCD pass is the only certifier
+        // for fast approaches from beyond DCD proximity, so raising the cap
+        // must not make it run less often.
+        if(temp_alpha > __dmul_rn(2.0, cfl_floor))
         {
             if((refined_invalid && (*refined_invalid & kCcdRawInvalid))
                || !isfinite(refined) || refined <= 0.0 || refined > 1.0)
                 atomicOr(invalid, kCcdInvalidGlobalRefined);
             const double refined_scaled = __dmul_rn(refined, ccd_size);
             alpha = temp_alpha < refined_scaled ? temp_alpha : refined_scaled;
-            alpha = alpha > alpha_cfl ? alpha : alpha_cfl;
+            alpha = alpha > cfl_floor ? alpha : cfl_floor;
         }
     }
     slots[4] = refined;
