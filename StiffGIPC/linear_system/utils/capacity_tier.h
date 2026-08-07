@@ -24,6 +24,14 @@ inline int assembly_capacity_tier(int count)
     // two (n=1 is the legacy ladder, n=2 adds the 1.5x rung, n=4 the
     // 1.25/1.5/1.75 rungs), trading finer widths for more frequent
     // re-records, which measure only 25-28 ms.
+    //
+    // VERDICT (2026-08-07, A/A-calibrated matrix, 6 rounds x duplicated
+    // arms): REJECTED as a default. n=4 vs the legacy ladder is a null
+    // (-1.0% median over 24 within-round pairings, 11/13 sign) and it
+    // robustly RAISES boundary fallbacks (6-8 vs 3-5 per 60 frames; finer
+    // tiers sit closer to the live counts). The earlier "-7.9% win" was a
+    // single-batch phantom; the same-config A/A noise floor on this
+    // workload is ~5-9% median, with host-arm excursions past 50%.
     static int s_steps = -1;
     if(s_steps < 0)
     {
