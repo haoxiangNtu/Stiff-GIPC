@@ -1579,7 +1579,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             }
         }
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end1));
-        double alpha = 1.0, slackness_a = 0.9, slackness_m = 0.8;
+        double alpha = 1.0, slackness_a = gipc_ccd_slack_a(), slackness_m = gipc_ccd_slack_m();
         double diag_ground_alpha = 1.0;
         double diag_narrow_alpha = 1.0;
         double diag_refined_alpha = 1.0;
@@ -1682,7 +1682,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                                m_ccd_alpha_invalid,
                                                m_ccd_refined_invalid,
                                                _cpNum,
-                                               frame_graph_device_state());
+                                               frame_graph_device_state(),
+                                               0,
+                                               gipc_ccd_cfl_factor());
         }
         else
         {
@@ -1705,7 +1707,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                                m_ccd_alpha_invalid,
                                                m_ccd_refined_invalid,
                                                nullptr,
-                                               frame_graph_device_state());
+                                               frame_graph_device_state(),
+                                               0,
+                                               gipc_ccd_cfl_factor());
         }
 
         // One scalar-chain D2H after every global decision and validation bit.
@@ -1739,7 +1743,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                                    m_ccd_alpha_invalid,
                                                    m_ccd_refined_invalid,
                                                    nullptr,
-                                                   frame_graph_device_state());
+                                                   frame_graph_device_state(),
+                                                   0,
+                                                   gipc_ccd_cfl_factor());
                 CUDA_SAFE_CALL(cudaMemcpy(h_ccd_state,
                                           m_ccd_alpha_slots,
                                           sizeof(h_ccd_state),
@@ -2353,7 +2359,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
         buildFullCP(alpha);
         if(h_ccd_cpNum > 0)
         {
-            double slackness_m = 0.8;
+            double slackness_m = gipc_ccd_slack_m();
             CUDA_SAFE_CALL(cudaMemsetAsync(m_ccd_alpha_invalid, 0, sizeof(int)));
             alpha              = std::min(alpha,
                              self_largestFeasibleStepSize(slackness_m, ensure_reduce_scratch(h_ccd_cpNum), h_ccd_cpNum));

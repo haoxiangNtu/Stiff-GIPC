@@ -58,6 +58,48 @@ struct RevoluteDrivingControlPacked;
 struct PrismaticDrivingControlPacked;
 }  // namespace gipc
 
+// [alpha-tune] CCD step-cap knobs (opt-in; defaults = legacy values).
+// slackness: ACCD conservative-advance fractions (ground / self+swept).
+// cfl_factor: the swept-BVH inflation guard sqrt(dHat)/maxspeed * factor --
+// a performance guard, not a correctness bound (it caps alpha below the
+// ACCD-certified value in 22.6% of heavy-segment iterations, median 1.48x).
+inline double gipc_ccd_slack_a()
+{
+    static double v = -1.0;
+    if(v < 0)
+    {
+        const char* e = getenv("STIFF_CCD_SLACK_A");
+        v             = e && e[0] ? atof(e) : 0.9;
+        if(!(v > 0.0 && v < 1.0))
+            v = 0.9;
+    }
+    return v;
+}
+inline double gipc_ccd_slack_m()
+{
+    static double v = -1.0;
+    if(v < 0)
+    {
+        const char* e = getenv("STIFF_CCD_SLACK_M");
+        v             = e && e[0] ? atof(e) : 0.8;
+        if(!(v > 0.0 && v < 1.0))
+            v = 0.8;
+    }
+    return v;
+}
+inline double gipc_ccd_cfl_factor()
+{
+    static double v = -1.0;
+    if(v < 0)
+    {
+        const char* e = getenv("STIFF_CCD_CFL_FACTOR");
+        v             = e && e[0] ? atof(e) : 0.5;
+        if(!(v > 0.0 && v <= 8.0))
+            v = 0.5;
+    }
+    return v;
+}
+
 class GIPC
 {
   public:

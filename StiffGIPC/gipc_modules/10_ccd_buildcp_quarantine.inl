@@ -22,7 +22,8 @@ __global__ void _ccd_final_alpha_combine(double* slots,
                                          const int* refined_invalid,
                                          const uint32_t* d_ccd_count,
                                          frame_fsm::FrameDeviceState* frame,
-                                         int ccd_capacity = 0)
+                                         int ccd_capacity = 0,
+                                         double cfl_factor = 0.5)
 {
     // [B3 ccd-defer] when armed, the pair gate comes from the live device
     // count and the raw count rides slot 8 of the same scalar-chain read
@@ -40,7 +41,11 @@ __global__ void _ccd_final_alpha_combine(double* slots,
     {
         const double max_speed = slots[3];
         refined  = slots[4];
-        alpha_cfl = __dmul_rn(__ddiv_rn(__dsqrt_rn(d_hat), max_speed), 0.5);
+        // [alpha-tune] CFL is a swept-BVH inflation guard, not a correctness
+        // bound: on the fs4 heavy segment it CAPS alpha below what ACCD
+        // already certified in 22.6% of iterations (median 1.48x). The factor
+        // is a knob so the cap-vs-query-cost trade can be measured.
+        alpha_cfl = __dmul_rn(__ddiv_rn(__dsqrt_rn(d_hat), max_speed), cfl_factor);
         // Keep comparison semantics deliberate: a NaN alpha_cfl propagates to
         // alpha and is rejected by the single host validation below.
         alpha = temp_alpha < alpha_cfl ? temp_alpha : alpha_cfl;
@@ -3191,8 +3196,12 @@ void GIPC::enqueue_post_ls_kappa_conditional()
 // grow-redo — validation and past-capacity retries ride FrameDeviceState.
 void GIPC::enqueue_ccd_alpha_conditional()
 {
-    const double slackness_a = 0.9;
-    const double slackness_m = 0.8;
+    // [alpha-tune] ACCD conservative-advance fractions. Raising them lets the
+    // line search start closer to the certified first-contact time; the ACCD
+    // math itself stays conservative, so non-penetration is untouched. The
+    // heavy-segment binder census: ground 34.6%, CFL 32.8%, refined 32.4%.
+    const double slackness_a = gipc_ccd_slack_a();
+    const double slackness_m = gipc_ccd_slack_m();
     const double ccd_size    = 1.0;
 
     CUDA_SAFE_CALL(cudaMemsetAsync(
@@ -3240,7 +3249,8 @@ void GIPC::enqueue_ccd_alpha_conditional()
                                        m_ccd_refined_invalid,
                                        _cpNum,
                                        frame_graph_device_state(),
-                                       ccd_train);
+                                       ccd_train,
+                                       gipc_ccd_cfl_factor());
 }
 
 void GIPC::throwIfGroundDistanceInvalid()
