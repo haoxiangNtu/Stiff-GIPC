@@ -1012,6 +1012,14 @@ void GIPC::postLineSearch(device_TetraData& TetMesh, double alpha)
     {
         initKappa(TetMesh);
     }
+    // [postls-freeze probe] causal test for the graph arm's +10.7% Newton
+    // surplus: skip the WITHIN-FRAME kappa/close-set adaptation the host
+    // normally does after every line search, approximating the recorded
+    // graph's frozen bookkeeping. Diagnostic only.
+    else if(getenv("STIFF_POSTLS_FREEZE"))
+    {
+        return;
+    }
     else
     {
         if(m_pergroup_kappa && m_kappa_group && m_d_close_grp)
