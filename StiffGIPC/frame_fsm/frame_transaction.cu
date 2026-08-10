@@ -254,11 +254,19 @@ bool full_graph_eligible(const GIPC& ipc,
                          std::string& reason,
                          bool allow_abd = false)
 {
-    if(knob_enabled("STIFF_FRAME_FORCE_ROLLBACK")
-       || knob_enabled("STIFF_FRAME_FORCE_UNIQUE_TIER"))
     {
-        reason = "transaction fault injection requires the two-graph gate";
-        return false;
+        const char* force_rb = std::getenv("STIFF_FRAME_FORCE_ROLLBACK");
+        const bool legacy_injection =
+            force_rb && force_rb[0] && force_rb[0] != '0'
+            && force_rb[0] != '2';
+        // =1 keeps the G16 contract (two-graph gate, throw). =2 is the
+        // paired-audit mode, implemented on the FULL path too (injection at
+        // the boundary in try_launch_full_graph), so it stays eligible.
+        if(legacy_injection || knob_enabled("STIFF_FRAME_FORCE_UNIQUE_TIER"))
+        {
+            reason = "transaction fault injection requires the two-graph gate";
+            return false;
+        }
     }
     if(std::getenv("NAN_DIAG"))
     {
@@ -689,6 +697,19 @@ __global__ void frame_restore_abd(
     q_prev[index]  = snap_q_prev[index];
     q_v[index]     = snap_q_v[index];
     q_tilde[index] = snap_q_tilde[index];
+}
+
+// [paired-audit] flip a COMPLETED full-graph frame to a rollback so the
+// retry loop finishes it on the release solver; the restore kernels below
+// (which no-op on FRAME_OK) then fire on the eager replay.
+__global__ void frame_inject_rollback(frame_fsm::FrameDeviceState* state)
+{
+    if(state->result != frame_fsm::FRAME_OK)
+        return;
+    frame_fsm::fsm_record_error(
+        state, frame_fsm::ERR_CAPACITY, frame_fsm::OVF_DCD_PAIRS, -1, -1);
+    state->result = frame_fsm::FRAME_RETRY_REQUIRED;
+    state->phase  = frame_fsm::PHASE_ROLLBACK;
 }
 
 __global__ void frame_restore_kappa(
@@ -2644,6 +2665,73 @@ bool try_launch_full_graph(GIPC& ipc,
             std::string("full frame graph boundary failed: ")
             + cudaGetErrorString(boundary));
     }
+    // [paired-audit] STIFF_FRAME_FORCE_ROLLBACK on the FULL path: the graph
+    // solved the whole frame; discard its result. Flip the device state to
+    // RETRY, replay the in-graph restore kernels eagerly from the context
+    // snapshot (vertex arrays + abd q family + kappa), refresh the serialized
+    // status, and restore the host mirrors. The retry loop then finishes the
+    // frame on the release solver, so the trajectory stays host-shaped while
+    // the [graph-frame] diag line keeps the attempt's true device-counted
+    // Newton/PCG cost: a per-frame paired cost audit on identical states.
+    if(const char* force_env = std::getenv("STIFF_FRAME_FORCE_ROLLBACK");
+       force_env && force_env[0] == '2'
+       && context.h_status->result == frame_fsm::FRAME_OK)
+    {
+        frame_inject_rollback<<<1, 1, 0, cudaStreamPerThread>>>(
+            context.d_state);
+        if(context.vertex_count)
+        {
+            const int blocks =
+                static_cast<int>((context.vertex_count + 255) / 256);
+            frame_restore_fem<<<blocks, 256, 0, cudaStreamPerThread>>>(
+                context.d_state,
+                mesh.vertexes,
+                mesh.o_vertexes,
+                mesh.velocities,
+                mesh.xTilta,
+                context.fem_vertexes,
+                context.fem_o_vertexes,
+                context.fem_velocities,
+                context.fem_x_tilta,
+                static_cast<int>(context.vertex_count));
+        }
+        if(context.abd_count)
+        {
+            auto& device = ipc.m_abd_sim_data->device;
+            const int abd_blocks =
+                static_cast<int>((context.abd_count + 255) / 256);
+            frame_restore_abd<<<abd_blocks, 256, 0, cudaStreamPerThread>>>(
+                context.d_state,
+                device.body_id_to_q.data(),
+                device.body_id_to_q_prev.data(),
+                device.body_id_to_q_v.data(),
+                device.body_id_to_q_tilde.data(),
+                context.abd_q,
+                context.abd_q_prev,
+                context.abd_q_v,
+                context.abd_q_tilde,
+                static_cast<int>(context.abd_count));
+        }
+        if(context.group_count)
+            frame_restore_kappa<<<
+                static_cast<int>((context.group_count + 255) / 256),
+                256,
+                0,
+                cudaStreamPerThread>>>(
+                context.d_state,
+                ipc.m_kappa_group,
+                context.kappa_snapshot,
+                static_cast<int>(context.group_count));
+        frame_serialize_status<<<1, 1, 0, cudaStreamPerThread>>>(
+            context.d_state, context.d_terminal, context.d_status);
+        CUDA_SAFE_CALL(cudaMemcpyAsync(context.h_status,
+                                       context.d_status,
+                                       sizeof(frame_fsm::FrameStatus),
+                                       cudaMemcpyDeviceToHost,
+                                       cudaStreamPerThread));
+        CUDA_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
+        restore_host_attempt(ipc, context.host_snapshot);
+    }
     return true;
 }
 
@@ -3955,8 +4043,8 @@ void GIPC::frame_graph_enqueue_terminal(device_TetraData&,
     input.terminal_d2h_nodes   = context.terminal_d2h;
 
     const char* force = std::getenv("STIFF_FRAME_FORCE_ROLLBACK");
-    if(input.result == frame_fsm::FRAME_OK && force && force[0]
-       && force[0] != '0')
+    if(input.result == frame_fsm::FRAME_OK && !m_diag_force_suppress && force
+       && force[0] && force[0] != '0')
     {
         input.result       = frame_fsm::FRAME_RETRY_REQUIRED;
         input.error_code   = frame_fsm::ERR_CAPACITY;
@@ -4386,6 +4474,12 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
     const bool diagnostic_rollback =
         force_rollback && force_rollback[0]
         && force_rollback[0] != '0';
+    // STIFF_FRAME_FORCE_ROLLBACK=1 keeps the G16 fault-injection contract
+    // (the injected frame throws, state stays put). =2 is the PAIRED-AUDIT
+    // mode: every injected frame finishes on the release solver, giving a
+    // per-frame graph-vs-host cost comparison on bitwise-identical states.
+    const bool paired_audit =
+        force_rollback && force_rollback[0] == '2';
     constexpr uint32_t capacity_bits =
         frame_fsm::OVF_DCD_PAIRS
         | frame_fsm::OVF_CCD_PAIRS
@@ -4524,10 +4618,18 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
                     attempt,
                     retry_invalid_bits);
                 IPC_Solver(mesh);
+                // [paired-audit] the release-solver FALLBACK finish must
+                // adjudicate honestly even under STIFF_FRAME_FORCE_ROLLBACK
+                // (re-flipping it would spin the retry loop to exhaustion and
+                // abort at the second frame). A first-attempt host body (two-
+                // graph mode) still takes the flip, so the no-graph layer of
+                // the paired decomposition can exercise rollback+fallback.
+                m_diag_force_suppress = capacity_fallback;
                 frame_graph_enqueue_terminal(
                     mesh,
                     frame_fsm::FRAME_OK,
                     frame_fsm::ERR_NONE);
+                m_diag_force_suppress = false;
                 CUDA_SAFE_CALL(
                     cudaStreamSynchronize(cudaStreamPerThread));
             }
@@ -4557,6 +4659,17 @@ void GIPC::IPC_Solver_FrameGraph(device_TetraData& mesh)
             return;
 
         retry_invalid_bits |= m_last_frame_status.invalid_bits;
+        // [paired-audit] Fault-injection mode used as a per-frame cost audit:
+        // finish EVERY injected-failure frame on the release solver so the
+        // trajectory stays host-shaped end to end, while each graph attempt's
+        // device-counted Newton/PCG cost is still logged by the [graph-frame]
+        // diag line. Without this bypass the injected failure is judged
+        // non-retryable and the second frame aborts the run.
+        if(paired_audit && attempt < max_retries)
+        {
+            capacity_fallback = true;
+            continue;
+        }
         // A too-small tier starves the solver (dropped pairs -> wrong energy ->
         // line-search budget exhaustion), and THAT error is what gets recorded,
         // not the capacity bit. Retry on any outcome that carries a capacity bit

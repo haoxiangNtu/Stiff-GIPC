@@ -529,6 +529,9 @@ class GIPC
     // tier below its trained width (hysteresis for STIFF_GRAPH_TRAIN_SHRINK).
     int      m_train_low_streak[5] = {0, 0, 0, 0, 0};
     int      m_width_rerecords      = 0;   // [width-shrink] policy activity
+    // [paired-audit] suppresses the STIFF_FRAME_FORCE_ROLLBACK flip for the
+    // host-fallback terminal (the injection targets graph attempts only).
+    bool     m_diag_force_suppress  = false;
     int      m_class_low_streak[4]  = {0, 0, 0, 0};
     // [lsx-diag] E0-time stash for the line-search-exhaustion probe: the 15
     // energy slots and the pair-count mirrors captured when E0 was evaluated,
