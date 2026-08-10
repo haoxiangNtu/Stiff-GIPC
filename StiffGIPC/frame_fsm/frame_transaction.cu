@@ -1252,6 +1252,47 @@ void capture_full_graph(GIPC& ipc,
                 cudaMemcpyDeviceToDevice,
                 cudaStreamPerThread));
         }
+        // [lsx fix] The FULL-graph transaction must snapshot the SAME state
+        // set as the two-graph root (abd q family + kappa), or a failed
+        // attempt rolls back vertexes while q keeps its mid-attempt value.
+        // That breaks the engine-wide invariant x == J*q at the fallback
+        // frame's entry: the host re-solve's E0 reads the restored vertex
+        // mirror while every line-search trial re-derives vert = J*q from
+        // the polluted q, so the stitch/soft term explodes (measured 3e5x
+        // to 6e7x) at ANY alpha, the search exhausts its 64 halvings, and a
+        // non-descent step legalizes the polluted q into the trajectory.
+        if(context.abd_count)
+        {
+            auto& device = ipc.m_abd_sim_data->device;
+            const size_t abd_bytes =
+                context.abd_count * sizeof(gipc::Vector12);
+            CUDA_SAFE_CALL(cudaMemcpyAsync(context.abd_q,
+                                           device.body_id_to_q.data(),
+                                           abd_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemcpyAsync(context.abd_q_prev,
+                                           device.body_id_to_q_prev.data(),
+                                           abd_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemcpyAsync(context.abd_q_v,
+                                           device.body_id_to_q_v.data(),
+                                           abd_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+            CUDA_SAFE_CALL(cudaMemcpyAsync(context.abd_q_tilde,
+                                           device.body_id_to_q_tilde.data(),
+                                           abd_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+        }
+        if(context.group_count)
+            CUDA_SAFE_CALL(cudaMemcpyAsync(context.kappa_snapshot,
+                                           ipc.m_kappa_group,
+                                           context.group_count * sizeof(double),
+                                           cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
 
         std::vector<cudaGraph_t> conditional_bodies;
         std::vector<cudaGraphNode_t> conditional_nodes;
@@ -1296,6 +1337,38 @@ void capture_full_graph(GIPC& ipc,
                 context.fem_x_tilta,
                 static_cast<int>(context.vertex_count));
         }
+        // [lsx fix] see the snapshot above: restore the abd q family and
+        // kappa alongside the vertex arrays (mirrors the two-graph
+        // terminal). Both kernels no-op when the frame result is FRAME_OK,
+        // so accepted frames stay bitwise-identical.
+        if(context.abd_count)
+        {
+            auto& device = ipc.m_abd_sim_data->device;
+            const int abd_blocks = static_cast<int>(
+                (context.abd_count + 255) / 256);
+            frame_restore_abd<<<
+                abd_blocks, 256, 0, cudaStreamPerThread>>>(
+                context.d_state,
+                device.body_id_to_q.data(),
+                device.body_id_to_q_prev.data(),
+                device.body_id_to_q_v.data(),
+                device.body_id_to_q_tilde.data(),
+                context.abd_q,
+                context.abd_q_prev,
+                context.abd_q_v,
+                context.abd_q_tilde,
+                static_cast<int>(context.abd_count));
+        }
+        if(context.group_count)
+            frame_restore_kappa<<<
+                static_cast<int>((context.group_count + 255) / 256),
+                256,
+                0,
+                cudaStreamPerThread>>>(
+                context.d_state,
+                ipc.m_kappa_group,
+                context.kappa_snapshot,
+                static_cast<int>(context.group_count));
 
         CUDA_SAFE_CALL(cudaMemcpyAsync(
             context.d_terminal,
