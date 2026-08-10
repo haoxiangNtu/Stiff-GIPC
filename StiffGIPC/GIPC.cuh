@@ -130,7 +130,7 @@ class GIPC
     cudaGraphExec_t m_ls_graph_exec   = nullptr;  // [C-1] cached trial-body self-tail graph
     // Captured host values: pointer generation, budget, the two device-count
     // energy launch bounds, and the frozen DCD snapshot copy length.
-    long long m_ls_graph_sig[5]       = {-1, -1, -1, -1, -1};
+    long long m_ls_graph_sig[6]       = {-1, -1, -1, -1, -1, -1};
     // [Phase C] Opaque owner of conditional graphs, transaction snapshots and
     // pinned frame-boundary packets.  Kept opaque here so the public solver
     // header exposes only the stable FrameStatus ABI.
@@ -530,6 +530,18 @@ class GIPC
     int      m_train_low_streak[5] = {0, 0, 0, 0, 0};
     int      m_width_rerecords      = 0;   // [width-shrink] policy activity
     int      m_class_low_streak[4]  = {0, 0, 0, 0};
+    // [lsx-diag] E0-time stash for the line-search-exhaustion probe: the 15
+    // energy slots and the pair-count mirrors captured when E0 was evaluated,
+    // compared slot-by-slot against the final (near-zero-alpha) trial.
+    double*  m_lsx_e0_slots         = nullptr;
+    uint32_t m_lsx_e0_cp[5]         = {0, 0, 0, 0, 0};
+    uint32_t m_lsx_e0_gp            = 0;
+    double   m_lsx_e0_rate          = -1.0;   // animation_fullRate at E0
+    double   m_lsx_e0_target[3]     = {0, 0, 0};   // targetVert[0] at E0
+    double   m_lsx_e0_motion        = -1.0;        // softMotionRate at E0
+    void*    m_lsx_e0_stitch_ptr    = nullptr;     // d_stitch_paired_vertex at E0
+    int      m_lsx_e0_stitch[4]     = {-9, -9, -9, -9};
+    double   m_lsx_e0_off[3]        = {0, 0, 0};   // d_stitch_rest_offset[0] at E0
     uint32_t m_peak_gpNum    = 0;
     // [C6-b] Set by frame_graph_finish_terminal when a capacity tier actually
     // grew. A frame that overflowed can only be retried if the retry will run

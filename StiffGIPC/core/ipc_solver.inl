@@ -192,6 +192,45 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
     else
         lastEnergyVal = computeEnergy(TetMesh);
+    // [lsx-diag] stash the E0-time term slots and pair counts so an
+    // exhaustion can print WHICH term/count changed at a numerically-zero
+    // trial step (that difference names the state leak).
+    if(getenv("STIFF_LSX_DIAG"))
+    {
+        if(!m_lsx_e0_slots)
+            CUDA_SAFE_CALL(
+                cudaMalloc(&m_lsx_e0_slots, kEnergySlotCount * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMemcpyAsync(m_lsx_e0_slots,
+                                       m_energy_slots,
+                                       kEnergySlotCount * sizeof(double),
+                                       cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
+        for(int i = 0; i < 5; ++i)
+            m_lsx_e0_cp[i] = h_cpNum[i];
+        m_lsx_e0_gp   = h_gpNum;
+        m_lsx_e0_rate = animation_fullRate;
+        if(softNum > 0 && TetMesh.targetVert)
+            CUDA_SAFE_CALL(cudaMemcpy(m_lsx_e0_target,
+                                      TetMesh.targetVert,
+                                      3 * sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+        // [lsx-diag v3] the soft term's remaining baked inputs: motion rate,
+        // stitch pairing pointer+content, rest offset. One of these MUST
+        // differ from the trial-graph's capture-time copy when only the soft
+        // slot explodes at a zero-length step.
+        m_lsx_e0_motion     = softMotionRate;
+        m_lsx_e0_stitch_ptr = (void*)TetMesh.d_stitch_paired_vertex;
+        if(softNum > 0 && TetMesh.d_stitch_paired_vertex)
+            CUDA_SAFE_CALL(cudaMemcpy(m_lsx_e0_stitch,
+                                      TetMesh.d_stitch_paired_vertex,
+                                      4 * sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+        if(softNum > 0 && TetMesh.d_stitch_rest_offset)
+            CUDA_SAFE_CALL(cudaMemcpy(m_lsx_e0_off,
+                                      TetMesh.d_stitch_rest_offset,
+                                      3 * sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+    }
     bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
                        && TetMesh.h_groups_present
                        && abd_fem_count_info.fem_point_num > 0
@@ -501,14 +540,28 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         if(energy_decision == 1 && s_ls_graph && device_ls && m_ls_defer_counts
            && m_total_frames >= 1 /* frame 0 warms every lazy alloc */)
         {
-            const long long sig[5] = {
+            long long sig[6] = {
                 pcg_buffer_generation(),
                 (long long)line_search_budget,
                 (long long)m_energy_bound_cp,
                 (long long)m_energy_bound_gp,
-                (long long)m_dcd_snap_count};
+                (long long)m_dcd_snap_count,
+                // [lsx fix] animation_fullRate is baked BY VALUE into the
+                // captured trial body (the soft-constraint energy scales with
+                // rate^2), while E0 outside the graph uses the live value. A
+                // replay under a drifted rate makes the trial energies
+                // incomparable with E0 -- measured on graph-fallback frames as
+                // a 6.3e7x soft-slot jump at a numerically-zero step, 64
+                // wasted halvings, and a forced non-descent accept. Bit-cast
+                // the rate into the signature so a drift re-records (~ms,
+                // only when the rate actually changes; constant-rate scenes
+                // never pay). Kappa already rides a device pointer (C4-b);
+                // the rate was the one missed scalar.
+                (long long)0};
+            static_assert(sizeof(long long) == sizeof(double), "bitcast");
+            std::memcpy((void*)&sig[5], &animation_fullRate, sizeof(double));
             bool graph_sig_match = m_ls_graph_exec != nullptr;
-            for(int i = 0; graph_sig_match && i < 5; ++i)
+            for(int i = 0; graph_sig_match && i < 6; ++i)
                 graph_sig_match = m_ls_graph_sig[i] == sig[i];
             if(m_ls_graph_exec && !graph_sig_match)
             {
@@ -573,7 +626,7 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                               == cudaSuccess
                        && m_ls_graph_exec)
                     {
-                        for(int i = 0; i < 5; ++i)
+                        for(int i = 0; i < 6; ++i)
                             m_ls_graph_sig[i] = sig[i];
                         static bool onceg = false;
                         if(!onceg)
@@ -683,6 +736,93 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
                 "barrier distances / iteration blow-up in later frames. Raise "
                 "Config.line_search_max_iter, reduce dt, or soften the drive.\n",
                 numOfLineSearch, alpha, testingE, lastEnergyVal);
+        // [lsx-diag] the final trial ran at a numerically-zero alpha, so its
+        // state equals the E0 state; any per-term or per-count difference
+        // below names the buffer the failed-attempt rollback leaked.
+        if(getenv("STIFF_LSX_DIAG") && m_lsx_e0_slots)
+        {
+            double e0s[kEnergySlotCount] = {};
+            double trs[kEnergySlotCount] = {};
+            CUDA_SAFE_CALL(cudaMemcpy(e0s, m_lsx_e0_slots,
+                                      sizeof(e0s), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(trs, m_energy_slots,
+                                      sizeof(trs), cudaMemcpyDeviceToHost));
+            static const char* kN[15] = {
+                "FEM_kinetic", "FEM_elastic", "membrane", "bending",
+                "soft", "ground", "barrier", "friction", "gfriction",
+                "ABD_kinetic", "ABD_shape", "ABD_joint", "ABD_rev_drive",
+                "ABD_prismatic", "ABD_pri_drive"};
+            for(int si = 0; si < kEnergySlotCount; ++si)
+                if(e0s[si] != trs[si])
+                    fprintf(stderr,
+                            "[lsx-diag] slot %-13s E0=%.9e trial=%.9e "
+                            "ratio=%.3f\n",
+                            kN[si], e0s[si], trs[si],
+                            e0s[si] != 0.0 ? trs[si] / e0s[si] : -1.0);
+            double tgt_now[3] = {0, 0, 0};
+            if(softNum > 0 && TetMesh.targetVert)
+                CUDA_SAFE_CALL(cudaMemcpy(tgt_now,
+                                          TetMesh.targetVert,
+                                          3 * sizeof(double),
+                                          cudaMemcpyDeviceToHost));
+            fprintf(stderr,
+                    "[lsx-diag] rate E0=%.9e now=%.9e | targetVert0 "
+                    "E0=(%.6e %.6e %.6e) now=(%.6e %.6e %.6e)\n",
+                    m_lsx_e0_rate,
+                    animation_fullRate,
+                    m_lsx_e0_target[0], m_lsx_e0_target[1], m_lsx_e0_target[2],
+                    tgt_now[0], tgt_now[1], tgt_now[2]);
+            fprintf(stderr,
+                    "[lsx-diag] counts E0 cp=[%u %u %u %u %u] gp=%u | now "
+                    "cp=[%u %u %u %u %u] gp=%u\n",
+                    m_lsx_e0_cp[0], m_lsx_e0_cp[1], m_lsx_e0_cp[2],
+                    m_lsx_e0_cp[3], m_lsx_e0_cp[4], m_lsx_e0_gp,
+                    h_cpNum[0], h_cpNum[1], h_cpNum[2], h_cpNum[3],
+                    h_cpNum[4], (uint32_t)h_gpNum);
+            // [lsx-diag v3] soft-term baked inputs, live at E0 vs live now.
+            int    st_now[4]  = {-9, -9, -9, -9};
+            double off_now[3] = {0, 0, 0};
+            if(softNum > 0 && TetMesh.d_stitch_paired_vertex)
+                CUDA_SAFE_CALL(cudaMemcpy(st_now,
+                                          TetMesh.d_stitch_paired_vertex,
+                                          4 * sizeof(int),
+                                          cudaMemcpyDeviceToHost));
+            if(softNum > 0 && TetMesh.d_stitch_rest_offset)
+                CUDA_SAFE_CALL(cudaMemcpy(off_now,
+                                          TetMesh.d_stitch_rest_offset,
+                                          3 * sizeof(double),
+                                          cudaMemcpyDeviceToHost));
+            fprintf(stderr,
+                    "[lsx-diag] motionRate E0=%.9e now=%.9e | stitchPtr "
+                    "E0=%p now=%p\n",
+                    m_lsx_e0_motion, softMotionRate,
+                    m_lsx_e0_stitch_ptr,
+                    (void*)TetMesh.d_stitch_paired_vertex);
+            fprintf(stderr,
+                    "[lsx-diag] stitch[0..3] E0=(%d %d %d %d) now=(%d %d %d "
+                    "%d) | off0 E0=(%.6e %.6e %.6e) now=(%.6e %.6e %.6e)\n",
+                    m_lsx_e0_stitch[0], m_lsx_e0_stitch[1],
+                    m_lsx_e0_stitch[2], m_lsx_e0_stitch[3],
+                    st_now[0], st_now[1], st_now[2], st_now[3],
+                    m_lsx_e0_off[0], m_lsx_e0_off[1], m_lsx_e0_off[2],
+                    off_now[0], off_now[1], off_now[2]);
+            // [lsx-diag v3] FINAL ARBITER: relaunch the energy dispatch fresh
+            // with LIVE arguments over the exact vertexes/pairs the graph's
+            // last trial read. fresh==trial -> the state itself is
+            // inconsistent (temp-buffer desync); fresh==E0 -> a baked
+            // argument inside the cached trial graph went stale.
+            computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 1);
+            double frs[kEnergySlotCount] = {};
+            CUDA_SAFE_CALL(cudaMemcpy(frs, m_energy_slots, sizeof(frs),
+                                      cudaMemcpyDeviceToHost));
+            const bool fresh_matches_trial =
+                fabs(frs[4] - trs[4]) <= 1e-12 + 1e-6 * fabs(trs[4]);
+            fprintf(stderr,
+                    "[lsx-diag] FRESH soft=%.9e barrier=%.9e vs trial "
+                    "soft=%.9e -> verdict=%s\n",
+                    frs[4], frs[6], trs[4],
+                    fresh_matches_trial ? "STATE-DESYNC" : "BAKED-ARGS");
+        }
         // [rl-reset] step-health telemetry: an RL loop diffs these counters
         // across step() to detect and discard degraded episodes.
         ++m_ls_exhausted_total;
