@@ -4,6 +4,53 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.5.3] — 2026-08-11
+
+Stable-line patch release (`release/stable-0.8`): two contact-I/O fixes
+ported from the tactile-sensor line onto 0.8.5.2. No solver-dynamics
+changes: trajectories are identical to 0.8.5.2 unless you call the new
+episode-reset API.
+
+### Fixed
+- **`get_vertex_contact_forces(components=friction_lagged|total)` always
+  returned zero friction.** The lagged-friction gradient is a function of the
+  in-step displacement (`x − o_vertexes`); the accessor recomputed it after the
+  end-of-step commit, where that displacement is identically zero — while the
+  friction sets were demonstrably alive inside the solve (266–270 lagged
+  pairs). The solver now snapshots the friction gradient right before
+  `updateVelocities` and the accessor returns the snapshot. Validated on a
+  two-joint shear rig: with gel μ=1.0, bar μ=0.6, measured slip ratio
+  |Ft|/|Fn| = 0.600 ± 0.008 over three press depths. If you ever debugged a
+  grasp-slip problem against this readout and saw zeros — that was this bug,
+  not your scene.
+- **`teleport_abd_bodies` left the ABD surface vertices at the old pose**
+  until the next solve ran (stale getters; any pair rebuild binned the old
+  configuration). The teleport now re-derives the surface block from the
+  teleported `q` immediately.
+
+### Added
+- `SimEngine.reset_transient_contact_state()` — for in-place episode resets.
+  Teleports restore poses, but the current/lagged contact-pair mirrors and
+  adaptive kappa still describe the previous episode; the first new solve then
+  applies phantom friction from the stale pair list (measured: 24 µm state
+  divergence vs a fresh build; 6.7e-9 m after the reset call). Deliberately
+  not called inside the teleport APIs — teleporting one body mid-scene must
+  not clear every other contact's friction state.
+
+## [0.8.5.2] — 2026-07-25
+
+Internal stability release (first published here). Multi-env robustness: a
+ground-infeasible environment now quarantines instead of killing the process.
+
+### Fixed
+- Mid-run ground-infeasible envs quarantine (fully inert afterwards) instead
+  of aborting the whole batch; half-configured isolation setups get loud
+  warnings instead of undefined behavior.
+- Five-lens audit sweep: 7 defects closed in one batch (buffer-growth and
+  mirror-consistency hardening across the v0.8.2..v0.8.5 span).
+- Frame-start discard-grow for the triplet buffer (allocation-time hardening
+  complementing the 0.8.5.1 preserve-grow fix).
+
 ## [0.8.5.1] — 2026-07-24
 
 Patch release: fixes a rare strict-mode illegal-memory crash. No API changes;
