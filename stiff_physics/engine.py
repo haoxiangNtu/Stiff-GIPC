@@ -315,7 +315,15 @@ class Config:
         # static accuracy; 1e-4 is a good grasp-scene default. Sharper epsv
         # costs Newton iterations. 0 = legacy path (bit-identical).
         # Env escape hatch: STIFF_EPSV overrides at engine init.
-        absolute_epsv: float = 0.0,
+        # [0.8.5.4] default 1e-4 m/s (was 0 = scene-derived ~1e-2*eff_diag):
+        # scene-size-independent static friction, no measurable step cost.
+        # Pass 0.0 to restore the legacy scene-derived value bit-exactly.
+        absolute_epsv: float = 1e-4,
+        # [0.8.5.4] Persistent friction anchors (true stiction, zero hold
+        # creep). Default ON; False (or STIFF_FRIC_ANCHOR=0) restores the
+        # legacy per-step-reset friction. Validated: flask_cap hold-slide
+        # 3.7mm->0.00mm, cap frustum rotation 11deg->pinned; +9% step cost.
+        friction_anchor: bool = True,
         joint_strength_ratio: float = 100.0,
         revolute_driving_strength_ratio: float = 100.0,
         semi_implicit_enabled: bool = False,
@@ -379,6 +387,8 @@ class Config:
         # from scene scale (see parameter doc above).
         if hasattr(self._cfg, "absolute_epsv"):
             self._cfg.absolute_epsv = absolute_epsv
+        if hasattr(self._cfg, "friction_anchor"):
+            self._cfg.friction_anchor = bool(friction_anchor)
         self._cfg.joint_strength_ratio = joint_strength_ratio
         self._cfg.revolute_driving_strength_ratio = revolute_driving_strength_ratio
         self._cfg.prismatic_strength_ratio = prismatic_strength_ratio

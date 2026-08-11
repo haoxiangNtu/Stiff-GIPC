@@ -9802,7 +9802,7 @@ void GIPC::carryFrictionAnchors()
 {
     {
         const char* e     = getenv("STIFF_FRIC_ANCHOR");
-        m_fric_anchor_on  = (e && atoi(e) != 0);
+        m_fric_anchor_on  = e ? (atoi(e) != 0) : m_fric_anchor_cfg;
     }
     double3* sym    = nullptr;
     double3* sym_gd = nullptr;

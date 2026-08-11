@@ -4,6 +4,41 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.5.4] — 2026-08-12
+
+Friction line: true static friction. Two features, both new-default-ON —
+this release CHANGES trajectories for every scene with friction (escape
+hatches restore 0.8.5.3 behavior bit-exactly).
+
+### ⚠ Behavior changes
+- **`Config.absolute_epsv` (m/s) — default 1e-4** (was scene-derived
+  `epsv = 1e-2 * eff_scene_diag`, e.g. 19 mm/s on a 1.9 m scene). The IPC
+  stiction threshold is contact physics, not geometry; the scene-scale
+  coupling made static-friction accuracy depend on scene size (third member
+  of the bbox-derived-parameter family after dhat and kappa). Legacy:
+  `absolute_epsv=0` or `STIFF_EPSV=0`.
+- **`Config.friction_anchor` — default True.** Persistent cross-step friction
+  anchors: each lagged pair carries an accumulated tangential elastic offset
+  e; energy/gradient/Hessian evaluate u_total = relDX_step + e, making
+  stiction a spring against a persistent anchor. ||e|| is capped at
+  epsv*h — the cap sliding IS Coulomb sliding (radial return). Anchors carry
+  across steps by canonical pair key (cub merge-sort + binary search,
+  deterministic); ground pairs use a dense per-vertex array; teleports /
+  `reset_transient_contact_state()` clear them. Legacy: `friction_anchor=False`
+  or `STIFF_FRIC_ANCHOR=0`.
+
+### Why
+The per-step anchor reset of GIPC/IPC lagged friction creeps under sustained
+load at (load/(mu*lambda))*epsv: a held flask slid 3.7 mm and its frustum cap
+rotated 11-20 deg over 6 s at forces far inside the mu cone. With both
+features: hold-slide 0.00 mm, cap rotation pinned (0.7-1.4 deg, flat), the
+per-step drift drops from 10 um/frame to 5e-12 m/frame (newton-trace).
+Cost: +9% step time on the grasp scene (extra Newton/PCG work resolving real
+stick-slip in dynamic segments; hold-phase iterations unchanged).
+
+### Added
+- `STIFF_NEWTON_TRACE` — per-Newton-iteration move-norm trace (diagnostics).
+
 ## [0.8.5.3] — 2026-08-11
 
 Stable-line patch release (`release/stable-0.8`): two contact-I/O fixes

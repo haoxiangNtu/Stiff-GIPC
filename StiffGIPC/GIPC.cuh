@@ -285,6 +285,7 @@ class GIPC
     // carry through a dense per-surface-vertex array. Unmatched pairs restart
     // at e = 0 (exactly legacy behavior for new contacts).
     bool        m_fric_anchor_on     = false;
+    bool        m_fric_anchor_cfg    = true;   // Config.friction_anchor (env overrides)
     double3*    fric_anchor          = nullptr;  // per lastH body-pair slot
     double3*    fric_anchor_gd       = nullptr;  // per lastH ground-pair slot
     ulonglong2* fric_key_prev        = nullptr;  // sorted keys, prev step body pairs

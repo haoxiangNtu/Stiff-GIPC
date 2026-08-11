@@ -68,6 +68,10 @@ struct SimEngineConfig
     // guidance: ~1e-3*scene_len default; 1e-5 m/s for static accuracy. 0 =
     // legacy scene-derived value (bit-identical to previous releases).
     double absolute_epsv                  = 0.0;
+    // Persistent friction anchors (true stiction; see GIPC::carryFrictionAnchors).
+    // Default ON as of 0.8.5.4 — held grasps stop creeping. STIFF_FRIC_ANCHOR
+    // env (0/1) overrides; false restores the legacy per-step-reset friction.
+    bool   friction_anchor                = true;
     int    preconditioner_type            = 1;  // 1 = MAS
     int    cuda_device                    = 0;
 
