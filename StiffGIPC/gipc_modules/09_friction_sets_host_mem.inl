@@ -465,11 +465,22 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     meanMass     = m_meanMass;
     meanVolumn   = m_meanVolumn;
     dHat = relative_dhat * relative_dhat * eff_bboxDiagSize2;  // = absolute_dhat^2 when set
-    fDhat = 1e-4 * eff_bboxDiagSize2;
+    // [absolute-epsv / port of dc1a297] The friction kernels consume fDhat as
+    // sqrt(fDhat)*h == per-step stiction displacement threshold, i.e.
+    // epsv = sqrt(fDhat) [m/s]. The legacy scene-scale value (1e-2*eff_diag,
+    // e.g. 19 mm/s @ eff_diag 1.9 m) makes STATIC friction accuracy depend on
+    // scene size and yields stiction creep ~= (load/(mu*lambda))*epsv on held
+    // grasps. epsv is contact physics, not geometry: absolute_epsv>0 (or
+    // STIFF_EPSV) pins it (IPC paper: 1e-5 m/s for static accuracy). 0 keeps
+    // the legacy path bit-identically.
+    double eff_epsv = absolute_epsv;
+    if(const char* _ev = getenv("STIFF_EPSV")) eff_epsv = atof(_ev);
+    fDhat = (eff_epsv > 0.0) ? eff_epsv * eff_epsv : 1e-4 * eff_bboxDiagSize2;
     if(::g_gipc_log_level >= 1)
-        printf("[dhat] bboxDiagSize2=%.6g (eff=%.6g)  relative_dhat=%.3g  abs_dhat=%.3g  dHat_sqrt=%.6g%s\n",
+        printf("[dhat] bboxDiagSize2=%.6g (eff=%.6g)  relative_dhat=%.3g  abs_dhat=%.3g  dHat_sqrt=%.6g%s  epsv=%.6g m/s%s\n",
                bboxDiagSize2, eff_bboxDiagSize2, relative_dhat, absolute_dhat,
-               sqrt(dHat), absolute_dhat > 0.0 ? " (ABSOLUTE)" : " (scene-bbox)");
+               sqrt(dHat), absolute_dhat > 0.0 ? " (ABSOLUTE)" : " (scene-bbox)",
+               sqrt(fDhat), eff_epsv > 0.0 ? " (ABSOLUTE)" : " (scene-scale)");
     if(getenv("STIFF_SEED_DIAG"))
         printf("[seed-diag] bboxDiagSize2=%.17g eff=%.17g meanMass=%.17g meanVolumn=%.17g dHat=%.17g fDhat=%.17g dTol=%.17g scene=[%.17g,%.17g,%.17g]-[%.17g,%.17g,%.17g]\n",
                bboxDiagSize2, eff_bboxDiagSize2, meanMass, meanVolumn, dHat, fDhat, dTol,

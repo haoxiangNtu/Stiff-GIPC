@@ -19,6 +19,7 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.newton_velocity_tol     = cfg.newton_velocity_tol;   // [uipc-style opt-in]
     ipc.relative_dhat       = cfg.relative_dhat;
     ipc.absolute_dhat       = cfg.absolute_dhat;
+    ipc.absolute_epsv       = cfg.absolute_epsv;
     ipc.YoungModulus        = cfg.young_modulus;
     ipc.pcg_data.P_type     = cfg.preconditioner_type;
     ipc.assets_dir_cfg      = resolved_assets_dir;

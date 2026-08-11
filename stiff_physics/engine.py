@@ -348,6 +348,9 @@ class Config:
         pcg_tol: float = 1e-4,  # [0.8.2] back to the 0.6.x default; 1e-6 cost ~22% at N=1 for no accuracy need
         relative_dhat: float = 1e-3,
         absolute_dhat: float = 0.0,
+        # Absolute friction stiction threshold epsv (m/s); 0 = legacy
+        # scene-derived value. See CHANGELOG [0.8.5.4]. STIFF_EPSV overrides.
+        absolute_epsv: float = 0.0,
         joint_strength_ratio: float = 100.0,
         revolute_driving_strength_ratio: float = 100.0,
         semi_implicit_enabled: bool = False,
@@ -407,6 +410,8 @@ class Config:
         # full-scene bbox → consistent contact across num_envs (no cross-env coupling).
         if hasattr(self._cfg, "absolute_dhat"):
             self._cfg.absolute_dhat = absolute_dhat
+        if hasattr(self._cfg, "absolute_epsv"):
+            self._cfg.absolute_epsv = absolute_epsv
         self._cfg.joint_strength_ratio = joint_strength_ratio
         self._cfg.revolute_driving_strength_ratio = revolute_driving_strength_ratio
         self._cfg.prismatic_strength_ratio = prismatic_strength_ratio

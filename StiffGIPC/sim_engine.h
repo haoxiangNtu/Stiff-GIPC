@@ -63,6 +63,11 @@ struct SimEngineConfig
     // count/spacing -> super-linear contact). Set to the single-env dHat_sqrt
     // for multi-env. 0 = legacy bbox-derived behavior (no change for single-env).
     double absolute_dhat                  = 0.0;
+    // Absolute friction stiction threshold epsv (m/s). >0 decouples the IPC
+    // friction smoothing from the scene scale (fDhat = epsv^2). IPC-paper
+    // guidance: 1e-5 m/s for static accuracy; 1e-4 is a good grasp default.
+    // 0 = legacy scene-derived value (bit-identical to previous releases).
+    double absolute_epsv                  = 0.0;
     int    preconditioner_type            = 1;  // 1 = MAS
     int    cuda_device                    = 0;
 

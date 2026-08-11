@@ -321,6 +321,10 @@ class GIPC
     // Absolute contact distance (meters). >0 overrides the scene-bbox-derived
     // dHat so the contact thickness does NOT inflate with scene/env count.
     double   absolute_dhat = 0.0;
+    // Absolute friction stiction threshold epsv (m/s). >0 overrides the
+    // scene-scale-derived fDhat (fDhat = epsv^2); 0 = legacy path. epsv is
+    // contact physics, not scene geometry (see 09_friction_sets_host_mem.inl).
+    double   absolute_epsv = 0.0;
     double   dTol          = 0.0;
     double   minKappaCoef  = 0.0;
     double   IPC_dt        = 0.0;
