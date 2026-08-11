@@ -949,6 +949,7 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.newton_velocity_tol     = cfg.newton_velocity_tol;   // [uipc-style opt-in]
     ipc.relative_dhat       = cfg.relative_dhat;
     ipc.absolute_dhat       = cfg.absolute_dhat;
+    ipc.absolute_epsv       = cfg.absolute_epsv;
     ipc.YoungModulus        = cfg.young_modulus;
     ipc.pcg_data.P_type     = cfg.preconditioner_type;
     ipc.assets_dir_cfg      = resolved_assets_dir;
@@ -3633,6 +3634,9 @@ void SimEngine::reset_transient_contact_state()
     // cleared). Zeroing it makes the next IPC_Solver re-derive kappa exactly
     // like a fresh process (its first-solve path: Kappa < 1e-16 -> suggestKappa).
     g.Kappa = 0.0;
+    // [fric-anchor] the persistent anchors describe the previous episode's
+    // contacts — teleported bodies must not inherit them.
+    g.clearFrictionAnchors();
 }
 
 

@@ -19,6 +19,11 @@
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
 #include <thrust/device_ptr.h>
+
+// [fric-anchor] forward decls — definitions live next to buildFrictionSets.
+// nullptr (feature off) keeps every kernel on the legacy code path bit-exactly.
+extern __device__ double3* g_fric_anchor_d;
+extern __device__ double3* g_fric_anchor_gd_d;
 #include "FrictionUtils.cuh"
 #include <cfloat>
 #include <cstring>
@@ -32,6 +37,7 @@
 
 #include <muda/cub/device/device_radix_sort.h>
 #include <cub/device/device_radix_sort.cuh>   // [perenv-parallel #2] pool sort-scratch sizing
+#include <cub/device/device_merge_sort.cuh>   // [fric-anchor] persistent-scratch pair sort
 using namespace Eigen;
 
 // Global log verbosity for the per-frame + one-time solver prints.  0 = silent
@@ -1274,11 +1280,13 @@ __device__ double __cal_Friction_gd_energy(const double3* _vertexes,
                                            uint32_t       gidx,
                                            double         dt,
                                            double         lastH,
-                                           double         eps)
+                                           double         eps,
+                                           double3 anchor = make_double3(0., 0., 0.))
 {
 
     double3 normal = *_normal;
     double3 Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
+    Vdiff          = __GEIGEN__::__add(Vdiff, anchor);   // [fric-anchor]
     double3 VProj  = __GEIGEN__::__minus(
         Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
     double VProjMag2 = __GEIGEN__::__squaredNorm(VProj);
@@ -1301,7 +1309,8 @@ __device__ double __cal_Friction_energy(const double3*         _vertexes,
                                         __GEIGEN__::Matrix3x2d tanBasis,
                                         double                 lastH,
                                         double                 fricDHat,
-                                        double                 eps)
+                                        double                 eps,
+                                        double3 anchor = make_double3(0., 0., 0.))
 {
     double3 relDX3D;
     if(MMCVIDI.x >= 0)
@@ -1358,6 +1367,7 @@ __device__ double __cal_Friction_energy(const double3*         _vertexes,
                 relDX3D);
         }
     }
+    relDX3D = __GEIGEN__::__add(relDX3D, anchor);   // [fric-anchor]
     __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis);
     double                 relDXSqNorm =
         __GEIGEN__::__squaredNorm(__GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D));
@@ -1419,6 +1429,7 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
     __GEIGEN__::Matrix3x3d H_vI;
 
     double3 Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
+    if(g_fric_anchor_gd_d) Vdiff = __GEIGEN__::__add(Vdiff, g_fric_anchor_gd_d[idx]);   // [fric-anchor]
     double3 normal = *_normal;
     double3 VProj  = __GEIGEN__::__minus(
         Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
@@ -1544,6 +1555,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
             distCoord[idx].x,
             distCoord[idx].y,
             relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
 
         __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
@@ -1625,6 +1637,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
                 relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -1709,6 +1722,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
                 distCoord[idx].x,
                 relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -1792,6 +1806,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                 distCoord[idx].x,
                 distCoord[idx].y,
                 relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
@@ -5277,6 +5292,7 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
     double3  normal = *_normal;
     uint32_t gidx   = _last_collisionPair_gd[idx];
     double3  Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
+    if(g_fric_anchor_gd_d) Vdiff = __GEIGEN__::__add(Vdiff, g_fric_anchor_gd_d[idx]);   // [fric-anchor]
     double3  VProj  = __GEIGEN__::__minus(
         Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
     double VProjMag2 = __GEIGEN__::__squaredNorm(VProj);
@@ -5329,6 +5345,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
             distCoord[idx].x,
             distCoord[idx].y,
             relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
         __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
         double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -5373,6 +5390,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
                 relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -5409,6 +5427,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
                 distCoord[idx].x,
                 relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -5449,6 +5468,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                 distCoord[idx].x,
                 distCoord[idx].y,
                 relDX3D);
+        if(g_fric_anchor_d) relDX3D = __GEIGEN__::__add(relDX3D, g_fric_anchor_d[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -7230,7 +7250,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
     if(idx < numbers)
     {
         temp = __cal_Friction_energy(
-            vertexes, o_vertexes, _collisionPair[idx], dt, distCoord[idx], tanBasis[idx], lastH[idx], fricDHat, eps);
+            vertexes, o_vertexes, _collisionPair[idx], dt, distCoord[idx], tanBasis[idx], lastH[idx], fricDHat, eps,
+            g_fric_anchor_d ? g_fric_anchor_d[idx] : make_double3(0., 0., 0.));
     // [per-body friction] the host combine multiplies the GLOBAL mu into this
     // sum (fric = frictionRate * slot); scale each pair's term by mu_pair/mu
     // here so the product lands on mu_pair exactly — zero changes to the four
@@ -7307,7 +7328,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
     if(idx < numbers)
     {
         temp = __cal_Friction_gd_energy(
-            vertexes, o_vertexes, _normal, _collisionPair_gd[idx], dt, lastH[idx], eps);
+            vertexes, o_vertexes, _normal, _collisionPair_gd[idx], dt, lastH[idx], eps,
+            g_fric_anchor_gd_d ? g_fric_anchor_gd_d[idx] : make_double3(0., 0., 0.));
     // [per-body friction] see _getFrictionEnergy_Reduction_3D: host combine
     // multiplies the GLOBAL gd mu; scale per-vertex here so the product is exact.
         if(vert_mu_gd)
@@ -9221,6 +9243,15 @@ void GIPC::FREE_DEVICE_MEM()
         lambda_lastH_scalar = nullptr; distCoord = nullptr; tanBasis = nullptr;
         _collisonPairs_lastH = nullptr; _MatIndex_last = nullptr;
     }
+    // [fric-anchor] persistent anchor buffers
+    if(fric_anchor)          { CUDA_SAFE_CALL(cudaFree(fric_anchor));          fric_anchor = nullptr; }
+    if(fric_anchor_gd)       { CUDA_SAFE_CALL(cudaFree(fric_anchor_gd));       fric_anchor_gd = nullptr; }
+    if(fric_key_prev)        { CUDA_SAFE_CALL(cudaFree(fric_key_prev));        fric_key_prev = nullptr; }
+    if(fric_anchor_prev)     { CUDA_SAFE_CALL(cudaFree(fric_anchor_prev));     fric_anchor_prev = nullptr; }
+    if(fric_anchor_gd_dense) { CUDA_SAFE_CALL(cudaFree(fric_anchor_gd_dense)); fric_anchor_gd_dense = nullptr; }
+    if(fric_sort_temp)       { CUDA_SAFE_CALL(cudaFree(fric_sort_temp));       fric_sort_temp = nullptr; }
+    fric_sort_temp_bytes = 0;
+    fric_anchor_cap = 0; fric_gd_dense_cap = 0; fric_prev_count = 0;
     if(lambda_lastH_scalar_gd)
     {
         CUDA_SAFE_CALL(cudaFree(lambda_lastH_scalar_gd));
@@ -9456,11 +9487,22 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     meanMass     = m_meanMass;
     meanVolumn   = m_meanVolumn;
     dHat = relative_dhat * relative_dhat * eff_bboxDiagSize2;  // = absolute_dhat^2 when set
-    fDhat = 1e-4 * eff_bboxDiagSize2;
+    // [absolute-epsv] The friction kernels consume fDhat as sqrt(fDhat)*h ==
+    // per-step stiction displacement threshold, i.e. epsv = sqrt(fDhat) [m/s].
+    // The legacy scene-scale value (1e-2*eff_diag, e.g. 19 mm/s @ eff_diag
+    // 1.9 m) makes STATIC friction accuracy depend on scene size and yields
+    // stiction creep ~= (load/(mu*lambda))*epsv on held grasps (translation
+    // mm/s, rotation deg/s). epsv is contact physics, not geometry:
+    // absolute_epsv>0 (or STIFF_EPSV) pins it (IPC paper: 1e-5 m/s for static
+    // accuracy). 0 keeps the legacy path bit-identically.
+    double eff_epsv = absolute_epsv;
+    if(const char* _ev = getenv("STIFF_EPSV")) eff_epsv = atof(_ev);
+    fDhat = (eff_epsv > 0.0) ? eff_epsv * eff_epsv : 1e-4 * eff_bboxDiagSize2;
     if(::g_gipc_log_level >= 1)
-        printf("[dhat] bboxDiagSize2=%.6g (eff=%.6g)  relative_dhat=%.3g  abs_dhat=%.3g  dHat_sqrt=%.6g%s\n",
+        printf("[dhat] bboxDiagSize2=%.6g (eff=%.6g)  relative_dhat=%.3g  abs_dhat=%.3g  dHat_sqrt=%.6g%s  epsv=%.6g m/s%s\n",
                bboxDiagSize2, eff_bboxDiagSize2, relative_dhat, absolute_dhat,
-               sqrt(dHat), absolute_dhat > 0.0 ? " (ABSOLUTE)" : " (scene-bbox)");
+               sqrt(dHat), absolute_dhat > 0.0 ? " (ABSOLUTE)" : " (scene-bbox)",
+               sqrt(fDhat), eff_epsv > 0.0 ? " (ABSOLUTE)" : " (scene-scale)");
     if(getenv("STIFF_SEED_DIAG"))
         printf("[seed-diag] bboxDiagSize2=%.17g eff=%.17g meanMass=%.17g meanVolumn=%.17g dHat=%.17g fDhat=%.17g dTol=%.17g scene=[%.17g,%.17g,%.17g]-[%.17g,%.17g,%.17g]\n",
                bboxDiagSize2, eff_bboxDiagSize2, meanMass, meanVolumn, dHat, fDhat, dTol,
@@ -9569,6 +9611,304 @@ GIPC::GIPC()
 }
 
 static void _dbg_ksum(const char*, const void*, size_t);  // [4.3 fwd]
+// ========================== [fric-anchor] ==========================
+// Persistent cross-step friction anchors (STIFF_FRIC_ANCHOR=1). The lagged
+// IPC friction measures slip against the step-start positions, so its anchor
+// resets every step: a held contact must re-slip u* = (load/(mu*lambda))*eps
+// each step to regenerate its force -> stiction creep proportional to epsv.
+// Here each lagged pair carries an accumulated tangential offset e (world,
+// meters); kernels evaluate u_total = relDX_step + e, so a static contact
+// settles with u_total constant across steps (zero creep). ||e|| is capped at
+// the stiction boundary eps = epsv*h; the cap sliding IS Coulomb sliding.
+__device__ double3* g_fric_anchor_d    = nullptr;  // body pairs, lastH slot order
+__device__ double3* g_fric_anchor_gd_d = nullptr;  // ground pairs, lastH slot order
+
+static __device__ __forceinline__ ulonglong2 _fricPairKey(const int4 v)
+{
+    // Raw bit-pack (negatives preserved): same physical pair -> same key.
+    ulonglong2 k;
+    k.x = (((unsigned long long)(unsigned int)v.x) << 32)
+          | (unsigned long long)(unsigned int)v.y;
+    k.y = (((unsigned long long)(unsigned int)v.z) << 32)
+          | (unsigned long long)(unsigned int)v.w;
+    return k;
+}
+struct _FricKeyLess
+{
+    __device__ __host__ bool operator()(const ulonglong2& a, const ulonglong2& b) const
+    {
+        return (a.x != b.x) ? (a.x < b.x) : (a.y < b.y);
+    }
+};
+
+// Project e onto the pair's tangent plane and cap ||e|| at eps.
+static __device__ __forceinline__ double3 _anchorProjectCap(
+    double3 e, const __GEIGEN__::Matrix3x2d T, double eps)
+{
+    double2 c = Friction::__M3x2_transpose_vec3__multiply(T, e);
+    double3 c0 = make_double3(T.m[0][0], T.m[1][0], T.m[2][0]);
+    double3 c1 = make_double3(T.m[0][1], T.m[1][1], T.m[2][1]);
+    double3 et = __GEIGEN__::__add(__GEIGEN__::__s_vec_multiply(c0, c.x),
+                                   __GEIGEN__::__s_vec_multiply(c1, c.y));
+    double n2 = __GEIGEN__::__squaredNorm(et);
+    if(n2 > eps * eps && n2 > 0.0)
+        et = __GEIGEN__::__s_vec_multiply(et, eps / sqrt(n2));
+    return et;
+}
+
+// Shared with the friction energy/gradient/Hessian kernels: the pair's
+// relative tangential-frame displacement between x and the step start.
+static __device__ double3 _fricRelDX3D(const double3* _vertexes,
+                                       const double3* _o_vertexes,
+                                       const int4     MMCVIDI,
+                                       const double2  dc)
+{
+    double3 relDX3D = make_double3(0, 0, 0);
+    if(MMCVIDI.x >= 0)
+    {
+        if(MMCVIDI.w >= 0)
+            Friction::computeRelDX_EE(
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.w], _o_vertexes[MMCVIDI.w]),
+                dc.x, dc.y, relDX3D);
+    }
+    else
+    {
+        int v0I = -MMCVIDI.x - 1;
+        if(MMCVIDI.z < 0)
+        {
+            if(MMCVIDI.y >= 0)
+                Friction::computeRelDX_PP(
+                    __GEIGEN__::__minus(_vertexes[v0I], _o_vertexes[v0I]),
+                    __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+                    relDX3D);
+        }
+        else if(MMCVIDI.w < 0)
+        {
+            if(MMCVIDI.y >= 0)
+                Friction::computeRelDX_PE(
+                    __GEIGEN__::__minus(_vertexes[v0I], _o_vertexes[v0I]),
+                    __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+                    __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
+                    dc.x, relDX3D);
+        }
+        else
+        {
+            Friction::computeRelDX_PT(
+                __GEIGEN__::__minus(_vertexes[v0I], _o_vertexes[v0I]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
+                __GEIGEN__::__minus(_vertexes[MMCVIDI.w], _o_vertexes[MMCVIDI.w]),
+                dc.x, dc.y, relDX3D);
+        }
+    }
+    return relDX3D;
+}
+
+__global__ void _fric_anchor_carry(const int4*                   pairs,
+                                   const __GEIGEN__::Matrix3x2d* tanBasis,
+                                   const ulonglong2*             prevKeys,
+                                   const double3*                prevAnchors,
+                                   int                           prevCount,
+                                   double3*                      anchors,
+                                   double                        eps,
+                                   int                           number)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    ulonglong2 key = _fricPairKey(pairs[idx]);
+    int        lo = 0, hi = prevCount;
+    _FricKeyLess less;
+    while(lo < hi)
+    {
+        int mid = (lo + hi) >> 1;
+        if(less(prevKeys[mid], key)) lo = mid + 1;
+        else hi = mid;
+    }
+    double3 e = make_double3(0, 0, 0);
+    if(lo < prevCount && prevKeys[lo].x == key.x && prevKeys[lo].y == key.y)
+        e = prevAnchors[lo];
+    anchors[idx] = _anchorProjectCap(e, tanBasis[idx], eps);
+}
+
+__global__ void _fric_anchor_carry_gd(const uint32_t* pairs_gd,
+                                      const double3*  dense,
+                                      double3*        anchors_gd,
+                                      int             number)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    anchors_gd[idx] = dense[pairs_gd[idx]];
+}
+
+__global__ void _fric_anchor_commit(const double3*                verts,
+                                    const double3*                o_verts,
+                                    const int4*                   pairs,
+                                    const double2*                distCoord,
+                                    const __GEIGEN__::Matrix3x2d* tanBasis,
+                                    const double3*                anchors_in,
+                                    double3*                      anchors_out,
+                                    ulonglong2*                   keys_out,
+                                    double                        eps,
+                                    int                           number)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    int4    MM       = pairs[idx];
+    double3 relDX3D  = _fricRelDX3D(verts, o_verts, MM, distCoord[idx]);
+    double3 e        = __GEIGEN__::__add(relDX3D, anchors_in[idx]);
+    anchors_out[idx] = _anchorProjectCap(e, tanBasis[idx], eps);
+    keys_out[idx]    = _fricPairKey(MM);
+}
+
+__global__ void _fric_anchor_commit_gd(const double3*  verts,
+                                       const double3*  o_verts,
+                                       const double3*  normal,
+                                       const uint32_t* pairs_gd,
+                                       const double3*  anchors_gd,
+                                       double3*        dense,
+                                       double          eps,
+                                       int             number)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= number)
+        return;
+    uint32_t g = pairs_gd[idx];
+    double3  n = *normal;
+    double3  e = __GEIGEN__::__add(
+        __GEIGEN__::__minus(verts[g], o_verts[g]), anchors_gd[idx]);
+    e = __GEIGEN__::__minus(
+        e, __GEIGEN__::__s_vec_multiply(n, __GEIGEN__::__v_vec_dot(e, n)));
+    double n2 = __GEIGEN__::__squaredNorm(e);
+    if(n2 > eps * eps && n2 > 0.0)
+        e = __GEIGEN__::__s_vec_multiply(e, eps / sqrt(n2));
+    dense[g] = e;
+}
+
+void GIPC::clearFrictionAnchors()
+{
+    fric_prev_count = 0;
+    if(fric_anchor_gd_dense && fric_gd_dense_cap > 0)
+        CUDA_SAFE_CALL(cudaMemset(
+            fric_anchor_gd_dense, 0, (size_t)fric_gd_dense_cap * sizeof(double3)));
+}
+
+void GIPC::carryFrictionAnchors()
+{
+    {
+        const char* e     = getenv("STIFF_FRIC_ANCHOR");
+        m_fric_anchor_on  = (e && atoi(e) != 0);
+    }
+    double3* sym    = nullptr;
+    double3* sym_gd = nullptr;
+    if(m_fric_anchor_on)
+    {
+        int needBody = (int)h_cpNum_last[0];
+        if(needBody > fric_anchor_cap)
+        {
+            // Growth drops the carried set once (anchors restart at 0 = legacy).
+            if(fric_anchor)      CUDA_SAFE_CALL(cudaFree(fric_anchor));
+            if(fric_key_prev)    CUDA_SAFE_CALL(cudaFree(fric_key_prev));
+            if(fric_anchor_prev) CUDA_SAFE_CALL(cudaFree(fric_anchor_prev));
+            int cap = needBody * 2 + 1024;
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor, (size_t)cap * sizeof(double3)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_key_prev, (size_t)cap * sizeof(ulonglong2)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor_prev, (size_t)cap * sizeof(double3)));
+            fric_anchor_cap = cap;
+            fric_prev_count = 0;
+        }
+        if((int)vertexNum > fric_gd_dense_cap)
+        {
+            if(fric_anchor_gd_dense) CUDA_SAFE_CALL(cudaFree(fric_anchor_gd_dense));
+            if(fric_anchor_gd)       CUDA_SAFE_CALL(cudaFree(fric_anchor_gd));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor_gd_dense,
+                                      (size_t)vertexNum * sizeof(double3)));
+            CUDA_SAFE_CALL(cudaMemset(fric_anchor_gd_dense, 0,
+                                      (size_t)vertexNum * sizeof(double3)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor_gd,
+                                      (size_t)vertexNum * sizeof(double3)));
+            fric_gd_dense_cap = (int)vertexNum;
+        }
+        const double eps = sqrt(fDhat) * IPC_dt;
+        if(h_cpNum_last[0] > 0)
+        {
+            int bn = ((int)h_cpNum_last[0] + 255) / 256;
+            _fric_anchor_carry<<<bn, 256>>>(_collisonPairs_lastH, tanBasis,
+                                            fric_key_prev, fric_anchor_prev,
+                                            fric_prev_count, fric_anchor, eps,
+                                            (int)h_cpNum_last[0]);
+        }
+        if(h_gpNum_last > 0)
+        {
+            int bn = ((int)h_gpNum_last + 255) / 256;
+            _fric_anchor_carry_gd<<<bn, 256>>>(_collisonPairs_lastH_gd,
+                                               fric_anchor_gd_dense,
+                                               fric_anchor_gd, (int)h_gpNum_last);
+        }
+        sym    = fric_anchor;
+        sym_gd = fric_anchor_gd;
+    }
+    if((void*)sym != m_fric_sym_last)
+    {
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_fric_anchor_d, &sym, sizeof(double3*)));
+        m_fric_sym_last = (void*)sym;
+    }
+    if((void*)sym_gd != m_fric_sym_gd_last)
+    {
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_fric_anchor_gd_d, &sym_gd, sizeof(double3*)));
+        m_fric_sym_gd_last = (void*)sym_gd;
+    }
+}
+
+void GIPC::commitFrictionAnchors(device_TetraData& TetMesh)
+{
+    if(!m_fric_anchor_on)
+        return;
+    const double eps = sqrt(fDhat) * IPC_dt;
+    if(fric_anchor_gd_dense)
+        CUDA_SAFE_CALL(cudaMemset(fric_anchor_gd_dense, 0,
+                                  (size_t)fric_gd_dense_cap * sizeof(double3)));
+    if(h_gpNum_last > 0 && fric_anchor_gd)
+    {
+        int bn = ((int)h_gpNum_last + 255) / 256;
+        _fric_anchor_commit_gd<<<bn, 256>>>(TetMesh.vertexes, TetMesh.o_vertexes,
+                                            _groundNormal, _collisonPairs_lastH_gd,
+                                            fric_anchor_gd, fric_anchor_gd_dense,
+                                            eps, (int)h_gpNum_last);
+    }
+    int n = (int)h_cpNum_last[0];
+    if(n > 0 && fric_anchor)
+    {
+        int bn = (n + 255) / 256;
+        // Direct-write into the carry-source buffers: no D2D copies.
+        _fric_anchor_commit<<<bn, 256>>>(TetMesh.vertexes, TetMesh.o_vertexes,
+                                         _collisonPairs_lastH, distCoord, tanBasis,
+                                         fric_anchor, fric_anchor_prev,
+                                         fric_key_prev, eps, n);
+        // cub merge-sort with a persistent scratch buffer — no per-step
+        // cudaMalloc/Free (thrust's default allocator syncs the device).
+        size_t need = 0;
+        cub::DeviceMergeSort::SortPairs(nullptr, need, fric_key_prev,
+                                        fric_anchor_prev, n, _FricKeyLess());
+        if(need > fric_sort_temp_bytes)
+        {
+            if(fric_sort_temp) CUDA_SAFE_CALL(cudaFree(fric_sort_temp));
+            fric_sort_temp_bytes = need * 2;
+            CUDA_SAFE_CALL(cudaMalloc(&fric_sort_temp, fric_sort_temp_bytes));
+        }
+        size_t bytes = fric_sort_temp_bytes;
+        cub::DeviceMergeSort::SortPairs(fric_sort_temp, bytes, fric_key_prev,
+                                        fric_anchor_prev, n, _FricKeyLess());
+    }
+    fric_prev_count = n;
+}
+// ======================== [fric-anchor end] ========================
+
 void GIPC::buildFrictionSets()
 {
     CUDA_SAFE_CALL(cudaMemset(_cpNum, 0, 5 * sizeof(uint32_t)));
@@ -9624,6 +9964,7 @@ void GIPC::buildFrictionSets()
                                                       m_pergroup_kappa ? m_d_p2g : nullptr);
     }
     h_gpNum_last = h_gpNum;
+    carryFrictionAnchors();   // [fric-anchor] match prev-step anchors into new slots
 }
 
 
@@ -16798,6 +17139,10 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     // [friction snapshot] capture the lagged-friction force of THIS step before
     // the commit below zeroes the in-step displacement it is computed from.
     snapshotFrictionForce(TetMesh);
+    // [fric-anchor] fold this step's slip into the persistent anchors while
+    // (x, o_vertexes) still describe the step. Must run before updateVelocities
+    // commits o_vertexes = x.
+    commitFrictionAnchors(TetMesh);
 #endif
 
     updateVelocities(TetMesh);

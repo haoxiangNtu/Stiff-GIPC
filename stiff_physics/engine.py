@@ -306,6 +306,16 @@ class Config:
         pcg_tol: float = 1e-4,  # [0.8.2] back to the 0.6.x default; 1e-6 cost ~22% at N=1 for no accuracy need
         relative_dhat: float = 1e-3,
         absolute_dhat: float = 0.0,
+        # Absolute friction stiction threshold epsv (m/s). >0 decouples IPC
+        # friction smoothing from the scene scale: legacy derives
+        # epsv = 1e-2 * eff_scene_diag (e.g. 19 mm/s at 1.9 m), which makes
+        # static-friction accuracy scene-size dependent and causes stiction
+        # creep on held grasps (~(load/(mu*N))*epsv: measured 0.5 mm/s slide,
+        # 3 deg/s cap rotation on flask_cap). IPC-paper guidance: 1e-5 m/s for
+        # static accuracy; 1e-4 is a good grasp-scene default. Sharper epsv
+        # costs Newton iterations. 0 = legacy path (bit-identical).
+        # Env escape hatch: STIFF_EPSV overrides at engine init.
+        absolute_epsv: float = 0.0,
         joint_strength_ratio: float = 100.0,
         revolute_driving_strength_ratio: float = 100.0,
         semi_implicit_enabled: bool = False,
@@ -365,6 +375,10 @@ class Config:
         # full-scene bbox → consistent contact across num_envs (no cross-env coupling).
         if hasattr(self._cfg, "absolute_dhat"):
             self._cfg.absolute_dhat = absolute_dhat
+        # absolute_epsv>0 pins the friction stiction threshold (m/s), decoupled
+        # from scene scale (see parameter doc above).
+        if hasattr(self._cfg, "absolute_epsv"):
+            self._cfg.absolute_epsv = absolute_epsv
         self._cfg.joint_strength_ratio = joint_strength_ratio
         self._cfg.revolute_driving_strength_ratio = revolute_driving_strength_ratio
         self._cfg.prismatic_strength_ratio = prismatic_strength_ratio
