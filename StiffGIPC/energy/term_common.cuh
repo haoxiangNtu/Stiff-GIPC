@@ -5,11 +5,22 @@
 // ============================================================================
 #pragma once
 
+#include "../linear_system/utils/binned_reduce.cuh"
+
+// [strict-LS N-invariance] per-env energy deposit. Plain atomicAdd(double) sums in
+// thread-scheduling order, which depends on the TOTAL batch shape → env_0's per-env
+// energy carries batch-dependent last-ulp jitter → near the S3 descent threshold this
+// FLIPS a backtrack-halve decision → alpha diverges across N. Same root as the ABD fix
+// in cal_abd_energy_perenv — this closes the FEM/contact side. binned_deposit is
+// exponent-binned (exact, order-independent) under the central g_det_reduce gate and a
+// single plain atomic into bin 0 otherwise. Callers pass a BINNED_K-wide bins block
+// (ng*BINNED_K), combined into the plain per-env slice by _penv_bins_combine at the end
+// of Energy_Add_Reduction_Algorithm_DeviceOut.
 __device__ inline void _penv_energy_accum(double* penv, const int* p2g, int vid, int ng, double e)
 {
     if(!penv || !p2g) return;
     int g = p2g[vid];
-    if(g >= 0 && g < ng) atomicAdd(&penv[g], e);
+    if(g >= 0 && g < ng) binned_deposit(penv + (size_t)g * BINNED_K, e);
 }
 
 // ── _ec_emit contact-force export helper (E3.6 hoist from gipc_modules/05) ──

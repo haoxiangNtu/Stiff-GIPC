@@ -198,6 +198,15 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
 }
 
 
+// [strict-LS N-invariance] fixed-order combine of the BINNED_K-wide bins block into
+// the plain per-env slice (see _penv_energy_accum in term_common.cuh).
+__global__ void _penv_bins_combine(const double* bins, double* pe, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    pe[g] = binned_combine(bins + (size_t)g * BINNED_K);
+}
+
 // [backport] standalone per-env energy dispatcher (from S3/4a370e5). Modeled on
 // Energy_Add_Reduction_Algorithm but writes the global scalar to a caller-provided
 // device slot (out_slot, D2D) and, when out_penv != nullptr, buckets each element's
@@ -242,16 +251,40 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
     int                blockNum    = (numbers + threadNum - 1) / threadNum;
     unsigned int       sharedMsize = sizeof(double) * (threadNum >> 5);
 
+    // [strict-LS N-invariance] kernels deposit into a BINNED_K-wide bins block
+    // (order-independent under g_det_reduce), combined into pe after the switch.
+    // pe itself stays a plain per-env slice — every downstream consumer unchanged.
+    double* pe_bins = nullptr;
+    if(pe)
+    {
+        static double* s_pe_bins = nullptr;
+        static int     s_pe_cap  = 0;
+        if(s_pe_cap < ng)
+        {
+            if(s_pe_bins) CUDA_SAFE_CALL(cudaFree(s_pe_bins));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s_pe_bins,
+                                      (size_t)ng * BINNED_K * sizeof(double)));
+            s_pe_cap = ng;
+        }
+        pe_bins = s_pe_bins;
+        CUDA_SAFE_CALL(
+            cudaMemsetAsync(pe_bins, 0, (size_t)ng * BINNED_K * sizeof(double)));
+    }
+
     // [E2] registry-driven launch: adding a constitutive term = its file
     // (energy_size_/energy_launch_ members) + ONE row in GIPC_ENERGY_TERMS.
 #define GIPC_ENERGY_LAUNCH_CASE(id, name)                                      \
     case id:                                                                   \
         energy_launch_##name(TetMesh, queue, numbers, blockNum, threadNum,     \
-                             sharedMsize, pe, p2g, ng, tet_offset,             \
+                             sharedMsize, pe_bins, p2g, ng, tet_offset,        \
                              point_offset, energy_kappa);                      \
         break;
     switch(type) { GIPC_ENERGY_TERMS(GIPC_ENERGY_LAUNCH_CASE) default: break; }
 #undef GIPC_ENERGY_LAUNCH_CASE
+
+    // [strict-LS N-invariance] fixed-order combine of the bins block into the slice.
+    if(pe_bins)
+        _penv_bins_combine<<<(ng + 255) / 256, 256>>>(pe_bins, pe, ng);
 
     numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;

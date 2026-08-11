@@ -780,24 +780,16 @@ void GIPC::clearFrictionAnchors()
 void GIPC::carryFrictionAnchors()
 {
     {
-        // strict mode (signature: STIFF_SPMV_DET, set by the shell) keeps the
-        // legacy friction by default: anchors shift friction energies onto
-        // ulp-boundaries of the N-shape-dependent line-search energy sums and
-        // break BATCH invariance (bisect: epsv-only green, anchor-only green,
-        // combo flips a discrete accept decision at one frame -> butterfly).
-        // Until those sums are made N-invariant, strict trades the anchor off;
-        // STIFF_FRIC_ANCHOR=1 still forces it on explicitly.
-        const char* e      = getenv("STIFF_FRIC_ANCHOR");
-        const char* sd     = getenv("STIFF_SPMV_DET");
-        bool        strict = (sd && atoi(sd) != 0);
-        m_fric_anchor_on   = e ? (atoi(e) != 0) : (m_fric_anchor_cfg && !strict);
-        static bool warned = false;
-        if(!warned && strict && !e && m_fric_anchor_cfg)
-        {
-            printf("[fric-anchor] strict mode: friction_anchor suppressed for batch "
-                   "invariance (STIFF_FRIC_ANCHOR=1 to force)\n");
-            warned = true;
-        }
+        // Anchors are on in EVERY mode, strict included. The historical strict
+        // suppression guarded a real batch break: anchors shifted friction
+        // energies onto ulp-boundaries of the per-env line-search energy sums,
+        // whose plain-atomic accumulation order was batch-shaped (N-dependent).
+        // Root-fixed by the binned (order-independent) per-env energy deposit
+        // in _penv_energy_accum under g_det_reduce — the sums are N-invariant
+        // now, so the anchor no longer trips them. STIFF_FRIC_ANCHOR=0 remains
+        // the escape hatch.
+        const char* e    = getenv("STIFF_FRIC_ANCHOR");
+        m_fric_anchor_on = e ? (atoi(e) != 0) : m_fric_anchor_cfg;
     }
     if(m_fric_anchor_on)
     {
