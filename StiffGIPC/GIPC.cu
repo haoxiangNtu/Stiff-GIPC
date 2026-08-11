@@ -20,6 +20,7 @@
 #include <thrust/sequence.h>
 #include <thrust/device_ptr.h>
 
+namespace gipc { extern int g_seg_trace_arm; }  // [seg-trace-fk]
 // [fric-anchor] forward decls — definitions live next to buildFrictionSets.
 // nullptr (feature off) keeps every kernel on the legacy code path bit-exactly.
 extern __device__ double3* g_fric_anchor_d;
@@ -7218,11 +7219,29 @@ __global__ void _halveGroundInvalidEnvAlpha(double* env_alpha,
 // the env bucket. penv==nullptr -> no-op (global-only callers stay byte-identical).
 // vid is a GLOBAL vertex id (p2g is the full point_to_group), except the kinetic
 // caller passes p2g already offset to the FEM region and vid local.
+#include "linear_system/utils/binned_reduce.cuh"
+
+// [strict-LS N-invariance] per-env energy deposit. Plain atomicAdd(double) sums in
+// thread-scheduling order, which depends on the TOTAL batch shape → env_0's per-env
+// energy carries batch-dependent last-ulp jitter → near the S3 descent threshold this
+// FLIPS a backtrack-halve decision → alpha diverges across N (the f18 batch break).
+// Same root as the ABD fix in cal_abd_energy_perenv — this closes the FEM/contact side.
+// binned_deposit is exponent-binned (exact, order-independent) under the central
+// g_det_reduce gate and a single plain atomic into bin 0 otherwise. Callers now pass a
+// BINNED_K-wide bins block (ng*BINNED_K), combined into the plain per-env slice by
+// _penv_bins_combine (fixed order) at the end of Energy_Add_Reduction_Algorithm_DeviceOut.
 __device__ inline void _penv_energy_accum(double* penv, const int* p2g, int vid, int ng, double e)
 {
     if(!penv || !p2g) return;
     int g = p2g[vid];
-    if(g >= 0 && g < ng) atomicAdd(&penv[g], e);
+    if(g >= 0 && g < ng) binned_deposit(penv + (size_t)g * BINNED_K, e);
+}
+
+__global__ void _penv_bins_combine(const double* bins, double* pe, int ng)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g >= ng) return;
+    pe[g] = binned_combine(bins + (size_t)g * BINNED_K);
 }
 
 __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
@@ -9802,12 +9821,15 @@ void GIPC::carryFrictionAnchors()
 {
     {
         // strict mode (signature: STIFF_SPMV_DET, set by the shell) keeps the
-        // legacy friction by default: anchors shift friction energies onto
-        // ulp-boundaries of the N-shape-dependent line-search energy sums and
-        // break BATCH invariance (bisect: epsv-only green, anchor-only green,
-        // combo flips a discrete accept decision at one frame -> butterfly).
-        // Until those sums are made N-invariant, strict trades the anchor off;
-        // STIFF_FRIC_ANCHOR=1 still forces it on explicitly.
+        // legacy friction by default: anchors shift trajectories onto discrete
+        // decision boundaries of a residual batch-shaped (N-dependent) quantity
+        // in the post-PCG k->k+1 path. The per-env line-search energy sums are
+        // binned (order-free, N-invariant) now — _penv_energy_accum — but the
+        // batch break persists UNCHANGED (same 1.229e-02 signature), so the
+        // remaining leak is elsewhere in this line; the 0.8.6 refactor line does
+        // not exhibit it (its gate is green with anchors on). Kept suppressed
+        // here to preserve the released strict contract; the root fix ships on
+        // 0.8.6. STIFF_FRIC_ANCHOR=1 still forces anchors on explicitly.
         const char* e      = getenv("STIFF_FRIC_ANCHOR");
         const char* sd     = getenv("STIFF_SPMV_DET");
         bool        strict = (sd && atoi(sd) != 0);
@@ -14523,6 +14545,25 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
     const int* p2g = TetMesh.d_point_to_group;
     const int  ng  = TetMesh.h_group_count;
     if(pe) CUDA_SAFE_CALL(cudaMemsetAsync(pe, 0, ng * sizeof(double)));
+    // [strict-LS N-invariance] kernels deposit into a BINNED_K-wide bins block
+    // (order-independent under g_det_reduce), combined into pe after the switch.
+    // pe itself stays a plain per-env slice — every downstream consumer unchanged.
+    double* pe_bins = nullptr;
+    if(pe)
+    {
+        static double* s_pe_bins = nullptr;
+        static int     s_pe_cap  = 0;
+        if(s_pe_cap < ng)
+        {
+            if(s_pe_bins) CUDA_SAFE_CALL(cudaFree(s_pe_bins));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&s_pe_bins,
+                                      (size_t)ng * BINNED_K * sizeof(double)));
+            s_pe_cap = ng;
+        }
+        pe_bins = s_pe_bins;
+        CUDA_SAFE_CALL(
+            cudaMemsetAsync(pe_bins, 0, (size_t)ng * BINNED_K * sizeof(double)));
+    }
     int tet_offset   = abd_fem_count_info.fem_tet_offset;
     int tet_count    = abd_fem_count_info.fem_tet_num;
     int point_offset = abd_fem_count_info.fem_point_offset;
@@ -14560,20 +14601,20 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
             _getKineticEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 TetMesh.vertexes + point_offset, TetMesh.xTilta + point_offset,
                 queue, TetMesh.masses + point_offset, numbers,
-                pe, pe ? p2g + point_offset : nullptr, ng);
+                pe_bins, pe_bins ? p2g + point_offset : nullptr, ng);
             break;
         case 1:
             _getFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.tetrahedras + tet_offset,
                 TetMesh.DmInverses + tet_offset, TetMesh.volum + tet_offset,
                 numbers, TetMesh.lengthRate + tet_offset, TetMesh.volumeRate + tet_offset,
-                pe, pe ? p2g : nullptr, ng);
+                pe_bins, pe_bins ? p2g : nullptr, ng);
             break;
         case 2:
             _getBarrierEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, _collisonPairs,
                 energy_kappa >= 0.0 ? energy_kappa : Kappa, dHat, numbers,
-                pe, pe ? p2g : nullptr, ng);
+                pe_bins, pe_bins ? p2g : nullptr, ng);
             break;
         case 3:
             _getDeltaEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
@@ -14583,14 +14624,14 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
             _computeGroundEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, _groundOffset, _groundNormal,
                 _environment_collisionPair, dHat, Kappa, numbers,
-                pe, pe ? p2g : nullptr, ng);
+                pe_bins, pe_bins ? p2g : nullptr, ng);
             break;
         case 5:
             _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
                 numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
                 fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
-                pe, pe ? p2g : nullptr, ng,
+                pe_bins, pe_bins ? p2g : nullptr, ng,
                 d_vert_mu, frictionRate);  // [per-body friction]
             break;
         case 6:
@@ -14598,7 +14639,7 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
                 queue, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
                 _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
                 sqrt(fDhat) * IPC_dt,
-                pe, pe ? p2g : nullptr, ng,
+                pe_bins, pe_bins ? p2g : nullptr, ng,
                 d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
             break;
         case 7:
@@ -14609,29 +14650,33 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
             _get_triangleFEMEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.triangles, TetMesh.triDmInverses,
                 TetMesh.area, numbers, stretchStiff, shearStiff, strainRate,
-                pe, pe ? p2g : nullptr, ng);
+                pe_bins, pe_bins ? p2g : nullptr, ng);
             break;
         case 9:
             _computeSoftConstraintEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.targetVert, TetMesh.targetIndex,
                 softMotionRate, animation_fullRate, TetMesh.d_stitch_paired_vertex,
                 TetMesh.d_stitch_rest_offset, numbers,
-                pe, pe ? p2g : nullptr, ng);
+                pe_bins, pe_bins ? p2g : nullptr, ng);
             break;
         case 10:
 #ifdef USE_QUADRATIC_BENDING
             _getQuadBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
                 TetMesh.tri_edge_adj_vertex, TetMesh.quad_bending_Q, numbers, bendStiff,
-                pe, pe ? p2g : nullptr, ng);
+                pe_bins, pe_bins ? p2g : nullptr, ng);
 #else
             _getBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
                 TetMesh.tri_edge_adj_vertex, numbers, bendStiff,
-                pe, pe ? p2g : nullptr, ng);
+                pe_bins, pe_bins ? p2g : nullptr, ng);
 #endif
             break;
     }
+
+    // [strict-LS N-invariance] fixed-order combine of the bins block into the plain slice.
+    if(pe_bins)
+        _penv_bins_combine<<<(ng + 255) / 256, 256>>>(pe_bins, pe, ng);
 
     numbers  = blockNum;
     blockNum = (numbers + threadNum - 1) / threadNum;
@@ -15939,6 +15984,15 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         // [decouple probe] PRE-SOLVE gradient dump (shape_grads + fb hold the CLEAN gradient here,
         // before calculateMovingDirection clobbers shape_grads as scratch). frame STIFF_DUMP_FRAME,
         // any k if STIFF_PROBE_K unset → use k==0. Python compares env0 across batches.
+        // [seg-trace-fk] arm the PCG per-iteration trace for exactly
+        // (STIFF_DUMP_FRAME, STIFF_PROBE_K) when STIFF_SEG_TRACE_FK is set.
+        {
+            ::gipc::g_seg_trace_arm = (getenv("STIFF_SEG_TRACE_FK")
+                               && getenv("STIFF_DUMP_FRAME")
+                               && s_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))
+                               && (int)k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 0))
+                                  ? 1 : 0;
+        }
         if(getenv("STIFF_GRAD_PRE") && TetMesh.d_point_to_group
            && s_dec_frame == atoi(getenv("STIFF_DUMP_FRAME"))
            && (int)k == (getenv("STIFF_PROBE_K") ? atoi(getenv("STIFF_PROBE_K")) : 0))

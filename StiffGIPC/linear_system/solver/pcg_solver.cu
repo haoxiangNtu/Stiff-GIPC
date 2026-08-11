@@ -685,6 +685,10 @@ extern void My_PCG_General_v_v_Reduction_DeviceOut(double* temp, double* A, doub
 
 namespace gipc
 {
+
+// [seg-trace-fk] frame-keyed arm (set by the Newton loop via GIPC.cu).
+int g_seg_trace_arm = 0;
+
 PCGSolver::PCGSolver(const PCGSolverConfig& cfg)
     : m_config(cfg)
 {
@@ -1237,6 +1241,19 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
     // the cost of ≤K extra iters after convergence. Fixed value → deterministic iter count (strict OK).
     const SizeT K = getenv("STIFF_PCG_CHECK_K") ? (SizeT)atoi(getenv("STIFF_PCG_CHECK_K")) : 8;
     std::vector<int> h_brk(ng);
+    // [seg-trace] batch-invariance forensics: STIFF_SEG_TRACE=<solve#> arms ONE
+    // solve (0-based, counted across the process) for per-PCG-iteration
+    // per-env rz / p·Ap dumps at 17 digits. Run with STIFF_PCG_GRAPH=0 so the
+    // plain loop executes (bit-identical arithmetic to the graph paths).
+    // [seg-trace-fk] frame-keyed arm set by the Newton loop (exact targeting).
+    extern int g_seg_trace_arm;
+    static long long s_seg_solve_idx = -1;
+    ++s_seg_solve_idx;
+    static int s_seg_trace_target = -2;
+    if(s_seg_trace_target == -2)
+    { const char* e = getenv("STIFF_SEG_TRACE"); s_seg_trace_target = e ? atoi(e) : -1; }
+    const bool seg_trace = (g_seg_trace_arm != 0)
+                        || (s_seg_trace_target >= 0 && s_seg_solve_idx == (long long)s_seg_trace_target);
     double tol = getenv("STIFF_PCG_TOL") ? atof(getenv("STIFF_PCG_TOL")) : m_config.global_tol_rate;
     if(ew)   // [E-W (2)] per-env tolerance for this solve (floor = the configured tol)
         _ew_eta<<<(ng + bs - 1) / bs, bs>>>(d_rz0_g, d_ew_prev, d_tol2_g, ew_gamma, ew_max2, tol, ng);
@@ -1447,7 +1464,19 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
         else
         {
             SizeT stop = (k + K < max_iter) ? k + K : max_iter;
-            for(; k < stop; ++k) body();
+            for(; k < stop; ++k)
+            {
+                body();
+                if(seg_trace)
+                {
+                    // rz_cur points at the freshest rz after body()'s swap.
+                    double hrz[2] = {0, 0}, hdt[2] = {0, 0};
+                    cudaMemcpy(hrz, rz_cur, 2 * sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(hdt, d_dot_g, 2 * sizeof(double), cudaMemcpyDeviceToHost);
+                    printf("[seg-trace] it=%zu rz0=%.17e rz1=%.17e pAp0=%.17e pAp1=%.17e\n",
+                           (size_t)k, hrz[0], hrz[1], hdt[0], hdt[1]);
+                }
+            }
             if(use_graph && !captured && k + K <= max_iter)
             {
                 if(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)
