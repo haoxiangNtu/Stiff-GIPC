@@ -35,12 +35,17 @@ constexpr std::uint32_t kVersion           = 2;
 constexpr std::uint32_t kHeaderSize        = 120;
 constexpr std::uint32_t kEndianMarker      = 0x01020304u;
 constexpr std::uint32_t kScalarSize        = sizeof(double);
-constexpr std::uint32_t kKnownStateFlags   = 0x1fu;
+constexpr std::uint32_t kKnownStateFlags   = 0x3fu;
 constexpr std::uint32_t kStateGroupKappa   = 1u << 0;
 constexpr std::uint32_t kStateEnvActive    = 1u << 1;
 constexpr std::uint32_t kStateQuarantined  = 1u << 2;
 constexpr std::uint32_t kStateDirectionNaN = 1u << 3;
 constexpr std::uint32_t kStateGroundSkip   = 1u << 4;
+// [fric-anchor] persistent stiction state: prev-step pair keys + tangential
+// anchors + dense ground anchors. Unlike the lastH friction set (a per-step
+// snapshot rebuilt from serialized positions), anchors are genuinely
+// cross-step — bitwise restart requires them in the payload.
+constexpr std::uint32_t kStateFricAnchor   = 1u << 5;
 constexpr std::uint64_t kCrcPolynomial     = 0x42F0E1EBA9EA3693ULL;
 #if defined(USE_SNK1)
 constexpr std::uint32_t kConstitutiveModel = 1;
@@ -687,7 +692,8 @@ std::uint64_t payload_size(std::uint64_t vertices,
                            std::uint64_t soft_constraints,
                            std::uint64_t env_count,
                            std::uint64_t collision_bodies,
-                           std::uint32_t state_flags)
+                           std::uint32_t state_flags,
+                           std::uint64_t fric_anchor_pairs)
 {
     constexpr std::uint64_t limit =
         std::numeric_limits<std::uint64_t>::max() / sizeof(double);
@@ -704,7 +710,19 @@ std::uint64_t payload_size(std::uint64_t vertices,
         + ((state_flags & kStateGroundSkip) ? collision_bodies : 0);
     if(int_count > (std::numeric_limits<std::uint64_t>::max() - bytes - 16) / 4)
         format_error("payload size overflow");
-    return bytes + 4 * int_count + 16;  // recheck counter + frame index
+    std::uint64_t total = bytes + 4 * int_count + 16;  // recheck counter + frame index
+    if(state_flags & kStateFricAnchor)
+    {
+        // u64 pair count + pairs*(16B key + 24B anchor)
+        // + u64 dense count + vertices*24B dense ground anchors
+        if(fric_anchor_pairs
+           > (std::numeric_limits<std::uint64_t>::max() - total - 16
+              - vertices * 24)
+                 / 40)
+            format_error("payload size overflow");
+        total += 16 + fric_anchor_pairs * 40 + vertices * 24;
+    }
+    return total;
 }
 
 void ensure_group_kappa(GIPC& engine,
@@ -753,6 +771,25 @@ void GIPC::save_checkpoint(device_TetraData& mesh, const char* raw_path)
         state_flags |= kStateDirectionNaN;
     if(collision_bodies > 0)
         state_flags |= kStateGroundSkip;
+
+    // [fric-anchor] cross-step stiction state (cannot be rebuilt from
+    // positions). Section present whenever the feature is live in this run;
+    // absent -> older files keep their exact byte layout.
+    std::uint64_t           fric_pairs = 0;
+    std::vector<ulonglong2> fric_keys;
+    std::vector<double3>    fric_prev_e, fric_gd_e;
+    if(m_fric_anchor_on && fric_anchor_gd_dense
+       && fric_gd_dense_cap >= static_cast<int>(vN))
+    {
+        state_flags |= kStateFricAnchor;
+        fric_pairs = static_cast<std::uint64_t>(std::max(fric_prev_count, 0));
+        if(fric_pairs > 0)
+        {
+            fric_keys   = copy_device(fric_key_prev, fric_pairs);
+            fric_prev_e = copy_device(fric_anchor_prev, fric_pairs);
+        }
+        fric_gd_e = copy_device(fric_anchor_gd_dense, vN);
+    }
 
     const auto current = copy_device(mesh.vertexes, vN);
     const auto previous = copy_device(mesh.o_vertexes, vN);
@@ -806,9 +843,12 @@ void GIPC::save_checkpoint(device_TetraData& mesh, const char* raw_path)
     if(!std::isfinite(Kappa) || Kappa < 0.0)
         format_error("Kappa is invalid");
 
+    require_finite(fric_prev_e, "friction anchors");
+    require_finite(fric_gd_e, "ground friction anchors");
+
     ByteBuffer payload;
-    payload.reserve(static_cast<std::size_t>(
-        payload_size(vN, nb, softN, env_count, collision_bodies, state_flags)));
+    payload.reserve(static_cast<std::size_t>(payload_size(
+        vN, nb, softN, env_count, collision_bodies, state_flags, fric_pairs)));
     append_double3s(payload, current);
     append_double3s(payload, previous);
     append_double3s(payload, velocity);
@@ -856,11 +896,23 @@ void GIPC::save_checkpoint(device_TetraData& mesh, const char* raw_path)
         for(int value : ground_skip)
             append_i32(payload, value);
     }
+    if(state_flags & kStateFricAnchor)
+    {
+        append_u64(payload, fric_pairs);
+        for(const auto& key : fric_keys)
+        {
+            append_u64(payload, key.x);
+            append_u64(payload, key.y);
+        }
+        append_double3s(payload, fric_prev_e);
+        append_u64(payload, vN);
+        append_double3s(payload, fric_gd_e);
+    }
     append_i64(payload, m_recheck_counter);
     append_i64(payload, m_total_frames);
 
-    const auto expected_payload =
-        payload_size(vN, nb, softN, env_count, collision_bodies, state_flags);
+    const auto expected_payload = payload_size(
+        vN, nb, softN, env_count, collision_bodies, state_flags, fric_pairs);
     if(payload.size() != expected_payload)
         format_error("internal payload-size mismatch");
 
@@ -980,13 +1032,33 @@ void GIPC::load_checkpoint(device_TetraData& mesh, const char* raw_path)
            || env_count != static_cast<std::uint64_t>(mesh.h_group_count)))
         format_error("environment layout differs from checkpoint");
 
-    const auto expected_payload =
-        payload_size(local_vN,
-                     local_nb,
-                     local_soft,
-                     env_count,
-                     local_collision_bodies,
-                     state_flags);
+    // [fric-anchor] the pair count is dynamic: derive it from the declared
+    // payload size against the fixed-size remainder, then re-validate exactly.
+    std::uint64_t fric_pairs = 0;
+    if(state_flags & kStateFricAnchor)
+    {
+        const auto base = payload_size(local_vN,
+                                       local_nb,
+                                       local_soft,
+                                       env_count,
+                                       local_collision_bodies,
+                                       state_flags & ~kStateFricAnchor,
+                                       0);
+        const std::uint64_t fixed = 16 + local_vN * 24;
+        if(saved_payload_size < base + fixed
+           || (saved_payload_size - base - fixed) % 40 != 0)
+            format_error("fric-anchor section size is inconsistent");
+        fric_pairs = (saved_payload_size - base - fixed) / 40;
+        if(fric_pairs > (1ull << 28))
+            format_error("fric-anchor pair count is implausible");
+    }
+    const auto expected_payload = payload_size(local_vN,
+                                               local_nb,
+                                               local_soft,
+                                               env_count,
+                                               local_collision_bodies,
+                                               state_flags,
+                                               fric_pairs);
     if(saved_payload_size != expected_payload)
         format_error("declared payload size is inconsistent with the header");
     const auto expected_file = static_cast<std::size_t>(
@@ -1044,6 +1116,23 @@ void GIPC::load_checkpoint(device_TetraData& mesh, const char* raw_path)
         for(int& value : ground_skip)
             value = read_i32(payload, cursor);
     }
+    std::vector<ulonglong2> fric_keys;
+    std::vector<double3>    fric_prev_e, fric_gd_e;
+    if(state_flags & kStateFricAnchor)
+    {
+        if(read_u64(payload, cursor) != fric_pairs)
+            format_error("fric-anchor pair count is inconsistent");
+        fric_keys.resize(static_cast<std::size_t>(fric_pairs));
+        for(auto& key : fric_keys)
+        {
+            key.x = read_u64(payload, cursor);
+            key.y = read_u64(payload, cursor);
+        }
+        fric_prev_e = read_double3s(payload, cursor, fric_pairs);
+        if(read_u64(payload, cursor) != local_vN)
+            format_error("fric-anchor dense size differs from the scene");
+        fric_gd_e = read_double3s(payload, cursor, local_vN);
+    }
     const auto recheck = read_i64(payload, cursor);
     const auto frame = read_i64(payload, cursor);
     if(cursor != payload.size())
@@ -1064,6 +1153,16 @@ void GIPC::load_checkpoint(device_TetraData& mesh, const char* raw_path)
     require_binary(quarantined, "per-env quarantine state");
     require_binary(direction_nan, "per-env direction-NaN state");
     require_binary(ground_skip, "ground-skip table");
+    require_finite(fric_prev_e, "friction anchors");
+    require_finite(fric_gd_e, "ground friction anchors");
+    for(std::size_t i = 1; i < fric_keys.size(); ++i)
+    {
+        // carryFrictionAnchors binary-searches these; _FricKeyLess order.
+        const auto& a = fric_keys[i - 1];
+        const auto& b = fric_keys[i];
+        if(a.x > b.x || (a.x == b.x && a.y > b.y))
+            format_error("fric-anchor keys are not sorted");
+    }
     for(double value : group_kappa)
         if(value < 0.0)
             format_error("per-group kappa contains a negative value");
@@ -1218,6 +1317,56 @@ void GIPC::load_checkpoint(device_TetraData& mesh, const char* raw_path)
                 cudaMemcpyHostToDevice));
         _ground_body_count = static_cast<int>(local_collision_bodies);
     }
+    // [fric-anchor] restore the cross-step stiction state (clear when the
+    // checkpoint predates the feature or was saved with it off). The grow
+    // pattern mirrors carryFrictionAnchors so the buffers stay consistent.
+    if(state_flags & kStateFricAnchor)
+    {
+        const int pairs = static_cast<int>(fric_pairs);
+        if(pairs > fric_anchor_cap)
+        {
+            const int cap = pairs * 2 + 1024;
+            if(fric_anchor) CUDA_SAFE_CALL(cudaFree(fric_anchor));
+            if(fric_key_prev) CUDA_SAFE_CALL(cudaFree(fric_key_prev));
+            if(fric_anchor_prev) CUDA_SAFE_CALL(cudaFree(fric_anchor_prev));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor,
+                                      (size_t)cap * sizeof(double3)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_key_prev,
+                                      (size_t)cap * sizeof(ulonglong2)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor_prev,
+                                      (size_t)cap * sizeof(double3)));
+            fric_anchor_cap = cap;
+        }
+        if(pairs > 0)
+        {
+            CUDA_SAFE_CALL(cudaMemcpy(fric_key_prev,
+                                      fric_keys.data(),
+                                      fric_keys.size() * sizeof(ulonglong2),
+                                      cudaMemcpyHostToDevice));
+            CUDA_SAFE_CALL(cudaMemcpy(fric_anchor_prev,
+                                      fric_prev_e.data(),
+                                      fric_prev_e.size() * sizeof(double3),
+                                      cudaMemcpyHostToDevice));
+        }
+        fric_prev_count = pairs;
+        if(static_cast<int>(local_vN) > fric_gd_dense_cap)
+        {
+            if(fric_anchor_gd_dense)
+                CUDA_SAFE_CALL(cudaFree(fric_anchor_gd_dense));
+            if(fric_anchor_gd) CUDA_SAFE_CALL(cudaFree(fric_anchor_gd));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor_gd_dense,
+                                      local_vN * sizeof(double3)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor_gd,
+                                      local_vN * sizeof(double3)));
+            fric_gd_dense_cap = static_cast<int>(local_vN);
+        }
+        CUDA_SAFE_CALL(cudaMemcpy(fric_anchor_gd_dense,
+                                  fric_gd_e.data(),
+                                  fric_gd_e.size() * sizeof(double3),
+                                  cudaMemcpyHostToDevice));
+    }
+    else
+        clearFrictionAnchors();
     Kappa             = saved_kappa;
     m_recheck_counter = static_cast<int>(recheck);
     m_total_frames    = static_cast<int>(frame);

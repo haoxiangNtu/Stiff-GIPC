@@ -32,7 +32,9 @@
 // STRICT
 //   + everything ISOLATED promises
 //   + BITWISE reproducibility: run-to-run AND cross-architecture (proven
-//     sm_80 == sm_89, anchor f7fb5a786c2d7935)
+//     sm_80 == sm_89 at anchor f7fb5a786c2d7935; re-pinned a924481fc5beec47
+//     after the friction-anchor port + binned per-env LS energies — the
+//     cross-arch property re-proof on sm_80 is pending re-run)
 //   - costs: canonical emission orders + layout-fixed policies (measured
 //     single-digit % on anchor-class scenes; workload-dependent)
 //   pinned by: G1 bitwise anchor (armed MIRROR+SLOT)

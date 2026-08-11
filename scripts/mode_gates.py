@@ -27,17 +27,25 @@ import tempfile
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GOLD = "f7fb5a786c2d7935"
+GOLD = "a924481fc5beec47"
 KEEP = {"STIFF_MIRROR_AUDIT", "STIFF_SLOT_AUDIT"}
 RECORD = os.environ.get("RECORD") == "1"
 
-# BASELINES recorded 2026-07-26 on RTX 4090 (tier-2 tree, SCENE_N=2, 50f):
-#   NEWTON identical across all three modes (53); merged r2r: hash varies
-#   (atomic order), NEWTON stable; measured equivalence deltas:
-#   isolated-strict 2.26e-9, merged-others 6.02e-5. EQ_TOL = 1e-3 gives 16x
-#   headroom over measured while still failing on gross mode divergence.
+# BASELINES re-recorded 2026-08-12 on RTX 4090 (friction-anchor port + binned
+#   order-free per-env line-search energies; strict runs anchors ON now):
+#   merged NEWTON=53 (unchanged, r2r NEWTON stable); strict NEWTON=54,
+#   bitwise-pinned by GOLD. isolated NEWTON=54 with measured RUN-TO-RUN
+#   jitter of +/-1 (54,55,54,54 over four runs): isolated makes NO
+#   reproducibility promise (mode_contract.h) - its gradient/MAS deposits are
+#   plain-atomic - and the canary now sits near a backtrack decision
+#   boundary, so an exact-equality envelope is inherently flaky there. The
+#   envelope's job is catching gross solver regressions, not bit-identity
+#   (that is GOLD's job), hence the tolerance band below. Measured
+#   equivalence deltas: isolated-strict 2.4e-9, merged-others 5.82e-5 (same
+#   magnitudes as the 2026-07-26 record). EQ_TOL = 1e-3 keeps 16x headroom.
 #   Re-derive with RECORD=1 after any change that legitimately moves them.
-BASE = {"merged": 53, "isolated": 53}
+BASE = {"merged": 53, "isolated": 54}
+BASE_TOL = {"merged": 0, "isolated": 1}
 EQ_TOL = 1e-3
 
 
@@ -86,8 +94,8 @@ ok = True
 if res["strict"][0] != GOLD:
     print(f"FAIL strict-resolver anchor: {res['strict'][0]} != {GOLD}"); ok = False
 for m in ("merged", "isolated"):
-    if res[m][1] != BASE[m]:
-        print(f"FAIL {m} envelope: NEWTON={res[m][1]} != {BASE[m]}"); ok = False
+    if abs(res[m][1] - BASE[m]) > BASE_TOL[m]:
+        print(f"FAIL {m} envelope: NEWTON={res[m][1]} != {BASE[m]}+/-{BASE_TOL[m]}"); ok = False
 if nt_m2 != res["merged"][1]:
     print(f"WARN merged r2r NEWTON differs: {res['merged'][1]} vs {nt_m2}")
 for a, b in (("merged", "isolated"), ("merged", "strict"), ("isolated", "strict")):

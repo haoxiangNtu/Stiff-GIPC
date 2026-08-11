@@ -20,7 +20,23 @@ __device__ inline void _penv_energy_accum(double* penv, const int* p2g, int vid,
 {
     if(!penv || !p2g) return;
     int g = p2g[vid];
-    if(g >= 0 && g < ng) binned_deposit(penv + (size_t)g * BINNED_K, e);
+    if(g < 0 || g >= ng) return;
+    // ALWAYS exact-binned — deliberately NOT g_det_reduce-gated: these sums
+    // feed the S3 backtracking decision, a DISCRETE control-flow branch, so
+    // last-ulp scheduling jitter becomes run-to-run Newton-count instability
+    // in isolated mode (measured: G9 envelope 54 vs 55). Order-free deposits
+    // pin the count in every mode; merged never passes penv and pays nothing.
+    double* bins = penv + (size_t)g * BINNED_K;
+    double  x    = e;
+#pragma unroll
+    for(int k = 0; k < BINNED_K; ++k)
+    {
+        double M  = ldexp(1.5, BINNED_E0 - k * BINNED_W);
+        double q  = __dadd_rn(M, x);
+        double hi = __dsub_rn(q, M);
+        atomicAdd(&bins[k], hi);
+        x         = __dsub_rn(x, hi);
+    }
 }
 
 // ── _ec_emit contact-force export helper (E3.6 hoist from gipc_modules/05) ──

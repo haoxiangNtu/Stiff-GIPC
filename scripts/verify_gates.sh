@@ -7,7 +7,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 QUICK="${1:-}"
-GOLD_ANCHOR="f7fb5a786c2d7935"
+GOLD_ANCHOR="a924481fc5beec47"
 
 source "$ROOT/scripts/gate_common.sh"
 gate_reset_test_environment
