@@ -15965,6 +15965,18 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         bool gradVanish = current_global_exit
                               ? false
                               : device_newton_converged(merged_diag_sample);
+        // [newton-trace] per-iteration residual proxy (move-dir norm reduced by
+        // calcMinMovement above) for convergence-slope diagnostics (e.g. the
+        // friction-anchor A/B: preload should raise r0, not flatten the slope).
+        if(!current_global_exit && getenv("STIFF_NEWTON_TRACE"))
+        {
+            double _mv = 0.0;
+            CUDA_SAFE_CALL(cudaMemcpy(&_mv, pcg_data.squeue, sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+            static long long _nt_frame = -1;
+            if(k == 0) _nt_frame++;
+            printf("[newton-trace] f=%lld k=%d move=%.6e\n", _nt_frame, k, _mv);
+        }
 
         // [multi-env P3a step2] per-env Newton convergence tracking (precursor to
         // mask early-exit). The merged Newton loop currently breaks on the GLOBAL
