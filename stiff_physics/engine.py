@@ -1150,6 +1150,19 @@ class Engine:
         offsets = np.ascontiguousarray(body_offsets, dtype=np.int32)
         return self._engine.get_abd_body_velocities(offsets)
 
+    def reset_transient_contact_state(self) -> None:
+        """[episode reset] Clear stale contact/friction carry-over after teleports.
+
+        The lagged-friction set is built from the previous solve's contact-pair
+        list; after an in-place episode reset (teleport_abd_bodies +
+        teleport_fem_vertices) that list still describes the OLD episode, and the
+        first new solve applies phantom friction from it (measured: 24 um state
+        divergence vs a fresh build). Call this once after the teleports.
+        Not called automatically: teleporting a single body mid-simulation must
+        not clear every other contact's friction state.
+        """
+        self._engine.reset_transient_contact_state()
+
     def set_abd_body_velocities(self, body_offsets: np.ndarray,
                                 velocities: np.ndarray) -> None:
         """Set ABD body velocities from (N, 4, 4) float64."""

@@ -419,6 +419,16 @@ class GIPC
     // assembly/PCG/SpMV masking (RHS-zero + triplet-skip) to skip converged envs.
     // Gated STIFF_PERENV_MASK. h_env_active mirror; m_recheck_counter drives the
     // periodic full re-check.
+    // [friction snapshot / port of 1bc13ef] The lagged-friction gradient is a
+    // function of the in-step displacement (x - o_vertexes); after IPC_Solver
+    // commits the step (updateVelocities), that displacement is zero, so any
+    // post-step readback recomputing it returns exactly zero. IPC_Solver
+    // snapshots the friction gradient into this buffer right BEFORE the commit;
+    // the get_vertex_contact_forces accessor returns the snapshot.
+    double3* m_d_fric_force_snap = nullptr;   // device, gradient units (dE/dx)
+    int      m_fric_snap_cap     = 0;
+    bool     m_have_fric_snap    = false;
+    void     snapshotFrictionForce(device_TetraData& TetMesh);
     DeviceBuffer<int>    m_env_active;      // [3d-2] device, size kEnvAlphaSlots
     std::vector<int>    h_env_active;                 // host mirror
     int                 m_recheck_counter = 0;

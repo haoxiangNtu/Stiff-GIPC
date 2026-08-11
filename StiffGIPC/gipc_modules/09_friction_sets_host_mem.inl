@@ -1056,3 +1056,29 @@ void GIPC::cfl_largestSpeed_DeviceOut(double* mqueue, double* out_slot)
     CUDA_SAFE_CALL(cudaMemcpyAsync(
         out_slot, mqueue, sizeof(double), cudaMemcpyDeviceToDevice));
 }
+
+// [port of 1bc13ef] see GIPC.cuh m_d_fric_force_snap block.
+void GIPC::snapshotFrictionForce(device_TetraData& TetMesh)
+{
+#ifdef USE_FRICTION
+    m_have_fric_snap = false;
+    if(h_cpNum_last[0] <= 0 && h_gpNum_last <= 0)
+        return;
+    const int nv = (int)vertexNum;
+    if(nv > m_fric_snap_cap)
+    {
+        if(m_d_fric_force_snap)
+            cudaFree(m_d_fric_force_snap);
+        CUDA_SAFE_CALL(cudaMalloc(&m_d_fric_force_snap, (size_t)nv * sizeof(double3)));
+        m_fric_snap_cap = nv;
+    }
+    CUDA_SAFE_CALL(cudaMemset(m_d_fric_force_snap, 0, (size_t)nv * sizeof(double3)));
+    // mirror the accessor's binned-gradient protocol exactly
+    zeroBinnedGrad();
+    calFrictionGradient(m_d_fric_force_snap, TetMesh);
+    combineBinnedGrad(m_d_fric_force_snap);
+    m_have_fric_snap = true;
+#else
+    (void)TetMesh;
+#endif
+}

@@ -1684,6 +1684,10 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
 #ifdef USE_FRICTION
     // [0be8da3-port] friction buffers persist across frames; freed in FREE_DEVICE_MEM.
+    // [friction snapshot / port of 1bc13ef] capture the lagged-friction force of
+    // THIS step before the commit below zeroes the in-step displacement it is
+    // computed from.
+    snapshotFrictionForce(TetMesh);
 #endif
 
     updateVelocities(TetMesh);

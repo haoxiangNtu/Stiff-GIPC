@@ -564,6 +564,11 @@ PYBIND11_MODULE(pystiffgipc, m)
                                   static_cast<const double*>(tbuf.ptr), count);
         }, py::arg("body_offsets"), py::arg("transforms"))
 
+        .def("reset_transient_contact_state", &SimEngine::reset_transient_contact_state,
+             "[episode reset] Zero current/lagged contact-pair mirrors and the friction "
+             "snapshot so the first solve after a teleport reset does not apply the "
+             "previous episode's lagged friction. Call after teleporting between episodes.")
+
         // ABD body velocities: get (count, 4, 4) float64
         .def("get_abd_body_velocities", [](const SimEngine& e,
                 py::array_t<int, py::array::c_style | py::array::forcecast> offsets) {

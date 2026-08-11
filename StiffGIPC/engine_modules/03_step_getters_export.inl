@@ -1079,7 +1079,11 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
         return nw;
     const bool want_normal   = (components == 0 || components == 2);
     const bool want_friction = (components == 1 || components == 2);
-    const bool have_friction = (g.h_cpNum_last[0] > 0 || g.h_gpNum_last > 0);
+    // [friction snapshot / port of 1bc13ef] the lagged-friction gradient is a
+    // function of the in-step displacement, which the end-of-step commit
+    // zeroes — recomputing it here always yields 0. Use the snapshot
+    // IPC_Solver took pre-commit.
+    const bool have_friction = g.m_have_fric_snap;
 
     if(want_normal)
     {
@@ -1109,15 +1113,27 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
         if(include_ground)
             g.computeGroundGradient(impl.d_contact_gradient, g.Kappa);
     }
-    if(want_friction && have_friction)
-        g.calFrictionGradient(impl.d_contact_gradient,
-                              impl.d_tetMesh);  // lastH set, read-only
     g.combineBinnedGrad(impl.d_contact_gradient);
     std::vector<double3> engine_order(nv);
     CUDA_SAFE_CALL(cudaMemcpy(engine_order.data(),
                               impl.d_contact_gradient,
                               (size_t)nv * sizeof(double3),
                               cudaMemcpyDeviceToHost));
+    if(want_friction && have_friction)
+    {
+        // [port of 1bc13ef] add the pre-commit friction snapshot (engine order,
+        // gradient units) before the permuted scale-out below.
+        std::vector<double3> snap(nv);
+        CUDA_SAFE_CALL(cudaMemcpy(snap.data(), g.m_d_fric_force_snap,
+                                  (size_t)nv * sizeof(double3),
+                                  cudaMemcpyDeviceToHost));
+        for(int i = 0; i < nv; ++i)
+        {
+            engine_order[i].x += snap[i].x;
+            engine_order[i].y += snap[i].y;
+            engine_order[i].z += snap[i].z;
+        }
+    }
     // The buffer holds the incremental-potential GRADIENT (dE/dx = -force*dt^2).
     // Physical contact force = -gradient/dt^2 (same convention as the
     // per-contact force magnitude path, GIPC.cu _calBarrierForces). The first
@@ -1299,6 +1315,25 @@ __global__ void _fem_scatter_vm_to_verts(const uint4* tets, const double* tet_vm
     _se_atomicMaxPosDouble(&vert_vm[t.y], v);
     _se_atomicMaxPosDouble(&vert_vm[t.z], v);
     _se_atomicMaxPosDouble(&vert_vm[t.w], v);
+}
+
+// [episode reset / port of 1bc13ef]
+void SimEngine::reset_transient_contact_state()
+{
+    GIPC& g = m_impl->ipc;
+    for(int i = 0; i < 5; i++)
+    {
+        g.h_cpNum[i]      = 0;
+        g.h_cpNum_last[i] = 0;
+    }
+    g.h_gpNum          = 0;
+    g.h_gpNum_last     = 0;
+    g.m_have_fric_snap = false;
+    // Adaptive kappa carries the previous episode's contact history (measured:
+    // 0.9 um residual state divergence after the pair/friction mirrors were
+    // cleared). Zeroing it makes the next IPC_Solver re-derive kappa exactly
+    // like a fresh process (its first-solve path: Kappa < 1e-16 -> suggestKappa).
+    g.Kappa = 0.0;
 }
 
 int SimEngine::get_fem_von_mises_stress(double* out, int n)

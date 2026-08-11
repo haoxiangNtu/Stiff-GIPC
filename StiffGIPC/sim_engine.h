@@ -448,6 +448,12 @@ class SimEngine
     // phantom velocities from stale q_prev.
     void teleport_abd_bodies(const int* body_offsets, const double* mat4x4, int count);
 
+    // [episode reset / port of 1bc13ef] Clear current/lagged contact-pair
+    // mirrors, adaptive kappa and the friction snapshot so the first solve
+    // after an in-place episode reset (teleports) does not apply the previous
+    // episode's lagged friction. Not called by the teleport APIs themselves.
+    void reset_transient_contact_state();
+
     // Read/write ABD velocity as 4x4 matrices (velocity of q).
     void get_abd_body_velocities(const int* body_offsets, double* out_mat4x4, int count) const;
     void set_abd_body_velocities(const int* body_offsets, const double* mat4x4, int count);
