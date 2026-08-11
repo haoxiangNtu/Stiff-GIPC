@@ -9801,8 +9801,24 @@ void GIPC::clearFrictionAnchors()
 void GIPC::carryFrictionAnchors()
 {
     {
-        const char* e     = getenv("STIFF_FRIC_ANCHOR");
-        m_fric_anchor_on  = e ? (atoi(e) != 0) : m_fric_anchor_cfg;
+        // strict mode (signature: STIFF_SPMV_DET, set by the shell) keeps the
+        // legacy friction by default: anchors shift friction energies onto
+        // ulp-boundaries of the N-shape-dependent line-search energy sums and
+        // break BATCH invariance (bisect: epsv-only green, anchor-only green,
+        // combo flips a discrete accept decision at one frame -> butterfly).
+        // Until those sums are made N-invariant, strict trades the anchor off;
+        // STIFF_FRIC_ANCHOR=1 still forces it on explicitly.
+        const char* e      = getenv("STIFF_FRIC_ANCHOR");
+        const char* sd     = getenv("STIFF_SPMV_DET");
+        bool        strict = (sd && atoi(sd) != 0);
+        m_fric_anchor_on   = e ? (atoi(e) != 0) : (m_fric_anchor_cfg && !strict);
+        static bool warned = false;
+        if(!warned && strict && !e && m_fric_anchor_cfg)
+        {
+            printf("[fric-anchor] strict mode: friction_anchor suppressed for batch "
+                   "invariance (STIFF_FRIC_ANCHOR=1 to force)\n");
+            warned = true;
+        }
     }
     double3* sym    = nullptr;
     double3* sym_gd = nullptr;
@@ -9811,16 +9827,32 @@ void GIPC::carryFrictionAnchors()
         int needBody = (int)h_cpNum_last[0];
         if(needBody > fric_anchor_cap)
         {
-            // Growth drops the carried set once (anchors restart at 0 = legacy).
+            // Growth must PRESERVE the carried set: dropping it wipes anchors at
+            // N-dependent frames (pair counts grow on different schedules for
+            // different env counts) and breaks batch invariance. Copy-grow.
+            int         cap    = needBody * 2 + 1024;
+            double3*    na     = nullptr;
+            ulonglong2* nk     = nullptr;
+            double3*    nap    = nullptr;
+            CUDA_SAFE_CALL(cudaMalloc((void**)&na, (size_t)cap * sizeof(double3)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&nk, (size_t)cap * sizeof(ulonglong2)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&nap, (size_t)cap * sizeof(double3)));
+            if(fric_prev_count > 0 && fric_key_prev && fric_anchor_prev)
+            {
+                CUDA_SAFE_CALL(cudaMemcpy(nk, fric_key_prev,
+                                          (size_t)fric_prev_count * sizeof(ulonglong2),
+                                          cudaMemcpyDeviceToDevice));
+                CUDA_SAFE_CALL(cudaMemcpy(nap, fric_anchor_prev,
+                                          (size_t)fric_prev_count * sizeof(double3),
+                                          cudaMemcpyDeviceToDevice));
+            }
             if(fric_anchor)      CUDA_SAFE_CALL(cudaFree(fric_anchor));
             if(fric_key_prev)    CUDA_SAFE_CALL(cudaFree(fric_key_prev));
             if(fric_anchor_prev) CUDA_SAFE_CALL(cudaFree(fric_anchor_prev));
-            int cap = needBody * 2 + 1024;
-            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor, (size_t)cap * sizeof(double3)));
-            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_key_prev, (size_t)cap * sizeof(ulonglong2)));
-            CUDA_SAFE_CALL(cudaMalloc((void**)&fric_anchor_prev, (size_t)cap * sizeof(double3)));
-            fric_anchor_cap = cap;
-            fric_prev_count = 0;
+            fric_anchor      = na;
+            fric_key_prev    = nk;
+            fric_anchor_prev = nap;
+            fric_anchor_cap  = cap;
         }
         if((int)vertexNum > fric_gd_dense_cap)
         {

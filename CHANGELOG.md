@@ -17,7 +17,11 @@ hatches restore 0.8.5.3 behavior bit-exactly).
   coupling made static-friction accuracy depend on scene size (third member
   of the bbox-derived-parameter family after dhat and kappa). Legacy:
   `absolute_epsv=0` or `STIFF_EPSV=0`.
-- **`Config.friction_anchor` — default True.** Persistent cross-step friction
+- **`Config.friction_anchor` — default True** (strict multi-env mode
+  auto-suppresses it to preserve batch invariance — anchors nudge the
+  N-shape-dependent line-search energy sums across ulp compare boundaries;
+  `STIFF_FRIC_ANCHOR=1` forces it on there. Root fix — N-invariant energy
+  reductions — tracked for 0.8.6). Persistent cross-step friction
   anchors: each lagged pair carries an accumulated tangential elastic offset
   e; energy/gradient/Hessian evaluate u_total = relDX_step + e, making
   stiction a spring against a persistent anchor. ||e|| is capped at
