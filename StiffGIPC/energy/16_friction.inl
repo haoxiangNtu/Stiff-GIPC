@@ -5,6 +5,7 @@
 // old module-07 position (before the host dispatch in energy/01).
 // ============================================================================
 __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
+                                                const double3* _fric_anchor,
                                                 const double3* vertexes,
                                                 const double3* o_vertexes,
                                                 const int4*    _collisionPair,
@@ -29,7 +30,8 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
     if(idx < numbers)
     {
         temp = __cal_Friction_energy(
-            vertexes, o_vertexes, _collisionPair[idx], dt, distCoord[idx], tanBasis[idx], lastH[idx], fricDHat, eps);
+            vertexes, o_vertexes, _collisionPair[idx], dt, distCoord[idx], tanBasis[idx], lastH[idx], fricDHat, eps,
+            _fric_anchor ? _fric_anchor[idx] : make_double3(0., 0., 0.));
     // [per-body friction] the host combine multiplies the GLOBAL mu into this
     // sum (fric = frictionRate * slot); scale each pair's term by mu_pair/mu
     // here so the product lands on mu_pair exactly — zero changes to the four
@@ -47,6 +49,7 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
 }
 
 __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
+                                                   const double3* _fric_anchor_gd,
                                                    const double3* vertexes,
                                                    const double3* o_vertexes,
                                                    const double3* _normal,
@@ -69,7 +72,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
     if(idx < numbers)
     {
         temp = __cal_Friction_gd_energy(
-            vertexes, o_vertexes, _normal, _collisionPair_gd[idx], dt, lastH[idx], eps);
+            vertexes, o_vertexes, _normal, _collisionPair_gd[idx], dt, lastH[idx], eps,
+            _fric_anchor_gd ? _fric_anchor_gd[idx] : make_double3(0., 0., 0.));
     // [per-body friction] see _getFrictionEnergy_Reduction_3D: host combine
     // multiplies the GLOBAL gd mu; scale per-vertex here so the product is exact.
         if(vert_mu_gd)
@@ -85,6 +89,7 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
 
 // ── verbatim from gipc_modules/02 (pre-E1c lines 1..475) ──
 __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
+                                    const double3* _fric_anchor_gd,
                                        const double3*   _o_vertexes,
                                        const double3*   _normal,
                                        const uint32_t*  _last_collisionPair_gd,
@@ -109,6 +114,7 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
     __GEIGEN__::Matrix3x3d H_vI;
 
     double3 Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
+    if(_fric_anchor_gd) Vdiff = __GEIGEN__::__add(Vdiff, _fric_anchor_gd[idx]);   // [fric-anchor]
     double3 normal = *_normal;
     double3 VProj  = __GEIGEN__::__minus(
         Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
@@ -195,6 +201,7 @@ __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
 }
 
 __global__ void _calFrictionHessian(const double3*          _vertexes,
+                                    const double3* _fric_anchor,
                                     const double3*          _o_vertexes,
                                     const int4*             _last_collisionPair,
                                     Eigen::Matrix3d*        triplet_values,
@@ -234,6 +241,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
             distCoord[idx].x,
             distCoord[idx].y,
             relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
 
         __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
@@ -315,6 +323,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
                 relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -399,6 +408,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
                 distCoord[idx].x,
                 relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -482,6 +492,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
                 distCoord[idx].x,
                 distCoord[idx].y,
                 relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
@@ -562,6 +573,7 @@ __global__ void _calFrictionHessian(const double3*          _vertexes,
 
 // ── verbatim from gipc_modules/05 (pre-E1d lines 109..341): friction gradients ──
 __global__ void _calFrictionGradient_gd(const double3* _vertexes,
+                                    const double3* _fric_anchor_gd,
                                         const double3* _o_vertexes,
                                         const double3* _normal,
                                         const const uint32_t* _last_collisionPair_gd,
@@ -580,6 +592,7 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
     double3  normal = *_normal;
     uint32_t gidx   = _last_collisionPair_gd[idx];
     double3  Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
+    if(_fric_anchor_gd) Vdiff = __GEIGEN__::__add(Vdiff, _fric_anchor_gd[idx]);   // [fric-anchor]
     double3  VProj  = __GEIGEN__::__minus(
         Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
     double VProjMag2 = __GEIGEN__::__squaredNorm(VProj);
@@ -603,6 +616,7 @@ __global__ void _calFrictionGradient_gd(const double3* _vertexes,
 }
 
 __global__ void _calFrictionGradient(const double3*    _vertexes,
+                                    const double3* _fric_anchor,
                                      const double3*    _o_vertexes,
                                      const const int4* _last_collisionPair,
                                      double3*          _gradient,
@@ -632,6 +646,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
             distCoord[idx].x,
             distCoord[idx].y,
             relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
         __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
         double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -676,6 +691,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.x], _o_vertexes[MMCVIDI.x]),
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.y], _o_vertexes[MMCVIDI.y]),
                 relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -712,6 +728,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                 __GEIGEN__::__minus(_vertexes[MMCVIDI.z], _o_vertexes[MMCVIDI.z]),
                 distCoord[idx].x,
                 relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX       = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -752,6 +769,7 @@ __global__ void _calFrictionGradient(const double3*    _vertexes,
                 distCoord[idx].x,
                 distCoord[idx].y,
                 relDX3D);
+        if(_fric_anchor) relDX3D = __GEIGEN__::__add(relDX3D, _fric_anchor[idx]);   // [fric-anchor]
 
             __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis[idx]);
             double2 relDX = __GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D);
@@ -804,7 +822,8 @@ void GIPC::energy_launch_friction(device_TetraData& TetMesh, double* queue, int 
                                 int tet_offset, int point_offset, double energy_kappa)
 {
             _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
+                queue,
+            (m_fric_anchor_on && fric_anchor)    ? fric_anchor    : nullptr, TetMesh.vertexes, TetMesh.o_vertexes, _collisonPairs_lastH,
                 numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
                 fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,
@@ -820,7 +839,8 @@ void GIPC::energy_launch_friction_gd(device_TetraData& TetMesh, double* queue, i
                                 int tet_offset, int point_offset, double energy_kappa)
 {
             _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
-                queue, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
+                queue,
+            (m_fric_anchor_on && fric_anchor_gd) ? fric_anchor_gd : nullptr, TetMesh.vertexes, TetMesh.o_vertexes, _groundNormal,
                 _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
                 sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,

@@ -1688,6 +1688,10 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     // THIS step before the commit below zeroes the in-step displacement it is
     // computed from.
     snapshotFrictionForce(TetMesh);
+    // [fric-anchor] fold this step's slip into the persistent anchors while
+    // (x, o_vertexes) still describe the step. Must run before updateVelocities
+    // commits o_vertexes = x.
+    commitFrictionAnchors(TetMesh);
 #endif
 
     updateVelocities(TetMesh);

@@ -68,6 +68,10 @@ struct SimEngineConfig
     // guidance: 1e-5 m/s for static accuracy; 1e-4 is a good grasp default.
     // 0 = legacy scene-derived value (bit-identical to previous releases).
     double absolute_epsv                  = 0.0;
+    // Persistent friction anchors (true stiction; GIPC::carryFrictionAnchors).
+    // Strict multi-env auto-suppresses (batch-invariance interaction under
+    // investigation); STIFF_FRIC_ANCHOR env (0/1) overrides either way.
+    bool   friction_anchor                = true;
     int    preconditioner_type            = 1;  // 1 = MAS
     int    cuda_device                    = 0;
 

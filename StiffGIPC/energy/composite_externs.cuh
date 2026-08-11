@@ -145,6 +145,7 @@ extern __global__ void _getRestStableNHKEnergy_Reduction_3D(double*       squeue
 
 // ── rung 5: friction (energy/friction.cu) ──
 extern __global__ void _calFrictionHessian(const double3*          _vertexes,
+                                    const double3* _fric_anchor,
                                     const double3*          _o_vertexes,
                                     const int4*             _last_collisionPair,
                                     Eigen::Matrix3d*        triplet_values,
@@ -166,6 +167,7 @@ extern __global__ void _calFrictionHessian(const double3*          _vertexes,
                                     int                     f_offset3,
                                     int                     f_offset2);
 extern __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
+                                    const double3* _fric_anchor_gd,
                                        const double3*   _o_vertexes,
                                        const double3*   _normal,
                                        const uint32_t*  _last_collisionPair_gd,
@@ -180,6 +182,7 @@ extern __global__ void _calFrictionHessian_gd(const double3*   _vertexes,
                                        double           coef,
                                        const double*    vert_mu_gd);
 extern __global__ void _calFrictionGradient(const double3*    _vertexes,
+                                    const double3* _fric_anchor,
                                      const double3*    _o_vertexes,
                                      const const int4* _last_collisionPair,
                                      double3*          _gradient,
@@ -192,6 +195,7 @@ extern __global__ void _calFrictionGradient(const double3*    _vertexes,
                                      double                  coef,
                                      const double*           vert_mu);
 extern __global__ void _calFrictionGradient_gd(const double3* _vertexes,
+                                    const double3* _fric_anchor_gd,
                                         const double3* _o_vertexes,
                                         const double3* _normal,
                                         const const uint32_t* _last_collisionPair_gd,
@@ -203,6 +207,7 @@ extern __global__ void _calFrictionGradient_gd(const double3* _vertexes,
                                         double   coef,
                                         const double* vert_mu_gd);
 extern __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
+                                                const double3* _fric_anchor,
                                                 const double3* vertexes,
                                                 const double3* o_vertexes,
                                                 const int4*    _collisionPair,
@@ -218,6 +223,7 @@ extern __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
 
 );
 extern __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
+                                                   const double3* _fric_anchor_gd,
                                                    const double3* vertexes,
                                                    const double3* o_vertexes,
                                                    const double3* _normal,

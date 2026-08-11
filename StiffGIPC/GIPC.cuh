@@ -355,6 +355,34 @@ class GIPC
     DeviceBuffer<uint32_t> _collisonPairs_lastH_gd;
     HostMirror<uint32_t> h_gpNum_last{"h_gpNum_last"};  // [3b-2] was UNINITIALIZED — T{} now
 
+    // [fric-anchor] Persistent cross-step friction anchors (STIFF_FRIC_ANCHOR=1,
+    // default off = legacy bit-identical). Per lagged pair we keep the
+    // accumulated tangential elastic offset e (world meters); the friction
+    // energy/gradient/Hessian evaluate u_total = relDX_step + e, turning
+    // stiction into a true spring to a persistent anchor -> zero creep
+    // (legacy resets the anchor every step -> creep = (load/(mu*lambda))*epsv).
+    // ||e|| is capped at the stiction boundary eps = epsv*h; hitting the cap
+    // slides the anchor = Coulomb sliding. Body pairs carry across steps by
+    // canonical pair key (sort + binary search, deterministic); ground pairs
+    // carry through a dense per-surface-vertex array. Unmatched pairs restart
+    // at e = 0 (exactly legacy behavior for new contacts).
+    bool        m_fric_anchor_on     = false;
+    bool        m_fric_anchor_cfg    = true;   // Config.friction_anchor (env overrides)
+    double3*    fric_anchor          = nullptr;  // per lastH body-pair slot
+    double3*    fric_anchor_gd       = nullptr;  // per lastH ground-pair slot
+    ulonglong2* fric_key_prev        = nullptr;  // sorted keys, prev step body pairs
+    double3*    fric_anchor_prev     = nullptr;  // anchors in fric_key_prev order
+    int         fric_prev_count      = 0;
+    double3*    fric_anchor_gd_dense = nullptr;  // per surface vertex (prev step)
+    int         fric_anchor_cap      = 0;        // body-pair slots allocated
+    int         fric_gd_dense_cap    = 0;
+    void*       fric_sort_temp       = nullptr;  // persistent cub sort scratch
+    size_t      fric_sort_temp_bytes = 0;
+    void        commitFrictionAnchors(device_TetraData& TetMesh);  // end-of-step: accumulate+cap+sort
+    void        carryFrictionAnchors();          // build-time: match prev -> new slots
+    void        clearFrictionAnchors();          // episode reset / teleport
+
+
     // Persistent device slots for 9 FEM/contact terms plus 6 ABD terms. The
     // line-search path combines these on device; diagnostic computeEnergy()
     // performs one batched D2H instead of one transfer per term.

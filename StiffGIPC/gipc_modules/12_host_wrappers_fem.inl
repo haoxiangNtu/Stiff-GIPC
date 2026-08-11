@@ -198,6 +198,7 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
         }
         _calFrictionHessian<<<blockNum, threadNum>>>(
             _vertexes,
+            (m_fric_anchor_on && fric_anchor)    ? fric_anchor    : nullptr,
             TetMesh.o_vertexes,
             _collisonPairs_lastH,
             gipc_global_triplet.block_values(),
@@ -230,6 +231,7 @@ void GIPC::calFrictionHessian(device_TetraData& TetMesh)
                         + h_cpNum_last[3] * M9_Off + h_cpNum_last[2] * M6_Off;
     _calFrictionHessian_gd<<<blockNum, threadNum>>>(
         _vertexes,
+            (m_fric_anchor_on && fric_anchor_gd) ? fric_anchor_gd : nullptr,
         TetMesh.o_vertexes,
         _groundNormal,
         _collisonPairs_lastH_gd,
@@ -411,6 +413,7 @@ void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
     {
         blockNum = (numbers + threadNum - 1) / threadNum;
         _calFrictionGradient<<<blockNum, threadNum>>>(_vertexes,
+                                    (m_fric_anchor_on && fric_anchor)    ? fric_anchor    : nullptr,
                                                       TetMesh.o_vertexes,
                                                       _collisonPairs_lastH,
                                                       _gradient,
@@ -429,6 +432,7 @@ void GIPC::calFrictionGradient(double3* _gradient, device_TetraData& TetMesh)
     blockNum = (numbers + threadNum - 1) / threadNum;
 
     _calFrictionGradient_gd<<<blockNum, threadNum>>>(_vertexes,
+                                    (m_fric_anchor_on && fric_anchor_gd) ? fric_anchor_gd : nullptr,
                                                      TetMesh.o_vertexes,
                                                      _groundNormal,
                                                      _collisonPairs_lastH_gd,

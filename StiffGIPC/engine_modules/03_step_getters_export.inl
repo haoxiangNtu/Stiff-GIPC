@@ -1323,8 +1323,8 @@ void SimEngine::reset_transient_contact_state()
     GIPC& g = m_impl->ipc;
     for(int i = 0; i < 5; i++)
     {
-        g.h_cpNum[i]      = 0;
-        g.h_cpNum_last[i] = 0;
+        g.h_cpNum.set(i, 0);        // audited mirrors: targeted writes
+        g.h_cpNum_last.set(i, 0);
     }
     g.h_gpNum          = 0;
     g.h_gpNum_last     = 0;
@@ -1334,6 +1334,9 @@ void SimEngine::reset_transient_contact_state()
     // cleared). Zeroing it makes the next IPC_Solver re-derive kappa exactly
     // like a fresh process (its first-solve path: Kappa < 1e-16 -> suggestKappa).
     g.Kappa = 0.0;
+    // [fric-anchor] the persistent anchors describe the previous episode's
+    // contacts — teleported bodies must not inherit them.
+    g.clearFrictionAnchors();
 }
 
 int SimEngine::get_fem_von_mises_stress(double* out, int n)

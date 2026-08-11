@@ -20,6 +20,7 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.relative_dhat       = cfg.relative_dhat;
     ipc.absolute_dhat       = cfg.absolute_dhat;
     ipc.absolute_epsv       = cfg.absolute_epsv;
+    ipc.m_fric_anchor_cfg   = cfg.friction_anchor;
     ipc.YoungModulus        = cfg.young_modulus;
     ipc.pcg_data.P_type     = cfg.preconditioner_type;
     ipc.assets_dir_cfg      = resolved_assets_dir;

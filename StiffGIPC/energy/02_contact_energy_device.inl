@@ -275,11 +275,13 @@ __device__ inline double __cal_Friction_gd_energy(const double3* _vertexes,
                                            uint32_t       gidx,
                                            double         dt,
                                            double         lastH,
-                                           double         eps)
+                                           double         eps,
+                                           double3 anchor = make_double3(0., 0., 0.))
 {
 
     double3 normal = *_normal;
     double3 Vdiff  = __GEIGEN__::__minus(_vertexes[gidx], _o_vertexes[gidx]);
+    Vdiff          = __GEIGEN__::__add(Vdiff, anchor);   // [fric-anchor]
     double3 VProj  = __GEIGEN__::__minus(
         Vdiff, __GEIGEN__::__s_vec_multiply(normal, __GEIGEN__::__v_vec_dot(Vdiff, normal)));
     double VProjMag2 = __GEIGEN__::__squaredNorm(VProj);
@@ -302,7 +304,8 @@ __device__ inline double __cal_Friction_energy(const double3*         _vertexes,
                                         __GEIGEN__::Matrix3x2d tanBasis,
                                         double                 lastH,
                                         double                 fricDHat,
-                                        double                 eps)
+                                        double                 eps,
+                                        double3 anchor = make_double3(0., 0., 0.))
 {
     double3 relDX3D;
     if(MMCVIDI.x >= 0)
@@ -359,6 +362,7 @@ __device__ inline double __cal_Friction_energy(const double3*         _vertexes,
                 relDX3D);
         }
     }
+    relDX3D = __GEIGEN__::__add(relDX3D, anchor);   // [fric-anchor]
     __GEIGEN__::Matrix2x3d tB_T = __GEIGEN__::__Transpose3x2(tanBasis);
     double                 relDXSqNorm =
         __GEIGEN__::__squaredNorm(__GEIGEN__::__M2x3_v3_multiply(tB_T, relDX3D));

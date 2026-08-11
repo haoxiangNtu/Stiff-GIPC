@@ -108,6 +108,7 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
         case 5:
             _getFrictionEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue,
+            (m_fric_anchor_on && fric_anchor)    ? fric_anchor    : nullptr,
                 TetMesh.vertexes,
                 TetMesh.o_vertexes,
                 _collisonPairs_lastH,
@@ -124,6 +125,7 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
         case 6:
             _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
                 queue,
+            (m_fric_anchor_on && fric_anchor_gd) ? fric_anchor_gd : nullptr,
                 TetMesh.vertexes,
                 TetMesh.o_vertexes,
                 _groundNormal,
