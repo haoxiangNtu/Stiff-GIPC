@@ -1197,6 +1197,35 @@ class Engine:
         """
         return self._engine.get_contacts()
 
+    def _device_to_input_perm(self):
+        """metis_to_input permutation, cached after finalize; None = identity.
+
+        Device-side per-vertex buffers are MAS-permuted whenever the MAS
+        preconditioner reorders vertices. ``get_vertices`` already returns
+        input order, but the contact-force and von-Mises accessors used to
+        hand back the DEVICE order — per-vertex maps were scrambled under
+        MAS (measured: 20% of a pressed pad's normal force appeared on coat
+        vertices before un-permuting, 100% after; per-body SUMS survived
+        because a single FEM body's range maps onto itself, which is why
+        force totals never looked wrong). Jacobi runs are identity.
+        """
+        if getattr(self, "_m2i_cache", None) is None:
+            m2i = np.asarray(self._engine.get_vertex_metis_to_input())
+            if np.array_equal(m2i, np.arange(len(m2i))):
+                self._m2i_cache = (True, None)          # identity
+            else:
+                self._m2i_cache = (False, m2i)
+        ident, m2i = self._m2i_cache
+        return None if ident else m2i
+
+    def _unpermute(self, arr: np.ndarray) -> np.ndarray:
+        m2i = self._device_to_input_perm()
+        if m2i is None:
+            return arr
+        out = np.empty_like(arr)
+        out[m2i] = arr
+        return out
+
     def get_vertex_contact_forces(self, include_ground: bool = True,
                                   components: str = "normal") -> np.ndarray:
         """Per-vertex IPC contact force (N, 3) in Newtons of the current state.
@@ -1217,12 +1246,13 @@ class Engine:
         read-only on the solver's frozen friction set.
         """
         comp = {"normal": 0, "friction_lagged": 1, "total": 2}[components]
-        return np.asarray(self._engine.get_vertex_contact_forces(include_ground, comp))
+        return self._unpermute(
+            np.asarray(self._engine.get_vertex_contact_forces(include_ground, comp)))
 
     def get_fem_von_mises_stress(self) -> np.ndarray:
         """Per-vertex von Mises stress (Pa): per-tet Neo-Hookean Cauchy stress,
         max-scattered to vertices. Non-tet vertices (cloth/ABD) are 0."""
-        return np.asarray(self._engine.get_fem_von_mises_stress())
+        return self._unpermute(np.asarray(self._engine.get_fem_von_mises_stress()))
 
     def get_per_env_newton_iters(self) -> np.ndarray:
         """Newton iter at which each env froze last solve (-1 = ran to loop
