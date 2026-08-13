@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <filesystem>
 #include <map>
@@ -3641,6 +3642,30 @@ void SimEngine::reset_transient_contact_state()
 }
 
 
+int SimEngine::get_vertex_metis_to_input(int* out, int n) const
+{
+    const auto& impl = *m_impl;
+    const int   nv   = static_cast<int>(impl.ipc.vertexNum);
+    const int   nw   = std::min(n, nv);
+    if(nw <= 0)
+        return 0;
+
+    const auto& perm = impl.tetMesh.vertex_metis_to_input;
+    if(perm.empty())
+    {
+        // No MAS reorder in this scene: hand back the identity so callers do
+        // not need a separate code path.
+        for(int i = 0; i < nw; i++)
+            out[i] = i;
+        return nw;
+    }
+
+    const int np = static_cast<int>(perm.size());
+    for(int i = 0; i < nw; i++)
+        out[i] = (i < np) ? perm[i] : i;
+    return nw;
+}
+
 int SimEngine::get_fem_von_mises_stress(double* out, int n)
 {
     auto& impl = *m_impl;
@@ -3854,10 +3879,44 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     std::filesystem::create_directories(tmp_dir);
     std::string tmp_path;
 
+    // [cache-key] The temp file's basename becomes the METIS cache key
+    // (<assets>/sorted_mesh/<basename>_sorted.16.msh, written by metis_sort).
+    // Naming it by load-record index alone made the key collide across scenes:
+    // two scenes loading DIFFERENT geometry at the same body index silently
+    // reused each other's sorted mesh, so a body came back with stale
+    // coordinates (announced only by "metis files exist (validated: N verts)").
+    // Mix a content hash of the vertex/face payload into the name: distinct
+    // geometry now gets a distinct cache entry, identical geometry still hits
+    // the cache (which is the point of having it).
+    auto content_tag = [&]() {
+        uint64_t h = 1469598103934665603ull;  // FNV-1a 64
+        auto mix   = [&h](const void* p, size_t nbytes) {
+            const unsigned char* b = static_cast<const unsigned char*>(p);
+            for(size_t i = 0; i < nbytes; i++)
+            {
+                h ^= b[i];
+                h *= 1099511628211ull;
+            }
+        };
+        mix(vertices, static_cast<size_t>(num_verts) * 3 * sizeof(double));
+        mix(faces, static_cast<size_t>(num_faces) * verts_per_face * sizeof(int));
+        const int meta[4] = {num_verts, num_faces, verts_per_face, dimensions};
+        mix(meta, sizeof(meta));
+        char buf[17];
+        snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+        return std::string(buf);
+    }();
+    const std::string tmp_stem =
+        "tmp_mesh_" + std::to_string(m_impl->load_records.size()) + "_" + content_tag;
+
     if(dimensions == 2 || verts_per_face == 3)
     {
-        tmp_path = tmp_dir + "tmp_mesh_" + std::to_string(m_impl->load_records.size()) + ".obj";
+        tmp_path = tmp_dir + tmp_stem + ".obj";
         std::ofstream ofs(tmp_path);
+        // [precision] Default ostream formatting keeps 6 significant digits,
+        // which quantised in-memory geometry to ~5e-8 m on a 40 mm part before
+        // it ever reached the solver. Round-trip losslessly instead.
+        ofs << std::setprecision(17);
         for(int i = 0; i < num_verts; i++)
             ofs << "v " << vertices[i * 3] << " " << vertices[i * 3 + 1] << " " << vertices[i * 3 + 2] << "\n";
         for(int i = 0; i < num_faces; i++)
@@ -3872,8 +3931,9 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     else
     {
         // For pre-tetrahedralized data (verts_per_face == 4), write as .msh
-        tmp_path = tmp_dir + "tmp_mesh_" + std::to_string(m_impl->load_records.size()) + ".msh";
+        tmp_path = tmp_dir + tmp_stem + ".msh";
         std::ofstream ofs(tmp_path);
+        ofs << std::setprecision(17);
         ofs << "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n";
         ofs << "$Nodes\n" << num_verts << "\n";
         for(int i = 0; i < num_verts; i++)

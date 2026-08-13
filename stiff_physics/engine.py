@@ -975,6 +975,28 @@ class Engine:
         """
         self._engine.reset_transient_contact_state()
 
+    def get_vertex_metis_to_input(self) -> np.ndarray:
+        """[gpu-direct] ``out[engine_idx] = input_idx`` for the raw device buffer.
+
+        :meth:`get_vertices_device_ptr` exposes the engine-internal vertex array,
+        which the MAS preconditioner may reorder. The host getters unscramble it
+        transparently; GPU consumers do not get that for free, so indices taken
+        from load records or your own mesh arrays must be mapped through the
+        inverse of this permutation before indexing the device buffer::
+
+            i2m = engine.get_vertex_input_to_metis()
+            device_index = i2m[input_index]
+
+        Returns the identity when no reorder was applied.
+        """
+        return np.asarray(self._engine.get_vertex_metis_to_input())
+
+    def get_vertex_input_to_metis(self) -> np.ndarray:
+        """Inverse of :meth:`get_vertex_metis_to_input`: input index -> device index."""
+        m2i = self.get_vertex_metis_to_input()
+        i2m = np.empty_like(m2i)
+        i2m[m2i] = np.arange(len(m2i), dtype=m2i.dtype)
+        return i2m
 
     def get_vertex_velocities(self) -> np.ndarray:
         """Return vertex velocities as (N, 3) float64 array."""

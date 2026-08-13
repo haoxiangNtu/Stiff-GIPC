@@ -319,6 +319,20 @@ class SimEngine
     /// APIs themselves: teleporting one body mid-scene must not clear the
     /// friction state of every other contact.
     void reset_transient_contact_state();
+    /// [gpu-direct] Vertex permutation between engine-internal (device) order
+    /// and input (load) order: out[engine_idx] = input_idx.
+    ///
+    /// The host getters (get_vertex_positions / get_surface_faces / ...) already
+    /// unscramble this, so it is invisible from Python -- but
+    /// get_vertices_device_ptr() hands out the RAW device buffer, which is in
+    /// engine order. Anything doing zero-copy GPU work on those vertices (e.g. a
+    /// tactile depth rasteriser indexing a gel's surface triangles) must remap
+    /// its input-order indices through the inverse of this permutation.
+    ///
+    /// Writes min(n, vertexNum) entries and returns the number written. Writes
+    /// the identity when no MAS reorder was applied (preconditioner_type == 0
+    /// or ABD-only scenes), so callers need no special case.
+    int get_vertex_metis_to_input(int* out, int n) const;
 
     /// [per-env productization] Newton iter at which each env froze last solve
     /// (converged / timeout / diverged; -1 = ran to loop end or absent).

@@ -425,6 +425,16 @@ PYBIND11_MODULE(pystiffgipc, m)
              "[episode reset] Zero current/lagged contact-pair mirrors and the friction "
              "snapshot so the first solve after a teleport reset does not apply the "
              "previous episode's lagged friction. Call after teleporting between episodes.")
+        .def("get_vertex_metis_to_input", [](const SimEngine& e) {
+                int n = e.get_vertex_count();
+                auto arr = py::array_t<int>(n);
+                e.get_vertex_metis_to_input(arr.mutable_data(), n);
+                return arr;
+            },
+            "[gpu-direct] out[engine_idx] = input_idx for the RAW device vertex "
+            "buffer returned by get_vertices_device_ptr(). The host getters "
+            "already unscramble this; zero-copy GPU consumers must not. Identity "
+            "when no MAS reorder was applied.")
         .def("get_fem_von_mises_stress", [](SimEngine& e) {
                 int n = e.get_vertex_count();
                 auto arr = py::array_t<double>(n);
