@@ -82,7 +82,28 @@ class AllegroURDF:
     """Minimal URDF reader + FK/IK. Revolute and fixed joints only, which is all
     the Allegro description uses."""
 
-    def __init__(self, urdf_path: str):
+    def __init__(self, urdf_path: str, chains: dict | None = None,
+                 pad_centre=None, pad_normal=None):
+        """chains/pad_centre/pad_normal default to the Allegro constants.
+
+        For other hands pass:
+          chains:     {finger: (tip_link, [joint, ...])}
+          pad_centre: (3,) in the tip-link frame, or {finger: (3,)} when the
+                      mount differs per finger (e.g. LinkerHand L20, whose
+                      thumb and finger distals are different parts)
+          pad_normal: same shapes, unit vector pointing AT the object
+        """
+        self.chains = dict(chains) if chains else dict(FINGER_CHAINS)
+
+        def _per_finger(v, default):
+            if v is None:
+                v = default
+            if isinstance(v, dict):
+                return {k: np.asarray(x, float) for k, x in v.items()}
+            return {f: np.asarray(v, float) for f in self.chains}
+
+        self.pad_c = _per_finger(pad_centre, PAD_CENTRE)
+        self.pad_n = _per_finger(pad_normal, PAD_NORMAL)
         self.path = urdf_path
         self.dir = osp.dirname(urdf_path)
         root = ET.parse(urdf_path).getroot()
@@ -174,7 +195,7 @@ class AllegroURDF:
         """
         from scipy.optimize import least_squares
 
-        tip, joints = FINGER_CHAINS[finger]
+        tip, joints = self.chains[finger]
         lo, hi = self.limits(joints)
         x0 = np.clip(np.zeros(len(joints)) if q0 is None else np.asarray(q0, float), lo, hi)
 
@@ -208,24 +229,27 @@ class AllegroURDF:
         """
         from scipy.optimize import least_squares
 
-        ja = FINGER_CHAINS[fa][1]
-        jb = FINGER_CHAINS[fb][1]
+        ja = self.chains[fa][1]
+        jb = self.chains[fb][1]
         joints = ja + jb
         lo, hi = self.limits(joints)
         x0 = np.array([(q0 or {}).get(j, 0.5 * (self.joints[j].lower + self.joints[j].upper))
                        for j in joints])
         x0 = np.clip(x0, lo, hi)
 
+        ca_l, na_l = self.pad_c[fa], self.pad_n[fa]
+        cb_l, nb_l = self.pad_c[fb], self.pad_n[fb]
+
         def poses(x):
             T = self.fk(dict(zip(joints, x)), base=base)
-            return T[FINGER_CHAINS[fa][0]], T[FINGER_CHAINS[fb][0]]
+            return T[self.chains[fa][0]], T[self.chains[fb][0]]
 
         def res(x):
             Ta, Tb = poses(x)
-            ca = Ta[:3, :3] @ PAD_CENTRE + Ta[:3, 3]
-            cb = Tb[:3, :3] @ PAD_CENTRE + Tb[:3, 3]
-            na = Ta[:3, :3] @ PAD_NORMAL
-            nb = Tb[:3, :3] @ PAD_NORMAL
+            ca = Ta[:3, :3] @ ca_l + Ta[:3, 3]
+            cb = Tb[:3, :3] @ cb_l + Tb[:3, 3]
+            na = Ta[:3, :3] @ na_l
+            nb = Tb[:3, :3] @ nb_l
             ya = Ta[:3, :3] @ np.array([0.0, 1.0, 0.0])
             yb = Tb[:3, :3] @ np.array([0.0, 1.0, 0.0])
             # scalar gap and scalar lateral distance, NOT the raw 3-vector
@@ -255,10 +279,10 @@ class AllegroURDF:
             xk = x0 if k == 0 else lo + rng.random(len(joints)) * (hi - lo)
             t = least_squares(res, xk, bounds=(lo, hi), max_nfev=3000)
             Ta, Tb = poses(t.x)
-            ca = Ta[:3, :3] @ PAD_CENTRE + Ta[:3, 3]
-            cb = Tb[:3, :3] @ PAD_CENTRE + Tb[:3, 3]
-            na = Ta[:3, :3] @ PAD_NORMAL
-            nb = Tb[:3, :3] @ PAD_NORMAL
+            ca = Ta[:3, :3] @ ca_l + Ta[:3, 3]
+            cb = Tb[:3, :3] @ cb_l + Tb[:3, 3]
+            na = Ta[:3, :3] @ na_l
+            nb = Tb[:3, :3] @ nb_l
             dc = cb - ca
             al = float(np.dot(dc, na))
             latv = float(np.linalg.norm(dc - al * na))
@@ -274,10 +298,10 @@ class AllegroURDF:
         s = type("R", (), {"x": best_c[4], "cost": best_c[5]})()
         q = dict(zip(joints, s.x))
         Ta, Tb = poses(s.x)
-        ca = Ta[:3, :3] @ PAD_CENTRE + Ta[:3, 3]
-        cb = Tb[:3, :3] @ PAD_CENTRE + Tb[:3, 3]
-        na = Ta[:3, :3] @ PAD_NORMAL
-        nb = Tb[:3, :3] @ PAD_NORMAL
+        ca = Ta[:3, :3] @ ca_l + Ta[:3, 3]
+        cb = Tb[:3, :3] @ cb_l + Tb[:3, 3]
+        na = Ta[:3, :3] @ na_l
+        nb = Tb[:3, :3] @ nb_l
         n_feasible = sum(1 for c in cands if c[0])
         info = dict(
             gap_mm=float(np.dot(cb - ca, na) * 1e3),

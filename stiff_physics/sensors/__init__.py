@@ -1,15 +1,9 @@
-"""stiff_physics.sensors - tactile sensor layer for StiffGIPC (VBTS + piezoresistive).
+"""Tactile sensor layer for StiffGIPC: VBTS + piezoresistive taxel arrays.
 
-Canonical release location of the sensor layer, shipping with the engine wheel.
-STRICTLY layered: this package imports stiff_physics; the engine core never
-imports this package. The C++/CUDA core carries only sensor-agnostic
-primitives (per-vertex contact forces, MAS permutation getters, content-keyed
-mesh cache, device vertex pointer); everything sensor-specific -- assets,
-cameras, rasteriser, n2rgb MLP, taxel transduction -- lives here in Python,
-where it can iterate without an engine rebuild.
-
-Dev workspace with the experiment scripts: /home/ps/Downloads/stiff_tactile
-(sync here with tools/sync_sensors.sh).
+Ships as `stiff_physics.sensors` inside the engine repo (canonical release
+location, synced from the dev workspace by tools/sync_sensors.sh); the same
+package also imports as `stiff_tactile` from the dev workspace. STRICTLY
+layered: this package imports stiff_physics; the engine core never imports it.
 
 Ported from Taccel (MIT, https://github.com/Taccel-Simulator/Taccel): the sensor
 asset / marker / depth / RGB layer, with warp_ipc replaced by stiff_physics.
