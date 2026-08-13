@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <abd_system/abd_system.h>
 #include <muda/launch.h>
 #include <muda/ext/eigen/evd.h>
@@ -663,6 +664,34 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
 
     int write_offset = 0;
+
+    if(getenv("STIFF_TRIPLET_DBG"))
+        printf("[triplet-dbg] cap=%zu  ff=%d abdfem=%d abdabd=%d  abd_bodies=%d "
+               "stitch=%d joints=%d  new_off=%d abd_abd_start=%d  first_write=%d\n",
+               global_triplets.triplet_capacity(),
+               global_triplets.fem_fem_contact_num, global_triplets.abd_fem_contact_num,
+               global_triplets.abd_abd_contact_num, (int)abd_body_count,
+               m_stitch_count, m_num_joints, new_triplet_offset,
+               h_abd_abd_contact_start_id,
+               h_abd_abd_contact_start_id + new_triplet_offset + write_offset);
+
+    // [abd-assembly capacity] Everything below indexes off new_triplet_offset:
+    // the block groups are written at (h_abd_abd_contact_start_id +
+    // new_triplet_offset + ...), and the memcpy at the end of this function
+    // reads the scratch region [new_triplet_offset, 2*new_triplet_offset) back
+    // down over [fem_fem_contact_num, new_triplet_offset). So the buffer must
+    // hold 2*new_triplet_offset blocks. GIPC.cu's pre-assembly bound only
+    // estimates that from h_cpNum, which under-shoots on contact-dense scenes
+    // (measured: a grasped 6720-face tile wanted 11.3M blocks against a 10.7M
+    // capacity -> illegal write in thread 0 of _setup_abd_system_hessian, and
+    // an invalid-argument memcpy here). Grow to the exact figure instead.
+    // reserve_triplets (not ensure_capacity_discard): the contact triplets in
+    // [0, new_triplet_offset) were written earlier this step and must survive.
+    {
+        const size_t need = 2ull * static_cast<size_t>(new_triplet_offset) + 65536ull;
+        if(global_triplets.triplet_capacity() < need)
+            global_triplets.reserve_triplets(need);
+    }
 
 
     int number    = body_hessian_size;

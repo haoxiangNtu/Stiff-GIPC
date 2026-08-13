@@ -13608,6 +13608,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // Non-hybrid only; hybrid keeps the worst-case finalize allocation.
     if(m_dynamic_triplet)
     {
+        // NOTE: this is only a pre-assembly ESTIMATE. h_cpNum[0] here is not the
+        // count the ABD assembly ends up partitioning, so it can under-shoot; the
+        // exact growth happens in setup_abd_system_gradient_and_hessian.cu once
+        // new_triplet_offset is known. Do not "fix" contact-dense overflows here.
         long long bound = m_fixed_triplet_base
             + static_cast<long long>(abd_fem_count_info.fem_point_num)
             + static_cast<long long>(h_cpNum[0]) * M12_Off     // all contact pairs x max blocks
@@ -13616,6 +13620,26 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
                + static_cast<long long>(h_gpNum_last) * M6_Off;
 #endif
+        // [abd-assembly headroom] setup_abd_system_gradient_and_hessian.cu writes
+        // its blocks at new_triplet_offset, which ALSO carries the ABD system's
+        // own fixed blocks: abd_body_count*10 plus stitch*4 and the joint/drive
+        // block groups. None of those were in this bound -- they were merely
+        // absorbed by the 4096 slack below, so a scene with a dense ABD surface
+        // AND many stitch springs (measured: a 6720-face tile + 383 stitches)
+        // wrote past the end of block_values and died with an illegal memory
+        // access at setup_abd_system_gradient_and_hessian.cu[684]. Small scenes
+        // (peg: 264 stitches on 68-face bodies) fitted in the slack, which is why
+        // this only ever surfaced on a dense grasped object.
+        {
+            const long long n_abd = static_cast<long long>(abd_fem_count_info.abd_body_num);
+            long long abd_blocks = n_abd * 10 + static_cast<long long>(softNum) * 4;
+            if(m_abd_system)
+                abd_blocks += 16LL * (m_abd_system->m_num_joints
+                                      + m_abd_system->m_num_revolute_driving
+                                      + m_abd_system->m_num_prismatic
+                                      + m_abd_system->m_num_prismatic_driving);
+            bound += abd_blocks;
+        }
         bound += 4096;                                          // fixed slack
         // [v0.8.5.1] This is the ONE point where the triplet buffer provably holds no
         // live data (offset just reset; the previous stream was fully consumed by its
