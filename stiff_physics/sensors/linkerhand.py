@@ -74,14 +74,22 @@ def _read_stl_verts(path: str) -> np.ndarray:
     return a[:, 12:48].copy().view("<f4").reshape(-1, 3).astype(np.float64)
 
 
-def pad_mount(urdf_dir: str, finger: str) -> np.ndarray:
+def pad_mount(urdf_dir: str, finger: str, thickness: float | None = None) -> np.ndarray:
     """4x4 pad-local -> distal-frame transform for this finger's mount.
 
     Pad-local convention is the fabricated flat pad's: coat (sensing face) at
     z=0 facing -z, body extending to +z, stick face at z=thickness glued to
-    the finger. So pad +z maps to -PRESS_DIR and the coat plane sits
-    `thickness` proud of the support plane.
+    the finger. So pad +z maps to -press and the coat plane sits `thickness`
+    proud of the support plane.
+
+    thickness=0 gives the NATIVE frame: the sensing plane IS the fingertip's
+    own support plane — used when the hand's original contact surface is the
+    sensor (the real L20 tactile variant: a taxel film in the fingertip skin,
+    no added gel), with per-vertex contact forces read straight off the
+    distal mesh and binned in this frame.
     """
+    if thickness is None:
+        thickness = PAD_SIZE[2]
     link = L20_CHAINS[finger][0]
     press = PRESS_DIRS.get(finger, PRESS_DIRS["default"])
     v = _read_stl_verts(osp.join(urdf_dir, "meshes", f"{link}.STL"))
@@ -97,9 +105,15 @@ def pad_mount(urdf_dir: str, finger: str) -> np.ndarray:
     x_pad /= np.linalg.norm(x_pad)
     y_pad = np.cross(z_pad, x_pad)
 
-    centre_on_plane = np.array([0.0, 0.0, (lo + hi) / 2.0])
-    centre_on_plane += (s_max - centre_on_plane @ press) * press
-    coat_centre = centre_on_plane + press * PAD_SIZE[2]
+    # Centre the frame on the actual TANGENT VERTEX, not the window midpoint:
+    # the rounded pulp's support point against a parallel plane sits where the
+    # surface bulges most, which on the L20 index is ~8 mm base-ward of the
+    # window middle -- a taxel grid centred on the midpoint missed the whole
+    # contact patch (index read 0.0 N while carrying 120 N).
+    i_sup = int(np.argmax(v[win] @ press))
+    v_sup = v[win][i_sup]
+    centre_on_plane = v_sup + (s_max - v_sup @ press) * press
+    coat_centre = centre_on_plane + press * thickness
 
     M = np.eye(4)
     M[:3, 0], M[:3, 1], M[:3, 2] = x_pad, y_pad, z_pad
@@ -107,22 +121,37 @@ def pad_mount(urdf_dir: str, finger: str) -> np.ndarray:
     return M
 
 
-def load_l20(urdf_path: str) -> AllegroURDF:
+def load_l20(urdf_path: str, native: bool = False) -> AllegroURDF:
     """AllegroURDF configured for the LinkerHand L20 with per-finger pad mounts.
+
+    native=True: sensing planes ON the bare fingertip surface (thickness 0),
+    for the built-in-taxel configuration with no added gel.
 
     NOTE: use the package-root URDF (next to meshes/), not the copy in urdf/ --
     its `meshes/...` paths resolve relative to the file.
     """
     d = osp.dirname(urdf_path)
+    t = 0.0 if native else None
     pad_c, pad_n = {}, {}
     for f in L20_CHAINS:
-        M = pad_mount(d, f)
+        M = pad_mount(d, f, thickness=t)
         pad_c[f] = M[:3, 3]
         pad_n[f] = PRESS_DIRS.get(f, PRESS_DIRS["default"]).copy()
     hand = AllegroURDF(urdf_path, chains=L20_CHAINS,
                        pad_centre=pad_c, pad_normal=pad_n)
-    hand.pad_mounts = {f: pad_mount(d, f) for f in L20_CHAINS}
+    hand.pad_mounts = {f: pad_mount(d, f, thickness=t) for f in L20_CHAINS}
     return hand
+
+
+def distal_surface(urdf_dir: str, finger: str):
+    """(verts (N,3), faces (F,3)) of the finger's OWN distal mesh, deduplicated
+    -- the body the native taxel film lives on."""
+    link = L20_CHAINS[finger][0]
+    raw = _read_stl_verts(osp.join(urdf_dir, "meshes", f"{link}.STL"))
+    verts, inv = np.unique(np.round(raw, 9), axis=0, return_inverse=True)
+    faces = inv.reshape(-1, 3).astype(np.int32)
+    ok = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2])         & (faces[:, 0] != faces[:, 2])
+    return verts, faces[ok]
 
 
 def pad_box_stl(out_path: str, size=PAD_SIZE, seg_mm: float = 1.0) -> str:
