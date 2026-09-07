@@ -29,9 +29,10 @@
    - 2.2 [v0.8.5.1](#22-v0851--2026-07-24--稳定线phase-cd)
    - 2.3 [v0.8.5.2](#23-v0852--2026-07-25--稳定线phase-cd分叉点)
    - 2.4 [v0.8.5.3](#24-v0853--2026-08-11--仅稳定线)
-   - 2.5 [v0.8.6-rc1-internal](#25-v086-rc1-internal--2026-07-27--仅-phase-cd内部)
-   - 2.6 [v0.8.6-rc2-internal](#26-v086-rc2-internal--2026-07-28--仅-phase-cd内部)
-   - 2.7 [phase-cd HEAD（未打 tag）](#27-phase-cd-head-b3ab747--2026-08-11--未打-tag)
+   - 2.5 [v0.8.5.4](#25-v0854--2026-08-12--仅稳定线)
+   - 2.6 [v0.8.6-rc1-internal](#26-v086-rc1-internal--2026-07-27--仅-phase-cd内部)
+   - 2.7 [v0.8.6-rc2-internal](#27-v086-rc2-internal--2026-07-28--仅-phase-cd内部)
+   - 2.8 [phase-cd HEAD（未打 tag）](#28-phase-cd-head-b3ab747--2026-08-11--未打-tag)
 3. [工程线主题时间线（按战役）](#3-工程线主题时间线按战役)
    - 3.1 [v0.8.6 结构重构 Phase 1–4 + P5](#31-v086-结构重构-phase-14--p5725)
    - 3.2 [mode 加固 + 能量层 E1–E3.6](#32-mode-加固--能量层-e1e36726727)
@@ -49,7 +50,7 @@
    - 3.14 [回滚泄漏破案 + 成对审计 + 优化路线图（收官）](#314-回滚泄漏破案--成对审计--优化路线图收官810811)
 4. [里程碑提交速查表](#4-里程碑提交速查表)
 5. [金锚与门禁演化](#5-金锚与门禁演化)
-6. [稳定线 v0.8.5.3 之后的历史提交（发布状态待核实）](#6-稳定线-v0853-之后的历史提交发布状态待核实)
+6. [稳定线 v0.8.5.3 之后的提交明细与工作树状态](#6-稳定线-v0853-之后的提交明细与工作树状态)
 7. [未推送/未发布状态说明](#7-未推送未发布状态说明)
 8. [本文未决点（待核实清单）](#8-本文未决点待核实清单)
 
@@ -63,7 +64,7 @@
 |---|---|---|
 | 仓库（本机） | `/home/ps/Downloads/Stiff-GIPC-stable-08` | `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph` |
 | 分支 | `release/stable-0.8` | `codex/phase-cd` |
-| 当前权威版本 | **v0.8.5.3**（tag `v0.8.5.3` = `b8e27a1`，2026-08-11；工作树与该 tag 逐字节一致，`git diff v0.8.5.3 --stat` 为空，亲验） | HEAD = `b3ab747`（2026-08-11，未打 tag；`pyproject.toml:7` 版本号 `0.8.6rc2`） |
+| 当前权威版本 | **最新 = v0.8.5.4**（tag `v0.8.5.4` = `c0339c8`，2026-08-12；`pyproject.toml:7` = `0.8.5.4`，亲验 `git show HEAD:pyproject.toml`）。**本手册的行号/行为引用基线仍是 v0.8.5.3**（`b8e27a1`，2026-08-11）——磁盘工作树内容与该 tag 逐字节一致（`git diff v0.8.5.3 --stat` 为空，8 个文件的已暂存回退改动把 HEAD 内容退回 v0.8.5.3），v0.8.5.4 独有行为见 §2.5 | HEAD = `b3ab747`（2026-08-11，未打 tag；`pyproject.toml:7` 版本号 `0.8.6rc2`） |
 | 发布形态 | 公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel，CUDA 架构 sm_80/89/120 | 仅本地源码构建，**分支未推送远端**（`git branch -a` 无 `origin/codex/phase-cd`，亲验） |
 | 文件布局 | **重构前单体**：`StiffGIPC/GIPC.cu` 16,884 行、`sim_engine.cu` 4,534 行、`mlbvh.cu` 3,171 行、`MASPreconditioner.cu` 3,126 行（`wc -l` 实测） | v0.8.6 模块化：四大单体拆成 `gipc_modules/`(现存 14，`00..14` 缺 `04`——barrier 融合装配已随能量层 E1d `7983be1` 迁至 `energy/03_barrier_fused_assembly.inl`；phase1 拆分时点为 15，见 §3.1) + `engine_modules/`(5) + `mlbvh_modules/`(7) + `mas_modules/`(6) + `energy/` 独立 TU + `core/` + `frame_fsm/` 等 |
 | 服务对象 | 需要稳定行为、复现实验、wheel 安装的用户 | 引擎开发、GPU 驻留 RL、整帧 CUDA Graph、门禁基建 |
@@ -91,16 +92,19 @@
                                                                 ├── 1bc13ef (2026-07-31) contact-IO: 摩擦读数恒零修复 + reset API
                                                                 ├── 1d05c7a (2026-07-31) teleport ABD 表面立即刷新
                                                                 │
-                                                              v0.8.5.3 = b8e27a1 (2026-08-11)  ◄── 当前权威稳定版（工作树钉在此处）
+                                                              v0.8.5.3 = b8e27a1 (2026-08-11)  ◄── 本手册的稳定线引用基线（工作树内容钉在此处）
                                                                 │
-                                                                ├── dc1a297 / d7ab5bf / 0894958 / c0339c8 (2026-08-11~12)
-                                                                │   "真静摩擦"系列, tag v0.8.5.4 存在于历史
-                                                                └── （发布状态待核实, 见 §6; 工作树已回退到 v0.8.5.3）
+                                                                ├── dc1a297 (8/11) absolute_epsv 旋钮 + 持久摩擦锚（真静摩擦）
+                                                                ├── d7ab5bf (8/11) STIFF_NEWTON_TRACE 逐迭代 move-norm 诊断
+                                                                ├── 0894958 (8/12) release 本体: 两者默认开
+                                                                │
+                                                              v0.8.5.4 = c0339c8 (2026-08-12)  ◄── 稳定线最新版本（strict 多环境抑制 anchor）
+                                                                                                  ⚠ 改变所有含摩擦场景的轨迹, 见 §2.5
 ```
 
 要点：
 
-- `v0.8.5.3` / `v0.8.5.4`（历史）**不在** phase-cd 历史里（`git merge-base --is-ancestor v0.8.5.3 HEAD` 在工程线返回 NOT ancestor，亲验）。
+- `v0.8.5.3` / `v0.8.5.4` **不在** phase-cd 历史里（`git merge-base --is-ancestor v0.8.5.3 HEAD` 在工程线返回 NOT ancestor，亲验）。
 - `v0.8.6-rc1-internal` / `v0.8.6-rc2-internal` 是**内部 tag**，只在私仓，未对外发布。
 - 工程线 HEAD `b3ab747` 未打 tag，v0.8.6 **尚未发布**（见 §7）。
 
@@ -112,7 +116,7 @@
 |---|---|---|
 | `v0.8.6-rc1-internal` | `3810f54`（"release(internal): v0.8.6-rc1"，2026-07-27） | `6c9d730`（同日，replay-trajectory 入 demo_verify） |
 | `v0.8.6-rc2-internal` | `7e39591`（"release: v0.8.6rc2 internal"，2026-07-28） | `6b0e02e`（同日，pre-push hook 两缺陷修复） |
-| `v0.8.5.4`（历史，见 §6） | `0894958`（"release(v0.8.5.4)"，2026-08-12） | `c0339c8`（strict 抑制 friction_anchor 提交） |
+| `v0.8.5.4`（见 §2.5） | `0894958`（"release(v0.8.5.4)"，2026-08-12） | `c0339c8`（strict 抑制 friction_anchor 提交） |
 
 引用版本内容时以 release 提交本体为准，引用"该 tag 可达的代码"时以 tag 落点为准。
 
@@ -192,13 +196,42 @@
 
 - **⚠ 移植状态**：以上 #1/#2 **未移植到 phase-cd**（见 §1.4）；#3 在 phase-cd 有独立实现（teleport 内建 BVH+CP 重建）。
 
-### 2.5 v0.8.6-rc1-internal — 2026-07-27 — 【仅 phase-cd，内部】
+### 2.5 v0.8.5.4 — 2026-08-12 — 【仅稳定线】
+
+**稳定线最新版本。** 单一主题：**真静摩擦（true stiction）**——把持握场景的静摩擦蠕滑（stiction creep）从"结构性缺陷"变成"默认修好"。
+
+- **tag 落点**：`c0339c8`（2026-08-12 01:05 +0800，strict 抑制 anchor 的收尾提交；符合 §1.3 的落点惯例）；**release 提交本体** `0894958`（2026-08-12 00:12 +0800，"release(v0.8.5.4): default-on true static friction"）。版本号 `pyproject.toml:7` = `0.8.5.4`、CHANGELOG 条目 `CHANGELOG.md:7-44`。⚠ **本条目的全部稳定仓行号取自 `git show HEAD:<file>`**，不是磁盘文件——工作树被 8 个文件的已暂存回退改动钉在 v0.8.5.3 内容上（见 §6），磁盘副本里这些代码与 CHANGELOG 条目都不存在。
+- **⚠ 行为警示（升级必读）**：两个新默认值**改变所有含摩擦场景的轨迹**——不是"不调用新 API 就一致"的那类补丁版（对比 v0.8.5.3 的兼容承诺，§2.4）。逐位回到 0.8.5.3 需显式关掉两者。
+
+**组成提交**（4 条，`git log v0.8.5.3..v0.8.5.4` 亲验）：
+
+| 提交 | 时间 | 内容 | 关键数字 |
+|---|---|---|---|
+| `dc1a297` | 8/11 22:47 | **真静摩擦两件套**（当时**双双默认关**）：① `absolute_epsv` 旋钮（m/s；`fDhat = epsv²` 钉死，旧编码 `fDhat = 1e-4·eff_bboxDiagSize²` ⇒ epsv = 1e-2×有效场景对角线，1.9 m 场景 = **19 mm/s**，是 IPC 论文默认 `1e-3·l` 的 10×、静摩擦精度值 1e-5 m/s 的 **1900×**；稳定仓 `GIPC.cu:9490-9500`、`GIPC.cuh:244-249`）② 持久摩擦锚：每个 lagged 配对携带累计切向弹性偏移 `e`，能量/梯度/Hessian 一律评估 `u_total = relDX_step + e`（稳定仓 `GIPC.cu:1289`、`:1370`、`:1558` 等），`‖e‖` 在 `eps = √fDhat · h = epsv·h` 处做径向回拉截断（`_anchorProjectCap`，稳定仓 `GIPC.cu:9645-9657`；`eps` 计算点 `:9869`）——**打到帽子就是 Coulomb 滑动**；跨步携带按规范化配对键（bit-packed int4 + cub merge-sort + 二分查找，确定性、strict 安全），地面配对走逐顶点稠密数组；未匹配的新接触从 `e=0` 起（= legacy 行为） | 动机实测 flask_cap（双臂 finray 抓取-提升-保持 400 步）：烧瓶 6 s 内滑 **3.7 mm**、瓶盖锥体转 **11–20°**，而受力**远在 μ=3.5 摩擦锥内**。机理：`creep_v ≈ (load/(μ·λ))·epsv`。分档验证：`epsv=1e-5` 把保持段滑移 3.71 → **0.05 mm**（step 成本 +12%）；`epsv=1e-4` **零成本**（49 ms/步不变）；anchor + `epsv=1e-4`：滑移 **0.00 mm**、cap 倾角全程钉在 0.7°（legacy 11° 且仍在爬；纯 `epsv=1e-5` 仍 3.9°） |
+| `d7ab5bf` | 8/11 23:19 | `STIFF_NEWTON_TRACE`：逐 Newton 迭代 move-norm 踪迹（默认关，开时每迭代一次 D2H；稳定仓 `GIPC.cu:16000-16011`） | 用作 anchor A/B 显微镜（flask_cap 保持段 f=150–400）：anchor **ON r1 中位 5.4e-12**（真不动点）vs **OFF 1.0e-5 m/帧** = 每步 10 µm 蠕滑（×50 fps = 0.5 mm/s，与观测滑移吻合）；动态段 f=80–150 anchor ON 多付 **+1.9 Newton 迭代/帧**（解真实 stick-slip 转换） |
+| `0894958` | 8/12 00:12 | **release 本体：两者翻默认开**——`Config.absolute_epsv = 1e-4`（m/s，原 0.0 = legacy 场景派生）、`Config.friction_anchor = True`（稳定仓 `engine.py:318-326`、`:386-391`；C++ 侧 `sim_engine.h:66-74`、`sim_engine.cu:952-953`、绑定 `bindings/pystiffgipc.cu:47-48`） | **改变所有含摩擦场景轨迹**；step 成本 **+9%**（release 口径；`dc1a297` 提交正文的 +30% 是优化前读数）。⚠ **两侧默认值不对称**：C++ `SimEngineConfig::absolute_epsv` 仍为 `0.0`（legacy），1e-4 由 Python `Config` 写入（稳定仓 `sim_engine.h:70` vs `engine.py:321`）——绕过 Python 层直接用 C++ 引擎的调用者拿到的是 legacy epsv，anchor 则两侧同为 `true` |
+| `c0339c8` | 8/12 01:05 | **strict 多环境默认抑制 anchor**：`m_fric_anchor_on = e ? (atoi(e)!=0) : (m_fric_anchor_cfg && !strict)`（strict 签名 = `STIFF_SPMV_DET`；稳定仓 `GIPC.cu:9803-9822`，抑制时打印 `[fric-anchor] strict mode: ... suppressed for batch invariance`）。真因：anchor 与 `absolute_epsv=1e-4` 组合后收紧的 cap 半径（`epsv·h ≈ 1 µm`）把摩擦能量推到 **N 形状相关的 line-search 能量和的 ulp 比较边界**上，翻掉一次 accept 决策 → 批不变性破坏。tag `v0.8.5.4` 落在此提交 | bisect：**epsv-only 绿、anchor-only 绿、组合红**；foldshirt strict env0 逐位 N=2 vs N=4：**前 17 帧逐位相同，第 18 帧一次 accept 翻转 → 单步 96% 顶点分歧**。本提交门禁：strict 跨 env moveDir 0.0、run-to-run vhash 25 帧一致、batch env0 max-delta 0.000。根修（N 不变能量归约）**排入 0.8.6** |
+
+**默认值与逃生阀速查**：
+
+| 旋钮 | v0.8.5.3 | v0.8.5.4 默认 | 逃生阀（逐位回 0.8.5.3） |
+|---|---|---|---|
+| `Config.absolute_epsv` | 不存在（epsv 恒场景派生） | **1e-4 m/s**（Python 层；C++ 结构体仍 0.0） | `absolute_epsv=0` 或 `STIFF_EPSV=0` |
+| `Config.friction_anchor` | 不存在（摩擦锚每步重置） | **True**；strict 多环境**自动关**（`STIFF_FRIC_ANCHOR=1` 可强开） | `friction_anchor=False` 或 `STIFF_FRIC_ANCHOR=0` |
+
+**IPC 原文口径**：静摩擦精度建议取 **1e-5 m/s**，抓取场景 **1e-4 是好默认**；epsv 越小 Newton 迭代越贵（稳定仓 `GIPC.cu:9490-9497` 注释、`engine.py:310-317`）。
+
+**配套语义**：`reset_transient_contact_state()` 在 v0.8.5.4 里**多清一族**——`g.clearFrictionAnchors()`（稳定仓 `sim_engine.cu:3622-3641`，其中 `:3640`）：传送/回合重置的物体不得继承上一 episode 的摩擦锚。
+
+- **⚠ 移植状态**：**这批工作完全不在工程线 `codex/phase-cd`**（两树 grep `absolute_epsv`/`friction_anchor` 均零命中，亲验）——继"摩擦读数恒零修复"与 `reset_transient_contact_state`（§2.4）之后的**第三个未移植项**。三项合并清单与移植路径见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.0 / §1.6。
+
+### 2.6 v0.8.6-rc1-internal — 2026-07-27 — 【仅 phase-cd，内部】
 
 - **tag 落点**：`6c9d730`（2026-07-27 09:58 +0800，replay-trajectory 家族入 demo_verify，19-demo 自动化面完成）；release 提交本体 `3810f54`（同日，"release(internal): v0.8.6-rc1"，版本号 0.8.5.1→0.8.6rc1）。
 - **定位**：内部测试 RC，不对外。主线 = v0.8.6 模块化重构 + 能量层分离 + 门禁体系（详见 §3.1–3.3）。
 - **验收面**：12 段武装门禁套件全绿；strict 金锚 `f7fb5a786c2d7935`；A800 四核+矩阵（[`../RELEASE_NOTES_v0.8.6-rc1.md`](../RELEASE_NOTES_v0.8.6-rc1.md):7-27）；demo_verify 19-run 与 owner 13-demo UI 走查（同文档 :44）。
 
-### 2.6 v0.8.6-rc2-internal — 2026-07-28 — 【仅 phase-cd，内部】
+### 2.7 v0.8.6-rc2-internal — 2026-07-28 — 【仅 phase-cd，内部】
 
 - **tag 落点**：`6b0e02e`（2026-07-28 01:59 +0800，pre-push hook 两个实弹缺陷修复：可重入 flock、GIT_DIR 泄漏）；release 提交本体 `7e39591`（同日，15 门禁绿，dlto 决策包归档）。
 - **rc2 增量**（rc1→rc2 窗口 11 条提交，**全部带 15 段门禁绿 + 锚 `f7fb5a786c2d7935` 不动实据**；[`../RELEASE_NOTES_v0.8.6-rc1.md`](../RELEASE_NOTES_v0.8.6-rc1.md):96-141）：
@@ -217,7 +250,7 @@
 | strict 金锚迁移（随 dlto 采纳） | `f7fb5a786c2d7935` → **`0544461bd82123ae`**（run-to-run 逐位；4090 sm_89 ≡ A800 sm_80 跨架构同值） |
 | 三模式全矩阵复验（`19b257a`，tag 后 docs） | 本地 19-demo × 3 模式 **56/56 绿**；A800 盘子 228 帧 3/3（strict peak 15 / 45.0s 与前役逐字复现） |
 
-### 2.7 phase-cd HEAD `b3ab747` — 2026-08-11 — 未打 tag
+### 2.8 phase-cd HEAD `b3ab747` — 2026-08-11 — 未打 tag
 
 - **提交**：`b3ab747`（2026-08-11 16:44 +0800，"docs: optimization roadmap anchored in the measured phase breakdown"）。`git describe --tags` = `v0.8.6-rc2-internal-147-gb3ab747`（rc2 后 147 条提交）；裸 `git describe` 输出 `v0.8.6-rc1-internal-164-gb3ab747`——`v0.8.6-rc2-internal` 是 lightweight tag，默认只认 annotated（rc1-internal 是 annotated），`git cat-file -t` 亲验。
 - **内容**：优化路线图定稿（见 §3.14）。rc2 → HEAD 之间的实质工作全部按战役收录于 §3.5–3.14：整帧 CUDA Graph（Phase C/C6）、GPU 驻留 RL 与 episode（Phase D）、确定性栈、BVH 战役、回滚泄漏破案、成对审计。
@@ -257,7 +290,7 @@
 
 ### 3.3 rc1 工程化（7/27，rc1 本体 + rc1→rc2 窗口）
 
-> **版本归属提醒**（时序亲验）：rc1 tag `6c9d730` 打在 07-27 09:58；本表 12 行中**只有 `d0c0071`（02:00）与 release 行在 rc1 tag 内**，其余 11 行（`6c562bc` 19:51、`ce11d36` 11:37、`07abb93` 11:38、`16746b9` 11:44、`c86a1ea` 23:08、`93a68b6` 23:13、`07f2254` 23:23、`de893e9` 23:40、`7eac2e8` 次日 00:58、`b6d6b80` 次日 01:24 等）都落在 **rc1 tag 之后的 rc1→rc2 窗口**（`git merge-base --is-ancestor` 亲验非 rc1 祖先），其成果由 §2.6 的 rc2 条目收录发布——本表按主题聚合当日战役，与 §2.6 是同一事实的两个视角，勿按"通往 rc1 的工作"读。
+> **版本归属提醒**（时序亲验）：rc1 tag `6c9d730` 打在 07-27 09:58；本表 12 行中**只有 `d0c0071`（02:00）与 release 行在 rc1 tag 内**，其余 11 行（`6c562bc` 19:51、`ce11d36` 11:37、`07abb93` 11:38、`16746b9` 11:44、`c86a1ea` 23:08、`93a68b6` 23:13、`07f2254` 23:23、`de893e9` 23:40、`7eac2e8` 次日 00:58、`b6d6b80` 次日 01:24 等）都落在 **rc1 tag 之后的 rc1→rc2 窗口**（`git merge-base --is-ancestor` 亲验非 rc1 祖先），其成果由 §2.7 的 rc2 条目收录发布——本表按主题聚合当日战役，与 §2.7 是同一事实的两个视角，勿按"通往 rc1 的工作"读。
 
 | 提交 | 内容 | 数字 |
 |---|---|---|
@@ -267,11 +300,11 @@
 | `de893e9`/`7eac2e8` | rl-reset：teleport 尾部重建 buildBVH+buildCP（与 load_checkpoint 同契约）、ABD teleport 从 q 同步顶点、隔离复活（`reviveEnv`）、G15 门禁 | — |
 | `d0c0071` | **case-26 ABD 质量奇异修复**（owner 在 UI 亲手抓到"布不落"）：PSD clamp 把负特征值钉在 0 → 奇异 affine mass → NaN q_tilde；xarm7 body 8 反绕面网格触发 | 修复 = 特征值正下限（min eig −0.095 案例） |
 | `ce11d36`；`06a6710`；`07abb93`→`16746b9` | FD 门禁（E↔G 有限差分一致性）；错误分类学 + STIFF_* 旋钮注册表（G13/G14）；CI 从 cron 轮询改 push 时门禁（pre-push hook 12 段武装套件；`SKIP_GATES=1` 为记录在案的逃生口） | [`../CI.md`](../CI.md) |
-| `3810f54` / `6c9d730`(tag) | = v0.8.6-rc1-internal（见 §2.5） | — |
+| `3810f54` / `6c9d730`(tag) | = v0.8.6-rc1-internal（见 §2.6） | — |
 
 ### 3.4 rc2 + dlto 采纳（7/28）
 
-见 §2.6 表。补充：`e7ea834` cmake urdfdom 命名空间 target（A800 wheel 构建）；`e774fdd` `BENCH_IDLE_ALLOWLIST`（GPU 非空闲 fail-closed 的白名单机制）。
+见 §2.7 表。补充：`e7ea834` cmake urdfdom 命名空间 target（A800 wheel 构建）；`e774fdd` `BENCH_IDLE_ALLOWLIST`（GPU 非空闲 fail-closed 的白名单机制）。
 
 ### 3.5 Phase A/B：宿主往返手术（7/28）
 
@@ -451,7 +484,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 | checkpoint 破案 | 7/27 | `c86a1ea` | load 后重建帧入口配对集 | 5e-6→5e-17 | 仅 phase-cd |
 | ABD 质量奇异 | 7/27 | `d0c0071` | PSD clamp 钉零 → 特征值正下限 | min eig −0.095 案 | 仅 phase-cd |
 | rc1 | 7/27 | `3810f54` / `6c9d730`(tag) | 内测 RC | 12 段套件 + 19 demo | 仅 phase-cd |
-| rc2 | 7/28 | `7e39591` / `6b0e02e`(tag) | 内测 rc2 | 15 门禁；56/56 矩阵（`19b257a`，tag 后复验，见 §2.6） | 仅 phase-cd |
+| rc2 | 7/28 | `7e39591` / `6b0e02e`(tag) | 内测 rc2 | 15 门禁；56/56 矩阵（`19b257a`，tag 后复验，见 §2.7） | 仅 phase-cd |
 | dlto 默认开 | 7/28 | `40c9f11` | 设备 LTO，锚重钉 | `0544461bd82123ae`；254→178 regs；SASS −21%；foldshirt merged −15.2% | 仅 phase-cd |
 | Phase A 剖析 | 7/28 | `eee2f64` | 75% A800 帧时间 = 宿主往返 | 138 memcpy + 132 ToSymbol + 151 sync + 1500 launch/帧 | 仅 phase-cd |
 | B3 手术 | 7/28 | `7e424bf` | ToSymbol 值缓存 | line_search ToSymbol 19,805→0 | 仅 phase-cd |
@@ -479,6 +512,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 | 成对审计 | 8/10 | **`4219f37`** | 同态 graph vs host Newton +1.0% | 869/1550 位级相等；1551 样本/趟 | 仅 phase-cd |
 | 路线图（HEAD） | 8/11 | `b3ab747` | 相位剖面 + 优先队列 | PCG 57%、MAS apply 27%、检测 1.3% | 仅 phase-cd |
 | 稳定 v0.8.5.3 | 8/11 | `b8e27a1`(tag) | contact-IO 修复（摩擦读数恒零 + reset API + teleport 表面刷新） | 滑动比 0.600±0.008；24 µm→6.7e-9 m | **仅稳定线** |
+| 稳定 v0.8.5.4 | 8/12 | `0894958` / `c0339c8`(tag) | 真静摩擦默认开：`absolute_epsv=1e-4` + 持久摩擦锚（strict 多环境自动抑制 anchor） | flask_cap 保持段滑移 3.7→**0.00 mm**、cap 11–20°→0.7°；每步蠕滑 1.0e-5→5.4e-12 m；step +9%。**⚠ 改变所有含摩擦场景轨迹**（§2.5） | **仅稳定线** |
 
 ---
 
@@ -498,9 +532,12 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 
 ---
 
-## 6. 稳定线 v0.8.5.3 之后的历史提交（发布状态待核实）
+## 6. 稳定线 v0.8.5.3 之后的提交明细与工作树状态
 
-稳定仓 git 历史在 `b8e27a1`（v0.8.5.3）之后还有 4 条提交与一个 tag `v0.8.5.4`，但**工作树已被回退到与 v0.8.5.3 逐字节一致**（`git diff v0.8.5.3 --stat` 为空 + 8 个文件的已暂存回退修改，亲验），且 `CHANGELOG.md` **没有 0.8.5.4 条目**（grep 零命中）。**本手册以 v0.8.5.3 为稳定线权威版本**；以下材料记录为"历史中存在、发布状态待核实"（见 §8 #1）：
+> **本节定位已更新**：这 4 条提交构成正式版本 **v0.8.5.4**，其版本条目见 **§2.5**；本节保留为**提交级明细 + 工作树状态记录**。
+> 仍需注意的两件事：① **磁盘工作树被回退到与 v0.8.5.3 逐字节一致**（`git diff v0.8.5.3 --stat` 为空 + 8 个文件的已暂存回退修改，亲验）——`git checkout`/`stash`/`reset` 任一操作都会让工作区静默变成 v0.8.5.4 内容；本手册的稳定线**行号**因此一律取自 v0.8.5.3 内容（v0.8.5.4 独有行号在 §2.5 里按 `git show HEAD:` 标注）。② **wheel 资产是否已挂公开仓仍待核实**（§8 #1 / OPEN_POINTS OP-001）——"版本存在"与"发布物存在"是两件事。
+
+组成提交明细（`CHANGELOG.md:7-44` 的 0.8.5.4 条目只存在于 `git show HEAD:CHANGELOG.md`，磁盘副本因回退而无此条目）：
 
 | 提交 | 日期 | 内容 | 关键数字 |
 |---|---|---|---|
@@ -509,7 +546,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 | `0894958` | 8/12 | "release(v0.8.5.4)" 提交本体：默认开 `absolute_epsv=1e-4 m/s` + `friction_anchor=True` | **改变所有含摩擦场景轨迹**；`STIFF_EPSV=0`/`STIFF_FRIC_ANCHOR=0` 位级回 0.8.5.3；flask 滑 3.7→0.00 mm，step 成本 +9% |
 | `c0339c8` | 8/12 | strict 多 env 默认压掉 friction_anchor——batch 不变性破坏（N=2 vs N=4 env0：17 帧位级相同后帧 18 一次 accept 翻转 → 96% 顶点单步分歧；bisect：epsv-only 绿、anchor-only 绿、组合红）；根修（N 不变能量归约）记为排入 0.8.6。tag `v0.8.5.4` 实际落在此提交 | — |
 
-这些特性（`absolute_epsv`/`friction_anchor`/`STIFF_NEWTON_TRACE`）**不在两个磁盘工作树的任何一个里**（grep 双树零命中，亲验），也不在 phase-cd 历史里。
+这些特性（`absolute_epsv`/`friction_anchor`/`STIFF_NEWTON_TRACE`）**不在两个磁盘工作树的任何一个里**（grep 双树零命中，亲验），也不在 phase-cd 历史里——即工程线的**第三个未移植项**，清单见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.0。
 
 ---
 
@@ -519,16 +556,16 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 |---|---|---|
 | 工程线分支 `codex/phase-cd` | **未推送远端**——全部 v0.8.5 后工程化工作（209 条提交）只存在于本地仓库 | `git branch -a` 无 `origin/codex/phase-cd` |
 | v0.8.6 | **未发布**——HEAD `b3ab747` 未打 tag；`v0.8.6-rc1-internal`/`rc2-internal` 是内部 tag，仅私仓；`pyproject.toml` 版本号 `0.8.6rc2` 是内部标识 | `git tag --merged HEAD`；pyproject.toml:7 |
-| 对外可获得的最新版本 | 稳定线 **v0.8.5.3**（公开仓 `github.com/haoxiangNtu/stiff-physics`，cp311/cp312 wheel，sm_80/89/120） | 任务权威事实；稳定仓 tag `b8e27a1` |
+| 稳定线最新版本 | **v0.8.5.4**（tag `c0339c8`，2026-08-12，`pyproject.toml:7` = `0.8.5.4`）——真静摩擦默认开，**改变所有含摩擦场景轨迹**（§2.5）。**已确认挂 wheel 的是 v0.8.5.3**（公开仓 `github.com/haoxiangNtu/stiff-physics`，cp311/cp312，sm_80/89/120）；v0.8.5.4 的 Release 资产状态见 §8 #1 | 稳定仓 tag `v0.8.5.4`/`v0.8.5.3`；`git show HEAD:pyproject.toml` |
 | 两线 Python 包名 | 同为 `stiff-physics`/`stiff_physics`，**不能并存于同一环境**；探测：`hasattr(engine, "reset_transient_contact_state")` = 稳定线；`hasattr(engine, "prepare_gpu_rl")` = phase-cd；或 `importlib.metadata.version` = `0.8.5.3` vs `0.8.6rc2` | 两树 pyproject.toml / 绑定名字级 diff |
-| tactile 修复移植 | 稳定线 v0.8.5.3 的接触力摩擦读数修复与 `reset_transient_contact_state` **尚未移植到 phase-cd**（§1.4）——从稳定线迁到工程线的用户须知 `get_vertex_contact_forces` 的 `friction_lagged`/`total` 分量在 phase-cd 上仍恒零 | grep `snapshotFrictionForce` phase-cd 零命中 |
+| 稳定线 → phase-cd 未移植项（**三项**） | ① 接触力摩擦读数修复（`snapshotFrictionForce`）② `reset_transient_contact_state` ③ **v0.8.5.4 真静摩擦**（`absolute_epsv` + `friction_anchor`，§2.5）——从稳定线迁到工程线的用户须知：`get_vertex_contact_forces` 的 `friction_lagged`/`total` 分量在 phase-cd 上仍恒零，且长时保持抓取会按 legacy 场景派生 epsv 蠕滑。清单与移植路径见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.0 | grep `snapshotFrictionForce` / `absolute_epsv` / `friction_anchor` 在 phase-cd 零命中 |
 | 工程线 CHANGELOG | phase-cd 树的 `CHANGELOG.md` 止于 0.8.5.1——0.8.5.2/0.8.5.3 条目只在稳定线树；v0.8.6 发布时需合并两树 CHANGELOG 并补 0.8.5.2+ 条目 | 两树 CHANGELOG grep |
 
 ---
 
 ## 8. 本文未决点（待核实清单）
 
-1. **v0.8.5.4 发布意图**：稳定仓历史有 tag `v0.8.5.4`（落在 `c0339c8`），但工作树被刻意回退到 v0.8.5.3、CHANGELOG 无条目、任务权威口径为"稳定线 = v0.8.5.3"。v0.8.5.4 是否曾对外发布 wheel、是否已撤回，需向 owner 确认。本文按"历史材料，未定稿"处理（§6）。
+1. **v0.8.5.4 的 wheel 资产状态**（版本本身已按正式版本收录，§2.5）：tag `v0.8.5.4` 落在 `c0339c8`、`pyproject.toml` 已是 `0.8.5.4`、CHANGELOG 有完整 [0.8.5.4] 条目（`git show HEAD:CHANGELOG.md:7-44`），但**磁盘工作树被刻意回退到 v0.8.5.3 内容**，公开仓 Releases 页是否挂 v0.8.5.4 的 cp311/cp312 wheel 未查证。安装指令仍以 v0.8.5.3 为准（README §3.1），升级前向 owner 确认（OPEN_POINTS OP-001）。
 2. **beaker +7% 破案的证据锚**：结论（纯启动段 ~0.3–0.6 s、每帧持平）见 [`../SIMULATOR_EXECUTION_DESIGN.md`](../SIMULATOR_EXECUTION_DESIGN.md):123 与工作记忆，但 v0.8.5..HEAD 提交史中**没有对应的破案提交**；每帧持平的原始数据文件未定位到具体行。
 3. **成对审计的分布细分**："B' 9342±230 vs 宿主 8808±60（15σ）"与"+6% 壳效应 / +4% 图化增量"的拆分出自 `4219f37` 提交正文与工作记忆合读；提交正文亲验部分只确认"+1.0% 同态差"与"869/1550 位级相等"。引用 ± 数字前应 `git show 4219f37` 核对完整 body。
 4. **tag 打在 release 提交后一条的惯例**（§1.3 三例）：是仓库惯例还是三次巧合，未向 owner 确认。
@@ -539,4 +576,4 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 
 ---
 
-*本分册由文档工程流水线生成于 2026-09-07；事实基线：稳定线 `b8e27a1`（v0.8.5.3）、工程线 `b3ab747`（codex/phase-cd HEAD）。发现与仓库现状不符处，请以 `git log`/`git show` 与 §8 清单为准修订。*
+*本分册由文档工程流水线生成于 2026-09-07（2026-09-08 补入 v0.8.5.4 条目，§2.5）；事实基线：稳定线 `b8e27a1`（v0.8.5.3，行号基线）+ `c0339c8`（v0.8.5.4，最新版本，内容取自 `git show HEAD:`）、工程线 `b3ab747`（codex/phase-cd HEAD）。发现与仓库现状不符处，请以 `git log`/`git show` 与 §8 清单为准修订。*

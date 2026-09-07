@@ -14,9 +14,9 @@
 
 **版本勘定**(2026-09-07 亲验):
 
-- 稳定线 = `/home/ps/Downloads/Stiff-GIPC-stable-08`,分支 `release/stable-0.8`。磁盘工作区内容与 tag `v0.8.5.3`(2026-08-11 发布)**逐字节一致**(`git diff v0.8.5.3 --stat` 为空);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel,CUDA 架构 sm_80/89/120。C++ 布局为重构前单体(`StiffGIPC/GIPC.cu` 16884 行)。仓库 git 历史中另有 tag `v0.8.5.4`(真静摩擦/friction anchor,见 §1.5)——**不在本册覆盖的工作区内容里**。
+- 稳定线 = `/home/ps/Downloads/Stiff-GIPC-stable-08`,分支 `release/stable-0.8`。磁盘工作区内容与 tag `v0.8.5.3`(2026-08-11 发布)**逐字节一致**(`git diff v0.8.5.3 --stat` 为空);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel,CUDA 架构 sm_80/89/120。C++ 布局为重构前单体(`StiffGIPC/GIPC.cu` 16884 行)。**稳定线最新版本是 tag `v0.8.5.4`**(2026-08-12 = `c0339c8`,`pyproject.toml:7` = `0.8.5.4`;真静摩擦默认开,**改变所有含摩擦场景轨迹**,见 §1.5/§1.6 与 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5)——但**磁盘工作区内容被回退到 v0.8.5.3**,故本册的稳定线行号一律是 v0.8.5.3 内容,v0.8.5.4 独有行号按 `git show HEAD:` 单独标注。
 - 工程线 = `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph`,分支 `codex/phase-cd`(HEAD `b3ab747`,`pyproject.toml` 版本 `0.8.6rc2`),含 v0.8.6 模块化重构、整帧 CUDA Graph、GPU 驻留 RL、episode、checkpoint v2 等全部 v0.8.5 后工作。
-- 两线分叉点 = `05c3f75`(git merge-base),**早于 v0.8.5.3**——稳定线 v0.8.5.3 的两个接触 I/O 修复提交(`1bc13ef`、`1d05c7a`)与 v0.8.5.4 全部提交都不在 phase-cd 历史里(§1.1、§1.2、§5)。
+- 两线分叉点 = `05c3f75`(git merge-base),**早于 v0.8.5.3**——稳定线 v0.8.5.3 的两个接触 I/O 修复提交(`1bc13ef`、`1d05c7a`)与 v0.8.5.4 全部提交都不在 phase-cd 历史里——**三个未移植项**,合并清单见 §1.0(详条 §1.1、§1.2、§1.6;分支拓扑见 §5)。
 - 文中行号:未注明仓库的 `文件:行号` 指 phase-cd 树 `StiffGIPC/` 下路径;`stable ...` 前缀指稳定线树。
 
 ---
@@ -24,11 +24,13 @@
 ## 目录
 
 - [1. 正确性类](#1-正确性类)
+  - [1.0 未移植项清单(稳定线 → phase-cd,三项)](#10-未移植项清单稳定线--phase-cd三项)
   - [1.1 phase-cd:接触力读数中摩擦分量恒为零](#11-phase-cd接触力读数中摩擦分量恒为零)
   - [1.2 phase-cd:缺 `reset_transient_contact_state()`(就地回合重置的幽灵摩擦)](#12-phase-cd缺-reset_transient_contact_state就地回合重置的幽灵摩擦)
   - [1.3 EE 近平行 mollifier 全关(边-边接触硬切换)](#13-ee-近平行-mollifier-全关边-边接触硬切换)
   - [1.4 硬钉(USE_HARD_PIN)弹性链式法则缺失](#14-硬钉use_hard_pin弹性链式法则缺失)
   - [1.5 静摩擦蠕滑:场景派生 epsv 过大](#15-静摩擦蠕滑场景派生-epsv-过大)
+  - [1.6 phase-cd:未移植 v0.8.5.4 真静摩擦(长时保持抓取蠕变)](#16-phase-cd未移植-v0854-真静摩擦长时保持抓取蠕变)
 - [2. 语义陷阱类](#2-语义陷阱类)
   - [2.1 legacy 接触力 API 返回 −F·dt² 而非牛顿](#21-legacy-接触力-api-返回-fdt-而非牛顿)
   - [2.2 `Config(**kwargs)` 静默忽略未知键](#22-configkwargs-静默忽略未知键)
@@ -58,6 +60,25 @@
 
 ## 1. 正确性类
 
+### 1.0 未移植项清单(稳定线 → phase-cd,三项)
+
+**适用线:【仅 phase-cd】**(三项都是"稳定线已修、工程线未合入";两线分叉点 `05c3f75` 早于三者的全部提交)
+
+本节把散落的三条**同源缺陷**并成一张表:它们的共同点是**修复只落在稳定线**,而 `codex/phase-cd`(HEAD `b3ab747`)的历史里连提交都没有。三者都与**摩擦**有关,升级/迁线的用户请整体评估,不要逐条踩。
+
+| # | 未移植项 | 稳定线修复落点 | phase-cd 上的后果 | 详条 |
+|---|---|---|---|---|
+| 1 | **接触力摩擦读数恒零修复**(`snapshotFrictionForce`) | v0.8.5.3 `1bc13ef`(stable `GIPC.cu:16504`、调用点 `:16800`) | `get_vertex_contact_forces(components="friction_lagged"\|"total")` 的摩擦贡献**恒零**(求解本身不受影响,只是读不出来) | [§1.1](#11-phase-cd接触力读数中摩擦分量恒为零) |
+| 2 | **`reset_transient_contact_state()`** 就地回合重置 API | v0.8.5.3 `1bc13ef`(stable `sim_engine.h:296-312`、`sim_engine.cu:3620-3636`;v0.8.5.4 在同函数追加 `clearFrictionAnchors()`,HEAD 内容 `:3622-3641`) | 无等价入口:绕过 teleport API 的自定义重置会带上一 episode 的陈旧配对(幻影摩擦),且没有 Kappa 归零入口(推定残留 ~0.9 µm 量级) | [§1.2](#12-phase-cd缺-reset_transient_contact_state就地回合重置的幽灵摩擦) |
+| 3 | **v0.8.5.4 真静摩擦**(`absolute_epsv` + 持久摩擦锚 `friction_anchor`) | v0.8.5.4 `dc1a297`/`0894958`/`c0339c8`(2026-08-11~12;`0894958` 起两个旋钮**默认开**) | epsv 仍由场景尺度派生(1.9 m 场景 = 19 mm/s)且摩擦锚每步重置 → **长时保持抓取持续蠕变**(稳定线实测 6 s 滑 3.7 mm、瓶盖转 11–20°) | [§1.6](#16-phase-cd未移植-v0854-真静摩擦长时保持抓取蠕变) |
+
+**共同规避**:需要以上任一能力的项目**用稳定线**(第 3 项要 v0.8.5.4;第 1/2 项 v0.8.5.3 起即可);必须留在 phase-cd 的,按各详条的"规避方法"降级使用,并在项目文档里写明缺陷。
+
+**共同移植路径**(亲验,2026-09-08):同仓分支 **`port/friction-anchor-086`** 已把三项**全部**按 v0.8.6 模块化布局落位——`3ec2734` "port(1bc13ef): contact-IO fixes onto the 0.8.6 refactored line"(第 1/2 项)、`c735e13` "port(dc1a297/epsv): absolute_epsv knob onto the 0.8.6 line"、`57015da` "port(anchors): persistent friction anchors onto the 0.8.6 line (parameterized)"(第 3 项)。该分支共 5 条提交,均为 2026-08-12。其后 `9fd2905` 给出了 **strict 的正解**(稳定线 `c0339c8` 只是把 anchor 在 strict 下关掉,根修排入 0.8.6——见 §1.6):真因是 `_penv_energy_accum` 用裸 `atomicAdd(double)` 按**线程调度顺序**累加逐 env 能量,顺序是 batch 形状相关的 → env0 能量带 N 依赖的末位 ulp 抖动 → 在边界帧翻掉一次 S3 回溯决策 → alpha 发散(E1–E7 取证链:梯度、rz0、整个 PCG 环在不同 N 下逐位相同,翻转发生在 PCG 之后)。修法 = 改走 `binned_deposit`(Demmel-Nguyen 精确分箱,`g_det_reduce` 下顺序无关)+ 固定顺序 `_penv_bins_combine` 收尾,kernel 签名不变;**能量和 N 不变之后 strict 不再需要抑制 anchor**,`carryFrictionAnchors` 在所有模式下都听配置(`STIFF_FRIC_ANCHOR=0` 逃生阀保留)。该提交的净室门禁(实测二进制):跨 env moveDir 0、run-to-run vhash 逐位、**batch env0 N=2 vs N=4 逐位 0.000e+00(anchor 开着)**、merged 冒烟干净。`1040edb` 再补 checkpoint 序列化摩擦锚状态 + 逐 env LS 能量恒精确分箱 + 重钉 strict 门禁。
+
+> ⚠ **合入前必须做的两件事**:① 该分支基于 `6b0e02e`(2026-07-28),**落后 phase-cd HEAD 147 个提交**且 `git merge-base --is-ancestor port/friction-anchor-086 codex/phase-cd` 返回 NOT ancestor(亲验)——须先前移(rebase/merge)到 `b3ab747` 并重跑 22 段门禁;② `3ec2734` 未触及 `frame_fsm/`——§1.1 移植要点第 5 条(整帧图/episode 路径的快照捕获)在该分支上**仍未解决**。
+> 合入第 3 项等于**改变所有含摩擦场景的默认轨迹**(与稳定线 v0.8.5.4 同性质),必须换锚立项,不能当"补丁合并"处理。
+
 ### 1.1 phase-cd:接触力读数中摩擦分量恒为零
 
 **适用线:【仅 phase-cd】**(稳定线 v0.8.5.3 已修复;修复未移植)
@@ -68,7 +89,7 @@
 | 根因 | IPC 滞后摩擦的梯度是**步内位移**的函数(当前位置相对摩擦集构建时刻位置的切向相对位移 `relDX`,见 `energy/02_contact_energy_device.inl:297-375`)。帧提交(`updateVelocities`,`core/ipc_solver.inl:2624`)之后步内位移归零,accessor 在提交后现算 `calFrictionGradient`(`engine_modules/03_step_getters_export.inl:1744-1746`,读只读 lastH 集)——数学上精确等于零。 |
 | 影响面 | phase-cd 上所有依赖摩擦力读数的传感/评估代码:抓取滑动检测(`|Ft|/|Fn|` 滑比)、斜面静置合力校验(文档示例 "total ≈ 0" 在 phase-cd 上**不成立**——total 退化为 normal)、RL 观测里的摩擦通道。求解本身**不受影响**(摩擦在求解器内正常施加,只是读数为零)。 |
 | 规避方法 | ① 需要摩擦读数的项目使用稳定线 v0.8.5.3(该修复经双关节剪切台验证:gel μ=1.0 / bar μ=0.6,三个压深实测滑比 0.600 ± 0.008,stable `CHANGELOG.md:7-41`)。② phase-cd 上暂用 `components="normal"` + 法向力 × μ 上界做保守判据,并在文档/代码注释中标注读数缺陷。 |
-| 修复状态 | 稳定线已修(v0.8.5.3 提交 `1bc13ef`);`codex/phase-cd`(HEAD `b3ab747`)未合入。**但移植成品已存在**:同仓分支 `port/friction-anchor-086` 首提交 `3ec2734` "port(1bc13ef): contact-IO fixes onto the 0.8.6 refactored line" 已把摩擦快照 + `reset_transient_contact_state`(§1.2)按模块化布局落位(GIPC.cuh 成员、`09_friction_sets_host_mem.inl` 快照实现、`ipc_solver.inl` 提交前钩子、`engine_modules/03` accessor、bindings、engine.py;提交注明 `1d05c7a` 无需移植——本线已有等价的 [rl-reset] `x=J·q` 整块重推),后续 `c735e13`/`57015da` 还移植了 v0.8.5.4 的 `absolute_epsv`/friction anchors(§1.5)。**注意**:该分支基于 `6b0e02e`(2026-07-28,落后 phase-cd HEAD 147 个提交),合入前须前移(rebase/merge)到 `b3ab747` 并重跑 22 段门禁;且 `3ec2734` 未触及 `frame_fsm/`——下述移植坑 5(整帧图路径)在该分支上仍未解决。 |
+| 修复状态 | 稳定线已修(v0.8.5.3 提交 `1bc13ef`);`codex/phase-cd`(HEAD `b3ab747`)未合入——**未移植项清单第 1 项,见 §1.0**。**移植成品已存在**:同仓分支 `port/friction-anchor-086` 首提交 `3ec2734` "port(1bc13ef): contact-IO fixes onto the 0.8.6 refactored line" 已把摩擦快照 + `reset_transient_contact_state`(§1.2)按模块化布局落位(GIPC.cuh 成员、`09_friction_sets_host_mem.inl` 快照实现、`ipc_solver.inl` 提交前钩子、`engine_modules/03` accessor、bindings、engine.py;提交注明 `1d05c7a` 无需移植——本线已有等价的 [rl-reset] `x=J·q` 整块重推),同分支后续 `c735e13`/`57015da` 还移植了 v0.8.5.4 的 `absolute_epsv`/friction anchors(§1.6)。**注意**(细节见 §1.0):该分支基于 `6b0e02e`(2026-07-28,落后 phase-cd HEAD 147 个提交),合入前须前移(rebase/merge)到 `b3ab747` 并重跑 22 段门禁;且 `3ec2734` 未触及 `frame_fsm/`——下述移植坑 5(整帧图路径)在该分支上仍未解决。 |
 
 **移植要点**(下述 1–4 步在 `port/friction-anchor-086@3ec2734` 已实现,列此供前移时 review 对照;第 5 步在该分支上也**尚未解决**):
 
@@ -88,7 +109,7 @@
 | 根因 | 每帧第一个摩擦集构建读的是宿主接触对镜像(`h_cpNum/h_cpNum_last/h_gpNum/h_gpNum_last`),teleport 单点写位姿不会使这些镜像失效;标量 `Kappa` 同为跨帧携带态。 |
 | 影响面 | RL 就地重置工作流。**注意区分**:phase-cd 的官方重置通道**没有此缺陷**——`teleport_fem_vertices` / `teleport_abd_bodies` 在尾部强制 `invalidateRefitTopology + buildBVH() + buildCP()` 重建帧入口配对集,并对被触及 env 调 `reviveEnv`(`engine_modules/03_step_getters_export.inl:2484-2585`、`04_teleport_checkpoint.inl:95-123`);GPU 驻留 RL 的 `launch_gpu_rl_reset_async` 回放 prepare 快照。**真正暴露的**是绕过 teleport API 的自定义重置(如手写 `set_vertex_positions_gpu` + `set_vertex_velocities_gpu` 拼重置),以及"想只清接触/摩擦历史、不动几何"的场景——phase-cd 没有等价入口。另注意语义差:phase-cd 的重建是"当前几何的**新**配对集",稳定线 API 是"清空镜像、下一 solve 从零建",两者近似但不逐位等价;phase-cd 也没有稳定线那样的 Kappa 归零入口(stable `sim_engine.cu:3635`:`Kappa=0` 使下一 solve 走 `suggestKappa` 全新派生)。 |
 | 规避方法 | phase-cd 上重置一律走 `teleport_fem_vertices` / `teleport_abd_bodies` / `launch_gpu_rl_reset_async`,不要拼裸 setter;需要 fresh-process 等价的 Kappa 时用 `save_checkpoint`/`load_checkpoint`(v2 checkpoint 含 Kappa 族)或重建 Engine。 |
-| 修复状态 | 稳定线 v0.8.5.3 新增 `SimEngine::reset_transient_contact_state()`(stable `sim_engine.h:296-312`、`sim_engine.cu:3620-3636`;实测重置分歧 24 µm → 6.7e-9 m;**刻意不并入 teleport API**——teleport 单个 body 不应清掉其它接触的摩擦状态)。phase-cd 主线未合入;移植量很小——清 5+5 个 `h_cpNum[i]`/`h_cpNum_last[i]` 配对镜像 **加 `h_gpNum`/`h_gpNum_last` 两个地面配对镜像**(漏掉这两个会把幽灵摩擦换成地面通道复现)+ 摩擦快照旗标 `m_have_fric_snap=false` + `Kappa=0.0`(stable `sim_engine.cu:3620-3636`)。该 API 连同 §1.1 已在分支 `port/friction-anchor-086`(`3ec2734`,基 `6b0e02e`,须前移到 HEAD)按模块化布局移植完成;合入时接入 `scripts/rl_reset_gate.py`(G15)验收。 |
+| 修复状态 | 稳定线 v0.8.5.3 新增 `SimEngine::reset_transient_contact_state()`(stable `sim_engine.h:296-312`、`sim_engine.cu:3620-3636`;实测重置分歧 24 µm → 6.7e-9 m;**刻意不并入 teleport API**——teleport 单个 body 不应清掉其它接触的摩擦状态)。phase-cd 主线未合入;移植量很小——清 5+5 个 `h_cpNum[i]`/`h_cpNum_last[i]` 配对镜像 **加 `h_gpNum`/`h_gpNum_last` 两个地面配对镜像**(漏掉这两个会把幽灵摩擦换成地面通道复现)+ 摩擦快照旗标 `m_have_fric_snap=false` + `Kappa=0.0`(stable `sim_engine.cu:3620-3636`)。该 API 连同 §1.1 已在分支 `port/friction-anchor-086`(`3ec2734`,基 `6b0e02e`,须前移到 HEAD)按模块化布局移植完成;合入时接入 `scripts/rl_reset_gate.py`(G15)验收。**未移植项清单第 2 项,见 §1.0**;若一并合入 v0.8.5.4 真静摩擦(§1.6),此处还须补清持久摩擦锚(稳定线 v0.8.5.4 在同一函数里加了 `clearFrictionAnchors()`,stable `sim_engine.cu:3640`)。 |
 
 ### 1.3 EE 近平行 mollifier 全关(边-边接触硬切换)
 
@@ -116,7 +137,7 @@
 
 ### 1.5 静摩擦蠕滑:场景派生 epsv 过大
 
-**适用线:【稳定线+phase-cd】**(两条线的磁盘内容都是场景派生 epsv;修复只存在于稳定仓 git 历史 v0.8.5.4)
+**适用线:【稳定线+phase-cd】**(两条线的**磁盘内容**都是场景派生 epsv;**修复在稳定线 v0.8.5.4**——该版本的代码不在磁盘工作树里,只在稳定仓 HEAD,见 §6#2。phase-cd 侧的未移植后果单列 §1.6)
 
 | 项 | 内容 |
 |---|---|
@@ -124,7 +145,19 @@
 | 根因 | IPC 摩擦平滑化阈值(epsv·h)由场景尺度派生:能量端一步内"静止"切向位移阈值 `eps = √fDhat · dt`,而 `fDhat = 1e-4 · eff_bboxDiagSize²`(`gipc_modules/09_friction_sets_host_mem.inl:613`、`energy/16_friction.inl:830,852`),即 **epsv ≈ 1e-2 × 有效场景对角线 [m/s]**。IPC 论文对静摩擦精度的建议量级是 1e-5;场景越大阈值越松,静止区内二次能量对切向滑移的抵抗越弱。 |
 | 影响面 | 所有依赖长时间静摩擦持握精度的场景(抓取保持、堆叠)。 |
 | 规避方法 | ① 减小 `absolute_dhat`/场景有效对角线可等比例收紧 eps(副作用是接触整体变硬,须回归验证)。② 缩短评估窗口,或在控制层做位置伺服补偿。 |
-| 修复状态 | 稳定仓 git 历史 v0.8.5.4(提交 `dc1a297`/`0894958`)引入 `absolute_epsv` 旋钮(Python 默认 1e-4 m/s)+ 持久摩擦锚 `friction_anchor`(默认开,真静摩擦:flask_cap 3.7 mm→0.00 mm,step 成本 +9%;后续 `c0339c8` 在 strict 多环境默认抑制 anchor)。**该修复既不在 v0.8.5.3 磁盘内容也不在 phase-cd**(两树 grep `absolute_epsv`/`friction_anchor` 均 0 命中)。引用/依赖 v0.8.5.4 行为前须确认其发布状态(见 §6)。 |
+| 修复状态 | **稳定线 v0.8.5.4 已修复并默认开**(提交 `dc1a297`/`0894958`):`absolute_epsv` 旋钮(Python `Config` 默认 1e-4 m/s)+ 持久摩擦锚 `friction_anchor`(默认 True,真静摩擦:flask_cap 保持段滑移 3.7 mm→0.00 mm,step 成本 +9%;后续 `c0339c8` 在 strict 多环境默认抑制 anchor)。详见 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5。**但该修复不在 v0.8.5.3 磁盘内容、也不在 phase-cd**(两树 grep `absolute_epsv`/`friction_anchor` 均 0 命中)——工程线侧的影响与规避见 §1.6;v0.8.5.4 的 wheel 资产状态见 §6#2。 |
+
+### 1.6 phase-cd:未移植 v0.8.5.4 真静摩擦(长时保持抓取蠕变)
+
+**适用线:【仅 phase-cd】**(§1.5 的缺陷本体两线共有;**修复只在稳定线 v0.8.5.4**,工程线未移植——§1.0 清单第 3 项)
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 工程线上**长时保持抓取会持续蠕变**:物体在摩擦锥内、受力远未达滑动条件,却以恒定速率滑移/转动,且**不收敛**——越保持越偏。稳定线修复前的同源实测(flask_cap 双臂 finray 抓取-提升-保持 400 步):烧瓶 6 s 内滑 **3.7 mm**,瓶盖锥体转 **11–20°**,而受力**远在 μ=3.5 摩擦锥内**;逐步分辨率下每步漂移 **1.0e-5 m**(×50 fps = 0.5 mm/s,与观测滑移吻合)。phase-cd 代码路径同构,故同样成立(未在工程线上复测,见 §6#6)。 |
+| 根因 | 两条,**都还在 phase-cd 里**:(a) **静摩擦阈值 epsv 由场景尺度派生**——`fDhat = 1e-4 · eff_bboxDiagSize²` ⇒ epsv = √fDhat = **1e-2 × 有效场景对角线**(`gipc_modules/09_friction_sets_host_mem.inl:613`、`energy/16_friction.inl:830,852`),1.9 m 场景即 **19 mm/s**,是 IPC 论文默认 `1e-3·l` 的 10×、静摩擦精度值 1e-5 m/s 的 1900×;蠕滑速度 `creep_v ≈ (load/(μ·λ))·epsv`,于是**场景 bbox 泄漏进了静摩擦精度**(继 dhat/kappa 之后 bbox 派生参数族的第三个成员)。(b) **摩擦位移锚点每步重置**——lagged 摩擦只度量"相对本步起始位置"的切向滑移,每步归零,静接触因此永远停在"刚开始滑"的状态,无法形成真正的静摩擦弹簧。稳定线的解法是 `u_total = relDX_step + e`(跨步累计切向弹性偏移 `e`,`‖e‖` 在 `eps = epsv·h` 处径向回拉截断 = Coulomb 滑动),phase-cd 无对应实现(grep `friction_anchor`/`absolute_epsv` 零命中)。 |
+| 影响面 | 工程线上**所有长时保持类任务**:抓取-提升-保持(RL 操作回放、装配、递交)、堆叠静置、任何以"保持 N 秒后位姿"为成功判据的评测。**RL 训练尤其危险**——蠕变是**系统性偏置**而非噪声,策略会学到补偿它;换到稳定线 v0.8.5.4 上评估时行为不迁移。求解稳定性不受影响(不是发散,是**物理上错的"稳定"**)。另注意与 §1.1 的叠加效应:phase-cd 上既蠕变、又读不出摩擦力,滑移检测两头落空。 |
+| 规避方法 | ① **需要真静摩擦就用稳定线 v0.8.5.4**(默认即开;逃生阀 `absolute_epsv=0` / `friction_anchor=False`,或 `STIFF_EPSV=0` / `STIFF_FRIC_ANCHOR=0`)。② 必须留在 phase-cd 时的**部分缓解**:缩小场景有效 bbox(等比例收紧 epsv,副作用是接触整体变硬,须回归验证)、缩短保持窗口、在控制层做位置伺服补偿——**都补不上锚点每步重置这条**,只能减速不能归零。③ 手工移植:见 §1.0 的 `port/friction-anchor-086` 路径(该分支连 strict 的正解一并给了,`9fd2905` 逐 env 分箱能量 → anchor 在 strict 下也能默认开)。④ 评测纪律:凡是拿 phase-cd 数据做保持类结论,须标注"legacy 场景派生 epsv + 每步锚重置"口径。 |
+| 修复状态 | **稳定线已修(v0.8.5.4,默认开)**;`codex/phase-cd`(HEAD `b3ab747`)**未合入,提交都不在历史里**(分叉点 `05c3f75` 早于 `dc1a297`)。移植成品在 `port/friction-anchor-086`(`c735e13` epsv + `57015da` anchors + `9fd2905` strict 正解 + `1040edb` checkpoint 序列化),**须先前移到 `b3ab747` 并重跑 22 段门禁**(§1.0)。合入即**改变所有含摩擦场景的默认轨迹**——等于换锚立项,不是补丁合并。 |
 
 ---
 
@@ -408,7 +441,7 @@ Raise Config.line_search_max_iter, reduce dt, or soften the drive.
 
 本项目是上游 **KemengHuang/StiffGIPC**(GIPC 论文作者实现谱系)的长期分叉。与已知问题相关的结构性事实:
 
-1. **分支拓扑**:`main` = 上游只读镜像(`CLAUDE.md:49-57`);`release/stable-0.8` = 稳定发布线;`codex/phase-cd` = 工程线。两条产品线的 git merge-base = `05c3f75`,早于 v0.8.5.3 —— 因此稳定线 v0.8.5.3 的接触 I/O 修复(`1bc13ef` 摩擦读数快照、`1d05c7a` teleport 表面顶点同步)与 v0.8.5.4 全部提交(`dc1a297`/`0894958`/`c0339c8` 真静摩擦族)**均不在 phase-cd 历史**;phase-cd 对 teleport 问题有自己的(不同实现的)解法(§1.2),对摩擦读数**没有**(§1.1)。
+1. **分支拓扑**:`main` = 上游只读镜像(`CLAUDE.md:49-57`);`release/stable-0.8` = 稳定发布线;`codex/phase-cd` = 工程线。两条产品线的 git merge-base = `05c3f75`,早于 v0.8.5.3 —— 因此稳定线 v0.8.5.3 的接触 I/O 修复(`1bc13ef` 摩擦读数快照、`1d05c7a` teleport 表面顶点同步)与 v0.8.5.4 全部提交(`dc1a297`/`0894958`/`c0339c8` 真静摩擦族)**均不在 phase-cd 历史**;phase-cd 对 teleport 问题有自己的(不同实现的)解法(§1.2),对摩擦读数**没有**(§1.1),对真静摩擦也**没有**(§1.6)——三项合并清单见 §1.0。
 2. **上游冻结项**(为保持可同步性,两线均不改动):EE mollifier smooth 分支(§1.3)、close-set 帧内 Kappa 倍增路径。后者是**刻意退役的死路**:宿主的帧内倍增门在 `h_close_gpNum/h_close_cpNum` 宿主镜像上,而这两个镜像树内**从无写点**,恒 false → Kappa 帧内永不动,每帧由梯度投影策略重播种(`gipc_modules/09_friction_sets_host_mem.inl:917-919`、`12_host_wrappers_fem.inl:344-345`:"do not revive … without a separately validated adaptive-contact redesign")。整帧图曾如实读设备计数把死路复活并引发 kappa 41.73→2670.70 六连倍增杀帧,现图路径默认宿主等价,倍增 kernel 仅留在 `STIFF_GRAPH_LEGACY_KAPPA_DOUBLE` 后供重设计对照(`10_ccd_buildcp_quarantine.inl:3151-3170`)【实验性,默认关】。
 3. **上游三方库遗留**:muda 的点-边 CCD `toc = roots[i]*(1-eta)` 带 `//TODO: distance eta` 注释(`muda/src/muda/ext/geo/distance/details/ccd.inl:462`)——eta 语义近似,非本仓可控,主 CCD 链(ACCD)不经过它。
 4. **上游算法基线**:CCD = Additive CCD(Li et al. 2021 Codimensional IPC 谱系,`ACCD.cu`);势垒 RANK=2 对数势垒 `E = κ(d−d̂)²log²(d/d̂)`(d 为平方距离,`contact/barrier_rank.h:7`);这些与上游一致,handbook 级对照修改都属换锚战役。
@@ -421,7 +454,8 @@ Raise Config.line_search_max_iter, reduce dt, or soften the drive.
 以下陈述在本册标注"待核实",不作为承诺引用:
 
 1. **"folded 布料 44 万 mollify 请求 / 0 执行"** 的具体计数出自战役记录,本次代码勘探确认了机制(请求被计数、`smooth=false` 使执行为零)但未复测该数字(§1.3)。
-2. **v0.8.5.4 的对外发布状态**(wheel 是否已挂公开仓):tag 与提交存在于稳定仓 git 历史,CHANGELOG 无条目,磁盘工作区已回退到 v0.8.5.3;引用 `absolute_epsv`/`friction_anchor`/`STIFF_EPSV` 行为前须确认发布物(§1.5)。
+2. **v0.8.5.4 的 wheel 资产状态**(版本本身已确认:tag `c0339c8`、`pyproject.toml` = `0.8.5.4`、`git show HEAD:CHANGELOG.md:7-44` 有完整 [0.8.5.4] 条目):公开仓 Releases 页是否挂 cp311/cp312 wheel 未查证,且磁盘工作区已回退到 v0.8.5.3 内容;按 v0.8.5.4 行为(`absolute_epsv`/`friction_anchor`/`STIFF_EPSV`)交付前须确认发布物(§1.5、§1.6;OPEN_POINTS OP-001)。
 3. **phase-cd 摩擦读数恒零**已由代码结构证实(无 snapshotFrictionForce、accessor 提交后现算)并与稳定线 `1bc13ef` 诊断同构,但未在 phase-cd 上跑剪切台复测数值(§1.1);移植后应以稳定线的滑比验证(0.600±0.008 @ μ=0.6)为验收基准。
 4. ~~**硬钉链式法则缺失(§1.4)在稳定线的存在性**~~ **已核实(2026-09-07)**:稳定线单体 GIPC.cu 含逐字相同的 KNOWN LIMITATION 注释与活代码路径(stable `GIPC.cu:13894-13906`、`[M3.5] WARN` 在 `:13787`),并经 `add_fem_pin_to_abd` / `add_fem_pins_with_local_pos` 公开绑定可达——§1.4 已改标【稳定线+phase-cd】。
 5. 稳定线 v0.8.5.3 的 line-search WARN 行号(stable `GIPC.cu:15221`)与 grow-redo 行号(stable `GIPC.cu:10318` 等)出自勘探笔记的当日核对,复引前建议 grep 复核(单体文件行号对补丁敏感)。
+6. **phase-cd 上的保持段蠕变未运行时复测**(§1.6):代码结构已证两条根因都在(场景派生 `fDhat`、无摩擦锚),蠕变数字(3.7 mm / 11–20° / 每步 1.0e-5 m)全部取自稳定线 v0.8.5.4 提交的 flask_cap 实测;工程线上跑一次同构保持实验即可闭合,移植后以稳定线的"保持段滑移 0.00 mm、cap 倾角 0.7° 恒定"为验收基准。

@@ -16,6 +16,7 @@
 | 【稳定线+phase-cd】 | 两条线都有,语义一致(差异会单独注明) |
 | 【仅 phase-cd】 | 只在工程线 `codex/phase-cd` 存在;稳定线设了/调了无效或不存在 |
 | 【仅稳定线】 | 只在稳定线 v0.8.5.3 存在(tactile 线修复),phase-cd 尚未移植 |
+| 【仅稳定线 v0.8.5.4+】 | 只在稳定线 v0.8.5.4(`dc1a297`..`c0339c8`)存在的摩擦线工作;v0.8.5.3 与 phase-cd 均无(两树 grep `absolute_epsv`/`friction_anchor` 0 命中) |
 | 【实验性,默认关】 | 存在但默认关闭,非生产承诺,开启前读对应小节的风险说明 |
 
 - **稳定线** = 仓库 `Stiff-GIPC-stable-08`,分支 `release/stable-0.8`,
@@ -23,8 +24,12 @@
   `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel,CUDA 架构 sm_80/89/120)。
   文件布局为重构前单体(`StiffGIPC/GIPC.cu`)。
   注:该仓库工作树在 v0.8.5.3 之后还有未发布的摩擦线提交(tag `v0.8.5.4`
-  "default-on true static friction" 等,无 CHANGELOG 条目);本分册**只覆盖到 v0.8.5.3
-  发布面**,v0.8.5.4 的静摩擦/friction-anchor 行为变更待核实,不在此文档承诺范围。
+  "default-on true static friction" 等);本分册的**默认承诺面仍是 v0.8.5.3**,
+  v0.8.5.4 的静摩擦/friction-anchor 行为一律按【仅稳定线 v0.8.5.4+】单独标注
+  (旋钮见 §7.4/§7.5,strict 交互见 §2.1,参数与升级影响见 API_CORE §2.1),
+  其**对外发布状态仍待核实**(附录 A#2 / OPEN_POINTS OP-001)。
+  更正一处旧勘探口径:CHANGELOG `[0.8.5.4]` 条目在提交 `0894958`/`c0339c8` 里
+  **是存在的**,只是被工作树那 8 个文件的未提交回退一并撤了,故树上看不到。
 - **工程线(phase-cd)** = 仓库 `Stiff-GIPC-c1-ls-graph`,分支 `codex/phase-cd`,
   HEAD `b3ab747`;含 v0.8.6 模块化重构、整帧 CUDA Graph、GPU 驻留 RL、episode、
   checkpoint v2 等全部 v0.8.5 之后的工作。
@@ -434,6 +439,19 @@ examples/replay_foldshirt_multienv.py:176-188):
 - **不要动 strict 栈的确定性旋钮**:`STIFF_SEG_WARP=1` 对 strict 强开 warp 预求和
   会**破坏确定性**(仅 A/B 用,pcg_solver.cu:1226-1244);`STIFF_GRAPH_INGRAPH_RETRY=1`
   注入 ~1e-6 run-to-run 扰动(frame_transaction.cu:4491-4503)。
+- **strict 会自动关掉持久摩擦锚**【仅稳定线 v0.8.5.4+】:v0.8.5.4 的
+  `friction_anchor` 虽默认开,但引擎一看到 strict 签名(`STIFF_SPMV_DET`)就把它
+  按回 legacy 并打印 `[fric-anchor] strict mode: friction_anchor suppressed for
+  batch invariance`(stable@c0339c8 GIPC.cu:9804-9822)。理由是**批不变性**:锚与
+  `absolute_epsv=1e-4` 组合后,收紧的锚封顶半径 `eps = epsv·h`(≈1 µm)把摩擦能量
+  推到线搜索能量求和的 ulp 比较边界上,而该求和的规约形状随 env 数 N 变——一次
+  accept 判定翻转即被混沌放大(foldshirt strict:前 17 帧逐位相同,第 18 帧一步内
+  96% 顶点分歧),表现为 env0 逐位 N=2 ≠ N=4。二分定位:**只开 epsv 绿、只开 anchor
+  绿、两者同开红**,故 strict 只交易掉 anchor(`absolute_epsv` 保留——它本身批安全);
+  merged / isolated 保持两个默认。`STIFF_FRIC_ANCHOR=1` 可在 strict 强制开回,
+  但那时不要再指望 batch 不变性。根治(N 不变的能量归约)记在 0.8.6:工程线未合入的
+  移植分支 `port/friction-anchor-086` 已有 `9fd2905`"order-free (binned) per-env
+  line-search energy;anchors default-ON in strict",可作移植时的参照。
 - 自检工具:`examples/test_strict_quadgate.py`(strict 五门逐位:run-to-run、
   跨 env、batch 不变性等;自足无金锚)。
 
@@ -1016,6 +1034,8 @@ if after != before:
 | `STIFF_ABD_PRECOND_LEGACY` | env_on | 恢复旧 racy 赋值式 ABD 对角预条件(新默认 atomic 累加,治轻质刚体 kick/flip) | 两线 |
 | `STIFF_SPLIT_GH` | presence-only | 梯度/Hessian 装配拆分 | 两线 |
 | `STIFF_NO_REFINE` | presence-only | 跳过 per-env α 的 refine 二次门(注册表标 perf,实改 α 语义;验证 hr 泄漏的测试旗) | 两线 |
+| `STIFF_EPSV` | float(m/s);`atof`,`>0` 才生效,`=0`/负 → legacy | 钉死 IPC 摩擦 stiction 阈值 epsv:`fDhat = epsv²`;否则 legacy 场景派生 `epsv = 1e-2·eff_scene_diag`(1.9 m 场景 ≈ 19 mm/s)。**覆盖 `Config.absolute_epsv`**(env 赢),读点在 `init` 一次性(stable@c0339c8 GIPC.cu:9498-9500);日志等级 ≥1 时 `[dhat]` 行会打印 `epsv=<值> (ABSOLUTE)`/`(scene-scale)`,是确认旋钮生效的唯一自证。默认 = `Config.absolute_epsv` = **1e-4(v0.8.5.4 起)**;`STIFF_EPSV=0` 是回 legacy 的逃生阀。IPC 原文:静摩擦精度取 1e-5,越小 Newton 越贵(1e-5 +12% step,1e-4 无可测成本) | **【仅稳定线 v0.8.5.4+】**;phase-cd 无读点,设了不但无效,还会被 knob-registry tripwire 报 `unknown STIFF_* knob`(§7.0) |
+| `STIFF_FRIC_ANCHOR` | `atoi != 0`;显式 `0`/`1` 均被尊重(存在即定值,不是 presence-only) | 持久跨步摩擦锚(真静摩擦)总开关,**覆盖 `Config.friction_anchor`**(stable@c0339c8 GIPC.cu:9811)。默认 = Config = **True(v0.8.5.4 起)**,但 **strict 下自动抑制**(检测到 `STIFF_SPMV_DET` 即关,并打印 `[fric-anchor] strict mode: friction_anchor suppressed for batch invariance`;`STIFF_FRIC_ANCHOR=1` 可强制开回,§2.1)。`=0` 回 legacy 每步重置锚。开着改物理:flask_cap 保持段滑移 3.7 mm→0.00 mm,代价 +9% step | **【仅稳定线 v0.8.5.4+】**;同上,phase-cd 无读点/未注册 |
 
 ## 7.5 diag / audit 类(诊断;多为 presence-only)
 
@@ -1031,6 +1051,7 @@ if after != before:
 | `STIFF_PHASE_TIME` | 宿主路径相位计时 | presence-only;capture 黑名单;两线 |
 | `STIFF_STACK_DIAG` | per-pop 栈深探针 | capture 黑名单;两线 |
 | `STIFF_LSX_DIAG` | LS 耗尽诊断(点名哪个能量项/计数在零步长下变了=状态泄漏) | 仅 phase-cd |
+| `STIFF_NEWTON_TRACE` | 逐 Newton 迭代打印 `[newton-trace] f=<帧> k=<迭代> move=<move-norm>`(取 `calcMinMovement` 归约出的移动范数,作残差代理;帧号由 `k==0` 自增,全局非 per-env;已判全局退出的那次迭代不打印) | **【仅稳定线 v0.8.5.4+】**(`d7ab5bf`,stable@c0339c8 GIPC.cu:16000-16011);presence-only(设 `=0` 也算开);开着**每迭代一次 D2H**,只作诊断用。用途示范:摩擦锚 A/B 显微镜——flask_cap 保持段 anchor ON 的 r1 中位 5.4e-12(真不动点)vs OFF 1.0e-5 m/步(= 10 µm/帧 creep,×50 fps ≈ 0.5 mm/s,与实测滑移吻合) |
 | `STIFF_POSTLS_FREEZE` | 跳过 LS 后帧内 kappa/close-set 自适应(因果测试) | 仅 phase-cd |
 | `STIFF_DEVICE_LINESEARCH_VALIDATE` / `STIFF_CCD_VALIDATE` / `STIFF_S3_VALIDATE` / `STIFF_ENERGY_VALIDATE` / `STIFF_MAS_FUSE_VALIDATE` / `STIFF_PCG_CACHE_VERIFY` | 各对照校验 | 两线为主 |
 | `STIFF_PENV_STATS` / `STIFF_A0_DUMP` / `STIFF_S1_DEBUG` / `STIFF_ALPHA_DBG` / `STIFF_ALPHA_STATS` / `STIFF_SWEPT_DIAG` / `STIFF_SEED_DIAG` | per-env α/S1/S3 打印族(其中前四个会把 S1 路由到 host 遥测路径,§1.8) | 两线为主 |
@@ -1060,6 +1081,9 @@ if after != before:
 3. **陈旧注释名 `STIFF_CONVERT_TIER_WIDTH`**:global_linear_system.cu:318 注释提到,
    代码实际读的是 `STIFF_CONVERT_EXACT_WIDTH`;不存在叫 TIER_WIDTH 的变量。
 4. 稳定线独有(phase-cd 已删):`STIFF_FRICTION_DBG`(stable GIPC.cu:9606, 11981)。
+   另有三个**稳定线 v0.8.5.4 独有、phase-cd 从未有过**的摩擦线旋钮:`STIFF_EPSV`、
+   `STIFF_FRIC_ANCHOR`(§7.4)、`STIFF_NEWTON_TRACE`(§7.5)。它们不在 phase-cd
+   注册表内,因此**不计入下条的 170**;在 phase-cd 上设置只会换来 unknown-knob WARN。
 5. 稳定线/phase-cd 覆盖对照:注册表 170 个旋钮中 **82 个稳定线也有消费点,88 个仅
    phase-cd**(整帧图全家族、BVH 实验族、converter 布局族、CCD 步长旋钮、audit 族、
    NVTX、AUTO_PREPARE_AT/MS_DUMP 均仅 phase-cd)。**给稳定线用户的配置不得出现这些。**
@@ -1339,10 +1363,14 @@ env_newton_iter_cap:中毒 env 冻结不炸进程)、`test_env_midrun_quarantine
 1. **per-env 遥测在纯设备快路径下的返回值**:`get_per_env_newton_iters/status` 在
    `STIFF_PERENV_TELEM=0` 且 `env_newton_iter_cap=0` 时返回 reset 值(-1/0)——
    由"host S1 路径才填"的代码路径推理得出,未运行程序验证(§1.8)。
-2. **稳定线 v0.8.5.4 未发布提交的行为**:稳定线仓库工作树在 v0.8.5.3 之后含
-   "default-on true static friction"、`absolute_epsv` + persistent friction anchors
-   等提交(tag v0.8.5.4,无 CHANGELOG 条目);其默认行为变更(真静摩擦)不在本分册
-   覆盖面,面向下一个稳定发布的文档需专门勘探。
+2. **稳定线 v0.8.5.4 的对外发布状态**(收窄:行为本身已勘探)。提交 `dc1a297`
+   (`absolute_epsv` + persistent friction anchors)、`0894958`(两者默认开,含
+   CHANGELOG `[0.8.5.4]` 条目)、`c0339c8`(strict 抑制 anchor)在稳定仓 git 历史里,
+   行为与旋钮已按【仅稳定线 v0.8.5.4+】写入 §2.1 / §7.4 / §7.5 与 API_CORE §2.1。
+   **仍待核实的只剩两件**:(a) 公开仓 `github.com/haoxiangNtu/stiff-physics` 是否
+   已挂 v0.8.5.4 wheel 资产(OPEN_POINTS OP-001);(b) 该 tag 是否会被撤回/重做——
+   稳定仓工作树至今被 8 个文件的未提交回退按在 v0.8.5.3(连 CHANGELOG 条目一起撤了),
+   这是"已提交但尚未认账"的状态,不是普通的已发布。承诺 v0.8.5.4 行为前先确认发布物。
 3. **`get_body_contact_force` 的 ground 口径矛盾**:Python docstring 称
    "no ground contact",但 C++ 实现(03_step_getters_export.inl:1174)实际调用了
    `computeGroundGradient`——倾向以代码为准(含 ground),文档口径待项目定夺。

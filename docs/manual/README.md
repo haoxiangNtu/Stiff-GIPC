@@ -1,7 +1,8 @@
 # StiffGIPC 仿真手册 — 总入口
 
-> 手册基准日期:2026-09-07。
-> 覆盖两条产品线:**稳定线 v0.8.5.3**(`release/stable-0.8`,tag `v0.8.5.3`,2026-08-11 发布)与
+> 手册基准日期:2026-09-07(2026-09-08 补入稳定线 v0.8.5.4,见 §2)。
+> 覆盖两条产品线:**稳定线**(`release/stable-0.8`;**最新 = tag `v0.8.5.4`,2026-08-12,真静摩擦默认开**;
+> 本手册的行号/行为基线 = tag `v0.8.5.3`,2026-08-11,磁盘工作树内容)与
 > **工程线 codex/phase-cd**(`0.8.6rc2`,HEAD `b3ab747`)。
 > 除非另有标注,文件:行号出处指工程线工作树 `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph`;
 > 标注 `[stable]` 前缀者指稳定线工作树 `/home/ps/Downloads/Stiff-GIPC-stable-08`。
@@ -37,7 +38,7 @@
 |---|---|
 | 【稳定线+phase-cd】 | 两线均有且行为一致(或差异已在条目内说明) |
 | 【仅 phase-cd】 | 只存在于工程线 `codex/phase-cd` |
-| 【仅稳定线】 | 只存在于稳定线 v0.8.5.3 |
+| 【仅稳定线】 | 只存在于稳定线(未加版本限定 = v0.8.5.3 起即有;真静摩擦族 `absolute_epsv`/`friction_anchor` 另标 **v0.8.5.4 起**,§2) |
 | 【实验性,默认关】 | 存在但默认关闭,需环境变量 / 构建开关显式开启,不承诺稳定契约 |
 
 机制描述附数学形式与 `文件:行号` 出处;性能数字一律引自仓库内证据文档
@@ -83,11 +84,35 @@ A800 上 RL 微步经 GPU 驻留通道从 19.3 → 3.85 ms/步(**5.0×**,
 
 ## 2. 版本导览:稳定线 vs 工程线
 
+> **⚠ 稳定线最新版本 = v0.8.5.4(2026-08-12),不是 v0.8.5.3**
+>
+> tag `v0.8.5.4` = `c0339c8`,[stable] `pyproject.toml:7` = `0.8.5.4`(亲验 `git show HEAD:`)。
+> 单一主题:**真静摩擦**——两个默认值变更,**改变所有含摩擦场景的轨迹**
+> (不是 v0.8.5.3 那种"不调用新 API 就逐位一致"的补丁版):
+>
+> | 旋钮 | v0.8.5.3 | **v0.8.5.4 默认** | 逃生阀(逐位回 0.8.5.3) |
+> |---|---|---|---|
+> | `Config.absolute_epsv` | 不存在(epsv 恒由场景 bbox 派生,1.9 m 场景 = 19 mm/s) | **`1e-4` m/s** 钉死(Python 层写入;C++ 结构体默认仍 `0.0`) | `absolute_epsv=0` 或 `STIFF_EPSV=0` |
+> | `Config.friction_anchor` | 不存在(摩擦锚每步重置 ⇒ 持握蠕滑) | **`True`**(跨步持久锚 = 真静摩擦);**strict 多环境自动关**,`STIFF_FRIC_ANCHOR=1` 可强开 | `friction_anchor=False` 或 `STIFF_FRIC_ANCHOR=0` |
+>
+> **升级用户须知**:① 保持类场景会**明显变好**(flask_cap 400 步实测:保持段滑移 3.7 mm → **0.00 mm**,瓶盖锥体 11–20° → 钉在 0.7°),代价 step 时间 **+9%**;
+> ② 但**任何既有轨迹/回放/金锚/RL 策略都不再逐位复现**——需要复现旧结果就用上表的逃生阀;
+> ③ strict 多环境下 anchor 被**自动抑制**(anchor 与 `epsv=1e-4` 组合会把摩擦能量推到 N 形状相关的 line-search ulp 比较边界上,破坏批不变性;根修排入 0.8.6),因此**strict 与 merged/isolated 的摩擦行为不同**,跨模式对照时务必注意;
+> ④ wheel 资产是否已挂公开仓**待核实**(§7#2)——安装指令仍按 v0.8.5.3 给(§3.1)。
+>
+> **本手册的稳定线基线仍是 v0.8.5.3**:磁盘工作树内容与 tag `v0.8.5.3` 逐字节一致
+> (`git diff v0.8.5.3 --stat` 为空),下表所有 `[stable] 文件:行号` 均取自该内容。
+> v0.8.5.4 独有内容见 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5、
+> [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.5/§1.6。
+> **工程线 phase-cd 完全没有这批工作**(grep `absolute_epsv`/`friction_anchor` 零命中)——
+> 它是稳定线 → 工程线的**第三个未移植项**([KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.0)。
+
 ### 2.1 怎么选
 
 | 你是谁 | 用哪条线 | 理由 |
 |---|---|---|
-| wheel 用户 / 需要稳定复现实验 | **稳定线 v0.8.5.3** | 唯一发布 wheel 的线;CHANGELOG 明言"不调用新 API 时轨迹与 0.8.5.2 完全一致"([stable] `CHANGELOG.md:7-13`) |
+| wheel 用户 / 需要稳定复现实验 | **稳定线 v0.8.5.3** | 唯一确认发布 wheel 的版本;CHANGELOG 明言"不调用新 API 时轨迹与 0.8.5.2 完全一致"([stable] `CHANGELOG.md:7-13`)。⚠ 稳定线**最新**是 v0.8.5.4(见上方警示框):轨迹**不**与 0.8.5.3 一致 |
+| 需要**长时保持抓取不蠕变**(装配、递交、堆叠、保持类评测) | **稳定线 v0.8.5.4** | 真静摩擦默认开(`absolute_epsv=1e-4` + 持久摩擦锚):保持段滑移 3.7 mm → 0.00 mm;两线的其它版本(含全部 phase-cd)都按 legacy 场景派生 epsv + 每步锚重置蠕变([KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.5/§1.6) |
 | 依赖接触**摩擦力读数**(触觉)的用户 | **稳定线 v0.8.5.3** | 摩擦读数恒零 bug 的修复(`snapshotFrictionForce`)与 `reset_transient_contact_state()` **只进了稳定线**;phase-cd 的 `get_vertex_contact_forces` friction_lagged/total 分量仍受恒零 bug 影响(未移植,见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)) |
 | 引擎/求解器开发 | **工程线 phase-cd** | v0.8.6 模块化布局、knob 注册表治理、22 段门禁基建 |
 | RL 训练(小帧微步、多环境吞吐) | **工程线 phase-cd** | episode / GPU 驻留 RL / torch 零拷贝只在这条线 |
@@ -115,13 +140,16 @@ A800 上 RL 微步经 GPU 驻留通道从 19.3 → 3.85 ms/步(**5.0×**,
 | 13 | FEM 本构 | 硬编码 SNK1 | CMake `STIFFGIPC_FEM_MODEL=SNK1|SNK2|ARAP`(默认 SNK1);运行时 `stiff_physics.fem_model()` 查询(`bindings/pystiffgipc.cu:16-17`) |
 | 14 | 构建 | `CMAKE_CUDA_ARCHITECTURES "80;89;120"`(含 PTX) | `STIFFGIPC_DLTO` 默认 ON → `80-real;89-real;120-real`(无 PTX JIT 回退),运行时最高 −15%、全量构建 +76%(`../RELEASE_NOTES_v0.8.6-rc1.md:124-141`) |
 | 15 | `Config` 类 | 两线 Python `Config` **逐字节相同**(diff 实测)——phase-cd 未增删任何 Config 参数 | 同左 |
+| 16 | 静摩擦(**v0.8.5.4 起**) | **稳定线 v0.8.5.4 = 真静摩擦默认开**:`absolute_epsv=1e-4` m/s 钉死 + 持久摩擦锚(strict 多环境自动关);v0.8.5.3 本身仍是 legacy | **无此能力**:epsv 恒 `1e-2 × 有效场景对角线`(`gipc_modules/09_friction_sets_host_mem.inl:613`、`energy/16_friction.inl:830,852`)、摩擦锚每步重置 → 长时保持抓取蠕变([KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.6);grep `absolute_epsv`/`friction_anchor` 零命中 |
 
 > 分叉点:`git merge-base` = `05c3f75`。phase-cd 分叉于 v0.8.5.3 **之前**,
-> 故稳定线 v0.8.5.3 的两个 contact-IO 修复提交不在 phase-cd 历史里。
-> 另:稳定线仓库 git 历史中存在 tag `v0.8.5.4`(absolute_epsv / friction_anchor 真静摩擦),
-> 但**磁盘工作树内容与 tag v0.8.5.3 逐字节一致**(`git diff v0.8.5.3 --stat` 为空),
-> 且 CHANGELOG 无 0.8.5.4 条目——本手册以 **v0.8.5.3** 为稳定线基准,
-> v0.8.5.4 特性是否已对外发布 wheel 待核实,不在手册覆盖范围。
+> 故稳定线 v0.8.5.3 的两个 contact-IO 修复提交、以及 v0.8.5.4 的全部提交
+> (`dc1a297`/`d7ab5bf`/`0894958`/`c0339c8`)都不在 phase-cd 历史里
+> ——**三个未移植项**的合并清单见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.0。
+> 上表第 1–15 行的稳定线列 = **v0.8.5.3 内容**(磁盘工作树与该 tag 逐字节一致,
+> `git diff v0.8.5.3 --stat` 为空;`git checkout`/`stash`/`reset` 会让工作区静默变成
+> v0.8.5.4 内容——[CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §6),
+> 第 16 行按 `git show HEAD:` 读 v0.8.5.4;v0.8.5.4 的 wheel 资产状态见 §7#2。
 
 ### 2.3 运行时探测你在哪条线
 
@@ -325,7 +353,7 @@ PYTHONPATH=. python examples/test_fem_3d_minimal.py
 | [PRINCIPLES_DYNAMICS.md](PRINCIPLES_DYNAMICS.md) | 动力学原理:增量势能形式、ABD 12-DOF 仿射动力学、FEM 本构(SNK1/SNK2/ARAP)、布料/弯曲、关节约束能量与外力注入(q_tilde 路径) |
 | [PRINCIPLES_CONTACT.md](PRINCIPLES_CONTACT.md) | 接触原理:IPC log-barrier 与 dHat/kappa 自适应、LBVH 四查询族、ACCD 与 line search、滞后摩擦模型及其读数陷阱、地面接触 |
 | [PRINCIPLES_EXECUTION.md](PRINCIPLES_EXECUTION.md) | 执行架构:一个表面两个内核(step 通道 vs residency 通道)、整帧 CUDA Graph 与容量档边界协议、确定性栈与 strict 金锚、性能成本结构与已裁决优化 |
-| [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) | 版本时间线:v0.8.5 → v0.8.5.3 / 0.8.6rc2 的行为变更与性能里程碑(合并两树 CHANGELOG,标注每项落在哪条线;更早历史见下方指路) |
+| [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) | 版本时间线:v0.8.5 → v0.8.5.4 / 0.8.6rc2 的行为变更与性能里程碑(合并两树 CHANGELOG,标注每项落在哪条线;更早历史见下方指路) |
 | [KNOWN_ISSUES.md](KNOWN_ISSUES.md) | 已知问题与坑:phase-cd 摩擦读数恒零、进程级模式锁、checkpoint 不兼容、EE mollifier 关闭、图开负收益场景、诊断类 API 的破坏性等 |
 | [OPEN_POINTS.md](OPEN_POINTS.md) | 待核实项唯一登记表:全手册约 45 处"待核实"标记收拢为 OP-001 起的 37 条编号条目(含验证方法建议);关闭时引用编号 |
 
@@ -411,8 +439,10 @@ phase-cd 上会 WARN);静音默认开(`CASE39_QUIET=1`)。
 
 1. v0.8.5.3 wheel 的 Release 资产文件名按 v0.8.4 发布页模板推断
    (cp311/cp312 已由发布记录确认),下载 URL 未逐字节验证。
-2. 稳定线仓库历史中的 tag `v0.8.5.4`(absolute_epsv / friction_anchor 真静摩擦)
-   是否已对外发布 wheel 未验证;磁盘工作树 = v0.8.5.3,本手册不覆盖 v0.8.5.4 行为。
+2. 稳定线最新版本 tag `v0.8.5.4`(absolute_epsv / friction_anchor 真静摩擦,§2)
+   **是否已挂公开仓 wheel 未验证**——版本本体已亲验(`pyproject.toml` = `0.8.5.4`、
+   CHANGELOG [0.8.5.4] 条目在 `git show HEAD:CHANGELOG.md:7-44`),但磁盘工作树
+   被回退到 v0.8.5.3 内容,§3.1 的安装指令因此仍按 v0.8.5.3 给(OPEN_POINTS OP-001)。
 3. ~~`examples/fix_obj_winding.py` 的实际位置~~ **已关闭**:文件在两树的
    `tools/fix_obj_winding.py`(亲验存在);`case_26_perf_tuned.py` docstring 的
    `examples/` 前缀过时(§6)。

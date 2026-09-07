@@ -122,7 +122,7 @@ Python 侧四个子类均以 `StiffGIPCError` 为基类,可 `from stiff_physics 
 
 `stiff_physics.Config`(engine.py:323-451)镜像 native `gipc::SimEngineConfig`(StiffGIPC/sim_engine.h:18-99)。**两树 Python Config 类逐字节相同,native 结构体字段与默认值也完全一致**(header diff 为空)。
 
-### 2.1 Python 构造器显式参数(34 个)【稳定线+phase-cd】
+### 2.1 Python 构造器显式参数(34 个两线共有 + 2 个仅稳定线 v0.8.5.4)【稳定线+phase-cd】
 
 | 参数 | 默认值 | 单位 | 物理含义 / 进引擎后的派生 |
 |---|---|---|---|
@@ -137,6 +137,8 @@ Python 侧四个子类均以 `StiffGIPCError` 为基类,可 `from stiff_physics 
 | `pcg_tol` | `1e-4` | — | PCG 容差。[0.8.2] 回到 0.6.x 默认;1e-6 在 N=1 代价 ~22% 无精度收益;刚接触场景可 1e-8(env `STIFF_PCG_TOL` 亦可) |
 | `relative_dhat` | `1e-3` | — | 相对接触距离(乘场景 bbox 对角);dHat 派生见 §2.4 |
 | `absolute_dhat` | `0.0` | m | >0 时 **dHat = absolute_dhat²** 钉死,不随合并 bbox/env 数膨胀(多环境正确性关键);0 = legacy bbox 派生。**仅当 `relative_dhat > 0` 时生效**(§2.4) |
+| `absolute_epsv` 【仅稳定线 v0.8.5.4+;phase-cd 无】 | **`1e-4`**(v0.8.5.4 起,stable@c0339c8 engine.py:321;dc1a297 首版为 `0.0`) | m/s | IPC 摩擦 stiction 阈值 epsv 钉成绝对值:`fDhat = eff_epsv²`,eff_epsv ≤ 0 时才回落 legacy 的 `fDhat = 1e-4·eff_bboxDiagSize2`(即 epsv = sqrt(fDhat) = 1e-2·eff_scene_diag,1.9 m 场景 ≈ 19 mm/s)——stable@c0339c8 GIPC.cu:9498-9500。epsv 是接触物理不是几何:legacy 编码使**静摩擦精度随场景 bbox 变化**,持握 creep ≈ (load/(μ·λ))·epsv(§2.2 的 `fDhat = 1e-4·eff` 是这条 legacy 分支)。IPC 原文口径:默认 ~1e-3·l、静摩擦精度取 1e-5 m/s,epsv 越小 Newton 越贵(实测 1e-5 +12% step、1e-4 无可测成本)。逃生阀:`absolute_epsv=0` 或 `STIFF_EPSV=0` |
+| `friction_anchor` 【仅稳定线 v0.8.5.4+;phase-cd 无】 | **`True`**(v0.8.5.4 起,stable@c0339c8 engine.py:326;dc1a297 首版默认关) | — | 持久跨步摩擦锚(真静摩擦):每个 lagged 接触对携带累计切向弹性偏移 e,能量/梯度/Hessian 按 `u_total = relDX_step + e` 求值,静接触收敛到常值 u_total 而不再每步重新滑移;‖e‖ 封顶在 stiction 边界 `eps = sqrt(fDhat)·h`,触顶即 Coulomb 滑动(径向回拉)。锚按规范 pair key 跨步匹配(bit-pack int4 + cub merge-sort + 二分,确定性),地面对走逐顶点稠密数组;未匹配的新接触从 e=0 起(即 legacy 行为);`reset_transient_contact_state()` / teleport 清锚(stable@c0339c8 sim_engine.cu:3638-3640)。实现出处 stable@c0339c8 GIPC.cu:9615-9622(设计注释)、:9793(`clearFrictionAnchors`)、:9801(`carryFrictionAnchors`)、:9999(建对后每步调用)。**strict 多环境下默认被抑制**(批不变性,见 API_EXECUTION §2.1)。逃生阀:`friction_anchor=False` 或 `STIFF_FRIC_ANCHOR=0` |
 | `joint_strength_ratio` | `100.0` | — | fixed/URDF 关节约束刚度系数:`kappa = ratio·(m_parent+m_child)`,**无 dt² 因子**(setup_abd_system_gradient_and_hessian.cu:1245-1260) |
 | `revolute_driving_strength_ratio` | `100.0` | — | revolute 位置伺服刚度系数;有效 K = ratio·per-joint strength·(m_p+m_c)(§4.5) |
 | `semi_implicit_enabled` | `False` | — | 半隐式模式开关 |
@@ -162,7 +164,25 @@ Python 侧四个子类均以 `StiffGIPCError` 为基类,可 `from stiff_physics 
 | `per_env_exit` | `False` | — | 【多环境】per-env 解耦退出:各 env 按自身判据收敛并冻结/掩出;解析为 `STIFF_DECOUPLE_THRESH + STIFF_PERENV_ALPHA + STIFF_PERENV_MASK (+ STIFF_PERENV_TELEM)`(engine.py:516-526);显式 env var 仍赢。多环境生产推荐 `per_env_exit=True, env_newton_iter_cap=100`(CHANGELOG 0.8.5) |
 | `**kwargs` | — | — | 透传:native `_cfg` 有该属性名则 `setattr`,**无则静默忽略,无警告**(engine.py:442-444)——拼错参数名不会报错,是常见事故源 |
 
-构造细节:`newton_velocity_tol`/`absolute_dhat`/`max_*_step_per_frame` 用 `hasattr` 守卫写入(兼容旧 native);`gravity`/`ground_normal` 转 float64 np.array 写入。`Config.__repr__` 只显示 dt 与 density。
+构造细节:`newton_velocity_tol`/`absolute_dhat`/`max_*_step_per_frame` 用 `hasattr` 守卫写入(兼容旧 native);`gravity`/`ground_normal` 转 float64 np.array 写入。`Config.__repr__` 只显示 dt 与 density。`absolute_epsv`/`friction_anchor` 同样是 `hasattr` 守卫写入(stable@c0339c8 engine.py:388-391)——**这正是它们在旧 native 上静默失效的机制**,见下。
+
+> **v0.8.5.4 摩擦默认值变更(升级 wheel 前必读)**【仅稳定线 v0.8.5.4+;phase-cd 无】
+>
+> 稳定线在 v0.8.5.3 之后把两个摩擦旋钮**同时翻成默认开**(`dc1a297` 引入、`0894958` 翻默认、`c0339c8` 在 strict 抑制 anchor):`Config.absolute_epsv` 由 `0.0`(场景派生)改为 **`1e-4` m/s**,`Config.friction_anchor` 由关改为 **`True`**。这**不是兼容性修复,而是物理默认值变更:所有含摩擦的场景轨迹都会变**。既有脚本一行不改、只换 wheel,复现出的轨迹就不再和 0.8.5.3 逐位一致(§2.2 的 `fDhat` 公式也随之走 `epsv²` 分支)。
+>
+> - **动机(实测,非推演)**:flask_cap 双臂 finray 抓取–提升–保持 400 步,受力远在 μ=3.5 摩擦锥内,烧瓶仍在 6 s 保持段滑 3.7 mm、瓶盖锥体转 11–20°。根因两条:(a) legacy epsv 由场景尺度派生(1.9 m 场景 = 19 mm/s,是 IPC 论文默认 `1e-3·l` 的 10×、静精度值 1e-5 m/s 的 1900×);(b) lagged 摩擦的位移锚点每步重置,持握接触必须每步重新滑 `u* = (load/(μ·λ))·eps` 才能重建摩擦力 = 与 epsv 成正比的 stiction creep。
+> - **效果**:epsv=1e-5 单独把保持段滑移 3.71 mm → 0.05 mm(step +12%);两者同开(epsv=1e-4 + anchor)滑移 0.00 mm、盖倾角钉在 0.7–1.4°(legacy 11° 且仍在爬),逐步漂移 10 µm/帧 → 5e-12 m/帧(`STIFF_NEWTON_TRACE` 测得)。代价:release 口径 **+9% step**(动态段多解真实 stick-slip 的 Newton/PCG,保持段迭代数不变);`dc1a297` 优化前口径为 +30%。
+> - **回到 legacy(三选一,前两者按 CHANGELOG 口径可逐位还原 0.8.5.3)**:
+>   ```python
+>   Config(absolute_epsv=0.0, friction_anchor=False, ...)   # 代码内
+>   ```
+>   ```bash
+>   STIFF_EPSV=0 STIFF_FRIC_ANCHOR=0 python your_script.py   # 环境变量,进程级
+>   ```
+>   或直接装回 0.8.5.3 wheel。**两个必须同时关**——只关一个仍是新轨迹。环境变量优先于 Config(stable@c0339c8 GIPC.cu:9499、:9811)。
+> - **phase-cd 上没有这两个字段**:`Config(absolute_epsv=1e-4)` 会走 `**kwargs` 透传路径,`hasattr(self._cfg, ...)` 为假 → **静默忽略、无警告**(见表末 `**kwargs` 行),不会报错也不会生效;`STIFF_EPSV` / `STIFF_FRIC_ANCHOR` 在 phase-cd 未注册,会被 knob-registry tripwire 报 `unknown STIFF_* knob`(API_EXECUTION §7.0)。工程线要用真静摩擦,须走未合入的移植分支 `port/friction-anchor-086`(`c735e13` epsv、`57015da` anchors;分支现状与合入前提见 KNOWN_ISSUES §1.5 与 §1.1 修复状态栏)。
+> - **行号约定**:本条 `stable@c0339c8 <文件>:<行号>` 指稳定线 **commit `c0339c8` 的 blob**,不是该仓当前工作树——工作树被 8 个文件的未提交回退按在 v0.8.5.3(§版本口径的脆弱性警告),树上 grep `absolute_epsv` 为 0 命中。
+> - **发布状态未决**:tag/提交在稳定仓 git 历史里,公开仓是否挂 v0.8.5.4 wheel 未核实(OPEN_POINTS OP-001 / README §7#2);把 v0.8.5.4 行为写进依赖前先确认发布物。
 
 ### 2.2 dHat / 摩擦 dhat / dTol 派生(GIPC::init)【稳定线+phase-cd】
 
