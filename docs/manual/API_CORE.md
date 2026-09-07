@@ -755,7 +755,7 @@ q = [p, a1, a2, a3](12-DOF 仿射);矩阵约定 `mat4[:3,:3] = Aᵀ`、`mat4[:3,
 
 ### 7.6 `get_frame_status()` 【仅 phase-cd】
 
-返回 `FrameStatus`(39 个只读字段,bindings/pystiffgipc.cu:38-94):`result`(`FrameResult` 枚举:OK/RETRY_REQUIRED/FATAL/RUNTIME_ERROR)、`phase`、`invalid_bits`、`launch_status`、`error_code`、`path_flags`、`err_env/err_primitive/err_newton_iter/err_ls_iter`、工作计数(`substeps/newton_iters/pcg_iters/ls_trials`)、容量高水位(`hw_*` / `required_*`:dcd_pairs/ccd_pairs/triplets/unique_blocks/mas_clusters)、图审计(`root/terminal_graph_nodes`、`*_d2h_nodes`、`graph_launches/host_boundaries`)、数值(`final_alpha/final_energy/max_movement/cfl_alpha/kappa`)、`frame_id/attempt/retry_count/retry_invalid_bits`。`FramePhase/FrameInvalidBits/FramePathFlags/FrameErrorCode` 未注册为 Python enum,只有整型字段值。
+返回 `FrameStatus`(39 个只读字段,bindings/pystiffgipc.cu:38-93):`result`(`FrameResult` 枚举:OK/RETRY_REQUIRED/FATAL/RUNTIME_ERROR)、`phase`、`invalid_bits`、`launch_status`、`error_code`、`path_flags`、`err_env/err_primitive/err_newton_iter/err_ls_iter`、工作计数(`substeps/newton_iters/pcg_iters/ls_trials`)、容量高水位(`hw_*` / `required_*`:dcd_pairs/ccd_pairs/triplets/unique_blocks/mas_clusters)、图审计(`root/terminal_graph_nodes`、`*_d2h_nodes`、`graph_launches/host_boundaries`)、数值(`final_alpha/final_energy/max_movement/cfl_alpha/kappa`)、`frame_id/attempt/retry_count/retry_invalid_bits`。`FramePhase/FrameInvalidBits/FramePathFlags/FrameErrorCode` 未注册为 Python enum,只有整型字段值。
 
 ---
 
