@@ -98,7 +98,7 @@ A800 上 RL 微步经 GPU 驻留通道从 19.3 → 3.85 ms/步(**5.0×**,
 > **升级用户须知**:① 保持类场景会**明显变好**(flask_cap 400 步实测:保持段滑移 3.7 mm → **0.00 mm**,瓶盖锥体 11–20° → 钉在 0.7°),代价 step 时间 **+9%**;
 > ② 但**任何既有轨迹/回放/金锚/RL 策略都不再逐位复现**——需要复现旧结果就用上表的逃生阀;
 > ③ strict 多环境下 anchor 被**自动抑制**(anchor 与 `epsv=1e-4` 组合会把摩擦能量推到 N 形状相关的 line-search ulp 比较边界上,破坏批不变性;根修排入 0.8.6),因此**strict 与 merged/isolated 的摩擦行为不同**,跨模式对照时务必注意;
-> ④ wheel 资产是否已挂公开仓**待核实**(§7#2)——安装指令仍按 v0.8.5.3 给(§3.1)。
+> ④ **wheel 已挂公开仓**:Release `v0.8.5.4` 2026-08-11 正式发布,cp311/cp312 双 wheel 在架——安装指令已按 v0.8.5.4 给(§3.1)。
 >
 > **本手册的稳定线基线仍是 v0.8.5.3**:磁盘工作树内容与 tag `v0.8.5.3` 逐字节一致
 > (`git diff v0.8.5.3 --stat` 为空),下表所有 `[stable] 文件:行号` 均取自该内容。
@@ -111,7 +111,7 @@ A800 上 RL 微步经 GPU 驻留通道从 19.3 → 3.85 ms/步(**5.0×**,
 
 | 你是谁 | 用哪条线 | 理由 |
 |---|---|---|
-| wheel 用户 / 需要稳定复现实验 | **稳定线 v0.8.5.3** | 唯一确认发布 wheel 的版本;CHANGELOG 明言"不调用新 API 时轨迹与 0.8.5.2 完全一致"([stable] `CHANGELOG.md:7-13`)。⚠ 稳定线**最新**是 v0.8.5.4(见上方警示框):轨迹**不**与 0.8.5.3 一致 |
+| wheel 用户 / 需要稳定复现实验 | **稳定线 v0.8.5.3** | 要**接着旧结果往下跑**就钉这一版:CHANGELOG 明言"不调用新 API 时轨迹与 0.8.5.2 完全一致"([stable] `CHANGELOG.md:7-13`),wheel 仍在架可直接装(§3.1)。⚠ 稳定线**最新**是 v0.8.5.4(见上方警示框,同样已挂 wheel 且 README 安装 URL 已指向它):轨迹**不**与 0.8.5.3 一致——不加逃生阀就换 wheel 会静默换掉摩擦轨迹 |
 | 需要**长时保持抓取不蠕变**(装配、递交、堆叠、保持类评测) | **稳定线 v0.8.5.4** | 真静摩擦默认开(`absolute_epsv=1e-4` + 持久摩擦锚):保持段滑移 3.7 mm → 0.00 mm;两线的其它版本(含全部 phase-cd)都按 legacy 场景派生 epsv + 每步锚重置蠕变([KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.5/§1.6) |
 | 依赖接触**摩擦力读数**(触觉)的用户 | **稳定线 v0.8.5.3** | 摩擦读数恒零 bug 的修复(`snapshotFrictionForce`)与 `reset_transient_contact_state()` **只进了稳定线**;phase-cd 的 `get_vertex_contact_forces` friction_lagged/total 分量仍受恒零 bug 影响(未移植,见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)) |
 | 引擎/求解器开发 | **工程线 phase-cd** | v0.8.6 模块化布局、knob 注册表治理、22 段门禁基建 |
@@ -149,7 +149,7 @@ A800 上 RL 微步经 GPU 驻留通道从 19.3 → 3.85 ms/步(**5.0×**,
 > 上表第 1–15 行的稳定线列 = **v0.8.5.3 内容**(磁盘工作树与该 tag 逐字节一致,
 > `git diff v0.8.5.3 --stat` 为空;`git checkout`/`stash`/`reset` 会让工作区静默变成
 > v0.8.5.4 内容——[CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §6),
-> 第 16 行按 `git show HEAD:` 读 v0.8.5.4;v0.8.5.4 的 wheel 资产状态见 §7#2。
+> 第 16 行按 `git show HEAD:` 读 v0.8.5.4;v0.8.5.4 的 wheel 已正式挂出(cp311/cp312,§3.1)。
 
 ### 2.3 运行时探测你在哪条线
 
@@ -190,16 +190,25 @@ phase-cd 另有模块级 `stiff_physics.fem_model()` 与可导入异常类
 ### 3.1 wheel 安装(稳定线)
 
 【仅稳定线】发布 wheel 挂在公开仓 `github.com/haoxiangNtu/stiff-physics` 的 GitHub Release。
-URL 模板(按 v0.8.4 发布页格式,[stable] `README.md:24-27`;v0.8.5.3 资产文件名按同模板,见 §7 待核实项 1):
+**最新发布版为 v0.8.5.4**(`published: 2026-08-11T17:07:37Z`,非 draft/prerelease;
+`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验:
+`stiff_physics-0.8.5.4-cp311/cp312-linux_x86_64.whl` 两个资产均已挂出,公开仓
+README 的安装 URL 也已由提交 `a38ede4` 指向它)。⚠ **v0.8.5.4 默认开启真静摩擦**
+(`absolute_epsv=1e-4`、`friction_anchor=True`),**会改变所有含摩擦场景的轨迹**——
+从 v0.8.5.3 升级前请读 [PRINCIPLES_CONTACT.md](PRINCIPLES_CONTACT.md) §4.7 与
+[API_CORE.md](API_CORE.md) §2.1 的升级说明,需要旧行为时两个参数都要关。
 
 ```bash
 # 模板
 pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v<版本>/stiff_physics-<版本>-cp<ABI>-cp<ABI>-linux_x86_64.whl
 
-# v0.8.5.3,Python 3.11
+# v0.8.5.4(最新),Python 3.11
+pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.8.5.4/stiff_physics-0.8.5.4-cp311-cp311-linux_x86_64.whl
+# v0.8.5.4(最新),Python 3.12
+pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.8.5.4/stiff_physics-0.8.5.4-cp312-cp312-linux_x86_64.whl
+
+# v0.8.5.3(如需 legacy 摩擦行为的已发布版本)
 pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.8.5.3/stiff_physics-0.8.5.3-cp311-cp311-linux_x86_64.whl
-# v0.8.5.3,Python 3.12
-pip install https://github.com/haoxiangNtu/stiff-physics/releases/download/v0.8.5.3/stiff_physics-0.8.5.3-cp312-cp312-linux_x86_64.whl
 ```
 
 | 要求 | 值 | 出处 |
@@ -437,12 +446,15 @@ phase-cd 上会 WARN);静音默认开(`CASE39_QUIET=1`)。
 
 ## 7. 本篇待核实项
 
-1. v0.8.5.3 wheel 的 Release 资产文件名按 v0.8.4 发布页模板推断
-   (cp311/cp312 已由发布记录确认),下载 URL 未逐字节验证。
-2. 稳定线最新版本 tag `v0.8.5.4`(absolute_epsv / friction_anchor 真静摩擦,§2)
-   **是否已挂公开仓 wheel 未验证**——版本本体已亲验(`pyproject.toml` = `0.8.5.4`、
-   CHANGELOG [0.8.5.4] 条目在 `git show HEAD:CHANGELOG.md:7-44`),但磁盘工作树
-   被回退到 v0.8.5.3 内容,§3.1 的安装指令因此仍按 v0.8.5.3 给(OPEN_POINTS OP-001)。
+1. ~~v0.8.5.3 wheel 的 Release 资产文件名按 v0.8.4 发布页模板推断~~ **已关闭**:
+   `gh release view v0.8.5.3 / v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验,两版资产名
+   均为 `stiff_physics-<版本>-cp311/cp312-linux_x86_64.whl`,§3.1 的下载 URL 与之逐字节
+   一致(OPEN_POINTS OP-018)。
+2. ~~稳定线最新版本 tag `v0.8.5.4` 是否已挂公开仓 wheel~~ **已关闭**:Release `v0.8.5.4`
+   已正式发布(`published: 2026-08-11T17:07:37Z`,非 draft/prerelease),cp311/cp312
+   **双 wheel 均已挂出**,公开仓 README 安装 URL 已由提交 `a38ede4` 指向 v0.8.5.4,
+   §3.1 随之改按 v0.8.5.4 给(OPEN_POINTS OP-001)。**与发布无关的一件事仍成立**:
+   稳定仓磁盘工作树被回退到 v0.8.5.3 内容,故本册稳定线行号仍是 v0.8.5.3 口径(§2.2)。
 3. ~~`examples/fix_obj_winding.py` 的实际位置~~ **已关闭**:文件在两树的
    `tools/fix_obj_winding.py`(亲验存在);`case_26_perf_tuned.py` docstring 的
    `examples/` 前缀过时(§6)。

@@ -23,11 +23,13 @@
   发布点 **tag `v0.8.5.3` = commit `b8e27a1`**(2026-08-11 发布;公开仓
   `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel,CUDA 架构 sm_80/89/120)。
   文件布局为重构前单体(`StiffGIPC/GIPC.cu`)。
-  注:该仓库工作树在 v0.8.5.3 之后还有未发布的摩擦线提交(tag `v0.8.5.4`
+  注:该仓库工作树在 v0.8.5.3 之后还有摩擦线提交(tag `v0.8.5.4`
   "default-on true static friction" 等);本分册的**默认承诺面仍是 v0.8.5.3**,
   v0.8.5.4 的静摩擦/friction-anchor 行为一律按【仅稳定线 v0.8.5.4+】单独标注
-  (旋钮见 §7.4/§7.5,strict 交互见 §2.1,参数与升级影响见 API_CORE §2.1),
-  其**对外发布状态仍待核实**(附录 A#2 / OPEN_POINTS OP-001)。
+  (旋钮见 §7.4/§7.5,strict 交互见 §2.1,参数与升级影响见 API_CORE §2.1)。
+  v0.8.5.4 **已正式对外发布**(2026-08-11T17:07:37Z,cp311/cp312 双 wheel 均已挂出;
+  附录 A#2 / OPEN_POINTS OP-001 已关闭)——读者拿到的 wheel 可能已是 v0.8.5.4,
+  本分册按 v0.8.5.3 给的摩擦默认值届时需按【仅稳定线 v0.8.5.4+】标注改读。
   更正一处旧勘探口径:CHANGELOG `[0.8.5.4]` 条目在提交 `0894958`/`c0339c8` 里
   **是存在的**,只是被工作树那 8 个文件的未提交回退一并撤了,故树上看不到。
 - **工程线(phase-cd)** = 仓库 `Stiff-GIPC-c1-ls-graph`,分支 `codex/phase-cd`,
@@ -1363,14 +1365,16 @@ env_newton_iter_cap:中毒 env 冻结不炸进程)、`test_env_midrun_quarantine
 1. **per-env 遥测在纯设备快路径下的返回值**:`get_per_env_newton_iters/status` 在
    `STIFF_PERENV_TELEM=0` 且 `env_newton_iter_cap=0` 时返回 reset 值(-1/0)——
    由"host S1 路径才填"的代码路径推理得出,未运行程序验证(§1.8)。
-2. **稳定线 v0.8.5.4 的对外发布状态**(收窄:行为本身已勘探)。提交 `dc1a297`
+2. **稳定线 v0.8.5.4 的对外发布状态(已核实关闭,2026-09-08)**。提交 `dc1a297`
    (`absolute_epsv` + persistent friction anchors)、`0894958`(两者默认开,含
    CHANGELOG `[0.8.5.4]` 条目)、`c0339c8`(strict 抑制 anchor)在稳定仓 git 历史里,
    行为与旋钮已按【仅稳定线 v0.8.5.4+】写入 §2.1 / §7.4 / §7.5 与 API_CORE §2.1。
-   **仍待核实的只剩两件**:(a) 公开仓 `github.com/haoxiangNtu/stiff-physics` 是否
-   已挂 v0.8.5.4 wheel 资产(OPEN_POINTS OP-001);(b) 该 tag 是否会被撤回/重做——
-   稳定仓工作树至今被 8 个文件的未提交回退按在 v0.8.5.3(连 CHANGELOG 条目一起撤了),
-   这是"已提交但尚未认账"的状态,不是普通的已发布。承诺 v0.8.5.4 行为前先确认发布物。
+   **发布物已确认**:公开仓 `github.com/haoxiangNtu/stiff-physics` 的 Release
+   `v0.8.5.4` 已正式发布(`published: 2026-08-11T17:07:37Z`,`draft:false`/
+   `prerelease:false`),`stiff_physics-0.8.5.4-cp311/cp312-linux_x86_64.whl`
+   两个资产均已挂出,公开仓 README 安装 URL 也已由 `a38ede4` 指向 v0.8.5.4——
+   **未撤回、未重做**(OPEN_POINTS OP-001 已关闭)。稳定仓工作树仍被 8 个文件的
+   未提交回退按在 v0.8.5.3(含 CHANGELOG 条目),那是**工作树状态**,与发布无关。
 3. **`get_body_contact_force` 的 ground 口径矛盾**:Python docstring 称
    "no ground contact",但 C++ 实现(03_step_getters_export.inl:1174)实际调用了
    `computeGroundGradient`——倾向以代码为准(含 ground),文档口径待项目定夺。

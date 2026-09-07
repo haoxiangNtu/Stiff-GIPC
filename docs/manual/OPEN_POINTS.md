@@ -9,6 +9,7 @@
 > 汇总口径出自 [`../manual_review_gaps.md`](../manual_review_gaps.md) §4(2026-09-07)。
 
 状态取值:`open`(未决)/ `closed`(已关闭,附证据)。
+**当前统计:37 条 = 34 open / 3 closed**(最近关闭:OP-001、OP-018,2026-09-08;OP-003,2026-09-07)。
 
 ---
 
@@ -16,7 +17,7 @@
 
 | 编号 | 描述 | 出处 | 验证方法建议 | 状态 |
 |---|---|---|---|---|
-| OP-001 | 稳定仓 tag `v0.8.5.4`(absolute_epsv / friction_anchor 真静摩擦)是否已对外发布 wheel / 是否已撤回 | README §7#2、API_CORE 版本口径、API_EXECUTION 附 A#2、KNOWN_ISSUES §6#2、CHANGELOG_TIMELINE §8#1、PRINCIPLES_EXECUTION §0 | 向 owner 确认发布意图;并查公开仓 `github.com/haoxiangNtu/stiff-physics` Releases 页是否挂 v0.8.5.4 资产 | open |
+| OP-001 | 稳定仓 tag `v0.8.5.4`(absolute_epsv / friction_anchor 真静摩擦)是否已对外发布 wheel / 是否已撤回 | README §7#2、API_CORE 版本口径、API_EXECUTION 附 A#2、KNOWN_ISSUES §6#2、CHANGELOG_TIMELINE §8#1、PRINCIPLES_EXECUTION §0 | **已关闭(2026-09-08):v0.8.5.4 已正式发布,未撤回。**`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验:`published: 2026-08-11T17:07:37Z`、`draft: false`、`prerelease: false`,资产 `stiff_physics-0.8.5.4-cp311/cp312-linux_x86_64.whl` **两个 wheel 均已挂出**;公开仓 README 安装 URL 已由提交 `a38ede4`("Bump install URLs to v0.8.5.4 (true static friction default-on)")指向 v0.8.5.4 | closed |
 | OP-002 | phase-cd 摩擦读数恒零(friction_lagged 分量)的**运行时**实测确认——代码结构已证(无 `snapshotFrictionForce`、accessor 提交后现算) | KNOWN_ISSUES §6#3、PRINCIPLES_CONTACT §9#5、CHANGELOG_TIMELINE §8#5、PRINCIPLES_DYNAMICS 附 C#11、API_EXECUTION 头部 | phase-cd 构建上跑一次剪切台实验,确认 `get_vertex_contact_forces(components=1)` 恒零;移植后以稳定线滑比 0.600±0.008 @ μ=0.6 为验收基准 | open |
 | OP-003 | `fix_obj_winding.py` 的实际位置(`case_26_perf_tuned.py` docstring 写 `examples/` 前缀,该处不存在) | README §7#3、API_EXECUTION 附 A#7 | 已亲验:文件在**两树** `tools/fix_obj_winding.py`,docstring 路径前缀过时(manual_review_gaps §2.2#2) | closed |
 | OP-004 | `replay_case39_UMI_obb_cup_shirt_forcegrip.py` 代码默认 `CASE39_GRIP_MODE="trackgrip"` 的语义,与 docstring 五模式列表不一致(旧线对照示例,低优先) | README §7#4、README §6 | 读脚本 trackgrip 分支实现,与 docstring 对照后二选一修正 | open |
@@ -38,7 +39,7 @@
 | OP-015 | per-env 遥测在纯设备快路径下的返回值(推理未运行验证) | API_EXECUTION §1.8/附 A#1 | `prepare_gpu_rl` 快路径跑一段,读 per-env 遥测字段与宿主通道对照 | open |
 | OP-016 | `m_avg_env_bbox2` 回退分支的触达条件 | API_EXECUTION 附 A#5 | 审阅该成员全部写点/读点;构造空 env 或极端 bbox 场景触发回退分支 | open |
 | OP-017 | gpu_rl `joint_observations` 的字节级打包布局 | API_EXECUTION 附 A#6 | torch 零拷贝视图读出与宿主 getter 逐字段比对 | open |
-| OP-018 | v0.8.5.3 wheel Release 资产文件名按 v0.8.4 发布页模板推断,下载 URL 未逐字节验证 | README §7#1 | 访问 Release 页(或 `curl -I` 该 URL)逐字节核对资产名 | open |
+| OP-018 | v0.8.5.3 wheel Release 资产文件名按 v0.8.4 发布页模板推断,下载 URL 未逐字节验证 | README §7#1 | **已关闭(2026-09-08)**:`gh release view v0.8.5.3 --repo haoxiangNtu/stiff-physics` 亲验资产 = `stiff_physics-0.8.5.3-cp311-cp311-linux_x86_64.whl` / `-cp312-cp312-`(v0.8.5.4 同模板),README §3.1 的下载 URL 与之逐字节一致 | closed |
 | OP-019 | `newton_velocity_tol` 的 uipc 参考默认 0.05 只来自注释 | API_CORE §2.1 | 查 uipc 上游源码/文档确认默认值 | open |
 
 ## C. 原理/机制类

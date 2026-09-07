@@ -182,7 +182,7 @@ Python 侧四个子类均以 `StiffGIPCError` 为基类,可 `from stiff_physics 
 >   或直接装回 0.8.5.3 wheel。**两个必须同时关**——只关一个仍是新轨迹。环境变量优先于 Config(stable@c0339c8 GIPC.cu:9499、:9811)。
 > - **phase-cd 上没有这两个字段**:`Config(absolute_epsv=1e-4)` 会走 `**kwargs` 透传路径,`hasattr(self._cfg, ...)` 为假 → **静默忽略、无警告**(见表末 `**kwargs` 行),不会报错也不会生效;`STIFF_EPSV` / `STIFF_FRIC_ANCHOR` 在 phase-cd 未注册,会被 knob-registry tripwire 报 `unknown STIFF_* knob`(API_EXECUTION §7.0)。工程线要用真静摩擦,须走未合入的移植分支 `port/friction-anchor-086`(`c735e13` epsv、`57015da` anchors;分支现状与合入前提见 KNOWN_ISSUES §1.5 与 §1.1 修复状态栏)。
 > - **行号约定**:本条 `stable@c0339c8 <文件>:<行号>` 指稳定线 **commit `c0339c8` 的 blob**,不是该仓当前工作树——工作树被 8 个文件的未提交回退按在 v0.8.5.3(§版本口径的脆弱性警告),树上 grep `absolute_epsv` 为 0 命中。
-> - **发布状态未决**:tag/提交在稳定仓 git 历史里,公开仓是否挂 v0.8.5.4 wheel 未核实(OPEN_POINTS OP-001 / README §7#2);把 v0.8.5.4 行为写进依赖前先确认发布物。
+> - **已发布(v0.8.5.4,双 wheel)**:公开仓 Release `v0.8.5.4` 已正式发布(2026-08-11T17:07:37Z,非 draft/prerelease),`cp311`/`cp312` 两个 wheel 均已挂出,README 安装 URL 也已指向它(`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验;OPEN_POINTS OP-001 已关闭)。**但"可以装"不等于"可以随手升"**:装上 v0.8.5.4 就是上表的新默认值,**所有含摩擦场景的轨迹都会变**——既有回放/金锚/RL 策略要逐位复现,升级时必须同时给上面的两个逃生阀。
 
 ### 2.2 dHat / 摩擦 dhat / dTol 派生(GIPC::init)【稳定线+phase-cd】
 

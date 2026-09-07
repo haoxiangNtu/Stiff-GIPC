@@ -200,7 +200,9 @@
 
 **稳定线最新版本。** 单一主题：**真静摩擦（true stiction）**——把持握场景的静摩擦蠕滑（stiction creep）从"结构性缺陷"变成"默认修好"。
 
-- **tag 落点**：`c0339c8`（2026-08-12 01:05 +0800，strict 抑制 anchor 的收尾提交；符合 §1.3 的落点惯例）；**release 提交本体** `0894958`（2026-08-12 00:12 +0800，"release(v0.8.5.4): default-on true static friction"）。版本号 `pyproject.toml:7` = `0.8.5.4`、CHANGELOG 条目 `CHANGELOG.md:7-44`。⚠ **本条目的全部稳定仓行号取自 `git show HEAD:<file>`**，不是磁盘文件——工作树被 8 个文件的已暂存回退改动钉在 v0.8.5.3 内容上（见 §6），磁盘副本里这些代码与 CHANGELOG 条目都不存在。
+- **tag 落点**：`c0339c8`（2026-08-12 01:05 +0800，strict 抑制 anchor 的收尾提交；符合 §1.3 的落点惯例）；**release 提交本体** `0894958`（2026-08-12 00:12 +0800，"release(v0.8.5.4): default-on true static friction"）。版本号 `pyproject.toml:7` = `0.8.5.4`、CHANGELOG 条目 `CHANGELOG.md:7-44`。
+- **对外发布**：公开仓 `github.com/haoxiangNtu/stiff-physics` 的 Release `v0.8.5.4`（标题 "v0.8.5.4 — true static friction (default-on)"）**已正式发布**，`published: 2026-08-11T17:07:37Z`（= 2026-08-12 01:07 +0800，紧跟 tag 提交），`draft:false`/`prerelease:false`；资产 **cp311/cp312 双 wheel**：`stiff_physics-0.8.5.4-cp311-cp311-linux_x86_64.whl`、`stiff_physics-0.8.5.4-cp312-cp312-linux_x86_64.whl`。公开仓 README 的安装 URL 已由 `a38ede4` 指向 v0.8.5.4（`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验；OPEN_POINTS OP-001 已关闭）。
+- ⚠ **本条目的全部稳定仓行号取自 `git show HEAD:<file>`**，不是磁盘文件——工作树被 8 个文件的已暂存回退改动钉在 v0.8.5.3 内容上（见 §6），磁盘副本里这些代码与 CHANGELOG 条目都不存在。
 - **⚠ 行为警示（升级必读）**：两个新默认值**改变所有含摩擦场景的轨迹**——不是"不调用新 API 就一致"的那类补丁版（对比 v0.8.5.3 的兼容承诺，§2.4）。逐位回到 0.8.5.3 需显式关掉两者。
 
 **组成提交**（4 条，`git log v0.8.5.3..v0.8.5.4` 亲验）：
@@ -535,7 +537,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 ## 6. 稳定线 v0.8.5.3 之后的提交明细与工作树状态
 
 > **本节定位已更新**：这 4 条提交构成正式版本 **v0.8.5.4**，其版本条目见 **§2.5**；本节保留为**提交级明细 + 工作树状态记录**。
-> 仍需注意的两件事：① **磁盘工作树被回退到与 v0.8.5.3 逐字节一致**（`git diff v0.8.5.3 --stat` 为空 + 8 个文件的已暂存回退修改，亲验）——`git checkout`/`stash`/`reset` 任一操作都会让工作区静默变成 v0.8.5.4 内容；本手册的稳定线**行号**因此一律取自 v0.8.5.3 内容（v0.8.5.4 独有行号在 §2.5 里按 `git show HEAD:` 标注）。② **wheel 资产是否已挂公开仓仍待核实**（§8 #1 / OPEN_POINTS OP-001）——"版本存在"与"发布物存在"是两件事。
+> 仍需注意的两件事：① **磁盘工作树被回退到与 v0.8.5.3 逐字节一致**（`git diff v0.8.5.3 --stat` 为空 + 8 个文件的已暂存回退修改，亲验）——`git checkout`/`stash`/`reset` 任一操作都会让工作区静默变成 v0.8.5.4 内容；本手册的稳定线**行号**因此一律取自 v0.8.5.3 内容（v0.8.5.4 独有行号在 §2.5 里按 `git show HEAD:` 标注）。② **wheel 资产已确认挂出**（§8 #1 / OPEN_POINTS OP-001 已关闭）：Release `v0.8.5.4` 2026-08-11 正式发布、cp311/cp312 双 wheel 在架——"版本存在"与"发布物存在"这次两件都成立，只有工作树还停在 v0.8.5.3。
 
 组成提交明细（`CHANGELOG.md:7-44` 的 0.8.5.4 条目只存在于 `git show HEAD:CHANGELOG.md`，磁盘副本因回退而无此条目）：
 
@@ -556,7 +558,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 |---|---|---|
 | 工程线分支 `codex/phase-cd` | **未推送远端**——全部 v0.8.5 后工程化工作（209 条提交）只存在于本地仓库 | `git branch -a` 无 `origin/codex/phase-cd` |
 | v0.8.6 | **未发布**——HEAD `b3ab747` 未打 tag；`v0.8.6-rc1-internal`/`rc2-internal` 是内部 tag，仅私仓；`pyproject.toml` 版本号 `0.8.6rc2` 是内部标识 | `git tag --merged HEAD`；pyproject.toml:7 |
-| 稳定线最新版本 | **v0.8.5.4**（tag `c0339c8`，2026-08-12，`pyproject.toml:7` = `0.8.5.4`）——真静摩擦默认开，**改变所有含摩擦场景轨迹**（§2.5）。**已确认挂 wheel 的是 v0.8.5.3**（公开仓 `github.com/haoxiangNtu/stiff-physics`，cp311/cp312，sm_80/89/120）；v0.8.5.4 的 Release 资产状态见 §8 #1 | 稳定仓 tag `v0.8.5.4`/`v0.8.5.3`；`git show HEAD:pyproject.toml` |
+| 稳定线最新版本 | **v0.8.5.4**（tag `c0339c8`，2026-08-12，`pyproject.toml:7` = `0.8.5.4`）——真静摩擦默认开，**改变所有含摩擦场景轨迹**（§2.5）。**已正式发布**：公开仓 `github.com/haoxiangNtu/stiff-physics` Release `v0.8.5.4`（2026-08-11 发布）挂 cp311/cp312 双 wheel，README 安装 URL 已指向它；v0.8.5.3 的 wheel 仍在架可回退（cp311/cp312，sm_80/89/120） | 稳定仓 tag `v0.8.5.4`/`v0.8.5.3`；`git show HEAD:pyproject.toml`；`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` |
 | 两线 Python 包名 | 同为 `stiff-physics`/`stiff_physics`，**不能并存于同一环境**；探测：`hasattr(engine, "reset_transient_contact_state")` = 稳定线；`hasattr(engine, "prepare_gpu_rl")` = phase-cd；或 `importlib.metadata.version` = `0.8.5.3` vs `0.8.6rc2` | 两树 pyproject.toml / 绑定名字级 diff |
 | 稳定线 → phase-cd 未移植项（**三项**） | ① 接触力摩擦读数修复（`snapshotFrictionForce`）② `reset_transient_contact_state` ③ **v0.8.5.4 真静摩擦**（`absolute_epsv` + `friction_anchor`，§2.5）——从稳定线迁到工程线的用户须知：`get_vertex_contact_forces` 的 `friction_lagged`/`total` 分量在 phase-cd 上仍恒零，且长时保持抓取会按 legacy 场景派生 epsv 蠕滑。清单与移植路径见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.0 | grep `snapshotFrictionForce` / `absolute_epsv` / `friction_anchor` 在 phase-cd 零命中 |
 | 工程线 CHANGELOG | phase-cd 树的 `CHANGELOG.md` 止于 0.8.5.1——0.8.5.2/0.8.5.3 条目只在稳定线树；v0.8.6 发布时需合并两树 CHANGELOG 并补 0.8.5.2+ 条目 | 两树 CHANGELOG grep |
@@ -565,7 +567,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 
 ## 8. 本文未决点（待核实清单）
 
-1. **v0.8.5.4 的 wheel 资产状态**（版本本身已按正式版本收录，§2.5）：tag `v0.8.5.4` 落在 `c0339c8`、`pyproject.toml` 已是 `0.8.5.4`、CHANGELOG 有完整 [0.8.5.4] 条目（`git show HEAD:CHANGELOG.md:7-44`），但**磁盘工作树被刻意回退到 v0.8.5.3 内容**，公开仓 Releases 页是否挂 v0.8.5.4 的 cp311/cp312 wheel 未查证。安装指令仍以 v0.8.5.3 为准（README §3.1），升级前向 owner 确认（OPEN_POINTS OP-001）。
+1. ~~**v0.8.5.4 的 wheel 资产状态**~~ **已关闭（2026-09-08）**：公开仓 Release `v0.8.5.4` 已正式发布（`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验：`published: 2026-08-11T17:07:37Z`，`draft:false`/`prerelease:false`），`stiff_physics-0.8.5.4-cp311/cp312-linux_x86_64.whl` **两个 wheel 均已挂出**，公开仓 README 的安装 URL 也已由提交 `a38ede4`（"Bump install URLs to v0.8.5.4 (true static friction default-on)"）指向它——**未撤回**。README §3.1 的安装指令已改按 v0.8.5.4 给（OPEN_POINTS OP-001 已关闭）。版本本体此前即已亲验：tag `v0.8.5.4` 落在 `c0339c8`、`pyproject.toml` = `0.8.5.4`、CHANGELOG 有完整 [0.8.5.4] 条目（`git show HEAD:CHANGELOG.md:7-44`）。（磁盘工作树被回退到 v0.8.5.3 内容是另一回事，见 §6。）
 2. **beaker +7% 破案的证据锚**：结论（纯启动段 ~0.3–0.6 s、每帧持平）见 [`../SIMULATOR_EXECUTION_DESIGN.md`](../SIMULATOR_EXECUTION_DESIGN.md):123 与工作记忆，但 v0.8.5..HEAD 提交史中**没有对应的破案提交**；每帧持平的原始数据文件未定位到具体行。
 3. **成对审计的分布细分**："B' 9342±230 vs 宿主 8808±60（15σ）"与"+6% 壳效应 / +4% 图化增量"的拆分出自 `4219f37` 提交正文与工作记忆合读；提交正文亲验部分只确认"+1.0% 同态差"与"869/1550 位级相等"。引用 ± 数字前应 `git show 4219f37` 核对完整 body。
 4. **tag 打在 release 提交后一条的惯例**（§1.3 三例）：是仓库惯例还是三次巧合，未向 owner 确认。

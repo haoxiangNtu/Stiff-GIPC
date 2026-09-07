@@ -145,7 +145,7 @@
 | 根因 | IPC 摩擦平滑化阈值(epsv·h)由场景尺度派生:能量端一步内"静止"切向位移阈值 `eps = √fDhat · dt`,而 `fDhat = 1e-4 · eff_bboxDiagSize²`(`gipc_modules/09_friction_sets_host_mem.inl:613`、`energy/16_friction.inl:830,852`),即 **epsv ≈ 1e-2 × 有效场景对角线 [m/s]**。IPC 论文对静摩擦精度的建议量级是 1e-5;场景越大阈值越松,静止区内二次能量对切向滑移的抵抗越弱。 |
 | 影响面 | 所有依赖长时间静摩擦持握精度的场景(抓取保持、堆叠)。 |
 | 规避方法 | ① 减小 `absolute_dhat`/场景有效对角线可等比例收紧 eps(副作用是接触整体变硬,须回归验证)。② 缩短评估窗口,或在控制层做位置伺服补偿。 |
-| 修复状态 | **稳定线 v0.8.5.4 已修复并默认开**(提交 `dc1a297`/`0894958`):`absolute_epsv` 旋钮(Python `Config` 默认 1e-4 m/s)+ 持久摩擦锚 `friction_anchor`(默认 True,真静摩擦:flask_cap 保持段滑移 3.7 mm→0.00 mm,step 成本 +9%;后续 `c0339c8` 在 strict 多环境默认抑制 anchor)。详见 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5。**但该修复不在 v0.8.5.3 磁盘内容、也不在 phase-cd**(两树 grep `absolute_epsv`/`friction_anchor` 均 0 命中)——工程线侧的影响与规避见 §1.6;v0.8.5.4 的 wheel 资产状态见 §6#2。 |
+| 修复状态 | **稳定线 v0.8.5.4 已修复并默认开**(提交 `dc1a297`/`0894958`):`absolute_epsv` 旋钮(Python `Config` 默认 1e-4 m/s)+ 持久摩擦锚 `friction_anchor`(默认 True,真静摩擦:flask_cap 保持段滑移 3.7 mm→0.00 mm,step 成本 +9%;后续 `c0339c8` 在 strict 多环境默认抑制 anchor)。详见 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5。**但该修复不在 v0.8.5.3 磁盘内容、也不在 phase-cd**(两树 grep `absolute_epsv`/`friction_anchor` 均 0 命中)——工程线侧的影响与规避见 §1.6;v0.8.5.4 已正式发布并挂出 cp311/cp312 双 wheel(§6#2)。 |
 
 ### 1.6 phase-cd:未移植 v0.8.5.4 真静摩擦(长时保持抓取蠕变)
 
@@ -454,7 +454,7 @@ Raise Config.line_search_max_iter, reduce dt, or soften the drive.
 以下陈述在本册标注"待核实",不作为承诺引用:
 
 1. **"folded 布料 44 万 mollify 请求 / 0 执行"** 的具体计数出自战役记录,本次代码勘探确认了机制(请求被计数、`smooth=false` 使执行为零)但未复测该数字(§1.3)。
-2. **v0.8.5.4 的 wheel 资产状态**(版本本身已确认:tag `c0339c8`、`pyproject.toml` = `0.8.5.4`、`git show HEAD:CHANGELOG.md:7-44` 有完整 [0.8.5.4] 条目):公开仓 Releases 页是否挂 cp311/cp312 wheel 未查证,且磁盘工作区已回退到 v0.8.5.3 内容;按 v0.8.5.4 行为(`absolute_epsv`/`friction_anchor`/`STIFF_EPSV`)交付前须确认发布物(§1.5、§1.6;OPEN_POINTS OP-001)。
+2. ~~**v0.8.5.4 的 wheel 资产状态**~~ **已关闭(2026-09-08)**:公开仓 Release `v0.8.5.4` 已正式发布(`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验:`published: 2026-08-11T17:07:37Z`、非 draft/prerelease),`stiff_physics-0.8.5.4-cp311/cp312-linux_x86_64.whl` **两个 wheel 均已挂出**,公开仓 README 安装 URL 也已由提交 `a38ede4` 指向它(OPEN_POINTS OP-001 已关闭)。版本本体此前即已确认(tag `c0339c8`、`pyproject.toml` = `0.8.5.4`、`git show HEAD:CHANGELOG.md:7-44` 有完整 [0.8.5.4] 条目)。**仍需注意**(与发布状态无关):磁盘工作区被回退到 v0.8.5.3 内容,故本册稳定线行号仍是 v0.8.5.3 口径;而拿到 v0.8.5.4 wheel 的用户默认就在真静摩擦轨迹上(§1.5、§1.6)。
 3. **phase-cd 摩擦读数恒零**已由代码结构证实(无 snapshotFrictionForce、accessor 提交后现算)并与稳定线 `1bc13ef` 诊断同构,但未在 phase-cd 上跑剪切台复测数值(§1.1);移植后应以稳定线的滑比验证(0.600±0.008 @ μ=0.6)为验收基准。
 4. ~~**硬钉链式法则缺失(§1.4)在稳定线的存在性**~~ **已核实(2026-09-07)**:稳定线单体 GIPC.cu 含逐字相同的 KNOWN LIMITATION 注释与活代码路径(stable `GIPC.cu:13894-13906`、`[M3.5] WARN` 在 `:13787`),并经 `add_fem_pin_to_abd` / `add_fem_pins_with_local_pos` 公开绑定可达——§1.4 已改标【稳定线+phase-cd】。
 5. 稳定线 v0.8.5.3 的 line-search WARN 行号(stable `GIPC.cu:15221`)与 grow-redo 行号(stable `GIPC.cu:10318` 等)出自勘探笔记的当日核对,复引前建议 grep 复核(单体文件行号对补丁敏感)。
