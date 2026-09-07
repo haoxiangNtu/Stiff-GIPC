@@ -8,7 +8,7 @@
 
 | 线 | 仓库 | 分支 / HEAD | 说明 |
 |---|---|---|---|
-| **稳定线** | `/home/ps/Downloads/Stiff-GIPC-stable-08` | `release/stable-0.8`,tag **v0.8.5.3**(`b8e27a1`,2026-08-11 发布) | 重构前单体布局(`StiffGIPC/GIPC.cu` 1.6 万+ 行);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel(CUDA `sm_80/89/120`) |
+| **稳定线** | `/home/ps/Downloads/Stiff-GIPC-stable-08` | `release/stable-0.8`;**分支 HEAD = `c0339c8` = tag v0.8.5.4**,但工作树内容经 8 个未提交回退 == tag **v0.8.5.3**(`b8e27a1`)——本册 `stable:` 行号按 v0.8.5.3 内容,偏移为零;工作树状态脆弱,勿 checkout/stash/reset(详见 README §2 与 AUDIT_LEDGER §2.5) | 重构前单体布局(`StiffGIPC/GIPC.cu` 1.6 万+ 行);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel(CUDA `sm_80/89/120`) |
 | **工程线(phase-cd)** | `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph` | `codex/phase-cd`,HEAD `b3ab747` | v0.8.6 模块化重构 + 整帧 CUDA Graph + GPU 驻留 RL 等全部 v0.8.5 后工作 |
 
 - 未注明的 `文件:行号` 均指 phase-cd 树 `StiffGIPC/` 下的路径;稳定线行号写作 `stable:GIPC.cu:NNNN`(指向该树 `StiffGIPC/GIPC.cu` 的 v0.8.5.3 内容)。
@@ -268,7 +268,7 @@ per-env S1 alpha(每 env 独立 ground/narrow α、per-env CCD 搜索用各 env 
 
 | 旋钮 | 作用 | 默认 | 合法域 | 出处 | 适用线 |
 |---|---|---|---|---|---|
-| `STIFF_CCD_SLACK_A` | ground ACCD slackness(η = 1−slack) | **0.9** | (0,1) | `GIPC.cuh:66-72` | 【仅 phase-cd】(稳定线硬编码 0.9,`stable:GIPC.cu:15850`) |
+| `STIFF_CCD_SLACK_A` | ground 解析步长的**直接乘子**:`α = slack·(dist/coef)`(`07_energy_alpha_reductions.inl:60-61`)。**ground 路径不走 ACCD、不存在 η**;η=1−slack 的语义只属于 self/swept 路径(见 SLACK_M 行与 §3.5) | **0.9** | (0,1) | `GIPC.cuh:66-72` | 【仅 phase-cd】(稳定线硬编码 0.9,`stable:GIPC.cu:15850`) |
 | `STIFF_CCD_SLACK_M` | self/swept ACCD slackness | **0.8** | (0,1) | `GIPC.cuh:83-84` | 【仅 phase-cd】(稳定线硬编码 0.8,同上) |
 | `STIFF_CCD_CFL_FACTOR` | CFL **cap** 系数(floor 恒 0.5) | **0.5** | (0,8] | `GIPC.cuh:95-98` | 【仅 phase-cd】(稳定线固定 0.5) |
 
@@ -735,7 +735,7 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n,
 void SimEngine::reset_transient_contact_state();
 ```
 
-(实现 `stable:sim_engine.cu:3620-3636`;pybind `bindings/pystiffgipc.cu:422`;Python `engine.py:941-952`。)
+(实现 `stable:sim_engine.cu:3620-3636`;pybind `stable:bindings/pystiffgipc.cu:422`;Python `stable:engine.py:941-952`——该 API 仅稳定线,三个锚点全在稳定树;phase-cd 的 `engine.py:941-952` 是无关的 `add_prismatic_joint`。)
 
 - **参数**:无。**返回**:无。
 - **语义**:就地 episode 重置用。执行:`h_cpNum[0..4]=0; h_cpNum_last[0..4]=0; h_gpNum=0; h_gpNum_last=0; m_have_fric_snap=false; Kappa=0.0`。
@@ -751,7 +751,7 @@ void SimEngine::reset_transient_contact_state();
 |---|---|---|---|---|---|
 | `get_vertex_contact_force_sum(offset,count)`(Python 名 `get_body_contact_force`) | **legacy:raw 梯度**(`dE/dx = −F·dt²`) | 含(C++ 实现调了 `computeGroundGradient`,`03:1174`;Python docstring 称"no ground"——以代码为准,见 §9) | 无 | pre-0.8.4 兼容;每调用重建 BVH+CP | 【稳定线+phase-cd】 |
 | `get_body_contact_force_batched(starts,counts)` | raw 梯度 | 无 | 无 | 一 block 一 segment,env 间零共享;整批 1 kernel + 1 D2H(`03:1584-1688`) | 【稳定线+phase-cd】 |
-| `get_pair_contact_force(A,B)` | raw 梯度(Python 侧乘 −1/dt²) | 无 | 无 | 临时把配对表指到子集重跑 barrier 梯度(`03:1350-1433`) | 【稳定线+phase-cd】 |
+| `get_pair_contact_force(A,B)` | raw 梯度(**Python 侧原样透传,不做换算**;docstring 明示由调用者自己套 `−1/dt²` + 符号约定换算牛顿,`engine.py:1607-1615`) | 无 | 无 | 临时把配对表指到子集重跑 barrier 梯度(`03:1350-1433`) | 【稳定线+phase-cd】 |
 | `compute_contacts(rebuild=false)` + `get_contacts()/get_contacts_device()` | **牛顿**(核内乘 1/dt²) | 含(bodyB=−1) | 无 | per-contact (bodyA,bodyB,force);默认复用上一 step 的接触集,零重建(`03:1304-1348`,`12:410-472`) | 【稳定线+phase-cd】 |
 | `get_collision_pairs_clean()` / `get_ccd_pairs_clean(move,α)` | — | — | — | UIPC 风格解码配对导出(PP/PE 以 −1 padding;`03:1186-1302`) | 【稳定线+phase-cd】 |
 
@@ -782,7 +782,7 @@ void SimEngine::reset_transient_contact_state();
 
 | 变量 | 作用 | 默认 | 适用线 |
 |---|---|---|---|
-| `STIFF_CCD_SLACK_A` / `STIFF_CCD_SLACK_M` | ground / self+swept ACCD slackness | 0.9 / 0.8 | 【仅 phase-cd】(稳定线硬编码同值) |
+| `STIFF_CCD_SLACK_A` / `STIFF_CCD_SLACK_M` | ground 解析步长直接乘子 / self+swept 的 ACCD slackness(η=1−slack 进 ACCD 内部推进;两者语义不同,见 §3.5) | 0.9 / 0.8 | 【仅 phase-cd】(稳定线硬编码同值) |
 | `STIFF_CCD_CFL_FACTOR` | CFL cap 系数(floor 恒 0.5) | 0.5,域 (0,8] | 【仅 phase-cd】 |
 | `GIPC_FORCE_CCD_SANITY` | 启用 line search 精确相交复查 | off | 【稳定线+phase-cd】 |
 | `STIFF_EE_NOMOLLIFY` | 连 mollify 请求计数也关掉 | off | 【稳定线+phase-cd】 |

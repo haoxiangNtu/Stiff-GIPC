@@ -71,7 +71,7 @@
 
 **分叉点**：`05c3f75`（= tag `v0.8.5.2`，2026-07-25，"feat(iron-law): quarantined envs go fully inert"；`git merge-base` 亲验）。
 
-**分叉理由**：v0.8.5.2 是 **v0.8.6 大规模工程化（模块化重构、整帧图、GPU 驻留）开始之前的最后一个纯修复版**。稳定线从这里分出，只接收行为保守的修复（v0.8.5.3 的两个 contact-I/O 修复即来自 tactile 传感器线），承诺"不调用新 API 则轨迹与上一版完全一致"（稳定仓 `CHANGELOG.md:7-13`）；工程线则在 `codex/phase-cd` 上滚动推进全部 v0.8.5 之后的结构与性能工作。
+**分叉理由**：v0.8.5.2 是 **v0.8.6 大规模工程化（模块化重构、整帧图、GPU 驻留）开始之前的最后一个纯修复版**。稳定线从这里分出，只接收行为保守的修复（v0.8.5.3 的两个 contact-I/O 修复即来自 tactile 传感器线），承诺"不调用新 API 则轨迹与上一版完全一致"（稳定仓 `CHANGELOG.md:7-13`；该承诺的 teleport 例外见 §2.4 行为承诺条）；工程线则在 `codex/phase-cd` 上滚动推进全部 v0.8.5 之后的结构与性能工作。
 
 **提交总量**（工程线，`git log v0.8.5..HEAD` 亲验）：**209 条**（2026-07-24 → 2026-08-11）。按日分布：7/24: 2｜7/25: 19｜7/26: 10｜7/27: 26｜**7/28: 38（峰值日）**｜7/29: 10｜7/30: 10｜7/31: 15｜8/1: 9｜8/2: 4｜8/3: 16｜**8/4: 23**｜8/5: 8｜8/6: 8｜8/7: 5｜8/9: 1｜8/10: 4｜8/11: 1。
 
@@ -185,12 +185,12 @@
 ### 2.4 v0.8.5.3 — 2026-08-11 — 【仅稳定线】
 
 - **tag 落点**：`b8e27a1`（2026-08-11 18:41 +0800，"release(v0.8.5.3): stable-line patch — contact-IO fixes from the tactile line"）。**当前稳定线权威版本；工作树钉在此处。** 公开仓挂 cp311/cp312 wheel（sm_80/89/120）。
-- **行为承诺**：无 solver-dynamics 改动；不调用新 API 时轨迹与 0.8.5.2 **完全一致**（稳定仓 `CHANGELOG.md:7-13`）。
+- **行为承诺**：无 solver-dynamics 改动；不调用新 API 时轨迹与 0.8.5.2 一致（稳定仓 `CHANGELOG.md:7-13`）。**⚠ 该承诺有一个上游 CHANGELOG 未列的例外**：`1d05c7a` 修的是**既有** API `teleport_abd_bodies` 的行为（v0.8.5.2 已存在，`git grep` tag 树 2 命中；修复前 teleport 后表面顶点滞留旧位姿），调用它的 0.8.5.2 脚本在 0.8.5.3 上轨迹**必然不同**——"完全一致"只对不调用 teleport 的脚本成立。
 - **内容**（组成提交 `1bc13ef`、`1d05c7a`，均 2026-07-31）：
 
 | # | 修复/新增 | 机制 | 验证数字 |
 |---|---|---|---|
-| 1 | `get_vertex_contact_forces(components=friction_lagged\|total)` **恒零修复** | accessor 在步末提交后重算 lagged-friction 梯度，此时步内位移恒 0 → 恒零；修复 = `updateVelocities` 前 `snapshotFrictionForce` 快照到持久设备缓冲（稳定仓 `GIPC.cu:16504`、`:16800`；`GIPC.cuh:332-341`） | 解内 `h_cpNum_last`=266..270 对活跃；双关节剪切台（gel μ=1.0 / bar μ=0.6）实测滑动比 \|Ft\|/\|Fn\| = **0.600 ± 0.008**（三个压深） |
+| 1 | `get_vertex_contact_forces` **摩擦分量恒零修复**（`friction_lagged` 恒零；`total` 读数本身非零、只是退化为 normal-only——勿用 `total==0` 作 bug 特征） | accessor 在步末提交后重算 lagged-friction 梯度，此时步内位移恒 0 → 恒零；修复 = `updateVelocities` 前 `snapshotFrictionForce` 快照到持久设备缓冲（稳定仓 `GIPC.cu:16504`、`:16800`；`GIPC.cuh:332-341`） | 解内 `h_cpNum_last`=266..270 对活跃；双关节剪切台（gel μ=1.0 / bar μ=0.6）实测滑动比 \|Ft\|/\|Fn\| = **0.600 ± 0.008**（三个压深） |
 | 2 | 新增 `SimEngine.reset_transient_contact_state()` | 就地 episode 重置：清零 current/lagged contact-pair host 镜像 + 摩擦快照 + **自适应 Kappa 归零**（`g.Kappa=0.0` → 下个 solve 走 fresh-process `suggestKappa`；`sim_engine.cu:3620-3636`）；**刻意不并入 teleport API**（teleport 单 body 不应清其它接触的摩擦状态） | 陈旧配对幻影摩擦 24 µm 状态分歧 → 只清镜像/快照仍残留 **0.9 µm**（kappa 携带接触历史）→ 连 kappa 清零后 **6.7e-9 m**（`1bc13ef` 分层实测） |
 | 3 | `teleport_abd_bodies` 表面顶点滞留旧位姿修复（`1d05c7a`） | teleport 写 q 族后立即对 ABD 点区间跑 `cal_x_from_q` 并同步 `o_vertexes`（修复前首个 line search 的 E0 用旧顶点评估 → 实测 40/40 帧 LS 预算耗尽） | — |
 
@@ -323,7 +323,7 @@
 | `cudaMemcpyToSymbol` | 30,029 次 = 132 次/帧 |
 | stream sync | 34,412 次 = 151 次/帧 |
 | kernel launch | 341,867 次 = **1,500 次/帧** |
-| 全驻留理论上限 | ≈3–4×（后由 Phase D 兑现为 A800 5.0×） |
+| 全驻留理论上限 | ≈3–4×——**该口径针对 A800 盘子 228 帧大帧回放**（29.2s→~8-9s，`PHASE_A…PROFILE.md:19`），此负载上图开实测反而 +35~43%，**上限从未兑现**；Phase D 的 A800 5.0× 是**另一负载**（RL 微步 300 步），regime 不同不可混接 |
 
 **Phase B 勘察与手术**：
 
@@ -371,9 +371,9 @@
 | C6-i | `b58a0b7` | **溢出帧改在 release solver 收尾**：增长决策回宿主帧边界，图只覆盖帧内部（iron law 的重试版；~1e-6 扰动源除） | 默认 `capacity_fallback=true`；`STIFF_GRAPH_INGRAPH_RETRY=1` 恢复旧行为（实验） |
 | C6-k | `8bba75d` | 武装态非确定性根因定位：frame 2 梯度位级相同、首个 moveDir 差 1e-16 → raciness 在 `calculateMovingDirection` | — |
 | C6-l | `1a5769b`/`454fb59` | spmv_det + ee_canon 准入整帧图；**det 旋钮下整帧图位级确定** | towel 220 帧逐帧哈希三连全同；4 个叠加缺陷修复（含 canonical pair-slot 排序 cub 两趟字典序 radix） |
-| C6-m/n | `ff35cc4`/`b14e6fd` | 容量回退跑真正关图帧（`s_layout_override_off` RAII）；`STIFF_FULL_GRAPH_MIN_VERTS`（默认 1024）以下谢绝整图机器 | A800 全例配对计时（`f09596b`）：15 例 13 过、graph-on 1.09–1.94×（4090 为 1.6–3.3×）；towel 82× 异常三层解剖（A800_ALLEX:35-44）：19 个重录风暴帧占 468 s 中的 **219 s**（A800 每次 capture 20–30 s，4090 1–3 s），其余帧付容量宽度固定成本，two-graph 门也非避风港 → 止血后 towel 图 env 6s vs off 7s |
+| C6-m/n | `ff35cc4`/`b14e6fd` | 容量回退跑真正关图帧（`s_layout_override_off` RAII）；`STIFF_FULL_GRAPH_MIN_VERTS`（默认 1024）以下谢绝整图机器 | A800 全例配对计时（`f09596b`）：15 例 13 过、graph-on 过例区间 **1.09–2.75×**（源文档散文段自写 1.09–1.94× 有误——其自己的表把 forcegrip 2.75×、beaker 2.07× 均计为 pass，`A800_ALLEX:16,18` vs `:30-31`；4090 为 1.6–3.3×）；towel 82× 异常：C6-n 解剖把 468 s 中的 **219 s** 归给 19 个重录风暴帧（A800 每次 capture 20–30 s），其余为容量宽度固定成本——**但 C6-o 的 nsys 归因随即推翻了重录假说**：two-graph towel 全程**零** capture/instantiate 调用，真因是 OVF 已标记而宿主帧末才看、导致空转**烧 150k PCG 迭代**（`A800_ALLEX:35-44,50-53`）。止血后 towel 图 env 6s vs off 7s |
 | C6-o | `fe83618`/`1ed5073` | **根治空转**——nsys 归因**推翻重录假说**（two-graph towel 全程**零** capture/instantiate 调用，A800_ALLEX:50-53）：真因 = OVF 已在设备标记而宿主帧末才看；修复 = 宿主 Newton 循环逐迭代轮询 pinned 快照，见 OVF 位立即中止尝试（否则截断梯度空转烧 150k PCG 迭代 = 8× 无效功）；每轴增长连击升级（8 帧窗内重越级则 2×，上限 4×） | towel full-graph **502→51 s** |
-| C6-p | `ed2617f`/`47c37d6`/`edbc6e1` | 稳态开销法证（pre-launch 12.5ms 非主因；PCG 迭代数与宽度 graph/host 相同）→ **默认 headroom 2→1** | forcegrip 4090 2.08×→**1.39×**、A800 3.25×→**1.75×**、beaker 1.61×→1.21×（vs 关图）；代价 97%→94% 全图覆盖率 |
+| C6-p | `ed2617f`/`47c37d6`/`edbc6e1` | 稳态开销法证（pre-launch 12.5ms 非主因；PCG 迭代数与宽度 graph/host 相同）→ **默认 headroom 2→1** | forcegrip 4090 2.08×→**1.39×**、A800 3.25×→**1.75×**、beaker 1.61×→1.21×（vs 关图）；代价 97%→94% 全图覆盖率。**口径注**：该轮（8/1）未记帧数/轮数；两天后 C6-w 轮（8/3）同场景为 1.96→1.46×——两轮为独立测量口径（混沌带 + 负载差），不可串成同一时间序列读作"回退"，中间不存在已解释/未解释的性能事件 |
 | C6-q | `575539f` | v0.8.5 标准复审抓 3 个本 session bug（C6-n 全旁路吞了 tier 训练 → 收窄为只谢绝 FULL 图） | 套件 **22/22** |
 | C6-r/s/t | `79f88f4`/`e460207`/`68f1e16` | episode 通道经济学、CDP 探针（cub CDP 可用但图不 fence CDP 子核）、**设备侧 grid-dim 更新可行**（修正"烘焙宽度是结构性"论断） | episode 通道大帧最慢：beaker 94 帧 4090 host 156.4 / step 图 244.4（1.56×）/ episode 319-326 ms（~2.05×） |
 | C6-t step1 | `dda5430` | converter 唯一性趟按 length 而非 capacity 发射 | forcegrip 4.2M 载荷曾按 8.4M 发射；nsys 记其为整帧图最大单项开销（2248 ms 中的 1284 ms） |
@@ -528,7 +528,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 | strict 金锚（dlto 后，工程线现行） | `0544461bd82123ae` | `45d74f0`/`40c9f11`（**rc2 tag 后首个变更**——dlto 默认开；checkout rc2 tag 仍是旧锚）起 | RELEASE_NOTES:132-137；[`../PHASE_C_FRAME_GRAPH_PLAN.md`](../PHASE_C_FRAME_GRAPH_PLAN.md):305（A800 跨架构 PASS） |
 | 门禁段数演化 | 8 段（phase1 `verify_gates.sh`）→ 12 段（rc1）→ 15 段（rc2，+G13/G14/G15）→ 21/21（Isaac 表皮附录 A 时代）→ **22/22**（C6-w/BVH 战役至今） | 2026-07-25 → 今 | RELEASE_NOTES:27,116；SIM_EXEC:154；A800_ALLEX:337-339 |
 | 门禁纪律 | 门禁必须自带构建（G0 build；G0.2 realpath 断言）；push 时执行（分支 = full，tag = heavy）；`SKIP_GATES=1` 逃生口入 bypass.log | `161e66e` 起 | [`../CI.md`](../CI.md) |
-| STIFF_* 旋钮治理 | `StiffGIPC/config/knob_registry.h` 单一真源（G14 时点 84+17+11 个）；未登记 WARN，`STIFF_KNOB_STRICT=1` 升 `ConfigurationError` | rc2 起 | CI.md:97-102；knob_registry.h:198-239 |
+| STIFF_* 旋钮治理 | `StiffGIPC/config/knob_registry.h` 单一真源（G14 落地提交 `06a6710` 时点共 **84** 条：diag 42/solver 15/perf 11/mode_isolated 7/mode_strict 4/python 3/audit 2，`git show 06a6710:…knob_registry.h` 亲验；现 170 条）；未登记 WARN，`STIFF_KNOB_STRICT=1` 升 `ConfigurationError` | rc2 起 | `git show 06a6710:StiffGIPC/config/knob_registry.h`；knob_registry.h:23 起 |
 
 **注意**：稳定线不承载以上门禁基建（无 `scripts/` 目录，亲验 `ls`）；其正确性承诺依赖"逐版本轨迹兼容声明"（CHANGELOG 条目）而非武装门禁。
 
@@ -556,7 +556,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 
 | 项 | 状态 | 依据（亲验） |
 |---|---|---|
-| 工程线分支 `codex/phase-cd` | **未推送远端**——全部 v0.8.5 后工程化工作（209 条提交）只存在于本地仓库 | `git branch -a` 无 `origin/codex/phase-cd` |
+| 工程线分支 `codex/phase-cd` | **已于 2026-09-08 首次推送远端**（`origin/codex/phase-cd`，含手册）。此前的备份状况也非"全在本地"：其中 **62 条**早已随 `origin/internal/v0.8.6-rc1` 在远端 | `git ls-remote origin codex/phase-cd`；62 条：`comm -12 <(rev-list v0.8.5..origin/internal/v0.8.6-rc1) <(rev-list v0.8.5..HEAD)` |
 | v0.8.6 | **未发布**——HEAD `b3ab747` 未打 tag；`v0.8.6-rc1-internal`/`rc2-internal` 是内部 tag，仅私仓；`pyproject.toml` 版本号 `0.8.6rc2` 是内部标识 | `git tag --merged HEAD`；pyproject.toml:7 |
 | 稳定线最新版本 | **v0.8.5.4**（tag `c0339c8`，2026-08-12，`pyproject.toml:7` = `0.8.5.4`）——真静摩擦默认开，**改变所有含摩擦场景轨迹**（§2.5）。**已正式发布**：公开仓 `github.com/haoxiangNtu/stiff-physics` Release `v0.8.5.4`（2026-08-11 发布）挂 cp311/cp312 双 wheel，README 安装 URL 已指向它；v0.8.5.3 的 wheel 仍在架可回退（cp311/cp312，sm_80/89/120） | 稳定仓 tag `v0.8.5.4`/`v0.8.5.3`；`git show HEAD:pyproject.toml`；`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` |
 | 两线 Python 包名 | 同为 `stiff-physics`/`stiff_physics`，**不能并存于同一环境**；探测：`hasattr(engine, "reset_transient_contact_state")` = 稳定线；`hasattr(engine, "prepare_gpu_rl")` = phase-cd；或 `importlib.metadata.version` = `0.8.5.3` vs `0.8.6rc2` | 两树 pyproject.toml / 绑定名字级 diff |

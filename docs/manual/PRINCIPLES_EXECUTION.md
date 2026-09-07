@@ -994,8 +994,8 @@ post-LS kappa 条件加倍 → `_newton_tail_conditional`。
   由快照回滚。step 整帧路径与 episode/GPU-RL 捕获共用。
 - **训练档成员**(GIPC.cuh:951-1025):`m_graph_train_cp[5]`(分 arity 的 DCD 档——
   triplet 流大小 = tier(n4)·M12 + tier(n3)·M9 + tier(n2)·M6,单一 pairs 数定不了);
-  `m_graph_train_ground`(**地面轴恒取最坏 surf_vertexNum**——地面无 OVF 位,截断不可
-  检测);`m_graph_train_ccd` 独立训练(foldshirt DCD ~27k vs 扫掠 ~324k,按比例推导
+  `m_graph_train_ground`(**地面轴恒取最坏 surf_vertexNum**——这已是真实上界:每个
+  表面顶点至多一个地面配对,截断结构上不可能,故无需 OVF 位);`m_graph_train_ccd` 独立训练(foldshirt DCD ~27k vs 扫掠 ~324k,按比例推导
   曾迫使 4× DCD 膨胀爆显存)。tier 按**峰值**而非帧末训练(foldshirt 帧末 ~58k vs
   峰值 ~390k)。
 - **headroom**:`graph_train_headroom_num()` 默认 **1**([C6-p] 从 2 翻转;tier 宽是录制

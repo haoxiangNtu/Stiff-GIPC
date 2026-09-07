@@ -243,7 +243,7 @@ Raise Config.line_search_max_iter, reduce dt, or soften the drive.
 | 项 | 内容 |
 |---|---|
 | 现象/策略 | **WARN + 接受最终候选步**(loud but non-fatal)——由调用方决定是否中止(`:689-693` 注释)。后果如警告文本所述:接触漂移、势垒距离塌陷、后续帧迭代爆炸。 |
-| 例外(仅 phase-cd) | ① 帧 0 + 非有限增量势 → 抛 `gipc::GeometryError`("initial configuration is infeasible for IPC — bodies interpenetrating at spawn",`ipc_solver.inl:837-846`;稳定线无类型化异常面)。② 整帧图内耗尽同样非致命,记 `INV_LS_BUDGET` 位接受(`gipc_modules/14_energy_linesearch_solver.inl:201-214`);**但**耗尽且同时挂容量 OVF 位 = "被截断配对集饿死的搜索"而非难帧,转 `FRAME_RETRY_REQUIRED` 在更大容量档重试(`14_energy:177-199`,towel 实证 inv=0x10040)。③ LS 后仍相交的二级回溯共用同一预算,耗尽**抛** `std::runtime_error("mesh intersection persists after energy line-search backtracking…")`(`ipc_solver.inl:853-862`)。 |
+| 例外(仅 phase-cd) | ① 帧 0 + 非有限增量势 → 抛 `gipc::GeometryError`("initial configuration is infeasible for IPC — bodies interpenetrating at spawn",`ipc_solver.inl:837-846`;稳定线无类型化异常面)。② 整帧图内耗尽同样非致命,记 `INV_LS_BUDGET` 位接受(`gipc_modules/14_energy_linesearch_solver.inl:201-214`);**但**耗尽且同时挂容量 OVF 位 = "被截断配对集饿死的搜索"而非难帧,转 `FRAME_RETRY_REQUIRED` 在更大容量档重试(`14_energy:177-199`,towel 实证 inv=0x10040)。③【更正:**两线同款,非 phase-cd 例外**】LS 后仍相交的二级回溯共用同一预算,耗尽**抛** `std::runtime_error("mesh intersection persists after energy line-search backtracking…")`——稳定线同文本同抛(`stable:GIPC.cu:15235-15242`,grep 2 命中;phase-cd `ipc_solver.inl:853-862`),此情形下**两线都会中止**而非 WARN 继续。 |
 | RL 契约 | merged 模式"WARN 并继续"是**成文契约**;RL 循环应跨 step 差分健康计数 `get_ls_exhausted_count()` / `get_ls_nonfinite_count()`(经 `engine.native.…`,`sim_engine.h:728-737`,计数累加点 `ipc_solver.inl:828-830`)来发现并丢弃中毒 episode。 |
 | 规避方法 | 按警告文本三选:提 `line_search_max_iter`、减 `dt`、软化驱动(降 `*_driving_strength_ratio` 或 `max_*_step_per_frame`);帧 0 抛错则修 spawn 位形(IPC 要求初始严格无穿透)。诊断:`STIFF_LSX_DIAG=1` 打印耗尽帧逐 slot 能量对照与 STATE-DESYNC/BAKED-ARGS 仲裁(`ipc_solver.inl:742-825`)。 |
 | 修复状态 | 按契约保持;NaN 防漏已修(非有限试探能量与任何比较皆 false,旧逻辑会落进"接受下降"分支;现 `!isfinite(e1) ⇒ 继续回溯`,`14_energy:51-57`,宿主对应 `ipc_solver.inl:518`)。 |
@@ -393,7 +393,7 @@ Raise Config.line_search_max_iter, reduce dt, or soften the drive.
 
 | 项 | 内容 |
 |---|---|
-| 现象 | 长时间运行的常驻进程显存单调上行至峰值负载水位:① 宿主 grow-redo——配对缓冲溢出自愈(`[DCD-grow]/[CCD-grow] … redo detection`,增长 1.5×+1,重跑检测;两线同款,stable `GIPC.cu:10318/11185/11246/11637`),且 CCD 镜像与 DCD 锁步、**从不收缩**(`contact/pair_buffers.cuh:1-50`;该头 10-15 行记载了曾经"收缩-越界"潜伏 bug 的修复——收缩被明令禁止)。② 图容量档按**峰值**训练(帧末计数会低估:foldshirt 帧末 ~58k vs 峰值 ~390k,C6-b 教训)且逐轴单调增长;地面轴恒按最坏 `surf_vertexNum` 烘焙(无 OVF 位,截断不可检测)。 |
+| 现象 | 长时间运行的常驻进程显存单调上行至峰值负载水位:① 宿主 grow-redo——配对缓冲溢出自愈(`[DCD-grow]/[CCD-grow] … redo detection`,增长 1.5×+1,重跑检测;两线同款,stable `GIPC.cu:10318/11185/11246/11637`),且 CCD 镜像与 DCD 锁步、**从不收缩**(`contact/pair_buffers.cuh:1-50`;该头 10-15 行记载了曾经"收缩-越界"潜伏 bug 的修复——收缩被明令禁止)。② 图容量档按**峰值**训练(帧末计数会低估:foldshirt 帧末 ~58k vs 峰值 ~390k,C6-b 教训)且逐轴单调增长;地面轴恒按最坏 `surf_vertexNum` 烘焙——这是其**真实上界**(每个表面顶点至多一个地面配对),截断在结构上不可能发生,故无需 OVF 位(不是"截断不可检测"的隐患,方向恰相反)。 |
 | 根因 | 收缩会使已发布指针/已录图失效,且历史上引入过越界;峰值训练是欠清零/欠检测事故的疫苗。 |
 | 影响面 | 显存预算紧张的部署(多引擎共卡、A800 共享集群);频繁 grow 行还提示初始容量偏小(性能:每次多付一遍检测)。 |
 | 规避方法 | ① 初始容量调 `collision_detection_buff_scale`(注意 §2.3 双默认值)。② 图路径勿盲目提 headroom(§4.1)。③ 历史教训已内建:OVF 增长按设备报告的轴掩码只长越界轴——"全轴齐长"曾致 triplet 512k→2.77M→11.8M 三连爆 OOM(`frame_transaction.cu:4277-4284` 注释)。④ 需要回收显存:销毁重建 Engine(注意 §4.5 进程级约束)。 |
