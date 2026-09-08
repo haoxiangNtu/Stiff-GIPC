@@ -68,7 +68,7 @@
 - **【仅稳定线】** 只进了 v0.8.5.3(如 tactile 线的两个修复);
 - **【实验性,默认关】** 存在但默认不启用,须显式旋钮打开。
 
-行号约定:`文件:行` 未注明线时指 **phase-cd @ b3ab747**;注明"稳定线"时指 v0.8.5.3(b8e27a1)。
+行号约定:`文件:行` 未注明线时指 **phase-cd @ b3ab747**;注明"稳定线"时指 v0.8.5.3(b8e27a1)的 blob——工作树自 2026-09-08 起为 v0.8.5.4 内容,复核行号用 `git show v0.8.5.3:<文件>`。
 本分册在稳定线上核对代码时使用的工作树 checkout 位于 v0.8.5.3 之后数个提交,经
 `git diff --stat b8e27a1..HEAD` 亲验共 8 个文件(GIPC.cu/GIPC.cuh/sim_engine.cu/.h/
 engine.py/bindings/pystiffgipc.cu/CHANGELOG.md/pyproject.toml),内容为摩擦锚/静摩擦线,

@@ -22,7 +22,7 @@
 | 记法 | 路径 | 状态 |
 |---|---|---|
 | **工程线** | `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph` | `codex/phase-cd`,台账编制时 HEAD `b3ab747`,现为 `75b3f47`(手册与 v0.8.5.4 delta 已入库) |
-| **稳定线** | `/home/ps/Downloads/Stiff-GIPC-stable-08` | 分支 HEAD = `c0339c8` = tag `v0.8.5.4`;**工作树内容经 8 个文件的未提交回退 == v0.8.5.3(`b8e27a1`)** |
+| **稳定线** | `/home/ps/Downloads/Stiff-GIPC-stable-08` | 分支 HEAD = `c0339c8` = tag `v0.8.5.4`;工作树自 2026-09-08 起 == HEAD(v0.8.5.4);台账与手册的稳定线行号按 tag `v0.8.5.3`(`b8e27a1`)blob,复核用 `git show v0.8.5.3:<文件>`(编制时工作树曾被误留的 8 文件暂存回退按在该内容上,owner 确认非本意,已 reset) |
 
 `file:line` 一律沿用校验记录里的原始锚点(它们已被校验代理与修订代理两次复核)。
 行号会随后续编辑漂移——若命令对不上,先 `grep` 符号名再核行号,不要直接判台账为错。
@@ -103,7 +103,7 @@
 |---|---|---|---|---|---|---|
 | **D-035** ×3 | 硬钉(USE_HARD_PIN)替换法弹性链式法则缺失标 **【仅 phase-cd】**("稳定线未核实存在该路径") | 稳定线单体 `GIPC.cu` 里有**逐字相同**的 KNOWN LIMITATION 注释块与活代码路径(inertia-only 链式法则、`m5_drive_joint2_test` k=1000 撞 cap、TODO M3.5),连 `[M3.5]` WARN 截断警告也在;Python 绑定暴露 `add_fem_pin_to_abd`,`n_fem_pins>0` 即走该路径。**一条 grep 即可证伪** | 稳定线 `StiffGIPC/GIPC.cu:13894-13906`、`:13787`、`:13906`;绑定 `bindings/pystiffgipc.cu:250-292` | **高危**:这是 Newton 不收敛级的正确性缺陷,稳定线用户(硬钉+动态关节)被错误告知与己无关 | KNOWN_ISSUES §1.4(改标【稳定线+phase-cd】) | `grep -n 'KNOWN LIMITATION' 稳定线/StiffGIPC/GIPC.cu` → `13894` 附近 |
 | **D-036** | "确定性:strict run-to-run 逐位 **+ 跨架构(sm_89 ≡ sm_80)**金锚 …【**稳定线+phase-cd**】" | 跨架构锚等值只在 **phase-cd 的 dlto 构建**上实测过;稳定线的锚 `f7fb5a786c2d7935` 在其 CHANGELOG 中明确是 **cross-ENV(跨环境)**锚,全库无任何 sm_89≡sm_80 的稳定线证据;稳定线以含 PTX 的 `"80;89;120"` 构建(JIT 生成的 SASS 随驱动/架构而变) | 稳定线 `CHANGELOG.md:58`;稳定线 `CMakeLists.txt:15`;跨架构证据仅 `docs/RELEASE_NOTES_v0.8.6-rc1.md:132-137` | **高危**:依赖稳定线 wheel 做跨 GPU 逐位复现实验的用户会被误导;确定性过度承诺 | README(该行已在当前修订中为正确形态,见 §4.1 skip #4) | `grep -n 'cross-env determinism anchor' 稳定线/CHANGELOG.md` |
-| **D-037** ×3 | "磁盘上的稳定线工作树 checkout 在 **v0.8.5.4 之后一个提交**(`c0339c8`)" | `c0339c8` **就是 tag `v0.8.5.4` 指向的提交本身**(`git describe --tags --long` = `v0.8.5.4-0-gc0339c8`);带 "release(v0.8.5.4)" 消息的 `0894958` 是其**父**提交。**更关键**:工作树文件内容经 8 个文件的未提交回退,与 `v0.8.5.3`(`b8e27a1`)**逐字节相同**(`git diff v0.8.5.3` 为空),故稳定线行号偏移**恰为零**,"可能有个位数偏移"的前提不成立 | 稳定线 `git describe --tags --long`;`git log --oneline -3`;`git status --short` = 8 文件 staged | 双向误导:一边把 c0339c8 的行为排除在 v0.8.5.4 之外,一边让读者以为行号有偏移。**且工作树状态极脆弱**——`git checkout/stash/reset` 任一操作会让"稳定线"静默变成行为不同的 v0.8.5.4 | API_CORE 版本行(加脆弱性警告)、PRINCIPLES_DYNAMICS §0 行号约定 + 文末快照行 + STIFF_EPSV 附录行 | `git -C 稳定线 describe --tags --long` → `v0.8.5.4-0-gc0339c8`;`git -C 稳定线 diff v0.8.5.3 --stat` → 空;`git -C 稳定线 status --short` → 8 个 `M` |
+| **D-037** ×3 | "磁盘上的稳定线工作树 checkout 在 **v0.8.5.4 之后一个提交**(`c0339c8`)" | `c0339c8` **就是 tag `v0.8.5.4` 指向的提交本身**(`git describe --tags --long` = `v0.8.5.4-0-gc0339c8`);带 "release(v0.8.5.4)" 消息的 `0894958` 是其**父**提交。**更关键**:工作树文件内容经 8 个文件的未提交回退,与 `v0.8.5.3`(`b8e27a1`)**逐字节相同**(`git diff v0.8.5.3` 为空),故稳定线行号偏移**恰为零**,"可能有个位数偏移"的前提不成立 | 稳定线 `git describe --tags --long`;`git log --oneline -3`;`git status --short` = 8 文件 staged | 双向误导:一边把 c0339c8 的行为排除在 v0.8.5.4 之外,一边让读者以为行号有偏移。**且工作树状态极脆弱**——`git checkout/stash/reset` 任一操作会让"稳定线"静默变成行为不同的 v0.8.5.4 | API_CORE 版本行(加脆弱性警告)、PRINCIPLES_DYNAMICS §0 行号约定 + 文末快照行 + STIFF_EPSV 附录行 | `git -C 稳定线 describe --tags --long` → `v0.8.5.4-0-gc0339c8`;**2026-09-08 后**:`git -C 稳定线 status --short` → 空、`git -C 稳定线 diff v0.8.5.3 --stat` → 8 files +511/−8(工作树已恢复 HEAD 内容;原暂存回退系误留) |
 | **D-038** ×2 | rc2 增量表把 "**dlto 默认开**(`40c9f11`/`45d74f0`)"、"金锚迁移 → `0544461bd82123ae`"、"三模式全矩阵(`19b257a`)56/56 绿" 列为 **v0.8.6-rc2-internal 的增量** | 三者都**晚于** rc2 tag `6b0e02e`(07-28 01:59)与 release 本体 `7e39591`(01:43):`19b257a` 03:12、`40c9f11`/`45d74f0` 08:10。**checkout rc2 tag 得到的仍是旧锚 `f7fb5a786c2d7935`、dlto 未开**。`RELEASE_NOTES_v0.8.6-rc1.md:130` 自注 "rc2 后首个变更",手册抄录时丢掉了"rc2 后"限定词 | `git merge-base --is-ancestor` 三者对 rc2 tag 均非祖先;`docs/RELEASE_NOTES_v0.8.6-rc1.md:97-98,129-130` | **高危**:锚值与默认集的版本归属全错,按版本条目复现会拿到不同的确定性锚 | CHANGELOG_TIMELINE §2.6 / §4 rc2 行 / §5 金锚表(拆分为"tag 内增量"与"tag 后采纳") | `git -C 工程线 merge-base --is-ancestor 40c9f11 v0.8.6-rc2-internal; echo $?` → 非 0 |
 | **D-039** | "### 3.3 rc1 工程化(7/27)" 表,末行以 `6c9d730`(rc1 tag)收尾 | 该表 **12 行中有 11 行的提交在 rc1 tag(`6c9d730`,07-27 09:58)之后**(6c562bc 19:51、c86a1ea 23:08 … 06a6710 22:42);只有 `d0c0071`(02:00)在 rc1 内。把 rc1→rc2 窗口的工作编排为"通往 rc1 的战役"并以 release 行收尾,还与 §2.6 rc2 增量表**双重记账** | `git merge-base --is-ancestor <hash> v0.8.6-rc1-internal` 逐条亲验 | 战役叙事与版本边界错位,同一工作被记两遍 | CHANGELOG_TIMELINE §3.3(标题/前言/TOC 均改为 "rc1→rc2 窗口") | `git -C 工程线 merge-base --is-ancestor 06a6710 v0.8.6-rc1-internal; echo $?` → 非 0 |
 | **D-040** ×2 | "后续配套(同窗口,**工程线** `03e70f6`,7/24):常规增长搬到帧首 discard-grow" | `03e70f6`(2026-07-24)**早于分叉点**(v0.8.5.2 / `05c3f75`,07-25),是两线**共同历史**;稳定线同样携带该 [P0-mem] 机制 | `git merge-base --is-ancestor 03e70f6 v0.8.5.2` 为真(两仓);稳定线 `StiffGIPC/GIPC.cu:13221,13255`("2.7 = 2 x 1.35") | 稳定线用户误以为自己缺此内存优化(仍双驻留 24GB 缓冲) | CHANGELOG_TIMELINE §2.2(改标"分叉前/两线共有") | `git -C 稳定线 merge-base --is-ancestor 03e70f6 HEAD; echo $?` → `0` |
@@ -252,22 +252,22 @@ grep -n 'NOT Newtons' /home/ps/Downloads/Stiff-GIPC-c1-ls-graph/stiff_physics/en
 | 分支 HEAD 在哪? | `c0339c8` |
 | `c0339c8` 是什么? | **就是 tag `v0.8.5.4` 本身**(`git describe --tags --long` = `v0.8.5.4-0-gc0339c8`) |
 | 那 "release(v0.8.5.4)" 的提交呢? | `0894958`,是 `c0339c8` 的**父**提交 |
-| 磁盘上的文件内容是哪个版本? | **v0.8.5.3**——8 个文件有未提交的回退改动,`git diff v0.8.5.3` 为空 |
+| 磁盘上的文件内容是哪个版本? | **编制时 v0.8.5.3**——8 个文件有未提交的回退改动,`git diff v0.8.5.3` 为空;**2026-09-08 起 v0.8.5.4**(owner 确认该回退非本意,已 `reset --hard`,补丁备份留存) |
 
 于是:tag 名比 release 提交**晚一个**,工作树内容比 HEAD **早一个版本**,而 `git log` 和 `ls` 会告诉你两件矛盾的事。校验代理们分别错在:"c0339c8 是 v0.8.5.4 之后一提交"(错,它就是 tag)、"工作树是 v0.8.5.4 内容、行号有偏移"(错,内容是 v0.8.5.3、偏移为零)。
 
-**错了会怎样**:两条独立的伤害。①**行号全体失准或全体准确,取决于你信哪个描述**——手册所有 `stable:GIPC.cu:NNNN` 锚点是按 `b8e27a1`(v0.8.5.3)写的,而工作树内容恰好就是它,所以**偏移实为零**;手册却自我声明"可能有个位数偏移",让读者对准确的锚点产生不必要的怀疑。②**远比行号严重的是脆弱性**:v0.8.5.3 的内容只靠 8 个**未提交**的回退改动维持。任何人执行 `git checkout .`、`git stash`、`git reset --hard`,甚至一次不小心的 IDE "discard changes",这棵"稳定线"就**静默变成 v0.8.5.4**——一个默认开启真静摩擦(`absolute_epsv` + 持久摩擦锚)、摩擦行为不同的版本。此后所有基于"稳定线"的对照实验都在测另一个东西,而且**没有任何报错**。
+**错了会怎样**:两条独立的伤害。①**行号全体失准或全体准确,取决于你信哪个描述**——手册所有 `stable:GIPC.cu:NNNN` 锚点是按 `b8e27a1`(v0.8.5.3)写的,而工作树内容恰好就是它,所以**偏移实为零**;手册却自我声明"可能有个位数偏移",让读者对准确的锚点产生不必要的怀疑。②**远比行号严重的是脆弱性**(历史状态,2026-09-08 已消除):v0.8.5.3 的内容只靠 8 个**未提交**的回退改动维持。任何人执行 `git checkout .`、`git stash`、`git reset --hard`,甚至一次不小心的 IDE "discard changes",这棵"稳定线"就**静默变成 v0.8.5.4**——一个默认开启真静摩擦(`absolute_epsv` + 持久摩擦锚)、摩擦行为不同的版本。此后所有基于"稳定线"的对照实验都在测另一个东西,而且**没有任何报错**。
 
-**怎么自查**:每次动稳定仓之前跑这三行,三个结果必须同时成立:
+**怎么自查**(2026-09-08 起的正确状态):每次动稳定仓之前跑这三行:
 
 ```bash
 ST=/home/ps/Downloads/Stiff-GIPC-stable-08
 git -C $ST describe --tags --long      # → v0.8.5.4-0-gc0339c8   (HEAD 就是 tag)
-git -C $ST diff v0.8.5.3 --stat        # → 空输出               (工作树内容 == v0.8.5.3)
-git -C $ST status --short              # → 8 个 M               (回退改动仍在)
+git -C $ST status --short              # → 空                   (工作树 == HEAD,无残留暂存)
+git -C $ST diff v0.8.5.3 --stat        # → 8 files, +511/-8     (工作树是 v0.8.5.4 内容)
 ```
 
-第二行一旦有输出,或第三行的 8 个 `M` 消失,**立刻停手**:你手上的已经不是手册所记述的稳定线了。第三条的正确恢复方式是从 `b8e27a1` 重新取那 8 个文件,而不是 `git reset`。
+第二行有输出,说明又有人往工作树塞了未提交改动。**复核手册的 v0.8.5.3 行号一律用 `git show v0.8.5.3:<文件> | sed -n 'N p'`,永远不要按磁盘行号**——这样引用锚就钉在不可变的 tag 上,与工作树状态无关。
 
 ---
 
@@ -427,8 +427,8 @@ git -C $ST status --short              # → 8 个 M               (回退改动
 | phase-cd `examples/test_*.py` | `30` | ✓ D-004 |
 | 稳定线 `examples/test_*.py` | `29` | ✓ D-004 |
 | 稳定仓 `git describe --tags --long` | `v0.8.5.4-0-gc0339c8` | ✓ D-037 |
-| 稳定仓 `git diff v0.8.5.3 --stat` | 空 | ✓ D-037 |
-| 稳定仓 `git status --short` | 8 个 `M` | ✓ D-037 |
+| 稳定仓 `git diff v0.8.5.3 --stat`(编制时) | 空;**2026-09-08 起 8 files +511**(工作树已恢复 HEAD) | ✓ D-037 |
+| 稳定仓 `git status --short`(编制时) | 8 个 `M`;**2026-09-08 起为空** | ✓ D-037 |
 
 另于 §4.2 逐条 grep 了 16 条未修条目在当前文档中的存活状态(结果见该节表格)。
 

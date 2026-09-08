@@ -8,7 +8,7 @@
 
 | 线 | 仓库 | 分支 / HEAD | 说明 |
 |---|---|---|---|
-| **稳定线** | `/home/ps/Downloads/Stiff-GIPC-stable-08` | `release/stable-0.8`;**分支 HEAD = `c0339c8` = tag v0.8.5.4**,但工作树内容经 8 个未提交回退 == tag **v0.8.5.3**(`b8e27a1`)——本册 `stable:` 行号按 v0.8.5.3 内容,偏移为零;工作树状态脆弱,勿 checkout/stash/reset(详见 README §2 与 AUDIT_LEDGER §2.5) | 重构前单体布局(`StiffGIPC/GIPC.cu` 1.6 万+ 行);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel(CUDA `sm_80/89/120`) |
+| **稳定线** | `/home/ps/Downloads/Stiff-GIPC-stable-08` | `release/stable-0.8`;**分支 HEAD = `c0339c8` = tag v0.8.5.4**,工作树自 2026-09-08 起即为该内容(此前误留的 8 文件暂存回退按在 v0.8.5.3,已清);本册 `stable:` 行号按 tag **v0.8.5.3**(`b8e27a1`)的 blob,复核用 `git show v0.8.5.3:<文件>`(详见 README §2 与 AUDIT_LEDGER §2.5) | 重构前单体布局(`StiffGIPC/GIPC.cu` 1.6 万+ 行);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel(CUDA `sm_80/89/120`) |
 | **工程线(phase-cd)** | `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph` | `codex/phase-cd`,HEAD `b3ab747` | v0.8.6 模块化重构 + 整帧 CUDA Graph + GPU 驻留 RL 等全部 v0.8.5 后工作 |
 
 - 未注明的 `文件:行号` 均指 phase-cd 树 `StiffGIPC/` 下的路径;稳定线行号写作 `stable:GIPC.cu:NNNN`(指向该树 `StiffGIPC/GIPC.cu` 的 v0.8.5.3 内容)。

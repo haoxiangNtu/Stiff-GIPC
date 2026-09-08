@@ -14,7 +14,7 @@
 
 **版本勘定**(2026-09-07 亲验):
 
-- 稳定线 = `/home/ps/Downloads/Stiff-GIPC-stable-08`,分支 `release/stable-0.8`。磁盘工作区内容与 tag `v0.8.5.3`(2026-08-11 发布)**逐字节一致**(`git diff v0.8.5.3 --stat` 为空);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel,CUDA 架构 sm_80/89/120。C++ 布局为重构前单体(`StiffGIPC/GIPC.cu` 16884 行)。**稳定线最新版本是 tag `v0.8.5.4`**(2026-08-12 = `c0339c8`,`pyproject.toml:7` = `0.8.5.4`;真静摩擦默认开,**改变所有含摩擦场景轨迹**,见 §1.5/§1.6 与 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5)——但**磁盘工作区内容被回退到 v0.8.5.3**,故本册的稳定线行号一律是 v0.8.5.3 内容,v0.8.5.4 独有行号按 `git show HEAD:` 单独标注。
+- 稳定线 = `/home/ps/Downloads/Stiff-GIPC-stable-08`,分支 `release/stable-0.8`。本册 `[stable]` 行号按 tag `v0.8.5.3`(2026-08-11 发布)的 blob(复核用 `git show v0.8.5.3:<文件>`);公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel,CUDA 架构 sm_80/89/120。C++ 布局为重构前单体(`StiffGIPC/GIPC.cu` 16884 行)。**稳定线最新版本是 tag `v0.8.5.4`**(2026-08-12 = `c0339c8`,`pyproject.toml:7` = `0.8.5.4`;真静摩擦默认开,**改变所有含摩擦场景轨迹**,见 §1.5/§1.6 与 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5)——工作树已于 2026-09-08 恢复为 HEAD(v0.8.5.4)内容——此前 8 个文件被某次会话误留的暂存回退按在 v0.8.5.3,非 owner 本意,已 `reset --hard`(回退补丁留有备份);本册稳定线行号一律按 v0.8.5.3 blob,v0.8.5.4 独有行号按 `stable@c0339c8` 单独标注(现与磁盘一致)。
 - 工程线 = `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph`,分支 `codex/phase-cd`(HEAD `b3ab747`,`pyproject.toml` 版本 `0.8.6rc2`),含 v0.8.6 模块化重构、整帧 CUDA Graph、GPU 驻留 RL、episode、checkpoint v2 等全部 v0.8.5 后工作。
 - 两线分叉点 = `05c3f75`(git merge-base),**早于 v0.8.5.3**——稳定线 v0.8.5.3 的两个接触 I/O 修复提交(`1bc13ef`、`1d05c7a`)与 v0.8.5.4 全部提交都不在 phase-cd 历史里——**三个未移植项**,合并清单见 §1.0(详条 §1.1、§1.2、§1.6;分支拓扑见 §5)。
 - 文中行号:未注明仓库的 `文件:行号` 指 phase-cd 树 `StiffGIPC/` 下路径;`stable ...` 前缀指稳定线树。

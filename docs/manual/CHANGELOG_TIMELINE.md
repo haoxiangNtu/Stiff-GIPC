@@ -64,7 +64,7 @@
 |---|---|---|
 | 仓库（本机） | `/home/ps/Downloads/Stiff-GIPC-stable-08` | `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph` |
 | 分支 | `release/stable-0.8` | `codex/phase-cd` |
-| 当前权威版本 | **最新 = v0.8.5.4**（tag `v0.8.5.4` = `c0339c8`，2026-08-12；`pyproject.toml:7` = `0.8.5.4`，亲验 `git show HEAD:pyproject.toml`）。**本手册的行号/行为引用基线仍是 v0.8.5.3**（`b8e27a1`，2026-08-11）——磁盘工作树内容与该 tag 逐字节一致（`git diff v0.8.5.3 --stat` 为空，8 个文件的已暂存回退改动把 HEAD 内容退回 v0.8.5.3），v0.8.5.4 独有行为见 §2.5 | HEAD = `b3ab747`（2026-08-11，未打 tag；`pyproject.toml:7` 版本号 `0.8.6rc2`） |
+| 当前权威版本 | **最新 = v0.8.5.4**（tag `v0.8.5.4` = `c0339c8`，2026-08-12；`pyproject.toml:7` = `0.8.5.4`，亲验 `git show HEAD:pyproject.toml`）。**本手册的行号/行为引用基线仍是 v0.8.5.3**（`b8e27a1`，2026-08-11）——行号按该 tag 的 blob（复核用 `git show v0.8.5.3:<文件>`；工作树已于 2026-09-08 恢复为 v0.8.5.4 内容，此前误留的 8 文件暂存回退已清），v0.8.5.4 独有行为见 §2.5 | HEAD = `b3ab747`（2026-08-11，未打 tag；`pyproject.toml:7` 版本号 `0.8.6rc2`） |
 | 发布形态 | 公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel，CUDA 架构 sm_80/89/120 | 仅本地源码构建，**分支未推送远端**（`git branch -a` 无 `origin/codex/phase-cd`，亲验） |
 | 文件布局 | **重构前单体**：`StiffGIPC/GIPC.cu` 16,884 行、`sim_engine.cu` 4,534 行、`mlbvh.cu` 3,171 行、`MASPreconditioner.cu` 3,126 行（`wc -l` 实测） | v0.8.6 模块化：四大单体拆成 `gipc_modules/`(现存 14，`00..14` 缺 `04`——barrier 融合装配已随能量层 E1d `7983be1` 迁至 `energy/03_barrier_fused_assembly.inl`；phase1 拆分时点为 15，见 §3.1) + `engine_modules/`(5) + `mlbvh_modules/`(7) + `mas_modules/`(6) + `energy/` 独立 TU + `core/` + `frame_fsm/` 等 |
 | 服务对象 | 需要稳定行为、复现实验、wheel 安装的用户 | 引擎开发、GPU 驻留 RL、整帧 CUDA Graph、门禁基建 |
@@ -92,7 +92,7 @@
                                                                 ├── 1bc13ef (2026-07-31) contact-IO: 摩擦读数恒零修复 + reset API
                                                                 ├── 1d05c7a (2026-07-31) teleport ABD 表面立即刷新
                                                                 │
-                                                              v0.8.5.3 = b8e27a1 (2026-08-11)  ◄── 本手册的稳定线引用基线（工作树内容钉在此处）
+                                                              v0.8.5.3 = b8e27a1 (2026-08-11)  ◄── 本手册的稳定线引用基线（按此 tag 的 blob；工作树现为 v0.8.5.4）
                                                                 │
                                                                 ├── dc1a297 (8/11) absolute_epsv 旋钮 + 持久摩擦锚（真静摩擦）
                                                                 ├── d7ab5bf (8/11) STIFF_NEWTON_TRACE 逐迭代 move-norm 诊断
@@ -202,7 +202,7 @@
 
 - **tag 落点**：`c0339c8`（2026-08-12 01:05 +0800，strict 抑制 anchor 的收尾提交；符合 §1.3 的落点惯例）；**release 提交本体** `0894958`（2026-08-12 00:12 +0800，"release(v0.8.5.4): default-on true static friction"）。版本号 `pyproject.toml:7` = `0.8.5.4`、CHANGELOG 条目 `CHANGELOG.md:7-44`。
 - **对外发布**：公开仓 `github.com/haoxiangNtu/stiff-physics` 的 Release `v0.8.5.4`（标题 "v0.8.5.4 — true static friction (default-on)"）**已正式发布**，`published: 2026-08-11T17:07:37Z`（= 2026-08-12 01:07 +0800，紧跟 tag 提交），`draft:false`/`prerelease:false`；资产 **cp311/cp312 双 wheel**：`stiff_physics-0.8.5.4-cp311-cp311-linux_x86_64.whl`、`stiff_physics-0.8.5.4-cp312-cp312-linux_x86_64.whl`。公开仓 README 的安装 URL 已由 `a38ede4` 指向 v0.8.5.4（`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验；OPEN_POINTS OP-001 已关闭）。
-- ⚠ **本条目的全部稳定仓行号取自 `git show HEAD:<file>`**，不是磁盘文件——工作树被 8 个文件的已暂存回退改动钉在 v0.8.5.3 内容上（见 §6），磁盘副本里这些代码与 CHANGELOG 条目都不存在。
+- ⚠ **本条目的全部稳定仓行号取自 `git show HEAD:<file>`**（勘探当时工作树被误留的 8 文件暂存回退钉在 v0.8.5.3 内容上，磁盘副本里看不到这些代码；该状态已于 2026-09-08 清除，现在磁盘文件与 `git show HEAD:` 一致，见 §6）。
 - **⚠ 行为警示（升级必读）**：两个新默认值**改变所有含摩擦场景的轨迹**——不是"不调用新 API 就一致"的那类补丁版（对比 v0.8.5.3 的兼容承诺，§2.4）。逐位回到 0.8.5.3 需显式关掉两者。
 
 **组成提交**（4 条，`git log v0.8.5.3..v0.8.5.4` 亲验）：
@@ -537,7 +537,7 @@ GPU-native RL 证据链定格数字：铰接一帧图 551 节点（无碰撞，�
 ## 6. 稳定线 v0.8.5.3 之后的提交明细与工作树状态
 
 > **本节定位已更新**：这 4 条提交构成正式版本 **v0.8.5.4**，其版本条目见 **§2.5**；本节保留为**提交级明细 + 工作树状态记录**。
-> 仍需注意的两件事：① **磁盘工作树被回退到与 v0.8.5.3 逐字节一致**（`git diff v0.8.5.3 --stat` 为空 + 8 个文件的已暂存回退修改，亲验）——`git checkout`/`stash`/`reset` 任一操作都会让工作区静默变成 v0.8.5.4 内容；本手册的稳定线**行号**因此一律取自 v0.8.5.3 内容（v0.8.5.4 独有行号在 §2.5 里按 `git show HEAD:` 标注）。② **wheel 资产已确认挂出**（§8 #1 / OPEN_POINTS OP-001 已关闭）：Release `v0.8.5.4` 2026-08-11 正式发布、cp311/cp312 双 wheel 在架——"版本存在"与"发布物存在"这次两件都成立，只有工作树还停在 v0.8.5.3。
+> 仍需注意的两件事：① **工作树状态已更正**：勘探时磁盘工作树被误留的 8 文件暂存回退按在 v0.8.5.3 内容上（owner 确认非本意），2026-09-08 已 `reset --hard HEAD` 恢复为 v0.8.5.4 内容（回退补丁留有备份）；本手册的稳定线**行号**仍一律按 v0.8.5.3 blob（复核用 `git show v0.8.5.3:<文件>`），v0.8.5.4 独有行号在 §2.5 里按 `stable@c0339c8` 标注、现与磁盘一致。② **wheel 资产已确认挂出**（§8 #1 / OPEN_POINTS OP-001 已关闭）：Release `v0.8.5.4` 2026-08-11 正式发布、cp311/cp312 双 wheel 在架——"版本存在"与"发布物存在"这次两件都成立，工作树也已跟上。
 
 组成提交明细（`CHANGELOG.md:7-44` 的 0.8.5.4 条目只存在于 `git show HEAD:CHANGELOG.md`，磁盘副本因回退而无此条目）：
 

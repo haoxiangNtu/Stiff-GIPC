@@ -2,10 +2,12 @@
 
 > 手册基准日期:2026-09-07(2026-09-08 补入稳定线 v0.8.5.4,见 §2)。
 > 覆盖两条产品线:**稳定线**(`release/stable-0.8`;**最新 = tag `v0.8.5.4`,2026-08-12,真静摩擦默认开**;
-> 本手册的行号/行为基线 = tag `v0.8.5.3`,2026-08-11,磁盘工作树内容)与
+> 本手册的行号/行为基线 = tag `v0.8.5.3` 的 blob,2026-08-11;工作树现为 v0.8.5.4)与
 > **工程线 codex/phase-cd**(`0.8.6rc2`,HEAD `b3ab747`)。
 > 除非另有标注,文件:行号出处指工程线工作树 `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph`;
-> 标注 `[stable]` 前缀者指稳定线工作树 `/home/ps/Downloads/Stiff-GIPC-stable-08`。
+> 标注 `[stable]` 前缀者指稳定线仓 `/home/ps/Downloads/Stiff-GIPC-stable-08` 的 **tag v0.8.5.3 blob**
+> (复核用 `git show v0.8.5.3:<文件> | sed -n '<行>p'`,勿按磁盘行号——工作树现为 v0.8.5.4,
+> 8 个文件有 +511 行插入);`stable@c0339c8 文件:行` 形式的引用与磁盘文件一致。
 
 ---
 
@@ -100,8 +102,8 @@ A800 上 RL 微步经 GPU 驻留通道从 19.3 → 3.85 ms/步(**5.0×**,
 > ③ strict 多环境下 anchor 被**自动抑制**(anchor 与 `epsv=1e-4` 组合会把摩擦能量推到 N 形状相关的 line-search ulp 比较边界上,破坏批不变性;根修排入 0.8.6),因此**strict 与 merged/isolated 的摩擦行为不同**,跨模式对照时务必注意;
 > ④ **wheel 已挂公开仓**:Release `v0.8.5.4` 2026-08-11 正式发布,cp311/cp312 双 wheel 在架——安装指令已按 v0.8.5.4 给(§3.1)。
 >
-> **本手册的稳定线基线仍是 v0.8.5.3**:磁盘工作树内容与 tag `v0.8.5.3` 逐字节一致
-> (`git diff v0.8.5.3 --stat` 为空),下表所有 `[stable] 文件:行号` 均取自该内容。
+> **本手册的稳定线行号基线仍是 v0.8.5.3 的 blob**:下表所有 `[stable] 文件:行号` 均按
+> `git show v0.8.5.3:<文件>` 给。工作树已于 2026-09-08 恢复为 HEAD(v0.8.5.4)内容——此前 8 个文件被某次会话误留的暂存回退按在 v0.8.5.3,非 owner 本意,已 `reset --hard`(回退补丁留有备份)。
 > v0.8.5.4 独有内容见 [CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §2.5、
 > [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.5/§1.6。
 > **工程线 phase-cd 完全没有这批工作**(grep `absolute_epsv`/`friction_anchor` 零命中)——
@@ -146,9 +148,8 @@ A800 上 RL 微步经 GPU 驻留通道从 19.3 → 3.85 ms/步(**5.0×**,
 > 故稳定线 v0.8.5.3 的两个 contact-IO 修复提交、以及 v0.8.5.4 的全部提交
 > (`dc1a297`/`d7ab5bf`/`0894958`/`c0339c8`)都不在 phase-cd 历史里
 > ——**三个未移植项**的合并清单见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) §1.0。
-> 上表第 1–15 行的稳定线列 = **v0.8.5.3 内容**(磁盘工作树与该 tag 逐字节一致,
-> `git diff v0.8.5.3 --stat` 为空;`git checkout`/`stash`/`reset` 会让工作区静默变成
-> v0.8.5.4 内容——[CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §6),
+> 上表第 1–15 行的稳定线列 = **v0.8.5.3 内容**(按 tag blob;工作树自 2026-09-08 起为
+> v0.8.5.4 内容,复核行号用 `git show v0.8.5.3:<文件>`——[CHANGELOG_TIMELINE.md](CHANGELOG_TIMELINE.md) §6),
 > 第 16 行按 `git show HEAD:` 读 v0.8.5.4;v0.8.5.4 的 wheel 已正式挂出(cp311/cp312,§3.1)。
 
 ### 2.3 运行时探测你在哪条线

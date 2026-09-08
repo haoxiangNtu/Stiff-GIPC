@@ -31,7 +31,8 @@
   附录 A#2 / OPEN_POINTS OP-001 已关闭)——读者拿到的 wheel 可能已是 v0.8.5.4,
   本分册按 v0.8.5.3 给的摩擦默认值届时需按【仅稳定线 v0.8.5.4+】标注改读。
   更正一处旧勘探口径:CHANGELOG `[0.8.5.4]` 条目在提交 `0894958`/`c0339c8` 里
-  **是存在的**,只是被工作树那 8 个文件的未提交回退一并撤了,故树上看不到。
+  **是存在的**;当时树上看不到是因为工作树被误留的 8 文件暂存回退按在 v0.8.5.3,
+  该状态已于 2026-09-08 清除,现在磁盘 CHANGELOG 即含该条目。
 - **工程线(phase-cd)** = 仓库 `Stiff-GIPC-c1-ls-graph`,分支 `codex/phase-cd`,
   HEAD `b3ab747`;含 v0.8.6 模块化重构、整帧 CUDA Graph、GPU 驻留 RL、episode、
   checkpoint v2 等全部 v0.8.5 之后的工作。
@@ -1373,8 +1374,8 @@ env_newton_iter_cap:中毒 env 冻结不炸进程)、`test_env_midrun_quarantine
    `v0.8.5.4` 已正式发布(`published: 2026-08-11T17:07:37Z`,`draft:false`/
    `prerelease:false`),`stiff_physics-0.8.5.4-cp311/cp312-linux_x86_64.whl`
    两个资产均已挂出,公开仓 README 安装 URL 也已由 `a38ede4` 指向 v0.8.5.4——
-   **未撤回、未重做**(OPEN_POINTS OP-001 已关闭)。稳定仓工作树仍被 8 个文件的
-   未提交回退按在 v0.8.5.3(含 CHANGELOG 条目),那是**工作树状态**,与发布无关。
+   **未撤回、未重做**(OPEN_POINTS OP-001 已关闭)。稳定仓工作树曾被误留的 8 文件
+   暂存回退按在 v0.8.5.3,已于 2026-09-08 恢复为 v0.8.5.4 内容;那只是工作树状态,与发布无关。
 3. **`get_body_contact_force` 的 ground 口径矛盾**:Python docstring 称
    "no ground contact",但 C++ 实现(03_step_getters_export.inl:1174)实际调用了
    `computeGroundGradient`——倾向以代码为准(含 ground),文档口径待项目定夺。

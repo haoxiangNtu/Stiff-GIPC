@@ -11,7 +11,7 @@
 | **工程线(phase-cd)** | `Stiff-GIPC-c1-ls-graph` | `codex/phase-cd`,HEAD `b3ab747` | v0.8.6 模块化重构(`core/`、`energy/`、`gipc_modules/`、`engine_modules/` 等)+ 整帧 CUDA Graph、GPU 驻留 RL、episode、checkpoint v2 等 v0.8.5 之后的全部工作 |
 
 - 未标注仓库的 `文件:行号` 一律指 **phase-cd 树**(`StiffGIPC/` 前缀省略);稳定线出处写作 `(稳定线 GIPC.cu:NNNN)`。
-- ⚠ 磁盘上的稳定线工作树 HEAD 是 `c0339c8`——即 tag **v0.8.5.4** 所指的提交本身(带 "release(v0.8.5.4)" 消息的 `0894958` 是其父提交);该线携带静摩擦锚 friction_anchor / absolute_epsv 工作,**不属于本手册记述的 v0.8.5.3 发布**。但**检出的文件内容与 v0.8.5.3(`b8e27a1`)逐字节相同**(`git diff v0.8.5.3` 为空;index 中的 staged 修改把 HEAD 内容回退到了 v0.8.5.3,friction_anchor / absolute_epsv 代码只在 git 历史里、不在工作树文件中)——本篇引用的稳定线行号即取自该工作树,**相对 `b8e27a1` 无偏移**。v0.8.5.4 独有行为(仅存于 git 历史)在文中单独标注。
+- ⚠ 磁盘上的稳定线工作树 HEAD 是 `c0339c8`——即 tag **v0.8.5.4** 所指的提交本身(带 "release(v0.8.5.4)" 消息的 `0894958` 是其父提交);该线携带静摩擦锚 friction_anchor / absolute_epsv 工作,**不属于本手册记述的 v0.8.5.3 发布**。本篇引用的稳定线行号按 **tag `v0.8.5.3`(`b8e27a1`)的 blob**(勘探时工作树曾被误留的暂存回退按在该内容上、与 blob 逐字节相同,故无偏移);工作树已于 2026-09-08 恢复为 v0.8.5.4 内容,复核请用 `git show v0.8.5.3:<文件>`,不要按磁盘行号。v0.8.5.4 独有行为在文中单独标注。
 - 适用线标签:**【稳定线+phase-cd】**两线均有;**【仅 phase-cd】**;**【仅稳定线】**;**【实验性,默认关】**需要环境变量显式开启。
 
 **本篇目录**

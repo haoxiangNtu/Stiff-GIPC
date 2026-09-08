@@ -19,7 +19,7 @@
 | | 稳定线 | 工程线 |
 |---|---|---|
 | 仓库 | `/home/ps/Downloads/Stiff-GIPC-stable-08`,分支 `release/stable-0.8` | `/home/ps/Downloads/Stiff-GIPC-c1-ls-graph`,分支 `codex/phase-cd`,HEAD `b3ab747` |
-| 版本 | **tag `v0.8.5.3`**(commit `b8e27a1`,2026-08-11 发布;本地工作区内容与该 tag 逐字节一致,`git diff v0.8.5.3` 为空;`pyproject.toml` version=`0.8.5.3`)。**脆弱性警告**:分支 HEAD 实为 `c0339c8` = tag `v0.8.5.4`(2026-08-12,较 v0.8.5.3 +511 行:`absolute_epsv` 旋钮、持久摩擦锚/默认开真静摩擦,**摩擦行为有变**),v0.8.5.3 内容仅靠 8 个文件的未提交回退改动维持——执行 `git checkout`/`stash`/`reset` 任一操作,工作区将静默变成 v0.8.5.4 | `0.8.6rc2`(`pyproject.toml:7`) |
+| 版本 | **tag `v0.8.5.3`**(commit `b8e27a1`,2026-08-11 发布;本册 `[stable]` 行号按该 tag 的 blob,复核用 `git show v0.8.5.3:<文件>`;tag 树 `pyproject.toml` version=`0.8.5.3`)。稳定线仓分支 HEAD = `c0339c8` = tag `v0.8.5.4`(2026-08-12,较 v0.8.5.3 +511 行:`absolute_epsv` 旋钮、持久摩擦锚/默认开真静摩擦,**摩擦行为有变**);工作树已于 2026-09-08 恢复为 HEAD(v0.8.5.4)内容——此前 8 个文件被某次会话误留的暂存回退按在 v0.8.5.3,非 owner 本意,已 `reset --hard`(回退补丁留有备份),**勿按磁盘行号复核 v0.8.5.3 引用** | `0.8.6rc2`(`pyproject.toml:7`) |
 | 发布形态 | 公开仓 `github.com/haoxiangNtu/stiff-physics` 挂 cp311/cp312 wheel,CUDA 架构 sm_80/89/120 | 仅源码构建(本地分支,未推送远端) |
 | C++ 布局 | 重构前单体(`StiffGIPC/GIPC.cu` 16884 行、`sim_engine.cu` 4534 行) | v0.8.6 模块化:`GIPC.cu`/`sim_engine.cu` 仅为按序 include `gipc_modules/`、`engine_modules/` 等 `.inl` 的组合 TU |
 | 内容差异 | 含 tactile 线两个修复(§8.1、§9.5) | 含 v0.8.5 之后全部工作:整帧 CUDA Graph、GPU 驻留 RL、episode、checkpoint v2、类型化异常、进程级模式锁等 |
@@ -181,7 +181,7 @@ Python 侧四个子类均以 `StiffGIPCError` 为基类,可 `from stiff_physics 
 >   ```
 >   或直接装回 0.8.5.3 wheel。**两个必须同时关**——只关一个仍是新轨迹。环境变量优先于 Config(stable@c0339c8 GIPC.cu:9499、:9811)。
 > - **phase-cd 上没有这两个字段**:`Config(absolute_epsv=1e-4)` 会走 `**kwargs` 透传路径,`hasattr(self._cfg, ...)` 为假 → **静默忽略、无警告**(见表末 `**kwargs` 行),不会报错也不会生效;`STIFF_EPSV` / `STIFF_FRIC_ANCHOR` 在 phase-cd 未注册,会被 knob-registry tripwire 报 `unknown STIFF_* knob`(API_EXECUTION §7.0)。工程线要用真静摩擦,须走未合入的移植分支 `port/friction-anchor-086`(`c735e13` epsv、`57015da` anchors;分支现状与合入前提见 KNOWN_ISSUES §1.5 与 §1.1 修复状态栏)。
-> - **行号约定**:本条 `stable@c0339c8 <文件>:<行号>` 指稳定线 **commit `c0339c8` 的 blob**,不是该仓当前工作树——工作树被 8 个文件的未提交回退按在 v0.8.5.3(§版本口径的脆弱性警告),树上 grep `absolute_epsv` 为 0 命中。
+> - **行号约定**:本条 `stable@c0339c8 <文件>:<行号>` 指稳定线 **commit `c0339c8` 的 blob**,自 2026-09-08 起与工作树一致(工作树已恢复为 `c0339c8` 内容)。勘探当时工作树曾被误留的 8 文件暂存回退按在 v0.8.5.3、树上 grep `absolute_epsv` 为 0 命中,该状态已清除。
 > - **已发布(v0.8.5.4,双 wheel)**:公开仓 Release `v0.8.5.4` 已正式发布(2026-08-11T17:07:37Z,非 draft/prerelease),`cp311`/`cp312` 两个 wheel 均已挂出,README 安装 URL 也已指向它(`gh release view v0.8.5.4 --repo haoxiangNtu/stiff-physics` 亲验;OPEN_POINTS OP-001 已关闭)。**但"可以装"不等于"可以随手升"**:装上 v0.8.5.4 就是上表的新默认值,**所有含摩擦场景的轨迹都会变**——既有回放/金锚/RL 策略要逐位复现,升级时必须同时给上面的两个逃生阀。
 
 ### 2.2 dHat / 摩擦 dhat / dTol 派生(GIPC::init)【稳定线+phase-cd】
