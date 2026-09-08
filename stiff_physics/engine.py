@@ -480,6 +480,9 @@ class Engine:
                 f"unknown multienv_mode {requested_mode!r}; "
                 "use merged/isolated/strict (or 0/1/2)"
             )
+        # Remembered for the finalize-time isolation audit (see finalize()).
+        self._multienv_mode = canonical_mode
+        self._declared_group_count = 0
         requested_per_env_exit = bool(
             getattr(self._config, "per_env_exit", False)
         )
@@ -724,6 +727,8 @@ class Engine:
         declarations fail at finalize() instead of silently degrading physics.
         """
         self._engine.set_body_groups([int(g) for g in groups])
+        ids = [int(g) for g in groups if int(g) >= 0]
+        self._declared_group_count = (max(ids) + 1) if ids else 0
 
     def set_vertex_env_ids(self, env_ids) -> None:
         """Set per-VERTEX env id, length = engine vertex count (ABD-body vertices in
@@ -988,8 +993,47 @@ class Engine:
         Reset or destroy it before finalizing another Engine.
         """
         _assert_process_mode_signature()
+        self._warn_isolated_without_quarantine()
         self._engine.finalize()
         self._finalized = True
+
+    def _warn_isolated_without_quarantine(self) -> None:
+        """[audit] isolated/strict are PHYSICAL isolation only.
+
+        Mid-run per-env quarantine (a diverging env goes inert, the others keep
+        running) lives on the host telemetry path, which the mode bundles do
+        not enable: ``GIPC::perEnvIsolationLive`` needs ``env_newton_iter_cap>0``
+        or ``STIFF_PERENV_TELEM``.  Without it ``quarantineEnv`` returns false
+        and a diverging environment aborts the WHOLE batch, exactly like
+        merged mode.  The productized switch is ``Config(per_env_exit=True)``.
+        Say so once, at finalize, instead of letting the batch die silently
+        later.  (Owner decision 2026-09-08: keep the two contracts separate —
+        telemetry routes through the host S1 path and makes the frame graph /
+        gpu_rl residency channel ineligible, so it must stay opt-in.)
+        """
+        mode = getattr(self, "_multienv_mode", "merged")
+        if mode not in ("isolated", "strict"):
+            return
+        groups = int(getattr(self, "_declared_group_count", 0))
+        if groups <= 1:
+            return
+        if bool(getattr(self._config, "per_env_exit", False)):
+            return
+        if _env_enabled("STIFF_PERENV_TELEM"):
+            return
+        try:
+            cap = int(getattr(self._config.native, "env_newton_iter_cap", 0))
+        except Exception:
+            cap = 0
+        if cap > 0:
+            return
+        print(f"[stiff-physics][WARN] multienv_mode='{mode}' with {groups} env "
+              "groups but per_env_exit=False (env_newton_iter_cap=0, "
+              "STIFF_PERENV_TELEM unset): a diverging environment aborts the "
+              "WHOLE batch — this mode is physical isolation only. For mid-run "
+              "per-env quarantine set Config(per_env_exit=True) (host telemetry "
+              "path; the frame graph / gpu_rl residency channel become "
+              "ineligible).", flush=True)
 
     def step(self) -> None:
         """Advance simulation by one timestep (dt).

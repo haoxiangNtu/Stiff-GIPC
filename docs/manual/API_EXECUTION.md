@@ -296,6 +296,12 @@ Engine.get_per_env_status() -> np.ndarray         # engine.py:1674-1677,长度 2
   纯设备快路径下不填,返回值保持 reset 值(-1 / 0)——该结论由代码路径推理得出,
   未跑程序验证(待核实)。实践口径:**要用遥测,配
   `per_env_exit=True` + `env_newton_iter_cap`(或 `STIFF_PERENV_TELEM=1`)**。
+  **owner 决策(2026-09-08)**:两种契约保持分离——isolated/strict 只管物理隔离,故障隔离
+  要 `per_env_exit=True` 另开(遥测走宿主 S1 路径,整帧图/gpu_rl 驻留通道随之失格,
+  `frame_transaction.cu:416-423`,所以不能默认带上)。作为补偿,【仅 phase-cd】`finalize()`
+  在 isolated/strict + 分组数>1 + 未开任何遥测时打印一次
+  `[stiff-physics][WARN] … this mode is physical isolation only`(`engine.py`
+  `_warn_isolated_without_quarantine`;六种组合的触发矩阵见 `examples/test_isolated_quarantine_warn.py`)。
 - 相关配置:`SimEngineConfig::env_newton_iter_cap = 0`(int,默认 0=off;per-env
   Newton 迭代预算,到 cap 仍活跃的 env 被强制冻结为 status 2,其他 env 不受影响;
   仅 host per-env 路径;sim_engine.h:73-76,pybind bindings/pystiffgipc.cu:130)。

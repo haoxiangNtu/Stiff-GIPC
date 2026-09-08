@@ -586,7 +586,9 @@ isolated 解决的是**物理隔离/公平**,不是复现。核心机制
 - **可用性门** `GIPC::perEnvIsolationLive()`:multi-env groups 已声明
   (`m_active_group_count > 1`)AND host 遥测路径开(`env_newton_iter_cap > 0` 或
   STIFF_PERENV_TELEM)AND per-env alpha 开。**纯设备快路径蓄意没有 NaN 防御——
-  隔离承诺依赖此门**(isolation.cuh:8-13)。
+  隔离承诺依赖此门**(isolation.cuh:8-13)。owner 决策(2026-09-08):此门**保持 opt-in**
+  (遥测使整帧图/驻留通道失格,`frame_transaction.cu:416-423`);【仅 phase-cd】`finalize()`
+  对"门关着的 isolated/strict 多分组"打印一次 WARN(`engine.py` `_warn_isolated_without_quarantine`)。
 - **状态码** `m_env_status`:0 running / 1 converged / 2 timeout-frozen(per-solve)/
   3 quarantined;`m_env_quarantined` 是跨帧持久旗标,带设备镜像(isolation.cuh:14-17)。
 - **被检疫 env 完全惰性**:位置冻结(α==0 保持最后接受状态)、每迭代方向清零
