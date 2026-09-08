@@ -9,7 +9,7 @@
 > 汇总口径出自 [`../manual_review_gaps.md`](../manual_review_gaps.md) §4(2026-09-07)。
 
 状态取值:`open`(未决)/ `closed`(已关闭,附证据)。
-**当前统计:37 条 = 34 open / 3 closed**(最近关闭:OP-001、OP-018,2026-09-08;OP-003,2026-09-07)。
+**当前统计:38 条 = 35 open / 3 closed**(最近关闭:OP-001、OP-018,2026-09-08;OP-003,2026-09-07)。
 
 ---
 
@@ -69,6 +69,7 @@
 | OP-035 | ~30 条纯 docs 提交只核对了标题/摘要,内部数字未回查 | CHANGELOG_TIMELINE §8#7 | 引用其内部数字前按 hash `git show` 回查全文(如 `79f88f4` episode 经济学数值表) | open |
 | OP-036 | RL 微步 19.3/9.7/3.85 ms/步的平台标签在 A800_ALLEXAMPLES 与 SIMULATOR_EXECUTION_DESIGN 之间冲突(手册已取 A800,待 owner 确认) | CHANGELOG_TIMELINE §8#8、README §1 | 向 owner 确认 A800_ALLEX 该节 "(4090, clean GPU)" 标题是否笔误;或定位原始 bench 日志的平台记录 | open |
 | OP-037 | 稳定线单体行号(stable `GIPC.cu:15221` line-search WARN、`:10318` grow-redo 等)出自当日勘探,复引前建议复核 | KNOWN_ISSUES §6#5 | 稳定树 grep 对应符号/字符串,刷新行号后再引用 | open |
+| OP-038 | 2026-08-11 A800 beaker 摩擦战役(14 臂矩阵、μ 饱和 Ft/Fn 四点、5.96 N/20 N 读数)的原始日志与运行配置未归档,`docs/BEAKER_FRICTION_CAMPAIGN_2026-08-11.md` 系从会话记录重建 | PRINCIPLES_CONTACT §5.2/§9.6;AUDIT_LEDGER D-022/D-023 | 在 A800 上按该文 §1 条件重跑 μ ∈ {0.02,0.05,0.1,0.2} 四臂 + 一次读数验证,把日志与脚本存入 `docs/evidence/beaker_friction_2026-08-11/`,数字对上即改本条为 closed 并去掉该文出处声明 | open |
 
 ---
 
