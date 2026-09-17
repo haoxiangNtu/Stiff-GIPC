@@ -78,7 +78,8 @@ class TactileRenderer:
 
     def __init__(self, ckpt_path: str, ref_img_path: str, device: str = "cuda:0",
                  chunk_px: int = 1 << 20, half: bool = False,
-                 flat_calibrate: bool = True):
+                 flat_calibrate: bool = True,
+                 resolution: tuple[int, int] | None = None):
         """
         Args:
             chunk_px: pixels evaluated per MLP forward. The MLP runs on EVERY
@@ -104,6 +105,14 @@ class TactileRenderer:
         self.mlp.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
         self.mlp.to(device=device, dtype=self.dtype).eval()
         self.ref = self._load_ref(ref_img_path)
+        # non-400x400 cameras (e.g. the 504x252 gripper pad): resample the
+        # reference image to the camera resolution -- the MLP is per-pixel, so
+        # only the reference compositing and the coord grid depend on size
+        if resolution is not None and tuple(self.ref.shape[:2]) != tuple(resolution):
+            from PIL import Image
+            im = Image.fromarray((self.ref * 255).astype(np.uint8))
+            im = im.resize((resolution[1], resolution[0]), Image.BILINEAR)
+            self.ref = np.asarray(im).astype(np.float64) / 255.0
         h, w = self.ref.shape[:2]
         coords = np.stack(np.meshgrid(np.arange(h), np.arange(w)), axis=-1).transpose(1, 0, 2)
         self.coords = torch.from_numpy(coords).float().reshape(1, -1, 2).to(device)
