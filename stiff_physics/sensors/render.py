@@ -98,6 +98,8 @@ class TactileRenderer:
         """
         if not _TORCH:
             raise ImportError("RGB rendering needs torch (pip install torch)")
+        # recorded so a runtime export can rebuild this renderer offline
+        self.source_paths = (ckpt_path, ref_img_path)
         self.device = device
         self.chunk_px = int(chunk_px)
         self.dtype = torch.float16 if half else torch.float32

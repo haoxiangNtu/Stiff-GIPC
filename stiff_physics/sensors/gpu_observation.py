@@ -40,10 +40,15 @@ def _load_ext(verbose: bool = False):
             _cand = osp.join(osp.dirname(_here), "csrc")
         src = osp.join(_cand,
                        "tactile_raster.cu")
+        # gencode follows the machine we are on (sm_89 dev box, sm_80 A800
+        # pods, ...) — a hardcoded arch ships kernels the device cannot run
+        import torch
+        cc = "%d%d" % torch.cuda.get_device_capability()
         _EXT = load(
             name="stiff_tactile_raster",
             sources=[src],
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_89,code=sm_89"],
+            extra_cuda_cflags=["-O3", "--use_fast_math",
+                               f"-gencode=arch=compute_{cc},code=sm_{cc}"],
             verbose=verbose,
         )
     return _EXT

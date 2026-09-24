@@ -1,4 +1,4 @@
-"""Generic parallel-jaw gripper with finger-face VBTS pads (Xense-style rig).
+"""Generic parallel-jaw gripper with finger-face VBTS pads (digital-twin rig).
 
 A two-jaw parallel gripper is the LOWEST-risk tactile configuration in this
 stack: the jaws close by pure translation, so the two pads are parallel by
