@@ -269,19 +269,15 @@ class ParallelGripper:
 
     def _measured_force(self, fb: dict | None = None) -> float:
         """Grip force in N. With tactile pads bound this is the pad normal
-        force (the gripper's own sensors — exact). Without them, estimate
-        from servo lag: the engine applies K_eff ≈ strength/dt² per metre of
-        (target − d) lag, verified on the A800 probe (186 N at 0.141 mm lag,
-        strength 25, dt 5 ms). NOTE get_prismatic_drive_force() itself uses
-        the raw strength as K and under-reads by ~1/dt² — engine-fix candidate."""
+        force (the gripper's own sensors — the product semantics). Without
+        them, the engine's drive-force readback: since the 2026-09 engine fix
+        get_prismatic_drive_force returns physical newtons (K*(target−d)/dt²;
+        it previously returned the raw K*lag and under-read by 1/dt²)."""
         if fb is None and self._feedback is not None:
             fb = self._feedback()
         if fb and ("fn_left" in fb or "fn_right" in fb):
             return max(fb.get("fn_left", 0.0), fb.get("fn_right", 0.0))
-        k_eff = self.stiffness / self.dt ** 2
-        return max(k_eff * max(0.0, self._targets[n]
-                               - self.eng.get_prismatic_current_distance(
-                                   self.j_close[n]))
+        return max(abs(self.eng.get_prismatic_drive_force(self.j_close[n]))
                    for n in self.sides)
 
     def get_gripper_status(self) -> dict:
