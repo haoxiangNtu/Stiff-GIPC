@@ -2948,7 +2948,71 @@ double SimEngine::get_prismatic_drive_force(int idx) const
     Vector3 Cq = worldpt(qc, drv.Cq_bar);
     Vector3 t  = Ac * drv.tq_bar;
     double  d  = (Cq - Cp).dot(t);
-    return static_cast<double>(drv.stiffness) * (static_cast<double>(drv.target_distance) - d);
+    // [force-control][FIX] Joint driving energies are assembled into the
+    // incremental potential WITHOUT a dt^2 factor (they act as stiff penalties
+    // next to the kinetic term; see setup_abd_system_gradient_and_hessian.cu),
+    // so the PHYSICAL spring force is K*(target-d)/dt^2. The raw K*(target-d)
+    // under-reported by exactly 1/dt^2 — measured 0.005 N reported while the
+    // pads statically carried 186 N (K=33 N-per-metre-of-lag, lag 0.141 mm,
+    // dt 5 ms: 33*1.413e-4/2.5e-5 = 186.6 N).
+    double dt = static_cast<double>(impl.ipc.IPC_dt);
+    return static_cast<double>(drv.stiffness)
+           * (static_cast<double>(drv.target_distance) - d) / (dt * dt);
+}
+
+double SimEngine::get_revolute_drive_torque(int idx) const
+{
+    // [force-control] Current revolute DRIVING torque in N*m: K*wrap(target -
+    // theta)/dt^2, the rotational twin of get_prismatic_drive_force (same
+    // no-dt^2 assembly convention, same 1/dt^2 physical conversion). Added so
+    // the torque readback cannot be re-derived with the raw-K mistake.
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_system || !impl.ipc.m_abd_sim_data)
+        return 0.0;
+    auto& sys = *impl.ipc.m_abd_system;
+    if(idx < 0 || idx >= sys.m_num_revolute_driving)
+        return 0.0;
+
+    RevoluteDrivingGPUData drv;
+    CUDA_SAFE_CALL(cudaMemcpy(&drv, sys.m_revolute_driving_data.data() + idx,
+                              sizeof(RevoluteDrivingGPUData), cudaMemcpyDeviceToHost));
+
+    using Vec12 = Eigen::Matrix<double, 12, 1>;
+    auto& q_buf = impl.ipc.m_abd_sim_data->device.body_id_to_q;
+    Vec12 q1, q2;
+    CUDA_SAFE_CALL(cudaMemcpy(&q1, q_buf.data() + drv.parent_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(&q2, q_buf.data() + drv.child_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+
+    Eigen::Matrix3d A1, A2;
+    A1.row(0) = q1.segment<3>(3).transpose();
+    A1.row(1) = q1.segment<3>(6).transpose();
+    A1.row(2) = q1.segment<3>(9).transpose();
+    A2.row(0) = q2.segment<3>(3).transpose();
+    A2.row(1) = q2.segment<3>(6).transpose();
+    A2.row(2) = q2.segment<3>(9).transpose();
+
+    Eigen::Vector3d p  = A1 * drv.p_bar;
+    Eigen::Vector3d pN = A1 * drv.pN_bar;
+    Eigen::Vector3d qd = A2 * drv.q_bar;
+    Eigen::Vector3d qN = A2 * drv.qN_bar;
+    double cos_t = 0.5 * (p.dot(qd) + pN.dot(qN));
+    double sin_t = 0.5 * (qd.dot(pN) - qN.dot(p));
+    double theta = std::atan2(sin_t, cos_t);
+
+    // EXACT derivative of the driving energy E = 0.5*K*(sin^2 d + b*(1-cos d)^2)
+    // (abd_driving_joint.h, beta = 0.02), d = theta - target:
+    //   tau = dE/dd / dt^2 = K * sin(d) * (cos(d) + b*(1-cos(d))) / dt^2.
+    // Sign: positive torque drives theta toward the target. Note drv.target_angle
+    // is the GPU's rate-limited target (max_revolute_step_per_frame), i.e. the
+    // spring setpoint actually in force this frame — the right one to read.
+    constexpr double beta = 0.02;
+    double d   = theta - static_cast<double>(drv.target_angle);
+    d          = std::atan2(std::sin(d), std::cos(d));      // wrap to (-pi, pi]
+    double dt  = static_cast<double>(impl.ipc.IPC_dt);
+    double dEdd = std::sin(d) * (std::cos(d) + beta * (1.0 - std::cos(d)));
+    return -static_cast<double>(drv.stiffness) * dEdd / (dt * dt);
 }
 
 void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,

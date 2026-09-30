@@ -590,7 +590,8 @@ class SimEngine
     void set_prismatic_target(int idx, double distance_m);
     void set_prismatic_force(int idx, double force);  // [force-control] external prismatic force (N)
     void set_prismatic_limit_barrier(int idx, double cl, double dir, double dhat, double kappa, int slot = 0);  // [force-control] one-sided IPC barrier; slot 0=closed end, 1=open end (hard no-overshoot both ways)
-    double get_prismatic_drive_force(int idx) const;  // [force-control] current K*(target-d) drive force
+    double get_prismatic_drive_force(int idx) const;  // [force-control] PHYSICAL drive force N = K*(target-d)/dt^2
+    double get_revolute_drive_torque(int idx) const;   // [force-control] PHYSICAL drive torque N*m = K*wrap(target-theta)/dt^2
     double get_prismatic_current_distance(int idx) const;  // [force-control] current opening d along axis
     void   get_vertex_contact_force_sum(int vert_offset, int vert_count, double* out3) const;  // [force-control] net IPC contact force on a body
     void   get_body_contact_force_batched(const int* offsets, const int* counts, int n_seg, double* out3) const;  // [force-control] BATCHED: rebuild contacts ONCE, sum per segment (finger/env) -> n_seg 3-vectors, ONE D2H

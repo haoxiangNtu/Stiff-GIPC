@@ -1363,7 +1363,20 @@ class Engine:
         self._engine.set_prismatic_strength(idx, strength)
 
     def get_prismatic_drive_force(self, idx: int) -> float:
+        """Current prismatic driving force in NEWTONS: ``K*(target-d)/dt^2``.
+
+        Joint driving energies enter the incremental potential WITHOUT a dt^2
+        factor, so the physical spring force carries the ``1/dt^2``. (Before
+        the 2026-09 fix this returned the raw ``K*(target-d)`` and under-read
+        by exactly ``1/dt^2`` — 0.005 N reported at 186 N actual.)
+        """
         return self._engine.get_prismatic_drive_force(idx)
+
+    def get_revolute_drive_torque(self, idx: int) -> float:
+        """Current revolute driving torque in N*m: ``K*wrap(target-theta)/dt^2``
+        (rotational twin of :meth:`get_prismatic_drive_force`, same physical
+        conversion)."""
+        return self._engine.get_revolute_drive_torque(idx)
 
     def get_prismatic_current_distance(self, idx: int) -> float:
         return self._engine.get_prismatic_current_distance(idx)

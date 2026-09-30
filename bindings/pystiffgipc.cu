@@ -771,6 +771,8 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_prismatic_drive_force", &SimEngine::get_prismatic_drive_force, py::arg("idx"),
              "[force-control] Current prismatic driving force K*(target-d) (N). "
              "Used by force-limited position control to cap the grip force.")
+        .def("get_revolute_drive_torque", &SimEngine::get_revolute_drive_torque, py::arg("idx"),
+             "Current revolute driving torque in N*m: K*wrap(target-theta)/dt^2.")
         .def("get_prismatic_current_distance", &SimEngine::get_prismatic_current_distance,
              py::arg("idx"),
              "[force-control] Current prismatic opening d (m) along the joint axis. "
