@@ -4,6 +4,27 @@ All notable changes to **stiff-physics** are documented here. This project
 follows the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/).
 
+## [0.8.5.5] — 2026-10-23
+
+Bug-fix release; no behavior or API changes.
+
+### Fixed
+- **Random `RuntimeError: parallel_for failed: cudaErrorInvalidDevice: invalid
+  device ordinal` from `Engine.step()`.** The PCG solver's device-launched
+  loop graph (on by default since 0.8.5.1) is re-instantiated when its
+  captured topology changes; the rejected `cudaGraphExecUpdate` was handled,
+  but its error stayed the CUDA thread's last error, and the next
+  error-checked library call (a thrust/cub launch in the CCD BVH build)
+  reported it and threw. The error is now cleared after the rejected update,
+  in both the single-world and the segmented (multi-env) PCG. It only fired
+  in scenes where the loop graph had to be rebuilt, which is why it looked
+  random and scene-dependent. Results are unchanged (only the error state is
+  cleared). Workaround for older versions: `STIFF_PCG_DEVICE_LOOP=0`.
+- **Wheels: GPU architectures restored.** The 0.8.5.4 wheels were built for
+  `sm_89` (RTX 40-series) only, so they had no kernels for A100/A800
+  (`sm_80`) or RTX 50-series (`sm_120`) GPUs. The 0.8.5.5 wheels again ship
+  `sm_80`, `sm_89` and `sm_120`, as 0.8.5.3 did.
+
 ## [0.8.5.4] — 2026-08-12
 
 Friction line: true static friction. Two features, both new-default-ON —
