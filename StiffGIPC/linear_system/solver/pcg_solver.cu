@@ -882,6 +882,10 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                          && update_info.result == cudaGraphExecUpdateSuccess;
                     if(!ready)
                     {
+                        // A rejected update is expected when the captured topology changed (it is rebuilt below), but
+                        // cudaGraphExecUpdate also leaves its error as the thread's last error. Clear it, otherwise the
+                        // next runtime-checked call (e.g. a thrust/cub launch in the CCD BVH build) reports it and throws.
+                        cudaGetLastError();
                         cudaGraphExecDestroy(m_device_loop_exec);
                         m_device_loop_exec = nullptr;
                     }
@@ -1365,6 +1369,10 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
                          && update_info.result == cudaGraphExecUpdateSuccess;
                     if(!ready)
                     {
+                        // A rejected update is expected when the captured topology changed (it is rebuilt below), but
+                        // cudaGraphExecUpdate also leaves its error as the thread's last error. Clear it, otherwise the
+                        // next runtime-checked call (e.g. a thrust/cub launch in the CCD BVH build) reports it and throws.
+                        cudaGetLastError();
                         cudaGraphExecDestroy(m_seg_device_loop_exec);
                         m_seg_device_loop_exec = nullptr;
                     }
