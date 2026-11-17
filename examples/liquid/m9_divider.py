@@ -10,6 +10,7 @@ stencil for particles 0.1 mm off a 1 mm plate; CPU counterexample in liquid_reau
     PYTHONPATH=. python examples/liquid/m9_divider.py --out out/liquid_m9_ctl --no-piston   # control (quiet water)
 """
 import argparse, json, os, sys, time
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 from pathlib import Path
 import numpy as np
 

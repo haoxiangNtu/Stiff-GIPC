@@ -10,6 +10,7 @@ palm pose of trajectory N and solves the 7 right-arm joints again (seeded with N
         --out Assets/rokae_wuji/teleop_dropper_ik2.npz
 """
 import argparse
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 import json
 import os.path as osp
 import sys

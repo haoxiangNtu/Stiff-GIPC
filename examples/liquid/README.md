@@ -12,6 +12,30 @@ implicit (one 5 ms step, no liquid sub-stepping).
 Engine code: `StiffGIPC/mpm/liquid_system.{cuh,cu}`; design notes (internal):
 `MPM_IPC_MONOLITHIC_DESIGN.md`.
 
+## Liquid paths and solver settings
+
+Two liquid paths live in the engine; `LIQ_UG` chooses between them when the liquid is added.
+
+| | UG mode (`LIQ_UG=1`, **the default**) | main path (`LIQ_UG=0`) |
+|---|---|---|
+| volume term | per particle (particle quadrature, trilinear cell stencil; `LIQ_UG_BSPLINE=1` for quadratic B-splines) | per grid cell (cell-mean J) |
+| water–solid coupling | particle IPC barrier only | grid wall constraint + ghost penalty + particle barrier |
+| extras | pre-solve push-apart (`LIQ_UG_PUSH`, default 0.95), `LIQ_TENSION` default 1 | implicit surface tension, thin-wall masking, pump / drain, rest treatments |
+
+"Fast" and "strict" are solver settings, not liquid paths:
+
+* fast (the default): `newton_tol=1e-2`, `pcg_tol=1e-4` (the `Config` defaults) and the particle-based Newton exit test
+  (`LIQ_CONV_PARTICLE=1`, on by default in UG mode);
+* strict: `newton_tol=1e-3`, the rest unchanged.
+
+The bundled main-path examples (bottle squeeze, dropper, lab bench, sponge, the `m*` regression scenes except
+`m17_float.py`) pin `LIQ_UG=0` when run as scripts; set `LIQ_UG=1` in the environment to override. The published
+main-path bottle results additionally use `LIQ_WFC=1 LIQ_GP=1 LIQ_GP_FULL=6 LIQ_WFC_GROUND=1 LIQ_PUSH_FILM=2
+LIQ_STI=0.072 LIQ_CONV_PARTICLE=1 LIQ_VOX_BAR=0.3 LIQ_WFC_AL=1 LIQ_CPIC=1 STIFF_EXIT_BETA=0.1` with `pcg_tol=1e-8`.
+
+Known limits of the UG mode: water in a sealed, completely full container stalls the Newton solve; still water in a
+small box loses a few per cent of its depth; in the square-bottle squeeze it spilled no water in the one test made.
+
 ## API
 
 ```python

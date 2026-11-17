@@ -4,6 +4,7 @@ Run on the simulation pod. Use Compute Sanitizer for --mode smoke;
 test --particles 256, 257, 10524, and repeat with LIQ_ST=2.
 """
 import argparse
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 import json
 import os
 from pathlib import Path

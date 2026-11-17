@@ -45,7 +45,8 @@ struct LiquidParams
                                  //   shared-node (thin wall) modes stays, the bulk (where sloshing lives) is second order. 1 = the 27-node stencil of every
                                  //   wall-point particle (~1.5 cells: at dx 5 that is most of a beaker), 2 = only the corners of the cut cells (~0.5 cell),
                                  //   0 = BDF2 everywhere
-    int     ug         = 0;      // LIQ_UG: particle-quadrature liquid of the recovered Unified_GIPC engine (liquid_ug.cuh): trilinear
+    int     ug         = 1;      // LIQ_UG (DEFAULT ON since 2026-11-18, with the fast settings: particle exit test, push-apart 0.95, tension 1;
+                                 //   LIQ_UG=0 selects the main path, which the bundled main-path examples pin): particle-quadrature liquid of the recovered Unified_GIPC engine (liquid_ug.cuh): trilinear
                                  //   8-node stencil, per-particle kappa/2 (J-1)^2 + volume barrier, contact only through the particle
                                  //   IPC barrier; turns every wall / rest / regularisation option of this system off (see configure)
     double  ug_jact    = 0.0;    // LIQ_UG_JACT: volume-barrier activation ratio (0 = off; recovered default range (0, 1))

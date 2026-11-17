@@ -7,6 +7,7 @@ Here: same tank and drop, ABD bunny two-way coupled with the liquid inside the I
     PYTHONPATH=. python examples/nuka/bunny_water.py --out out/nuka/bw1 --liquid-dx 0.016
 """
 import argparse, os, os.path as osp, sys, time
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 import numpy as np
 
 sys.path.insert(0, osp.join(osp.dirname(osp.abspath(__file__)), "..", "robotgym"))

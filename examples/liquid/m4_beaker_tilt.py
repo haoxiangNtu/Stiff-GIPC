@@ -5,6 +5,7 @@ spill-onset angle, how much stays inside, the jet, and the solver cost.
     python examples/liquid/m4_beaker_tilt.py --fill 0.6 --out out/liquid_m4
 """
 import argparse, os, sys, time
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))

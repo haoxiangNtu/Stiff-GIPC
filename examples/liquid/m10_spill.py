@@ -6,6 +6,7 @@ the film's count and median vertical speed and the puddle's count, spread radius
     LIQ_WFC=1 LIQ_GP=1 LIQ_GP_FULL=6 LIQ_REST_K=20 LIQ_REST_KV=0.003 PYTHONPATH=. python examples/liquid/m10_spill.py --tag base
 """
 import argparse, os, os.path as osp, sys, time
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 import numpy as np
 from scipy.spatial import cKDTree
 sys.path.insert(0, osp.join(osp.dirname(osp.abspath(__file__)), "..", "robotgym"))

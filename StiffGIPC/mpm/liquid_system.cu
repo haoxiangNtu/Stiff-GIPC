@@ -4514,7 +4514,8 @@ void LiquidSystem::configure(const LiquidParams& p, const std::vector<double3>& 
     {   // the recovered engine's liquid: no grid wall BC, no rest / regularisation layers; only the particle barrier meets the solids
         P.wfc = P.wfc_ground = P.gp = 0; P.cpic = 0; P.wb = 0; P.cutcell = 0; P.wall_bc = P.ground_bc = 0;
         P.rest_damp = 0.0; P.sleep_v = 0.0; P.isl_v = 0.0; P.push_film = 0;   // LIQ_REST_K / LIQ_REST_KV (in-solve rest drag of slow nodes, k_write_node_slots) stay available in UG mode
-        P.push_apart = liquid_env("LIQ_UG_PUSH", 0.0);   // explicit pre-solve push-apart (main-path push_apart_pass) as the cheap sub-cell density control of UG mode; 0 = off
+        P.push_apart = liquid_env("LIQ_UG_PUSH", 0.95);  // explicit pre-solve push-apart (main-path push_apart_pass) as the cheap sub-cell density control of UG mode; 0 = off (default 0.95 since 2026-11-18)
+        if(!getenv("LIQ_TENSION")) P.tension_ratio = 1.0;   // UG default (2026-11-18): symmetric volumetric energy, as in every UG validation run
         P.st_gamma = 0.0; P.sti_gamma = 0.0; P.stm_sigma = 0.0; P.stick_h = 0.0; P.ghost_floor = 0.0; P.jfilt = 0.0;
         P.vbar = 0.0; P.visc = 0.0; P.pdev = 0.0; P.flip = 0.0; P.j_mode = 0; P.gm = 0;   // LIQ_BDF2 stays available (grid-node BDF2, no wall arrays in UG)
         P.g2p_jcell = 0; P.g2p_fluid = 0; P.wb_g2p = 0; P.wb_aggr = 0.0;
@@ -7919,7 +7920,7 @@ void LiquidSystem::zero_rows(double3* md, int vertex_num)
 
 const double3* LiquidSystem::scaled_movedir(const double3* md, int vertex_num)
 {
-    static const int s_conv_particle = getenv("LIQ_CONV_PARTICLE") ? atoi(getenv("LIQ_CONV_PARTICLE")) : 0;
+    static const int s_conv_particle = getenv("LIQ_CONV_PARTICLE") ? atoi(getenv("LIQ_CONV_PARTICLE")) : (P.ug ? 1 : 0);   // UG mode: on by default (fast settings, 2026-11-18)
     if(P.conv_scale >= 1.0 && !s_conv_particle) return md;
     if(!d_md_scaled || n_vertices_total != vertex_num)
     {

@@ -7,6 +7,7 @@ LIQ_FLOOR_GRAVITY (1: weighed, 0: inertia only), so the smallest drops are where
     python examples/liquid/m11_freefall.py --out out/liquid_m11
 """
 import argparse, json, os, sys, time
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))

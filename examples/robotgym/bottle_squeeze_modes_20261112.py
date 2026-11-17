@@ -9,6 +9,7 @@ built with -DGIPC_QUADRATIC_BENDING=OFF, i.e. dihedral bending).
     PYTHONPATH=. python examples/robotgym/bottle_squeeze.py --dry                              # IK check only
 """
 from __future__ import annotations
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 
 import argparse
 import json

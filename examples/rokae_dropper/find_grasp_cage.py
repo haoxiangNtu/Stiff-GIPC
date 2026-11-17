@@ -7,6 +7,7 @@ max(d_thumb, d_finger); the bulb centre is the point that minimises the worst su
 part of the hold (17-23 s), then the per-time clearances are printed for the whole grasp.
 """
 import os.path as osp
+if __name__ == "__main__": import os as _os; _os.environ.setdefault("LIQ_UG", "0")   # main-path example, when run as a script: pinned to the main liquid path (the engine default is the UG mode since 2026-11-18)
 import sys
 
 import numpy as np
