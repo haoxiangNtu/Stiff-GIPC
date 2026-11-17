@@ -819,6 +819,15 @@ void ABDSystem::_fix_surface_mesh_vertex_masses(muda::DeviceBuffer<Float>& uniqu
         double total_mass = (m_it != m_body_mass_override.end())
                                 ? m_it->second
                                 : std::abs(volume) * body_density;
+        // The full inertia override is authoritative for the dynamic mass
+        // matrix below. Use that same mass in the vertex sum/body_mass buffer
+        // read by joint drives; otherwise collision geometry silently changes
+        // actuator stiffness even though the authored inertia is unchanged.
+        auto inertia_it = m_body_inertia_override.find(smb.body_id);
+        if(inertia_it != m_body_inertia_override.end())
+            total_mass = inertia_it->second.mass;
+        if(!(total_mass > 0.0) || !std::isfinite(total_mass))
+            throw std::runtime_error("[StiffGIPC] ABD surface mass must be finite and positive");
         double mass_per_vertex = total_mass / static_cast<double>(smb.point_count);
 
         std::vector<Float> h_masses(smb.point_count, static_cast<Float>(mass_per_vertex));

@@ -17,7 +17,18 @@
 class device_TetraData
 {
   public:
-    static constexpr int kGroupSlotCapacity = 256;
+    // Max number of collision groups ("envs") a scene may declare via
+    // SimEngine::set_body_groups. Enforced in finalize(); also sizes
+    // GIPC::kEnvAlphaSlots.
+    //
+    // Raised 256 -> 4096 for many-environment tactile runs. The cost is a few
+    // small device arrays that are allocated at this capacity regardless of the
+    // scene's actual group count -- m_env_alpha (8B), m_env_active (4B),
+    // m_env_ground_trial_invalid (4B), m_ccd_refined_invalid (4B) and
+    // m_env_scratch (5x8B) per slot, i.e. ~232 KB total at 4096 versus ~15 KB at
+    // 256. Every per-env kernel is launched as (N + 255) / 256 blocks over the
+    // scene's RUNTIME group count, so nothing else scales with this constant.
+    static constexpr int kGroupSlotCapacity = 4096;
     double3* vertexes        = nullptr;
     double3* o_vertexes      = nullptr;
     double3* rest_vertexes   = nullptr;
@@ -36,6 +47,8 @@ class device_TetraData
 #ifdef USE_QUADRATIC_BENDING
     Eigen::Matrix4d* quad_bending_Q = nullptr;  // Precomputed Q matrices for quadratic bending
 #endif
+    double* bend_theta_p = nullptr;  // per tri-edge plastic rest-angle offset (dihedral bending with yield); zeros = elastic
+    double3* tet_plastic = nullptr;  // per tet volumetric plasticity: x = yield stress (Pa, 0 = elastic), y = linear hardening (Pa), z = accumulated plastic strain
 
     uint32_t* targetIndex     = nullptr;
     uint4*    tempTetrahedras = nullptr;

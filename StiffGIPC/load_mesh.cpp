@@ -1450,6 +1450,30 @@ void tetrahedra_obj::set_body_point_num(gipc::BodyType body_type, int point_num)
 }
 
 
+int tetrahedra_obj::load_points_body(const std::vector<double3>& pts,
+                                     const std::vector<double>&  masses_in,
+                                     int                         vertex_boundary_type,
+                                     BodyBoundaryType            body_boundary_type)
+{
+    begin_load_body("liquid_points", gipc::BodyType::FEM, body_boundary_type);
+    const int n = static_cast<int>(pts.size());
+    vertexNum += n;
+    set_body_point_num(gipc::BodyType::FEM, n);
+    for(int i = 0; i < n; ++i)
+    {
+        boundaryTypies.push_back(vertex_boundary_type);
+        vertexes.push_back(pts[i]);
+        velocities.push_back(make_double3(0, 0, 0));
+        masses.push_back(i < (int)masses_in.size() ? masses_in[i] : 0.0);
+        apply_gravity.push_back(1);
+        __GEIGEN__::Matrix3x3d constraint;
+        __GEIGEN__::__set_Mat_val(constraint, 1, 0, 0, 0, 1, 0, 0, 0, 1);
+        constraints.push_back(constraint);
+    }
+    vertexOffset = vertexNum;
+    return current_body_id;
+}
+
 void tetrahedra_obj::begin_load_body(const std::string& filename,
                                      gipc::BodyType     body_type,
                                      BodyBoundaryType   body_boundary_type)

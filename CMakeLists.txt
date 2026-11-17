@@ -40,14 +40,17 @@ endif()
 # add external libraries
 
 # Common compile definitions for physics engine
+option(GIPC_QUADRATIC_BENDING "Bergou quadratic bending for shells (assumes a flat rest shape); OFF = dihedral hinge bending with the optional plastic yield" ON)
 set(GIPC_PHYSICS_DEFS
     USE_SNK1 
     ADAPTIVE_KAPPA 
     USE_FRICTION 
-    USE_QUADRATIC_BENDING
     GIPC_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Assets/"
     GIPC_OUTPUT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Output/"
 )
+if(GIPC_QUADRATIC_BENDING)
+    list(APPEND GIPC_PHYSICS_DEFS USE_QUADRATIC_BENDING)
+endif()
 
 # Common CUDA compile options
 set(GIPC_CUDA_PRIVATE_OPTS

@@ -683,6 +683,7 @@ void My_PCG_General_v_v_Reduction_DeviceOut(double* temp, double* A, double* B,
 extern void My_PCG_General_v_v_Reduction_DeviceOut(double* temp, double* A, double* B,
                                                    int vertexNum, double* d_out);
 
+extern double g_pcg_setup_ms, g_pcg_iter_ms;   // [audit] defined in global_linear_system.cu
 namespace gipc
 {
 PCGSolver::PCGSolver(const PCGSolverConfig& cfg)
@@ -753,35 +754,122 @@ SizeT PCGSolver::solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Fl
         d2g = system_ptr()->m_s4_dof_to_group;
         ng  = system_ptr()->m_s4_ng;
     }
-    auto iter = (d2g && ng > 0)
-                    ? seg_pcg(x, b, m_config.max_iter_ratio * b.size(), d2g, ng)
-                    : pcg(x, b, m_config.max_iter_ratio * b.size());
+    if(d2g && ng > 0)
+        return seg_pcg(x, b, m_config.max_iter_ratio * b.size(), d2g, ng);
 
-    return iter;
+    // [live-prefix PCG] iterate on the leading m_live_n DOFs when the system declared
+    // the rest exactly inert (see GlobalLinearSystem::live_prefix_for_solve). x was
+    // zeroed over its whole length above, so the dead tail returns exactly 0, as the
+    // full-length solve leaves it. The iteration cap stays max_iter_ratio * b.size().
+    const SizeT n_full = b.size();
+    const SizeT n      = (m_live_n > 0 && m_live_n < n_full) ? m_live_n : n_full;
+    SizeT       n_dot  = n;
+    if(n < n_full)
+    {
+        // the cub scratch requirement grows with n: size it for the full length once,
+        // so every prefix length fits (the lazy query would size it for the first n)
+        cub_dot_reserve((int)n_full);
+        if(m_dot_n > n)
+        {
+            // verification: dots over [0, n_dot) with exactly-zero tails reproduce the
+            // full-length reduction partition bit for bit
+            n_dot = std::min(m_dot_n, n_full);
+            const size_t tail = (size_t)(n_dot - n) * sizeof(Float);
+            CUDA_SAFE_CALL(cudaMemsetAsync(z.view().data() + n, 0, tail));
+            CUDA_SAFE_CALL(cudaMemsetAsync(r.view().data() + n, 0, tail));
+            CUDA_SAFE_CALL(cudaMemsetAsync(p.view().data() + n, 0, tail));
+            CUDA_SAFE_CALL(cudaMemsetAsync(Ap.view().data() + n, 0, tail));
+        }
+    }
+    return pcg(x.subview(0, (int)n), b.subview(0, (int)n), m_config.max_iter_ratio * n_full, n_dot);
+}
+
+void PCGSolver::cub_dot_reserve(int n)
+{
+    cub::CountingInputIterator<int> counter(0);
+    cub::TransformInputIterator<double, DotProductOp, cub::CountingInputIterator<int>> input(
+        counter, DotProductOp{nullptr, nullptr});
+    size_t need = 0;
+    cub::DeviceReduce::Sum(nullptr, need, input, d_rz, n);
+    if(cub_temp_ptr == nullptr || need > cub_temp_bytes)
+    {
+        if(cub_temp_ptr)
+            CUDA_SAFE_CALL(cudaFree(cub_temp_ptr));
+        CUDA_SAFE_CALL(cudaMalloc(&cub_temp_ptr, need));
+        cub_temp_bytes = need;
+    }
 }
 
 
-SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter)
+namespace
+{
+// [audit] STIFF_PCG_SPLIT: GPU-timeline split of one solve into setup (initial residual,
+// preconditioner, dot, p = z and -- as GPU idle -- the host graph capture/update/upload)
+// and the iteration batches.
+struct PcgSplit
+{
+    bool        on      = false;
+    bool        started = false;
+    cudaEvent_t a = nullptr, b = nullptr, c = nullptr;
+    PcgSplit()
+    {
+        static const bool env = getenv("STIFF_PCG_SPLIT") != nullptr;
+        on = env;
+        if(on) { cudaEventCreate(&a); cudaEventCreate(&b); cudaEventCreate(&c); cudaEventRecord(a, cudaStreamPerThread); }
+    }
+    void mark_iterations_start()
+    {
+        if(on && !started) { cudaEventRecord(b, cudaStreamPerThread); started = true; }
+    }
+    ~PcgSplit()
+    {
+        if(!on) return;
+        if(!started) cudaEventRecord(b, cudaStreamPerThread);
+        cudaEventRecord(c, cudaStreamPerThread);
+        cudaEventSynchronize(c);
+        float ab = 0, bc = 0;
+        cudaEventElapsedTime(&ab, a, b);
+        cudaEventElapsedTime(&bc, b, c);
+        ::g_pcg_setup_ms += ab;
+        ::g_pcg_iter_ms += bc;
+        cudaEventDestroy(a); cudaEventDestroy(b); cudaEventDestroy(c);
+    }
+};
+}  // namespace
+
+SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter,
+                     SizeT n_dot_in)
 {
     SizeT k = 0;
+    PcgSplit split;
 
-    r.buffer_view().copy_from(b.buffer_view());
+    // [live-prefix PCG] n = DOFs iterated on (x/b are leading views of that length;
+    // == the full length unless the system declared an inert tail); the member work
+    // vectors keep their full allocation and are used through same-length prefixes.
+    const int n     = (int)x.size();
+    const int n_dot = (int)std::max<SizeT>(n_dot_in, (SizeT)n);
+    auto      zv    = z.view().subview(0, n);
+    auto      rv    = r.view().subview(0, n);
+    auto      pv    = p.view().subview(0, n);
+    auto      Apv   = Ap.view().subview(0, n);
+
+    rv.buffer_view().copy_from(b.buffer_view());
 
     {
         //Timer timer{"preconditioner"};
-        apply_preconditioner(z, r);
+        apply_preconditioner(zv, rv);
     }
 
     // Step E: cub-based fused dot for initial rz = dot(r, z).
-    Cub_PCG_DotReduction(r.buffer_view().data(),
-                         z.buffer_view().data(),
-                         z.size(),
+    Cub_PCG_DotReduction(rv.data(),
+                         zv.data(),
+                         n_dot,
                          d_rz,
                          &cub_temp_ptr, &cub_temp_bytes);
     copy_scalar_kernel<<<1, 1>>>(d_rz0, d_rz);
     cudaMemsetAsync(d_break, 0, sizeof(int));
 
-    p = z;
+    pv.buffer_view().copy_from(zv.buffer_view());   // p = z
 
     // [perf] convergence-check period: each check is a BLOCKING D2H (host loop needs the flag to
     // break) → the dominant host-bound cost (nsys: cudaMemcpy 68% of API). Larger K = fewer syncs at
@@ -796,25 +884,25 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     auto body = [&]()
     {
         // Ap = A * p
-        spmv(p.cview(), Ap.view());
+        spmv(pv, Apv);
         // Step E: cub fused dot(p, Ap) -> d_dot_res (1 launch instead of 2-3).
-        Cub_PCG_DotReduction(p.buffer_view().data(), Ap.buffer_view().data(), z.size(),
+        Cub_PCG_DotReduction(pv.data(), Apv.data(), n_dot,
                              d_dot_res, &cub_temp_ptr, &cub_temp_bytes);
         // Step E: fused axpy re-deriving alpha = *d_rz / *d_dot_res per-thread.
-        LaunchCudaKernal_default(z.size(), 256, 0, update_vector_dx_r_fused,
-                                 x.buffer_view().data(), r.buffer_view().data(),
-                                 (const double*)p.buffer_view().data(),
-                                 (const double*)Ap.buffer_view().data(),
+        LaunchCudaKernal_default(n, 256, 0, update_vector_dx_r_fused,
+                                 x.data(), rv.data(),
+                                 (const double*)pv.data(),
+                                 (const double*)Apv.data(),
                                  (const double*)d_rz, (const double*)d_dot_res,
-                                 d_break, (int)z.size());
-        apply_preconditioner(z, r);
+                                 d_break, n);
+        apply_preconditioner(zv, rv);
         // Step E: cub fused dot(r, z) -> d_rz_new.
-        Cub_PCG_DotReduction(r.buffer_view().data(), z.buffer_view().data(), z.size(),
+        Cub_PCG_DotReduction(rv.data(), zv.data(), n_dot,
                              d_rz_new, &cub_temp_ptr, &cub_temp_bytes);
         // Step E: fused axpy on p re-deriving beta = *d_rz_new / *d_rz per-thread.
-        LaunchCudaKernal_default(z.size(), 256, 0, update_vector_c_fused,
-                                 p.buffer_view().data(), (const double*)z.buffer_view().data(),
-                                 (const double*)d_rz_new, (const double*)d_rz, (int)z.size());
+        LaunchCudaKernal_default(n, 256, 0, update_vector_c_fused,
+                                 pv.data(), (const double*)zv.data(),
+                                 (const double*)d_rz_new, (const double*)d_rz, n);
         // Step E: combined swap (d_rz = d_rz_new) + convergence check.
         post_iter_swap_and_check<<<1, 1>>>(d_rz, d_rz_new, d_rz0, pcg_tol, d_break);
     };
@@ -882,6 +970,10 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
                          && update_info.result == cudaGraphExecUpdateSuccess;
                     if(!ready)
                     {
+                        // A rejected update is expected when the captured topology changed (it is rebuilt below), but
+                        // cudaGraphExecUpdate also leaves its error as the thread's last error. Clear it, otherwise the
+                        // next runtime-checked call (e.g. a thrust/cub launch in the CCD BVH build) reports it and throws.
+                        cudaGetLastError();
                         cudaGraphExecDestroy(m_device_loop_exec);
                         m_device_loop_exec = nullptr;
                     }
@@ -911,6 +1003,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
             CUDA_SAFE_CALL(cudaGraphDestroy(dg));
             dg = nullptr;
             pcg_graph_state_init<<<1, 1>>>(d_graph_state, 1ULL);
+            split.mark_iterations_start();
             CUDA_SAFE_CALL(cudaGraphLaunch(m_device_loop_exec, cudaStreamPerThread));
 
             unsigned long long graph_state[2] = {1ULL, 0ULL};
@@ -955,6 +1048,7 @@ SizeT PCGSolver::pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Floa
     cudaGraphExec_t pge = nullptr;
     bool            captured = false;
     k = 1;
+    split.mark_iterations_start();
     while(k < max_iter)
     {
         if(captured && k + K <= (SizeT)max_iter)
@@ -1365,6 +1459,10 @@ SizeT PCGSolver::seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<
                          && update_info.result == cudaGraphExecUpdateSuccess;
                     if(!ready)
                     {
+                        // A rejected update is expected when the captured topology changed (it is rebuilt below), but
+                        // cudaGraphExecUpdate also leaves its error as the thread's last error. Clear it, otherwise the
+                        // next runtime-checked call (e.g. a thrust/cub launch in the CCD BVH build) reports it and throws.
+                        cudaGetLastError();
                         cudaGraphExecDestroy(m_seg_device_loop_exec);
                         m_seg_device_loop_exec = nullptr;
                     }

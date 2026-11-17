@@ -58,6 +58,13 @@ class IterativeSolver
     // (m_s4_dof_to_group / m_s4_ng) for the segmented block-diagonal PCG.
     GlobalLinearSystem* system_ptr() const { return m_system; }
 
+    // [live-prefix PCG] set by GlobalLinearSystem around one solve: iterate on DOFs
+    // [0, live_n) only (0 = all). dot_n > live_n makes every dot product run over
+    // [0, dot_n) with exactly-zero tails, i.e. with the full-length reduction
+    // partition (verification mode). The iteration cap stays tied to b.size().
+    SizeT m_live_n = 0;
+    SizeT m_dot_n  = 0;
+
   private:
     void system(GlobalLinearSystem& system) { m_system = &system; }
 };

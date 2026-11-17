@@ -39,6 +39,11 @@ class IPreconditioner
     // cudaErrorStreamCaptureUnsupported; caught by the v0.8.0 fresh-env sweep on
     // default-preconditioner case_26).
     virtual bool graph_capturable() const { return false; }
+    // [live-prefix PCG] a GLOBAL preconditioner returns true iff apply() on a
+    // leading prefix of r/z (size = 3 * k blocks) reads and writes only that prefix
+    // and gives the same prefix values as a full-length apply. Locals are checked
+    // by their subsystem's DOF range instead. Conservative default false.
+    virtual bool prefix_capable() const { return false; }
 
   protected:
     muda::LinearSystemContext& ctx() const;

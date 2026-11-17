@@ -39,8 +39,12 @@ void device_TetraData::Malloc_DEVICE_MEM(const int& vertex_num,
 #ifdef USE_QUADRATIC_BENDING
     CUDA_SAFE_CALL(cudaMalloc((void**)&quad_bending_Q, tri_edgeNum * sizeof(Eigen::Matrix4d)));
 #endif
+    CUDA_SAFE_CALL(cudaMalloc((void**)&bend_theta_p, std::max<size_t>(1, tri_edgeNum) * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemset(bend_theta_p, 0, std::max<size_t>(1, tri_edgeNum) * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&volum, tetradedra_num * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&tet_plastic, std::max<size_t>(1, tetradedra_num) * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemset(tet_plastic, 0, std::max<size_t>(1, tetradedra_num) * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&masses, vertex_num * sizeof(double)));
 
     CUDA_SAFE_CALL(cudaMalloc((void**)&lengthRate, tetradedra_num * sizeof(double)));
@@ -122,6 +126,7 @@ void device_TetraData::FREE_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaFree(tetrahedras));
     CUDA_SAFE_CALL(cudaFree(tempTetrahedras));
     CUDA_SAFE_CALL(cudaFree(volum));
+    CUDA_SAFE_CALL(cudaFree(tet_plastic));
     CUDA_SAFE_CALL(cudaFree(masses));
     CUDA_SAFE_CALL(cudaFree(lengthRate));
     CUDA_SAFE_CALL(cudaFree(volumeRate));
@@ -142,6 +147,7 @@ void device_TetraData::FREE_DEVICE_MEM()
 #ifdef USE_QUADRATIC_BENDING
     CUDA_SAFE_CALL(cudaFree(quad_bending_Q));
 #endif
+    CUDA_SAFE_CALL(cudaFree(bend_theta_p));
 
     CUDA_SAFE_CALL(cudaFree(body_id_to_boundary_type));
     CUDA_SAFE_CALL(cudaFree(point_id_to_body_id));

@@ -99,12 +99,27 @@ __device__ double __cal_ARAP_energy_3D(const double3*                vertexes,
                                        const double&                 lenRate);
 
 
+void set_bend_phys_scale(double s);   // GIPC_BEND_PHYS (femEnergy.cu)
 __device__ double __cal_bending_energy(const double3* vertexes,
                                        const double3* rest_vertexes,
                                        const uint2&   edge,
                                        const uint2&   adj,
                                        double         length,
-                                       double         bendStiff);
+                                       double         bendStiff,
+                                       double         theta_p = 0.0);
+
+// plastic hinge: theta_p[e] += (|dtheta| - yield) * rate * sign(dtheta) wherever the elastic hinge
+// angle dtheta = theta - theta_rest - theta_p exceeds the yield angle (rate 1 = perfectly plastic)
+void update_bending_plasticity(const double3* vertexes, const double3* rest_vertexes, const uint2* edges,
+                               const uint2* edges_adj_vertex, int edgeNum, double* theta_p, double yield_angle,
+                               double rate);
+
+// volumetric plasticity (J2 / von Mises on the Hencky strain, linear isotropic hardening), applied between Newton steps as a
+// rest-shape update: the elastic deformation of a tet is F_e = Ds * DmInv; where |dev tau| = 2 mu |dev log(Sigma)| exceeds
+// sqrt(2/3) (sigma_y + H eps_p) the deviatoric log-stretch is radially returned and DmInv is rewritten so that the returned
+// F_e becomes the new elastic state (DmInv' = DmInv V diag(Sigma'/Sigma) V^T). Isochoric: the rest volume stays.
+void update_tet_plasticity(const double3* vertexes, const uint4* tetrahedras, __GEIGEN__::Matrix3x3d* DmInverses,
+                           const double* lengthRate, double3* plastic, int tetNum);
 
 __device__ double __cal_strainL_energy(Eigen::Vector2d& sigma, double area);
 
@@ -121,7 +136,8 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
                                                     int*   row_ids,
                                                     int*   col_ids,
                                                     double IPC_dt,
-                                                    int global_hessian_fem_offset);
+                                                    int global_hessian_fem_offset,
+                                                    const double* theta_p = nullptr);
 
 
 #ifdef USE_QUADRATIC_BENDING

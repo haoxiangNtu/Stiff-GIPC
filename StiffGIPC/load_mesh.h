@@ -268,6 +268,12 @@ class tetrahedra_obj
                                          bool               isfixed);
     //void load_test(double scale, int num = 1);
     void getSurface();
+    // [liquid] point-only FEM body (no tets/faces): used for the MPM grid-node
+    // pool and the liquid particles. Returns the collision body id.
+    int load_points_body(const std::vector<double3>& pts,
+                         const std::vector<double>&  masses_in,
+                         int                         vertex_boundary_type,
+                         BodyBoundaryType            body_boundary_type);
     bool output_tetrahedraMesh(const std::string& filename);
 
     bool output_tetrahedraMesh_reorder(const std::string&      filename,

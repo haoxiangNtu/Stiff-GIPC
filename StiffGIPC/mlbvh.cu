@@ -77,6 +77,62 @@ __device__ int g_max_stack = 0;  // [ovf] max traversal stack depth reached
 // STIFF_STACK_DIAG (GIPC.cu) — the probe itself never was. Default OFF.
 __device__ int g_bvh_audit = 0;
 void set_bvh_audit(int v){ CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_audit,&v,sizeof(int))); }
+// [audit 2026-10-09] leaf-level traversal counters (STIFF_AUDIT_BVH=1 via g_bvh_audit):
+// [kernel: 0 vf DCD, 1 ee DCD, 2 vf CCD, 3 ee CCD][0 internal nodes pushed, 1 overlapping leaves,
+// 2 leaves passing the body/env tests, 3 EE rejected as adjacent, 4 EE rejected by the pair dedup,
+// 5 leaves reaching the narrow phase / emitted]
+__device__ unsigned long long g_bvh_cnt[4][6];
+void reset_bvh_cnt(){ unsigned long long z[24] = {0}; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_cnt, z, sizeof(z))); }
+void get_bvh_cnt(unsigned long long* out){ CUDA_SAFE_CALL(cudaMemcpyFromSymbol(out, g_bvh_cnt, 24 * sizeof(unsigned long long))); }
+// [audit 2026-10-09, A3 tail] per-thread traversal work (STIFF_AUDIT_BVH only). With the whole query
+// grid resident at once the kernel time follows the slowest threads, which the totals above cannot show.
+// hist: threads binned by internal-node pushes <64, <256, <1k, <4k, <16k, <64k, >=64k; [7] = threads seen.
+// tmax: max over threads of (count << 32 | query primitive) for pushes, leaves, body-ok, narrow.
+// tail: threads with >= g_bvh_tail_thr pushes (first BVH_TAIL_CAP per frame).
+__device__ unsigned int g_bvh_thist[4][8];
+__device__ unsigned long long g_bvh_tmax[4][4];
+struct BvhTailRec { unsigned int kind, prim, push, leaf, ok, narrow; int body; float len; };
+#define BVH_TAIL_CAP 256
+__device__ BvhTailRec g_bvh_tail[BVH_TAIL_CAP];
+__device__ unsigned int g_bvh_tail_n = 0;
+__device__ unsigned int g_bvh_tail_thr = 4096;
+__device__ __forceinline__ void _bvh_tail_note(int k, unsigned int prim, unsigned int p, unsigned int l,
+                                               unsigned int o, unsigned int n, int body, float len)
+{
+    const int b = p < 64 ? 0 : p < 256 ? 1 : p < 1024 ? 2 : p < 4096 ? 3 : p < 16384 ? 4 : p < 65536 ? 5 : 6;
+    atomicAdd(&g_bvh_thist[k][b], 1u);
+    atomicAdd(&g_bvh_thist[k][7], 1u);
+    atomicMax(&g_bvh_tmax[k][0], ((unsigned long long)p << 32) | prim);
+    atomicMax(&g_bvh_tmax[k][1], ((unsigned long long)l << 32) | prim);
+    atomicMax(&g_bvh_tmax[k][2], ((unsigned long long)o << 32) | prim);
+    atomicMax(&g_bvh_tmax[k][3], ((unsigned long long)n << 32) | prim);
+    if(p >= g_bvh_tail_thr)
+    {
+        const unsigned int slot = atomicAdd(&g_bvh_tail_n, 1u);
+        if(slot < BVH_TAIL_CAP)
+            g_bvh_tail[slot] = BvhTailRec{(unsigned int)k, prim, p, l, o, n, body, len};
+    }
+}
+void reset_bvh_tail()
+{
+    unsigned int h[32] = {0};
+    unsigned long long m[16] = {0};
+    unsigned int z = 0;
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_thist, h, sizeof(h)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_tmax, m, sizeof(m)));
+    CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_tail_n, &z, sizeof(z)));
+}
+void set_bvh_tail_thr(unsigned int t) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_bvh_tail_thr, &t, sizeof(t))); }
+// recs: BVH_TAIL_CAP x 8 words (kind, prim, push, leaf, ok, narrow, body, len as float bits); returns records seen
+unsigned int get_bvh_tail(unsigned int* hist32, unsigned long long* tmax16, unsigned int* recs)
+{
+    unsigned int n = 0;
+    CUDA_SAFE_CALL(cudaMemcpyFromSymbol(hist32, g_bvh_thist, 32 * sizeof(unsigned int)));
+    CUDA_SAFE_CALL(cudaMemcpyFromSymbol(tmax16, g_bvh_tmax, 16 * sizeof(unsigned long long)));
+    CUDA_SAFE_CALL(cudaMemcpyFromSymbol(&n, g_bvh_tail_n, sizeof(n)));
+    CUDA_SAFE_CALL(cudaMemcpyFromSymbol(recs, g_bvh_tail, BVH_TAIL_CAP * sizeof(BvhTailRec)));
+    return n;
+}
 void reset_max_stack(){ int z=0; CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_max_stack,&z,sizeof(int))); }
 int get_max_stack(){ int v=0; CUDA_SAFE_CALL(cudaMemcpyFromSymbol(&v,g_max_stack,sizeof(int))); return v; }
 void set_ee_trace(int v) { CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_ee_trace, &v, sizeof(int))); }
@@ -1811,6 +1867,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
     double gapl = sqrt(dHat);  //0.001 * sqrt(bboxDiagSize2);
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
+    unsigned int _tp = 0, _tl = 0, _to = 0, _tn = 0;  // [audit A3 tail]
     do
     {
         const uint32_t node_id = *--stack_ptr;
@@ -1823,16 +1880,19 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][1], 1ull); ++_tl; }
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
                    && !_cross_env_skip(idx, _faces[obj_idx].x)
                    && _same_env(idx, _faces[obj_idx].x))
                 {
+                    if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][2], 1ull); ++_to; }
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
                     {
-                        if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
+                        if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][5], 1ull); ++_tn; }
+                        if(!(_btype[idx] >= 2 && _btype[idx] != 4 /*liquid particle*/ && _btype[_faces[obj_idx].x] >= 2
                              && _btype[_faces[obj_idx].y] >= 2
                              && _btype[_faces[obj_idx].z] >= 2))
                             _checkPTintersection(_vertexes,
@@ -1850,7 +1910,7 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = L_idx;
+                *stack_ptr++ = L_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][0], 1ull); ++_tp; }
             }
         }
         if(overlap(_bv, _bvs[R_idx], gapl))
@@ -1858,16 +1918,19 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][1], 1ull); ++_tl; }
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
                    && !_cross_env_skip(idx, _faces[obj_idx].x)
                    && _same_env(idx, _faces[obj_idx].x))
                 {
+                    if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][2], 1ull); ++_to; }
                     if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                        && idx != _faces[obj_idx].z)
                     {
-                        if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
+                        if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][5], 1ull); ++_tn; }
+                        if(!(_btype[idx] >= 2 && _btype[idx] != 4 /*liquid particle*/ && _btype[_faces[obj_idx].x] >= 2
                              && _btype[_faces[obj_idx].y] >= 2
                              && _btype[_faces[obj_idx].z] >= 2))
                             _checkPTintersection(_vertexes,
@@ -1885,10 +1948,11 @@ __global__ void _selfQuery_vf(const int*      _bodyID,
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = R_idx;
+                *stack_ptr++ = R_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[0][0], 1ull); ++_tp; }
             }
         }
     } while(stack < stack_ptr);
+    if(g_bvh_audit) _bvh_tail_note(0, (unsigned int)idx, _tp, _tl, _to, _tn, _bodyID[idx], 0.f);
 }
 
 __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
@@ -1941,6 +2005,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
     double gapl = sqrt(dHat);  //0.001 * sqrt(bboxDiagSize2);
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
+    unsigned int _tp = 0, _tl = 0, _to = 0, _tn = 0;  // [audit A3 tail]
     do
     {
         const uint32_t node_id = *--stack_ptr;
@@ -1953,19 +2018,22 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][1], 1ull); ++_tl; }
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
                    && !_cross_env_skip(idx, _faces[obj_idx].x)
                    && _same_env(idx, _faces[obj_idx].x))
                 {
+                    if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][2], 1ull); ++_to; }
 
-                    if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
+                    if(!(_btype[idx] >= 2 && _btype[idx] != 4 /*liquid particle*/ && _btype[_faces[obj_idx].x] >= 2
                          && _btype[_faces[obj_idx].y] >= 2
                          && _btype[_faces[obj_idx].z] >= 2))
                         if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                            && idx != _faces[obj_idx].z)
                         {
+                            if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][5], 1ull); ++_tn; }
                             _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                 make_int4(-idx - 1,
                                           _faces[obj_idx].x,
@@ -1977,7 +2045,7 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = L_idx;
+                *stack_ptr++ = L_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][0], 1ull); ++_tp; }
             }
         }
         if(overlap(_bv, _bvs[R_idx], gapl))
@@ -1985,18 +2053,21 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][1], 1ull); ++_tl; }
                 if(_should_check_pair(_bodyID[idx], _bodyID[_faces[obj_idx].x], _body_id_to_is_fem)
                    && !_is_collision_excluded(_bodyID[idx], _bodyID[_faces[obj_idx].x],
                                              _collision_skip_matrix, _collision_body_count)
                    && !_cross_env_skip(idx, _faces[obj_idx].x)
                    && _same_env(idx, _faces[obj_idx].x))
                 {
-                    if(!(_btype[idx] >= 2 && _btype[_faces[obj_idx].x] >= 2
+                    if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][2], 1ull); ++_to; }
+                    if(!(_btype[idx] >= 2 && _btype[idx] != 4 /*liquid particle*/ && _btype[_faces[obj_idx].x] >= 2
                          && _btype[_faces[obj_idx].y] >= 2
                          && _btype[_faces[obj_idx].z] >= 2))
                         if(idx != _faces[obj_idx].x && idx != _faces[obj_idx].y
                            && idx != _faces[obj_idx].z)
                         {
+                            if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][5], 1ull); ++_tn; }
                             _ccd_collisionPair[_emit_slot(_cpNum, g_ccd_cp_cap)] =
                                 make_int4(-idx - 1,
                                           _faces[obj_idx].x,
@@ -2008,10 +2079,11 @@ __global__ void _selfQuery_vf_ccd(const int*      _bodyID,
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = R_idx;
+                *stack_ptr++ = R_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[2][0], 1ull); ++_tp; }
             }
         }
     } while(stack < stack_ptr);
+    if(g_bvh_audit) _bvh_tail_note(2, (unsigned int)idx, _tp, _tl, _to, _tn, _bodyID[idx], 0.f);
 }
 
 
@@ -2062,6 +2134,7 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
     double gapl = sqrt(dHat);  //0.001 * sqrt(bboxDiagSize2);
     //double dHat = gapl * gapl;// *bboxDiagSize2;
     unsigned int num_found = 0;
+    unsigned int _tp = 0, _tl = 0, _to = 0, _tn = 0;  // [audit A3 tail]
     do
     {
         const uint32_t node_id = *--stack_ptr;
@@ -2074,6 +2147,7 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[1][1], 1ull); ++_tl; }
                 if(self_eid != obj_idx)
                 {
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
@@ -2082,6 +2156,11 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
                        && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
                        && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
+                        if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[1][2], 1ull); ++_to;
+                            const uint2 _qe = _edges[self_eid], _oe = _edges[obj_idx];
+                            const bool _adj = (_qe.x == _oe.x || _qe.x == _oe.y || _qe.y == _oe.x || _qe.y == _oe.y);
+                            const bool _dd = (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_oe) < _edge_lkey(_qe)) : (obj_idx < self_eid)));
+                            atomicAdd(&g_bvh_cnt[1][_adj ? 3 : (_dd ? 4 : 5)], 1ull); if(!_adj && !_dd) ++_tn; }
 
 
                         if(!(_edges[self_eid].x == _edges[obj_idx].x
@@ -2113,7 +2192,7 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = L_idx;
+                *stack_ptr++ = L_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[1][0], 1ull); ++_tp; }
             }
         }
         if((qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv) && overlap(_bv, _bvs[R_idx], gapl))
@@ -2121,6 +2200,7 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[1][1], 1ull); ++_tl; }
                 if(self_eid != obj_idx)
                 {
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
@@ -2129,6 +2209,11 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
                        && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
                        && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
+                        if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[1][2], 1ull); ++_to;
+                            const uint2 _qe = _edges[self_eid], _oe = _edges[obj_idx];
+                            const bool _adj = (_qe.x == _oe.x || _qe.x == _oe.y || _qe.y == _oe.x || _qe.y == _oe.y);
+                            const bool _dd = (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_oe) < _edge_lkey(_qe)) : (obj_idx < self_eid)));
+                            atomicAdd(&g_bvh_cnt[1][_adj ? 3 : (_dd ? 4 : 5)], 1ull); if(!_adj && !_dd) ++_tn; }
                         if(!(_edges[self_eid].x == _edges[obj_idx].x
                              || _edges[self_eid].x == _edges[obj_idx].y
                              || _edges[self_eid].y == _edges[obj_idx].x
@@ -2158,10 +2243,16 @@ static __device__ __forceinline__ void _selfQuery_ee_body(const int*     _bodyID
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = R_idx;
+                *stack_ptr++ = R_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[1][0], 1ull); ++_tp; }
             }
         }
     } while(stack < stack_ptr);
+    if(g_bvh_audit)
+    {
+        const uint2 _qe = _edges[self_eid];
+        const double3 _dv = __GEIGEN__::__minus(_vertexes[_qe.x], _vertexes[_qe.y]);
+        _bvh_tail_note(1, self_eid, _tp, _tl, _to, _tn, _bodyID[_qe.x], (float)__GEIGEN__::__norm(_dv));
+    }
 }
 
 // [ee-lb] launch shells. Baseline compiles to ~168 reg → 1 block/SM (8 warps, 16.7% theoretical
@@ -2237,6 +2328,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
     double gapl = sqrt(dHat);
 
     unsigned int num_found = 0;
+    unsigned int _tp = 0, _tl = 0, _to = 0, _tn = 0;  // [audit A3 tail]
     do
     {
         const uint32_t node_id = *--stack_ptr;
@@ -2249,6 +2341,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             const auto obj_idx = _nodes[L_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[3][1], 1ull); ++_tl; }
                 if(self_eid != obj_idx)
                 {
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
@@ -2257,6 +2350,11 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                        && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
                        && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
+                        if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[3][2], 1ull); ++_to;
+                            const uint2 _qe = _edges[self_eid], _oe = _edges[obj_idx];
+                            const bool _adj = (_qe.x == _oe.x || _qe.x == _oe.y || _qe.y == _oe.x || _qe.y == _oe.y);
+                            const bool _dd = (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_oe) < _edge_lkey(_qe)) : (obj_idx < self_eid)));
+                            atomicAdd(&g_bvh_cnt[3][_adj ? 3 : (_dd ? 4 : 5)], 1ull); if(!_adj && !_dd) ++_tn; }
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
                              && _btype[_edges[obj_idx].x] >= 2
@@ -2277,7 +2375,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = L_idx;
+                *stack_ptr++ = L_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[3][0], 1ull); ++_tp; }
             }
         }
         if((qenv < 0 || node_env[R_idx] < 0 || node_env[R_idx] == qenv) && overlap(_bv, _bvs[R_idx], gapl))
@@ -2285,6 +2383,7 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             const auto obj_idx = _nodes[R_idx].element_idx;
             if(obj_idx != 0xFFFFFFFF)
             {
+                if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[3][1], 1ull); ++_tl; }
                 if(self_eid != obj_idx)
                 {
                     if(_should_check_pair(_bodyID[_edges[self_eid].x], _bodyID[_edges[obj_idx].x], _body_id_to_is_fem)
@@ -2293,6 +2392,11 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
                        && !_cross_env_skip(_edges[self_eid].x, _edges[obj_idx].x)
                        && _same_env(_edges[self_eid].x, _edges[obj_idx].x))
                     {
+                        if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[3][2], 1ull); ++_to;
+                            const uint2 _qe = _edges[self_eid], _oe = _edges[obj_idx];
+                            const bool _adj = (_qe.x == _oe.x || _qe.x == _oe.y || _qe.y == _oe.x || _qe.y == _oe.y);
+                            const bool _dd = (!g_ee_nodedup && (g_ee_canon ? (_edge_lkey(_oe) < _edge_lkey(_qe)) : (obj_idx < self_eid)));
+                            atomicAdd(&g_bvh_cnt[3][_adj ? 3 : (_dd ? 4 : 5)], 1ull); if(!_adj && !_dd) ++_tn; }
                         if(!(_btype[_edges[self_eid].x] >= 2
                              && _btype[_edges[self_eid].y] >= 2
                              && _btype[_edges[obj_idx].x] >= 2
@@ -2313,10 +2417,16 @@ __global__ void _selfQuery_ee_ccd(const int*     _bodyID,
             }
             else  // the node is not a leaf.
             {
-                *stack_ptr++ = R_idx;
+                *stack_ptr++ = R_idx; if(g_bvh_audit) { atomicAdd(&g_bvh_cnt[3][0], 1ull); ++_tp; }
             }
         }
     } while(stack < stack_ptr);
+    if(g_bvh_audit)
+    {
+        const uint2 _qe = _edges[self_eid];
+        const double3 _dv = __GEIGEN__::__minus(_vertexes[_qe.x], _vertexes[_qe.y]);
+        _bvh_tail_note(3, self_eid, _tp, _tl, _to, _tn, _bodyID[_qe.x], (float)__GEIGEN__::__norm(_dv));
+    }
 }
 
 ///////////////////////////////////////host//////////////////////////////////////////////

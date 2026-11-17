@@ -4,6 +4,8 @@
 #include <pybind11/eigen.h>
 #include "sim_engine.h"
 #include "GIPC.cuh"
+#include "mpm/liquid_system.cuh"
+#include <limits>
 
 namespace py = pybind11;
 using namespace gipc;
@@ -27,11 +29,14 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readwrite("cloth_thickness",      &SimEngineConfig::cloth_thickness)
         .def_readwrite("cloth_young_modulus",  &SimEngineConfig::cloth_young_modulus)
         .def_readwrite("bend_young_modulus",   &SimEngineConfig::bend_young_modulus)
+        .def_readwrite("bend_yield_angle",     &SimEngineConfig::bend_yield_angle)
+        .def_readwrite("bend_plastic_rate",    &SimEngineConfig::bend_plastic_rate)
         .def_readwrite("cloth_density",        &SimEngineConfig::cloth_density)
         .def_readwrite("strain_rate",          &SimEngineConfig::strain_rate)
         .def_readwrite("soft_motion_rate",     &SimEngineConfig::soft_motion_rate)
         .def_readwrite("newton_tol",           &SimEngineConfig::newton_tol)
         .def_readwrite("newton_velocity_tol",  &SimEngineConfig::newton_velocity_tol)
+        .def_readwrite("kappa_mean_mass",      &SimEngineConfig::kappa_mean_mass)
         .def_readwrite("pcg_tol",              &SimEngineConfig::pcg_tol)
         .def_readwrite("relative_dhat",        &SimEngineConfig::relative_dhat)
         .def_readwrite("joint_strength_ratio",             &SimEngineConfig::joint_strength_ratio)
@@ -52,6 +57,7 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def_readwrite("semi_implicit_beta_tol",           &SimEngineConfig::semi_implicit_beta_tol)
         .def_readwrite("semi_implicit_min_iter",           &SimEngineConfig::semi_implicit_min_iter)
         .def_readwrite("newton_iter_cap",                  &SimEngineConfig::newton_iter_cap)
+        .def_readwrite("pcg_max_iter_ratio",               &SimEngineConfig::pcg_max_iter_ratio)
         .def_readwrite("env_newton_iter_cap",              &SimEngineConfig::env_newton_iter_cap)
         .def_readwrite("line_search_max_iter",             &SimEngineConfig::line_search_max_iter)
         .def_readwrite("energy_abs_tol",                   &SimEngineConfig::energy_abs_tol)
@@ -161,6 +167,97 @@ PYBIND11_MODULE(pystiffgipc, m)
              py::arg("young_modulus"),
              py::arg("boundary_type") = 0)
 
+        // [liquid] MPM Lite water inside the IPC solve
+        .def("add_liquid", [](SimEngine& e,
+                py::array_t<double, py::array::c_style | py::array::forcecast> xyz,
+                double dx, const Eigen::Vector3d& domain_lo, const Eigen::Vector3d& domain_hi,
+                double rho, double kappa, double particle_volume, int node_pool,
+                double mass_floor, bool apic, double push_apart, int j_mode, double ground_mu, double stick_h, double apic_ratio) {
+            auto buf = xyz.request();
+            if(buf.ndim != 2 || buf.shape[1] != 3)
+                throw py::value_error("add_liquid: xyz must have shape (n, 3)");
+            if(buf.shape[0] <= 0 || buf.shape[0] > std::numeric_limits<int>::max() / 27)
+                throw py::value_error("add_liquid: particle count is empty or exceeds 32-bit stencil capacity");
+            LiquidSpec sp;
+            sp.dx = dx; sp.domain_lo = domain_lo; sp.domain_hi = domain_hi;
+            sp.rho = rho; sp.kappa = kappa; sp.particle_volume = particle_volume;
+            sp.node_pool = node_pool; sp.mass_floor = mass_floor; sp.apic = apic; sp.apic_ratio = apic_ratio;
+            sp.push_apart = push_apart; sp.j_mode = j_mode; sp.ground_mu = ground_mu; sp.stick_h = stick_h;
+            e.add_liquid(static_cast<const double*>(buf.ptr), static_cast<int>(buf.shape[0]), sp);
+        }, py::arg("xyz"), py::arg("dx"), py::arg("domain_lo"), py::arg("domain_hi"),
+           py::arg("rho") = 1000.0, py::arg("kappa") = 1e5, py::arg("particle_volume") = 0.0,
+           py::arg("node_pool") = 0, py::arg("mass_floor") = 0.05, py::arg("apic") = true,
+           py::arg("push_apart") = 0.9, py::arg("j_mode") = 3, py::arg("ground_mu") = 0.3, py::arg("stick_h") = 0.0, py::arg("apic_ratio") = 1.0)
+        .def("get_liquid_particle_count", &SimEngine::get_liquid_particle_count)
+        .def("get_liquid_particles", [](const SimEngine& e) {
+            int n = e.get_liquid_particle_count();
+            auto arr = py::array_t<double>({n, 3});
+            if(n > 0) e.get_liquid_particles(arr.mutable_data());
+            return arr;
+        })
+        .def("get_liquid_velocities", [](const SimEngine& e) {
+            int n = e.get_liquid_particle_count();
+            auto arr = py::array_t<double>({n, 3});
+            if(n > 0) e.get_liquid_velocities(arr.mutable_data());
+            return arr;
+        })
+        .def("get_liquid_J", [](const SimEngine& e) {
+            int n = e.get_liquid_particle_count();
+            auto arr = py::array_t<double>({n});
+            if(n > 0) e.get_liquid_J(arr.mutable_data());
+            return arr;
+        })
+        .def("set_liquid_J", [](SimEngine& e, py::array_t<double, py::array::c_style | py::array::forcecast> J) {
+            const int n = e.get_liquid_particle_count();
+            if(J.ndim() != 1 || J.shape(0) != n) throw py::value_error("set_liquid_J: expected a 1-D array of the liquid particle count");
+            for(int p = 0; p < n; ++p) if(!(J.data()[p] > 0.0) || !std::isfinite(J.data()[p])) throw py::value_error("set_liquid_J: J must be finite and positive");
+            e.set_liquid_J(J.data());
+        }, py::arg("J"))
+        .def("set_liquid_containers", [](SimEngine& e, py::array_t<int, py::array::c_style | py::array::forcecast> body,
+                                          py::array_t<double, py::array::c_style | py::array::forcecast> Rd,
+                                          py::array_t<double, py::array::c_style | py::array::forcecast> td,
+                                          py::array_t<int, py::array::c_style | py::array::forcecast> nprof,
+                                          py::array_t<double, py::array::c_style | py::array::forcecast> py_,
+                                          py::array_t<double, py::array::c_style | py::array::forcecast> pr,
+                                          py::array_t<double, py::array::c_style | py::array::forcecast> ytop,
+                                          py::array_t<double, py::array::c_style | py::array::forcecast> band,
+                                          py::array_t<int, py::array::c_style | py::array::forcecast> slip, double wall_mass, int ground_bc) {
+            if(body.size() > LIQ_MAX_CONT)
+                throw py::value_error("set_liquid_containers: too many containers");
+            int n = (int)body.size();
+            if(Rd.size() != 9 * n || td.size() != 3 * n || nprof.size() != n || py_.size() != 32 * n || pr.size() != 32 * n
+               || ytop.size() != n || band.size() != n || slip.size() != n)
+                throw std::runtime_error("set_liquid_containers: array sizes (Rd 9n, td 3n, py/pr 32n, others n)");
+            e.set_liquid_containers(n, body.data(), Rd.data(), td.data(), nprof.data(), py_.data(), pr.data(), ytop.data(), band.data(), slip.data(),
+                                    wall_mass, ground_bc);
+        }, py::arg("body"), py::arg("Rd"), py::arg("td"), py::arg("nprof"), py::arg("py"), py::arg("pr"), py::arg("y_top"), py::arg("band"),
+           py::arg("slip"), py::arg("wall_mass") = 1e3, py::arg("ground_bc") = 1)
+        .def("set_liquid_pump", [](SimEngine& e, const Eigen::Vector3d& tip, const Eigen::Vector3d& top, double radius, double accel, double conveyor, double follow, double track, double bore_radius) {
+            e.set_liquid_pump(tip.data(), top.data(), radius, accel, conveyor, follow, track, bore_radius);
+        }, py::arg("tip"), py::arg("top"), py::arg("radius"), py::arg("accel"), py::arg("conveyor") = 0.0, py::arg("follow") = 0.0, py::arg("track") = 0.0,
+           py::arg("bore_radius") = 0.0)
+        .def("count_liquid_in_pump", &SimEngine::count_liquid_in_pump)
+        .def("set_fem_plasticity", &SimEngine::set_fem_plasticity, py::arg("fem_body_idx"), py::arg("yield_stress"), py::arg("hardening") = 0.0,
+             "Volumetric plasticity for one FEM body (Hencky J2 + linear hardening, rest-shape update between steps). After finalize().")
+        .def("mean_plastic_strain", &SimEngine::mean_plastic_strain, py::arg("fem_body_idx"))
+        .def("set_liquid_porous", &SimEngine::set_liquid_porous, py::arg("fem_body_idx"), py::arg("drag"), py::arg("porosity"), py::arg("suction") = 0.0)
+        .def("count_liquid_in_porous", &SimEngine::count_liquid_in_porous)
+        .def("get_liquid_porous_saturation", &SimEngine::get_liquid_porous_saturation)
+        .def("set_liquid_visc", &SimEngine::set_liquid_visc, py::arg("mu"))
+        .def("get_liquid_stats", [](const SimEngine& e) {
+            int out[19];
+            e.get_liquid_stats(out);
+            py::dict d;
+            d["active_cells"] = out[0]; d["active_nodes"] = out[1]; d["node_pool"] = out[2];
+            d["node_slot_base"] = out[3]; d["particle_slot_base"] = out[4];
+            d["node_body_id"] = out[5]; d["particle_body_id"] = out[6];
+            // last-step clamp / fallback events (traceability): a physics test must report these, not hide them
+            d["fb_cell_J_clamp"] = out[7]; d["fb_reanchor_J_clamp"] = out[8]; d["fb_fill_J_clamp"] = out[9];
+            d["fb_nonfinite_J"] = out[10]; d["fb_particle_J_clamp"] = out[11]; d["fb_push_domain_clamp"] = out[12];
+            d["fb_reinit_J_clamp"] = out[13]; d["fb_g2p_domain_clamp"] = out[14];
+            d["fb_cpic_nowall"] = out[15]; d["fb_cpic_isolated"] = out[16]; d["fb_vox_corner_inactive"] = out[17];
+            return d;
+        })
         .def("load_mesh_from_data", [](SimEngine& e,
                 py::array_t<double, py::array::c_style | py::array::forcecast> vertices,
                 py::array_t<int, py::array::c_style | py::array::forcecast> faces,
@@ -214,6 +311,8 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_mesh_asset", &SimEngine::get_mesh_asset, py::arg("asset_id"),
              py::return_value_policy::reference_internal)
 
+        .def("set_body_self_collision", &SimEngine::set_body_self_collision, py::arg("body"), py::arg("enabled"),
+             "FEM self-collision of one body (load-record index) on/off; call before finalize(). Contact with other bodies is unaffected.")
         .def("add_collision_exclusion", &SimEngine::add_collision_exclusion,
              py::arg("body_a"), py::arg("body_b"))
         .def("set_body_groups", &SimEngine::set_body_groups,
@@ -403,6 +502,32 @@ PYBIND11_MODULE(pystiffgipc, m)
 
         .def("get_assets_dir", &SimEngine::get_assets_dir)
 
+        .def("set_liquid_pump_chamber", [](SimEngine& e, const Eigen::Vector3d& tip, const Eigen::Vector3d& top, double radius, double V_cav, double p0, double bore_radius) {
+            e.set_liquid_pump_chamber(tip.data(), top.data(), radius, V_cav, p0, bore_radius);
+        }, py::arg("tip"), py::arg("top"), py::arg("radius"), py::arg("V_cav"), py::arg("p0") = 101325.0, py::arg("bore_radius") = 0.0,
+            "Chamber-pressure dropper pump: the liquid column in the bore (tip->top, radius) is driven by the air pressure of a "
+            "chamber of volume V_cav (m^3, bulb cavity + bore; prescribed or measured from the bulb mesh) minus the column volume; "
+            "isothermal gas, implicit 1-DOF axial update, unsealed tip resets the reference volume. Replaces the kinematic pump.")
+        .def("get_liquid_pump_state", [](const SimEngine& e) {
+            double o[6]; e.get_liquid_pump_state(o);
+            py::dict d; d["V_air"] = o[0]; d["p_gauge"] = o[1]; d["V_liq"] = o[2]; d["n_column"] = o[3]; d["V0"] = o[4]; d["sealed"] = o[5] > 0.5;
+            return d;
+        })
+        .def("get_liquid_ghost_reaction", [](SimEngine& e) {
+            auto arr = py::array_t<double>({3}); e.get_liquid_ghost_reaction(arr.mutable_data()); return arr;
+        },
+            "CPIC (LIQ_CPIC=1): total voxel-pressure force (N) the liquid exerts on the fixed ghost nodes inside the walls -- the part of "
+            "the liquid load absorbed by the ghost constraint rather than transmitted to the solid. Zero without CPIC.")
+        .def("get_liquid_wall_forces", [](SimEngine& e) {
+                int n = e.get_vertex_count();
+                auto arr = py::array_t<double>({n, 3});
+                e.get_liquid_wall_forces(arr.mutable_data(), n);
+                return arr;
+            },
+            "Liquid -> solid reaction of the wall field constraint (WFC) per vertex in NEWTONS (= -gradient/dt^2 at the last "
+            "Newton assembly of the step); zero on liquid slots and when WFC is off. Add to get_vertex_contact_forces "
+            "(particle barrier) for the total liquid load on a body.")
+
         .def("get_vertex_contact_forces", [](SimEngine& e, bool include_ground,
                                              int components) {
                 int n = e.get_vertex_count();
@@ -425,6 +550,16 @@ PYBIND11_MODULE(pystiffgipc, m)
              "[episode reset] Zero current/lagged contact-pair mirrors and the friction "
              "snapshot so the first solve after a teleport reset does not apply the "
              "previous episode's lagged friction. Call after teleporting between episodes.")
+        .def("get_vertex_metis_to_input", [](const SimEngine& e) {
+                int n = e.get_vertex_count();
+                auto arr = py::array_t<int>(n);
+                e.get_vertex_metis_to_input(arr.mutable_data(), n);
+                return arr;
+            },
+            "[gpu-direct] out[engine_idx] = input_idx for the RAW device vertex "
+            "buffer returned by get_vertices_device_ptr(). The host getters "
+            "already unscramble this; zero-copy GPU consumers must not. Identity "
+            "when no MAS reorder was applied.")
         .def("get_fem_von_mises_stress", [](SimEngine& e) {
                 int n = e.get_vertex_count();
                 auto arr = py::array_t<double>(n);
@@ -761,6 +896,8 @@ PYBIND11_MODULE(pystiffgipc, m)
         .def("get_prismatic_drive_force", &SimEngine::get_prismatic_drive_force, py::arg("idx"),
              "[force-control] Current prismatic driving force K*(target-d) (N). "
              "Used by force-limited position control to cap the grip force.")
+        .def("get_revolute_drive_torque", &SimEngine::get_revolute_drive_torque, py::arg("idx"),
+             "Current revolute driving torque in N*m: K*wrap(target-theta)/dt^2.")
         .def("get_prismatic_current_distance", &SimEngine::get_prismatic_current_distance,
              py::arg("idx"),
              "[force-control] Current prismatic opening d (m) along the joint axis. "

@@ -2374,6 +2374,34 @@ __global__ void _calculate_fem_gradient(__GEIGEN__::Matrix3x3d* DmInverses,
 
 
 
+// Physical scale of the dihedral (discrete-shells) bending energy, GIPC_BEND_PHYS (0 = legacy).
+// Legacy energy is bendStiff (theta - theta0)^2 |e|: one length factor short of an energy -- the effective plate rigidity
+// becomes ~|e| x D (bending a flat mesh into a cylinder of radius R gives 0.975 |e| D / R^2 per area instead of D / 2R^2), i.e.
+// 270-410x too soft on a 2.5 mm shell. With g_bend_phys > 0 the hinge weight is the discrete-shells one,
+// g_bend_phys |e|^2 / A_e (A_e = both rest triangles): mesh-independent; g_bend_phys = 3 / 3.7 gives D / 2R^2 within +-20 %
+// over bend directions on a regular grid (factor 2.93 across / 4.46 along the diagonals, calibrated 2026-10-26).
+__device__ double g_bend_phys = 0.0;
+
+void set_bend_phys_scale(double s)
+{
+    cudaError_t err = cudaMemcpyToSymbol(g_bend_phys, &s, sizeof(double));
+    if(err != cudaSuccess) printf("[bending] set_bend_phys_scale failed: %s\n", cudaGetErrorString(err));
+}
+
+__device__ __forceinline__ double bend_hinge_weight(const double3& r0, const double3& r1, const double3& r2, const double3& r3, double length)
+{
+    if(g_bend_phys <= 0.0)
+        return length;
+    const double3 e0 = __GEIGEN__::__minus(r1, r0);
+    const double3 e1 = __GEIGEN__::__minus(r2, r0);
+    const double3 e2 = __GEIGEN__::__minus(r3, r0);
+    const double  a  = 0.5 * __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(e0, e1)) + 0.5 * __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(e0, e2));
+    if(a <= 1e-20)
+        return 0.0;
+    return g_bend_phys * __GEIGEN__::__squaredNorm(e0) / a;
+}
+
+
 __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
                                                     const double3* rest_vertexes,
                                                     const uint2* edges,
@@ -2386,7 +2414,8 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
                                                     int*   row_ids,
                                                     int*   col_ids,
                                                     double IPC_dt,
-                                                    int global_hessian_fem_offset)
+                                                    int global_hessian_fem_offset,
+                                                    const double* theta_p)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= edgeNum)
@@ -2447,8 +2476,10 @@ __global__ void _calculate_bending_gradient_hessian(const double3* vertexes,
     double rest_t = LibShell::edgeTheta(
         rest_x0_eigen, rest_x1_eigen, rest_x2_eigen, rest_x3_eigen, nullptr, nullptr);
 
-    H = 2 * ((t - rest_t) * H + grad_transpose.transpose() * grad_transpose);
-    grad_transpose = 2 * (t - rest_t) * grad_transpose * IPC_dt * IPC_dt * length * bendStiff;
+    const double dth = t - rest_t - (theta_p ? theta_p[idx] : 0.0);
+    length = bend_hinge_weight(rest_x0, rest_x1, rest_x2, rest_x3, length);   // GIPC_BEND_PHYS: discrete-shells weight
+    H = 2 * (dth * H + grad_transpose.transpose() * grad_transpose);
+    grad_transpose = 2 * dth * grad_transpose * IPC_dt * IPC_dt * length * bendStiff;
     makePDSNK<double, 12>(H);
     //__GEIGEN__::Vector12 f;
     //for(int i = 0; i < 12; i++)
@@ -2845,7 +2876,8 @@ __device__ double __cal_bending_energy(const double3* vertexes,
                                        const uint2&   edge,
                                        const uint2&   adj,
                                        double         length,
-                                       double         bendStiff)
+                                       double         bendStiff,
+                                       double         theta_p)
 {
     if(adj.y == -1)
         return 0;
@@ -2878,7 +2910,8 @@ __device__ double __cal_bending_energy(const double3* vertexes,
         Eigen::Matrix<double, 3, 1>(rest_x3.x, rest_x3.y, rest_x3.z);
     double rest_t = LibShell::edgeTheta(
         rest_x0_eigen, rest_x1_eigen, rest_x2_eigen, rest_x3_eigen, nullptr, nullptr);
-    double bend_energy = bendStiff * (t - rest_t) * (t - rest_t) * length;
+    length = bend_hinge_weight(rest_x0, rest_x1, rest_x2, rest_x3, length);   // GIPC_BEND_PHYS: discrete-shells weight
+    double bend_energy = bendStiff * (t - rest_t - theta_p) * (t - rest_t - theta_p) * length;
     return bend_energy;
 }
 
@@ -2924,4 +2957,76 @@ double calculateArea(const double3* vertexes, const uint3& index)
     double3 v20  = __GEIGEN__::__minus(vertexes[index.z], vertexes[index.x]);
     double  area = __GEIGEN__::__norm(__GEIGEN__::__v_vec_cross(v10, v20));
     return 0.5 * area;
+}
+
+__global__ void _update_bending_plastic(const double3* vertexes, const double3* rest_vertexes, const uint2* edges,
+                                        const uint2* edges_adj_vertex, int edgeNum, double* theta_p, double yield_angle, double rate)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= edgeNum) return;
+    uint2 edge = edges[idx], adj = edges_adj_vertex[idx];
+    if(adj.y == -1) return;
+    auto x0 = vertexes[edge.x]; auto x1 = vertexes[edge.y]; auto x2 = vertexes[adj.x]; auto x3 = vertexes[adj.y];
+    Eigen::Vector3d x0e(x0.x, x0.y, x0.z), x1e(x1.x, x1.y, x1.z), x2e(x2.x, x2.y, x2.z), x3e(x3.x, x3.y, x3.z);
+    double t = LibShell::edgeTheta(x0e, x1e, x2e, x3e, nullptr, nullptr);
+    auto r0 = rest_vertexes[edge.x]; auto r1 = rest_vertexes[edge.y]; auto r2 = rest_vertexes[adj.x]; auto r3 = rest_vertexes[adj.y];
+    Eigen::Vector3d r0e(r0.x, r0.y, r0.z), r1e(r1.x, r1.y, r1.z), r2e(r2.x, r2.y, r2.z), r3e(r3.x, r3.y, r3.z);
+    double rest_t = LibShell::edgeTheta(r0e, r1e, r2e, r3e, nullptr, nullptr);
+    double d = t - rest_t - theta_p[idx];
+    double ex = fabs(d) - yield_angle;
+    if(ex > 0.0) theta_p[idx] += (d > 0.0 ? 1.0 : -1.0) * ex * rate;
+}
+
+__global__ void _update_tet_plastic(const double3* vertexes, const uint4* tetrahedras, __GEIGEN__::Matrix3x3d* DmInverses,
+                                    const double* lengthRate, double3* plastic, int tetNum)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= tetNum) return;
+    double3 pp = plastic[idx];
+    if(pp.x <= 0.0) return;
+    __GEIGEN__::Matrix3x3d Ds, F, U, V, S;
+    __calculateDms3D_double(vertexes, tetrahedras[idx], Ds);
+    __M_Mat_multiply(Ds, DmInverses[idx], F);
+    __GEIGEN__::SVD(F, U, V, S);
+    double s[3] = {S.m[0][0], S.m[1][1], S.m[2][2]};
+    if(!(s[0] > 1e-6 && s[1] > 1e-6 && s[2] > 1e-6)) return;   // inverted / degenerate: leave it to the elastic solve
+    double e[3] = {log(s[0]), log(s[1]), log(s[2])};
+    const double em = (e[0] + e[1] + e[2]) / 3.0;
+    double d[3] = {e[0] - em, e[1] - em, e[2] - em};
+    const double dn = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    const double mu = 0.75 * lengthRate[idx];   // lengthRate = 4 mu / 3
+    const double tau = 2.0 * mu * dn;           // |dev tau| (Hencky / Kirchhoff)
+    const double radius = sqrt(2.0 / 3.0) * (pp.x + pp.y * pp.z);
+    if(dn < 1e-12 || tau <= radius) return;
+    const double dgam = (tau - radius) / (2.0 * mu + (2.0 / 3.0) * pp.y);   // plastic multiplier (strain)
+    const double f = 1.0 - dgam / dn;                                          // keeps the deviatoric direction
+    double r[3];
+    for(int i = 0; i < 3; ++i) r[i] = exp(em + f * d[i]) / s[i];              // Sigma' / Sigma
+    pp.z += sqrt(2.0 / 3.0) * dgam;
+    plastic[idx] = pp;
+    // R = V diag(r) V^T ; DmInv' = DmInv R
+    __GEIGEN__::Matrix3x3d R;
+    for(int i = 0; i < 3; ++i)
+        for(int j = 0; j < 3; ++j)
+            R.m[i][j] = V.m[i][0] * r[0] * V.m[j][0] + V.m[i][1] * r[1] * V.m[j][1] + V.m[i][2] * r[2] * V.m[j][2];
+    __GEIGEN__::Matrix3x3d Dn;
+    __M_Mat_multiply(DmInverses[idx], R, Dn);
+    DmInverses[idx] = Dn;
+}
+void update_tet_plasticity(const double3* vertexes, const uint4* tetrahedras, __GEIGEN__::Matrix3x3d* DmInverses,
+                           const double* lengthRate, double3* plastic, int tetNum)
+{
+    if(tetNum < 1 || !plastic) return;
+    const unsigned int threadNum = 256;
+    int blockNum = (tetNum + threadNum - 1) / threadNum;
+    _update_tet_plastic<<<blockNum, threadNum>>>(vertexes, tetrahedras, DmInverses, lengthRate, plastic, tetNum);
+}
+
+void update_bending_plasticity(const double3* vertexes, const double3* rest_vertexes, const uint2* edges,
+                               const uint2* edges_adj_vertex, int edgeNum, double* theta_p, double yield_angle, double rate)
+{
+    if(edgeNum < 1 || !theta_p) return;
+    const unsigned int threadNum = 256;
+    int blockNum = (edgeNum + threadNum - 1) / threadNum;
+    _update_bending_plastic<<<blockNum, threadNum>>>(vertexes, rest_vertexes, edges, edges_adj_vertex, edgeNum, theta_p, yield_angle, rate);
 }
