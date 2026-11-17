@@ -61,7 +61,7 @@ struct RevoluteDrivingGPUData
     Vector3 q_bar;    // body2 perpendicular direction  (same as p_bar at rest)
     Vector3 qN_bar;   // body2 perpendicular direction  (same as pN_bar at rest)
 
-    Float   stiffness;              // K = sr * ctrl_sr * (m_parent + m_child) * dt²
+    Float   stiffness;              // K = sr * ctrl_sr * (m_parent + m_child); assembled WITHOUT dt^2 (physical torque = K*err/dt^2)
     Float   target_angle;           // theta_tgt in radians (relative to loaded config)
     Float   initial_angle_offset;   // offset from FK-loaded pose (absolute URDF target = relative target + offset)
 

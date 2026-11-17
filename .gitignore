@@ -50,3 +50,6 @@ dist_*/
 Assets/sorted_mesh/*.16.obj
 Assets/sorted_mesh/*.16.part
 Assets/sorted_mesh/*.16.msh
+
+# lab_tactile demo outputs (recordings / renders)
+/out/

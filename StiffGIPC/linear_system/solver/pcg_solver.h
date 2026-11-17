@@ -91,7 +91,10 @@ class PCGSolver : public IterativeSolver
     SizeT solve(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b) override;
 
   private:
-    SizeT pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter);
+    SizeT pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter,
+              SizeT n_dot = 0);
+    // [live-prefix PCG] size the cub dot scratch for n DOFs (no-op when already large enough)
+    void cub_dot_reserve(int n);
     // [multi-env P3] segmented block-diagonal PCG (per-env α/β/convergence). dof_to_group is
     // block-indexed (DOF i → block i/3 → group dof_to_group[i/3]).
     SizeT seg_pcg(muda::DenseVectorView<Float> x, muda::CDenseVectorView<Float> b, SizeT max_iter,

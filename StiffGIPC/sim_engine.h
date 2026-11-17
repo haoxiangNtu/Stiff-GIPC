@@ -25,6 +25,8 @@ struct SimEngineConfig
     double cloth_thickness     = 1e-3;
     double cloth_young_modulus = 1e6;
     double bend_young_modulus  = 1e5;
+    double bend_yield_angle    = 0.0;   // shell plasticity: hinge yield angle (rad), 0 = elastic; needs GIPC_QUADRATIC_BENDING=OFF
+    double bend_plastic_rate   = 1.0;   // 0..1, share of the over-yield hinge angle that becomes permanent each step
     double cloth_density       = 2e2;
     double strain_rate         = 100;
     double soft_motion_rate    = 1e0;
@@ -35,6 +37,11 @@ struct SimEngineConfig
     // exact current behavior). Scene-size and env-count independent by
     // construction; also makes relative_dhat fully inert for the exit check.
     double newton_velocity_tol = 0.0;
+    // [kappa scale] Explicit mean vertex mass for the adaptive barrier-stiffness bounds
+    // (suggestKappa / upperBoundKappa are proportional to it). 0 = computed as total lumped
+    // vertex mass / vertex count, which falls with the number of massless ABD surface
+    // vertices (refining a rigid collision mesh alone softens contact). >0 pins the scale.
+    double kappa_mean_mass = 0.0;
     double pcg_tol             = 1e-4;
     double relative_dhat       = 1e-3;
 
@@ -93,6 +100,7 @@ struct SimEngineConfig
     double energy_abs_tol         = 0.0;
     double energy_rel_tol         = 0.0;
     int    newton_iter_cap        = 1000;
+    double pcg_max_iter_ratio     = 0.3;   // PCG iteration cap as a fraction of the DOF count
 
     bool   skip_all_collision = false;
 
@@ -147,6 +155,38 @@ struct InstancedLoadResult
     std::vector<int> vertex_offsets;  // N vertex start indices
     std::vector<int> vertex_counts;   // N vertex counts (all same for same mesh)
     int              asset_id;        // shared mesh asset reference
+};
+
+// [liquid] MPM Lite water inside the IPC Newton solve (see
+// MPM_IPC_MONOLITHIC_DESIGN.md). Registered before finalize();
+// the grid-node pool and the particles become two point-only FEM bodies
+// appended after every other body.
+struct LiquidSpec
+{
+    double          dx              = 0.005;
+    Eigen::Vector3d domain_lo       = Eigen::Vector3d(0, 0, 0);
+    Eigen::Vector3d domain_hi       = Eigen::Vector3d(1, 1, 1);
+    double          rho             = 1000.0;
+    double          kappa           = 1e5;
+    double          particle_volume = 0.0;   // rest volume per particle (0 = dx^3/8)
+    int             node_pool       = 0;     // 0 = auto (12x the seed's node count, >= 8192)
+    double          mass_floor      = 0.05;  // node mass floor (fraction of rho*dx^3): conditions free-surface nodes
+    bool            apic            = true;
+    double          apic_ratio      = 1.0;   // APIC affine scale (1 = APIC, 0 = PIC)
+    double          push_apart      = 0.9;   // particle min-spacing floor (fraction of seed spacing, 0 = off)
+    int             j_mode          = 3;     // 0 tracked J, 1 SPH-density reinit, 2 cell-density, 3 hybrid (default), 4 cell-density x geometric fill (no surface creep / layer loss)
+    double          ground_mu       = 0.3;   // particle-ground friction (spilled water skates forever on a frictionless table); solids stay 0
+    int             model           = 0;     // 0 = water (EOS kappa), 1 = elastic solid (fixed corotated, young/poisson), see liquid_system.cuh
+    double          young           = 1e5;   // model 1
+    double          poisson         = 0.3;   // model 1
+    double          plastic_stretch  = 0.0;  // model 1 plasticity: principal stretch cap 1 + s (tension cut-off, the body tears open); 0 = off
+    double          plastic_compress = 0.0;  // model 1 plasticity: principal stretch floor 1 - c (crushing); 0 = off
+    double          plastic_yield    = 0.0;  // model 1 plasticity: von Mises bound on |dev ln S| of F_p; 0 = off
+    double          plastic_damage   = 0.0;  // model 1 damage: largest principal stretch > 1 + d breaks a particle for good; 0 = off
+    double          plastic_damage_residual = 0.1;  // model 1 damage: share of the elastic energy a broken particle keeps (+ full compression; 0 jets them out)
+    double          plastic_damage_strain   = 0.0;  // model 1 ductile damage: accumulated equivalent plastic strain > this breaks a particle; 0 = off
+    double          mu              = 0.0;   // particle-solid friction, pair coefficient sqrt(mu x the body's mu): water 0 (inviscid); a model-1 solid needs it
+    double          stick_h         = 0.0;   // particles within stick_h of the ground plane freeze (puddle instead of a tension-free sheet); 0 = off
 };
 
 class SimEngine
@@ -226,9 +266,14 @@ class SimEngine
     void add_ground(double height = 0.0);
 
     void add_collision_exclusion(int body_a, int body_b);
+    // FEM self-collision of one body on/off (before finalize). Only same-body pairs are affected; contact with every
+    // other body stays on. (A self-exclusion through add_collision_exclusion(b, b) would instead mark the body fully
+    // isolated: the BVH-skip uses the skip-matrix diagonal as "collides with nothing".)
+    void set_body_self_collision(int body, bool enabled);
     /// Declare one group id per collision body. Non-negative ids must be dense
-    /// [0,N), N<=256. Wildcard -1 is supported only by merged-mode execution;
-    /// isolated/strict require every body to be grouped. Validated at finalize().
+    /// [0,N), N <= device_TetraData::kGroupSlotCapacity (4096). Wildcard -1 is
+    /// supported only by merged-mode execution; isolated/strict require every
+    /// body to be grouped. Validated at finalize().
     void set_body_groups(const std::vector<int>& groups);
     // [multi-env subscene] Per-VERTEX env id (length = engine vertex count). The
     // broad-phase skips contact pairs whose two vertices carry different (>=0) env
@@ -319,6 +364,20 @@ class SimEngine
     /// APIs themselves: teleporting one body mid-scene must not clear the
     /// friction state of every other contact.
     void reset_transient_contact_state();
+    /// [gpu-direct] Vertex permutation between engine-internal (device) order
+    /// and input (load) order: out[engine_idx] = input_idx.
+    ///
+    /// The host getters (get_vertex_positions / get_surface_faces / ...) already
+    /// unscramble this, so it is invisible from Python -- but
+    /// get_vertices_device_ptr() hands out the RAW device buffer, which is in
+    /// engine order. Anything doing zero-copy GPU work on those vertices (e.g. a
+    /// tactile depth rasteriser indexing a gel's surface triangles) must remap
+    /// its input-order indices through the inverse of this permutation.
+    ///
+    /// Writes min(n, vertexNum) entries and returns the number written. Writes
+    /// the identity when no MAS reorder was applied (preconditioner_type == 0
+    /// or ABD-only scenes), so callers need no special case.
+    int get_vertex_metis_to_input(int* out, int n) const;
 
     /// [per-env productization] Newton iter at which each env froze last solve
     /// (converged / timeout / diverged; -1 = ran to loop end or absent).
@@ -533,6 +592,66 @@ class SimEngine
                                 const std::string& msh_path,
                                 double young_modulus = 1e7);
 
+    // ---- Liquid (MPM Lite + IPC monolithic) ----
+    /// Register a liquid: `xyz` = (n,3) particle seed positions. Must be
+    /// called BEFORE finalize(); the liquid bodies are appended last.
+    void add_liquid(const double* xyz, int n, const LiquidSpec& spec);
+    int  get_liquid_particle_count() const;
+    void get_liquid_particles(double* out_xyz) const;
+    void get_liquid_velocities(double* out_xyz) const;
+    void get_liquid_J(double* out) const;
+    void get_liquid_damage(int* out) const;
+    void get_liquid_plastic_strain(double* out) const;
+    /// out[0]=active cells, out[1]=active nodes, out[2]=node pool, out[3]=node slot base,
+    /// out[4]=particle slot base, out[5]=node body id, out[6]=particle body id
+    void get_liquid_stats(int* out19) const;
+    int  get_liquid_wall_forces(double* out3, int n) const;   // liquid -> solid wall-constraint reaction per solid vertex (N)
+    void set_liquid_pump_chamber(const double* tip, const double* top, double radius, double V_cav, double p0, double bore_radius);
+    void get_liquid_pump_state(double* out6) const;   // V_air, p_gauge, V_liq, n_column, V0, sealed
+    void get_liquid_ghost_reaction(double* out3);      // CPIC: voxel-pressure force on the fixed ghost nodes (N)   // [0..6] layout, [7..18] last-step clamp / fallback counters
+    /// Dropper / pipette pump for the liquid: particles within `radius` of the segment
+    /// tip->top (world coords; the region extends 10 mm beyond the tip) receive an
+    /// acceleration `accel` along tip->top before each step (+ suction up the tube,
+    /// - squeeze out of the tip, 0 = off). Call every frame with the live tube geometry.
+    /// bore_radius (<= 0: = radius): the intake conveyor only draws in particles within
+    /// bore_radius - dhat of the axis, i.e. under the opening, never under the glass end face.
+    void set_liquid_pump(const double* tip_xyz, const double* top_xyz, double radius, double accel, double conveyor = 0.0, double follow = 0.0,
+                         double track = 0.0, double bore_radius = 0.0);
+    /// Porous (open-cell sponge) coupling of the engine liquid with one 3D FEM body, by FEM body index
+    /// (load-record body_offset). Call after finalize(). Particles inside the body's tets stop colliding
+    /// with its surface, relax toward the material velocity at rate `drag` (1/s) and keep their water
+    /// against gravity while the tet holds <= porosity x its current volume (capillary retention);
+    /// squeezing the body shrinks that capacity and the excess drains / is pressed out.
+    void set_liquid_porous(int fem_body_idx, double drag, double porosity, double suction = 0.0);
+    /// Damage gate of a model-1 MPM solid (before finalize): only particles this body (a knife) has touched may break.
+    void set_liquid_cutter(int body_offset);
+    /// Elastic particle solid (add_liquid model 1): per-particle factors on Young's modulus and on the damage stretch threshold
+    /// (input particle order; either pointer may be null). Call after finalize().
+    void set_liquid_particle_material(const double* young_scale, const double* damage_scale, int n);
+    // cutter CPIC for a model-1 MPM solid (after finalize, before each step): M12 = 3x4 row-major world -> cutter-native affine
+    // (native x: spine -> edge, y: along the blade, z: across it), mid-plane z = zm, edge x = edge[k] at y = s0 + k ds (k < K);
+    // particles within `band` of the mid-plane, inside the blade and up to `lead` beyond the edge, couple only to their side's corners
+    void set_liquid_cut_plane(const double* M12, double zm, double s0, double ds, const double* edge, int K, double lead, double band);
+    int  get_liquid_cut_masked() const;
+    /// Persistent pieces of a model-1 MPM solid (after finalize; needs LIQ_CUT_FIELDS=2): one piece id per particle (input order).
+    /// Two pieces interact through the grid only where their particles are within `contact_spacings` seed spacings; ids = nullptr turns it off.
+    void set_liquid_pieces(const int* ids, int n, double contact_spacings);
+    /// Volumetric (tet) plasticity for one FEM body: J2 / von Mises yield on the Hencky strain with linear isotropic
+    /// hardening, applied between Newton steps as a per-tet rest-shape update. Call after finalize(). yield_stress 0 = elastic.
+    void   set_fem_plasticity(int fem_body_idx, double yield_stress, double hardening = 0.0);
+    double mean_plastic_strain(int fem_body_idx) const;   // mean accumulated equivalent plastic strain of the body's tets
+    int  count_liquid_in_porous() const;   // particles inside the porous body at the last step
+    double get_liquid_porous_saturation() const;   // inside water volume / (porosity x current body volume), last step
+    /// Grid-level wall boundary condition for axisymmetric containers carried by ABD bodies
+    /// (gipc_liquid::LiquidContainer). Per container k: ABD body index, design frame X = Rd xbar + td
+    /// (Rd row-major, 9 doubles), cavity inner-radius profile py/pr (LIQ_PROF_N = 32 slots, nprof used,
+    /// py[0] = floor), free above y_top, constrained shell `band`, slip flag. Call after finalize.
+    void set_liquid_containers(int n, const int* body, const double* Rd, const double* td, const int* nprof,
+                               const double* py, const double* pr, const double* y_top, const double* band,
+                               const int* slip, double wall_mass, int ground_bc);
+    /// Number of liquid particles currently inside the pump region (diagnostic).
+    int  count_liquid_in_pump() const;
+
     // ---- FEM vertex state ----
     void get_vertex_velocities(double* out_xyz, int count) const;
     void set_vertex_positions_gpu(const double* xyz, int count);
@@ -575,7 +694,8 @@ class SimEngine
     void set_prismatic_target(int idx, double distance_m);
     void set_prismatic_force(int idx, double force);  // [force-control] external prismatic force (N)
     void set_prismatic_limit_barrier(int idx, double cl, double dir, double dhat, double kappa, int slot = 0);  // [force-control] one-sided IPC barrier; slot 0=closed end, 1=open end (hard no-overshoot both ways)
-    double get_prismatic_drive_force(int idx) const;  // [force-control] current K*(target-d) drive force
+    double get_prismatic_drive_force(int idx) const;  // [force-control] PHYSICAL drive force N = K*(target-d)/dt^2
+    double get_revolute_drive_torque(int idx) const;   // [force-control] PHYSICAL drive torque N*m = K*wrap(target-theta)/dt^2
     double get_prismatic_current_distance(int idx) const;  // [force-control] current opening d along axis
     void   get_vertex_contact_force_sum(int vert_offset, int vert_count, double* out3) const;  // [force-control] net IPC contact force on a body
     void   get_body_contact_force_batched(const int* offsets, const int* counts, int n_seg, double* out3) const;  // [force-control] BATCHED: rebuild contacts ONCE, sum per segment (finger/env) -> n_seg 3-vectors, ONE D2H

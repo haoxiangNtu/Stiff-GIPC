@@ -22,7 +22,13 @@ class Spmv
                               // s4_dof_to_group[row]; skip if !s4_active[group].
                               const int*                    s4_active = nullptr,
                               const int*                    s4_dof_to_group = nullptr,
-                              int                           s4_ng = 0);
+                              int                           s4_ng = 0,
+                              // [live-prefix PCG] >0: x/y hold only the first
+                              // live_blocks 3x3 blocks. Triplets touching a block
+                              // >= live_blocks contribute nothing (their values are
+                              // exactly zero or they only feed dead rows) and never
+                              // read x or write y past the prefix. 0 = no limit.
+                              int                           live_blocks = 0);
     ~Spmv();
 
     // [seg-fused dot] when set (by seg_pcg's fast path), the spmv ALSO accumulates the per-env

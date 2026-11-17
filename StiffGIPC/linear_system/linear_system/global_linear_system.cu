@@ -2,7 +2,13 @@
 #include <linear_system/linear_system/i_linear_system_solver.h>
 #include <linear_system/linear_system/i_preconditioner.h>
 #include <gipc/utils/timer.h>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <algorithm>
 
+extern std::vector<double> g_audit_abd_P, g_audit_abd_M;
+extern int g_audit_abd_nb;
 namespace gipc
 {
 bool GlobalLinearSystem::build_linear_system()
@@ -93,6 +99,63 @@ bool GlobalLinearSystem::build_linear_system()
     }
     convert_new();
 
+    // [audit 2026-10-09] STIFF_AUDIT_ABDPRE=1: compare each ABD body's preconditioner block (before
+    // inversion) with the same 12x12 diagonal block of the assembled matrix; print the difference
+    // relative to the body's mass matrix (a difference equal to M means the mass is counted twice).
+    if(getenv("STIFF_AUDIT_ABDPRE") && g_audit_abd_nb > 0)
+    {
+        static int prints = 0;
+        if(prints < 12)
+        {
+            ++prints;
+            const int nb = g_audit_abd_nb, nu = gipc_global_triplet->h_unique_key_number;
+            std::vector<int>    hr(nu), hc(nu);
+            std::vector<double> hv((size_t)nu * 9);
+            CUDA_SAFE_CALL(cudaMemcpy(hr.data(), gipc_global_triplet->block_row_indices(), nu * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(hc.data(), gipc_global_triplet->block_col_indices(), nu * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(hv.data(), gipc_global_triplet->block_values(), (size_t)nu * 9 * sizeof(double), cudaMemcpyDeviceToHost));
+            std::vector<double> T((size_t)nb * 144, 0.0);
+            for(int t = 0; t < nu; ++t)
+            {
+                int r = hr[t], c = hc[t];
+                if(r / 4 != c / 4 || r / 4 >= nb) continue;
+                double* B = &T[(size_t)(r / 4) * 144];
+                const double* H = &hv[(size_t)t * 9];   // Eigen column-major 3x3
+                for(int a = 0; a < 3; ++a)
+                    for(int b = 0; b < 3; ++b)
+                    {
+                        double h = H[b * 3 + a];
+                        B[((r % 4) * 3 + a) * 12 + (c % 4) * 3 + b] += h;
+                        if(r != c) B[((c % 4) * 3 + b) * 12 + (r % 4) * 3 + a] += h;
+                    }
+            }
+            double worst_dm = 0.0, worst_d = 0.0, mean_dm = 0.0;
+            for(int b = 0; b < nb; ++b)
+            {
+                double nm = 0, nd = 0, ndm = 0, na = 0;
+                for(int q = 0; q < 144; ++q)
+                {
+                    // P and M are Eigen 12x12 column-major; T is row-major -> transpose index
+                    int i = q / 12, j = q % 12;
+                    double p = g_audit_abd_P[(size_t)b * 144 + j * 12 + i];
+                    double m = g_audit_abd_M[(size_t)b * 144 + j * 12 + i];
+                    double a = T[(size_t)b * 144 + q];
+                    double d = p - a;
+                    nm += m * m; nd += d * d; ndm += (d - m) * (d - m); na += a * a;
+                }
+                nm = std::sqrt(nm); nd = std::sqrt(nd); ndm = std::sqrt(ndm); na = std::sqrt(na);
+                worst_d  = std::max(worst_d, nd / std::max(nm, 1e-300));
+                worst_dm = std::max(worst_dm, ndm / std::max(nm, 1e-300));
+                mean_dm += ndm / std::max(nm, 1e-300) / nb;
+                if(prints <= 2)
+                    printf("[audit-abdpre] body %2d: |A_bb| %.3e |M| %.3e | |P - A_bb|/|A_bb| %.3e | (P - A_bb) vs M: |(P-A)-M|/|M| %.3e, |(P-A)-M|/|A_bb| %.3e\n",
+                           b, na, nm, nd / std::max(na, 1e-300), ndm / std::max(nm, 1e-300), ndm / std::max(na, 1e-300));
+            }
+            printf("[audit-abdpre] %d bodies: max |P - A_bb|/|M| %.3e; |(P - A_bb) - M|/|M| max %.3e mean %.3e\n",
+                   nb, worst_d, worst_dm, mean_dm);
+        }
+    }
+
     if(m_global_preconditioner)
         m_global_preconditioner->do_assemble(*gipc_global_triplet);
 
@@ -167,11 +230,209 @@ __global__ void _s4_zero_masked_rhs(double* b, const int* active, const int* d2g
     if(g >= 0 && g < ng && active[g] == 0) b[i] = 0.0;
 }
 
+// [live-prefix PCG] first index in the (row, col)-sorted unique triplets whose row >= key.
+__global__ void _live_lower_bound(const int* rows, int n, int key, int* out)
+{
+    int lo = 0, hi = n;
+    while(lo < hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if(rows[mid] < key) lo = mid + 1;
+        else hi = mid;
+    }
+    *out = lo;
+}
+
+// [live-prefix PCG] verification: count unique blocks that couple a live block to a
+// dead one with any nonzero entry, and dead RHS entries that are nonzero.
+__global__ void _live_coupling_check(const Eigen::Matrix3d* vals, const int* rows, const int* cols,
+                                     int n_trip, int live_blocks, const double* b, int n_full,
+                                     int n_live, unsigned long long* out)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if(t < n_trip)
+    {
+        int  i = rows[t], j = cols[t];
+        bool li = i < live_blocks, lj = j < live_blocks;
+        if(li != lj)
+        {
+            const double* m = vals[t].data();
+            bool nz = false;
+            for(int q = 0; q < 9; ++q) nz |= (m[q] != 0.0);
+            if(nz) atomicAdd(&out[0], 1ull);
+            atomicAdd(&out[1], 1ull);
+        }
+    }
+    int d = n_live + t;
+    if(d < n_full && b[d] != 0.0) atomicAdd(&out[2], 1ull);
+}
+
+SizeT GlobalLinearSystem::live_prefix_for_solve(SizeT n_full)
+{
+    static int s_env = -1;
+    if(s_env < 0)
+    {
+        const char* e = getenv("STIFF_PCG_LIVE");
+        s_env = e ? atoi(e) : 1;
+    }
+    const SizeT n = m_live_dof_request;
+    if(!s_env || n == 0 || n >= n_full || (n % 3) != 0)
+        return 0;
+    if(m_s4_active)  // multi-env masked path keeps the full-length solve
+        return 0;
+    if(getenv("STIFF_SEGMENTED_PCG") && m_s4_dof_to_group && m_s4_ng > 0)
+        return 0;  // seg_pcg: not prefix-aware
+    if(!m_global_preconditioner || !m_global_preconditioner->prefix_capable())
+        return 0;
+    for(auto& p : m_local_preconditioners)
+    {
+        const SizeT off = (SizeT)p->m_subsystem->dof_offset()[0];
+        const SizeT cnt = p->m_subsystem->right_hand_side_dof();
+        if(off + cnt > n)
+            return 0;
+    }
+    return n;
+}
+
+void GlobalLinearSystem::begin_live_solve(SizeT n_live)
+{
+    const int live_blocks = (int)(n_live / 3);
+    const int n_trip      = gipc_global_triplet->h_unique_key_number;
+    static int* d_lb      = nullptr;
+    if(!d_lb)
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_lb, sizeof(int)));
+    _live_lower_bound<<<1, 1>>>(gipc_global_triplet->block_row_indices(), n_trip, live_blocks, d_lb);
+    int cut = n_trip;
+    CUDA_SAFE_CALL(cudaMemcpy(&cut, d_lb, sizeof(int), cudaMemcpyDeviceToHost));
+    // Round up to a whole warp: the SpMV's warp-segmented row reduce then sees exactly
+    // the lanes of the full-length launch for every live row (lanes past the cut hold
+    // dead rows, which the kernel reduces but never deposits).
+    long long cut32 = ((long long)cut + 31) / 32 * 32;
+    if(cut32 > n_trip) cut32 = n_trip;
+    m_spmv_triplets    = (int)cut32;
+    m_spmv_live_blocks = live_blocks;
+    m_solver->m_live_n = n_live;
+    static const bool fulldot = getenv("STIFF_PCG_LIVE_FULLDOT") != nullptr;
+    m_solver->m_dot_n = fulldot ? m_b.size() : 0;
+}
+
+void GlobalLinearSystem::end_live_solve()
+{
+    m_spmv_triplets    = -1;
+    m_spmv_live_blocks = 0;
+    m_solver->m_live_n = 0;
+    m_solver->m_dot_n  = 0;
+}
+
+// STIFF_PCG_LIVE_VERIFY=1: solve every system full-length AND on the live prefix and
+// compare (=2 adds a second full-length solve: the run-to-run noise floor). Keeps the
+// live-prefix result, so the run follows the optimized trajectory.
+SizeT GlobalLinearSystem::verify_live_solve(SizeT n_live, SizeT n_full)
+{
+    const int live_blocks = (int)(n_live / 3);
+    // structural check: no nonzero block may couple a live and a dead block
+    static unsigned long long* d_cnt = nullptr;
+    if(!d_cnt)
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_cnt, 3 * sizeof(unsigned long long)));
+    CUDA_SAFE_CALL(cudaMemset(d_cnt, 0, 3 * sizeof(unsigned long long)));
+    {
+        int n_trip = gipc_global_triplet->h_unique_key_number;
+        int n_dead = (int)(n_full - n_live);
+        int n      = std::max(n_trip, n_dead);
+        _live_coupling_check<<<(n + 255) / 256, 256>>>(gipc_global_triplet->block_values(),
+                                                       gipc_global_triplet->block_row_indices(),
+                                                       gipc_global_triplet->block_col_indices(),
+                                                       n_trip, live_blocks, m_b.view().data(),
+                                                       (int)n_full, (int)n_live, d_cnt);
+    }
+    unsigned long long cnt[3] = {0, 0, 0};
+    CUDA_SAFE_CALL(cudaMemcpy(cnt, d_cnt, sizeof(cnt), cudaMemcpyDeviceToHost));
+
+    static int verify = atoi(getenv("STIFF_PCG_LIVE_VERIFY"));
+    auto fetch = [&](std::vector<double>& h)
+    {
+        h.resize(n_full);
+        CUDA_SAFE_CALL(cudaMemcpy(h.data(), m_x.view().data(), n_full * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+    };
+    std::vector<double> xa, xb, xc;
+    SizeT ka = m_solver->solve(m_x, m_b);
+    fetch(xa);
+    SizeT kb = 0;
+    if(verify >= 2)
+    {
+        kb = m_solver->solve(m_x, m_b);
+        fetch(xb);
+    }
+    begin_live_solve(n_live);
+    SizeT kc = m_solver->solve(m_x, m_b);
+    end_live_solve();
+    fetch(xc);
+
+    auto cmp = [&](const std::vector<double>& u, const std::vector<double>& v,
+                   double& maxabs, long long& ndiff)
+    {
+        maxabs = 0.0;
+        ndiff  = 0;
+        for(SizeT q = 0; q < n_full; ++q)
+            if(u[q] != v[q])
+            {
+                ++ndiff;
+                maxabs = std::max(maxabs, std::fabs(u[q] - v[q]));
+            }
+    };
+    double    xmax = 0.0;
+    long long tail_nz = 0;
+    for(SizeT q = 0; q < n_full; ++q)
+    {
+        xmax = std::max(xmax, std::fabs(xa[q]));
+        if(q >= n_live && xa[q] != 0.0) ++tail_nz;
+    }
+    double    d_ac = 0.0, d_ab = 0.0;
+    long long n_ac = 0, n_ab = 0;
+    cmp(xa, xc, d_ac, n_ac);
+    if(verify >= 2) cmp(xa, xb, d_ab, n_ab);
+    static int call = 0;
+    char kb_s[32] = "", ab_s[96] = "";
+    if(verify >= 2)
+    {
+        snprintf(kb_s, sizeof(kb_s), " / %zu", (size_t)kb);
+        snprintf(ab_s, sizeof(ab_s), " | full-vs-full: %lld differ, max %.3e (rel %.3e)", n_ab, d_ab,
+                 xmax > 0 ? d_ab / xmax : 0.0);
+    }
+    printf("[live-verify] #%d dof %zu live %zu (%.1f%%) iters full %zu%s live %zu | "
+           "full-vs-live: %lld differ, max %.3e (rel %.3e)%s | full tail nonzero %lld | "
+           "live/dead coupling blocks %llu (nonzero %llu) | dead rhs nonzero %llu\n",
+           call++, (size_t)n_full, (size_t)n_live, 100.0 * n_live / n_full, (size_t)ka, kb_s,
+           (size_t)kc, n_ac, d_ac, xmax > 0 ? d_ac / xmax : 0.0, ab_s, tail_nz, cnt[1], cnt[0],
+           cnt[2]);
+    return kc;
+}
+
+}  // namespace gipc
+// [audit 2026-10-09] PCG phase split (STIFF_PCG_SPLIT=1; synchronising event timers, per frame,
+// reset and printed by GIPC::solve_subIP under STIFF_AUDIT_STATS).
+double    g_pcg_build_ms = 0.0, g_pcg_solve_ms = 0.0, g_pcg_setup_ms = 0.0, g_pcg_iter_ms = 0.0;
+long long g_pcg_solves = 0;
+namespace gipc
+{
+static bool pcg_split_on() { static const bool on = getenv("STIFF_PCG_SPLIT") != nullptr; return on; }
+
 gipc::SizeT GlobalLinearSystem::solve_linear_system()
 {
+    cudaEvent_t sp_a = nullptr, sp_b = nullptr, sp_c = nullptr;
+    if(pcg_split_on())
+    {
+        cudaEventCreate(&sp_a); cudaEventCreate(&sp_b); cudaEventCreate(&sp_c);
+        cudaEventRecord(sp_a, cudaStreamPerThread);
+    }
     bool success = build_linear_system();
+    if(sp_a) cudaEventRecord(sp_b, cudaStreamPerThread);
     if(!success)
+    {
+        if(sp_a) { cudaEventDestroy(sp_a); cudaEventDestroy(sp_b); cudaEventDestroy(sp_c); }
         return 0;
+    }
     MUDA_ASSERT(m_solver, "Solver is null, call create_solver() to setup a solver.");
     // [S4] RHS-zero for masked envs (correctness of per-env masking)
     if(m_s4_active && m_s4_dof_to_group && m_b.size() > 0)
@@ -180,7 +441,35 @@ gipc::SizeT GlobalLinearSystem::solve_linear_system()
         _s4_zero_masked_rhs<<<gn, bs>>>(m_b.view().data(), m_s4_active,
                                         m_s4_dof_to_group, n, m_s4_ng);
     }
-    auto iter = m_solver->solve(m_x, m_b);
+    const SizeT n_full = m_b.size();
+    const SizeT n_live = live_prefix_for_solve(n_full);
+    SizeT       iter   = 0;
+    if(n_live && getenv("STIFF_PCG_LIVE_VERIFY"))
+    {
+        // the verification keeps the live-prefix result; its iteration count is
+        // the one reported (printed alongside the full-length count)
+        iter = verify_live_solve(n_live, n_full);
+    }
+    else if(n_live)
+    {
+        begin_live_solve(n_live);
+        iter = m_solver->solve(m_x, m_b);
+        end_live_solve();
+    }
+    else
+        iter = m_solver->solve(m_x, m_b);
+    if(sp_a)
+    {
+        cudaEventRecord(sp_c, cudaStreamPerThread);
+        cudaEventSynchronize(sp_c);
+        float ab = 0, bc = 0;
+        cudaEventElapsedTime(&ab, sp_a, sp_b);
+        cudaEventElapsedTime(&bc, sp_b, sp_c);
+        g_pcg_build_ms += ab;
+        g_pcg_solve_ms += bc;
+        g_pcg_solves += 1;
+        cudaEventDestroy(sp_a); cudaEventDestroy(sp_b); cudaEventDestroy(sp_c);
+    }
     distribute_solution();
     return iter;
 }
@@ -273,16 +562,21 @@ void GlobalLinearSystem::spmv(Float                         a,
                               muda::DenseVectorView<Float>  y)
 {
 
+    // [live-prefix PCG] during a live solve only the warp-rounded prefix of the sorted
+    // unique triplets can touch a live row; the kernel zeroes any dead-row/column term.
+    const int n_trip = (m_spmv_triplets >= 0) ? m_spmv_triplets
+                                              : gipc_global_triplet->h_unique_key_number;
     m_spmv.warp_reduce_sym_spmv(a,
                                 gipc_global_triplet->block_values(),
                                 gipc_global_triplet->block_row_indices(),
                                 gipc_global_triplet->block_col_indices(),
-                                gipc_global_triplet->h_unique_key_number,
+                                n_trip,
                                 x,
                                 b,
                                 y,
                                 m_s4_active,        // [S4] skip masked envs' triplets
                                 m_s4_dof_to_group,
-                                m_s4_ng);
+                                m_s4_ng,
+                                m_spmv_live_blocks);
 }
 }  // namespace gipc

@@ -34,6 +34,7 @@ void computeNodeEnv(int* node_env, const Node* _nodes, const int* prim_env, uint
 void reset_max_stack();
 int get_max_stack();
 void set_bvh_audit(int v);  // [audit-gate] enable the per-pop stack-depth probe (STIFF_STACK_DIAG)
+void set_bvh_tail_thr(unsigned int t);  // [audit A3 tail] per-thread record threshold (STIFF_AUDIT_BVH_TAIL)
 void set_ee_vloc(const int* p);
 
 struct AABB
@@ -67,16 +68,16 @@ class lbvh
   public:
     uint32_t  vert_number;
     double3*  _vertexes;
-    AABB*     _bvs;
-    AABB*     _tempLeafBox;
-    Node*     _nodes;
-    uint64_t* _MChash;
-    uint32_t* _indices;
+    AABB*     _bvs = nullptr;
+    AABB*     _tempLeafBox = nullptr;
+    Node*     _nodes = nullptr;
+    uint64_t* _MChash = nullptr;
+    uint32_t* _indices = nullptr;
     int4*     _collisionPair;
     int4*     _ccd_collisionPair;
     uint32_t* _cpNum;
     int*      _MatIndex;
-    uint32_t* _flags;
+    uint32_t* _flags = nullptr;
     AABB      scene;
     int*      _btype;
     int*      _bodyId;

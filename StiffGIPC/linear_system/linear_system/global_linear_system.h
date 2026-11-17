@@ -107,6 +107,15 @@ class GlobalLinearSystem
     const int* m_s4_dof_to_group = nullptr;
     int        m_s4_ng           = 0;
 
+    // [live-prefix PCG] GIPC declares, before each solve, how many leading DOFs can
+    // be nonzero (0 = all). The rows past it must be exactly inert: zero RHS, no
+    // nonzero block coupling them to a leading row, an invertible diagonal block.
+    // PCG then runs on the prefix -- the same arithmetic minus additions of exact
+    // zeros (dot products are re-partitioned; STIFF_PCG_LIVE_FULLDOT=1 keeps the
+    // full-length dot partition so the result is bit-identical in strict mode).
+    void  set_live_dof(SizeT n) { m_live_dof_request = n; }
+    SizeT m_live_dof_request = 0;
+
   private:
     std::vector<U<ILinearSubsystem>> m_subsystems;
     std::vector<DiagonalSubsystem*>  m_inner_subsystems;
@@ -124,6 +133,13 @@ class GlobalLinearSystem
     std::vector<Float> m_accuracy_statisfied_per_subsystem;
 
     size_t                         reserved_triplet_count = 0;
+    // [live-prefix PCG] SpMV range for the solve in progress (-1 / 0 = whole matrix)
+    int                            m_spmv_triplets    = -1;
+    int                            m_spmv_live_blocks = 0;
+    SizeT                          live_prefix_for_solve(SizeT n_full);
+    void                           begin_live_solve(SizeT n_live);
+    void                           end_live_solve();
+    SizeT                          verify_live_solve(SizeT n_live, SizeT n_full);
     Spmv                           m_spmv;
     Converter                      m_converter;
     muda::DeviceDenseVector<Float> fake_y;

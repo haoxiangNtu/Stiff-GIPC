@@ -22,7 +22,8 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                                 muda::DenseVectorView<Float>  y,
                                 const int*                    s4_active,
                                 const int*                    s4_dof_to_group,
-                                int                           s4_ng)
+                                int                           s4_ng,
+                                int                           live_blocks)
 
 {
     using namespace muda;
@@ -98,6 +99,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
              fast = fast,
              seg_dot, seg_ng,
              s4_active, s4_dof_to_group, s4_ng,
+             live_blocks,
              ybin = m_ybin,
              y = y.viewer().name("y")] __device__() mutable
             {
@@ -134,16 +136,26 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                 }
 
 
+                // [live-prefix PCG] a triplet whose row or column block lies past the live
+                // prefix contributes nothing: a dead row's y is not part of the solve, and a
+                // live-row/dead-column block multiplies x_dead = 0 (its value is exactly zero
+                // as well). The thread still joins the warp-segmented reduce below so every
+                // live row keeps exactly the lane/segment layout of the full-length SpMV.
+                bool dead = false;
                 {
                     //auto Triplet = Mats3[];
                     i                = rows[global_thread_id];
                     auto j           = cols[global_thread_id];
+                    dead = live_blocks > 0 && (i >= live_blocks || j >= live_blocks);
                     auto block_value = Mats3[global_thread_id];
-                    vec = block_value * x.segment<N>(j * N).as_eigen();
+                    if(dead)
+                        vec.setZero();
+                    else
+                        vec = block_value * x.segment<N>(j * N).as_eigen();
 
                     //flags.is_valid = 1;
 
-                    if(i != j)  // process lower triangle
+                    if(i != j && !dead)  // process lower triangle
                     {
                         Vector3 vec_ = a * block_value.transpose()
                                        * x.segment<N>(i * N).as_eigen();
@@ -168,7 +180,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                             dotc = a * x.segment<N>(i * N).as_eigen().dot(vec)
                                    + x.segment<N>(j * N).as_eigen().dot(vec_);
                     }
-                    else if(seg_dot)   // i==j: x_row == x_col
+                    else if(seg_dot && !dead)   // i==j: x_row == x_col
                         dotc = a * x.segment<N>(j * N).as_eigen().dot(vec);
                 }
 
@@ -183,6 +195,8 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
 
                 if(det)
                 {
+                    if(dead)
+                        return;   // [live-prefix PCG] nothing to deposit (det path has no warp reduce)
                     // [env-det] per-entry deposit (no warp reduce) ⇒ fully order-free ⇒ the row
                     // contribution is bit-identical regardless of warp/triplet layout ⇒ cross-env mirror.
                     Vector3 result = a * vec;
@@ -221,7 +235,7 @@ void Spmv::warp_reduce_sym_spmv(Float                         a,
                 // ----------------------------------- warp reduce -----------------------------------------------
 
 
-                if(flags)
+                if(flags && !(live_blocks > 0 && i >= live_blocks))
                 {
                     Vector3 result = a * vec;
                     if(fast)

@@ -298,6 +298,13 @@ class Config:
         # newton_tol*length*dt exit (exact current behavior). Scene-size and
         # env-count independent; makes relative_dhat inert for the exit check.
         newton_velocity_tol: float = 0.0,
+        # Explicit mean vertex mass for the adaptive kappa bounds (kappa is
+        # proportional to it). 0 = engine computes total lumped vertex mass /
+        # vertex count, a value that drops whenever massless ABD surface
+        # vertices are added, so refining a rigid collision mesh alone softens
+        # every contact. Pin it to keep kappa fixed across mesh changes (the
+        # engine prints the computed and the mass-bearing means at log level 1).
+        kappa_mean_mass: float = 0.0,
         # 1e-6 (was 1e-4, inherited from upstream, never tuned): with absolute-dhat
         # kappa (correct contact stiffness) loose PCG directions explode Newton
         # counts (measured 1407 vs 507 total Newton over 30f at 1e-4 vs 1e-6 on the
@@ -330,6 +337,7 @@ class Config:
         semi_implicit_beta_tol: float = 1e-3,
         semi_implicit_min_iter: int = 1,
         newton_iter_cap: int = 1000,
+        pcg_max_iter_ratio: float = 0.3,
         # Optional shared merged/per-env energy acceptance band. Defaults to
         # strict non-increase (E1 <= E0); set nonzero values explicitly to use
         # E1 <= E0 + energy_abs_tol + energy_rel_tol*abs(E0).
@@ -377,6 +385,8 @@ class Config:
         self._cfg.newton_tol = newton_tol
         if hasattr(self._cfg, "newton_velocity_tol"):
             self._cfg.newton_velocity_tol = newton_velocity_tol
+        if hasattr(self._cfg, "kappa_mean_mass"):
+            self._cfg.kappa_mean_mass = kappa_mean_mass
         self._cfg.pcg_tol = pcg_tol
         self._cfg.relative_dhat = relative_dhat
         # absolute_dhat>0 makes dHat = absolute_dhat^2 (fixed), independent of the
@@ -401,6 +411,8 @@ class Config:
         self._cfg.semi_implicit_beta_tol = semi_implicit_beta_tol
         self._cfg.semi_implicit_min_iter = semi_implicit_min_iter
         self._cfg.newton_iter_cap = newton_iter_cap
+        if hasattr(self._cfg, "pcg_max_iter_ratio"):
+            self._cfg.pcg_max_iter_ratio = pcg_max_iter_ratio
         if energy_abs_tol < 0.0 or energy_rel_tol < 0.0:
             raise ValueError("energy tolerances must be non-negative")
         self._cfg.energy_abs_tol = energy_abs_tol
@@ -587,6 +599,237 @@ class Engine:
         self._engine.load_mesh_from_data(verts, fcs, verts_per_face,
                                          dimensions, bt, transform,
                                          young_modulus, bb)
+
+    # ------------------------------------------------------------------
+    # Liquid (MPM Lite water solved monolithically with IPC)
+    # ------------------------------------------------------------------
+    def add_liquid(
+        self,
+        points: np.ndarray,
+        dx: float,
+        domain_lo,
+        domain_hi,
+        rho: float = 1000.0,
+        kappa: float = 1e5,
+        particle_volume: Optional[float] = None,
+        node_pool: int = 0,
+        mass_floor: float = 0.05,
+        apic: bool = True,
+        push_apart: float = 0.9,
+        j_mode: int = 3,
+        ground_mu: float = 0.3,
+        stick_h: float = 0.0,
+        apic_ratio: float = 1.0,
+        model: int = 0,
+        young: float = 1e5,
+        poisson: float = 0.3,
+        plastic_stretch: float = 0.0,
+        plastic_compress: float = 0.0,
+        plastic_yield: float = 0.0,
+        plastic_damage: float = 0.0,
+        plastic_damage_residual: float = 0.1,
+        mu: float = 0.0,
+        plastic_damage_strain: float = 0.0,
+    ) -> None:
+        """Register a liquid before finalize(). ``points`` are the (N,3)
+        particle seeds; the background grid covers [domain_lo, domain_hi]
+        with spacing ``dx`` (leave >= 1 cell of margin around the water).
+
+        ``j_mode`` selects the volume state the water pressure acts on:
+        3 (default) = particle-tracked J re-anchored to the cell density in
+        full cells; 4 = cell density corrected by the geometric fill fraction
+        of each cell (position-based: no free-surface creep, no layer loss at
+        walls); 2 = plain cell density; 0 = tracked J; 1 = SPH-density reinit.
+        ``stick_h`` (m, 0 = off): particles whose centre comes within this
+        height of the ground plane freeze in place (adhesion stand-in: spilled
+        water forms a puddle instead of a tension-free sheet); vessel floors
+        thicker than ``stick_h`` keep their contents unaffected.
+
+        ``model`` 0 = water (bulk modulus ``kappa``); 1 = elastic solid with a fixed-corotated energy on the
+        particle deformation gradient (``young``, ``poisson``), the Unified-GIPC MPM elastic material.
+
+        Model 1 plasticity (return mapping after each step, all 0 = off): ``plastic_stretch`` caps every principal
+        stretch at 1 + s (tension cut-off: the body tears open, the fracture stand-in used for cutting),
+        ``plastic_compress`` floors it at 1 - c, ``plastic_yield`` bounds |dev ln S| (von Mises on the Hencky strain).
+        ``plastic_damage`` (0 = off): a particle whose largest principal stretch exceeds 1 + d breaks for good and then keeps
+        only ``plastic_damage_residual`` of its elastic energy (plus full resistance to compression), so the two sides of a cut
+        cannot glue back (residual 0 lets broken particles jet out); see :meth:`get_liquid_damage`.
+        ``plastic_damage_strain`` (0 = off): ductile damage, a particle also breaks once its accumulated equivalent plastic
+        strain (sqrt(2/3) |delta ln S| summed over the return mappings above) exceeds this. A sharp edge splits the material by
+        shearing it aside rather than stretching it, so this is the criterion that marks the cut faces of a knife cut; see
+        :meth:`get_liquid_plastic_strain`.
+
+        ``mu``: friction of the particles against solid bodies (the pair coefficient is sqrt(mu x the body's friction, see
+        :meth:`set_body_friction`)). 0 (default) suits water; a model-1 solid needs it, or it slides on whatever it rests on
+        and a knife's pull cut shears nothing. Friction against the analytic ground plane is ``ground_mu``."""
+        pts = np.ascontiguousarray(points, dtype=np.float64).reshape(-1, 3)
+        pv = float(particle_volume) if particle_volume else 0.0
+        self._engine.add_liquid(pts, float(dx),
+                                np.asarray(domain_lo, dtype=np.float64),
+                                np.asarray(domain_hi, dtype=np.float64),
+                                float(rho), float(kappa), pv, int(node_pool),
+                                float(mass_floor), bool(apic),
+                                float(push_apart), int(j_mode), float(ground_mu),
+                                float(stick_h), float(apic_ratio), int(model), float(young), float(poisson),
+                                float(plastic_stretch), float(plastic_compress), float(plastic_yield), float(plastic_damage),
+                                float(plastic_damage_residual), float(mu), float(plastic_damage_strain))
+
+    def set_fem_plasticity(self, fem_body_idx: int, yield_stress: float, hardening: float = 0.0) -> None:
+        """Volumetric plasticity for one FEM (tet) body: von Mises / J2 yield on the Hencky strain with linear
+        isotropic hardening, applied between Newton steps as a per-tet rest-shape update (isochoric). Call after
+        :meth:`finalize`. ``fem_body_idx`` is the FEM body index (0 = first FEM body); ``yield_stress`` 0 = elastic."""
+        self._engine.set_fem_plasticity(int(fem_body_idx), float(yield_stress), float(hardening))
+
+    def mean_plastic_strain(self, fem_body_idx: int) -> float:
+        """Mean accumulated equivalent plastic strain of the body's tets (diagnostic)."""
+        return float(self._engine.mean_plastic_strain(int(fem_body_idx)))
+
+    def set_liquid_particle_material(self, young_scale=None, damage_scale=None) -> None:
+        """Elastic particle solid (``add_liquid(model=1)``): per-particle factors, in the order of the seed points,
+        on Young's modulus (``young``) and on the damage stretch threshold (``plastic_damage``). Lets one body have
+        a stiff tough skin, firm flesh and a soft core. Call after :meth:`finalize`; ``None`` leaves a property uniform."""
+        ys = None if young_scale is None else np.ascontiguousarray(young_scale, dtype=np.float64).ravel()
+        ds = None if damage_scale is None else np.ascontiguousarray(damage_scale, dtype=np.float64).ravel()
+        self._engine.set_liquid_particle_material(ys, ds)
+
+    def set_liquid_cutter(self, body_id: int) -> None:
+        """Damage gate of a model-1 MPM solid (call before :meth:`finalize`): only particles this body (a knife) has touched
+        through a contact may break, so the damage criteria of :meth:`add_liquid` act in the band the blade sweeps rather than
+        wherever the bulk yields (the edge-band damage of recent MPM cutting simulators)."""
+        self._engine.set_liquid_cutter(int(body_id))
+
+    def set_liquid_cut_plane(self, world_to_native, zm: float, s0: float, ds: float, edge, lead: float, band: float) -> None:
+        """Cutter CPIC for a model-1 MPM solid (after :meth:`finalize`, before each step; needs LIQ_EL_LIN=1). The knife's
+        mid-plane, from its edge back to the spine plus ``lead`` beyond the edge, acts as a zero-thickness crack surface: a
+        particle within ``band`` of it couples only to the grid corners on its own side, so the grid does not glue the two
+        cut faces together across a blade thinner than two cells, and a blunt edge meets material that is already split.
+        ``world_to_native`` (3x4) maps world points to the knife's frame (x: spine -> edge, y: along the blade, z: across);
+        the mid-plane is z = ``zm`` and the edge x = ``edge[k]`` at y = ``s0 + k ds``."""
+        self._engine.set_liquid_cut_plane(np.ascontiguousarray(world_to_native, dtype=np.float64).reshape(-1), float(zm), float(s0),
+                                          float(ds), np.ascontiguousarray(edge, dtype=np.float64).reshape(-1), float(lead), float(band))
+
+    def set_liquid_pieces(self, ids, contact_spacings: float = 1.0) -> None:
+        """Persistent pieces of a model-1 MPM solid (after :meth:`finalize`; needs LIQ_CUT_FIELDS=2 and LIQ_EL_LIN=1): one
+        piece id per particle (input order). Pieces of one particle body normally interact through the background grid as
+        soon as they share grid nodes, i.e. while still up to two cells apart; with piece ids a grid node that two pieces
+        reference is split into two copies unless particles of the two pieces are within ``contact_spacings`` seed
+        spacings of each other (or will be within this step), so cut-off pieces only push on each other where they
+        actually touch. ``ids=None`` turns it off."""
+        if ids is None:
+            self._engine.set_liquid_pieces(None, float(contact_spacings))
+        else:
+            self._engine.set_liquid_pieces(np.ascontiguousarray(ids, dtype=np.int32).ravel(), float(contact_spacings))
+
+    def get_liquid_cut_masked(self) -> int:
+        """Particles that had a cutter CPIC mask in the last step."""
+        return int(self._engine.get_liquid_cut_masked())
+
+    def set_liquid_porous(self, fem_body_idx: int, drag: float, porosity: float, suction: float = 0.0) -> None:
+        """Open-cell sponge coupling (call after finalize). ``fem_body_idx`` is the FEM body index (load-record
+        ``body_offset``). Particles inside the body's tets pass through its surface, relax toward the material
+        velocity at ``drag`` (1/s) and are held against gravity while the tet holds at most ``porosity`` x its
+        current volume of water; squeezing the body drains / presses the excess out."""
+        self._engine.set_liquid_porous(int(fem_body_idx), float(drag), float(porosity), float(suction))
+
+    def count_liquid_in_porous(self) -> int:
+        return int(self._engine.count_liquid_in_porous())
+
+    def get_liquid_porous_saturation(self) -> float:
+        return float(self._engine.get_liquid_porous_saturation())
+
+    def get_liquid_particle_count(self) -> int:
+        return int(self._engine.get_liquid_particle_count())
+
+    def get_liquid_particles(self) -> np.ndarray:
+        return np.asarray(self._engine.get_liquid_particles())
+
+    def get_liquid_velocities(self) -> np.ndarray:
+        return np.asarray(self._engine.get_liquid_velocities())
+
+    def get_liquid_damage(self) -> np.ndarray:
+        """Per-particle damage flag of a model-1 solid (1 = broken), see ``add_liquid(plastic_damage=...)``."""
+        return np.asarray(self._engine.get_liquid_damage())
+
+    def get_liquid_plastic_strain(self) -> np.ndarray:
+        """Accumulated equivalent plastic strain per particle of a model-1 solid, see ``add_liquid(plastic_damage_strain=...)``."""
+        return np.asarray(self._engine.get_liquid_plastic_strain())
+
+    def get_liquid_J(self) -> np.ndarray:
+        return np.asarray(self._engine.get_liquid_J())
+
+    def get_liquid_stats(self) -> dict:
+        return dict(self._engine.get_liquid_stats())
+
+    def set_liquid_pump_chamber(self, tip, top, radius: float, V_cav: float, p0: float = 101325.0, bore_radius: float = 0.0) -> None:
+        """Chamber-pressure dropper pump (physical replacement of :meth:`set_liquid_pump`): the only input is the
+        air-chamber volume ``V_cav`` (m^3); the bore column is driven by the gas pressure. Call every step."""
+        self._engine.set_liquid_pump_chamber(np.asarray(tip, float), np.asarray(top, float), float(radius), float(V_cav), float(p0), float(bore_radius))
+
+    def get_liquid_pump_state(self) -> dict:
+        return dict(self._engine.get_liquid_pump_state())
+
+    def get_liquid_ghost_reaction(self) -> np.ndarray:
+        """(3,) voxel-pressure force on the CPIC fixed ghost nodes (N); the liquid load not reaching the solid."""
+        return np.asarray(self._engine.get_liquid_ghost_reaction())
+
+    def get_liquid_wall_forces(self) -> np.ndarray:
+        """(N,3) liquid->solid reaction of the wall field constraint per vertex, Newtons (zero on liquid
+        slots / when WFC is off). Add the particle-barrier part from :meth:`get_vertex_contact_forces`."""
+        return np.asarray(self._engine.get_liquid_wall_forces())
+
+    def set_liquid_pump(self, tip, top, radius: float, accel: float, conveyor: float = 0.0,
+                        follow: float = 0.0, track: float = 0.0, bore_radius: float = 0.0) -> None:
+        """Dropper / pipette pump on the liquid particles within ``radius`` of the
+        segment tip->top (world coordinates, extended 10 mm beyond the tip); call
+        every frame with the live tube geometry. ``accel`` (m/s^2, along tip->top)
+        is added to the particle velocities before the transfer (+9.81 cancels
+        gravity on a column that owns its grid nodes = hold); ``conveyor`` (m/s)
+        moves the particle positions along the axis after the step (+ draws water
+        in through the tip, - squeezes it out; robust where the grid averages the
+        column with the bulk water across the thin glass wall); ``follow`` (0..1)
+        moves them with the tube's own velocity (tip displacement between calls),
+        i.e. the sealed column travels with the dropper; ``track`` (0..1) relaxes
+        the velocity of the particles inside the bore toward the tube's velocity
+        every step (with accel = +g the column rests in the tube). All 0 = off.
+        ``bore_radius`` (<= 0: = radius) is the tube's inner radius: the intake
+        conveyor only draws in particles within bore_radius - dhat of the axis,
+        i.e. under the opening, never under the glass end face (a position
+        conveyor runs outside the barrier/CCD, so a particle pushed into the
+        wall would stay there)."""
+        self._engine.set_liquid_pump(np.asarray(tip, dtype=np.float64), np.asarray(top, dtype=np.float64),
+                                     float(radius), float(accel), float(conveyor), float(follow), float(track),
+                                     float(bore_radius))
+
+    def set_liquid_containers(self, containers, wall_mass: float = 1e3, ground: bool = True) -> None:
+        """Grid-level wall boundary condition for the engine liquid (call after finalize).
+
+        ``containers``: list of dicts with ``body`` (ABD body index), ``Rd`` (3x3) and ``td`` (3,) mapping the
+        body's reference coordinates xbar to the vessel design frame X = Rd xbar + td (revolution axis = +y),
+        ``profile`` ((K, 2) array of (y, inner radius), y increasing, first row = cavity floor, K <= 32),
+        ``y_top`` (design height above which nodes stay free: the mouth / spout), ``band`` (thickness of
+        the constrained shell outside the cavity) and optional ``slip`` (default True).  Grid nodes on the
+        solid side follow the body along the wall normal (slip) and are weightless; ``ground`` also locks
+        the vertical motion of nodes below the ground plane.
+        """
+        N = 32
+        n = len(containers)
+        body = np.array([int(c["body"]) for c in containers], np.int32)
+        Rd = np.array([np.asarray(c["Rd"], np.float64).reshape(9) for c in containers], np.float64).reshape(-1)
+        td = np.array([np.asarray(c["td"], np.float64).reshape(3) for c in containers], np.float64).reshape(-1)
+        py = np.zeros((n, N)); pr = np.zeros((n, N)); nprof = np.zeros(n, np.int32)
+        for k, c in enumerate(containers):
+            prof = np.asarray(c["profile"], np.float64).reshape(-1, 2)
+            if len(prof) > N or len(prof) < 1:
+                raise ValueError("profile needs 1..32 samples")
+            nprof[k] = len(prof); py[k, :len(prof)] = prof[:, 0]; pr[k, :len(prof)] = prof[:, 1]
+            py[k, len(prof):] = prof[-1, 0]; pr[k, len(prof):] = prof[-1, 1]
+        ytop = np.array([float(c["y_top"]) for c in containers]); band = np.array([float(c["band"]) for c in containers])
+        slip = np.array([1 if c.get("slip", True) else 0 for c in containers], np.int32)
+        self._engine.set_liquid_containers(body, Rd, td, nprof, py.reshape(-1), pr.reshape(-1), ytop, band, slip,
+                                           float(wall_mass), int(bool(ground)))
+
+    def count_liquid_in_pump(self) -> int:
+        return int(self._engine.count_liquid_in_pump())
 
     def load_mesh_instanced(
         self,
@@ -975,6 +1218,28 @@ class Engine:
         """
         self._engine.reset_transient_contact_state()
 
+    def get_vertex_metis_to_input(self) -> np.ndarray:
+        """[gpu-direct] ``out[engine_idx] = input_idx`` for the raw device buffer.
+
+        :meth:`get_vertices_device_ptr` exposes the engine-internal vertex array,
+        which the MAS preconditioner may reorder. The host getters unscramble it
+        transparently; GPU consumers do not get that for free, so indices taken
+        from load records or your own mesh arrays must be mapped through the
+        inverse of this permutation before indexing the device buffer::
+
+            i2m = engine.get_vertex_input_to_metis()
+            device_index = i2m[input_index]
+
+        Returns the identity when no reorder was applied.
+        """
+        return np.asarray(self._engine.get_vertex_metis_to_input())
+
+    def get_vertex_input_to_metis(self) -> np.ndarray:
+        """Inverse of :meth:`get_vertex_metis_to_input`: input index -> device index."""
+        m2i = self.get_vertex_metis_to_input()
+        i2m = np.empty_like(m2i)
+        i2m[m2i] = np.arange(len(m2i), dtype=m2i.dtype)
+        return i2m
 
     def get_vertex_velocities(self) -> np.ndarray:
         """Return vertex velocities as (N, 3) float64 array."""
@@ -1175,6 +1440,35 @@ class Engine:
         """
         return self._engine.get_contacts()
 
+    def _device_to_input_perm(self):
+        """metis_to_input permutation, cached after finalize; None = identity.
+
+        Device-side per-vertex buffers are MAS-permuted whenever the MAS
+        preconditioner reorders vertices. ``get_vertices`` already returns
+        input order, but the contact-force and von-Mises accessors used to
+        hand back the DEVICE order — per-vertex maps were scrambled under
+        MAS (measured: 20% of a pressed pad's normal force appeared on coat
+        vertices before un-permuting, 100% after; per-body SUMS survived
+        because a single FEM body's range maps onto itself, which is why
+        force totals never looked wrong). Jacobi runs are identity.
+        """
+        if getattr(self, "_m2i_cache", None) is None:
+            m2i = np.asarray(self._engine.get_vertex_metis_to_input())
+            if np.array_equal(m2i, np.arange(len(m2i))):
+                self._m2i_cache = (True, None)          # identity
+            else:
+                self._m2i_cache = (False, m2i)
+        ident, m2i = self._m2i_cache
+        return None if ident else m2i
+
+    def _unpermute(self, arr: np.ndarray) -> np.ndarray:
+        m2i = self._device_to_input_perm()
+        if m2i is None:
+            return arr
+        out = np.empty_like(arr)
+        out[m2i] = arr
+        return out
+
     def get_vertex_contact_forces(self, include_ground: bool = True,
                                   components: str = "normal") -> np.ndarray:
         """Per-vertex IPC contact force (N, 3) in Newtons of the current state.
@@ -1195,12 +1489,13 @@ class Engine:
         read-only on the solver's frozen friction set.
         """
         comp = {"normal": 0, "friction_lagged": 1, "total": 2}[components]
-        return np.asarray(self._engine.get_vertex_contact_forces(include_ground, comp))
+        return self._unpermute(
+            np.asarray(self._engine.get_vertex_contact_forces(include_ground, comp)))
 
     def get_fem_von_mises_stress(self) -> np.ndarray:
         """Per-vertex von Mises stress (Pa): per-tet Neo-Hookean Cauchy stress,
         max-scattered to vertices. Non-tet vertices (cloth/ABD) are 0."""
-        return np.asarray(self._engine.get_fem_von_mises_stress())
+        return self._unpermute(np.asarray(self._engine.get_fem_von_mises_stress()))
 
     def get_per_env_newton_iters(self) -> np.ndarray:
         """Newton iter at which each env froze last solve (-1 = ran to loop
@@ -1311,7 +1606,20 @@ class Engine:
         self._engine.set_prismatic_strength(idx, strength)
 
     def get_prismatic_drive_force(self, idx: int) -> float:
+        """Current prismatic driving force in NEWTONS: ``K*(target-d)/dt^2``.
+
+        Joint driving energies enter the incremental potential WITHOUT a dt^2
+        factor, so the physical spring force carries the ``1/dt^2``. (Before
+        the 2026-09 fix this returned the raw ``K*(target-d)`` and under-read
+        by exactly ``1/dt^2`` — 0.005 N reported at 186 N actual.)
+        """
         return self._engine.get_prismatic_drive_force(idx)
+
+    def get_revolute_drive_torque(self, idx: int) -> float:
+        """Current revolute driving torque in N*m: ``K*wrap(target-theta)/dt^2``
+        (rotational twin of :meth:`get_prismatic_drive_force`, same physical
+        conversion)."""
+        return self._engine.get_revolute_drive_torque(idx)
 
     def get_prismatic_current_distance(self, idx: int) -> float:
         return self._engine.get_prismatic_current_distance(idx)

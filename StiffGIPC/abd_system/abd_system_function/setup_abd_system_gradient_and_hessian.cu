@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <abd_system/abd_system.h>
 #include <muda/launch.h>
 #include <muda/ext/eigen/evd.h>
@@ -19,6 +20,11 @@ __device__ double* g_abd_hessbin   = nullptr;
 __device__ double* g_abd_wrenchbin = nullptr;
 #include <fstream>
 #include <vector>
+// [audit 2026-10-09] ABD preconditioner blocks before inversion + mass seeds (STIFF_AUDIT_ABDPRE)
+#include <vector>
+std::vector<double> g_audit_abd_P, g_audit_abd_M;
+int g_audit_abd_nb = 0;
+
 namespace gipc
 {
 // [4.3] combine binned accumulators back into the ABD buffers (+= onto the body-func init).
@@ -663,6 +669,34 @@ void ABDSystem::_setup_abd_system_hessian(ABDSimData& sim_data,
 
 
     int write_offset = 0;
+
+    if(getenv("STIFF_TRIPLET_DBG"))
+        printf("[triplet-dbg] cap=%zu  ff=%d abdfem=%d abdabd=%d  abd_bodies=%d "
+               "stitch=%d joints=%d  new_off=%d abd_abd_start=%d  first_write=%d\n",
+               global_triplets.triplet_capacity(),
+               global_triplets.fem_fem_contact_num, global_triplets.abd_fem_contact_num,
+               global_triplets.abd_abd_contact_num, (int)abd_body_count,
+               m_stitch_count, m_num_joints, new_triplet_offset,
+               h_abd_abd_contact_start_id,
+               h_abd_abd_contact_start_id + new_triplet_offset + write_offset);
+
+    // [abd-assembly capacity] Everything below indexes off new_triplet_offset:
+    // the block groups are written at (h_abd_abd_contact_start_id +
+    // new_triplet_offset + ...), and the memcpy at the end of this function
+    // reads the scratch region [new_triplet_offset, 2*new_triplet_offset) back
+    // down over [fem_fem_contact_num, new_triplet_offset). So the buffer must
+    // hold 2*new_triplet_offset blocks. GIPC.cu's pre-assembly bound only
+    // estimates that from h_cpNum, which under-shoots on contact-dense scenes
+    // (measured: a grasped 6720-face tile wanted 11.3M blocks against a 10.7M
+    // capacity -> illegal write in thread 0 of _setup_abd_system_hessian, and
+    // an invalid-argument memcpy here). Grow to the exact figure instead.
+    // reserve_triplets (not ensure_capacity_discard): the contact triplets in
+    // [0, new_triplet_offset) were written earlier this step and must survive.
+    {
+        const size_t need = 2ull * static_cast<size_t>(new_triplet_offset) + 65536ull;
+        if(global_triplets.triplet_capacity() < need)
+            global_triplets.reserve_triplets(need);
+    }
 
 
     int number    = body_hessian_size;
@@ -2084,13 +2118,35 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
     auto  body_hessian_size = sim_data.abd_fem_count_info().abd_body_num;
 
     abd_system_diag_preconditioner.resize(body_hessian_size);
-    // Must zero-init: the scatter loop below only touches bodies that appear
-    // in the contact triplet range.  Bodies with no barrier/joint coupling
-    // (e.g. an isolated free rigid body) would otherwise receive uninitialized
-    // stack memory, and a later inverse(P(i)) propagates NaN.  Build the
-    // per-body block accumulator on a clean zero buffer, then add the mass
-    // diagonal so every body has at least a valid preconditioner.
+    // Zero-init: a body with no block in the accumulated range would otherwise
+    // keep stale memory and a later inverse(P(i)) would propagate NaN.
     abd_system_diag_preconditioner.fill(Matrix12x12::Zero());
+    // STIFF_ABD_PRECOND_LEGACY=1 restores the old scatter below (assignment
+    // instead of accumulation) for A/B.
+    static const bool s_legacy = [] {
+        const char* v = getenv("STIFF_ABD_PRECOND_LEGACY");
+        return v && v[0] && v[0] != '0';
+    }();
+    const bool legacy = s_legacy;  // locals are capturable by device lambdas
+    // [audit 2026-10-09 fix] No mass seed on the accumulate path. The range
+    // accumulated below starts at h_abd_abd_contact_start_id and (after
+    // _setup_abd_system_hessian) holds the per-body 12x12 Hessian blocks of
+    // EVERY body (kinetic M + shape + joints; exactly M for Fixed bodies)
+    // before the contact blocks, so seeding P with M counted the mass twice:
+    // measured P - A = M for all 20 lab-scene bodies (free props 7-9 % off,
+    // Fixed bodies 2M). The legacy assignment path keeps the seed because it
+    // overwrites sub-blocks instead of adding to them.
+    // Measured effect of the exact block (lab stage 4, no liquid): physics
+    // identical, Newton counts identical, PCG iterations/Newton +13-15 % in
+    // the grasp and lift windows (unchanged elsewhere), +2 % wall time — the
+    // extra M acted as a (undocumented, scene-dependent) stiffening of the
+    // block preconditioner. STIFF_ABD_PRECOND_MSEED=1 keeps that extra M on
+    // the accumulate path for A/B on other scenes.
+    static const bool s_mseed = [] {
+        const char* v = getenv("STIFF_ABD_PRECOND_MSEED");
+        return v && v[0] && v[0] != '0';
+    }();
+    if(legacy || s_mseed)
     {
         using namespace muda;
         auto Ms = sim_data.device.body_id_to_abd_mass.cviewer().name("M");
@@ -2118,12 +2174,7 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
         // on the same pusher-vs-toy scene). Fix: ACCUMULATE onto the mass seed
         // with atomics. (The old racy assignment was already order-
         // nondeterministic, so this does not regress determinism.)
-        // STIFF_ABD_PRECOND_LEGACY=1 restores the old behavior for A/B.
-        static const bool s_legacy = [] {
-            const char* v = getenv("STIFF_ABD_PRECOND_LEGACY");
-            return v && v[0] && v[0] != '0';
-        }();
-        const bool legacy = s_legacy;  // locals are capturable by device lambdas
+        // STIFF_ABD_PRECOND_LEGACY=1 restores the old behavior for A/B (see above).
         ParallelFor(256)
             .kernel_name(__FUNCTION__)
             .apply(global_triplet->abd_abd_contact_num,
@@ -2155,6 +2206,24 @@ void ABDSystem::_cal_abd_system_preconditioner(ABDSimData& sim_data)
                            }
                    });
         int count = sim_data.abd_fem_count_info().abd_body_num;
+        // [audit 2026-10-09] STIFF_AUDIT_ABDPRE=1: keep the 12x12 blocks before inversion and
+        // the mass seeds, so GlobalLinearSystem can compare them with the assembled matrix.
+        if(getenv("STIFF_AUDIT_ABDPRE") && count > 0)
+        {
+            g_audit_abd_nb = count;
+            g_audit_abd_P.resize((size_t)count * 144);
+            g_audit_abd_M.resize((size_t)count * 144);
+            CUDA_SAFE_CALL(cudaMemcpy(g_audit_abd_P.data(), abd_system_diag_preconditioner.data(),
+                                      (size_t)count * 144 * sizeof(double), cudaMemcpyDeviceToHost));
+            muda::DeviceBuffer<Matrix12x12> Mtmp(count);
+            ParallelFor(256)
+                .apply(count,
+                       [Ms = sim_data.device.body_id_to_abd_mass.cviewer().name("M"),
+                        out = Mtmp.viewer().name("out")] __device__(int i) mutable
+                       { out(i) = Ms(i).to_mat(); });
+            CUDA_SAFE_CALL(cudaMemcpy(g_audit_abd_M.data(), Mtmp.data(),
+                                      (size_t)count * 144 * sizeof(double), cudaMemcpyDeviceToHost));
+        }
         ParallelFor(256)
             .kernel_name(__FUNCTION__)
             .apply(count,

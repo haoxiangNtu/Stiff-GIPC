@@ -166,6 +166,7 @@ void GIPC::create_LinearSystem(device_TetraData& tet)
     std::cout << "- create PCG Solver" << std::endl;
     gipc::PCGSolverConfig cfg;
     cfg.global_tol_rate = pcg_threshold;
+    cfg.max_iter_ratio  = pcg_max_iter_ratio;  // [liquid] bound the cost of a stagnating PCG
     auto& pcg           = m_global_linear_system->create<gipc::PCGSolver>(cfg);
 
     std::cout << "- create Preconditioner" << std::endl;

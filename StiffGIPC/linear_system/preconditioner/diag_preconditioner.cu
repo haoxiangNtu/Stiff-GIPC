@@ -1,4 +1,5 @@
 #include <linear_system/preconditioner/diag_preconditioner.h>
+#include <algorithm>
 #include <muda/ext/eigen/inverse.h>
 #include <gipc/utils/timer.h>
 namespace gipc
@@ -35,9 +36,12 @@ namespace details
     {
         using namespace muda;
 
+        // [live-prefix PCG] r/z may cover only a leading prefix of the blocks: apply
+        // the block-diagonal inverse to exactly those (full-length: n == diag size).
+        const size_t n_blocks = std::min(diag_inv.size(), (size_t)(r.size() / 3));
         ParallelFor(256)
             .file_line(__FILE__, __LINE__)
-            .apply(diag_inv.size(),
+            .apply((int)n_blocks,
                    [r = r.viewer().name("r"),
                     z = z.viewer().name("z"),
                     diag_inv = diag_inv.viewer().name("diag_inv")] __device__(int I) mutable

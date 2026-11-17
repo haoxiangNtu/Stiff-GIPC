@@ -16,6 +16,7 @@
 
 #include "PCG_SOLVER.cuh"
 #include <gipc/abd_fem_count_info.h>
+namespace gipc_liquid { class LiquidSystem; }
 namespace gipc
 {
 class ABDSimData;
@@ -305,7 +306,14 @@ class GIPC
     // Persistent device slots for 9 FEM/contact terms plus 6 ABD terms. The
     // line-search path combines these on device; diagnostic computeEnergy()
     // performs one batched D2H instead of one transfer per term.
-    static constexpr int kEnergySlotCount = 15;
+    static constexpr int kEnergySlotCount = 16;  // [liquid] slot 15 = voxel water energy (x dt^2)
+    // [liquid] owned by SimEngine::Impl; null when the scene has no liquid.
+    gipc_liquid::LiquidSystem* m_liquid = nullptr;
+    double pcg_max_iter_ratio = 0.3;  // PCG iteration cap = ratio * dof (PCGSolverConfig default 0.3)
+    double m_liq_dbg_e0_slots[16] = {};  // [liquid debug]
+    unsigned m_liq_dbg_e0_cp[6] = {};
+    double3* m_liq_dbg_saved = nullptr;
+    bool     m_liq_dbg_have_saved = false;
     double* m_energy_slots = nullptr;
     // E0/Etrial belong exclusively to line search. Compatibility callers use a
     // separate scalar so diagnostics cannot overwrite an in-flight E0.
@@ -420,6 +428,11 @@ class GIPC
     double clothThickness          = 0.0;
     double clothYoungModulus       = 0.0;
     double bendYoungModulus        = 0.0;
+    double bendYieldAngle          = 0.0;   // plastic hinge yield (rad); 0 = elastic (dihedral bending build only)
+    double bendPlasticRate         = 1.0;   // fraction of the excess hinge angle converted to permanent set per step
+    void   update_bending_plasticity(device_TetraData& TetMesh);
+    bool   tetPlastic = false;             // any FEM body with set_fem_plasticity()
+    void   update_tet_plasticity(device_TetraData& TetMesh);
     double stretchStiff            = 0.0;
     double shearStiff              = 0.0;
     double strainRate              = 0.0;

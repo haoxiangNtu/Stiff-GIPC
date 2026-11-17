@@ -117,6 +117,15 @@ class GIPCTripletMatrix
         size_t cap = need + margin;
         resize_triplets(live_count);   // publish the live size: reserve()'s copy covers [0:live)
         reserve_triplets(cap);
+        // The grown region is fresh cudaMalloc memory. Zero it, as the per-iteration
+        // memset does for the previous capacity: blocks assembled after this point may
+        // leave reserved-but-unwritten slots, which must read as (0,0) = 0, not garbage.
+        cudaMemset(m_block_values.data() + live_count, 0,
+                   (m_block_values.capacity() - live_count) * sizeof(BlockMatrix));
+        cudaMemset(m_block_row_indices.data() + live_count, 0,
+                   (m_block_row_indices.capacity() - live_count) * sizeof(int));
+        cudaMemset(m_block_col_indices.data() + live_count, 0,
+                   (m_block_col_indices.capacity() - live_count) * sizeof(int));
     }
 
     void resize(int row, int col, size_t nonzero_count)
@@ -234,7 +243,7 @@ class GIPCTripletMatrix
     // overwrite their scratch after convert — with the old aliased layout
     // (d_contact_start_block + 4) that clobbered the unique count and a stale
     // host mirror could pick the garbage up (towel-strict OOB, 2026-07-24).
-    int* d_unique_key_number;
+    int* d_unique_key_number = nullptr;
     int* d_assembly_scratch_count = nullptr;
 
     // ②-D2H: one contiguous [5] block (abd_abd, abd_fem, fem_abd, fem_fem,

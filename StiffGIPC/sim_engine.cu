@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <filesystem>
 #include <map>
@@ -29,6 +30,9 @@
 #include <gipc/utils/urdf_scene_importer.h>
 #include <gipc/utils/simple_scene_importer.h>
 #include "abd_system/abd_system.h"
+#include "mpm/liquid_system.cuh"
+#include "mpm/liquid_validation.h"
+#include <memory>
 #include <Eigen/Geometry>
 
 // Defined at GLOBAL scope in GIPC.cu (GIPC class is not in namespace gipc).
@@ -85,6 +89,15 @@ struct SimEngine::Impl
     // Cache of URDF link world transforms after load_urdf (link_name -> 4x4).
     // Used by get_urdf_link_transform() for hybrid attachment placement.
     std::map<std::string, Eigen::Matrix4d> urdf_link_transforms;
+
+    // [liquid]
+    std::unique_ptr<gipc_liquid::LiquidSystem> liquid;
+    LiquidSpec                                 liquid_spec;
+    int                                        liquid_cutter = -1;   // set_liquid_cutter: load-record index
+    std::vector<double3>                       liquid_seed;
+    void liquid_load_bodies();   // finalize(): append node-pool + particle bodies
+    void liquid_prepare_host();  // after do_initFEM(): masses, surfVerts, meanMass
+    void liquid_alloc_device();  // after do_init_bvh_and_solver()
 
     void apply_config_to_ipc();
     void do_initFEM();
@@ -375,6 +388,19 @@ void SimEngine::load_mesh(const std::string&     mesh_path,
 void SimEngine::add_collision_exclusion(int body_a, int body_b)
 {
     m_impl->tetMesh.collision_exclusion_pairs.emplace_back(body_a, body_b);
+}
+
+void SimEngine::set_body_self_collision(int body, bool enabled)
+{
+    // body_id_to_is_fem (one entry per load record) is consulted ONLY for same-body pairs (_should_check_pair,
+    // _skip_same_abd_body): 0 there means "no self-contact", exactly as for an ABD body.
+    auto& f = m_impl->tetMesh.body_id_to_is_fem;
+    if(body < 0 || body >= (int)f.size())
+    {
+        printf("[set_body_self_collision] body %d out of range (%zu bodies loaded)\n", body, f.size());
+        return;
+    }
+    f[body] = enabled ? 1 : 0;
 }
 
 void SimEngine::set_body_groups(const std::vector<int>& groups)
@@ -937,6 +963,8 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.clothThickness      = cfg.cloth_thickness;
     ipc.clothYoungModulus   = cfg.cloth_young_modulus;
     ipc.bendYoungModulus    = cfg.bend_young_modulus;
+    ipc.bendYieldAngle      = cfg.bend_yield_angle;
+    ipc.bendPlasticRate     = cfg.bend_plastic_rate;
     ipc.clothDensity        = cfg.cloth_density;
     ipc.strainRate          = cfg.strain_rate;
     ipc.softMotionRate      = cfg.soft_motion_rate;
@@ -945,6 +973,7 @@ void SimEngine::Impl::apply_config_to_ipc()
     ipc.ground_normal_cfg   = make_double3(cfg.ground_normal.x(), cfg.ground_normal.y(), cfg.ground_normal.z());
     ipc.ground_offset_cfg   = cfg.ground_offset;
     ipc.pcg_threshold       = cfg.pcg_tol;
+    ipc.pcg_max_iter_ratio  = cfg.pcg_max_iter_ratio;
     ipc.Newton_solver_threshold = cfg.newton_tol;
     ipc.newton_velocity_tol     = cfg.newton_velocity_tol;   // [uipc-style opt-in]
     ipc.relative_dhat       = cfg.relative_dhat;
@@ -1176,8 +1205,8 @@ void SimEngine::Impl::do_upload_to_gpu()
     // this translation they pull the WRONG engine vertices -> garbage forces ->
     // Newton never converges (the case_40 MAS-on bug). P_type==0 => perm is
     // identity => skipped (no-op).
-    if(cfg.preconditioner_type != 0 && tetMesh.softNum > 0
-       && !tetMesh.vertex_metis_to_input.empty())
+    if(cfg.preconditioner_type != 0 && !tetMesh.vertex_metis_to_input.empty()
+       && (tetMesh.softNum > 0 || !tetMesh.fem_pin_fem_vertex.empty()))
     {
         const auto& m2i = tetMesh.vertex_metis_to_input;  // engine_idx -> input_idx
         std::vector<int> i2m(m2i.size(), -1);             // input_idx -> engine_idx
@@ -1188,13 +1217,34 @@ void SimEngine::Impl::do_upload_to_gpu()
             return (input_id >= 0 && input_id < (int)i2m.size() && i2m[input_id] >= 0)
                        ? i2m[input_id] : input_id;
         };
-        for(auto& v : tetMesh.targetIndex)
-            v = static_cast<uint32_t>(to_engine(static_cast<int>(v)));
-        for(auto& v : d_tetMesh.stitch_paired_vertex)  // ABD anchors: identity, safe
-            v = to_engine(v);
-        if(g_gipc_log_level >= 1)
-            printf("[MAS-fix] remapped %d stitch FEM indices input->engine (metis) order\n",
-                   tetMesh.softNum);
+        if(tetMesh.softNum > 0)
+        {
+            for(auto& v : tetMesh.targetIndex)
+                v = static_cast<uint32_t>(to_engine(static_cast<int>(v)));
+            for(auto& v : d_tetMesh.stitch_paired_vertex)  // ABD anchors: identity, safe
+                v = to_engine(v);
+            if(g_gipc_log_level >= 1)
+                printf("[MAS-fix] remapped %d stitch FEM indices input->engine (metis) order\n",
+                       tetMesh.softNum);
+        }
+        // [MAS pin index fix] The FEM-pin APIs (add_fem_pin_to_abd, add_fem_pins_with_local_pos,
+        // add_hybrid_fem_body) take INPUT-order vertex ids too, and finalize() builds BoundaryType,
+        // the pinned mask and vertex_to_pin_idx from this vector as ENGINE ids: under MAS every pin
+        // landed on the wrong gel vertex (lab scene: 500/500 wrong, median 9 mm off). Translate once,
+        // in place, before the upload below (reset() rebuilds the host state, so no double apply).
+        if(!tetMesh.fem_pin_fem_vertex.empty())
+        {
+            int changed = 0;
+            for(auto& v : tetMesh.fem_pin_fem_vertex)
+            {
+                const int e = to_engine(v);
+                changed += (e != v);
+                v = e;
+            }
+            if(g_gipc_log_level >= 1)
+                printf("[MAS-fix] remapped %zu FEM-pin vertex ids input->engine (metis) order (%d changed)\n",
+                       tetMesh.fem_pin_fem_vertex.size(), changed);
+        }
     }
     safe_copy(d_tetMesh.targetIndex, tetMesh.targetIndex.data(),
               tetMesh.softNum * sizeof(uint32_t), cudaMemcpyHostToDevice);
@@ -1786,6 +1836,26 @@ void SimEngine::Impl::do_init_bvh_and_solver()
             printf("[env-scale] per-env bbox: active=%d avg_diag2=%.6g (env0=%.6g)\n",
                    nact, ipc.m_avg_env_bbox2, ipc.h_env_bbox2[0]);
     }
+    // [kappa scale] tetMesh.meanMass (total lumped vertex mass / vertex count) sets the adaptive
+    // barrier-stiffness bounds: suggestKappa and upperBoundKappa are proportional to it, and kappa
+    // sits at the upper bound most of the time in contact-rich scenes. ABD surface vertices carry
+    // no lumped mass, so the value falls with their count: refining a rigid collision mesh alone
+    // lowered it x0.806 in the lab scene and softened every contact (beaker E* 61.3 -> 54.7 MPa).
+    // cfg.kappa_mean_mass > 0 pins the scale explicitly; the mass-bearing mean is printed so a
+    // scene can adopt the tessellation-invariant value if it wants to.
+    {
+        const int n_scan = liquid ? liquid->node_slot_base : tetMesh.vertexNum;
+        double    mb_sum = 0.0;
+        long      mb_n   = 0;
+        for(int v = 0; v < n_scan && v < (int)tetMesh.masses.size(); ++v)
+            if(tetMesh.masses[v] > 0.0) { mb_sum += tetMesh.masses[v]; ++mb_n; }
+        if(::g_gipc_log_level >= 1)
+            printf("[kappa-scale] meanMass %.17g over %d vertices (mass-bearing: %ld vertices, mean %.17g)%s\n",
+                   tetMesh.meanMass, n_scan, mb_n, mb_n ? mb_sum / (double)mb_n : 0.0,
+                   cfg.kappa_mean_mass > 0.0 ? " -> pinned by kappa_mean_mass" : "");
+        if(cfg.kappa_mean_mass > 0.0)
+            tetMesh.meanMass = cfg.kappa_mean_mass;
+    }
     ipc.init(tetMesh.meanMass, tetMesh.meanVolum, tetMesh.minConer, tetMesh.maxConer,
              cfg.linear_system_buff_scale);
 
@@ -1934,6 +2004,9 @@ void SimEngine::finalize()
     auto& impl = *m_impl;
     impl.apply_config_to_ipc();
 
+    // [liquid] the grid-node pool and the particles are the LAST bodies.
+    if(impl.liquid) impl.liquid_load_bodies();
+
     // Build ABD system + linear system
     impl.ipc.build_gipc_system(impl.d_tetMesh);
 
@@ -1958,8 +2031,10 @@ void SimEngine::finalize()
     impl.do_setMAS_partition();
     impl.tetMesh.getSurface();
     impl.do_initFEM();
+    if(impl.liquid) impl.liquid_prepare_host();
     impl.do_upload_to_gpu();
     impl.do_init_bvh_and_solver();
+    if(impl.liquid) impl.liquid_alloc_device();
 
     impl.finalized = true;
     std::cout << "[SimEngine] Finalized: "
@@ -2415,7 +2490,21 @@ void SimEngine::step()
         impl.ipc.update_joint_angle_targets_from_mesh(impl.tetMesh);
     }
 
+    if(impl.liquid)
+    {
+        impl.liquid->d_faces = impl.ipc._faces;   // collision surface for the wall field constraint
+        impl.liquid->n_faces = (int)impl.ipc.surface_Num;
+        impl.liquid->pre_step(impl.d_tetMesh, impl.ipc.IPC_dt, impl.ipc.gravity);
+        // the particles (advection, push-apart) and the grid nodes (re-lattice) moved
+        // since the last line search: the engine keeps the DCD pair list across steps,
+        // so refresh it or the first Newton iteration works on stale contacts.
+        impl.ipc.buildBVH();
+        impl.ipc.buildCP();
+    }
     impl.ipc.IPC_Solver(impl.d_tetMesh);
+    if(impl.ipc.bendYieldAngle > 0.0) impl.ipc.update_bending_plasticity(impl.d_tetMesh);   // plastic shell hinges
+    if(impl.ipc.tetPlastic) impl.ipc.update_tet_plasticity(impl.d_tetMesh);                  // volumetric (tet) plasticity
+    if(impl.liquid) impl.liquid->post_step(impl.d_tetMesh, impl.ipc.IPC_dt);
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     impl.step_count++;
 
@@ -2436,6 +2525,378 @@ void SimEngine::step()
 }
 
 // ======================== state queries ========================
+// ======================== liquid ========================
+void SimEngine::add_liquid(const double* xyz, int n, const LiquidSpec& spec)
+{
+    auto& impl = *m_impl;
+    if(impl.finalized) throw std::runtime_error("[liquid] add_liquid must be called before finalize()");
+    if(impl.liquid) throw std::runtime_error("[liquid] only one liquid per engine is supported");
+    if(n <= 0) throw std::runtime_error("[liquid] empty particle set");
+    using namespace gipc_liquid;
+    liquid_require(xyz != nullptr && n <= std::numeric_limits<int>::max() / 27,
+                   "invalid particle pointer or count exceeds 32-bit stencil capacity");
+    int dims[3];
+    for(int a = 0; a < 3; ++a) dims[a] = checked_cells(spec.domain_lo[a], spec.domain_hi[a], spec.dx);
+    checked_grid_count(dims[0], dims[1], dims[2], 1);
+    liquid_require(finite_positive(spec.rho) && finite_positive(spec.kappa), "rho and kappa must be finite and positive");
+    liquid_require(finite_nonnegative(spec.particle_volume), "particle_volume must be finite and nonnegative (0 = auto)");
+    const double pv = spec.particle_volume > 0 ? spec.particle_volume : spec.dx * spec.dx * spec.dx / 8.0;
+    liquid_require(finite_positive(pv) && finite_positive(spec.rho * pv)
+                       && finite_positive(spec.rho * spec.dx * spec.dx * spec.dx), "particle or cell mass is not representable");
+    liquid_require(spec.node_pool >= 0, "node_pool must be nonnegative (0 = auto)");
+    liquid_require(finite_nonnegative(spec.mass_floor) && finite_nonnegative(spec.push_apart)
+                       && finite_nonnegative(spec.ground_mu) && finite_nonnegative(spec.stick_h),
+                   "mass_floor, push_apart, ground_mu and stick_h must be finite and nonnegative");
+    liquid_require(std::isfinite(spec.apic_ratio) && spec.apic_ratio >= 0 && spec.apic_ratio <= 1,
+                   "apic_ratio must be in [0, 1]");
+    liquid_require(spec.j_mode >= 0 && spec.j_mode <= 4, "j_mode must be 0, 1, 2, 3 or 4");
+    liquid_require(finite_nonnegative(spec.mu), "mu must be finite and nonnegative");
+    liquid_require(finite_nonnegative(spec.plastic_damage_strain), "plastic_damage_strain must be finite and nonnegative");
+    liquid_require(std::isfinite(spec.plastic_damage_residual) && spec.plastic_damage_residual >= 0 && spec.plastic_damage_residual <= 1,
+                   "plastic_damage_residual must be in [0, 1]");
+    // Validate the entire input before registering any state. A failed call can be retried.
+    for(int i = 0; i < n; ++i)
+        for(int a = 0; a < 3; ++a)
+            liquid_require(std::isfinite(xyz[3 * i + a]) && xyz[3 * i + a] >= spec.domain_lo[a]
+                               && xyz[3 * i + a] < spec.domain_hi[a], "particle coordinates must be finite and inside [domain_lo, domain_hi)");
+    impl.liquid_spec = spec;
+    impl.liquid_seed.resize(n);
+    for(int i = 0; i < n; ++i) impl.liquid_seed[i] = make_double3(xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]);
+    impl.liquid.reset(new gipc_liquid::LiquidSystem());
+}
+
+void SimEngine::Impl::liquid_load_bodies()
+{
+    const LiquidSpec& sp = liquid_spec;
+    gipc_liquid::LiquidParams P;
+    P.dx     = sp.dx;
+    P.origin = make_double3(sp.domain_lo.x(), sp.domain_lo.y(), sp.domain_lo.z());
+    P.dims   = make_int3(gipc_liquid::checked_cells(sp.domain_lo.x(), sp.domain_hi.x(), sp.dx),
+                         gipc_liquid::checked_cells(sp.domain_lo.y(), sp.domain_hi.y(), sp.dx),
+                         gipc_liquid::checked_cells(sp.domain_lo.z(), sp.domain_hi.z(), sp.dx));
+    P.rho    = sp.rho;
+    P.kappa  = sp.kappa;
+    if(!(sp.model == 0 || sp.model == 1)) throw std::invalid_argument("[liquid] model must be 0 (water) or 1 (elastic solid)");
+    P.model   = sp.model;
+    P.young   = sp.young;
+    P.poisson = sp.poisson;
+    P.pl_stretch  = sp.plastic_stretch;
+    P.pl_compress = sp.plastic_compress;
+    P.pl_yield    = sp.plastic_yield;
+    P.pl_damage   = sp.plastic_damage;
+    P.pl_dmg_res  = sp.plastic_damage_residual;
+    P.pl_dmg_eps  = sp.plastic_damage_strain;
+    P.apic   = sp.apic ? 1 : 0;
+    P.apic_ratio = sp.apic_ratio;
+    P.mass_floor = sp.mass_floor;
+    P.push_apart = sp.push_apart;
+    P.j_mode     = sp.j_mode;
+    P.stick_h    = sp.stick_h;
+    // particles may sink below the lattice floor but never below the ground plane (+y normal)
+    P.clamp_lo_y = (cfg.ground_normal.y() > 0.99) ? cfg.ground_offset + 1e-4 : -1e300;
+    P.park   = make_double3(P.origin.x + (P.dims.x + 1) * P.dx, P.origin.y + (P.dims.y + 1) * P.dx, P.origin.z + (P.dims.z + 1) * P.dx);
+    if(liquid_cutter >= 0)
+    {   // damage gate: only the particles the cutter body touches may break (set_liquid_cutter)
+        const auto& r = load_records[liquid_cutter];
+        P.cut_v0 = r.vertex_offset;
+        P.cut_v1 = r.vertex_offset + r.vertex_count;
+    }
+    double pv = sp.particle_volume > 0.0 ? sp.particle_volume : sp.dx * sp.dx * sp.dx / 8.0;
+    liquid->configure(P, liquid_seed, pv);
+    int seed_nodes = liquid->estimate_seed_nodes();
+    // the pool is fixed at finalize (node slots are FEM vertices); a pour spreads the water
+    // over several cavities + splashes (lab run: 4913 active nodes from 1219 seed nodes) -> be generous
+    int pool       = static_cast<int>(std::min<long long>(liquid->n_nodes,
+                         sp.node_pool > 0 ? sp.node_pool : std::max(8192LL, 12LL * seed_nodes)));
+    gipc_liquid::liquid_require(pool >= seed_nodes, "node_pool is smaller than the initial active node count");
+    liquid->P.node_pool = pool;
+    liquid->max_voxels  = liquid->P.cpic ? 2 * pool : pool;  // #active cells <= #active nodes (each cell owns its min corner); 2b: up to 2 elements per cut cell
+
+    // node pool body: parked, Fixed (btype 1) until activated each step
+    std::vector<double3> park(pool, P.park);
+    std::vector<double>  mnode(pool, P.rho * P.dx * P.dx * P.dx);
+    liquid->node_slot_base = tetMesh.vertexNum;
+    liquid->body_id_nodes  = tetMesh.load_points_body(park, mnode, 1, BodyBoundaryType::Free);
+    record_load(1, liquid->node_slot_base);
+    // particle body: btype 2 (rows dropped), masses physical
+    std::vector<double> mp(liquid_seed.size(), P.rho * pv);
+    liquid->particle_slot_base = tetMesh.vertexNum;
+    liquid->body_id_particles  = tetMesh.load_points_body(liquid_seed, mp, LIQUID_PARTICLE_BTYPE, BodyBoundaryType::Free);
+    record_load(1, liquid->particle_slot_base);
+    if(P.model == 1 && P.sticky_ground)   // elastic solid: the ground acts on the grid (sticky node layer), not through the particle proxies
+        tetMesh.ground_collision_skip_body_ids.push_back(liquid->body_id_particles);
+    // water is inviscid (spec.mu 0): no friction against solids; a model-1 solid takes spec.mu (without it a body
+    // resting on a board slides off at the first push and a knife's pull cut shears nothing)
+    pending_body_mu[(int)load_records.size() - 1] = {sp.mu, sp.ground_mu};
+
+    // grid nodes never collide (they are virtual); particles collide with every
+    // solid body (IPC barrier, chain-ruled onto the nodes) but not with the nodes.
+    const int nb = (int)tetMesh.abd_fem_count_info.total_body_num();
+    for(int b = 0; b < nb; ++b)
+        if(b != liquid->body_id_nodes) tetMesh.collision_exclusion_pairs.emplace_back(liquid->body_id_nodes, b);
+    ipc.m_liquid = liquid.get();
+    if(ipc.pcg_data.P_type != 0)
+        throw std::runtime_error("[liquid] requires preconditioner_type=0 (MAS reorders FEM vertices)");
+    if(::g_gipc_log_level >= 0)
+        printf("[liquid] %zu particles, grid %dx%dx%d cells (dx %.4f), node pool %d (seed nodes %d), bodies nodes=%d particles=%d, vertex slots [%d,%d)\n",
+               liquid_seed.size(), P.dims.x, P.dims.y, P.dims.z, P.dx, pool, seed_nodes, liquid->body_id_nodes,
+               liquid->body_id_particles, liquid->node_slot_base, tetMesh.vertexNum);
+}
+
+void SimEngine::Impl::liquid_prepare_host()
+{
+    auto& L = *liquid;
+    // particles are collision points (ground + every solid surface); they have
+    // no faces so getSurface() did not list them. Grid nodes stay virtual.
+    for(int p = 0; p < L.n_particles; ++p) tetMesh.surfVerts.push_back((uint32_t)(L.particle_slot_base + p));
+    // keep the solid scene's kappa scale: meanMass/meanVolum over non-liquid vertices only
+    const int n_liq = L.P.node_pool + L.n_particles;
+    const int n_sol = tetMesh.vertexNum - n_liq;
+    if(n_sol > 0)
+    {
+        double ms = 0.0;
+        for(int v = 0; v < L.node_slot_base; ++v) ms += tetMesh.masses[v];
+        tetMesh.meanMass  = ms / n_sol;
+        tetMesh.meanVolum = tetMesh.meanVolum * (double)tetMesh.vertexNum / (double)n_sol;
+    }
+}
+
+void SimEngine::Impl::liquid_alloc_device()
+{
+    liquid->P.dhat = std::sqrt(std::max(0.0, ipc.dHat));  // GIPC::init set dHat (squared distance)
+    liquid->alloc_device();
+}
+
+void SimEngine::set_liquid_pump(const double* a, const double* b, double radius, double accel, double conveyor, double follow, double track,
+                                double bore_radius)
+{
+    if(!m_impl->liquid) return;
+    using namespace gipc_liquid;
+    liquid_require(a && b, "pump endpoints must not be null");
+    for(int i = 0; i < 3; ++i)
+        liquid_require(std::isfinite(a[i]) && std::isfinite(b[i]), "pump endpoints must be finite");
+    liquid_require(finite_nonnegative(radius) && std::isfinite(accel) && std::isfinite(conveyor)
+                       && std::isfinite(bore_radius), "invalid pump radius, acceleration or conveyor speed");
+    liquid_require(std::isfinite(follow) && follow >= 0 && follow <= 1
+                       && std::isfinite(track) && track >= 0 && track <= 1, "pump follow and track must be in [0, 1]");
+    m_impl->liquid->set_pump(make_double3(a[0], a[1], a[2]), make_double3(b[0], b[1], b[2]), radius, accel, conveyor, follow, track, bore_radius);
+}
+
+void SimEngine::set_fem_plasticity(int fem_body_idx, double yield_stress, double hardening)
+{
+    if(!m_impl->finalized) throw std::runtime_error("set_fem_plasticity: call after finalize()");
+    if(fem_body_idx < 0 || fem_body_idx >= static_cast<int>(m_impl->fem_body_ranges.size()))
+        throw std::invalid_argument("set_fem_plasticity: FEM body index out of range");
+    if(!(std::isfinite(yield_stress) && yield_stress >= 0.0 && std::isfinite(hardening) && hardening >= 0.0))
+        throw std::invalid_argument("set_fem_plasticity: yield stress and hardening must be finite and >= 0");
+    const int body = static_cast<int>(m_impl->tetMesh.abd_fem_count_info.abd_body_num) + fem_body_idx;
+    const int nt   = static_cast<int>(m_impl->ipc.tetrahedraNum);
+    std::vector<int> tb(std::max(nt, 1));
+    if(nt > 0) CUDA_SAFE_CALL(cudaMemcpy(tb.data(), m_impl->d_tetMesh.tet_id_to_body_id, nt * sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<double3> pp(std::max(nt, 1));
+    CUDA_SAFE_CALL(cudaMemcpy(pp.data(), m_impl->d_tetMesh.tet_plastic, std::max(nt, 1) * sizeof(double3), cudaMemcpyDeviceToHost));
+    int count = 0;
+    for(int i = 0; i < nt; ++i)
+        if(tb[i] == body) { pp[i] = make_double3(yield_stress, hardening, 0.0); ++count; }
+    if(count == 0) throw std::invalid_argument("set_fem_plasticity: the body has no tetrahedra (needs a 3D FEM body)");
+    CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.tet_plastic, pp.data(), std::max(nt, 1) * sizeof(double3), cudaMemcpyHostToDevice));
+    m_impl->ipc.tetPlastic = yield_stress > 0.0 || m_impl->ipc.tetPlastic;
+    printf("[fem] plasticity on FEM body %d (collision body %d): %d tets, yield %.0f Pa, hardening %.0f Pa (Hencky J2, rest-shape update)\n",
+           fem_body_idx, body, count, yield_stress, hardening);
+}
+
+double SimEngine::mean_plastic_strain(int fem_body_idx) const
+{
+    if(!m_impl->finalized || fem_body_idx < 0 || fem_body_idx >= static_cast<int>(m_impl->fem_body_ranges.size())) return 0.0;
+    const int body = static_cast<int>(m_impl->tetMesh.abd_fem_count_info.abd_body_num) + fem_body_idx;
+    const int nt   = static_cast<int>(m_impl->ipc.tetrahedraNum);
+    if(nt == 0) return 0.0;
+    std::vector<int> tb(nt); std::vector<double3> pp(nt);
+    CUDA_SAFE_CALL(cudaMemcpy(tb.data(), m_impl->d_tetMesh.tet_id_to_body_id, nt * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(pp.data(), m_impl->d_tetMesh.tet_plastic, nt * sizeof(double3), cudaMemcpyDeviceToHost));
+    double sum = 0.0; int count = 0;
+    for(int i = 0; i < nt; ++i) if(tb[i] == body) { sum += pp[i].z; ++count; }
+    return count ? sum / count : 0.0;
+}
+
+void SimEngine::set_liquid_porous(int fem_body_idx, double drag, double porosity, double suction)
+{
+    if(!m_impl->liquid) return;
+    using namespace gipc_liquid;
+    auto& liquid = *m_impl->liquid;
+    liquid_require(m_impl->finalized && liquid.body_id_particles >= 0, "set_liquid_porous: call after finalize()");
+    liquid_require(fem_body_idx >= 0 && fem_body_idx < static_cast<int>(m_impl->fem_body_ranges.size()), "set_liquid_porous: FEM body index out of range");
+    liquid_require(finite_nonnegative(drag) && std::isfinite(porosity) && porosity > 0.0 && porosity <= 1.0 && finite_nonnegative(suction),
+                   "set_liquid_porous: invalid drag / porosity / suction");
+    const int body = static_cast<int>(m_impl->tetMesh.abd_fem_count_info.abd_body_num) + fem_body_idx;   // global collision body id
+    const int nt   = static_cast<int>(m_impl->ipc.tetrahedraNum);
+    std::vector<int> tb(std::max(nt, 1));
+    if(nt > 0) CUDA_SAFE_CALL(cudaMemcpy(tb.data(), m_impl->d_tetMesh.tet_id_to_body_id, nt * sizeof(int), cudaMemcpyDeviceToHost));
+    int t0 = -1, t1 = -1;
+    for(int i = 0; i < nt; ++i)
+        if(tb[i] == body) { if(t0 < 0) t0 = i; t1 = i + 1; }
+    liquid_require(t0 >= 0, "set_liquid_porous: the body has no tetrahedra (needs a 3D FEM body)");
+    for(int i = t0; i < t1; ++i) liquid_require(tb[i] == body, "set_liquid_porous: the body's tetrahedra are not contiguous");
+    // the water passes through the sponge surface: no particle <-> body contact (device skip matrix, read by the BVH queries)
+    const int N = m_impl->d_tetMesh.collision_body_num, pb = liquid.body_id_particles, one = 1;
+    liquid_require(body < N && pb < N && m_impl->d_tetMesh.collision_skip_matrix, "set_liquid_porous: collision skip matrix missing");
+    CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.collision_skip_matrix + (size_t)body * N + pb, &one, sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(m_impl->d_tetMesh.collision_skip_matrix + (size_t)pb * N + body, &one, sizeof(int), cudaMemcpyHostToDevice));
+    const auto& vr = m_impl->fem_body_ranges[fem_body_idx];
+    liquid.set_porous(body, t0, t1, vr.vertex_start, vr.vertex_count, drag, porosity, suction);
+    printf("[liquid] porous body %d (FEM %d): tets [%d, %d), drag %.0f /s, porosity %.2f, suction %.2f; particle<->body contact off\n",
+           body, fem_body_idx, t0, t1, drag, porosity, suction);
+}
+
+int SimEngine::count_liquid_in_porous() const
+{
+    return m_impl->liquid ? m_impl->liquid->h_porous_inside : 0;
+}
+
+double SimEngine::get_liquid_porous_saturation() const
+{
+    return m_impl->liquid ? m_impl->liquid->h_porous_sat : 0.0;
+}
+
+void SimEngine::set_liquid_containers(int n, const int* body, const double* Rd, const double* td, const int* nprof,
+                                      const double* py, const double* pr, const double* y_top, const double* band,
+                                      const int* slip, double wall_mass, int ground_bc)
+{
+    auto& impl = *m_impl;
+    if(!impl.liquid) return;
+    if(!impl.ipc.m_abd_sim_data) throw std::runtime_error("[liquid] wall BC needs the ABD system (call after finalize)");
+    using namespace gipc_liquid;
+    liquid_require(n >= 0 && n <= LIQ_MAX_CONT, "invalid number of liquid containers");
+    liquid_require(n == 0 || (body && Rd && td && nprof && py && pr && y_top && band && slip),
+                   "container arrays must not be null");
+    liquid_require(finite_nonnegative(wall_mass), "wall_mass must be finite and nonnegative");
+    const double new_mass = liquid_env("LIQ_WALL_MASS", wall_mass > 0 ? wall_mass : impl.liquid->P.wall_mass);
+    const int new_ground = liquid_env("LIQ_GROUND_BC", ground_bc);
+    const int new_wall = liquid_env("LIQ_WALL_BC", 1);
+    liquid_require(finite_positive(new_mass) && (new_ground == 0 || new_ground == 1)
+                       && (new_wall == 0 || new_wall == 1), "invalid wall mass or boundary-condition switch");
+    const auto abd_count = impl.ipc.m_abd_sim_data->device.body_id_to_q.size();
+    std::vector<gipc_liquid::LiquidContainer> c(n);
+    for(int k = 0; k < n; ++k)
+    {
+        liquid_require(body[k] >= 0 && static_cast<size_t>(body[k]) < abd_count, "container ABD body index out of range");
+        liquid_require(nprof[k] >= 1 && nprof[k] <= LIQ_PROF_N, "container profile needs 1..32 samples");
+        for(int r = 0; r < 9; ++r) liquid_require(std::isfinite(Rd[9 * k + r]), "container transform must be finite");
+        for(int r = 0; r < 3; ++r) liquid_require(std::isfinite(td[3 * k + r]), "container translation must be finite");
+        for(int r = 0; r < nprof[k]; ++r)
+        {
+            const int i = LIQ_PROF_N * k + r;
+            liquid_require(std::isfinite(py[i]) && finite_nonnegative(pr[i]), "invalid container profile height or radius");
+            liquid_require(r == 0 || py[i] > py[i - 1], "container profile heights must be strictly increasing");
+        }
+        liquid_require(std::isfinite(y_top[k]) && finite_nonnegative(band[k]) && (slip[k] == 0 || slip[k] == 1),
+                       "invalid container top, shell band or slip switch");
+        auto& C = c[k];
+        C.body  = body[k];
+        for(int r = 0; r < 9; ++r) C.Rd[r] = Rd[9 * k + r];
+        for(int r = 0; r < 3; ++r) C.td[r] = td[3 * k + r];
+        C.n     = nprof[k];
+        for(int r = 0; r < LIQ_PROF_N; ++r) { C.py[r] = py[LIQ_PROF_N * k + r]; C.pr[r] = pr[LIQ_PROF_N * k + r]; }
+        C.y_top = y_top[k];
+        C.band  = band[k];
+        C.slip  = slip[k];
+    }
+    impl.liquid->P.wall_mass = new_mass;
+    impl.liquid->P.ground_bc = new_ground;
+    impl.liquid->set_containers(c, reinterpret_cast<const double*>(impl.ipc.m_abd_sim_data->device.body_id_to_q.data()),
+                                reinterpret_cast<const double*>(impl.ipc.m_abd_sim_data->device.body_id_to_q_v.data()));
+}
+
+int SimEngine::count_liquid_in_pump() const
+{
+    if(!m_impl->liquid || m_impl->liquid->pump_r <= 0.0) return 0;
+    return m_impl->liquid->count_in_pump();
+}
+
+int SimEngine::get_liquid_particle_count() const
+{
+    return m_impl->liquid ? m_impl->liquid->n_particles : 0;
+}
+void SimEngine::set_liquid_pump_chamber(const double* a, const double* b, double radius, double V_cav, double p0, double bore_radius)
+{
+    if(!m_impl->liquid) return;
+    m_impl->liquid->set_pump_chamber(make_double3(a[0], a[1], a[2]), make_double3(b[0], b[1], b[2]), radius, V_cav, p0, bore_radius);
+}
+void SimEngine::get_liquid_pump_state(double* out6) const
+{
+    for(int i = 0; i < 6; ++i) out6[i] = m_impl->liquid ? m_impl->liquid->h_pump_state[i] : 0.0;
+}
+void SimEngine::get_liquid_ghost_reaction(double* out3)
+{
+    out3[0] = out3[1] = out3[2] = 0.0;
+    if(m_impl->liquid) m_impl->liquid->get_ghost_reaction(m_impl->d_tetMesh.vertexes, out3);
+}
+int SimEngine::get_liquid_wall_forces(double* out3, int n) const
+{
+    if(!m_impl->liquid) { if(n > 0) std::fill(out3, out3 + 3 * (size_t)n, 0.0); return 0; }
+    return m_impl->liquid->get_wall_forces(out3, n, m_impl->ipc.IPC_dt);
+}
+
+void SimEngine::get_liquid_particles(double* out) const
+{
+    if(m_impl->liquid) m_impl->liquid->get_particles(out);
+}
+void SimEngine::get_liquid_velocities(double* out) const
+{
+    if(m_impl->liquid) m_impl->liquid->get_particle_velocities(out);
+}
+void SimEngine::get_liquid_J(double* out) const
+{
+    if(m_impl->liquid) m_impl->liquid->get_particle_J(out);
+}
+void SimEngine::get_liquid_damage(int* out) const
+{
+    if(m_impl->liquid) m_impl->liquid->get_particle_damage(out);
+}
+void SimEngine::set_liquid_particle_material(const double* young_scale, const double* damage_scale, int n)
+{
+    if(!m_impl->liquid) throw std::runtime_error("set_liquid_particle_material: no liquid (call after finalize())");
+    m_impl->liquid->set_particle_material(young_scale, damage_scale, n);
+}
+void SimEngine::set_liquid_cutter(int body_offset)
+{
+    if(body_offset < 0 || body_offset >= (int)m_impl->load_records.size())
+        throw std::runtime_error("set_liquid_cutter: invalid body_offset " + std::to_string(body_offset));
+    m_impl->liquid_cutter = body_offset;
+}
+void SimEngine::set_liquid_cut_plane(const double* M12, double zm, double s0, double ds, const double* edge, int K, double lead, double band)
+{
+    if(!m_impl->liquid || !m_impl->finalized) throw std::runtime_error("set_liquid_cut_plane: call after finalize() on a scene with an MPM solid");
+    m_impl->liquid->set_cut_plane(M12, zm, s0, ds, edge, K, lead, band);
+}
+void SimEngine::set_liquid_pieces(const int* ids, int n, double contact_spacings)
+{
+    if(!m_impl->liquid || !m_impl->finalized) throw std::runtime_error("set_liquid_pieces: call after finalize() on a scene with an MPM solid");
+    m_impl->liquid->set_pieces(ids, n, contact_spacings);
+}
+int SimEngine::get_liquid_cut_masked() const
+{
+    return m_impl->liquid ? m_impl->liquid->h_cut_masked : 0;
+}
+void SimEngine::get_liquid_plastic_strain(double* out) const
+{
+    if(m_impl->liquid) m_impl->liquid->get_particle_plastic_strain(out);
+}
+void SimEngine::get_liquid_stats(int* out) const
+{
+    for(int i = 0; i < 19; ++i) out[i] = 0;
+    if(!m_impl->liquid) return;
+    auto& L = *m_impl->liquid;
+    for(int i = 0; i < 12; ++i) out[7 + i] = L.h_fallback[i];
+    out[0] = L.h_active_cells;
+    out[1] = L.h_active_nodes;
+    out[2] = L.P.node_pool;
+    out[3] = L.node_slot_base;
+    out[4] = L.particle_slot_base;
+    out[5] = L.body_id_nodes;
+    out[6] = L.body_id_particles;
+}
+
 int SimEngine::get_vertex_count() const
 {
     return m_impl->ipc.vertexNum;
@@ -2947,7 +3408,71 @@ double SimEngine::get_prismatic_drive_force(int idx) const
     Vector3 Cq = worldpt(qc, drv.Cq_bar);
     Vector3 t  = Ac * drv.tq_bar;
     double  d  = (Cq - Cp).dot(t);
-    return static_cast<double>(drv.stiffness) * (static_cast<double>(drv.target_distance) - d);
+    // [force-control][FIX] Joint driving energies are assembled into the
+    // incremental potential WITHOUT a dt^2 factor (they act as stiff penalties
+    // next to the kinetic term; see setup_abd_system_gradient_and_hessian.cu),
+    // so the PHYSICAL spring force is K*(target-d)/dt^2. The raw K*(target-d)
+    // under-reported by exactly 1/dt^2 — measured 0.005 N reported while the
+    // pads statically carried 186 N (K=33 N-per-metre-of-lag, lag 0.141 mm,
+    // dt 5 ms: 33*1.413e-4/2.5e-5 = 186.6 N).
+    double dt = static_cast<double>(impl.ipc.IPC_dt);
+    return static_cast<double>(drv.stiffness)
+           * (static_cast<double>(drv.target_distance) - d) / (dt * dt);
+}
+
+double SimEngine::get_revolute_drive_torque(int idx) const
+{
+    // [force-control] Current revolute DRIVING torque in N*m: K*wrap(target -
+    // theta)/dt^2, the rotational twin of get_prismatic_drive_force (same
+    // no-dt^2 assembly convention, same 1/dt^2 physical conversion). Added so
+    // the torque readback cannot be re-derived with the raw-K mistake.
+    auto& impl = *m_impl;
+    if(!impl.ipc.m_abd_system || !impl.ipc.m_abd_sim_data)
+        return 0.0;
+    auto& sys = *impl.ipc.m_abd_system;
+    if(idx < 0 || idx >= sys.m_num_revolute_driving)
+        return 0.0;
+
+    RevoluteDrivingGPUData drv;
+    CUDA_SAFE_CALL(cudaMemcpy(&drv, sys.m_revolute_driving_data.data() + idx,
+                              sizeof(RevoluteDrivingGPUData), cudaMemcpyDeviceToHost));
+
+    using Vec12 = Eigen::Matrix<double, 12, 1>;
+    auto& q_buf = impl.ipc.m_abd_sim_data->device.body_id_to_q;
+    Vec12 q1, q2;
+    CUDA_SAFE_CALL(cudaMemcpy(&q1, q_buf.data() + drv.parent_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(&q2, q_buf.data() + drv.child_body_id,
+                              sizeof(Vec12), cudaMemcpyDeviceToHost));
+
+    Eigen::Matrix3d A1, A2;
+    A1.row(0) = q1.segment<3>(3).transpose();
+    A1.row(1) = q1.segment<3>(6).transpose();
+    A1.row(2) = q1.segment<3>(9).transpose();
+    A2.row(0) = q2.segment<3>(3).transpose();
+    A2.row(1) = q2.segment<3>(6).transpose();
+    A2.row(2) = q2.segment<3>(9).transpose();
+
+    Eigen::Vector3d p  = A1 * drv.p_bar;
+    Eigen::Vector3d pN = A1 * drv.pN_bar;
+    Eigen::Vector3d qd = A2 * drv.q_bar;
+    Eigen::Vector3d qN = A2 * drv.qN_bar;
+    double cos_t = 0.5 * (p.dot(qd) + pN.dot(qN));
+    double sin_t = 0.5 * (qd.dot(pN) - qN.dot(p));
+    double theta = std::atan2(sin_t, cos_t);
+
+    // EXACT derivative of the driving energy E = 0.5*K*(sin^2 d + b*(1-cos d)^2)
+    // (abd_driving_joint.h, beta = 0.02), d = theta - target:
+    //   tau = dE/dd / dt^2 = K * sin(d) * (cos(d) + b*(1-cos(d))) / dt^2.
+    // Sign: positive torque drives theta toward the target. Note drv.target_angle
+    // is the GPU's rate-limited target (max_revolute_step_per_frame), i.e. the
+    // spring setpoint actually in force this frame — the right one to read.
+    constexpr double beta = 0.02;
+    double d   = theta - static_cast<double>(drv.target_angle);
+    d          = std::atan2(std::sin(d), std::cos(d));      // wrap to (-pi, pi]
+    double dt  = static_cast<double>(impl.ipc.IPC_dt);
+    double dEdd = std::sin(d) * (std::cos(d) + beta * (1.0 - std::cos(d)));
+    return -static_cast<double>(drv.stiffness) * dEdd / (dt * dt);
 }
 
 void SimEngine::get_vertex_contact_force_sum(int vert_offset, int vert_count,
@@ -3505,6 +4030,22 @@ int SimEngine::get_vertex_contact_forces(double* out3, int n, bool include_groun
     const double neg_inv_dt2 = -1.0 / (g.IPC_dt * g.IPC_dt);
     for(int i = 0; i < nw * 3; ++i)
         out3[i] *= neg_inv_dt2;
+    // [MAS-perm] the buffers are in engine (metis) order; return input order like get_vertices (out[perm[i]] = engine[i]).
+    // Before this fix every caller with preconditioner_type != 0 read other vertices' forces.
+    const auto& perm = m_impl->tetMesh.vertex_metis_to_input;
+    if(!perm.empty() && (int)perm.size() >= nw)
+    {
+        static std::vector<double> s_h_perm;
+        s_h_perm.assign(out3, out3 + (size_t)nw * 3);
+        for(int i = 0; i < nw; ++i)
+        {
+            int j = perm[i];
+            if(j < 0 || j >= nw) j = i;
+            out3[3 * j + 0] = s_h_perm[3 * i + 0];
+            out3[3 * j + 1] = s_h_perm[3 * i + 1];
+            out3[3 * j + 2] = s_h_perm[3 * i + 2];
+        }
+    }
     return nw;
 }
 
@@ -3640,6 +4181,30 @@ void SimEngine::reset_transient_contact_state()
     g.clearFrictionAnchors();
 }
 
+
+int SimEngine::get_vertex_metis_to_input(int* out, int n) const
+{
+    const auto& impl = *m_impl;
+    const int   nv   = static_cast<int>(impl.ipc.vertexNum);
+    const int   nw   = std::min(n, nv);
+    if(nw <= 0)
+        return 0;
+
+    const auto& perm = impl.tetMesh.vertex_metis_to_input;
+    if(perm.empty())
+    {
+        // No MAS reorder in this scene: hand back the identity so callers do
+        // not need a separate code path.
+        for(int i = 0; i < nw; i++)
+            out[i] = i;
+        return nw;
+    }
+
+    const int np = static_cast<int>(perm.size());
+    for(int i = 0; i < nw; i++)
+        out[i] = (i < np) ? perm[i] : i;
+    return nw;
+}
 
 int SimEngine::get_fem_von_mises_stress(double* out, int n)
 {
@@ -3854,10 +4419,44 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     std::filesystem::create_directories(tmp_dir);
     std::string tmp_path;
 
+    // [cache-key] The temp file's basename becomes the METIS cache key
+    // (<assets>/sorted_mesh/<basename>_sorted.16.msh, written by metis_sort).
+    // Naming it by load-record index alone made the key collide across scenes:
+    // two scenes loading DIFFERENT geometry at the same body index silently
+    // reused each other's sorted mesh, so a body came back with stale
+    // coordinates (announced only by "metis files exist (validated: N verts)").
+    // Mix a content hash of the vertex/face payload into the name: distinct
+    // geometry now gets a distinct cache entry, identical geometry still hits
+    // the cache (which is the point of having it).
+    auto content_tag = [&]() {
+        uint64_t h = 1469598103934665603ull;  // FNV-1a 64
+        auto mix   = [&h](const void* p, size_t nbytes) {
+            const unsigned char* b = static_cast<const unsigned char*>(p);
+            for(size_t i = 0; i < nbytes; i++)
+            {
+                h ^= b[i];
+                h *= 1099511628211ull;
+            }
+        };
+        mix(vertices, static_cast<size_t>(num_verts) * 3 * sizeof(double));
+        mix(faces, static_cast<size_t>(num_faces) * verts_per_face * sizeof(int));
+        const int meta[4] = {num_verts, num_faces, verts_per_face, dimensions};
+        mix(meta, sizeof(meta));
+        char buf[17];
+        snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+        return std::string(buf);
+    }();
+    const std::string tmp_stem =
+        "tmp_mesh_" + std::to_string(m_impl->load_records.size()) + "_" + content_tag;
+
     if(dimensions == 2 || verts_per_face == 3)
     {
-        tmp_path = tmp_dir + "tmp_mesh_" + std::to_string(m_impl->load_records.size()) + ".obj";
+        tmp_path = tmp_dir + tmp_stem + ".obj";
         std::ofstream ofs(tmp_path);
+        // [precision] Default ostream formatting keeps 6 significant digits,
+        // which quantised in-memory geometry to ~5e-8 m on a 40 mm part before
+        // it ever reached the solver. Round-trip losslessly instead.
+        ofs << std::setprecision(17);
         for(int i = 0; i < num_verts; i++)
             ofs << "v " << vertices[i * 3] << " " << vertices[i * 3 + 1] << " " << vertices[i * 3 + 2] << "\n";
         for(int i = 0; i < num_faces; i++)
@@ -3872,8 +4471,9 @@ void SimEngine::load_mesh_from_data(const double*          vertices,
     else
     {
         // For pre-tetrahedralized data (verts_per_face == 4), write as .msh
-        tmp_path = tmp_dir + "tmp_mesh_" + std::to_string(m_impl->load_records.size()) + ".msh";
+        tmp_path = tmp_dir + tmp_stem + ".msh";
         std::ofstream ofs(tmp_path);
+        ofs << std::setprecision(17);
         ofs << "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n";
         ofs << "$Nodes\n" << num_verts << "\n";
         for(int i = 0; i < num_verts; i++)

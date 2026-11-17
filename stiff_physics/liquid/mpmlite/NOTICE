@@ -1,0 +1,9 @@
+This directory vendors the reference implementation of
+"MPM Lite: Linear Kernels and Integration Without Particles"
+(Feng, Chen, Yu, Su, Terzopoulos, Yang, Masterjohn, Castro, Jiang; ACM TOG 45(4), 2026),
+https://github.com/f1shel/mpm-lite, commit 3c0d06f (2026-07-01), Apache License 2.0.
+
+Local modifications (StiffGIPC liquid integration, 2026-10):
+  - package-relative imports; icecream / pyvista / vispy dependencies removed
+  - separable (non-sticky) boundary type 3 added in boundary_utils.py
+  - see git history of stiff_physics/liquid/ for details

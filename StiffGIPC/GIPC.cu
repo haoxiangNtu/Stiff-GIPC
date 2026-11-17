@@ -7,6 +7,7 @@
 //
 
 #include "GIPC.cuh"
+#include "mpm/liquid_system.cuh"
 #include "eigen_data.h"  // Vector12 for stitch local-frame fix
 #include <stdexcept>     // [d-floor fail-fast] ground-distance collapse -> throw
 #include <string>
@@ -1390,6 +1391,17 @@ __device__ double __cal_Friction_energy(const double3*         _vertexes,
 //   PT/PE/PP (x<0, enc.):  point -x-1 vs prim  -> reps -x-1 and y (decoded)
 // Combine = geometric mean (PhysX-style multiplicative feel; symmetric).
 // vmu == nullptr -> feature off, return the scalar fallback (legacy path).
+// [per-body friction] weight of the friction energy slots. The friction gradient and Hessian read the per-vertex mu
+// tables directly whenever they exist, so the energy has to as well: with a zero global rate (water's ground_mu 0.3 in
+// a scene whose Config has no friction) the weight 0 dropped the energy but kept the force, which left a gradient with
+// no energy behind it -- Newton directions that are not descent directions and line searches that stall at the cap.
+static bool g_liq_fd_after_exhaust = false;   // LIQ_FD_ON_EXHAUST: probe the iteration after a line-search exhaustion
+static inline double fric_energy_rate(double global_rate, const double* vert_mu)
+{
+    if(getenv("STIFF_SKIP_FRIC")) return 0.0;   // that switch drops the friction gradient / Hessian: drop the energy with them
+    return (vert_mu && !(global_rate > 0.0)) ? 1.0 : global_rate;
+}
+
 __device__ __forceinline__ double _pair_mu(const int4 v, const double* vmu, double fallback)
 {
     if(!vmu)
@@ -7257,7 +7269,7 @@ __global__ void _getFrictionEnergy_Reduction_3D(double*        squeue,
     // here so the product lands on mu_pair exactly — zero changes to the four
     // combine paths, and the per-env slots below get the same scaling.
         if(vert_mu)
-            temp *= _pair_mu(_collisionPair[idx], vert_mu, mu_global) / mu_global;
+            temp = (mu_global > 0.0) ? temp * _pair_mu(_collisionPair[idx], vert_mu, mu_global) / mu_global : 0.0;  // [liquid] 0/0 guard
 
         int v0 = _collisionPair[idx].x;
         if(v0 < 0) v0 = -v0 - 1;
@@ -7332,8 +7344,8 @@ __global__ void _getFrictionEnergy_gd_Reduction_3D(double*        squeue,
             g_fric_anchor_gd_d ? g_fric_anchor_gd_d[idx] : make_double3(0., 0., 0.));
     // [per-body friction] see _getFrictionEnergy_Reduction_3D: host combine
     // multiplies the GLOBAL gd mu; scale per-vertex here so the product is exact.
-        if(vert_mu_gd)
-            temp *= vert_mu_gd[_collisionPair_gd[idx]] / mu_global;
+        if(vert_mu_gd)  // [liquid] guard: a zero global rate with per-vertex mu gave 0/0 = NaN
+            temp = (mu_global > 0.0) ? temp * vert_mu_gd[_collisionPair_gd[idx]] / mu_global : 0.0;
 
         _penv_energy_accum(penv, p2g, _collisionPair_gd[idx], ng, temp);
     }
@@ -8012,6 +8024,7 @@ __global__ void _getBendingEnergy_Reduction(double*        squeue,
                                             const uint2*   edge_adj_vertex,
                                             int            edgesNum,
                                             double         bendStiff,
+                                            const double*  theta_p,
                                             double* penv = nullptr, const int* p2g = nullptr, int ng = 0)
 {
     int idof = blockIdx.x * blockDim.x;
@@ -8026,7 +8039,7 @@ __global__ void _getBendingEnergy_Reduction(double*        squeue,
         double3 rest_x0 = rest_vertexex[edges[idx].x];
         double3 rest_x1 = rest_vertexex[edges[idx].y];
         double  length  = __GEIGEN__::__norm(__GEIGEN__::__minus(rest_x0, rest_x1));
-        temp = __cal_bending_energy(vertexes, rest_vertexex, edges[idx], adj, length, bendStiff);
+        temp = __cal_bending_energy(vertexes, rest_vertexex, edges[idx], adj, length, bendStiff, theta_p ? theta_p[idx] : 0.0);
         _penv_energy_accum(penv, p2g, edges[idx].x, ng, temp);
     }
     //double temp = 0;
@@ -9324,6 +9337,9 @@ void GIPC::MALLOC_DEVICE_MEM()
 {
     // +1 trash slot: pair-emit overflow is redirected to index==cap (see _emit_slot
     // in mlbvh.cu) so detection never writes out of bounds; the host then grows.
+    // [liquid] many collision points with few edges made the CCD mirror smaller than the
+    // DCD cap (mirror writes past the allocation): keep the init invariant dcd <= ccd.
+    if(MAX_CCD_COLLITION_PAIRS_NUM < MAX_COLLITION_PAIRS_NUM) MAX_CCD_COLLITION_PAIRS_NUM = MAX_COLLITION_PAIRS_NUM;
     CUDA_SAFE_CALL(cudaMalloc((void**)&_MatIndex, ((size_t)MAX_COLLITION_PAIRS_NUM + 1) * sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&_collisonPairs,
                               ((size_t)MAX_COLLITION_PAIRS_NUM + 1) * sizeof(int4)));
@@ -9529,6 +9545,14 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
         + static_cast<long long>(m_abd_system->m_num_prismatic) * 16
         + static_cast<long long>(m_abd_system->m_num_prismatic_driving) * 16
         + static_cast<long long>(softNum) * 4;
+    // [liquid] every active voxel writes 36 upper 3x3 blocks (8-node element). Those are
+    // node-node blocks of an unpinned point body, so they never feed the pinned-vertex
+    // chain-rule expansion (16 blocks per pinned-touching FEM block) that the x margin
+    // below provisions for. Reserve them once, AFTER the margin: inside it they inflated
+    // the buffer by 31 x 36 x max_voxels slots (5-10 GB at pool 60k-90k), all of which
+    // the per-Newton memset cleared every iteration.
+    const long long unsigned liquid_triplet_num =
+        m_liquid ? 37ull * static_cast<long long unsigned>(m_liquid->max_voxels) : 0ull;  // 36 per voxel + 1 wall-BC diagonal block per node slot
     long long unsigned total_max_collision_triplet_num =
         minCollisionBuffer4 * 16 + minCollisionBuffer3 * 9
         + minCollisionBuffer2 * 4 + minCollisionBuffer1;
@@ -9541,15 +9565,16 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
     long long unsigned total_max_global_triplet_num =
         total_internal_triplet_num
             * static_cast<long long unsigned>(m_triplet_internal_margin)
+        + liquid_triplet_num
         + total_max_collision_triplet_num;
     // [P1-dyn] Non-hybrid scenes (margin forced to 1 by sim_engine when n_fem_pins==0)
     // size the triplet buffer per-step from ACTUAL contact counts instead of the
     // worst-case 2*(surf+edge)*29 (cp-stats: <1% used). Allocate a small initial buffer;
     // computeGradientAndHessian() grows it to 2*length each step (2x = converter's
     // documented [length:2*length) scratch region). Hybrid keeps the worst-case alloc.
-    m_fixed_triplet_base = static_cast<long long>(total_internal_triplet_num);
+    m_fixed_triplet_base = static_cast<long long>(total_internal_triplet_num + liquid_triplet_num);
     m_dynamic_triplet    = (m_triplet_internal_margin <= 1.0);
-    long long unsigned init_total = total_internal_triplet_num
+    long long unsigned init_total = total_internal_triplet_num + liquid_triplet_num
         + static_cast<long long unsigned>(abd_fem_count_info.fem_point_num)
         + 2u * static_cast<long long unsigned>(surf_vertexNum) + 100000u;
     long long unsigned triplet_alloc = m_dynamic_triplet
@@ -9557,9 +9582,10 @@ void GIPC::init(double m_meanMass, double m_meanVolumn, double3 minConer, double
         : (total_max_global_triplet_num * (long long unsigned)buffScale);
     long long unsigned hash_alloc = m_dynamic_triplet
         ? init_total
-        : (long long unsigned)((total_internal_triplet_num + total_max_collision_triplet_num) * buffScale);
-    if(::g_gipc_log_level >= 1) printf("[buffer] internal=%llu worst=%llu init_alloc=%llu (dynamic=%d, ~%llu MB)\n",
-           total_internal_triplet_num, total_max_global_triplet_num, triplet_alloc,
+        : (long long unsigned)((total_internal_triplet_num + liquid_triplet_num + total_max_collision_triplet_num) * buffScale);
+    if(::g_gipc_log_level >= 1 || m_liquid)
+        printf("[buffer] internal=%llu liquid=%llu worst=%llu init_alloc=%llu (dynamic=%d, ~%llu MB)\n",
+           total_internal_triplet_num, liquid_triplet_num, total_max_global_triplet_num, triplet_alloc,
            (int)m_dynamic_triplet, triplet_alloc * 80 / 1024 / 1024);
 
     gipc_global_triplet.init_var();
@@ -10580,7 +10606,9 @@ void GIPC::buildCP()
     set_ee_nodedup(getenv("STIFF_EE_NODEDUP") ? 1 : 0);
     set_ee_detgate(getenv("STIFF_EE_DETGATE") ? 1 : 0);
     set_bvh_envpart(getenv("STIFF_BVH_ENVPART") ? 1 : 0);
-    set_bvh_audit(getenv("STIFF_STACK_DIAG") ? 1 : 0);  // [audit-gate] per-pop depth probe, diag only
+    set_bvh_audit((getenv("STIFF_STACK_DIAG") || getenv("STIFF_AUDIT_BVH")) ? 1 : 0);  // [audit-gate] per-pop depth probe + leaf counters, diag only
+    if(const char* t = getenv("STIFF_AUDIT_BVH_TAIL"))  // [audit A3 tail] per-thread record threshold (pushes)
+        set_bvh_tail_thr((unsigned int)atoi(t));
     // [perenv-par] per-vertex cross-env skip at self-collision emission (robust where BVH env-part is
     // bypassed by env-MIXED co-located nodes). Gated STIFF_DECOUPLE_THRESH; null = off (legacy path).
     set_self_p2g((getenv("STIFF_DECOUPLE_THRESH") && m_d_p2g) ? m_d_p2g : nullptr);
@@ -12534,7 +12562,8 @@ void calculate_bending_gradient_hessian(const double3*   vertexes,
                                         int*             row_ids,
                                         int*             col_ids,
                                         double           IPC_dt,
-                                        int global_hessian_fem_offset)
+                                        int global_hessian_fem_offset,
+                                        const double*    theta_p)
 {
     int numbers = edgeNum;
     if(numbers < 1)
@@ -12553,7 +12582,8 @@ void calculate_bending_gradient_hessian(const double3*   vertexes,
                                                                  row_ids,
                                                                  col_ids,
                                                                  IPC_dt,
-                                                                 global_hessian_fem_offset);
+                                                                 global_hessian_fem_offset,
+                                                                 theta_p);
 }
 
 
@@ -12814,6 +12844,9 @@ void GIPC::step_forward(device_TetraData& TetMesh, double alpha, bool move_bound
                         fem_vertexes.size());
         }
     }
+    // [liquid] particles follow their grid-node stencil (linear embedding)
+    if(m_liquid) m_liquid->apply_particle_positions(TetMesh.vertexes, TetMesh.temp_double3Mem, TetMesh.xTilta);
+
     if(abd_fem_count_info.abd_point_num <= 0)
         return;
 
@@ -13553,17 +13586,44 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                               3 * (size_t)vertexNum * BINNED_K * sizeof(double)));
     CUDA_SAFE_CALL(cudaMemset(TetMesh.shape_grads, 0, vertexNum * sizeof(double3)));
 
-    // [multi-env determinism 4.3] zero the WHOLE triplet buffer (block values + row/col) to the
-    // reserved capacity. The triplet count is a provable UPPER BOUND (16 slots/pair, but PP/PE/PT
-    // write fewer) → reserved-but-unwritten slots otherwise hold GARBAGE that the converter
+    // [multi-env determinism 4.3] zero the reserved-but-unwritten triplet slots (block values +
+    // row/col). The contact reservations are provable UPPER BOUNDS (M12/M9/M6 slots per pair,
+    // atomic-ranked friction slots) → unwritten slots otherwise hold GARBAGE that the converter
     // processes → non-deterministic matrix. Zeroing makes them (0,0)=0 (benign + deterministic).
+    // Only the contact sections at the head of the stream (barrier, friction, ground) can hold
+    // such slots: every later writer fills its slots completely (FEM 10 per tet incl. zero
+    // blocks, ABD body/joint/stitch/contact, M3.5 at its exact count, liquid voxels and chain
+    // rule, mass, pins) and the converter / partition / ABD scratch regions are written before
+    // they are read. So zero [0, contact end) instead of the whole capacity (0.75 GB at the x32
+    // pin margin, ~1 GB with the liquid pool) -- bit-identical. The host counts below are the
+    // ones the barrier / friction / ground assembly uses to advance the offset.
+    // STIFF_TRIPLET_FULL_MEMSET=1 restores the whole-capacity memset; STIFF_TRIPLET_POISON=1
+    // fills everything past the contact prefix with NaN / -1 to prove nothing reads it unwritten.
     {
+        static const bool s_full   = getenv("STIFF_TRIPLET_FULL_MEMSET") != nullptr;
+        static const bool s_poison = getenv("STIFF_TRIPLET_POISON") != nullptr;
         size_t cap = gipc_global_triplet.triplet_capacity();
-        if(cap > 0)
+        long long contact_end =
+            static_cast<long long>(h_cpNum[4]) * M12_Off + static_cast<long long>(h_cpNum[3]) * M9_Off
+            + static_cast<long long>(h_cpNum[2]) * M6_Off + static_cast<long long>(h_gpNum);
+#ifdef USE_FRICTION
+        contact_end += static_cast<long long>(h_cpNum_last[4]) * M12_Off
+                       + static_cast<long long>(h_cpNum_last[3]) * M9_Off
+                       + static_cast<long long>(h_cpNum_last[2]) * M6_Off
+                       + static_cast<long long>(h_gpNum_last);
+#endif
+        size_t n = s_full ? cap : std::min(cap, static_cast<size_t>(std::max(0LL, contact_end)));
+        if(n > 0)
         {
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, cap * 9 * sizeof(double)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, cap * sizeof(int)));
-            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, cap * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values(), 0, n * 9 * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices(), 0, n * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices(), 0, n * sizeof(int)));
+        }
+        if(s_poison && cap > n)
+        {
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_values() + n, 0xFF, (cap - n) * 9 * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_row_indices() + n, 0xFF, (cap - n) * sizeof(int)));
+            CUDA_SAFE_CALL(cudaMemset(gipc_global_triplet.block_col_indices() + n, 0xFF, (cap - n) * sizeof(int)));
         }
     }
 
@@ -13608,6 +13668,10 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     // Non-hybrid only; hybrid keeps the worst-case finalize allocation.
     if(m_dynamic_triplet)
     {
+        // NOTE: this is only a pre-assembly ESTIMATE. h_cpNum[0] here is not the
+        // count the ABD assembly ends up partitioning, so it can under-shoot; the
+        // exact growth happens in setup_abd_system_gradient_and_hessian.cu once
+        // new_triplet_offset is known. Do not "fix" contact-dense overflows here.
         long long bound = m_fixed_triplet_base
             + static_cast<long long>(abd_fem_count_info.fem_point_num)
             + static_cast<long long>(h_cpNum[0]) * M12_Off     // all contact pairs x max blocks
@@ -13616,6 +13680,26 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
         bound += static_cast<long long>(h_cpNum_last[0]) * M12_Off
                + static_cast<long long>(h_gpNum_last) * M6_Off;
 #endif
+        // [abd-assembly headroom] setup_abd_system_gradient_and_hessian.cu writes
+        // its blocks at new_triplet_offset, which ALSO carries the ABD system's
+        // own fixed blocks: abd_body_count*10 plus stitch*4 and the joint/drive
+        // block groups. None of those were in this bound -- they were merely
+        // absorbed by the 4096 slack below, so a scene with a dense ABD surface
+        // AND many stitch springs (measured: a 6720-face tile + 383 stitches)
+        // wrote past the end of block_values and died with an illegal memory
+        // access at setup_abd_system_gradient_and_hessian.cu[684]. Small scenes
+        // (peg: 264 stitches on 68-face bodies) fitted in the slack, which is why
+        // this only ever surfaced on a dense grasped object.
+        {
+            const long long n_abd = static_cast<long long>(abd_fem_count_info.abd_body_num);
+            long long abd_blocks = n_abd * 10 + static_cast<long long>(softNum) * 4;
+            if(m_abd_system)
+                abd_blocks += 16LL * (m_abd_system->m_num_joints
+                                      + m_abd_system->m_num_revolute_driving
+                                      + m_abd_system->m_num_prismatic
+                                      + m_abd_system->m_num_prismatic_driving);
+            bound += abd_blocks;
+        }
         bound += 4096;                                          // fixed slack
         // [v0.8.5.1] This is the ONE point where the triplet buffer provably holds no
         // live data (offset just reset; the previous stream was fully consumed by its
@@ -13764,6 +13848,11 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
     }
     gipc_global_triplet.global_triplet_offset += h_gpNum;
     KSEG("seg_thru_ground")
+    // [liquid] contact gradient on particles -> stencil nodes; contact Hessian blocks
+    // touching a particle expanded onto its nodes (raw vertex ids, so the partition
+    // + ABD assembly below treat them like any other contact block). The original
+    // particle blocks are zeroed later by the btype!=0 passes.
+    if(m_liquid) m_liquid->chain_rule_contact(contact_grads, gipc_global_triplet);
     gipc_global_triplet.global_collision_triplet_offset =
         gipc_global_triplet.global_triplet_offset;
 
@@ -13891,7 +13980,8 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
                                            gipc_global_triplet.block_row_indices(),
                                            gipc_global_triplet.block_col_indices(),
                                            IPC_dt,
-                                           fem_global_hessian_index_offset);
+                                           fem_global_hessian_index_offset,
+                                           TetMesh.bend_theta_p);
 #endif
         gipc_global_triplet.global_triplet_offset += tri_edge_num * 10;
         //CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -13914,6 +14004,19 @@ float GIPC::computeGradientAndHessian(device_TetraData& TetMesh)
 
         gipc_global_triplet.global_triplet_offset += triangleNum * 6;
 
+        // [liquid] voxel water elements (gradient into the open g_gbin bracket,
+        // 36 blocks per active voxel; inactive voxels never appear).
+        if(m_liquid && m_liquid->h_active_cells > 0)
+        {
+            m_liquid->assemble(TetMesh.vertexes,
+                               fem_global_hessian_index_offset,
+                               IPC_dt,
+                               gipc_global_triplet.global_triplet_offset,
+                               gipc_global_triplet.block_values(),
+                               gipc_global_triplet.block_row_indices(),
+                               gipc_global_triplet.block_col_indices());
+            gipc_global_triplet.global_triplet_offset += m_liquid->triplet_count();
+        }
 
         // [decouple probe] sub-stage e_presoft: kinetic+FEM+bending+triangle (NO soft yet).
         // Combine current bins into a scratch copy (does NOT disturb shape_grads or the bins).
@@ -14428,7 +14531,7 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
                 fDhat * IPC_dt * IPC_dt,
                 sqrt(fDhat) * IPC_dt,
                 nullptr, nullptr, 0,
-                d_vert_mu, frictionRate);  // [per-body friction]
+                d_vert_mu, fric_energy_rate(frictionRate, d_vert_mu));  // [per-body friction]
             break;
         case 6:
             _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
@@ -14442,7 +14545,7 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
                 lambda_lastH_scalar_gd,
                 sqrt(fDhat) * IPC_dt,
                 nullptr, nullptr, 0,
-                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
+                d_vert_mu_gd, fric_energy_rate(gd_frictionRate, d_vert_mu_gd));  // [per-body friction]
             break;
         case 7:
             _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
@@ -14484,7 +14587,8 @@ double GIPC::Energy_Add_Reduction_Algorithm(int type, device_TetraData& TetMesh)
                 TetMesh.tri_edges,
                 TetMesh.tri_edge_adj_vertex,
                 numbers,
-                bendStiff);
+                bendStiff,
+                TetMesh.bend_theta_p);
 #endif
             break;
     }
@@ -14591,7 +14695,7 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
                 numbers, IPC_dt, distCoord, tanBasis, lambda_lastH_scalar,
                 fDhat * IPC_dt * IPC_dt, sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,
-                d_vert_mu, frictionRate);  // [per-body friction]
+                d_vert_mu, fric_energy_rate(frictionRate, d_vert_mu));  // [per-body friction]
             break;
         case 6:
             _getFrictionEnergy_gd_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
@@ -14599,7 +14703,7 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
                 _collisonPairs_lastH_gd, numbers, IPC_dt, lambda_lastH_scalar_gd,
                 sqrt(fDhat) * IPC_dt,
                 pe, pe ? p2g : nullptr, ng,
-                d_vert_mu_gd, gd_frictionRate);  // [per-body friction]
+                d_vert_mu_gd, fric_energy_rate(gd_frictionRate, d_vert_mu_gd));  // [per-body friction]
             break;
         case 7:
             _getRestStableNHKEnergy_Reduction_3D<<<blockNum, threadNum, sharedMsize>>>(
@@ -14627,7 +14731,7 @@ void GIPC::Energy_Add_Reduction_Algorithm_DeviceOut(int               type,
 #else
             _getBendingEnergy_Reduction<<<blockNum, threadNum, sharedMsize>>>(
                 queue, TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges,
-                TetMesh.tri_edge_adj_vertex, numbers, bendStiff,
+                TetMesh.tri_edge_adj_vertex, numbers, bendStiff, TetMesh.bend_theta_p,
                 pe, pe ? p2g : nullptr, ng);
 #endif
             break;
@@ -14671,6 +14775,7 @@ __global__ void _global_energy_combine(const double* slots,
     e = __dadd_rn(e, __dmul_rn(dt2, slots[1]));
     e = __dadd_rn(e, __dmul_rn(dt2, slots[2]));
     e = __dadd_rn(e, __dmul_rn(dt2, slots[3]));
+    e = __dadd_rn(e, __dmul_rn(dt2, slots[15]));  // [liquid] voxel water
     e = __dadd_rn(e, slots[4]);
     e = __dadd_rn(e, slots[5]);
     e = __dadd_rn(e, __dmul_rn(Kappa, slots[6]));
@@ -14699,13 +14804,35 @@ void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar
     Energy_Add_Reduction_Algorithm_DeviceOut(6,  TetMesh, m_energy_slots + 8);
 #endif
     m_abd_system->cal_abd_energy_DeviceOut(*m_abd_sim_data, m_energy_slots + 9);
+    if(m_liquid)
+        m_liquid->energy_device_out(TetMesh.vertexes, m_energy_slots + 15);
+    else
+        CUDA_SAFE_CALL(cudaMemsetAsync(m_energy_slots + 15, 0, sizeof(double)));
 
     _global_energy_combine<<<1, 1>>>(m_energy_slots,
                                      IPC_dt * IPC_dt,
                                      Kappa,
-                                     frictionRate,
-                                     gd_frictionRate,
+                                     fric_energy_rate(frictionRate, d_vert_mu),
+                                     fric_energy_rate(gd_frictionRate, d_vert_mu_gd),
                                      out_scalar);
+
+    // [liquid debug] report the first non-finite energy slots
+    static int  liq_dbg_prints = 0;
+    static bool liq_dbg        = getenv("LIQ_DEBUG") != nullptr;
+    if(liq_dbg && liq_dbg_prints < 12)
+    {
+        double slots[kEnergySlotCount] = {};
+        CUDA_SAFE_CALL(cudaMemcpy(slots, m_energy_slots, sizeof(slots), cudaMemcpyDeviceToHost));
+        bool bad = false;
+        for(int i = 0; i < kEnergySlotCount; ++i) bad |= !std::isfinite(slots[i]);
+        if(bad)
+        {
+            ++liq_dbg_prints;
+            printf("[liq-dbg] energy slots:");
+            for(int i = 0; i < kEnergySlotCount; ++i) printf(" %d=%.3e", i, slots[i]);
+            printf("  (cp %u gp %u)\n", h_cpNum[0], (unsigned)h_gpNum);
+        }
+    }
 
     static bool energy_validated = false;
     if(!energy_validated && getenv("STIFF_ENERGY_VALIDATE"))
@@ -14732,12 +14859,13 @@ void GIPC::computeEnergy_DeviceOut(device_TetraData& TetMesh, double* out_scalar
         host_energy += dt2 * slots[1];
         host_energy += dt2 * slots[2];
         host_energy += dt2 * slots[3];
+        host_energy += dt2 * slots[15];
         host_energy += slots[4];
         host_energy += slots[5];
         host_energy += Kappa * slots[6];
 #ifdef USE_FRICTION
-        host_energy += frictionRate * slots[7];
-        host_energy += gd_frictionRate * slots[8];
+        host_energy += fric_energy_rate(frictionRate, d_vert_mu) * slots[7];
+        host_energy += fric_energy_rate(gd_frictionRate, d_vert_mu_gd) * slots[8];
 #endif
         const bool exact = std::memcmp(&host_energy,
                                        &device_energy,
@@ -14953,8 +15081,8 @@ double GIPC::computeEnergy_perenv(device_TetraData& TetMesh, std::vector<double>
     for(int g = 0; g < NG; ++g)
         env_out[g] += (perenv_k ? hs(9)[g] : Kappa) * hs(8)[g];
 #ifdef USE_FRICTION
-    for(int g = 0; g < NG; ++g) env_out[g] += frictionRate * hs(6)[g];      // friction (self)
-    for(int g = 0; g < NG; ++g) env_out[g] += gd_frictionRate * hs(7)[g];   // friction (ground)
+    for(int g = 0; g < NG; ++g) env_out[g] += fric_energy_rate(frictionRate, d_vert_mu) * hs(6)[g];      // friction (self)
+    for(int g = 0; g < NG; ++g) env_out[g] += fric_energy_rate(gd_frictionRate, d_vert_mu_gd) * hs(7)[g];   // friction (ground)
 #endif
     double abd_sum = 0.0;
     for(int g = 0; g < NG; ++g) { env_out[g] += hs(10)[g]; abd_sum += hs(10)[g]; }
@@ -14986,8 +15114,8 @@ void GIPC::computeEnergy_perenv_dev(device_TetraData& TetMesh, double* d_Eg)
         d_Eg,
         Kappa,
         IPC_dt * IPC_dt,
-        frictionRate,
-        gd_frictionRate,
+        fric_energy_rate(frictionRate, d_vert_mu),
+        fric_energy_rate(gd_frictionRate, d_vert_mu_gd),
         perenv_k ? 1 : 0,
         kEnvAlphaSlots,
         NG);
@@ -15105,6 +15233,30 @@ int GIPC::calculateMovingDirection(device_TetraData& TetMesh, int cpNum, int pre
     // (fb is assembled by computeGradientAndHessian from identical co-located verts.)
     if(getenv("STIFF_XENV") && m_d_p2g) xenvDiff(TetMesh.fb, "fb(grad) pre-solve");
 
+    // [live-prefix PCG] liquid layout: [solids][active nodes][parked slots][particles].
+    // Parked slots (btype 1) and particle rows (btype 4) get a zero RHS, their blocks
+    // to every other DOF are zeroed (btype passes / chain rule), and their diagonal is
+    // the mass block: they stay exactly zero through PCG, so the solve may stop at the
+    // last active node. Any other layout keeps the full-length solve.
+    {
+        gipc::SizeT live = 0;
+        if(m_liquid)
+        {
+            const auto&     c       = abd_fem_count_info;
+            const long long fem_off = (long long)c.fem_point_offset;
+            const long long v_end   = fem_off + (long long)c.fem_point_num;
+            const auto&     L       = *m_liquid;
+            if(c.fem_point_offset == c.abd_point_num && L.node_slot_base >= fem_off
+               && L.particle_slot_base == L.node_slot_base + L.P.node_pool
+               && (long long)L.particle_slot_base + L.n_particles == v_end
+               && v_end == (long long)vertexNum && L.h_live_nodes >= 0
+               && L.h_live_nodes <= L.P.node_pool)
+                live = 3ull * (4ull * (unsigned long long)c.abd_body_num
+                               + (unsigned long long)(L.node_slot_base + L.h_live_nodes - fem_off));   // [2b] + private ghost slots
+        }
+        if(getenv("LIQ_NO_LIVE")) live = 0;   // [2b debug] force the full-length solve
+        m_global_linear_system->set_live_dof(live);
+    }
     iter = m_global_linear_system->solve_linear_system();
 
     // [xenv] search-direction asymmetry — did the SOLVE (SpMV/dot/precond) introduce it?
@@ -15288,6 +15440,47 @@ bool GIPC::isIntersected(device_TetraData& TetMesh)
 
 // [phase-time] lineSearch inner split (per frame): energy evals vs buildBVH+intersect vs buildCP vs step.
 static double g_ls_e_ms = 0.0, g_ls_bvh_ms = 0.0, g_ls_cp_ms = 0.0, g_ls_step_ms = 0.0;
+// [audit 2026-10-09] per-frame diagnostic counters for verifying the performance audits
+// (STIFF_AUDIT_STATS=1; STIFF_LS_SPLIT=1 adds synchronising per-trial timers to the merged
+// line search, so never combine it with timing comparisons).
+static int       g_aud_ls_trials = 0, g_aud_ls_calls = 0, g_aud_ls_max_trials = 0;
+static int       g_aud_ccd_iters = 0, g_aud_ccd_unused = 0, g_aud_ccd_skip_cfl = 0;
+static int       g_aud_ccd_deadband = 0, g_aud_ccd_refine = 0, g_aud_k0_exit = 0;
+static long long g_aud_pin_pairs_max = 0, g_aud_pairs_max = 0, g_aud_liq_exp_max = 0, g_aud_liq_cpart_max = 0;
+static double    g_aud_ls_step_ms = 0.0, g_aud_ls_bvh_ms = 0.0, g_aud_ls_cp_ms = 0.0, g_aud_ls_e_ms = 0.0;
+static bool      audit_stats_on() { static const bool on = getenv("STIFF_AUDIT_STATS") != nullptr; return on; }
+void reset_bvh_cnt();
+void get_bvh_cnt(unsigned long long* out);
+void reset_bvh_tail();
+unsigned int get_bvh_tail(unsigned int* hist32, unsigned long long* tmax16, unsigned int* recs);
+static bool      ls_split_on() { static const bool on = getenv("STIFF_LS_SPLIT") != nullptr; return on; }
+// PCG split timers live in the linear-system sources
+extern double    g_pcg_build_ms, g_pcg_solve_ms, g_pcg_setup_ms, g_pcg_iter_ms;
+extern long long g_pcg_solves;
+// [audit] contact pairs that touch an FEM-pinned vertex (BoundaryType 2)
+__global__ void _audit_count_pinned_pairs(const int4* pairs, int n, const int* btype, int vnum,
+                                          unsigned long long* out)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= n) return;
+    int4 p = pairs[i];
+    int  a = p.x >= 0 ? p.x : -p.x - 1;
+    int  b = p.y >= 0 ? p.y : -p.y - 1;
+    bool hit = (a < vnum && btype[a] == 2) || (b < vnum && btype[b] == 2)
+               || (p.z >= 0 && p.z < vnum && btype[p.z] == 2)
+               || (p.w >= 0 && p.w < vnum && btype[p.w] == 2);
+    if(hit) atomicAdd(out, 1ull);
+}
+// synchronising stopwatch for the merged line-search trial split (STIFF_LS_SPLIT only)
+struct _LsSplitTimer {
+    bool on; cudaEvent_t a, b; double* acc;
+    explicit _LsSplitTimer(double* accum) : on(ls_split_on()), acc(accum)
+    { if(on){ cudaEventCreate(&a); cudaEventCreate(&b); cudaEventRecord(a); } }
+    void stop()
+    { if(on){ cudaEventRecord(b); cudaEventSynchronize(b); float m=0; cudaEventElapsedTime(&m,a,b);
+              *acc += m; cudaEventDestroy(a); cudaEventDestroy(b); on=false; } }
+    ~_LsSplitTimer() { stop(); }
+};
 // gated event-pair stopwatch (STIFF_PHASE_TIME only; events are stream-ordered, no extra syncs —
 // callers place it around ops that already end host-synchronous).
 struct _LsTimer {
@@ -15309,8 +15502,40 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     // reads its counts on the host.  All energy work below is ordered on PTDS,
     // so the former full-device wait here was redundant.
     double lastEnergyVal = 0.0;
+    if(getenv("LIQ_DEBUG") && m_liquid)
+    {   // [liquid debug] who moved since the previous accepted trial? is the DCD list stale?
+        static double3* saved = nullptr;
+        static int      prints = 0;
+        if(!saved) CUDA_SAFE_CALL(cudaMalloc((void**)&saved, vertexNum * sizeof(double3)));
+        if(m_liq_dbg_have_saved && prints < 400)
+        {
+            std::vector<double3> a(vertexNum), b(vertexNum);
+            CUDA_SAFE_CALL(cudaMemcpy(a.data(), TetMesh.vertexes, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+            CUDA_SAFE_CALL(cudaMemcpy(b.data(), m_liq_dbg_saved, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+            double dabd = 0, dnode = 0, dpart = 0;
+            const int pbase = m_liquid->particle_slot_base, nbase = m_liquid->node_slot_base;
+            for(int i = 0; i < (int)vertexNum; ++i)
+            {
+                double d = fabs(a[i].x - b[i].x) + fabs(a[i].y - b[i].y) + fabs(a[i].z - b[i].z);
+                if(i < nbase) dabd = std::max(dabd, d);
+                else if(i < pbase) dnode = std::max(dnode, d);
+                else dpart = std::max(dpart, d);
+            }
+            printf("[liq-dbg][ls-start] moved since accept: abd %.3e node %.3e particle %.3e | cp %u\n", dabd, dnode, dpart, h_cpNum[0]);
+            ++prints;
+        }
+        (void)saved;
+    }
     if(device_ls)
+    {
         computeEnergy_DeviceOut(TetMesh, m_line_search_energy + 0);
+        if(getenv("LIQ_DEBUG") || (getenv("STIFF_LS_SLOTS_FRAME") && g_dec_frame == atoi(getenv("STIFF_LS_SLOTS_FRAME"))))
+        {   // [liquid debug] keep E0's slot breakdown for the exhaustion report / the per-frame slot probe
+            CUDA_SAFE_CALL(cudaMemcpy(m_liq_dbg_e0_slots, m_energy_slots, sizeof(m_liq_dbg_e0_slots), cudaMemcpyDeviceToHost));
+            for(int i = 0; i < 5; ++i) m_liq_dbg_e0_cp[i] = h_cpNum[i];
+            m_liq_dbg_e0_cp[5] = h_gpNum;
+        }
+    }
     else
         lastEnergyVal = computeEnergy(TetMesh);
     bool perenv_try = (m_env_alpha_valid && m_env_alpha && TetMesh.d_point_to_group
@@ -15443,11 +15668,11 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         // reference lastEnergyVal is the eager entry computeEnergy (bit-exact original semantics).
     }
 
-    step_forward(TetMesh, alpha, false);
+    { _LsSplitTimer _ts(&g_aud_ls_step_ms); step_forward(TetMesh, alpha, false); }
 
     bool rehash = true;
 
-    buildBVH();
+    { _LsSplitTimer _tb(&g_aud_ls_bvh_ms); buildBVH(); }
 
     int ground_trial_backtracks = 0;
     int ground_trial_status = groundTrialStatus(nullptr, 0);
@@ -15455,8 +15680,8 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
     {
         alpha *= 0.5;
         ++ground_trial_backtracks;
-        step_forward(TetMesh, alpha, false);
-        buildBVH();
+        { _LsSplitTimer _ts(&g_aud_ls_step_ms); step_forward(TetMesh, alpha, false); }
+        { _LsSplitTimer _tb(&g_aud_ls_bvh_ms); buildBVH(); }
         ground_trial_status = groundTrialStatus(nullptr, 0);
     }
     if(ground_trial_status != 0)
@@ -15487,12 +15712,12 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         alpha /= 2.0;
         numOfIntersect++;
         alpha = std::min(cfl_alpha, alpha);
-        step_forward(TetMesh, alpha, false);
-        buildBVH();
+        { _LsSplitTimer _ts(&g_aud_ls_step_ms); step_forward(TetMesh, alpha, false); }
+        { _LsSplitTimer _tb(&g_aud_ls_bvh_ms); buildBVH(); }
         //break;
     }
 
-    buildCP();
+    { _LsSplitTimer _tc(&g_aud_ls_cp_ms); buildCP(); }
 
     double testingE = 0.0;
 
@@ -15550,8 +15775,35 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
             return 1;
         return testingE > rhs + tol ? 1 : (testingE > rhs ? 2 : 0);
     };
-    int energy_decision = evaluate_trial_energy(alpha);
+    int energy_decision = 0;
+    { _LsSplitTimer _te(&g_aud_ls_e_ms); energy_decision = evaluate_trial_energy(alpha); }
 
+    // [liquid debug] energy slots of the start state and the first trial
+    static const bool liq_ls_dbg = getenv("LIQ_DEBUG") != nullptr;
+    static int        liq_ls_prints = 0;
+    if(liq_ls_dbg && energy_decision == 1 && liq_ls_prints < 6)
+    {
+        double sl[kEnergySlotCount] = {}, e01[2] = {};
+        CUDA_SAFE_CALL(cudaMemcpy(sl, m_energy_slots, sizeof(sl), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(e01, m_line_search_energy, sizeof(e01), cudaMemcpyDeviceToHost));
+        printf("[liq-dbg][ls] alpha %.3g E0 %.12e E1 %.12e dE %.3e | trial slots kin %.3e voxel(x dt2) %.3e barrier %.3e ground(x k) %.3e fric %.3e gfric %.3e cp %u gp %u\n",
+               alpha, e01[0], e01[1], e01[1] - e01[0], sl[0], sl[15] * IPC_dt * IPC_dt, sl[5], sl[6] * Kappa, sl[7], sl[8], h_cpNum[0], (unsigned)h_gpNum);
+        ++liq_ls_prints;
+    }
+
+    // [ls-slots probe] STIFF_LS_SLOTS_FRAME=N: for frame N, print which energy slots rise on the first trial
+    // (E0 vs E1 per slot) whenever the full step is rejected -- identifies the term that forces backtracking.
+    if(energy_decision == 1 && getenv("STIFF_LS_SLOTS_FRAME") && g_dec_frame == atoi(getenv("STIFF_LS_SLOTS_FRAME")))
+    {
+        double sl[kEnergySlotCount] = {}, e01[2] = {};
+        CUDA_SAFE_CALL(cudaMemcpy(sl, m_energy_slots, sizeof(sl), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(e01, m_line_search_energy, sizeof(e01), cudaMemcpyDeviceToHost));
+        printf("[ls-slots] alpha %.4g E0 %.12e E1 %.12e dE %.4e | slot E0 -> E1 (d):", alpha, e01[0], e01[1], e01[1] - e01[0]);
+        for(int i = 0; i < kEnergySlotCount; ++i)
+            if(m_liq_dbg_e0_slots[i] != 0.0 || sl[i] != 0.0)
+                printf(" [%d] %.6e->%.6e (%+.3e)", i, m_liq_dbg_e0_slots[i], sl[i], sl[i] - m_liq_dbg_e0_slots[i]);
+        printf(" | Kappa %.4e dt %.3g\n", Kappa, IPC_dt);
+    }
     int    numOfLineSearch = 0;
     double LFStepSize      = alpha;
 
@@ -15567,14 +15819,29 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         alpha /= 2.0;
         ++numOfLineSearch;
 
-        step_forward(TetMesh, alpha, false);
-        buildBVH();
-        buildCP();
-        energy_decision = evaluate_trial_energy(alpha);
+        { _LsSplitTimer _ts(&g_aud_ls_step_ms); step_forward(TetMesh, alpha, false); }
+        { _LsSplitTimer _tb(&g_aud_ls_bvh_ms); buildBVH(); }
+        { _LsSplitTimer _tc(&g_aud_ls_cp_ms); buildCP(); }
+        { _LsSplitTimer _te(&g_aud_ls_e_ms); energy_decision = evaluate_trial_energy(alpha); }
     }
     const bool line_search_exhausted = energy_decision == 1;
+    if(audit_stats_on())
+    {
+        const int trials = 1 + ground_trial_backtracks + numOfIntersect + numOfLineSearch;
+        g_aud_ls_trials += trials;
+        g_aud_ls_calls += 1;
+        g_aud_ls_max_trials = std::max(g_aud_ls_max_trials, trials);
+    }
+    if(getenv("LIQ_DEBUG") && m_liquid)
+    {   // [liquid debug] snapshot of the state whose pair list will be reused next iteration
+        if(!m_liq_dbg_saved) CUDA_SAFE_CALL(cudaMalloc((void**)&m_liq_dbg_saved, vertexNum * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaMemcpy(m_liq_dbg_saved, TetMesh.vertexes, vertexNum * sizeof(double3), cudaMemcpyDeviceToDevice));
+        m_liq_dbg_have_saved = true;
+    }
     if(energy_decision == 2)
         ++energy_tolerance_accept_count;
+    if(line_search_exhausted && getenv("LIQ_FD_ON_EXHAUST"))
+        g_liq_fd_after_exhaust = true;
     if(line_search_exhausted)
     {
         if(device_ls)
@@ -15590,6 +15857,38 @@ bool GIPC::lineSearch(device_TetraData& TetMesh, double& alpha, const double& cf
         // [T1] Monotonicity NOT achieved within budget: the accepted step raises
         // the incremental potential. Loud and unconditional — a silent
         // non-descent step corrupts contact state downstream.
+        if(getenv("LIQ_DEBUG"))
+        {   // [liquid debug] slot breakdown: E0 (start) vs the last trial (alpha ~ 0, same positions)
+            static int n_rep = 0;
+            if(n_rep++ < 8)
+            {
+                double sl[kEnergySlotCount] = {};
+                CUDA_SAFE_CALL(cudaMemcpy(sl, m_energy_slots, sizeof(sl), cudaMemcpyDeviceToHost));
+                printf("[liq-dbg][exhaust] slot: E0 / last-trial  cp E0 [%u pt %u pe %u pp %u gp %u] vs now [%u pt %u pe %u pp %u gp %u]\n",
+                       m_liq_dbg_e0_cp[0], m_liq_dbg_e0_cp[4], m_liq_dbg_e0_cp[3], m_liq_dbg_e0_cp[2], m_liq_dbg_e0_cp[5],
+                       h_cpNum[0], h_cpNum[4], h_cpNum[3], h_cpNum[2], (unsigned)h_gpNum);
+                for(int i = 0; i < kEnergySlotCount; ++i)
+                    if(m_liq_dbg_e0_slots[i] != 0.0 || sl[i] != 0.0)
+                        printf("   slot %2d  %.9e  /  %.9e\n", i, m_liq_dbg_e0_slots[i], sl[i]);
+                // determinism probe: positions vs line-search start, then rebuild + recount twice
+                std::vector<double3> hv(vertexNum), htmp(vertexNum);
+                CUDA_SAFE_CALL(cudaMemcpy(hv.data(), TetMesh.vertexes, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(htmp.data(), TetMesh.temp_double3Mem, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                double dmax = 0.0;
+                for(int i = 0; i < (int)vertexNum; ++i)
+                    dmax = std::max(dmax, fabs(hv[i].x - htmp[i].x) + fabs(hv[i].y - htmp[i].y) + fabs(hv[i].z - htmp[i].z));
+                printf("   max|x - x_start| = %.3e\n", dmax);
+                for(int rep = 0; rep < 2; ++rep)
+                {
+                    buildBVH();
+                    buildCP();
+                    computeEnergy_DeviceOut(TetMesh, m_compatibility_energy);
+                    double sl2[kEnergySlotCount] = {};
+                    CUDA_SAFE_CALL(cudaMemcpy(sl2, m_energy_slots, sizeof(sl2), cudaMemcpyDeviceToHost));
+                    printf("   rebuild #%d: cp %u (pt %u pe %u pp %u) gp %u  barrier %.9e\n", rep, h_cpNum[0], h_cpNum[4], h_cpNum[3], h_cpNum[2], (unsigned)h_gpNum, sl2[5]);
+                }
+            }
+        }
         fprintf(stderr,
                 "[line-search][WARN] budget exhausted (%d halvings, alpha=%.3e): "
                 "energy did NOT decrease (E=%.9e > E0=%.9e). Step accepted anyway "
@@ -15800,6 +16099,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     stats_at_current_frame["newton"] = gipc::Json::array();
     g_t3_s1_ms = 0.0; g_t3_ls_ms = 0.0;   // [phase-time] time3 sub-split, per frame
     g_ls_e_ms = 0.0; g_ls_bvh_ms = 0.0; g_ls_cp_ms = 0.0; g_ls_step_ms = 0.0;
+    g_aud_ls_trials = g_aud_ls_calls = g_aud_ls_max_trials = 0;
+    g_aud_ccd_iters = g_aud_ccd_unused = g_aud_ccd_skip_cfl = g_aud_ccd_deadband = g_aud_ccd_refine = 0;
+    g_aud_k0_exit = 0; g_aud_pin_pairs_max = 0; g_aud_pairs_max = 0; g_aud_liq_exp_max = 0; g_aud_liq_cpart_max = 0;
+    g_aud_ls_step_ms = g_aud_ls_bvh_ms = g_aud_ls_cp_ms = g_aud_ls_e_ms = 0.0;
+    g_pcg_build_ms = g_pcg_solve_ms = g_pcg_setup_ms = g_pcg_iter_ms = 0.0; g_pcg_solves = 0;
     const int active_group_count = TetMesh.h_group_count;
     m_active_group_count = active_group_count;
     // [env-det] capture p2g at entry so the canon env-local-id tiebreak (g_vloc) is built BEFORE the
@@ -15978,7 +16282,10 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                  : sqrt(Newton_solver_threshold * Newton_solver_threshold
                                         * thr_bbox2 * IPC_dt * IPC_dt);
         auto device_newton_converged = [&](bool retain_movement) {
-            calcMinMovement_DeviceOut(_moveDir, pcg_data.squeue, vertexNum);
+            // [liquid] water rows enter the max-move exit test with a looser weight
+            double3* md_conv = _moveDir;
+            if(m_liquid) md_conv = const_cast<double3*>(m_liquid->scaled_movedir(_moveDir, vertexNum));
+            calcMinMovement_DeviceOut(md_conv, pcg_data.squeue, vertexNum);
             _newton_convergence_decide<<<1, 1>>>(pcg_data.squeue,
                                                  _newton_thr,
                                                  m_newton_convergence_decision);
@@ -16127,6 +16434,27 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             destroy_iteration_events();
             break;
         }
+        // (counted inside the assembly timing window, not the PCG one)
+        if(audit_stats_on())
+        {
+            static unsigned long long* d_pin_cnt = nullptr;
+            if(!d_pin_cnt) CUDA_SAFE_CALL(cudaMalloc((void**)&d_pin_cnt, sizeof(unsigned long long)));
+            CUDA_SAFE_CALL(cudaMemset(d_pin_cnt, 0, sizeof(unsigned long long)));
+            const int np = (int)h_cpNum[0];
+            if(np > 0)
+                _audit_count_pinned_pairs<<<(np + 255) / 256, 256>>>(_collisonPairs, np, TetMesh.BoundaryType,
+                                                                     (int)vertexNum, d_pin_cnt);
+            unsigned long long hp = 0;
+            CUDA_SAFE_CALL(cudaMemcpy(&hp, d_pin_cnt, sizeof(hp), cudaMemcpyDeviceToHost));
+            g_aud_pin_pairs_max = std::max(g_aud_pin_pairs_max, (long long)hp);
+            g_aud_pairs_max = std::max(g_aud_pairs_max, (long long)np);
+            if(m_liquid)
+            {
+                g_aud_liq_exp_max   = std::max(g_aud_liq_exp_max, (long long)m_liquid->h_expanded_blocks);
+                g_aud_liq_cpart_max = std::max(g_aud_liq_cpart_max, (long long)m_liquid->h_contact_particles);
+            }
+        }
+
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end0));
 
         auto cg_count = calculateMovingDirection(TetMesh, h_cpNum[0], pcg_data.P_type);
@@ -16185,6 +16513,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         if(current_global_exit)
         {
             gradVanish = device_newton_converged(merged_diag_sample);
+            if(audit_stats_on() && k == 0 && gradVanish && drive_ratio >= 1.0)
+                ++g_aud_k0_exit;   // S1.12: the fresh first direction already passes the exit test
             if(k && gradVanish && drive_ratio >= 1.0)
             {
                 destroy_iteration_events();
@@ -16232,6 +16562,97 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
             }
         }
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end1));
+        // [liquid] particle move direction = stencil-weighted node direction (for CCD)
+        if(m_liquid) m_liquid->apply_particle_movedir(_moveDir);
+        if(m_liquid && getenv("LIQ_DEBUG"))
+        {   // directional derivative g.d over free FEM vertices (expect > 0: step is x - alpha*d)
+            static int prints = 0;
+            if(prints < 40)
+            {
+                std::vector<double3> hd(vertexNum), hg(vertexNum), hb(vertexNum);
+                std::vector<int>     ht(vertexNum);
+                CUDA_SAFE_CALL(cudaMemcpy(hd.data(), _moveDir, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hg.data(), TetMesh.shape_grads, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hb.data(), TetMesh.fb, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(ht.data(), TetMesh.BoundaryType, vertexNum * sizeof(int), cudaMemcpyDeviceToHost));
+                double gd = 0, gn = 0, dn = 0;
+                for(int i = (int)abd_fem_count_info.fem_point_offset; i < (int)vertexNum; ++i)
+                {
+                    if(ht[i] != 0) continue;
+                    double3 g = make_double3(hg[i].x + hb[i].x, hg[i].y + hb[i].y, hg[i].z + hb[i].z);
+                    gd += g.x * hd[i].x + g.y * hd[i].y + g.z * hd[i].z;
+                    gn += g.x * g.x + g.y * g.y + g.z * g.z;
+                    dn += hd[i].x * hd[i].x + hd[i].y * hd[i].y + hd[i].z * hd[i].z;
+                }
+                printf("[liq-dbg][dir] g.d %.4e |g| %.3e |d| %.3e  (cp %u gp %u)\n", gd, sqrt(gn), sqrt(dn), h_cpNum[0], (unsigned)h_gpNum);
+                ++prints;
+            }
+        }
+        // [liquid debug] LIQ_FD_FRAME=a[:b]: gradient/energy consistency along the Newton direction for frames a..b. The step is
+        // x - alpha d, so dE/dalpha(0) must equal -g.d; the forward difference of every energy slot (x - eps d) names the term
+        // whose assembled gradient is not the derivative of the energy the line search evaluates.
+        if(m_liquid && (getenv("LIQ_FD_FRAME") || g_liq_fd_after_exhaust))
+        {
+            static int fd_a = -1, fd_b = -1, fd_prints = 0;
+            if(fd_a < 0 && getenv("LIQ_FD_FRAME"))
+            {
+                const char* fs = getenv("LIQ_FD_FRAME");
+                fd_a = atoi(fs);
+                const char* c = strchr(fs, ':');
+                fd_b = c ? atoi(c + 1) : fd_a;
+            }
+            const bool fd_ex = g_liq_fd_after_exhaust;
+            g_liq_fd_after_exhaust = false;
+            if(((g_dec_frame >= fd_a && g_dec_frame <= fd_b && ((int)k < 3 || ((int)k % 25) == 0)) || fd_ex) && fd_prints < 400)
+            {
+                ++fd_prints;
+                std::vector<double3> hd(vertexNum), hg(vertexNum), hb(vertexNum), hx(vertexNum), hxt(vertexNum);
+                std::vector<double>  hm(vertexNum);
+                std::vector<int>     ht(vertexNum);
+                CUDA_SAFE_CALL(cudaMemcpy(hd.data(), _moveDir, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hg.data(), TetMesh.shape_grads, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hb.data(), TetMesh.fb, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hx.data(), TetMesh.vertexes, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hxt.data(), TetMesh.xTilta, vertexNum * sizeof(double3), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(hm.data(), TetMesh.masses, vertexNum * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_SAFE_CALL(cudaMemcpy(ht.data(), TetMesh.BoundaryType, vertexNum * sizeof(int), cudaMemcpyDeviceToHost));
+                double gd_sh = 0, gd_fb = 0, gd_kin = 0, dmax_fixed = 0;
+                for(int i = (int)abd_fem_count_info.fem_point_offset; i < (int)vertexNum; ++i)
+                {
+                    const double3 d = hd[i];
+                    if(ht[i] != 0) { dmax_fixed = std::max(dmax_fixed, sqrt(d.x * d.x + d.y * d.y + d.z * d.z)); continue; }
+                    gd_sh  += hg[i].x * d.x + hg[i].y * d.y + hg[i].z * d.z;
+                    gd_fb  += hb[i].x * d.x + hb[i].y * d.y + hb[i].z * d.z;
+                    gd_kin += hm[i] * ((hx[i].x - hxt[i].x) * d.x + (hx[i].y - hxt[i].y) * d.y + (hx[i].z - hxt[i].z) * d.z);
+                }
+                CUDA_SAFE_CALL(cudaMemcpy(TetMesh.temp_double3Mem, TetMesh.vertexes, vertexNum * sizeof(double3), cudaMemcpyDeviceToDevice));
+                m_abd_system->copy_q_to_q_temp(*m_abd_sim_data);
+                double s0[kEnergySlotCount] = {}, s1[kEnergySlotCount] = {};
+                buildBVH();
+                buildCP();
+                computeEnergy_DeviceOut(TetMesh, m_compatibility_energy);
+                CUDA_SAFE_CALL(cudaMemcpy(s0, m_energy_slots, sizeof(s0), cudaMemcpyDeviceToHost));
+                const double dt2 = IPC_dt * IPC_dt;
+                printf("[liq-fd] f=%d k=%d analytic slope -g.d: total %.6e = shape %.6e (kin %.6e, rest %.6e) + fb %.6e | max|d| fixed rows %.3e\n",
+                       g_dec_frame, (int)k, -(gd_sh + gd_fb), -gd_sh, -gd_kin, -(gd_sh - gd_kin), -gd_fb, dmax_fixed);
+                for(double eps : {1e-2, 1e-4, 1e-6})
+                {
+                    step_forward(TetMesh, eps, false);
+                    buildBVH();
+                    buildCP();
+                    computeEnergy_DeviceOut(TetMesh, m_compatibility_energy);
+                    CUDA_SAFE_CALL(cudaMemcpy(s1, m_energy_slots, sizeof(s1), cudaMemcpyDeviceToHost));
+                    const double fk = (s1[0] - s0[0]) / eps, fl = dt2 * (s1[15] - s0[15]) / eps, fbar = (s1[5] - s0[5]) / eps,
+                                 fg = Kappa * (s1[6] - s0[6]) / eps, fa = (s1[9] + s1[10] - s0[9] - s0[10]) / eps,
+                                 fo = (s1[4] - s0[4] + dt2 * (s1[1] + s1[2] + s1[3] - s0[1] - s0[2] - s0[3])) / eps;
+                    printf("[liq-fd]   eps %.0e FD slope: kin %.6e liquid %.6e barrier %.6e ground %.6e abd %.6e other %.6e | sum %.6e\n", eps, fk, fl, fbar,
+                           fg, fa, fo, fk + fl + fbar + fg + fa + fo);
+                }
+                step_forward(TetMesh, 0.0, false);   // back to the iterate (alpha 0 copies the saved positions)
+                buildBVH();
+                buildCP();
+            }
+        }
         double alpha = 1.0, slackness_a = 0.9, slackness_m = 0.8;
         double diag_ground_alpha = 1.0;
         double diag_narrow_alpha = 1.0;
@@ -16304,6 +16725,38 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                     nullptr);
         }
 
+        // [audit A2 / solid-audit S1.5, opt-in STIFF_CCD_SKIP=1, default off] If
+        // alpha_CFL = 0.5 sqrt(dHat) / max_surface|d| >= temp_alpha, _ccd_final_alpha_combine
+        // returns temp_alpha whatever the swept candidates are (min(temp, cfl) = temp, and the
+        // refinement only runs when temp > 2 cfl), so the swept build / query / refined passes
+        // cannot change the step. Decide that BEFORE building: same reduction, same formula
+        // (sqrt and division are correctly rounded on both sides; x0.5 is exact).
+        static const bool s_ccd_skip = [] { const char* e = getenv("STIFF_CCD_SKIP"); return e && e[0] && e[0] != '0'; }();
+        bool ccd_skipped = false;
+        if(s_ccd_skip && !s1_on && !m_perenv_bvh && surf_vertexNum >= 1 && !getenv("GIPC_FORCE_CCD_SANITY"))
+        {
+            cfl_largestSpeed_DeviceOut(pcg_data.squeue, m_ccd_alpha_slots + 3);
+            double tm[2] = {0.0, 0.0};   // slots 2 (temp_alpha) and 3 (max surface |d|)
+            CUDA_SAFE_CALL(cudaMemcpy(tm, m_ccd_alpha_slots + 2, 2 * sizeof(double), cudaMemcpyDeviceToHost));
+            if(tm[1] > 0.0 && (sqrt(dHat) / tm[1]) * 0.5 >= tm[0])
+                ccd_skipped = true;
+            else if(tm[1] == 0.0)
+                ccd_skipped = true;   // nothing moves: alpha_CFL = inf, the result is temp_alpha too
+            // NaN / inf directions keep the full chain (and its validation throw)
+        }
+        // STIFF_CCD_SKIP_VERIFY=1 (diagnostic): decide as above but still run the full chain, then check
+        // bit for bit that it returned temp_alpha, i.e. what the skipped path hands to the line search.
+        static const bool s_ccd_skip_verify = getenv("STIFF_CCD_SKIP_VERIFY") != nullptr;
+        bool ccd_would_skip = false;
+        if(ccd_skipped && s_ccd_skip_verify)
+        {
+            ccd_would_skip = true;
+            ccd_skipped    = false;
+        }
+        if(ccd_skipped)
+            h_ccd_cpNum = 0;   // no swept candidates this iteration (only S1 / diagnostics read it)
+        else
+        {
         buildBVH_FULLCCD(1.0, m_ccd_alpha_slots + 2);
         buildFullCP(1.0, m_ccd_alpha_slots + 2);
         if(h_ccd_cpNum > 0)
@@ -16316,6 +16769,7 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                 ensure_reduce_scratch(h_ccd_cpNum),
                 h_ccd_cpNum,
                 m_ccd_alpha_slots + 4);
+        }
         }
         _ccd_final_alpha_combine<<<1, 1>>>(m_ccd_alpha_slots,
                                            h_ccd_cpNum > 0 ? 1 : 0,
@@ -16331,6 +16785,21 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                   sizeof(h_ccd_state),
                                   cudaMemcpyDeviceToHost));
         validateFinalCcdStateOrThrow(h_ccd_state, "device CCD chain");
+        if(ccd_would_skip)
+        {
+            static long long s_verify_n = 0, s_verify_bad = 0, s_verify_pairs = 0;
+            ++s_verify_n;
+            if(h_ccd_cpNum > 0) ++s_verify_pairs;
+            if(memcmp(&h_ccd_state[5], &h_ccd_state[2], sizeof(double)) != 0)
+            {
+                ++s_verify_bad;
+                printf("[ccd-skip-verify] MISMATCH temp %.17g full-chain alpha %.17g cfl %.17g pairs %u\n",
+                       h_ccd_state[2], h_ccd_state[5], h_ccd_state[6], h_ccd_cpNum);
+            }
+            if(s_verify_n % 200 == 0)
+                printf("[ccd-skip-verify] %lld skip-eligible iterations checked (%lld with swept pairs), %lld mismatches\n",
+                       s_verify_n, s_verify_pairs, s_verify_bad);
+        }
         if(getenv("STIFF_CCD_VALIDATE"))
         {
             const double host_temp = h_ccd_state[0] < h_ccd_state[1]
@@ -16371,7 +16840,30 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         diag_refined_alpha = h_ccd_state[4];
         alpha              = h_ccd_state[5];
         alpha_CFL          = h_ccd_state[6];
+        if(m_liquid && getenv("LIQ_DEBUG"))
+            printf("[liq-dbg][ccd] ground %.3g narrow %.3g temp %.3g refined %.3g cfl %.3g final %.3g maxspeed %.3g ccdpairs %u\n",
+                   diag_ground_alpha, diag_narrow_alpha, temp_alpha, diag_refined_alpha, alpha_CFL, alpha, h_ccd_state[3], h_ccd_cpNum);
         diag_refine_used   = h_ccd_cpNum > 0 && temp_alpha > 2.0 * alpha_CFL;
+        if(audit_stats_on())
+        {
+            // S1.5: the swept CCD result is unused when there are no candidates or alpha_CFL >= temp.
+            // 'skip_cfl' is the subset that a surface max-|d| reduction run BEFORE the swept build
+            // proves skippable (0.5 sqrt(dHat) / max|d| >= temp), whatever the candidate count.
+            ++g_aud_ccd_iters;
+            double max_speed = h_ccd_state[3];
+            if(h_ccd_cpNum == 0 && surf_vertexNum >= 1)
+            {
+                static double* d_ms = nullptr;
+                if(!d_ms) CUDA_SAFE_CALL(cudaMalloc((void**)&d_ms, sizeof(double)));
+                cfl_largestSpeed_DeviceOut(pcg_data.squeue, d_ms);
+                CUDA_SAFE_CALL(cudaMemcpy(&max_speed, d_ms, sizeof(double), cudaMemcpyDeviceToHost));
+            }
+            const double cfl_bound = (max_speed > 0.0) ? 0.5 * sqrt(dHat) / max_speed : 1e300;
+            if(h_ccd_cpNum == 0 || !(alpha_CFL < temp_alpha)) ++g_aud_ccd_unused;
+            if(cfl_bound >= temp_alpha) ++g_aud_ccd_skip_cfl;
+            if(h_ccd_cpNum > 0 && alpha_CFL < temp_alpha && !(temp_alpha > 2.0 * alpha_CFL)) ++g_aud_ccd_deadband;
+            if(diag_refine_used) ++g_aud_ccd_refine;
+        }
 
         if(phase_time) CUDA_SAFE_CALL(cudaEventRecord(end2));
         //printf("alpha:  %f\n", alpha);
@@ -16878,6 +17370,50 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
     // [phase-time] cumulative GPU ms per phase (across frames). time0=Hessian/grad assembly,
     // time1=PCG linear solve, time2=CCD-BVH build, time3=line-search(+per-env alpha), time4=κ update.
     // Compare modes to localize the isolated/strict slowdown. Also reports Newton iters this frame.
+    if(getenv("STIFF_AUDIT_BVH"))
+    {
+        unsigned long long c[24];
+        get_bvh_cnt(c);
+        reset_bvh_cnt();
+        printf("[audit-bvh] vfDCD push %llu leaf %llu body-ok %llu narrow %llu | eeDCD push %llu leaf %llu body-ok %llu adj %llu dedup %llu narrow %llu"
+               " | vfCCD push %llu leaf %llu body-ok %llu emit %llu | eeCCD push %llu leaf %llu body-ok %llu adj %llu dedup %llu emit %llu\n",
+               c[0], c[1], c[2], c[5], c[6], c[7], c[8], c[9], c[10], c[11],
+               c[12], c[13], c[14], c[17], c[18], c[19], c[20], c[21], c[22], c[23]);
+        // [audit A3 tail] per-thread work: histogram of pushes, per-kind maxima, heaviest threads
+        static unsigned int       recs[256 * 8];
+        unsigned int              h[32];
+        unsigned long long        m[16];
+        const unsigned int        nrec = get_bvh_tail(h, m, recs);
+        reset_bvh_tail();
+        static const char* kn[4] = {"vfDCD", "eeDCD", "vfCCD", "eeCCD"};
+        printf("[audit-bvh-tail]");
+        for(int q = 0; q < 4; ++q)
+            printf(" | %s threads %u hist %u/%u/%u/%u/%u/%u/%u max push %llu (prim %llu) leaf %llu (prim %llu) ok %llu narrow %llu (prim %llu)",
+                   kn[q], h[q * 8 + 7], h[q * 8 + 0], h[q * 8 + 1], h[q * 8 + 2], h[q * 8 + 3], h[q * 8 + 4], h[q * 8 + 5], h[q * 8 + 6],
+                   m[q * 4 + 0] >> 32, m[q * 4 + 0] & 0xffffffffull, m[q * 4 + 1] >> 32, m[q * 4 + 1] & 0xffffffffull,
+                   m[q * 4 + 2] >> 32, m[q * 4 + 3] >> 32, m[q * 4 + 3] & 0xffffffffull);
+        printf(" | tail %u\n", nrec);
+        const unsigned int nr = nrec < 256u ? nrec : 256u;
+        std::vector<int> order(nr);
+        for(unsigned int i = 0; i < nr; ++i) order[i] = (int)i;
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return recs[a * 8 + 2] > recs[b * 8 + 2]; });
+        for(unsigned int i = 0; i < nr && i < 8u; ++i)
+        {
+            const unsigned int* r = recs + order[i] * 8;
+            float len; memcpy(&len, &r[7], sizeof(float));
+            printf("[audit-bvh-tail-rec] %s prim %u push %u leaf %u ok %u narrow %u body %d len %.2f mm\n",
+                   kn[r[0] & 3u], r[1], r[2], r[3], r[4], r[5], (int)r[6], 1000.0f * len);
+        }
+    }
+    if(audit_stats_on())
+        printf("[audit] newton %d | ls calls %d trials %d max %d | ccd iters %d unused %d skip_cfl %d deadband %d refine %d"
+               " | k0_exit %d | pairs max %lld pinned max %lld | liq expanded max %lld contact particles max %lld | kappa %.4e"
+               " | pcg solves %lld build %.2f solve %.2f (setup %.2f iter %.2f) ms"
+               " | ls-split step %.2f bvh %.2f cp %.2f e %.2f ms\n",
+               k, g_aud_ls_calls, g_aud_ls_trials, g_aud_ls_max_trials, g_aud_ccd_iters, g_aud_ccd_unused,
+               g_aud_ccd_skip_cfl, g_aud_ccd_deadband, g_aud_ccd_refine, g_aud_k0_exit, g_aud_pairs_max,
+               g_aud_pin_pairs_max, g_aud_liq_exp_max, g_aud_liq_cpart_max, Kappa, g_pcg_solves, g_pcg_build_ms, g_pcg_solve_ms, g_pcg_setup_ms,
+               g_pcg_iter_ms, g_aud_ls_step_ms, g_aud_ls_bvh_ms, g_aud_ls_cp_ms, g_aud_ls_e_ms);
     if(getenv("STIFF_PHASE_TIME"))
         printf("[phase-time cum-ms] Hess=%.0f PCG=%.0f ccdBVH=%.0f lineSearch=%.0f kappaUpd=%.0f | ls-split[s1=%.0f ls=%.0f] ls-inner[e=%.0f bvh=%.0f cp=%.0f step=%.0f] | this-frame-newton-iters=%d cum-pcg-iters=%lld\n",
                time0, time1, time2, time3, time4, g_t3_s1_ms, g_t3_ls_ms,
@@ -17189,6 +17725,7 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
     commitFrictionAnchors(TetMesh);
 #endif
 
+    if(m_liquid) m_liquid->hydrostatic_probe(TetMesh);
     updateVelocities(TetMesh);
 
     computeXTilta(TetMesh, 1);
@@ -17270,4 +17807,18 @@ void   GIPC::IPC_Solver(device_TetraData& TetMesh)
 
     auto f = stats.frame();
     stats.frame(f + 1);
+}
+
+
+void GIPC::update_tet_plasticity(device_TetraData& TetMesh)
+{
+    if(!tetPlastic || tetrahedraNum == 0) return;
+    ::update_tet_plasticity(TetMesh.vertexes, TetMesh.tetrahedras, TetMesh.DmInverses, TetMesh.lengthRate, TetMesh.tet_plastic, (int)tetrahedraNum);
+}
+
+void GIPC::update_bending_plasticity(device_TetraData& TetMesh)
+{
+    if(bendYieldAngle <= 0.0 || tri_edge_num == 0) return;
+    ::update_bending_plasticity(TetMesh.vertexes, TetMesh.rest_vertexes, TetMesh.tri_edges, TetMesh.tri_edge_adj_vertex,
+                                (int)tri_edge_num, TetMesh.bend_theta_p, bendYieldAngle, bendPlasticRate);
 }
