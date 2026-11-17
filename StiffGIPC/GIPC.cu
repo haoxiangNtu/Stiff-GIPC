@@ -9421,7 +9421,7 @@ void GIPC::MALLOC_DEVICE_MEM()
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_line_search_decision, sizeof(int)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&m_newton_convergence_decision, sizeof(int)));
     // Device-resident CCD alpha/control chain (see slot layout in GIPC.cuh).
-    CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 9 * sizeof(double)));   // slot 8: unused, kept at 1
+    CUDA_SAFE_CALL(cudaMalloc((void**)&m_ccd_alpha_slots, 9 * sizeof(double)));   // slot 8: liquid volume feasible step (1 when absent)
     {
         const double one = 1.0;
         CUDA_SAFE_CALL(cudaMemcpy(m_ccd_alpha_slots + 8, &one, sizeof(double), cudaMemcpyHostToDevice));
@@ -16601,7 +16601,8 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
 
         // [liquid fast mode] LIQ_NEWTON_CAP=<n>: the liquid rows take at most n Newton directions per step and are then
         // frozen (zero move) while the solids keep converging. A truncated Newton leaves the inertia-only (shear / hourglass)
-        // modes of the particle-quadrature liquid under-resolved = numerical damping of its null-space creep. Liquid-only here.
+        // modes of the particle-quadrature liquid under-resolved = numerical damping of its null-space creep, which is what
+        // the recovered Unified_GIPC engine does globally (2-3 iterations, physical-direction stop). Liquid-only here.
         {
             static const int s_liq_newton_cap = getenv("LIQ_NEWTON_CAP") ? atoi(getenv("LIQ_NEWTON_CAP")) : 0;
             if(m_liquid && s_liq_newton_cap > 0 && (int)k >= s_liq_newton_cap) m_liquid->zero_rows(_moveDir, vertexNum);
@@ -16949,6 +16950,9 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
                                            m_ccd_alpha_invalid,
                                            m_ccd_refined_invalid);
 
+        // [liquid] LIQ_UG volume feasible step into slot 8 of the same chain (device side, rides the single D2H below)
+        if(m_liquid && m_liquid->has_feasible_step())
+            m_liquid->feasible_alpha_device(TetMesh.vertexes, _moveDir, m_ccd_alpha_slots + 8);
         // One scalar-chain D2H after every global decision and validation bit.
         double h_ccd_state[9] = {1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0};
         CUDA_SAFE_CALL(cudaMemcpy(h_ccd_state,
@@ -17011,6 +17015,11 @@ int              GIPC::solve_subIP(device_TetraData& TetMesh,
         diag_refined_alpha = h_ccd_state[4];
         alpha              = h_ccd_state[5];
         alpha_CFL          = h_ccd_state[6];
+        if(m_liquid && m_liquid->has_feasible_step() && h_ccd_state[8] < alpha)
+        {   // no particle may invert along x - alpha d (the recovered engine's volume feasible step)
+            alpha = h_ccd_state[8];
+            ++m_liquid->feasible_hits;
+        }
         if(m_liquid && getenv("LIQ_DEBUG"))
             printf("[liq-dbg][ccd] ground %.3g narrow %.3g temp %.3g refined %.3g cfl %.3g final %.3g maxspeed %.3g ccdpairs %u\n",
                    diag_ground_alpha, diag_narrow_alpha, temp_alpha, diag_refined_alpha, alpha_CFL, alpha, h_ccd_state[3], h_ccd_cpNum);

@@ -45,6 +45,19 @@ struct LiquidParams
                                  //   shared-node (thin wall) modes stays, the bulk (where sloshing lives) is second order. 1 = the 27-node stencil of every
                                  //   wall-point particle (~1.5 cells: at dx 5 that is most of a beaker), 2 = only the corners of the cut cells (~0.5 cell),
                                  //   0 = BDF2 everywhere
+    int     ug         = 0;      // LIQ_UG: particle-quadrature liquid of the recovered Unified_GIPC engine (liquid_ug.cuh): trilinear
+                                 //   8-node stencil, per-particle kappa/2 (J-1)^2 + volume barrier, contact only through the particle
+                                 //   IPC barrier; turns every wall / rest / regularisation option of this system off (see configure)
+    double  ug_jact    = 0.0;    // LIQ_UG_JACT: volume-barrier activation ratio (0 = off; recovered default range (0, 1))
+    double  ug_kb      = 1.0;    // LIQ_UG_KB: volume-barrier stiffness in units of kappa
+    double  ug_mfloor  = 0.0;    // LIQ_UG_MFLOOR: node mass floor in UG mode (fraction of rho dx^3; the recovered engine has none)
+    int     ug_bspline = 0;      // LIQ_UG_BSPLINE: 1 = quadratic B-spline 27-node stencil instead of the trilinear 8-node one (liquid_ug.cuh)
+    double  ug_reanchor = 0.0;   // LIQ_UG_REANCHOR: beta of the density re-anchor of interior particles after each step (k_reanchor_J; 0 = off)
+    double  ug_feasible = 0.9;   // LIQ_UG_FEASIBLE: safety factor of the volume feasible step (first alpha in (0,1] with det A = 0, x factor); 0 = off
+    double  ug_hg       = 0.0;   // LIQ_UG_HG: hourglass viscosity (Pa s) on the trilinear stencil's zero-energy modes (sub-cell clustering control); 0 = off
+    double  ug_rep      = 0.0;   // LIQ_UG_REP: sub-cell density control = pair repulsion energy 1/2 k (r0 - r)^2 between particles closer than
+                                 //   r0 (k = ug_rep x kappa x h, the bulk stiffness of one particle); reuses the LIQ_STI pair pipeline; 0 = off
+    double  ug_rep_r0   = 0.8;   // LIQ_UG_REP_R0: repulsion range in seed spacings (no pairs exist at rest: the seed spacing is 1.0)
     int     bdf2       = 0;      // LIQ_BDF2: second-order BDF2 (velocity form) for the grid nodes instead of implicit Euler:
                                  //   v1 = 4/3 v - 1/3 v_prev + 2/3 dt a(x1),  x1 = x + dt (19/18 v - 1/18 v_prev) + 4/9 dt^2 a(x1)
                                  //   = an incremental potential with node mass x 9/4 and that predictor (the solver is unchanged).
@@ -443,10 +456,11 @@ class LiquidSystem
     double*  d_gm_red  = nullptr;
     int      h_gm = 0, gm_cap = 0;
     bool     bh_init  = false;
-    bool coh_active() const { return P.sti_gamma > 0.0 && h_coh > 0 && d_coh_pairs && wfc_x; }
-    double pair_k() const { return 2.0 * P.sti_gamma * h_spacing * h_spacing; }   // pair energy scale (J/m^2 or J)
-    double pair_r0() const { return P.sti_r0 * h_spacing; }
-    double pair_rc() const { return P.sti_rc * h_spacing; }
+    bool rep_on() const { return P.ug && P.ug_rep > 0.0; }                       // LIQ_UG_REP: the pair pipeline runs as repulsion
+    bool coh_active() const { return (P.sti_gamma > 0.0 || rep_on()) && h_coh > 0 && d_coh_pairs && wfc_x; }
+    double pair_k() const { return rep_on() ? P.ug_rep * P.kappa * h_spacing : 2.0 * P.sti_gamma * h_spacing * h_spacing; }   // pair energy scale (J/m^2 or J)
+    double pair_r0() const { return (rep_on() ? P.ug_rep_r0 : P.sti_r0) * h_spacing; }
+    double pair_rc() const { return (rep_on() ? P.ug_rep_r0 : P.sti_rc) * h_spacing; }
     // membrane surface tension (LIQ_STM): surface elements of this step (particle index + tangents), built in pre_step
     int*     d_stm_flag = nullptr;
     int*     d_stm_scan = nullptr;
@@ -472,6 +486,12 @@ class LiquidSystem
     double*  d_vox_Jb    = nullptr;
     int3*    d_vox_ijk   = nullptr;
     double*  d_reduce    = nullptr;  // energy partials
+    int*     d_ug_nodes  = nullptr;  // LIQ_UG: 8 vertex ids per particle (-1 = inactive node)
+    double*  d_ug_hmass  = nullptr;  // LIQ_UG + LIQ_BDF2: scratch node mass / ref flags of the history P2G
+    int*     d_ug_href   = nullptr;
+    double*  d_ug_w      = nullptr;  //         8 weights per particle
+    double3* d_ug_grad   = nullptr;  //         8 weight gradients per particle
+    double*  d_ug_red    = nullptr;  //         energy partials (blocks of particles)
     double3* d_md_scaled = nullptr;  // scaled copy of moveDir for the convergence test (vertexNum)
     int      n_vertices_total = 0;
     // neighbour grid over the lattice cells (post-step push-apart / density)
@@ -707,8 +727,16 @@ class LiquidSystem
                   Eigen::Matrix3d* triplet_values,
                   int*             row_ids,
                   int*             col_ids);
-    int  triplet_count() const { return 36 * h_elements + (wall_active() ? h_active_nodes : 0) + 45 * h_ag; }
-    bool has_elements() const { return h_active_cells > 0; }
+    int  ug_ns() const { return P.ug_bspline ? 27 : 8; }                 // LIQ_UG stencil nodes per particle
+    bool   has_feasible_step() const { return P.ug && P.ug_feasible > 0.0; }
+    double feasible_alpha(const double3* vertexes, const double3* dir);   // LIQ_UG: largest line-search step keeping every particle's det A > 0 (k_ug_feasible)
+    void   feasible_alpha_device(const double3* vertexes, const double3* dir, double* out_slot);   // same, written into a device slot of the CCD alpha chain
+    long long feasible_hits = 0;    // Newton iterations where the bound was below the contact alpha
+    int  ug_nb() const { int k = ug_ns(); return k * (k + 1) / 2; }  // LIQ_UG upper-triangle Hessian blocks per particle (36 / 378)
+    int  triplet_count() const { return P.ug ? ug_nb() * n_particles : 36 * h_elements + (wall_active() ? h_active_nodes : 0) + 45 * h_ag; }
+    bool has_elements() const { return P.ug ? (n_particles > 0 && h_active_nodes > 0) : h_active_cells > 0; }
+    void ug_pre(device_TetraData& m, double dt, double3 gravity);
+    void ug_post(device_TetraData& m, double dt);
     // sum_c V_c psi(J_c)  (WITHOUT dt^2; the energy combine scales by dt^2)
     void energy_device_out(const double3* vertexes, double* out_slot);
 

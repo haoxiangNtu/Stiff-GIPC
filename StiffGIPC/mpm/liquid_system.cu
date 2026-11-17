@@ -108,11 +108,31 @@ struct NodeStencil
     int    b[3];
     double w[3][3];
 };
+__device__ int g_liq_tri = 0;   // LIQ_UG: the embedding is the trilinear stencil of the particle's cell, packed into the 27-node layout
 __device__ __forceinline__ NodeStencil node_stencil(int3 base, double3 frac)
 {
     NodeStencil s;
     s.b[0] = base.x; s.b[1] = base.y; s.b[2] = base.z;
     double f[3] = {frac.x, frac.y, frac.z};
+    if(g_liq_tri == 2)
+    {   // LIQ_UG_BSPLINE: quadratic B-spline at node coordinate b + 1/2 + f (= ug_weights_q of liquid_ug.cuh)
+        for(int a = 0; a < 3; ++a)
+        {
+            s.w[a][0] = 0.5 * (1.0 - f[a]) * (1.0 - f[a]);
+            s.w[a][1] = 0.75 - (f[a] - 0.5) * (f[a] - 0.5);
+            s.w[a][2] = 0.5 * f[a] * f[a];
+        }
+        return s;
+    }
+    if(g_liq_tri)
+    {   // particle at node coordinate b + 1/2 + f: nodes (b, b+1) for f < 1/2, (b+1, b+2) otherwise
+        for(int a = 0; a < 3; ++a)
+        {
+            if(f[a] < 0.5) { s.w[a][0] = 0.5 - f[a]; s.w[a][1] = 0.5 + f[a]; s.w[a][2] = 0.0; }
+            else           { s.w[a][0] = 0.0; s.w[a][1] = 1.5 - f[a]; s.w[a][2] = f[a] - 0.5; }
+        }
+        return s;
+    }
     for(int a = 0; a < 3; ++a)
     {
         s.w[a][0] = 0.5 * (1.0 - f[a]);
@@ -2362,6 +2382,7 @@ __global__ void k_vox_energy(int            nvox,
     }
     if(threadIdx.x == 0) partial[blockIdx.x] = sh[0];
 }
+#include "liquid_ug.cuh"
 
 __global__ void k_sum_partials(int n, const double* partial, double* out)
 {
@@ -3326,8 +3347,16 @@ __global__ void k_neighbors(int n, const double3* xp, const double* mp, const in
 // psi (unit = bond energy k = 2 gamma h^2): -1 at the rest distance r0 (no force), repulsive below (-1 + A (1 - r/r0)^2,
 // A matching the curvature at r0), attractive up to the cutoff rc (smoothstep back to 0, zero force at rc).
 // ----------------------------------------------------------------------------
+__device__ int g_coh_mode = 0;   // 0 = LIQ_STI cohesion, 1 = LIQ_UG_REP repulsion (1/2 (r0 - r)^2 below r0, nothing beyond)
 __device__ __forceinline__ void coh_psi(double r, double r0, double rc, double& e, double& d1, double& d2)
 {
+    if(g_coh_mode == 1)
+    {   // cubic onset (C2 at r0: the Hessian does not jump when a pair enters the range, which kept the Newton chattering)
+        if(r >= r0) { e = 0.0; d1 = 0.0; d2 = 0.0; return; }
+        const double u = r0 - r;
+        e = u * u * u / (3.0 * r0); d1 = -u * u / r0; d2 = 2.0 * u / r0;
+        return;
+    }
     if(r >= rc) { e = 0.0; d1 = 0.0; d2 = 0.0; return; }
     const double L = rc - r0;
     if(r >= r0)
@@ -4463,6 +4492,35 @@ void LiquidSystem::configure(const LiquidParams& p, const std::vector<double3>& 
     liquid_require(std::isfinite(P.wall_tang) && P.wall_tang >= 0.0 && P.wall_tang <= 1.0, "LIQ_WALL_TANG must be in [0, 1]");
     liquid_require(P.wall_static_normal == 0 || P.wall_static_normal == 1, "LIQ_WALL_STATIC_NORMAL must be 0 or 1");
     liquid_require(!(P.wb && P.wb_slip && P.bdf2) || P.bdf2_wall_be != 0, "LIQ_WB slip nodes need LIQ_BDF2_WALL_BE >= 1 under LIQ_BDF2 (they are implicit-Euler nodes)");
+    P.ug = (int)liquid_env("LIQ_UG", (double)P.ug);
+    P.ug_jact = liquid_env("LIQ_UG_JACT", P.ug_jact);
+    P.ug_kb = liquid_env("LIQ_UG_KB", P.ug_kb);
+    P.ug_mfloor = liquid_env("LIQ_UG_MFLOOR", P.ug_mfloor);
+    P.ug_bspline = (int)liquid_env("LIQ_UG_BSPLINE", (double)P.ug_bspline);
+    P.ug_reanchor = liquid_env("LIQ_UG_REANCHOR", P.ug_reanchor);
+    P.ug_feasible = liquid_env("LIQ_UG_FEASIBLE", P.ug_feasible);
+    P.ug_hg       = liquid_env("LIQ_UG_HG", P.ug_hg);
+    liquid_require(finite_nonnegative(P.ug_hg), "LIQ_UG_HG must be a nonnegative viscosity (Pa s)");
+    P.ug_rep      = liquid_env("LIQ_UG_REP", P.ug_rep);
+    P.ug_rep_r0   = liquid_env("LIQ_UG_REP_R0", P.ug_rep_r0);
+    liquid_require(finite_nonnegative(P.ug_rep) && finite_positive(P.ug_rep_r0) && P.ug_rep_r0 < 1.0, "LIQ_UG_REP must be nonnegative and LIQ_UG_REP_R0 in (0, 1) seed spacings");
+    liquid_require(P.ug == 0 || P.ug == 1, "LIQ_UG must be 0 or 1");
+    liquid_require(P.ug_bspline == 0 || P.ug_bspline == 1, "LIQ_UG_BSPLINE must be 0 or 1");
+    liquid_require(finite_nonnegative(P.ug_reanchor) && P.ug_reanchor <= 1.0, "LIQ_UG_REANCHOR must be in [0, 1]");
+    liquid_require(finite_nonnegative(P.ug_feasible) && P.ug_feasible <= 1.0, "LIQ_UG_FEASIBLE must be in [0, 1]");
+    liquid_require(finite_nonnegative(P.ug_jact) && P.ug_jact < 1.0 && finite_positive(P.ug_kb) && finite_nonnegative(P.ug_mfloor),
+                   "LIQ_UG_JACT must be in [0, 1), LIQ_UG_KB positive, LIQ_UG_MFLOOR nonnegative");
+    if(P.ug)
+    {   // the recovered engine's liquid: no grid wall BC, no rest / regularisation layers; only the particle barrier meets the solids
+        P.wfc = P.wfc_ground = P.gp = 0; P.cpic = 0; P.wb = 0; P.cutcell = 0; P.wall_bc = P.ground_bc = 0;
+        P.rest_damp = 0.0; P.sleep_v = 0.0; P.isl_v = 0.0; P.push_film = 0;   // LIQ_REST_K / LIQ_REST_KV (in-solve rest drag of slow nodes, k_write_node_slots) stay available in UG mode
+        P.push_apart = liquid_env("LIQ_UG_PUSH", 0.0);   // explicit pre-solve push-apart (main-path push_apart_pass) as the cheap sub-cell density control of UG mode; 0 = off
+        P.st_gamma = 0.0; P.sti_gamma = 0.0; P.stm_sigma = 0.0; P.stick_h = 0.0; P.ghost_floor = 0.0; P.jfilt = 0.0;
+        P.vbar = 0.0; P.visc = 0.0; P.pdev = 0.0; P.flip = 0.0; P.j_mode = 0; P.gm = 0;   // LIQ_BDF2 stays available (grid-node BDF2, no wall arrays in UG)
+        P.g2p_jcell = 0; P.g2p_fluid = 0; P.wb_g2p = 0; P.wb_aggr = 0.0;
+        P.mass_floor = P.ug_mfloor;
+        P.apic = 1;
+    }
     liquid_require(P.gm == 0 || P.gm == 1, "LIQ_GHOST_MIRROR must be 0 or 1");
     liquid_require(P.gm == 0 || liquid_env("LIQ_GHOST_MIRROR_RESEARCH", 0) == 1,
                    "LIQ_GHOST_MIRROR rejected 2026-10-23 (still water worse: flask 1.1 mm/s, tanks 6-14 mm/s; WATER_REALISM_REVIEW_2026-10-23.md); "
@@ -4535,6 +4593,10 @@ int LiquidSystem::estimate_seed_nodes() const
 void LiquidSystem::alloc_device()
 {
     free_device();
+    {
+        int tri = P.ug ? (P.ug_bspline ? 2 : 1) : 0;   // LIQ_UG: trilinear (1) / quadratic B-spline (2) embedding for every node_stencil user (contact chain rule, particle slots)
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_liq_tri, &tri, sizeof(int)));
+    }
     const int n = n_particles;
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_xp, n * sizeof(double3)));
     CUDA_SAFE_CALL(cudaMalloc((void**)&d_vp, n * sizeof(double3)));
@@ -4745,7 +4807,12 @@ void LiquidSystem::push_apart_pass()
     if(P.push_film && steps_done == 1)
         printf("[liquid] push-apart film mode %d: water within %.1f mm of the ground plane, spacing %.2f mm%s\n", P.push_film, P.dx * 1e3, r0f * 1e3,
                film ? "" : " -- INACTIVE (needs LIQ_WFC or LIQ_CPIC, a +y ground plane and dhat < the wall search radius)");
-    k_neighbors<0><<<blocks_for(n), 256>>>(n, d_xp, d_mp, d_pkey, d_pidx, d_cstart, d_cend, P.origin, P.dx, P.dims, r0, cap, 0.0, d_push, d_rho, d_pflag,
+    // LIQ_UG_PUSH_CONTACT=1 (UG mode): particles in solid contact are pushed too (the per-step cap < 0.45 dhat keeps them
+    // outside the surface; the barrier + CCD of this step then hold them), so the contact layer at the floor / walls is
+    // regularised like the interior instead of being skipped
+    static const int s_push_contact = getenv("LIQ_UG_PUSH_CONTACT") ? atoi(getenv("LIQ_UG_PUSH_CONTACT")) : 0;
+    const int* pflag_push = (P.ug && s_push_contact) ? nullptr : d_pflag;
+    k_neighbors<0><<<blocks_for(n), 256>>>(n, d_xp, d_mp, d_pkey, d_pidx, d_cstart, d_cend, P.origin, P.dx, P.dims, r0, cap, 0.0, d_push, d_rho, pflag_push,
                                            d_mc, d_cell_flag, P.rho * P.dx * P.dx * P.dx, P.push_surf_ratio,
                                            (P.cpic && d_wp_near) ? d_wp_near : nullptr, d_wp_X, d_wp_n,
                                            film, film ? d_wp_near : nullptr, P.clamp_lo_y - 1e-4, P.dx, r0f, d_vp);
@@ -4879,6 +4946,9 @@ void LiquidSystem::free_device()
     d_pkey = d_pidx = d_cstart = d_cend = nullptr;
     d_push = nullptr;
     d_rho  = nullptr;
+    for(void* q : {(void*)d_ug_nodes, (void*)d_ug_w, (void*)d_ug_grad, (void*)d_ug_red, (void*)d_ug_hmass, (void*)d_ug_href})
+        if(q) cudaFree(q);
+    d_ug_nodes = nullptr; d_ug_w = nullptr; d_ug_grad = nullptr; d_ug_red = nullptr; d_ug_hmass = nullptr; d_ug_href = nullptr;
     d_pbase = nullptr; d_pfrac = nullptr; d_Hpp = nullptr; d_pflag = nullptr; d_counters = nullptr; d_fallback = nullptr; d_pmask = nullptr; d_pwinv = nullptr;
     { int* fp = nullptr; cudaMemcpyToSymbol(g_liq_fbk, &fp, sizeof(int*)); }
     d_md_scaled = nullptr;
@@ -5167,6 +5237,13 @@ void LiquidSystem::pre_step(device_TetraData& m, double dt, double3 gravity)
     if(P.push_apart > 0.0 && steps_done > 0)
     {
         build_neighbor_grid();
+        if(P.ug)
+        {   // LIQ_UG_PUSH: the free-surface gate of k_neighbors<0> reads the tent cell masses, which only the main-path P2G
+            // (or the UG re-anchor) fills -> deposit them here, otherwise every particle counts as surface and nothing moves
+            CUDA_SAFE_CALL(cudaMemsetAsync(d_mc, 0, n_cells * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMemsetAsync(d_cell_flag, 0, n_cells * sizeof(int)));
+            k_ug_cellmass<<<blocks_for(n_particles), 256>>>(n_particles, d_xp, d_mp, P.origin, P.dx, P.dims, d_mc, d_cell_flag);
+        }
         push_apart_pass();
     }
     if(pump_r > 0.0 && pump_mode == 2)
@@ -5283,8 +5360,15 @@ void LiquidSystem::pre_step(device_TetraData& m, double dt, double3 gravity)
     // particle stencils are final here (push-apart, pump, porous, surface tension are done): build them before the
     // wall geometry (compatibility masks need them) and the transfers
     k_particle_stencil<<<blocks_for(n), 256>>>(n, d_xp, P.origin, P.dx, P.dims, d_pbase, d_pfrac);
+    if(P.ug)
+    {
+        if(rep_on()) cohesion_pairs();   // LIQ_UG_REP: step-start pair list (the main-path call below is not reached in UG mode)
+        ug_pre(m, dt, gravity);
+        g_prof.stop(5);
+        return;
+    }
     if((P.wfc || P.cpic) && d_faces && n_faces > 0) wall_geometry(m);   // nearest wall per particle (+ masks), step-start solid positions
-    if(P.sti_gamma > 0.0) cohesion_pairs();
+    if(P.sti_gamma > 0.0 || rep_on()) cohesion_pairs();
     if(P.stm_sigma > 0.0) stm_setup();
     if(P.bdf2)
     {
@@ -6796,7 +6880,7 @@ void LiquidSystem::wfc_points(device_TetraData& m)
 void LiquidSystem::chain_rule_contact(double3* fb, GIPCTripletMatrix& T)
 {
     const bool   coh  = coh_active();
-    const double kdt2 = pair_k() * last_dt * last_dt;   // bond (LIQ_STI) energy scale in Newton units
+    const double kdt2 = pair_k() * last_dt * last_dt;   // bond (LIQ_STI) / repulsion (LIQ_UG_REP) energy scale in Newton units
     if(coh)   // on the particle rows: the particle chain rule below maps it with the contact gradient
         k_coh_grad<<<blocks_for(h_coh), 256>>>(h_coh, d_coh_pairs, d_coh_w, wfc_x, particle_slot_base, kdt2, pair_r0(), pair_rc(), fb);
     chain_rule_contact_particles(fb, T);
@@ -6891,7 +6975,7 @@ void LiquidSystem::chain_rule_contact(double3* fb, GIPCTripletMatrix& T)
 
 void LiquidSystem::wfc_commit_activity(const double3* vertexes)
 {   // called by the engine after the Newton solve of a step, BEFORE it commits o_vertexes = x (the solid displacement of the step is still x - o_vertexes)
-    if((!P.wfc_pre && !P.wfc_al) || !wfc_active() || !d_wp_act || !d_overt || n_particles <= 0) return;
+    if((!P.wfc_pre && !P.wfc_al) || P.ug || !wfc_active() || !d_wp_act || !d_overt || n_particles <= 0) return;
     if(h_wp <= 0)
     {
         CUDA_SAFE_CALL(cudaMemsetAsync(d_wp_act, 0, n_particles * sizeof(int)));
@@ -6935,7 +7019,17 @@ void LiquidSystem::cohesion_pairs()
     }
     if(!d_coh_cwall) CUDA_SAFE_CALL(cudaMalloc((void**)&d_coh_cwall, (size_t)n_cells * sizeof(int)));
     build_neighbor_grid();   // final step-start positions (push-apart, pump, porous moved them)
-    if(!(P.sti_freeze && coh_gate_done))
+    if(rep_on())
+    {   // LIQ_UG_REP: every particle takes part (no surface gate); the potential switches to repulsion in coh_psi
+        if(!coh_gate_done)
+        {
+            const int mode = 1;
+            CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_coh_mode, &mode, sizeof(int)));
+            thrust::fill(thrust::device, thrust::device_pointer_cast(d_coh_s), thrust::device_pointer_cast(d_coh_s) + n, 1.0);
+            coh_gate_done = true;
+        }
+    }
+    else if(!(P.sti_freeze && coh_gate_done))
     {   // LIQ_STI_FREEZE keeps the first step's gate (diagnostic: no pair switches on or off between steps)
         CUDA_SAFE_CALL(cudaMemsetAsync(d_coh_cwall, 0, (size_t)n_cells * sizeof(int)));
         k_coh_wallcells<<<blocks_for(n), 256>>>(n, d_xp, (P.wfc || P.cpic) ? d_wp_near : nullptr, P.origin, P.dx, P.dims, d_coh_cwall);
@@ -6956,7 +7050,13 @@ void LiquidSystem::cohesion_pairs()
         cnt = coh_cap;
     }
     h_coh = cnt;
-    if(steps_done == 0)
+    if(rep_on())
+    {
+        if(steps_done == 0 || steps_done % 200 == 0)
+            printf("[liquid] LIQ_UG_REP sub-cell density control: pair repulsion k %.3g N/m below %.2f mm (%.2f seed spacings), %d pairs (step %d)\n",
+                   pair_k(), pair_r0() * 1e3, P.ug_rep_r0, h_coh, steps_done);
+    }
+    else if(steps_done == 0)
         printf("[liquid] implicit surface tension ON: gamma %.4g N/m (bond %.3g J), rest %.2f mm, cutoff %.2f mm, surface particles (air-adjacent cells, wall layer excluded), %d pairs\n",
                P.sti_gamma, 2.0 * P.sti_gamma * h_spacing * h_spacing, P.sti_r0 * h_spacing * 1e3, P.sti_rc * h_spacing * 1e3, h_coh);
     else if(steps_done % 200 == 0)
@@ -7249,6 +7349,21 @@ void LiquidSystem::force_probe(const double3* vertexes, int fem_off, double dt, 
 
 void LiquidSystem::assemble(const double3* vertexes, int fem_off, double dt, int global_offset, Eigen::Matrix3d* vals, int* rows, int* cols)
 {
+    if(P.ug)
+    {
+        if(n_particles <= 0 || h_active_nodes <= 0) return;
+        g_prof.start();
+        if(P.ug_bspline)
+            k_ug_assemble<3><<<blocks_for(n_particles, 128), 128>>>(n_particles, d_ug_nodes, d_ug_grad, d_Vp0, d_Jp, vertexes, UgGrid{d_active_nodes, node_slot_base, P.dims, P.origin, P.dx}, P.kappa, P.tension_ratio,
+                                                                   P.ug_jact, P.ug_kb * P.kappa, dt, fem_off, global_offset, vals, rows, cols, P.ug_hg);
+        else
+            k_ug_assemble<2><<<blocks_for(n_particles, 128), 128>>>(n_particles, d_ug_nodes, d_ug_grad, d_Vp0, d_Jp, vertexes, UgGrid{d_active_nodes, node_slot_base, P.dims, P.origin, P.dx}, P.kappa, P.tension_ratio,
+                                                                   P.ug_jact, P.ug_kb * P.kappa, dt, fem_off, global_offset, vals, rows, cols, P.ug_hg);
+        CUDA_SAFE_CALL(cudaGetLastError());
+        g_prof.stop(0);
+        g_prof.tick();
+        return;
+    }
     if(h_elements <= 0) return;
     {   // LIQ_FORCE_PROBE=<prefix>, LIQ_FORCE_PROBE_STEP=<n>: per-term node forces at the first Newton iterate (u = 0) of step n
         const char* fpre = getenv("LIQ_FORCE_PROBE");
@@ -7292,6 +7407,20 @@ void LiquidSystem::assemble(const double3* vertexes, int fem_off, double dt, int
 
 void LiquidSystem::energy_device_out(const double3* vertexes, double* out_slot)
 {
+    if(P.ug)
+    {
+        if(n_particles <= 0 || h_active_nodes <= 0) { CUDA_SAFE_CALL(cudaMemsetAsync(out_slot, 0, sizeof(double))); return; }
+        const int t = 256, b = blocks_for(n_particles, t);
+        if(P.ug_bspline)
+            k_ug_energy<3><<<b, t, t * sizeof(double)>>>(n_particles, d_ug_nodes, d_ug_grad, d_Vp0, d_Jp, vertexes, UgGrid{d_active_nodes, node_slot_base, P.dims, P.origin, P.dx}, P.kappa, P.tension_ratio,
+                                                         P.ug_jact, P.ug_kb * P.kappa, d_ug_red, P.ug_hg, last_dt > 0.0 ? last_dt : 1.0);
+        else
+            k_ug_energy<2><<<b, t, t * sizeof(double)>>>(n_particles, d_ug_nodes, d_ug_grad, d_Vp0, d_Jp, vertexes, UgGrid{d_active_nodes, node_slot_base, P.dims, P.origin, P.dx}, P.kappa, P.tension_ratio,
+                                                         P.ug_jact, P.ug_kb * P.kappa, d_ug_red, P.ug_hg, last_dt > 0.0 ? last_dt : 1.0);
+        k_sum_partials<<<1, 1>>>(b, d_ug_red, out_slot);
+        CUDA_SAFE_CALL(cudaGetLastError());
+        return;
+    }
     if(h_elements <= 0)
     {
         CUDA_SAFE_CALL(cudaMemsetAsync(out_slot, 0, sizeof(double)));
@@ -7489,6 +7618,11 @@ void LiquidSystem::post_step(device_TetraData& m, double dt)
                    hd[0], hd[1] / h_ag, hd[2], hd[3], dt);
         }
     }
+    if(P.ug)
+    {
+        ug_post(m, dt);
+        return;
+    }
     const int n = n_particles;
     g_prof.start();
     CUDA_SAFE_CALL(cudaMemsetAsync(d_vi, 0, n_vnodes * sizeof(double3)));
@@ -7576,6 +7710,169 @@ void LiquidSystem::post_step(device_TetraData& m, double dt)
     steps_done++;
 }
 
+// ---------------------------------------------------------------------------- LIQ_UG (liquid_ug.cuh)
+void LiquidSystem::ug_pre(device_TetraData& m, double dt, double3 gravity)
+{
+    const int n = n_particles;
+    last_dt     = dt;   // k_ug_energy (LIQ_UG_HG) needs the step size
+    if(!d_ug_nodes)
+    {
+        int tri = P.ug_bspline ? 2 : 1;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(g_liq_tri, &tri, sizeof(int)));
+        const size_t ns = (size_t)ug_ns();
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_ug_nodes, ns * (size_t)n * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_ug_w, ns * (size_t)n * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_ug_grad, ns * (size_t)n * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaMalloc((void**)&d_ug_red, (blocks_for(n) + 1) * sizeof(double)));
+        if((long long)ug_nb() * n > 37ll * max_voxels)
+            throw std::runtime_error("[liquid] LIQ_UG needs 36 (trilinear) / 378 (B-spline) triplet blocks per particle: the liquid triplet reservation (37 x max_voxels) is too small");
+        printf("[liquid] LIQ_UG particle-quadrature liquid (recovered Unified_GIPC method): %s, kappa %.3g, tension ratio %.2f, "
+               "volume barrier %s (J_act %.3f, k %.2f kappa), node mass floor %.3f rho dx^3; wall / rest / push-apart layers off\n",
+               P.ug_bspline ? "quadratic B-spline 27-node stencil (LIQ_UG_BSPLINE=1)" : "trilinear 8-node stencil",
+               P.kappa, P.tension_ratio, P.ug_jact > 0.0 ? "ON" : "off", P.ug_jact, P.ug_kb, P.mass_floor);
+        if(P.ug_reanchor > 0.0) printf("[liquid] LIQ_UG density re-anchor of interior particles: beta %.2f per step\n", P.ug_reanchor);
+        if(P.ug_hg > 0.0) printf("[liquid] LIQ_UG hourglass viscosity %.3g Pa s on the trilinear stencil's zero-energy modes%s\n", P.ug_hg, P.ug_bspline ? " (IGNORED with the B-spline stencil)" : "");
+        printf("[liquid] LIQ_UG volume feasible step: %s\n", P.ug_feasible > 0.0 ? "ON (line search bounded at the first inverted particle, safety factor applied)" : "off (infinite-energy rejection only)");
+    }
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_mi, 0, n_vnodes * sizeof(double)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_mvi, 0, n_vnodes * sizeof(double3)));
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_node_ref, 0, n_vnodes * sizeof(int)));
+    if(P.ug_bspline) k_ug_p2g<3><<<blocks_for(n), 256>>>(n, d_xp, d_vp, d_Cp, d_mp, P.origin, P.dx, P.dims, P.apic, d_mi, d_mvi, d_node_ref);
+    else             k_ug_p2g<2><<<blocks_for(n), 256>>>(n, d_xp, d_vp, d_Cp, d_mp, P.origin, P.dx, P.dims, P.apic, d_mi, d_mvi, d_node_ref);
+    if(P.bdf2)
+    {   // LIQ_BDF2 in UG mode: previous-step particle velocities on this step's stencils -> d_bh_mvi (same weights as d_mvi)
+        if(!bh_init)
+        {
+            CUDA_SAFE_CALL(cudaMemcpyAsync(d_bh_vp, d_vp, n * sizeof(double3), cudaMemcpyDeviceToDevice));
+            CUDA_SAFE_CALL(cudaMemcpyAsync(d_bh_Cp, d_Cp, 9 * (size_t)n * sizeof(double), cudaMemcpyDeviceToDevice));
+            bh_init = true;
+        }
+        if(!d_ug_hmass)
+        {
+            CUDA_SAFE_CALL(cudaMalloc((void**)&d_ug_hmass, n_vnodes * sizeof(double)));
+            CUDA_SAFE_CALL(cudaMalloc((void**)&d_ug_href, n_vnodes * sizeof(int)));
+        }
+        CUDA_SAFE_CALL(cudaMemsetAsync(d_bh_mvi, 0, n_vnodes * sizeof(double3)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(d_ug_hmass, 0, n_vnodes * sizeof(double)));
+        if(P.ug_bspline) k_ug_p2g<3><<<blocks_for(n), 256>>>(n, d_xp, d_bh_vp, d_bh_Cp, d_mp, P.origin, P.dx, P.dims, P.apic, d_ug_hmass, d_bh_mvi, d_ug_href);
+        else             k_ug_p2g<2><<<blocks_for(n), 256>>>(n, d_xp, d_bh_vp, d_bh_Cp, d_mp, P.origin, P.dx, P.dims, P.apic, d_ug_hmass, d_bh_mvi, d_ug_href);
+    }
+    k_node_flag<<<blocks_for(n_vnodes), 256>>>(n_vnodes, d_mi, d_node_ref, 0, d_node_flag, d_node_ghost);
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_cell_flag, 0, n_cells * sizeof(int)));
+    thrust::exclusive_scan(thrust::device, thrust::device_pointer_cast(d_cell_flag), thrust::device_pointer_cast(d_cell_flag) + n_cells, thrust::device_pointer_cast(d_cell_scan));
+    thrust::exclusive_scan(thrust::device, thrust::device_pointer_cast(d_node_flag), thrust::device_pointer_cast(d_node_flag) + n_vnodes, thrust::device_pointer_cast(d_node_scan));
+    k_compact_nodes<<<blocks_for(n_vnodes), 256>>>(n_vnodes, d_node_flag, d_node_scan, d_active_nodes, d_node_slot);
+    k_counts<<<1, 1>>>(n_cells, n_vnodes, d_cell_flag, d_cell_scan, d_node_flag, d_node_scan, d_counts);
+    int counts[2] = {0, 0};
+    CUDA_SAFE_CALL(cudaMemcpy(counts, d_counts, 2 * sizeof(int), cudaMemcpyDeviceToHost));
+    h_active_cells = 0;
+    h_active_nodes = counts[1];
+    if(h_active_nodes > P.node_pool)
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "[liquid] %d active grid nodes exceed the node pool (%d): raise node_pool", h_active_nodes, P.node_pool);
+        throw std::runtime_error(buf);
+    }
+    h_elements = 0; h_ghost_slots = 0; h_live_nodes = h_active_nodes; h_ag = 0; h_cc = 0;
+    if(d_wall_count) CUDA_SAFE_CALL(cudaMemsetAsync(d_wall_count, 0, sizeof(int)));
+    k_write_node_slots<<<blocks_for(P.node_pool), 256>>>(P.node_pool, h_active_nodes, d_active_nodes, d_mi, d_mvi, P.dims, P.dx, P.origin, P.park,
+                                                         P.mass_floor, P.floor_gravity, nullptr, 0.0, 0.0,
+                                                         P.cav_on, P.cav[0], P.cav[1], P.cav[2], P.cav[3], P.cav[4], P.cav[5], P.cav[6],
+                                                         nullptr, 0, d_ghost_corner, n_nodes, nullptr, 0, d_abd_q, d_abd_qv, 0, P.clamp_lo_y,
+                                                         nullptr, d_wall_n, d_wall_xt, nullptr,
+                                                         P.rho, 0.0, P.rest_kv, dt, gravity, node_slot_base, m.vertexes, m.o_vertexes, m.velocities,
+                                                         m.xTilta, m.masses, m.BoundaryType, P.bdf2 ? d_bh_mvi : nullptr, P.bdf2 ? d_bh_vb : nullptr,
+                                                         P.bdf2 ? d_bh_xt : nullptr, nullptr, nullptr, nullptr, P.wb_airgrav);
+    fp_xt = m.xTilta; fp_mass = m.masses;
+    wfc_x = m.vertexes;
+    d_overt = m.o_vertexes;
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_counters, 0, sizeof(int)));
+    if(P.ug_bspline) k_ug_stencil<3><<<blocks_for(n), 256>>>(n, d_xp, P.origin, P.dx, P.dims, d_node_slot, node_slot_base, d_ug_nodes, d_ug_w, d_ug_grad, d_counters);
+    else             k_ug_stencil<2><<<blocks_for(n), 256>>>(n, d_xp, P.origin, P.dx, P.dims, d_node_slot, node_slot_base, d_ug_nodes, d_ug_w, d_ug_grad, d_counters);
+    int bad = 0;
+    CUDA_SAFE_CALL(cudaMemcpy(&bad, d_counters, sizeof(int), cudaMemcpyDeviceToHost));
+    if(bad) throw std::runtime_error("[liquid] LIQ_UG: a particle stencil node with positive weight is not active");
+    k_write_particle_slots<<<blocks_for(n), 256>>>(n, d_xp, particle_slot_base, m.vertexes, m.o_vertexes, m.xTilta);
+    CUDA_SAFE_CALL(cudaGetLastError());
+    if(steps_done % 200 == 0) printf("[liquid] LIQ_UG step %d: %d active grid nodes, %d particles; volume feasible step engaged in %lld Newton iterations so far\n", steps_done, h_active_nodes, n, feasible_hits);
+}
+
+__global__ void k_min_partials(int n, const double* partial, double* out)
+{
+    double a = 1.0;
+    for(int i = 0; i < n; ++i) a = fmin(a, partial[i]);
+    out[0] = a;
+}
+__global__ void k_set_one(double* out) { out[0] = 1.0; }
+
+// device-side variant: writes the bound into one slot of the engine's CCD alpha chain (no extra D2H per Newton iteration)
+void LiquidSystem::feasible_alpha_device(const double3* vertexes, const double3* dir, double* out_slot)
+{
+    if(!P.ug || P.ug_feasible <= 0.0 || n_particles <= 0 || h_active_nodes <= 0 || !d_ug_nodes) { k_set_one<<<1, 1>>>(out_slot); return; }
+    const int t = 256, b = blocks_for(n_particles, t);
+    const UgGrid G{d_active_nodes, node_slot_base, P.dims, P.origin, P.dx};
+    if(P.ug_bspline) k_ug_feasible<3><<<b, t, t * sizeof(double)>>>(n_particles, d_ug_nodes, d_ug_grad, vertexes, dir, G, P.ug_feasible, d_ug_red);
+    else             k_ug_feasible<2><<<b, t, t * sizeof(double)>>>(n_particles, d_ug_nodes, d_ug_grad, vertexes, dir, G, P.ug_feasible, d_ug_red);
+    k_min_partials<<<1, 1>>>(b, d_ug_red, out_slot);
+}
+
+double LiquidSystem::feasible_alpha(const double3* vertexes, const double3* dir)
+{
+    if(!P.ug || P.ug_feasible <= 0.0 || n_particles <= 0 || h_active_nodes <= 0 || !d_ug_nodes) return 1.0;
+    const int t = 256, b = blocks_for(n_particles, t);
+    const UgGrid G{d_active_nodes, node_slot_base, P.dims, P.origin, P.dx};
+    if(P.ug_bspline) k_ug_feasible<3><<<b, t, t * sizeof(double)>>>(n_particles, d_ug_nodes, d_ug_grad, vertexes, dir, G, P.ug_feasible, d_ug_red);
+    else             k_ug_feasible<2><<<b, t, t * sizeof(double)>>>(n_particles, d_ug_nodes, d_ug_grad, vertexes, dir, G, P.ug_feasible, d_ug_red);
+    std::vector<double> h(b);
+    CUDA_SAFE_CALL(cudaMemcpy(h.data(), d_ug_red, b * sizeof(double), cudaMemcpyDeviceToHost));
+    double a = 1.0;
+    for(double v : h) a = std::min(a, v);
+    return a;
+}
+
+void LiquidSystem::ug_post(device_TetraData& m, double dt)
+{
+    const int n = n_particles;
+    g_prof.start();
+    double3 lo = make_double3(P.origin.x, fmax(P.origin.y - 0.5 * P.dx, P.clamp_lo_y), P.origin.z);
+    double3 hi = make_double3(P.origin.x + P.dims.x * P.dx - 1e-9, P.origin.y + P.dims.y * P.dx - 1e-9, P.origin.z + P.dims.z * P.dx - 1e-9);
+    CUDA_SAFE_CALL(cudaMemsetAsync(d_counters, 0, sizeof(int)));
+    if(h_active_nodes > 0)
+    {
+        const double3* vvel = nullptr;
+        if(P.bdf2)
+        {   // BDF2 velocity form: v_i = vb_i + 3/2 (x_i - x~_i) / dt per active node, scattered per lattice node id
+            CUDA_SAFE_CALL(cudaMemsetAsync(d_bh_vel, 0, n_vnodes * sizeof(double3)));
+            CUDA_SAFE_CALL(cudaMemsetAsync(d_vi, 0, n_vnodes * sizeof(double3)));
+            k_read_node_vel_bdf2<<<blocks_for(h_active_nodes), 256>>>(h_active_nodes, d_active_nodes, m.vertexes, d_bh_xt, d_bh_vb, P.dims, P.dx, P.origin,
+                                                                      node_slot_base, dt, d_vi, d_bh_vel, nullptr);
+            vvel = d_bh_vel;
+        }
+        const UgGrid G{d_active_nodes, node_slot_base, P.dims, P.origin, P.dx};
+        if(P.ug_bspline) k_ug_commit<3><<<blocks_for(n), 256>>>(n, d_ug_nodes, d_ug_w, d_ug_grad, m.vertexes, G, dt, P.apic, lo, hi, d_xp, d_vp, d_Cp, d_Jp, d_counters,
+                                                                vvel, P.bdf2 ? d_bh_vp : nullptr, P.bdf2 ? d_bh_Cp : nullptr);
+        else             k_ug_commit<2><<<blocks_for(n), 256>>>(n, d_ug_nodes, d_ug_w, d_ug_grad, m.vertexes, G, dt, P.apic, lo, hi, d_xp, d_vp, d_Cp, d_Jp, d_counters,
+                                                                vvel, P.bdf2 ? d_bh_vp : nullptr, P.bdf2 ? d_bh_Cp : nullptr);
+    }
+    int bad = 0;
+    CUDA_SAFE_CALL(cudaMemcpy(&bad, d_counters, sizeof(int), cudaMemcpyDeviceToHost));
+    if(bad) throw std::runtime_error("[liquid] LIQ_UG commit: non-positive or non-finite particle volume / displacement");
+    if(P.ug_reanchor > 0.0 && h_active_nodes > 0)
+    {   // density re-anchor (LIQ_UG_REANCHOR): interior particles take the tent-smeared cell volume ratio (j_mode 3 of the main path)
+        CUDA_SAFE_CALL(cudaMemsetAsync(d_mc, 0, n_cells * sizeof(double)));
+        CUDA_SAFE_CALL(cudaMemsetAsync(d_cell_flag, 0, n_cells * sizeof(int)));
+        k_ug_cellmass<<<blocks_for(n), 256>>>(n, d_xp, d_mp, P.origin, P.dx, P.dims, d_mc, d_cell_flag);
+        k_reanchor_J<<<blocks_for(n), 256>>>(n, d_xp, d_mc, d_cell_flag, P.origin, P.dx, P.dims, P.rho * P.dx * P.dx * P.dx, P.J_min, P.ug_reanchor, d_Jp);
+    }
+    porous_post(m, dt);
+    k_write_particle_slots<<<blocks_for(n), 256>>>(n, d_xp, particle_slot_base, m.vertexes, m.o_vertexes, m.xTilta);
+    CUDA_SAFE_CALL(cudaGetLastError());
+    g_prof.stop(5);
+    g_prof.step_done();
+    CUDA_SAFE_CALL(cudaMemcpy(h_fallback, d_fallback, 12 * sizeof(int), cudaMemcpyDeviceToHost));
+    steps_done++;
+}
+
 double* LiquidSystem::local_step_alpha_buffer()
 {   // LIQ_LOCAL_STEP: per-particle step bound, reset to 1 (the engine's pair kernel takes atomic minima into it)
     if(n_particles <= 0) return nullptr;
@@ -7585,7 +7882,7 @@ double* LiquidSystem::local_step_alpha_buffer()
 }
 int LiquidSystem::local_step_filter(double3* md, const double3* vertexes, double cut, bool count_out)
 {   // scale the direction of the grid nodes around step-limited particles (contact pairs / ground plane), then refresh the particle rows
-    if(n_particles <= 0 || !d_ls_alpha || node_slot_base < 0) return 0;
+    if(n_particles <= 0 || !d_ls_alpha || node_slot_base < 0 || P.ug) return 0;
     const int nslots = particle_slot_base - node_slot_base;
     if(nslots <= 0) return 0;
     if(!d_ls_scale || ls_scale_n != nslots)
@@ -7632,9 +7929,9 @@ const double3* LiquidSystem::scaled_movedir(const double3* md, int vertex_num)
     }
     if(s_conv_particle)
     {   // LIQ_CONV_PARTICLE=1: the liquid enters the Newton exit test through the PARTICLE-interpolated direction
-        // (sum_i w_ip d_i), not through the node rows.
+        // (sum_i w_ip d_i, what the recovered engine's "physical direction" norm measures), not through the node rows.
         // Null-space (hourglass / sub-cell) node directions are nearly invisible at the particles, so the Newton stops
-        // before resolving them: they stay unresolved = damped every step,
+        // before resolving them: they stay unresolved = damped every step, which is how the recovered engine settles
         // while the particle-visible (physical) motion is still converged to the tolerance.
         CUDA_SAFE_CALL(cudaMemcpyAsync(d_md_scaled, md, (size_t)vertex_num * sizeof(double3), cudaMemcpyDeviceToDevice));
         apply_particle_movedir(d_md_scaled);                                                                      // particle rows <- interpolated node rows

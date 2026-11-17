@@ -1,8 +1,8 @@
-"""Side-by-side particle videos of two (or more) runs that dumped frames/f_<step>.npz (x, v[, block]) of the same
-scene — rendered with matplotlib (no GPU), faststart mp4.
+"""Side-by-side particle videos of two (or more) runs that dumped frames/f_<step>.npz (x, v[, block]) — our engine and
+the recovered Unified_GIPC engine on the same scene — rendered with matplotlib (no GPU), faststart mp4.
 
-    python sidebyside_video.py --scene m2 --out m2_ab.mp4 --panel "run A" out/m2_a \
-                                                          --panel "run B" out/m2_b
+    python sidebyside_video.py --scene m2 --out m2_tri.mp4 --panel "ours (trilinear)" out/ugrun/v_m2_tri \
+                                                           --panel "recovered (trilinear)" ug_ref/out/v_m2_tri
 
 Each panel is a side view (x horizontal, y vertical) of the particles coloured by speed, with the container outline;
 the frame time is taken from the dump. Frames are matched by step (dumps must use the same --dump-every and dt).
@@ -73,6 +73,8 @@ def main():
             b = None
             if "block" in d.files:
                 b = d["block"]
+            elif a.scene == "float" and "mesh" in d.files and d["mesh"].shape[0] >= 24:
+                b = d["mesh"][16:24]            # recovered runner: cup (16 vertices) then the block (8)
             if b is not None:
                 bx = b[:, 2] if sc.get("proj") == "xz->z" else b[:, 0]
                 from scipy.spatial import ConvexHull

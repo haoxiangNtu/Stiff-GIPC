@@ -2603,6 +2603,7 @@ void SimEngine::Impl::liquid_load_bodies()
     gipc_liquid::liquid_require(pool >= seed_nodes, "node_pool is smaller than the initial active node count");
     liquid->P.node_pool = pool;
     liquid->max_voxels  = liquid->P.cpic ? 2 * pool : pool;  // #active cells <= #active nodes (each cell owns its min corner); 2b: up to 2 elements per cut cell
+    if(liquid->P.ug) liquid->max_voxels = std::max(liquid->max_voxels, (int)((liquid->n_particles * (long long)liquid->ug_nb() + 36) / 37 + 1));   // LIQ_UG: 36 (trilinear) / 378 (B-spline) blocks per particle
 
     // node pool body: parked, Fixed (btype 1) until activated each step
     std::vector<double3> park(pool, P.park);

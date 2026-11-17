@@ -1,4 +1,5 @@
-"""M17: two-way coupling check — a light block dropped on still water.
+"""M17: two-way coupling check — a light block dropped on still water (the same scene as run_ugref.py float in the
+recovered Unified_GIPC engine, for a side-by-side comparison).
 
 The m2 box (Fixed ABD) holds 0.6 L of water seeded over the whole cavity footprint (2 mm from the walls); a free
 40 x 40 x 20 mm ABD block of density 500 kg/m^3 is released with its bottom 5 mm above the surface. Expected: it
